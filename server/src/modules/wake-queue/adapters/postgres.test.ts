@@ -1337,11 +1337,23 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const boundedDb = createDb(tempDb!.connectionString, { maxConnections: poolSize });
     const companyId = await seedCompany();
     const agentId = await seedAgent({ companyId });
-    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
-    const runIds: string[] = [];
+    const releasesToRun: Array<{ issueId: string; runId: string }> = [];
     for (let index = 0; index < poolSize * 3; index += 1) {
-      runIds.push(await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } }));
+      // Distinct issue locks let several release transactions hold pooled
+      // connections at once. One shared issue would serialize all callbacks.
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } });
+      releasesToRun.push({ issueId, runId });
     }
+
+    let concurrentCallbacks = 0;
+    let releaseFirstWave!: () => void;
+    let rejectFirstWave!: (error: Error) => void;
+    const firstWave = new Promise<void>((resolve, reject) => {
+      releaseFirstWave = resolve;
+      rejectFirstWave = reject;
+    });
+    const gateTimeout = setTimeout(() => rejectFirstWave(new Error("release callbacks did not overlap")), 5_000);
 
     // The adapter has already row-locked the issue, so its transaction owns
     // an xid. An autocommit read on the global pool would see none.
@@ -1361,6 +1373,9 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         return company?.defaultResponsibleUserId ?? null;
       },
       getRoutineEnv: async (tx) => {
+        concurrentCallbacks += 1;
+        if (concurrentCallbacks === poolSize) releaseFirstWave();
+        await firstWave;
         await assertOnReleaseTransaction(tx);
         calls.push("getRoutineEnv");
         return { routineId: null, env: null, responsibleUserId: null };
@@ -1377,7 +1392,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     };
 
     const adapter = createPostgresWakeQueueAdapter(boundedDb, deps);
-    const releases = runIds.map((runId) =>
+    const releases = releasesToRun.map(({ issueId, runId }) =>
       adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (locked, ports) => {
         const routineEnvContext = await ports.host.getRoutineEnv({ companyId, issue: locked.primaryIssue });
         await ports.host.resolveSessionBeforeForWakeup({ companyId, agentId, taskKey: issueId });
@@ -1403,14 +1418,19 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     });
     try {
       const results = await Promise.race([Promise.all(releases), deadline]);
-      expect(results).toHaveLength(runIds.length);
+      expect(results).toHaveLength(releasesToRun.length);
       // An independent read through the same bounded pool still succeeds.
       await expect(Promise.race([boundedDb.execute(sql`select 1`), deadline])).resolves.toBeDefined();
     } finally {
       clearTimeout(timer);
+      clearTimeout(gateTimeout);
+      // Also break any pending pool reads if the deadline failed. Otherwise
+      // the suite's database cleanup can wait on those release transactions.
+      await boundedDb.$client.end({ timeout: 0 });
     }
-    expect(calls.filter((call) => call === "resolveSessionBeforeForWakeup")).toHaveLength(runIds.length);
-  });
+    expect(concurrentCallbacks).toBeGreaterThanOrEqual(poolSize);
+    expect(calls.filter((call) => call === "resolveSessionBeforeForWakeup")).toHaveLength(releasesToRun.length);
+  }, 30_000);
 
   // The admission half opens no transaction of its own: `heartbeat.ts` still
   // owns it. These tests drive the admission writer directly against a

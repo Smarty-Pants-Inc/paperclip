@@ -36,6 +36,7 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let inFlight: Promise<unknown>[] = [];
+  let deadlineExceeded = false;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-wakeup-pool-");
@@ -45,6 +46,17 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
   }, 60_000);
 
   afterEach(async () => {
+    if (deadlineExceeded) {
+      // A failed deadline may leave transactions waiting on each other. End
+      // the bounded pool immediately instead of waiting forever for wakeups
+      // that cannot settle. A fresh pool keeps later scenarios independent.
+      await db.$client.end({ timeout: 0 });
+      db = createDb(tempDb!.connectionString, { maxConnections: POOL_SIZE });
+      heartbeat = heartbeatService(db);
+      inFlight = [];
+      deadlineExceeded = false;
+      return;
+    }
     // Only a failed run leaves transactions stuck. Terminate them so their
     // wakeups reject and the next test starts with a usable pool.
     await adminDb.execute(sql`
@@ -60,6 +72,8 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
   }, 60_000);
 
   afterAll(async () => {
+    await db?.$client.end({ timeout: 0 });
+    await adminDb?.$client.end({ timeout: 0 });
     await tempDb?.cleanup();
   }, 60_000);
 
@@ -77,6 +91,7 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        deadlineExceeded = true;
         void idleInTransactionCount()
           .catch(() => "unknown")
           .then((count) =>
