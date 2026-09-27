@@ -1353,6 +1353,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       releaseFirstWave = resolve;
       rejectFirstWave = reject;
     });
+    // The timeout can fire before a callback awaits this gate on a slow host.
+    void firstWave.catch(() => undefined);
     const gateTimeout = setTimeout(() => rejectFirstWave(new Error("release callbacks did not overlap")), 5_000);
 
     // The adapter has already row-locked the issue, so its transaction owns
