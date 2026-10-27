@@ -175,6 +175,9 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
     count: number;
     parentId?: string | null;
     firstNumber?: number;
+    // Routine-origin issues make the wake path read the routine env; manual
+    // issues return before that read, so they leave its binding unpinned.
+    routineOrigin?: boolean;
   }) {
     const ids = Array.from({ length: input.count }, () => randomUUID());
     const firstNumber = input.firstNumber ?? 1;
@@ -189,6 +192,7 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
         parentId: input.parentId ?? null,
         issueNumber: firstNumber + index,
         identifier: `${input.issuePrefix}-${firstNumber + index}`,
+        ...(input.routineOrigin ? { originKind: "routine_execution", originId: randomUUID() } : {}),
       })),
     );
     return ids;
@@ -208,7 +212,7 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
 
   it("completes concurrent assignment wakeups on one issue and keeps the pool usable", async () => {
     const { companyId, agentId, issuePrefix } = await seedCompanyAndAgent();
-    const [issueId] = await seedIssues({ companyId, agentId, issuePrefix, count: 1 });
+    const [issueId] = await seedIssues({ companyId, agentId, issuePrefix, count: 1, routineOrigin: true });
 
     const wakeups = Array.from({ length: POOL_SIZE * 3 }, () => assignmentWake(agentId, issueId));
     inFlight = wakeups;
@@ -237,7 +241,15 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
       issueNumber: 1,
       identifier: `${issuePrefix}-1`,
     });
-    const childIds = await seedIssues({ companyId, agentId, issuePrefix, count: 25, parentId, firstNumber: 2 });
+    const childIds = await seedIssues({
+      companyId,
+      agentId,
+      issuePrefix,
+      count: 25,
+      parentId,
+      firstNumber: 2,
+      routineOrigin: true,
+    });
 
     const wakeups = childIds.map((issueId) => assignmentWake(agentId, issueId));
     inFlight = wakeups;
@@ -293,7 +305,7 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
     try {
       await settings.updateExperimental({ enableIsolatedWorkspaces: true });
       const { companyId, agentId, issuePrefix } = await seedCompanyAndAgent();
-      const issueIds = await seedIssues({ companyId, agentId, issuePrefix, count: POOL_SIZE * 2 });
+      const issueIds = await seedIssues({ companyId, agentId, issuePrefix, count: POOL_SIZE * 2, routineOrigin: true });
       await db.insert(agentTaskSessions).values(
         issueIds.map((issueId) => ({
           companyId,
@@ -338,8 +350,8 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
   it("completes concurrent run releases that promote a deferred wake, resolving the owner through the release transaction", async () => {
     // Drives the production wake-queue callbacks in heartbeat.ts. Each release
     // runs in a transaction that holds one pooled connection and promotes a
-    // deferred wake, which reads the routine env, the responsible user and the
-    // prior session. A callback that reads through the global pool needs a
+    // deferred wake, which reads the routine env (the issues are routine-origin
+    // so that read happens), the responsible user and the prior session. A callback that reads through the global pool needs a
     // second connection per release and deadlocks the bounded pool.
     const { companyId, agentId, issuePrefix } = await seedCompanyAndAgent();
     const finishingAgentIds = Array.from({ length: POOL_SIZE * 2 }, () => randomUUID());
@@ -356,7 +368,13 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
         permissions: {},
       })),
     );
-    const issueIds = await seedIssues({ companyId, agentId, issuePrefix, count: finishingAgentIds.length });
+    const issueIds = await seedIssues({
+      companyId,
+      agentId,
+      issuePrefix,
+      count: finishingAgentIds.length,
+      routineOrigin: true,
+    });
     const runIds = finishingAgentIds.map(() => randomUUID());
     await db.insert(heartbeatRuns).values(
       runIds.map((id, index) => ({
