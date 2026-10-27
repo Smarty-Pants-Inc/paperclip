@@ -324,6 +324,25 @@ import { createHeartbeatQueueTestDependencies } from "./helpers/heartbeat-queue.
       { status: "resolved", outcome: "false_positive" },
     ]);
   });
+  it("settles a pre-provider shutdown while an open child insert holds foreign-key locks on the run and issue", async () => {
+    const { f, run } = await interruptedBootstrap();
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    let markInserted!: () => void;
+    const inserted = new Promise<void>(resolve => { markInserted = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.insert(workspaceOperations).values({ companyId: f.companyId, heartbeatRunId: run.id, issueId: f.sourceId, phase: "worktree_cleanup" });
+      markInserted();
+      await released;
+    });
+    await Promise.race([inserted, holder]);
+    let settled: Awaited<ReturnType<typeof settleInterruptedNativeBootstrap>> | "blocked";
+    try {
+      settled = await Promise.race([settleInterruptedNativeBootstrap(db, { run, providerDispatchStarted: false }),
+        new Promise<"blocked">(resolve => setTimeout(() => resolve("blocked"), 3_000))]);
+    } finally { release(); await holder; }
+    expect(settled).toMatchObject({ id: run.id, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+  });
   it.each(["already-blocked", "human-reblock", "dependency-change", "new-session", "new-owner", "other-execution"])("does not undo %s when settling bootstrap evidence", async kind => {
     const { f, run } = await interruptedBootstrap();
     if (kind === "already-blocked") await issueService(db).update(f.sourceId, { status: "blocked" });

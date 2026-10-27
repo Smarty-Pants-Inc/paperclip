@@ -134,14 +134,14 @@ export async function terminalizeLegacyExecution(input: {
           .where(
             and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)),
           )
-          .for("update")
+          .for("no key update")
       : [];
     const [current] = await tx.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
       runtimeMode: heartbeatRuns.runtimeMode, status: heartbeatRuns.status,
       resultJson: heartbeatRuns.resultJson, executionStatusDeliveryId: heartbeatRuns.executionStatusDeliveryId,
     }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
-    )).for("update");
+    )).for("no key update");
     if (!current || (current.runtimeMode !== "legacy" && !(input.recordRestoreFailureOnly && current.runtimeMode === "native")) ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
     if (patch?.resultJson !== undefined) patch = { ...patch,
@@ -342,8 +342,8 @@ export async function settleInterruptedNativeBootstrap(
   const issueId = input.run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
   return db.transaction(async tx => {
-    const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
-    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("update");
+    const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("no key update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("no key update");
     if (!task || !run || !isInterruptedNativePreparationCandidate(run) ||
         run.contextSnapshot?.issueId !== task.id ||
         executionFailureRetryCount(run) >= 2) return null;
