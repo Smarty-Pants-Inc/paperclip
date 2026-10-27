@@ -1,12 +1,24 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import {
+  agents,
+  agentTaskSessions,
+  agentWakeupRequests,
+  companies,
+  createDb,
+  heartbeatRuns,
+  issues,
+} from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { instanceSettingsService } from "../services/instance-settings.js";
 
 // Regression coverage for paperclipai/paperclip#14196: a wakeup holds one
 // pooled connection inside its transaction. Any helper that then reads
@@ -266,6 +278,142 @@ describeEmbeddedPostgres("heartbeat wakeup under a bounded connection pool", () 
     expect(results.every((run) => run?.status === "queued")).toBe(true);
     // Resolved through the company default, read on the wakeup's own transaction.
     expect(results.every((run) => run?.responsibleUserId === "company-default-user")).toBe(true);
+
+    await expectPoolStillServesQueries();
+  }, 60_000);
+
+  it("completes concurrent continuation wakeups on distinct issues with isolated workspaces and a prior session", async () => {
+    // With isolated workspaces on, each issue wakeup probes the task session of
+    // the issue's prior run while it holds its issue-transaction connection.
+    // Continuation wakes (not issue_assigned) keep that session, so the probe
+    // reads the session row and must do it on the wakeup's own transaction.
+    const settings = instanceSettingsService(db);
+    const previous = await settings.getExperimental();
+    const sessionCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pool-session-"));
+    try {
+      await settings.updateExperimental({ enableIsolatedWorkspaces: true });
+      const { companyId, agentId, issuePrefix } = await seedCompanyAndAgent();
+      const issueIds = await seedIssues({ companyId, agentId, issuePrefix, count: POOL_SIZE * 2 });
+      await db.insert(agentTaskSessions).values(
+        issueIds.map((issueId) => ({
+          companyId,
+          agentId,
+          adapterType: "process",
+          taskKey: issueId,
+          sessionParamsJson: { sessionId: `session-${issueId}`, cwd: sessionCwd },
+        })),
+      );
+
+      const wakeups = issueIds.map((issueId) =>
+        heartbeat.wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: { issueId },
+          contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+          requestedByActorType: "system",
+          requestedByActorId: null,
+        }),
+      );
+      inFlight = wakeups;
+
+      const results = await withinDeadline(
+        "concurrent isolated-workspace continuation wakeups",
+        Promise.all(wakeups),
+        WAKEUP_DEADLINE_MS,
+      );
+
+      expect(results.every((run) => run?.status === "queued")).toBe(true);
+      await expectPoolStillServesQueries();
+    } finally {
+      await fs.rm(sessionCwd, { recursive: true, force: true });
+      // Reset through the admin connection: after a deadlock the bounded pool
+      // may be unusable.
+      await instanceSettingsService(adminDb)
+        .updateExperimental({ enableIsolatedWorkspaces: previous.enableIsolatedWorkspaces })
+        .catch(() => undefined);
+    }
+  }, 60_000);
+
+  it("completes concurrent run releases that promote a deferred wake, resolving the owner through the release transaction", async () => {
+    // Drives the production wake-queue callbacks in heartbeat.ts. Each release
+    // runs in a transaction that holds one pooled connection and promotes a
+    // deferred wake, which reads the routine env, the responsible user and the
+    // prior session. A callback that reads through the global pool needs a
+    // second connection per release and deadlocks the bounded pool.
+    const { companyId, agentId, issuePrefix } = await seedCompanyAndAgent();
+    const finishingAgentIds = Array.from({ length: POOL_SIZE * 2 }, () => randomUUID());
+    await db.insert(agents).values(
+      finishingAgentIds.map((id, index) => ({
+        id,
+        companyId,
+        name: `Finishing Agent ${index + 1}`,
+        role: "engineer",
+        status: "idle",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })),
+    );
+    const issueIds = await seedIssues({ companyId, agentId, issuePrefix, count: finishingAgentIds.length });
+    const runIds = finishingAgentIds.map(() => randomUUID());
+    await db.insert(heartbeatRuns).values(
+      runIds.map((id, index) => ({
+        id,
+        companyId,
+        agentId: finishingAgentIds[index]!,
+        invocationSource: "assignment" as const,
+        triggerDetail: "system",
+        status: "running",
+        runtimeMode: "legacy" as const,
+        startedAt: new Date(),
+        contextSnapshot: { issueId: issueIds[index] },
+      })),
+    );
+    // Each issue is locked by its finishing run and has a wake deferred behind
+    // it, without a responsible user so the company default is resolved.
+    for (const [index, issueId] of issueIds.entries()) {
+      await db.update(issues).set({ executionRunId: runIds[index]! }).where(eq(issues.id, issueId));
+    }
+    const deferredWakeIds = issueIds.map(() => randomUUID());
+    await db.insert(agentWakeupRequests).values(
+      issueIds.map((issueId, index) => ({
+        id: deferredWakeIds[index]!,
+        companyId,
+        agentId,
+        source: "automation",
+        reason: "issue_commented",
+        status: "deferred_issue_execution",
+        requestedByActorType: "system" as const,
+        requestedByActorId: "test",
+        requestedAt: new Date(),
+        payload: { issueId },
+      })),
+    );
+
+    // A workspace wait releases the lock and goes on to promote the deferred wake.
+    const cancels = runIds.map((runId) =>
+      heartbeat.cancelRun(runId, undefined, {
+        errorCode: "workspace_busy",
+        resultJson: { executionRecovery: { kind: "workspace_wait", providerWorkStarted: false } },
+      }),
+    );
+    inFlight = cancels;
+
+    await withinDeadline("concurrent run releases", Promise.all(cancels), WAKEUP_DEADLINE_MS);
+
+    const promoted = await db
+      .select({ id: agentWakeupRequests.id, status: agentWakeupRequests.status, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(inArray(agentWakeupRequests.id, deferredWakeIds));
+    expect(promoted.every((wake) => wake.status !== "deferred_issue_execution" && wake.runId !== null)).toBe(true);
+    const promotedRuns = await db
+      .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
+      .from(heartbeatRuns)
+      .where(inArray(heartbeatRuns.id, promoted.flatMap((wake) => (wake.runId ? [wake.runId] : []))));
+    expect(promotedRuns).toHaveLength(deferredWakeIds.length);
+    expect(promotedRuns.every((run) => run.responsibleUserId === "company-default-user")).toBe(true);
 
     await expectPoolStillServesQueries();
   }, 60_000);
