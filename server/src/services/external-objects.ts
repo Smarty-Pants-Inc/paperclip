@@ -667,16 +667,16 @@ export function externalObjectService(
     }
   }
 
-  async function syncIssueSafely(issueId: string) {
-    await safeSync("issue", () => syncIssue(issueId));
+  async function syncIssueSafely(issueId: string, dbOrTx: any = db) {
+    await safeSync("issue", () => syncIssue(issueId, dbOrTx));
   }
 
   async function syncCommentSafely(commentId: string, dbOrTx: any = db) {
     await safeSync("comment", () => syncComment(commentId, dbOrTx));
   }
 
-  async function syncDocumentSafely(documentId: string) {
-    await safeSync("document", () => syncDocument(documentId));
+  async function syncDocumentSafely(documentId: string, dbOrTx: any = db) {
+    await safeSync("document", () => syncDocument(documentId, dbOrTx));
   }
 
   function toObjectPayload(object: ExternalObjectRecord, now = new Date()) {
