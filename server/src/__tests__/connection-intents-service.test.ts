@@ -486,6 +486,11 @@ describeEmbeddedPostgres("connectionIntentService", () => {
             label: "Use your own GitHub App",
             auth: "oauth",
           }),
+          expect.objectContaining({
+            key: "app-installation",
+            label: "Custom GitHub App",
+            auth: "api_key",
+          }),
         ],
       }),
     );
@@ -509,6 +514,11 @@ describeEmbeddedPostgres("connectionIntentService", () => {
         key: "own-oauth",
         label: "Use your own GitHub App",
         auth: "oauth",
+      }),
+      expect.objectContaining({
+        key: "app-installation",
+        label: "Custom GitHub App",
+        auth: "api_key",
       }),
     ]);
     expect(setup.service.methods.map((method) => method.key)).not.toContain(
