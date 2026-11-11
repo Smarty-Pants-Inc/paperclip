@@ -27,6 +27,43 @@ const deniedRequests = [
   { method: "POST", path: "/api/issues/task-1/recovery-actions/resolve" },
 ];
 
+const gatewayRequests = [
+  { method: "POST", path: "/api/tool-gateway/sessions" },
+  { method: "POST", path: "/api/tool-gateway/sessions/session-1/revoke" },
+  { method: "GET", path: "/api/tool-gateway/tools" },
+  { method: "POST", path: "/api/tool-gateway/tools/call" },
+];
+
+const deniedGatewayRequests = [
+  { method: "GET", path: "/api/tool-gateway/sessions" },
+  { method: "DELETE", path: "/api/tool-gateway/sessions/session-1/revoke" },
+  { method: "POST", path: "/api/tool-gateway/tools" },
+  { method: "GET", path: "/api/tool-gateway/tools/call" },
+  { method: "POST", path: "/api/tool-gateway/sessions/" },
+  { method: "POST", path: "/api/tool-gateway/sessions/session-1/revoke/extra" },
+  { method: "POST", path: "/api/tool-gateway/sessions/session-1/extra/revoke" },
+  { method: "GET", path: "/api/tool-gateway/tools/extra" },
+  { method: "POST", path: "/api/tool-gateway/tools/call/extra" },
+  { method: "POST", path: "/api/tool-gateway/admin" },
+  { method: "POST", path: "/api/tool-gateway/approvals" },
+  { method: "POST", path: "/api/tool-gateway/runtime" },
+  { method: "POST", path: "/api/tool-gateway/mcp" },
+];
+
+describe.each([
+  ["queue_v1", undefined],
+  ["http2_v1", HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST],
+] as const)("sandbox tool gateway over %s", (_transport, routes) => {
+  it.each(gatewayRequests)("admits exact gateway request $method $path", request => {
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, routes)).toBeNull();
+  });
+
+  it.each(deniedGatewayRequests)("rejects unlisted gateway request $method $path", request => {
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, routes))
+      .toBe(`Route not allowed: ${request.method} ${request.path}`);
+  });
+});
+
 describe.each([
   ["queue", undefined],
   ["HTTP/2", HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST],
