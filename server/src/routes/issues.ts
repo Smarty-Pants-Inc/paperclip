@@ -5354,6 +5354,67 @@ export function issueRoutes(
     return (await canActorReadProject(req, project)) ? project : null;
   }
 
+  type RawIssueAncestors = Awaited<ReturnType<typeof svc.getAncestors>>;
+
+  async function redactIssueAncestors(
+    req: Request,
+    companyId: string,
+    ancestors: RawIssueAncestors,
+  ): Promise<Array<RawIssueAncestors[number] | IssueLockedStub>> {
+    if (ancestors.length === 0) return ancestors;
+    const issueIds = [...new Set(ancestors.map((ancestor) => ancestor.id))];
+    const projectIds = [...new Set(ancestors
+      .map((ancestor) => ancestor.project?.id)
+      .filter((id): id is string => !!id))];
+    // The actorless service projection is not proof of existence in this company
+    // or permission to read either the ancestor or its independently private project.
+    const [ancestorRows, projectRows] = await Promise.all([
+      db.select({
+        id: issueRows.id,
+        companyId: issueRows.companyId,
+        projectId: issueRows.projectId,
+        parentId: issueRows.parentId,
+        assigneeAgentId: issueRows.assigneeAgentId,
+        assigneeUserId: issueRows.assigneeUserId,
+        status: issueRows.status,
+      }).from(issueRows)
+        .where(and(eq(issueRows.companyId, companyId), inArray(issueRows.id, issueIds))),
+      projectIds.length > 0
+        ? db.select({ id: projects.id, companyId: projects.companyId }).from(projects)
+          .where(and(eq(projects.companyId, companyId), inArray(projects.id, projectIds)))
+        : [],
+    ]);
+    const resources = [
+      ...ancestorRows.map((row) => ({
+        type: "issue" as const,
+        companyId: row.companyId,
+        issueId: row.id,
+        projectId: row.projectId,
+        parentIssueId: row.parentId,
+        assigneeAgentId: row.assigneeAgentId,
+        assigneeUserId: row.assigneeUserId,
+        status: row.status,
+      })),
+      ...projectRows.map((row) => ({ type: "project" as const, companyId: row.companyId, projectId: row.id })),
+    ];
+    const allowedIssueIds = new Set<string>();
+    const allowedProjectIds = new Set<string>();
+    if (resources.length > 0) {
+      const decisions = await access.decideReads(req.actor, resources);
+      for (const [index, resource] of resources.entries()) {
+        if (decisions[index]?.allowed !== true) continue;
+        if (resource.type === "issue") allowedIssueIds.add(resource.issueId);
+        else allowedProjectIds.add(resource.projectId);
+      }
+    }
+    return ancestors.map((ancestor): RawIssueAncestors[number] | IssueLockedStub => {
+      // Unlike relation stubs, hidden ancestors must not retain their identifier.
+      if (!allowedIssueIds.has(ancestor.id)) return { id: ancestor.id, identifier: null, locked: true };
+      if (ancestor.project && !allowedProjectIds.has(ancestor.project.id)) return { ...ancestor, project: null };
+      return ancestor;
+    });
+  }
+
   async function assertCanManageIssuePrivacy(
     req: Request,
     res: Response,
@@ -9996,11 +10057,12 @@ export function issueRoutes(
     const relationsWithRecoveryActions = withRecoveryActionsOnRelationSummaries(
       relations, recoveryActionsByRelationIssue,
     );
-    const [visibleRelations, visibleReferenceSummary, visibleProject, mentionedProjectVisibility] = await Promise.all([
+    const [visibleRelations, visibleReferenceSummary, visibleProject, mentionedProjectVisibility, visibleAncestors] = await Promise.all([
       redactIssueRelationEdges(req, issue.companyId, relationsWithRecoveryActions),
       redactIssueReferenceEdges(req, issue.companyId, referenceSummary),
       visibleIssueProject(req, project),
       Promise.all(mentionedProjects.map((mentionedProject) => canActorReadProject(req, mentionedProject))),
+      redactIssueAncestors(req, issue.companyId, ancestors),
     ]);
     const visibleMentionedProjects = mentionedProjects.filter((_, index) => mentionedProjectVisibility[index]);
     // Recovery revalidation may change the blocker; read it afterwards.
@@ -10010,7 +10072,7 @@ export function issueRoutes(
       ...issue,
       ...inboxArchiveFields,
       goalId: goal?.id ?? issue.goalId,
-      ancestors,
+      ancestors: visibleAncestors,
       ...(blockerAttention ? { blockerAttention } : {}),
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,

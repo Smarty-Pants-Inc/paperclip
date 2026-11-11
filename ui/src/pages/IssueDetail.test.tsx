@@ -2958,13 +2958,14 @@ describe("IssueDetail", () => {
   it.each([false, true])("renders a noninteractive private parent with mobile=%s", async (isMobile) => {
     mockSidebarState.isMobile = isMobile;
     mockIssuesApi.get.mockResolvedValue(createIssue({
-      ancestors: [{ id: "private-parent", identifier: "PAP-0", locked: true }] as unknown as Issue["ancestors"],
+      parentId: "private-parent",
+      ancestors: [{ id: "private-parent", identifier: null, locked: true }],
     }));
     await act(async () => { renderIssueView(); });
     await flushReact();
     expect(mockSetBreadcrumbs).toHaveBeenLastCalledWith([
       { label: "Tasks", href: "/issues" },
-      expect.objectContaining({ label: "Private task", identifier: "PAP-0", href: undefined }),
+      expect.objectContaining({ label: "Private task", identifier: undefined, href: undefined }),
       expect.objectContaining({ label: "Issue detail smoke" }),
     ]);
     const parentCrumb = mockSetBreadcrumbs.mock.calls.at(-1)![0][1];
@@ -2972,13 +2973,17 @@ describe("IssueDetail", () => {
     await act(async () => { renderIssueView(parentCrumb.control); });
     const chip = container.querySelector('[data-testid="locked-issue-chip"]');
     expect(chip).not.toBeNull();
-    expect(chip?.textContent).toBe(isMobile ? "Private" : "PAP-0");
+    expect(chip?.textContent).toBe("Private");
+    expect(container.textContent).not.toContain("PAP-0");
+    expect(container.textContent).not.toContain("private-parent");
+    expect(container.querySelector('[title]')).toBeNull();
     expect(container.querySelector('a, [role="link"]')).toBeNull();
   });
 
-  it("updates the private parent label when an open task changes viewport", async () => {
+  it("updates an identifier-bearing locked reference label when an open task changes viewport", async () => {
+    // Generic locked-reference compatibility; ancestor responses use the null identifier tested above.
     mockIssuesApi.get.mockResolvedValue(createIssue({
-      ancestors: [{ id: "private-parent", identifier: "PAP-0", locked: true }] as unknown as Issue["ancestors"],
+      ancestors: [{ id: "private-parent", identifier: "PAP-0", locked: true }],
     }));
     const captured: Breadcrumb[][] = [];
     for (const isMobile of [false, true, false]) {

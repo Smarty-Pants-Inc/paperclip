@@ -930,7 +930,8 @@ export interface Issue {
   privacyRootIssueId?: string | null;
   /** Immediate task from which private access flows downward, including chat handoffs. */
   privacyParentIssueId?: string | null;
-  ancestors?: IssueAncestor[];
+  /** Immediate parent first; unreadable ancestors are stubs, readable ancestors may have redacted projects. */
+  ancestors?: (IssueAncestor | IssueLockedStub)[];
   /** Detail responses only: access-checked creation provenance, or null. */
   createdFrom?: IssueCreationSource | null;
   /** Create/update responses only: present when the requested parent was not used as-is. */

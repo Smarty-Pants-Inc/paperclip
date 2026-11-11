@@ -18,6 +18,7 @@ import {
   issues,
   projectAccessMembers,
   projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -85,6 +86,7 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projectAccessMembers);
+    await db.delete(projectWorkspaces);
     await db.delete(projects);
     await db.delete(agentWakeupRequests);
     await db.delete(agents);
@@ -213,6 +215,223 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
       openIssue,
     };
   }
+
+  async function seedAncestorFixture() {
+    const fixture = await seedFixture();
+    const includedUserId = `included-${randomUUID()}`;
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: includedUserId,
+      name: "Included project member",
+      email: `${includedUserId}@example.test`,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await db.insert(companyMemberships).values({
+      companyId: fixture.companyId,
+      principalType: "user",
+      principalId: includedUserId,
+      status: "active",
+      membershipRole: "operator",
+    });
+    const parentCanaries = {
+      identifier: "ANCESTOR-SECRET-1",
+      title: "ancestor-parent-title-secret-7c91",
+      description: "ancestor-parent-description-secret-26d4",
+    };
+    const projectCanaries = {
+      name: "ancestor-project-name-secret-a913",
+      description: "ancestor-project-description-secret-b625",
+      workspaceName: "ancestor-workspace-name-secret-c738",
+      workspaceCwd: "/private/ancestor-workspace-cwd-secret-d849",
+      workspaceRepoUrl: "https://example.test/ancestor-workspace-repo-url-secret-e950.git",
+      workspaceRepoRef: "ancestor-workspace-repo-ref-secret-f061",
+      workspaceMetadataKey: "ancestor-workspace-metadata-key-secret-1072",
+      workspaceMetadataValue: "ancestor-workspace-metadata-value-secret-2183",
+    };
+    const project = await db.insert(projects).values({
+      companyId: fixture.companyId,
+      name: projectCanaries.name,
+      description: projectCanaries.description,
+      visibility: "private",
+      status: "planned",
+    }).returning().then((rows) => rows[0]!);
+    const workspace = await db.insert(projectWorkspaces).values({
+      companyId: fixture.companyId,
+      projectId: project.id,
+      name: projectCanaries.workspaceName,
+      cwd: projectCanaries.workspaceCwd,
+      repoUrl: projectCanaries.workspaceRepoUrl,
+      repoRef: projectCanaries.workspaceRepoRef,
+      metadata: { [projectCanaries.workspaceMetadataKey]: projectCanaries.workspaceMetadataValue },
+      isPrimary: true,
+    }).returning().then((rows) => rows[0]!);
+    await db.insert(projectAccessMembers).values([fixture.ownerId, includedUserId].map((subjectId) => ({
+      companyId: fixture.companyId,
+      projectId: project.id,
+      subjectType: "user",
+      subjectId,
+    })));
+    const parentId = randomUUID();
+    const parent = await db.insert(issues).values({
+      id: parentId,
+      companyId: fixture.companyId,
+      ...parentCanaries,
+      status: "backlog",
+      priority: "medium",
+      projectId: project.id,
+      visibility: "private",
+      privacyRootIssueId: parentId,
+      responsibleUserId: fixture.ownerId,
+      createdByUserId: fixture.ownerId,
+    }).returning().then((rows) => rows[0]!);
+    const child = await db.insert(issues).values({
+      companyId: fixture.companyId,
+      identifier: "ANCESTOR-CHILD-2",
+      title: "Task-only shared child",
+      parentId: parent.id,
+      privacyParentIssueId: parent.id,
+      privacyRootIssueId: parent.id,
+      projectId: project.id,
+      visibility: "private",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: fixture.ownerId,
+      createdByUserId: fixture.ownerId,
+    }).returning().then((rows) => rows[0]!);
+    return { ...fixture, includedUserId, parentCanaries, projectCanaries, project, workspace, parent, child };
+  }
+
+  it("ancestor privacy: returns only an exact locked stub after an official child-only grant", async () => {
+    const fixture = await seedAncestorFixture();
+    const ownerApp = await createApp(db, boardActor(fixture.companyId, fixture.ownerId));
+    const granteeApp = await createApp(db, boardActor(fixture.companyId, fixture.sharedUserId));
+    const nonGranteeApp = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+
+    await request(granteeApp).get(`/api/issues/${fixture.child.id}`).expect(404);
+    const grant = await request(ownerApp)
+      .post(`/api/issues/${fixture.child.id}/access-grants`)
+      .send({ subjectType: "user", subjectId: fixture.sharedUserId });
+    expect(grant.status, JSON.stringify(grant.body)).toBe(201);
+    expect(grant.body).toMatchObject({
+      issueId: fixture.child.id,
+      subjectType: "user",
+      subjectId: fixture.sharedUserId,
+      source: "explicit",
+    });
+    expect(await db.select().from(issueAccessGrants)).toEqual([
+      expect.objectContaining({ issueId: fixture.child.id, subjectId: fixture.sharedUserId, revokedAt: null }),
+    ]);
+
+    await request(granteeApp).get(`/api/issues/${fixture.parent.id}`).expect(404);
+    await request(granteeApp).get(`/api/projects/${fixture.project.id}`).expect(404);
+    await request(nonGranteeApp).get(`/api/issues/${fixture.child.id}`).expect(404);
+    const detail = await request(granteeApp).get(`/api/issues/${fixture.child.id}`);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+    expect(detail.body).toMatchObject({
+      id: fixture.child.id,
+      parentId: fixture.parent.id,
+      projectId: fixture.project.id,
+    });
+    expect(detail.body.project).toBeNull();
+    expect.soft(detail.body.ancestors).toEqual([
+      { id: fixture.parent.id, identifier: null, locked: true },
+    ]);
+    const serialized = JSON.stringify(detail.body);
+    for (const canary of [...Object.values(fixture.parentCanaries), ...Object.values(fixture.projectCanaries)]) {
+      expect.soft(serialized, `Child-only grantee must not receive ${canary}`).not.toContain(canary);
+    }
+  }, 20_000);
+
+  it("ancestor privacy: retains a granted readable ancestor but independently hides its private project", async () => {
+    const fixture = await seedAncestorFixture();
+    const ownerApp = await createApp(db, boardActor(fixture.companyId, fixture.ownerId));
+    const granteeApp = await createApp(db, boardActor(fixture.companyId, fixture.sharedUserId));
+    const grant = await request(ownerApp)
+      .post(`/api/issues/${fixture.parent.id}/access-grants`)
+      .send({ subjectType: "user", subjectId: fixture.sharedUserId });
+    expect(grant.status, JSON.stringify(grant.body)).toBe(201);
+    expect(grant.body.issueId).toBe(fixture.parent.id);
+    expect(await db.select().from(issueAccessGrants)).toEqual([
+      expect.objectContaining({ issueId: fixture.parent.id, subjectId: fixture.sharedUserId, revokedAt: null }),
+    ]);
+
+    const parentDetail = await request(granteeApp).get(`/api/issues/${fixture.parent.id}`);
+    expect(parentDetail.status, JSON.stringify(parentDetail.body)).toBe(200);
+    expect(parentDetail.body.projectId).toBe(fixture.project.id);
+    expect(parentDetail.body.project).toBeNull();
+    await request(granteeApp).get(`/api/projects/${fixture.project.id}`).expect(404);
+    const detail = await request(granteeApp).get(`/api/issues/${fixture.child.id}`);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+    expect(detail.body).toMatchObject({
+      id: fixture.child.id,
+      parentId: fixture.parent.id,
+      projectId: fixture.project.id,
+    });
+    expect(detail.body.project).toBeNull();
+    expect(detail.body.ancestors).toHaveLength(1);
+    expect(detail.body.ancestors[0]).toMatchObject({
+      id: fixture.parent.id,
+      ...fixture.parentCanaries,
+      status: fixture.parent.status,
+      priority: fixture.parent.priority,
+      assigneeAgentId: null,
+      projectId: fixture.project.id,
+      goalId: null,
+    });
+    expect.soft(detail.body.ancestors[0].project).toBeNull();
+    for (const body of [parentDetail.body, detail.body]) {
+      const serialized = JSON.stringify(body);
+      for (const canary of Object.values(fixture.projectCanaries)) {
+        expect.soft(serialized, `Issue grant must not reveal private project canary ${canary}`).not.toContain(canary);
+      }
+    }
+  }, 20_000);
+
+  it("ancestor privacy: preserves full ancestor and project workspace metadata for an included project member", async () => {
+    const fixture = await seedAncestorFixture();
+    const includedApp = await createApp(db, boardActor(fixture.companyId, fixture.includedUserId));
+    expect(await db.select().from(issueAccessGrants)).toEqual([]);
+    await request(includedApp).get(`/api/issues/${fixture.parent.id}`).expect(200);
+    await request(includedApp).get(`/api/projects/${fixture.project.id}`).expect(200);
+    const detail = await request(includedApp).get(`/api/issues/${fixture.child.id}`);
+    expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+    expect(detail.body).toMatchObject({
+      id: fixture.child.id,
+      parentId: fixture.parent.id,
+      projectId: fixture.project.id,
+      project: { id: fixture.project.id },
+    });
+    const expectedWorkspace = {
+      id: fixture.workspace.id,
+      companyId: fixture.companyId,
+      projectId: fixture.project.id,
+      name: fixture.workspace.name,
+      cwd: fixture.workspace.cwd,
+      repoUrl: fixture.workspace.repoUrl,
+      repoRef: fixture.workspace.repoRef,
+      metadata: fixture.workspace.metadata,
+      isPrimary: true,
+    };
+    expect(detail.body.ancestors).toHaveLength(1);
+    expect(detail.body.ancestors[0]).toMatchObject({
+      id: fixture.parent.id,
+      ...fixture.parentCanaries,
+      status: fixture.parent.status,
+      priority: fixture.parent.priority,
+      assigneeAgentId: null,
+      projectId: fixture.project.id,
+      goalId: null,
+      project: {
+        id: fixture.project.id,
+        name: fixture.projectCanaries.name,
+        description: fixture.projectCanaries.description,
+        status: fixture.project.status,
+        workspaces: [expect.objectContaining(expectedWorkspace)],
+        primaryWorkspace: expect.objectContaining(expectedWorkspace),
+      },
+    });
+  }, 20_000);
 
   it("requires explicit owner/admin break-glass and records both audit evidence and an owner-visible notice", async () => {
     const fixture = await seedFixture();
