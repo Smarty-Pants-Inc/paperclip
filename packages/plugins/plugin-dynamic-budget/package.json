@@ -1,0 +1,22 @@
+{
+  "name": "@smarty-pants/plugin-dynamic-budget",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Read-only company-scoped budget picture; no admission or routing effects",
+  "paperclipPlugin": { "manifest": "./dist/manifest.js", "worker": "./dist/worker.js", "ui": "./dist/ui/" },
+  "files": ["dist", "migrations", "README.md"],
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": { "@paperclipai/plugin-sdk": "workspace:*" },
+  "devDependencies": {
+    "@types/node": "^24.0.0", "@types/react": "^19.2.18", "esbuild": "^0.28.2",
+    "react": "^19.2.8", "react-dom": "^19.2.8", "typescript": "^7.0.2", "vitest": "^5.0.3"
+  },
+  "peerDependencies": { "react": ">=18", "react-dom": ">=18" },
+  "engines": { "node": ">=24.11.0" }
+}
