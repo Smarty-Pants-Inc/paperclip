@@ -8,6 +8,7 @@ import { agents, aiProviderDefaults, companies, companyMemberships, connectionGr
 import type { AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
 import { agentHarnessVerificationService } from "../services/agent-harness-verification.js";
 import * as serverAdapters from "../adapters/index.js";
+import * as runnerRuntime from "../vendor/paperclip-runner/index.js";
 import * as environmentTests from "../services/agent-environment-test.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { secretService } from "../services/secrets.js";
@@ -128,13 +129,13 @@ describePostgres("saved harness account preflight", () => {
     expect(release).toHaveBeenCalledExactlyOnceWith("failed");
   });
 
-  async function useRunnerTaskEnvironment(runtimeConfig: Record<string, unknown>, homeMode?: string) {
+  async function useRunnerTaskEnvironment(runtimeConfig: Record<string, unknown>, homeMode?: string, supportsTasks = true) {
     const pluginId = randomUUID(), pluginKey = `test.runner-tasks.${pluginId}`;
     await db.insert(plugins).values({ id: pluginId, pluginKey, packageName: "@test/runner-tasks", version: "1.0.0", apiVersion: 1,
       categories: ["automation"], status: "ready", manifestJson: { id: pluginKey, apiVersion: 1, version: "1.0.0",
         displayName: "Runner tasks", description: "Runner task fixture", author: "Paperclip", categories: ["automation"],
         capabilities: ["environment.drivers.register"], entrypoints: { worker: "worker.js" },
-        environmentDrivers: [{ driverKey: "tasks", displayName: "Tasks", supportsTasks: true, configSchema: { type: "object" } }] } } as any);
+        environmentDrivers: [{ driverKey: "tasks", displayName: "Tasks", supportsTasks, configSchema: { type: "object" } }] } } as any);
     const [environment] = await db.insert(environments).values({ name: `Runner tasks ${pluginId}`, driver: "plugin", status: "active",
       config: { pluginKey, driverKey: "tasks", driverConfig: {} } }).returning();
     vi.mocked(environmentTests.agentEnvironmentTestService).mockImplementation((database, manager) => ({
@@ -168,6 +169,59 @@ describePostgres("saved harness account preflight", () => {
     await expect(verify()).resolves.toBe("complete");
     expect(allocate).toHaveBeenCalledOnce();
     expect(probe).toHaveBeenCalledOnce();
+  });
+
+  it.each(["passed", "runtime failure", "authentication failure"] as const)("routes unbound plugin Pi verification to the native hello probe: %s", async outcome => {
+    await useRunnerTaskEnvironment({});
+    await db.update(agents).set({ adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "operator/model" } })
+      .where(eq(agents.id, agent.id));
+    const task = vi.fn().mockResolvedValue({ kind: "description", launchPreparationVersion: 1, projectAuthCheckVersion: 1,
+      taskId: "pi-task", runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } });
+    allocate.mockResolvedValue({ executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: ".", leaseId: "pi-probe-lease",
+      runnerTaskProbe: { runId: "pi-probe-run", sessionId: "pi-probe-session" }, runnerTask: task },
+      environmentName: "Operator Pi computer", fallbackChecks: [], release });
+    const nativeProbe = vi.spyOn(runnerRuntime, "probeNativeRunnerEnvironment").mockImplementation(async input => {
+      await input.onCleanupConfirmed?.();
+      if (outcome !== "passed") throw new Error(outcome);
+      return { provider: "acpx", providerDriver: "acpx_runtime", effectiveModel: "operator/model", helloProbePassed: true };
+    });
+    if (outcome === "passed") {
+      await expect(verify()).resolves.toBe("complete");
+      // Plugin images have no immutable identity here: an installed account's pass is never cached.
+      await expect(verify()).resolves.toBe("complete");
+      expect(nativeProbe).toHaveBeenCalledTimes(2);
+      expect(release).toHaveBeenLastCalledWith("released");
+    } else {
+      await expect(verify()).rejects.toMatchObject({ code: "harness_test_failed" });
+      expect(release).toHaveBeenCalledExactlyOnceWith("failed");
+    }
+    expect(nativeProbe).toHaveBeenCalledWith(expect.objectContaining({ provider: "acpx", model: "operator/model",
+      transportOptions: expect.objectContaining({ acpxAgent: "pi" }) }));
+    expect((await db.select().from(agents).where(eq(agents.id, agent.id)))[0]!.harnessVerifiedDigest).toBeNull();
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  // S18b's actual path: the plugin returns a shell sandbox, not a Runner-task target.
+  it.each(["passed", "timeout", "exit", "unsupported platform", "exception"] as const)("verifies unbound shell-sandbox Pi without Runner tasks: %s", async outcome => {
+    await useRunnerTaskEnvironment({}, undefined, false);
+    await db.update(agents).set({ adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "operator/model" } })
+      .where(eq(agents.id, agent.id));
+    const execute = vi.fn().mockResolvedValue({ exitCode: outcome === "exit" ? 1 : 0, timedOut: outcome === "timeout",
+      stdout: outcome === "unsupported platform" ? "Linux\narmv7l\n" : "Linux\nx86_64\n", stderr: "" });
+    if (outcome === "exception") execute.mockRejectedValue(new Error("Remote sandbox unavailable"));
+    allocate.mockResolvedValue({ executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "test",
+      runner: { execute } }, environmentName: "Operator Pi shell sandbox", fallbackChecks: [], release });
+    if (outcome === "passed") {
+      await expect(verify()).resolves.toBe("complete");
+      await expect(verify()).resolves.toBe("complete");
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(release).toHaveBeenLastCalledWith("released");
+    } else {
+      await expect(verify()).rejects.toMatchObject({ code: "harness_test_failed" });
+      expect(release).toHaveBeenCalledExactlyOnceWith("failed");
+    }
+    expect(probe).not.toHaveBeenCalled();
+    expect((await db.select().from(agents).where(eq(agents.id, agent.id)))[0]!.harnessVerifiedDigest).toBeNull();
   });
 
   it("reuses a passed verification of the same configuration and tests again after a change", async () => {

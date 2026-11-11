@@ -5,6 +5,7 @@ import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { QUALIFIED_ACPX_PROFILES, KIMI_DISTRIBUTION_CLOSURE_SHA256 } from "../vendor/paperclip-runner/index.js";
 import { assertHarnessTestPassed } from "../services/agent-harness-verification.js";
+import * as runnerRuntime from "../vendor/paperclip-runner/index.js";
 
 const { probeInstallation, probeGrokInstallation, probePiInstallation, probeKimiInstallation, probeKimiModels, probeKimiRemote, verifyApiKey } = vi.hoisted(() => ({
   verifyApiKey: vi.fn(),
@@ -322,6 +323,41 @@ describe("native ACPX environment checks", () => {
     expect(probeGrokInstallation).not.toHaveBeenCalled();
   });
 
+  it("verifies unbound shell-sandbox Pi through the Runner pre-launch contract", async () => {
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment({ ...context,
+      config: { provider: "acpx", acpxAgent: "pi", model: "operator/model" },
+      executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "test",
+        runner: { execute: vi.fn().mockResolvedValue({ exitCode: 0, timedOut: false, stdout: "Linux\nx86_64\n" }) } },
+    });
+    expect(result).toMatchObject({ status: "pass", checks: [{ code: "acpx_remote_runtime_runner_verified", level: "info" }] });
+    expect(() => assertHarnessTestPassed(result)).not.toThrow();
+    expect(probePiInstallation).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { homeMode: "preconfigured" },
+    { managedAiConnection: { method: "api_key" } },
+    { managedAiRouting: { kind: "openrouter" } },
+  ])("does not extend shell-sandbox Pi verification to managed or preconfigured accounts: %j", async overrides => {
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment({ ...context,
+      config: { provider: "acpx", acpxAgent: "pi", model: "operator/model", ...overrides },
+      executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "test",
+        runner: { execute: vi.fn().mockResolvedValue({ exitCode: 0, timedOut: false, stdout: "Linux\nx86_64\n" }) } },
+    });
+    expect(result).toMatchObject({ status: "warn", checks: [{ code: "acpx_remote_runtime_unverified", level: "warn" }] });
+    expect(() => assertHarnessTestPassed(result)).toThrow("The harness test failed");
+  });
+
+  it("does not use the shell-sandbox fallback with a managed credential home", async () => {
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment({ ...context,
+      config: { provider: "acpx", acpxAgent: "pi", model: "operator/model" }, managedAiCredentialHome: "/managed/home",
+      executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", providerKey: "test",
+        runner: { execute: vi.fn().mockResolvedValue({ exitCode: 0, timedOut: false, stdout: "Linux\nx86_64\n" }) } },
+    });
+    expect(result.status).toBe("warn");
+    expect(() => assertHarnessTestPassed(result)).toThrow("The harness test failed");
+  });
+
   it("does not use the host platform to reject a remote environment", async () => {
     vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
     const result = await requireServerAdapter("paperclip_runner").testEnvironment!({
@@ -343,6 +379,17 @@ describe("native ACPX environment checks", () => {
       remoteWorkspacePath: "/workspace", privateKey: null, knownHosts: null, strictHostKeyChecking: true,
     },
   };
+
+  it("does not extend unbound Pi verification to SSH", async () => {
+    vi.spyOn(executionTarget, "runAdapterExecutionTargetShellCommand").mockResolvedValue({
+      exitCode: 0, timedOut: false, stdout: "Linux\nx86_64\n", stderr: "", signal: null, pid: null, startedAt: new Date(0).toISOString(),
+    });
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment({ ...context,
+      config: { provider: "acpx", acpxAgent: "pi", model: "operator/model" }, executionTarget: sshTarget });
+    expect(result.status).toBe("warn");
+    expect(result.checks[0].code).toBe("acpx_remote_runtime_unverified");
+    expect(() => assertHarnessTestPassed(result)).toThrow("The harness test failed");
+  });
 
   it.each([
     ["Linux\nx86_64\n", "warn"],
@@ -386,9 +433,43 @@ function authorizeKimi(model: string) {
 }
 
 describe("plugin Runner-task environment checks", () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  it.each(["passed", "authentication failure", "wrong model"] as const)("uses the native hello probe for an installed Pi account: %s", async outcome => {
+    const nativeProbe = vi.spyOn(runnerRuntime, "probeNativeRunnerEnvironment").mockImplementation(async input => {
+      await input.onCleanupConfirmed?.();
+      if (outcome !== "passed") throw new Error(outcome);
+      return { provider: "acpx", providerDriver: "acpx_runtime", effectiveModel: "operator/model", helloProbePassed: true };
+    });
+    const runnerTask = vi.fn().mockResolvedValue({ kind: "description", launchPreparationVersion: 1, projectAuthCheckVersion: 1,
+      taskId: "pi-task", runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } });
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment({ companyId: "company-test", adapterType: "paperclip_runner",
+      config: { provider: "acpx", acpxAgent: "pi", model: "operator/model" },
+      executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: ".", leaseId: "probe-lease",
+        runnerTaskProbe: { runId: "probe-run", sessionId: "probe-session" }, runnerTask } });
+    expect(nativeProbe).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ status: outcome === "passed" ? "pass" : "fail",
+      checks: [{ code: outcome === "passed" ? "runner_hello_probe_passed" : "runner_hello_probe_failed" }] });
+    if (outcome === "passed") expect(() => assertHarnessTestPassed(result)).not.toThrow();
+    else expect(() => assertHarnessTestPassed(result)).toThrow("The harness test failed");
+  });
+
+  it.each([
+    { provider: "acpx", acpxAgent: "pi", model: "operator/model", env: { PAPERCLIP_PI_PROVIDERS: "{}" } },
+    { provider: "acpx", acpxAgent: "pi", model: "operator/model", managedAiConnection: { identity: "not-server-authorized" } },
+  ])("does not silently ignore unbound Pi account overrides: %j", async config => {
+    const runnerTask = vi.fn();
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment({ companyId: "company-test", adapterType: "paperclip_runner", config,
+      executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: ".", leaseId: "probe-lease",
+        runnerTaskProbe: { runId: "probe-run", sessionId: "probe-session" }, runnerTask } });
+    expect(result).toMatchObject({ status: "fail", checks: [{ code: "runner_account_selection_required" }] });
+    expect(runnerTask).not.toHaveBeenCalled();
+  });
+
   it.each([
     { provider: "codex", model: "gpt-6.1-sol" },
     { provider: "acpx", acpxAgent: "claude", model: "claude-opus-5-5" },
+    { provider: "acpx", acpxAgent: "pi", model: "operator/model", homeMode: "preconfigured" },
   ])("requires a managed AI connection before any task operation: %j", async config => {
     const runnerTask = vi.fn();
     const result = await requireServerAdapter("paperclip_runner").testEnvironment!({ companyId: "company-test", adapterType: "paperclip_runner", config,

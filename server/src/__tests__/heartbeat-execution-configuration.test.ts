@@ -294,10 +294,15 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     { name: "a run with a managed AI connection", managed: true, homeMode: undefined, persisted: false, supportsTasks: true, refused: false },
     { name: "resumed native input admitted before the rule", managed: false, homeMode: undefined, persisted: true, supportsTasks: true, refused: false },
     { name: "a plugin environment without Runner tasks", managed: false, homeMode: undefined, persisted: false, supportsTasks: false, refused: false },
-  ] as const)("plugin Runner-task environments require a managed AI connection: $name", async ({ managed, homeMode, persisted, supportsTasks, refused }) => {
+    { name: "an installed Pi account", managed: false, homeMode: undefined, persisted: false, supportsTasks: true, refused: false, pi: true },
+    { name: "an unbound Pi shell sandbox without Runner tasks", managed: false, homeMode: undefined, persisted: false, supportsTasks: false, refused: false, pi: true },
+    { name: "a preconfigured Pi home", managed: false, homeMode: "preconfigured", persisted: false, supportsTasks: true, refused: true, pi: true },
+  ] as const)("plugin Runner-task account admission: $name", async scenario => {
+    const { managed, homeMode, persisted, supportsTasks, refused } = scenario;
     const f = await seed(managed);
     const environment = await runnerTaskEnvironment(supportsTasks);
-    const config = { provider: "codex", model: "gpt-6.1-sol", ...(homeMode ? { homeMode } : {}) };
+    const config = { ...("pi" in scenario ? { provider: "acpx", acpxAgent: "pi", model: "operator/model" } : { provider: "codex", model: "gpt-6.1-sol" }),
+      ...(homeMode ? { homeMode } : {}) };
     const [agent] = await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: config }).where(eq(agents.id, f.agentId)).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, scopeKind: "issue",
       status: "running", runtimeMode: "native", contextSnapshot: { issueId: f.issueId } }).returning();

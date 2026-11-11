@@ -3,12 +3,17 @@ import type { Db } from "@paperclipai/db";
 import { parseEnvironmentDriverConfig } from "./environment-config.js";
 
 /**
- * A plugin environment that runs Runner tasks executes only runs with a
- * managed AI connection. The account installed on the provider's machine is
- * not a supported credential source, so Core refuses these runs and setup
- * probes before it leases or calls the provider.
+ * Plugin Runner tasks require a managed AI connection, except Pi, whose
+ * operator-installed provider routing is verified by a real Runner hello probe.
+ * Other installed accounts are refused before a lease or provider call.
  */
 export const PLUGIN_RUNNER_AI_CONNECTION_REQUIRED = "ai_connection_required";
+
+/** Pi can use the remote operator's PAPERCLIP_PI_PROVIDERS without a managed account. */
+export function pluginRunnerAllowsUnmanagedAiConnection(adapterType: string, config: Record<string, unknown>) {
+  return adapterType === "paperclip_runner" && config.provider === "acpx" && config.acpxAgent === "pi"
+    && config.homeMode !== "preconfigured";
+}
 
 export const PLUGIN_RUNNER_AI_CONNECTION_REQUIRED_MESSAGE =
   "This agent's environment requires a managed AI connection. Choose an AI connection for this agent in Configuration, then retry.";

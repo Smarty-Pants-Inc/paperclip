@@ -1,4 +1,4 @@
-import { pluginRunnerAiConnectionRequiredTestResult } from "../services/plugin-runner-ai-connection.js";
+import { pluginRunnerAiConnectionRequiredTestResult, pluginRunnerAllowsUnmanagedAiConnection } from "../services/plugin-runner-ai-connection.js";
 import { HttpError } from "../errors.js";
 import type { AdapterRuntimeCommandSpec, ServerAdapterModule } from "./types.js";
 import { parseAdapterModelsEnv } from "../services/adapter-models-env.js";
@@ -440,9 +440,13 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       };
     }
     if (profile.provider !== "cursor_cloud" && context.executionTarget?.kind === "remote" && context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask) {
-      // Managed connections probe through testManagedEnvironment. This path has
-      // none, which a plugin Runner-task environment never runs.
-      return pluginRunnerAiConnectionRequiredTestResult("paperclip_runner");
+      // Managed connections probe through testManagedEnvironment. Pi can instead
+      // use the operator's remote routing, but must pass the same real Runner hello.
+      if (pluginRunnerAllowsUnmanagedAiConnection(context.adapterType, context.config)) {
+        const { probePluginRunnerEnvironment } = await import("../services/native-runtime/plugin-runner-probe.js");
+        return probePluginRunnerEnvironment(context);
+      }
+      return pluginRunnerAiConnectionRequiredTestResult("paperclip_runner", context.config.homeMode === "preconfigured");
     }
     if (profile.provider === "cursor_cloud") {
       const failure = (code: string, message: string) => ({ adapterType: "paperclip_runner", status: "fail" as const, testedAt: new Date().toISOString(), checks: [{ code, level: "error" as const, message }] });
@@ -527,6 +531,20 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
           const [os, arch] = probe.stdout.trim().split(/\s+/);
           if (!((os === "Linux" && (arch === "x86_64" || (profile.acpxAgent === "claude" && ["aarch64", "arm64"].includes(arch)))) || (os === "Darwin" && (arch === "arm64" || (!["grok"].includes(profile.acpxAgent) && arch === "x86_64"))))) {
             throw new Error(`ACPX ${profile.acpxAgent} requires a qualified Linux ${profile.acpxAgent === "claude" ? "x64/ARM64" : "x64"} or macOS architecture.`);
+          }
+          if (target.transport === "sandbox" && !target.runnerTask && !context.managedAiCredentialHome
+            && !context.config.managedAiConnection && !context.config.managedAiRouting
+            && pluginRunnerAllowsUnmanagedAiConnection(context.adapterType, context.config)) {
+            // Shell-only Pi delegates runtime checks to fail-closed pre-launch gates at e2104449:
+            // server/src/services/native-runtime/native-session-executor.ts:13430-13477,15938-15958 (provider-pack identity);
+            // packages/paperclip-runner/src/drivers/acpx/runtime-host.ts:747-783,1298-1322 (admitted runtime/model identity);
+            // packages/paperclip-runner/src/drivers/acpx/pi-runtime-extension.ts:453-466 (Pi readiness sentinel).
+            // This is not a hello probe; Runner-task targets still require the real hello above.
+            return {
+              adapterType: "paperclip_runner", status: "pass" as const, testedAt: new Date().toISOString(),
+              checks: [{ code: "acpx_remote_runtime_runner_verified", level: "info" as const,
+                message: "The remote platform is supported. The Runner enforces runtime package integrity, admitted model identity, and Pi readiness before launch. No model prompt was sent." }],
+            };
           }
           return verifyNativeAcpxApiKey(context.config, {
             adapterType: "paperclip_runner", status: "warn" as const, testedAt: new Date().toISOString(),
