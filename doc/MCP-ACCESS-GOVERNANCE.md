@@ -450,10 +450,15 @@ These are intentional gaps as of the MCP Access Governance v1 launch. Track or w
 ## Sandbox callback bridge
 
 Sandbox adapters can use the session API through either the queue callback bridge
-or the HTTP/2 bridge. The allowlist admits only `POST /api/tool-gateway/sessions`,
-`POST /api/tool-gateway/sessions/:sessionId/revoke`, `GET /api/tool-gateway/tools`,
-and `POST /api/tool-gateway/tools/call`. It does not admit gateway administration,
-approval, audit, runtime-management, or MCP endpoints.
+or the HTTP/2 bridge. The bridge's HTTP endpoint admits these four gateway routes:
+`POST /api/tool-gateway/sessions`,
+`POST /api/tool-gateway/sessions/:sessionId/revoke` (a UUID session id),
+`GET /api/tool-gateway/tools`, and `POST /api/tool-gateway/tools/call`.
+On the queue transport, the host does not re-validate raw queue records against
+the HTTP endpoint's canonical-path and header checks. The server's actor, session,
+and policy checks are the authorization boundary; the queue allowlist is not a
+guarantee that gateway administration, approval, audit, runtime-management, or MCP
+endpoints cannot be reached through forged queue records.
 
 Create a session with the bridge's `PAPERCLIP_API_KEY`, then pass the returned
 session token in `x-paperclip-tool-gateway-token` for discovery and calls. The

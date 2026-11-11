@@ -522,7 +522,7 @@ describe("HTTP logger redaction", () => {
     expect(log.res.statusCode).toBe(status);
   });
 
-  it.each([200, 403, 500])("redacts runtime GitHub capabilities from HTTP %i logs", async (status) => {
+  it.each([200, 403, 500])("redacts runtime GitHub and gateway capabilities from HTTP %i logs", async (status) => {
     const capability = "runtime-github-capability-canary";
     const chunks: string[] = [];
     const stream = new Writable({
@@ -540,6 +540,7 @@ describe("HTTP logger redaction", () => {
     await request(app)
       .post("/runtime-tools/github/credentials")
       .set("X-Paperclip-Github-Capability", capability)
+      .set("X-Paperclip-Tool-Gateway-Token", "tool-gateway-token-canary")
       .send({})
       .expect(status);
 
@@ -547,6 +548,7 @@ describe("HTTP logger redaction", () => {
     expect(output).not.toContain(capability);
     const log = JSON.parse(output.trim());
     expect(log.req.headers["x-paperclip-github-capability"]).toBe("[Redacted]");
+    expect(log.req.headers["x-paperclip-tool-gateway-token"]).toBe("[Redacted]");
     expect(log.req.url).toBe("/runtime-tools/github/credentials");
     expect(log.res.statusCode).toBe(status);
   });

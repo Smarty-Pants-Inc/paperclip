@@ -29,19 +29,19 @@ const deniedRequests = [
 
 const gatewayRequests = [
   { method: "POST", path: "/api/tool-gateway/sessions" },
-  { method: "POST", path: "/api/tool-gateway/sessions/session-1/revoke" },
+  { method: "POST", path: "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/revoke" },
   { method: "GET", path: "/api/tool-gateway/tools" },
   { method: "POST", path: "/api/tool-gateway/tools/call" },
 ];
 
 const deniedGatewayRequests = [
   { method: "GET", path: "/api/tool-gateway/sessions" },
-  { method: "DELETE", path: "/api/tool-gateway/sessions/session-1/revoke" },
+  { method: "DELETE", path: "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/revoke" },
   { method: "POST", path: "/api/tool-gateway/tools" },
   { method: "GET", path: "/api/tool-gateway/tools/call" },
   { method: "POST", path: "/api/tool-gateway/sessions/" },
-  { method: "POST", path: "/api/tool-gateway/sessions/session-1/revoke/extra" },
-  { method: "POST", path: "/api/tool-gateway/sessions/session-1/extra/revoke" },
+  { method: "POST", path: "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/revoke/extra" },
+  { method: "POST", path: "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/extra/revoke" },
   { method: "GET", path: "/api/tool-gateway/tools/extra" },
   { method: "POST", path: "/api/tool-gateway/tools/call/extra" },
   { method: "POST", path: "/api/tool-gateway/admin" },

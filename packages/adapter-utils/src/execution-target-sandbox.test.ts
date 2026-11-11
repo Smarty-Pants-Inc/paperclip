@@ -3563,7 +3563,7 @@ describe("sandbox adapter execution targets", () => {
       expect(gateway.bridge?.env.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");
       for (const [method, requestPath] of [
         ["POST", "/api/tool-gateway/sessions"],
-        ["POST", "/api/tool-gateway/sessions/session-1/revoke"],
+        ["POST", "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/revoke"],
         ["GET", "/api/tool-gateway/tools"],
         ["POST", "/api/tool-gateway/tools/call"],
       ]) {
@@ -3595,7 +3595,7 @@ describe("sandbox adapter execution targets", () => {
       expect(gateway.bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe(transport);
       for (const [method, requestPath] of [
         ["POST", "/api/tool-gateway/sessions"],
-        ["POST", "/api/tool-gateway/sessions/session-1/revoke"],
+        ["POST", "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/revoke"],
         ["GET", "/api/tool-gateway/tools"],
         ["POST", "/api/tool-gateway/tools/call"],
       ]) {
@@ -3604,11 +3604,11 @@ describe("sandbox adapter execution targets", () => {
       }
       for (const [method, requestPath] of [
         ["GET", "/api/tool-gateway/sessions"],
-        ["DELETE", "/api/tool-gateway/sessions/session-1/revoke"],
+        ["DELETE", "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/revoke"],
         ["POST", "/api/tool-gateway/tools"],
         ["GET", "/api/tool-gateway/tools/call"],
-        ["POST", "/api/tool-gateway/sessions/session-1/revoke/extra"],
-        ["POST", "/api/tool-gateway/sessions/session-1/extra/revoke"],
+        ["POST", "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/revoke/extra"],
+        ["POST", "/api/tool-gateway/sessions/00000000-0000-4000-8000-000000000001/extra/revoke"],
         ["POST", "/api/tool-gateway/tools/call/extra"],
         ["POST", "/api/tool-gateway/admin"],
         ["POST", "/api/tool-gateway/approvals"],
@@ -3625,6 +3625,43 @@ describe("sandbox adapter execution targets", () => {
         expect([400, 403]).toContain(response.status);
         expect(gateway.api.requests).toHaveLength(0);
       }
+    } finally {
+      await gateway.close();
+    }
+  }, 20000);
+
+  it.each([
+    "/api/tool-gateway/sessions/..\\x/revoke",
+    "/api/tool-gateway/sessions/x?/revoke",
+    "/api/tool-gateway/sessions/%2e%2e/revoke",
+  ])("rejects non-UUID gateway revoke paths in raw queue records: %s", async (requestPath) => {
+    const gateway = await startGatewayTestBridge("queue_v1");
+    try {
+      expect(gateway.bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const queueDir = gateway.bridge!.env.PAPERCLIP_BRIDGE_QUEUE_DIR;
+      const id = "gateway-forged-revoke";
+      const filePath = path.join(queueDir, "requests", `${id}.json`);
+      // Bypass the sandbox HTTP endpoint, as an untrusted sandbox process can.
+      await writeFile(`${filePath}.tmp`, JSON.stringify({
+        id,
+        method: "POST",
+        path: requestPath,
+        query: "",
+        headers: {
+          authorization: "Bearer forged-token",
+          "x-paperclip-run-id": "forged-run",
+          "x-paperclip-tool-gateway-token": "gateway-session-token",
+        },
+        body: "",
+        createdAt: new Date().toISOString(),
+      }));
+      await rename(`${filePath}.tmp`, filePath);
+      await vi.waitFor(async () => {
+        expect(await readdir(path.join(queueDir, "responses"))).toContain(`${id}.json`);
+      }, { timeout: 5000 });
+      const response = JSON.parse(await readFile(path.join(queueDir, "responses", `${id}.json`), "utf8"));
+      expect.soft(response.status).toBe(403);
+      expect(gateway.api.requests).toHaveLength(0);
     } finally {
       await gateway.close();
     }

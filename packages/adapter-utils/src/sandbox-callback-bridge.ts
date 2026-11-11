@@ -139,7 +139,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
 
   // Run-scoped tool gateway; controllers retain actor and session authorization.
   { method: "POST", path: /^\/api\/tool-gateway\/sessions$/ },
-  { method: "POST", path: /^\/api\/tool-gateway\/sessions\/[^/]+\/revoke$/ },
+  { method: "POST", path: /^\/api\/tool-gateway\/sessions\/[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\/revoke$/ },
   { method: "GET", path: /^\/api\/tool-gateway\/tools$/ },
   { method: "POST", path: /^\/api\/tool-gateway\/tools\/call$/ },
 
