@@ -110,6 +110,24 @@ existing configured secret environment, never through a new loader. Pi's
 `--offline` disables automatic Pi activity, not explicitly trusted extension
 HTTP exports. Test an actual local Langfuse endpoint before claiming trace delivery.
 
+For every Runner `acpx/pi` heartbeat dispatch, the server supplies these defaults
+in the configured task environment before forwarding it to the sidecar:
+
+- `LANGFUSE_PI_PARENT_TRACE_ID`: the first 32 lowercase hex characters of
+  SHA-256 of the UTF-8 string `paperclip.run:` followed by the heartbeat run ID.
+- `LANGFUSE_PI_PARENT_SPAN_ID`: the first 16 lowercase hex characters of
+  SHA-256 of `paperclip.run.span:` followed by the same run ID.
+- `LANGFUSE_PI_PARENT_SESSION_ID`: the issue ID, or the run ID for an issue-less run.
+
+Explicit operator values take precedence independently. No parent depth is
+synthesized. The Pi controller/session credential binding also admits exactly
+`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`,
+`LANGFUSE_TRACING_ENVIRONMENT`, `LANGFUSE_TRACING_ENABLED`, `PI_LANGFUSE_MAX_CHARS`,
+and the three parent IDs above. This is not a wildcard host-env passthrough:
+configure export keys through the existing resolved task secret environment.
+The defaults correlate with the server-side Langfuse run envelope; they do not
+install an extension, enable tracing, or establish successful export delivery.
+
 ## Profile chronology
 
 Until 2026-10-30, these digests hashed Paperclip source files, so each change

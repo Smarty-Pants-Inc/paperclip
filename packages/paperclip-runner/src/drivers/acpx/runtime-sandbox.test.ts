@@ -1,4 +1,7 @@
 import { composeCopilotSystemInstructions, COPILOT_TASK_ORIENTATION_INSTRUCTIONS } from "./copilot-profile.js";
+import { spawnSync } from "node:child_process";
+import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createAcpxSidecarHostEnvironment } from "./environment.js";
+import { createPiLaunchSpec } from "./pi-acp-runtime.js";
 import { configuredEnvironmentProjection } from "../../configured-environment.js";
 import { preconfiguredHomeEnvironment } from "../preconfigured-home.js";
 import {
@@ -39,6 +42,50 @@ afterEach(async () => {
 });
 
 describe("ACPX runtime sandbox", () => {
+  // Trust boundary: explicit controller values must survive every TS launch
+  // boundary, including a real child spawned from Pi's launch specification.
+  it.each([false, true])("forwards exactly the explicit Pi Langfuse names to a child process (configured: %s)", async configured => {
+    const fixture = await sandboxFixture("pi");
+    const langfuse = {
+      LANGFUSE_PUBLIC_KEY: "synthetic-public-key",
+      LANGFUSE_SECRET_KEY: "synthetic-secret-key",
+      LANGFUSE_BASE_URL: "https://langfuse.example.test",
+      LANGFUSE_TRACING_ENVIRONMENT: "test",
+      LANGFUSE_TRACING_ENABLED: "true",
+      PI_LANGFUSE_MAX_CHARS: "12345",
+      LANGFUSE_PI_PARENT_TRACE_ID: "840666d160dfd7848af5f5e86661e0d6",
+      LANGFUSE_PI_PARENT_SPAN_ID: "53485794c95451df",
+      LANGFUSE_PI_PARENT_SESSION_ID: "11111111-1111-4111-8111-111111111111",
+    };
+    const source = {
+      ...(configured ? configuredEnvironmentProjection(langfuse) : langfuse),
+      LANGFUSE_UNRELATED: "not-allowlisted", PAPERCLIP_API_KEY: "controller-only",
+      NODE_OPTIONS: "--require=/untrusted/bootstrap.js",
+    };
+    const binding = createAcpxCredentialBinding(source, "pi", "session-1")!;
+    expect(JSON.parse(binding).names).toEqual(expect.arrayContaining(Object.keys(langfuse)));
+    for (const value of Object.values(langfuse)) expect(binding).not.toContain(value);
+    const sidecar = createAcpxSidecarHostEnvironment({ ...source, [ACPX_CREDENTIAL_BINDING_ENV]: binding }, "pi", "session-1");
+    const sandbox = await prepareAcpxRuntimeSandbox({
+      binding: fixture.binding, agent: "pi", providerPolicy: { readOnly: false }, environment: sidecar,
+    });
+    // A tiny executable reports the real child env without provider login/network.
+    const entrypoint = join(sandbox.root, "env-probe.cjs");
+    const extension = join(sandbox.root, "extension.js");
+    await writeFile(entrypoint, `process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("LANGFUSE_") || key === "PI_LANGFUSE_MAX_CHARS" || key === "PAPERCLIP_API_KEY" || key === "NODE_OPTIONS"))));`);
+    await writeFile(extension, "// environment probe");
+    const launch = createPiLaunchSpec({ cwd: fixture.binding.workspacePath }, {
+      ...sandbox.launchEnvironment,
+      PAPERCLIP_PI_NODE_EXECUTABLE: process.execPath,
+      PAPERCLIP_PI_ENTRYPOINT: entrypoint,
+      PAPERCLIP_PI_EXTENSION_PATH: extension,
+    });
+    const child = spawnSync(launch.command, launch.args, { env: launch.env, encoding: "utf8", timeout: 10_000 });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual(langfuse);
+    expect(launch.args.join(" ")).not.toContain(langfuse.LANGFUSE_SECRET_KEY);
+  });
   it.each([false, true])("allows selected task secrets in Codex shells (agent identity: %s)", async identity => {
     const fixture = await sandboxFixture("codex");
     const pages = { PAPERCLIP_PAGE_AWS_SECRET_ACCESS_KEY: "task-pages-secret", CUSTOM_TOKEN: "task-service-secret" };
