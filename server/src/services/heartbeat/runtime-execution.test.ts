@@ -4,6 +4,7 @@ import { createNativeUsageDelivery } from "../native-runtime/native-usage-delive
 import { flushBudgetEvaluationWork } from "../budgets.js";
 import { NativeSessionCloseUnrecoverableError, type PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -418,6 +419,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       LANGFUSE_PI_PARENT_TRACE_ID: "operator-trace",
       LANGFUSE_PI_PARENT_SPAN_ID: "operator-span",
       LANGFUSE_PI_PARENT_SESSION_ID: "operator-session",
+      LANGFUSE_USER_ID: "operator-user",
     } : {};
     input.config.configuredTaskEnvironment = { LANGFUSE_TRACING_ENABLED: "true", ...operator };
     input.config.adapterEnv = { LANGFUSE_TRACING_ENABLED: "true", ...operator };
@@ -428,12 +430,43 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       LANGFUSE_PI_PARENT_TRACE_ID: createHash("sha256").update(`paperclip.run:${input.run.id}`).digest("hex").slice(0, 32),
       LANGFUSE_PI_PARENT_SPAN_ID: createHash("sha256").update(`paperclip.run.span:${input.run.id}`).digest("hex").slice(0, 16),
       LANGFUSE_PI_PARENT_SESSION_ID: input.task.issueId ?? input.run.id,
+      LANGFUSE_USER_ID: input.agent.id,
       ...operator,
     });
     expect(JSON.parse(environment.PAPERCLIP_CONFIGURED_ENV_KEYS!)).toEqual([
-      "LANGFUSE_PI_PARENT_SESSION_ID", "LANGFUSE_PI_PARENT_SPAN_ID", "LANGFUSE_PI_PARENT_TRACE_ID", "LANGFUSE_TRACING_ENABLED",
+      "LANGFUSE_PI_PARENT_SESSION_ID", "LANGFUSE_PI_PARENT_SPAN_ID", "LANGFUSE_PI_PARENT_TRACE_ID", "LANGFUSE_TRACING_ENABLED", "LANGFUSE_USER_ID",
     ]);
     expect(environment).not.toHaveProperty("LANGFUSE_PI_PARENT_DEPTH");
+  });
+
+  it("enforces configured Pi exclusion after merging adapter values into Runner dispatch", async () => {
+    const { input } = await fixture(true, "acpx");
+    input.config.configuredTaskEnvironment = {
+      LANGFUSE_TRACING_ENABLED: "FaLsE", LANGFUSE_SECRET_KEY: "configured-secret",
+      LANGFUSE_PUBLIC_KEY: "configured-public", LANGFUSE_USER_ID: "operator-user",
+      LANGFUSE_PI_PARENT_TRACE_ID: "operator-trace", LANGFUSE_PI_PARENT_SPAN_ID: "operator-span",
+      LANGFUSE_PI_PARENT_SESSION_ID: "operator-session", PI_LANGFUSE_MAX_CHARS: "200000",
+      LANGFUSE_FLUSH_AT: "1", LANGFUSE_UNRELATED: "configured-extra", CUSTOM: "retained",
+      PAPERCLIP_PI_EXTENSIONS: '["/opt/smarty-pi/extensions/langfuse/node_modules/@langfuse/pi-observability-plugin/src/index.ts","/opt/pi/other/index.ts"]',
+    };
+    // Provider/bootstrap injection must not reintroduce keys or override the
+    // agent's exclusion decision after the configured projection was filtered.
+    input.config.adapterEnv = {
+      ...input.config.configuredTaskEnvironment, LANGFUSE_TRACING_ENABLED: "true",
+      LANGFUSE_SECRET_KEY: "adapter-secret", LANGFUSE_ADAPTER_EXTRA: "adapter-extra",
+    };
+    await executeHeartbeatRuntime(db, input);
+    const environment = vi.mocked(executePaperclipNativeSession).mock.calls[0]![0].runnerEnvironment!;
+    expect(Object.fromEntries(Object.entries(environment).filter(([name]) => name.startsWith("LANGFUSE_") || name === "PI_LANGFUSE_MAX_CHARS")))
+      .toEqual({ LANGFUSE_TRACING_ENABLED: "false" });
+    expect(environment.CUSTOM).toBe("retained");
+    expect(environment.PAPERCLIP_PI_EXTENSIONS).toBe('["/opt/pi/other/index.ts"]');
+    expect(JSON.parse(environment.PAPERCLIP_CONFIGURED_ENV_KEYS!)).toEqual(["CUSTOM", "LANGFUSE_TRACING_ENABLED", "PAPERCLIP_PI_EXTENSIONS"]);
+    const child = spawnSync(process.execPath, ["-e", `process.stdout.write(JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([name]) => name.startsWith("LANGFUSE_") || name === "PI_LANGFUSE_MAX_CHARS"))))`],
+      { env: environment, encoding: "utf8", timeout: 10_000 });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({ LANGFUSE_TRACING_ENABLED: "false" });
   });
 
   it("passes preparation renewal ownership to native dispatch", async () => {

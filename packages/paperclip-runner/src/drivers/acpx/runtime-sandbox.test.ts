@@ -52,7 +52,9 @@ describe("ACPX runtime sandbox", () => {
       LANGFUSE_BASE_URL: "https://langfuse.example.test",
       LANGFUSE_TRACING_ENVIRONMENT: "test",
       LANGFUSE_TRACING_ENABLED: "true",
-      PI_LANGFUSE_MAX_CHARS: "12345",
+      LANGFUSE_FLUSH_AT: "1",
+      LANGFUSE_USER_ID: "22222222-2222-4222-8222-222222222222",
+      PI_LANGFUSE_MAX_CHARS: "200000",
       LANGFUSE_PI_PARENT_TRACE_ID: "840666d160dfd7848af5f5e86661e0d6",
       LANGFUSE_PI_PARENT_SPAN_ID: "53485794c95451df",
       LANGFUSE_PI_PARENT_SESSION_ID: "11111111-1111-4111-8111-111111111111",
@@ -63,8 +65,12 @@ describe("ACPX runtime sandbox", () => {
       NODE_OPTIONS: "--require=/untrusted/bootstrap.js",
     };
     const binding = createAcpxCredentialBinding(source, "pi", "session-1")!;
-    expect(JSON.parse(binding).names).toEqual(expect.arrayContaining(Object.keys(langfuse)));
-    for (const value of Object.values(langfuse)) expect(binding).not.toContain(value);
+    expect(JSON.parse(binding)).toEqual({
+      schema: "paperclip.acpx_credential_binding.v1", agent: "pi", sessionId: "session-1",
+      names: expect.arrayContaining(Object.keys(langfuse)),
+    });
+    expect(JSON.parse(binding).names).toHaveLength(Object.keys(langfuse).length);
+    for (const value of [langfuse.LANGFUSE_PUBLIC_KEY, langfuse.LANGFUSE_SECRET_KEY]) expect(binding).not.toContain(value);
     const sidecar = createAcpxSidecarHostEnvironment({ ...source, [ACPX_CREDENTIAL_BINDING_ENV]: binding }, "pi", "session-1");
     const sandbox = await prepareAcpxRuntimeSandbox({
       binding: fixture.binding, agent: "pi", providerPolicy: { readOnly: false }, environment: sidecar,
@@ -85,6 +91,27 @@ describe("ACPX runtime sandbox", () => {
     expect(child.status, child.stderr).toBe(0);
     expect(JSON.parse(child.stdout)).toEqual(langfuse);
     expect(launch.args.join(" ")).not.toContain(langfuse.LANGFUSE_SECRET_KEY);
+    for (const name of Object.keys(langfuse)) expect(sandbox.persistedEnvironment).not.toHaveProperty(name);
+
+    // The server's exclusion projection must remain key-free when the same
+    // runtime home is reused after a previously enabled run.
+    const excluded = configuredEnvironmentProjection({ LANGFUSE_TRACING_ENABLED: "false" });
+    const excludedBinding = createAcpxCredentialBinding(excluded, "pi", "session-1")!;
+    const resumed = await prepareAcpxRuntimeSandbox({
+      binding: fixture.binding, agent: "pi", providerPolicy: { readOnly: false },
+      environment: createAcpxSidecarHostEnvironment({ ...excluded, [ACPX_CREDENTIAL_BINDING_ENV]: excludedBinding }, "pi", "session-1"),
+    });
+    expect(resumed.agentHomeDirectory).toBe(sandbox.agentHomeDirectory);
+    const resumedLaunch = createPiLaunchSpec({ cwd: fixture.binding.workspacePath }, {
+      ...resumed.launchEnvironment,
+      PAPERCLIP_PI_NODE_EXECUTABLE: process.execPath,
+      PAPERCLIP_PI_ENTRYPOINT: entrypoint,
+      PAPERCLIP_PI_EXTENSION_PATH: extension,
+    });
+    const resumedChild = spawnSync(resumedLaunch.command, resumedLaunch.args, { env: resumedLaunch.env, encoding: "utf8", timeout: 10_000 });
+    expect(resumedChild.error).toBeUndefined();
+    expect(resumedChild.status, resumedChild.stderr).toBe(0);
+    expect(JSON.parse(resumedChild.stdout)).toEqual({ LANGFUSE_TRACING_ENABLED: "false" });
   });
   it.each([false, true])("allows selected task secrets in Codex shells (agent identity: %s)", async identity => {
     const fixture = await sandboxFixture("codex");

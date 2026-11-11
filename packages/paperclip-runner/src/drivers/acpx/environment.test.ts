@@ -78,6 +78,7 @@ describe("ACPX launch environment", () => {
     "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL",
     "LANGFUSE_TRACING_ENVIRONMENT", "LANGFUSE_TRACING_ENABLED", "PI_LANGFUSE_MAX_CHARS",
     "LANGFUSE_PI_PARENT_TRACE_ID", "LANGFUSE_PI_PARENT_SPAN_ID", "LANGFUSE_PI_PARENT_SESSION_ID",
+    "LANGFUSE_FLUSH_AT", "LANGFUSE_USER_ID",
   ])("requires an explicit Pi-only session binding for %s, never ambient inheritance", name => {
     vi.stubEnv(name, "ambient-value");
     expect(createSanitizedAcpxSpawnInput(undefined, "pi").env).not.toHaveProperty(name);

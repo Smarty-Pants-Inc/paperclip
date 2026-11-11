@@ -666,14 +666,43 @@ export async function resolveExecutionRunAdapterConfig(input: {
   };
 }
 
+/** The configured exclusion decision also fences later provider-env merges. */
+export function applyPiLangfuseExclusion(
+  environment: NodeJS.ProcessEnv,
+  provider: { kind: string; agent?: string },
+  configured: NodeJS.ProcessEnv = environment,
+): NodeJS.ProcessEnv {
+  if (provider.kind !== "acpx" || provider.agent !== "pi"
+    || configured.LANGFUSE_TRACING_ENABLED?.toLowerCase() !== "false") return environment;
+  const result: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(environment)
+    .filter(([name]) => !name.startsWith("LANGFUSE_") && name !== "PI_LANGFUSE_MAX_CHARS"));
+  result.LANGFUSE_TRACING_ENABLED = "false";
+  // The contract excludes the official extension as well as its keys. Keep
+  // unrelated explicit extensions; malformed configuration must never launch.
+  const raw = result.PAPERCLIP_PI_EXTENSIONS;
+  if (raw !== undefined) {
+    const invalid = () => new Error("Pi extensions require a bounded JSON array of local paths");
+    if (Buffer.byteLength(raw) > 32 * 1024) throw invalid();
+    let extensions: unknown;
+    try { extensions = JSON.parse(raw); } catch { throw invalid(); }
+    if (!Array.isArray(extensions) || extensions.some(path => typeof path !== "string")) throw invalid();
+    const retained = (extensions as string[]).filter(path => !/(?:^|\/)(?:@langfuse|langfuse|pi-observability-plugin)(?:\/|$)/i.test(path));
+    if (retained.length !== extensions.length) result.PAPERCLIP_PI_EXTENSIONS = JSON.stringify(retained);
+  }
+  return result;
+}
+
 /** Join Pi observations to the server's Langfuse run envelope, before projection. */
 export function buildPiLangfuseParentEnvironment(
   configured: NodeJS.ProcessEnv,
   provider: { kind: string; agent?: string },
   runId: string,
+  agentId: string,
   issueId?: string | null,
 ): NodeJS.ProcessEnv {
   if (provider.kind !== "acpx" || provider.agent !== "pi") return configured;
+  const excluded = applyPiLangfuseExclusion(configured, provider);
+  if (excluded !== configured) return excluded;
   // Byte-exact contract shared with the server-side Langfuse plugin. Defaults
   // are run-scoped, not session-scoped; operator values (even empty) win.
   return {
@@ -683,6 +712,7 @@ export function buildPiLangfuseParentEnvironment(
     LANGFUSE_PI_PARENT_SPAN_ID: configured.LANGFUSE_PI_PARENT_SPAN_ID
       ?? createHash("sha256").update(`paperclip.run.span:${runId}`).digest("hex").slice(0, 16),
     LANGFUSE_PI_PARENT_SESSION_ID: configured.LANGFUSE_PI_PARENT_SESSION_ID ?? issueId ?? runId,
+    LANGFUSE_USER_ID: configured.LANGFUSE_USER_ID ?? agentId,
   };
 }
 
