@@ -657,6 +657,29 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("emits optional monotonic executable and spawn timing marks in order", async () => {
+    const origin = performance.now();
+    const marks: Array<{ name: string; elapsedMs: number; pid?: number }> = [];
+    const result = await runChildProcess(randomUUID(), process.execPath, ["-e", "process.exit(0)"], {
+      cwd: process.cwd(),
+      env: {},
+      timeoutSec: 5,
+      graceSec: 1,
+      onLog: async () => {},
+      spawnTiming: { origin, onMark: (name, elapsedMs, pid) => marks.push({ name, elapsedMs, ...(pid ? { pid } : {}) }) },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(marks.map((mark) => mark.name)).toEqual([
+      "executable_resolution_started",
+      "executable_resolved",
+      "spawn_started",
+      "spawn_returned",
+    ]);
+    expect(marks.every((mark) => mark.elapsedMs >= 0)).toBe(true);
+    expect(marks[3]?.pid).toBe(result.pid);
+  });
+
   it("does not crash when the child closes stdin before a delayed write", async () => {
     const tempDir = await fs.mkdtemp(
       path.join(os.tmpdir(), "paperclip-stdin-epipe-"),

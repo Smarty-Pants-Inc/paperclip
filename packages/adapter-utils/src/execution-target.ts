@@ -299,6 +299,10 @@ export interface AdapterExecutionTargetProcessOptions {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  spawnTiming?: {
+    origin: number;
+    onMark: (name: "executable_resolution_started" | "executable_resolved" | "spawn_started" | "spawn_returned", elapsedMs: number, pid?: number) => void;
+  };
   /** Trusted invocation observation, not a turn completion callback. Called only
    * after local child close or a remotely observed exit, including nonzero exits. */
   onProcessStopped?: () => void;
@@ -982,6 +986,7 @@ export async function runAdapterExecutionTargetProcess(
     graceSec: options.graceSec,
     onLog: options.onLog,
     onSpawn: options.onSpawn,
+    spawnTiming: options.spawnTiming,
     terminalResultCleanup: options.terminalResultCleanup,
     localProcessSandbox: target?.kind === "local" || !target ? options.localProcessSandbox : null,
     remoteExecution: adapterExecutionTargetToRemoteSpec(target),

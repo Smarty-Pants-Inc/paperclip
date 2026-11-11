@@ -4796,6 +4796,10 @@ export async function runChildProcess(
       processGroupId: number | null;
       startedAt: string;
     }) => Promise<void>;
+    spawnTiming?: {
+      origin: number;
+      onMark: (name: "executable_resolution_started" | "executable_resolved" | "spawn_started" | "spawn_returned", elapsedMs: number, pid?: number) => void;
+    };
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -4830,16 +4834,19 @@ export async function runChildProcess(
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
     }
+    opts.spawnTiming?.onMark("executable_resolution_started", performance.now() - opts.spawnTiming.origin);
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
       remoteEnv: opts.remoteExecution ? opts.env : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
+        opts.spawnTiming?.onMark("executable_resolved", performance.now() - opts.spawnTiming.origin);
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        opts.spawnTiming?.onMark("spawn_started", performance.now() - opts.spawnTiming.origin);
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
@@ -4847,6 +4854,9 @@ export async function runChildProcess(
           shell: false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
+        if (typeof child.pid === "number" && child.pid > 0) {
+          opts.spawnTiming?.onMark("spawn_returned", performance.now() - opts.spawnTiming.origin, child.pid);
+        }
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 

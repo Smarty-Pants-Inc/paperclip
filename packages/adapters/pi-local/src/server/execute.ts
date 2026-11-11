@@ -718,6 +718,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         heartbeatPromptChars: attemptRenderedHeartbeatPrompt.length,
       };
       const args = buildArgs(sessionFile, userPrompt);
+      const spawnTimingOrigin = performance.now();
+      const spawnTimingMarks: Array<{ name: string; elapsedMs: number; pid?: number }> = [];
+      const markSpawnTiming = (name: string, elapsedMs: number, pid?: number) => {
+        spawnTimingMarks.push({ name, elapsedMs, ...(pid ? { pid } : {}) });
+      };
+      markSpawnTiming("invoke_write_started", 0);
       if (onMeta) {
         await onMeta({
           adapterType: "pi_local",
@@ -731,6 +737,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           context,
         });
       }
+      markSpawnTiming("invoke_write_done", performance.now() - spawnTimingOrigin);
 
       // Buffer stdout by lines to handle partial JSON chunks
       let stdoutBuffer = "";
@@ -775,11 +782,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timeoutSec,
         graceSec,
         onSpawn,
+        spawnTiming: {
+          origin: spawnTimingOrigin,
+          onMark: markSpawnTiming,
+        },
         onRuntimeProgress: ctx.onRuntimeProgress,
         onLog: accountingLog,
         runLogTail: paperclipBridge?.runLogTail,
         settleRunDisposition: paperclipBridge?.settleRunDisposition,
       });
+      if (spawnTimingMarks.some((mark) => mark.name === "spawn_returned")) {
+        await onLog("stdout", `[paperclip] adapter.spawn_timing ${JSON.stringify({ runId, marks: spawnTimingMarks })}\n`);
+      }
       await accountingLog.flush();
 
       // Flush any remaining buffer content
