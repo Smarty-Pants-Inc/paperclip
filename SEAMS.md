@@ -29,6 +29,28 @@ Each seam lives on its own branch, `seam/<name>`, kept rebased on upstream, and 
 merged into this fork's `master`. Offering a seam upstream needs the product
 owner's approval of the exact text.
 
+## Upgrades
+
+The fork follows every upstream stable release (the `latest` npm dist-tag and the
+`vYYYY.MDD.P` release tags in `paperclipai/paperclip`):
+
+1. A weekly routine opens an upgrade issue when upstream has a new stable release.
+2. Each seam branch is rebased onto the new release tag, in the order of the table
+   below. A conflict is fixed in the seam, not worked around in a new seam.
+3. Each seam's own tests and its real-path check run again on the rebased build.
+   A seam that no longer passes blocks the upgrade until it is fixed or dropped.
+4. Before rebasing, each seam is checked against the release notes. If upstream now
+   does the job, the seam is dropped and its extensions move to the upstream way.
+5. `master` is rebuilt as the release tag plus the fork's own commits (this register
+   and the rebased seams), and the fork's release image is built from it.
+
+To keep upgrades cheap, a seam changes as few core files as it can, keeps its
+configuration and contracts in one declaration, and puts everything else in plugins,
+adapters or skills.
+
+Until upstream's next stable release, the seam branches are based on upstream
+`master`. From then on, they are based on release tags.
+
 ## Seams
 
 | ID | Seam | Status | Branch | Design and review | Upstream |
