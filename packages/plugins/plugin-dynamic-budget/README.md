@@ -33,14 +33,14 @@ POST /api/plugins/PLUGIN_ID/config
 
 Then `POST /api/plugins/PLUGIN_ID/enable` if not already ready. Read `GET /api/plugins/PLUGIN_ID`, `GET /api/plugins/PLUGIN_ID/health`, and `GET /api/plugins/PLUGIN_ID/config?companyId=COMPANY_UUID`.
 
-Data reads use the host's documented POST bridge (not a mutating plugin action):
+Data reads use the host's documented POST bridge (not a mutating plugin action). The top-level `companyId` is the authorization scope; the host forwards it to the worker and overrides any handler param with that authorized value:
 
 ```json
 POST /api/plugins/PLUGIN_ID/bridge/data
-{"key":"budget","params":{"companyId":"COMPANY_UUID"}}
+{"key":"budget","companyId":"COMPANY_UUID","params":{"companyId":"COMPANY_UUID"}}
 ```
 
-Open the company's **Budget** sidebar entry (`/COMPANY_PREFIX/dynamic-budget`) and dashboard widget. Refresh only rereads stored evidence. No provider observation is refreshed by reading this page. Errors remain visible and do not become zero.
+Open the company's **Budget** sidebar entry (`/COMPANY_PREFIX/dynamic-budget`) and dashboard widget. Refresh only requests a new stored-evidence read; its SDK trigger returns void. The page says “Refresh requested,” not “refreshed”; loading/error/data from the hook determine the outcome. No provider observation is refreshed by reading this page. Errors remain visible and do not become zero.
 
 Disable: `POST /api/plugins/PLUGIN_ID/disable`. Re-enable with `/enable`. Removal: `DELETE /api/plugins/PLUGIN_ID` **without `purge=true`**. Preserve source evidence, audit and raw traces independently; do not purge. There are no budget blockers to release in this phase. Never restart Paperclip core, Postgres, gateway or tunnel for this plugin.
 
@@ -77,7 +77,7 @@ Category rows compare current and previous UTC calendar months. Both amounts rem
 
 Bound company SELECTs read current/previous cost events and current run counts from the two declared core tables. Native cost groups use UTC month, billing class and status, never provider. Metered API/overage reported or estimated costs are accrual evidence, never invoice actuals. Subscription-included list-price equivalents, credits, unknown billing types and unpriced events are not inferred as cash. When an `aggregate-inference:YYYY-MM` record is imported for the mapped inference category, native marginal evidence is displayed **separately** as a period total, not added to it: inclusion/additional-spend basis is unknown until bill reconciliation. Do not import separate inference charges alongside an unallocated aggregate commitment.
 
-`node scripts/build-import.mjs COMPANY_UUID SEED_JSON METER_READINGS OUTPUT_JSON` preserves the operator's schema-1 seed policy/commitments and appends current-month daily CI v2 observations. The seed notes must identify meter scope and rate provenance. V2 is measured USD (factor 1.0); v1 is excluded, not multiplied into v2. Each CI bucket is day-to-date through its observation, not complete-month coverage or an invoice. The helper expects a configured `ci` category. Approval ceilings are never spend. This is an explicit operator import, **not a live collector**; refresh does not rerun it.
+`node scripts/build-import.mjs COMPANY_UUID SEED_JSON METER_READINGS OUTPUT_JSON` preserves the operator's schema-1 seed policy/commitments and appends current-month daily CI v2 observations. The seed notes must identify meter scope and rate provenance. V2 is measured USD (factor 1.0); v1 is excluded, not multiplied into v2. Each CI bucket is day-to-date through its observation, not complete-month coverage or an invoice. The helper validates complete amount tokens through the ledger's exact-money contract and rejects unsupported precision or suffixes without writing a new output. An errored/malformed collection status never becomes actual zero: the helper preserves the most recent valid snapshot with its original observation time and adds a failure/unknown-coverage note, or imports no amount if no valid snapshot exists. The helper expects a configured `ci` category. Approval ceilings are never spend. This is an explicit operator import, **not a live collector**; refresh does not rerun it.
 
 Published rates are not charges. Actual sandbox spend stays unknown without a validated usage export and resource allocation evidence. Core run count is not sandbox lifetime or billing coverage. Quota windows and forecast remain unknown. No control-plane phase is included.
 

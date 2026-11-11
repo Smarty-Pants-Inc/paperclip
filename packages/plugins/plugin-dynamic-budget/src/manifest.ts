@@ -1,6 +1,6 @@
 import type { PaperclipPluginManifestV1 } from '@paperclipai/plugin-sdk';
 const manifest: PaperclipPluginManifestV1 = {
-  id: 'smarty.dynamic-budget', apiVersion: 1, version: '0.1.1',
+  id: 'smarty.dynamic-budget', apiVersion: 1, version: '0.1.2',
   displayName: 'Budget', author: 'Smarty Pants', categories: ['ui'],
   description: 'One read-only budget picture. No holds, agent changes, purchases, or routing effects.',
   capabilities: ['ui.page.register', 'ui.sidebar.register', 'ui.dashboardWidget.register', 'database.namespace.read', 'database.namespace.migrate'],
