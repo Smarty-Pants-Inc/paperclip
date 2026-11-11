@@ -58,10 +58,14 @@ Until upstream's next stable release, the seam branches are based on upstream
 | S1 | Runner Pi configuration: Pi version, thinking levels, named Pi packages | design review | `seam/runner-pi-1.2` | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered |
 | S2 | Manager interrupts or steers a report's run | planned | | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered |
 | S3 | Fork pipeline: upstream sync, CI, release image | planned | | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not applicable |
-| S4 | Sandbox callback bridge admits the run-scoped tool gateway: 4 exact routes plus the gateway session-token header (no allow-all) | built, not deployed | `seam/sandbox-tool-gateway` | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered (upstream [#18748](https://github.com/paperclipai/paperclip/issues/18748); the broader [#18949](https://github.com/paperclipai/paperclip/pull/18949) is not used) |
+| S4 | Sandbox callback bridge admits the run-scoped tool gateway: 4 exact routes plus the gateway session-token header (no allow-all) | parked (agents use Paperclip's staged runtime MCP) | `seam/sandbox-tool-gateway` (fixes: `hotfix/2026-11-11` @ f31f080: UUID-anchored revoke, token log redaction, queue_v1 60 s budget; challenger re-check PASS) | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered (upstream [#18748](https://github.com/paperclipai/paperclip/issues/18748); the broader [#18949](https://github.com/paperclipai/paperclip/pull/18949) is not used) |
+| S5 | Runner Pi extensions: operator-named extension list (`PAPERCLIP_PI_EXTENSIONS`) and native mode (`PAPERCLIP_PI_EXTENSIONS_MODE=native`: Pi's own settings, packages, project .pi and -e, owned extension first, private session dir) | built, in review | `hq/2026-11-11c` @ 877b6be5 + e2104449 | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | draft for the owner's approval |
+| S6 | Runner Pi thinking: a Claude model's top level runs as Pi xhigh, never max; only an identified GPT model keeps max (fail closed) | in tonight's hq image (build in progress) | `hq/2026-11-11c` @ e4e01bb7 + d892d229 | independent review PASS | not offered |
 
 S1's scope and whether it splits into separate seams are being settled by its design
 review. This table is updated when the review result is recorded.
+
+S4 follow-ups (all under 5, only if S4 is un-parked): N1 the issue-update helper's 30 s curl timeout can double-apply a PATCH behind a long queue_v1 call; N2 the long budget also slows dead-exec detection; N3 a caller forwardTimeoutMs under 70 s gives a retryable 502; N4 slow test; N5 stale comments.
 
 ## Upstream-pending carries
 
@@ -76,11 +80,28 @@ Each carry records its test result and whether it is deployed.
 | C1 | Pool starvation: [#18744](https://github.com/paperclipai/paperclip/pull/18744), [#17833](https://github.com/paperclipai/paperclip/pull/17833), [#18928](https://github.com/paperclipai/paperclip/pull/18928) (issue [#18700](https://github.com/paperclipai/paperclip/issues/18700)) | `carry/pool-starvation` on `canary/v2026.1111.0-canary.4` | Tested locally, not deployed. Pool size 10: the burst is accepted (80/80, against 0/80 without it). Pool size 40: no proven gain. `DATABASE_POOL_MAX=40` is used instead. | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) |
 | C2 | Lock timeout in legacy execution terminalization: [#17846](https://github.com/paperclipai/paperclip/pull/17846) (issue [#16417](https://github.com/paperclipai/paperclip/issues/16417)) | `carry/c2-55p03` on `canary/v2026.1111.0-canary.4` | Tested locally, not deployed. A run whose work succeeded was marked `adapter_failed` (55P03) when a child row held a lock on its run row. Our regression test fails 3/3 without the carry and passes 3/3 with it; the touched suites pass 129/129. | [smarty-dev#20094](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20094) |
 
+Both are verified on canary.12 (`hq-next/p4p5` @ 09809c30) and are not yet in the hq image.
+
+## Fork fixes (no upstream pull request yet)
+
+Small fixes of our own, carried until upstream has an equivalent; each is checked at every merge-down.
+
+| ID | Fix | Branch | Status | Upstream |
+| --- | --- | --- | --- | --- |
+| F1 | Persisted run-log chunk cap settable by `PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS` (default unchanged; export matching infers historical caps) | `fix/run-log-cap` @ b1e2579; in hq image | in tonight's hq image (hq setting: 1 MiB) | issue draft for the owner's approval |
+| F2 | Keep a reusable plugin sandbox when its ordinary release fails (stop-and-retain instead of destroy) | `hq/2026-11-11b` @ 417b15bd + 3b94d9bf | in tonight's hq image; independent review PASS | not offered |
+| F3 | Routine and issue-ancestor resource visibility | `fix/routine-embed-visibility` (PR #6) | parked (dropped from the switch) | U9 draft |
+
+## Merge-down and redundancy check
+
+Every merge-down onto a new upstream canary rebases each seam, carry and fix. A redundancy check then compares each against upstream master and the newest canary, dropping any patch upstream now covers. The result is posted as a comment on the 'Fork patches' task in the hq Paperclip instance. The hq image is built from the merged head with the documented Docker build and the full commit as `PAPERCLIP_BUILD_COMMIT`.
+
 ## Extensions on Paperclip's own surfaces (no seam)
 
 | Extension | Surface | Tracking |
 | --- | --- | --- |
 | Dynamic budgets | Paperclip plugin | [smarty-dev#20052](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20052) |
+| Langfuse export (smarty-langfuse-export) | Paperclip plugin | [smarty-dev#18268](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/18268) |
 
 ## Entry template
 
