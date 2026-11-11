@@ -44,7 +44,7 @@ Detailed evidence ledger: maintainer notes (private) and maintainer notes (priva
 | Cancel the report's issue | manager agent key + own run | 200 | cancelled | 3.63 s / 16.47 s | case 2ac74de3; manager run 80e360dc |
 | Pause the agent (board; the same server path as plugin `ctx.agents.pause`) | board | 200 | cancelled (`agent_paused`) | 0.43 s / 1.82 s; lifecycle settled to paused in 6.92 s | case 468428c1 |
 | Pause again | board | 200 | cancelled (`agent_paused`) | 0.24 s / 1.64 s; settled in 19.08 s; resume to idle 1.36 s | case 37a8e869 |
-| Redirect by plain comment (no interrupt) | board/agent | 201 | ran to completion; picked up on the NEXT turn | successor run started 33-104 s after the comment | run 00b32d12, successor 2bd65992 |
+| Redirect by plain comment (no interrupt) | board | 201 | ran to completion; picked up on the NEXT turn | successor run started 33-104 s after the comment | run 00b32d12, successor 2bd65992 |
 Conclusion: native reassign/cancel (from the manager's run) and plugin-path pause already stop a report's live run. Terminate/retire-by-manager and run-only cancel/interrupt (stopping a run without changing the issue's ownership or status) have no agent or plugin primitive.
 
 ## Design
