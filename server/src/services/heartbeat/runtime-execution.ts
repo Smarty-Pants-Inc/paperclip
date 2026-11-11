@@ -23,6 +23,7 @@ import {
   configuredPaperclipApiBaseUrl,
   buildPaperclipRuntimeMcpServers,
   buildPiLangfuseParentEnvironment,
+  applyPiLangfuseExclusion,
   createAdapterRuntimeToolAccess,
   paperclipApiBaseUrl,
   createAdapterRuntimeMcpAccess,
@@ -698,11 +699,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               managedAiCredentialWriteback: managedAiRuntime?.credentialWriteback,
               managedAiCredentialHome: managedAiRuntime ? String((managedAiRuntime.config.env as Record<string, unknown>).CODEX_HOME) : undefined,
               dotWorkspaceRoot: nativeExecution.provider.kind === "openai_dot" && resolvedConfig.dotWorkspaceAccess === true ? executionWorkspace.cwd : undefined,
-              runnerEnvironment: {
+              runnerEnvironment: applyPiLangfuseExclusion({
                 ...configuredEnvironmentProjection(buildPiLangfuseParentEnvironment(
                   configuredTaskEnvironment,
                   nativeExecution.provider,
                   run.id,
+                  agent.id,
                   issueId,
                 )),
                 ...buildNativeProviderEnvironment(
@@ -728,7 +730,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                       ),
                     }
                   : {}),
-              },
+              }, nativeExecution.provider, configuredTaskEnvironment),
               onTaskDispatched: markDispatchStarted,
               runnerExecutionTarget: executionTarget,
               runnerIngressAuthorized: isRunnerIngressAuthorized(

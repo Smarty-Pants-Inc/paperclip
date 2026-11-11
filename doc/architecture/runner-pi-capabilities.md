@@ -118,15 +118,29 @@ in the configured task environment before forwarding it to the sidecar:
 - `LANGFUSE_PI_PARENT_SPAN_ID`: the first 16 lowercase hex characters of
   SHA-256 of `paperclip.run.span:` followed by the same run ID.
 - `LANGFUSE_PI_PARENT_SESSION_ID`: the issue ID, or the run ID for an issue-less run.
+- `LANGFUSE_USER_ID`: the run's agent ID.
 
-Explicit operator values take precedence independently. No parent depth is
+Explicit operator values take precedence independently (including empty strings). No parent depth is
 synthesized. The Pi controller/session credential binding also admits exactly
 `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`,
 `LANGFUSE_TRACING_ENVIRONMENT`, `LANGFUSE_TRACING_ENABLED`, `PI_LANGFUSE_MAX_CHARS`,
-and the three parent IDs above. This is not a wildcard host-env passthrough:
+`LANGFUSE_FLUSH_AT`, `LANGFUSE_USER_ID`, and the three parent IDs above. This is not a wildcard host-env passthrough:
 configure export keys through the existing resolved task secret environment.
 The defaults correlate with the server-side Langfuse run envelope; they do not
 install an extension, enable tracing, or establish successful export delivery.
+For Cloud export, configure `PI_LANGFUSE_MAX_CHARS=200000` and
+`LANGFUSE_FLUSH_AT=1`; these are forwarded operator values, not server defaults.
+
+Set `LANGFUSE_TRACING_ENABLED=false` in an excluded agent's resolved task
+configuration **before dispatch** (the value is case-insensitive). For Pi, this
+removes every other `LANGFUSE_*` value, `PI_LANGFUSE_MAX_CHARS`, and the official
+Langfuse extension entries from `PAPERCLIP_PI_EXTENSIONS`, and emits only
+`LANGFUSE_TRACING_ENABLED=false` for Langfuse. No parent IDs or user ID are added.
+The exclusion is reapplied after provider environment merging so bootstrap
+values cannot restore keys. Unrelated environment and explicit extensions remain
+unchanged; malformed excluded extension JSON blocks dispatch. Exclusion policy
+owners must set this flag from the same company/agent deny-list used by the
+server exporter; this environment gate does not maintain a second deny-list.
 
 ## Profile chronology
 

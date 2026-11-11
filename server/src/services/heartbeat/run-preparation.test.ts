@@ -51,8 +51,10 @@ const emptyRoutineContext = { routineId: null, env: null, responsibleUserId: nul
 describe("Pi Langfuse parent environment", () => {
   const runId = "00000000-0000-4000-8000-000000000001";
   const issueId = "11111111-1111-4111-8111-111111111111";
+  const agentId = "22222222-2222-4222-8222-222222222222";
   const pi = { kind: "acpx", agent: "pi" };
   const parents = {
+    LANGFUSE_USER_ID: agentId,
     LANGFUSE_PI_PARENT_TRACE_ID: "840666d160dfd7848af5f5e86661e0d6",
     LANGFUSE_PI_PARENT_SPAN_ID: "53485794c95451df",
     LANGFUSE_PI_PARENT_SESSION_ID: issueId,
@@ -61,23 +63,61 @@ describe("Pi Langfuse parent environment", () => {
   // Trust boundary: these exact bytes join the server envelope and Pi spans.
   it("derives the fixed server-plugin contract vector without setting depth", () => {
     const source = { LANGFUSE_TRACING_ENABLED: "true" };
-    expect(buildPiLangfuseParentEnvironment(source, pi, runId, issueId)).toEqual({ ...source, ...parents });
+    expect(buildPiLangfuseParentEnvironment(source, pi, runId, agentId, issueId)).toEqual({ ...source, ...parents });
     expect(source).toEqual({ LANGFUSE_TRACING_ENABLED: "true" });
   });
 
   it.each([null, undefined])("uses the heartbeat run for a run without an issue (%s)", issue => {
-    expect(buildPiLangfuseParentEnvironment({}, pi, runId, issue)).toEqual({ ...parents, LANGFUSE_PI_PARENT_SESSION_ID: runId });
+    expect(buildPiLangfuseParentEnvironment({}, pi, runId, agentId, issue)).toEqual({ ...parents, LANGFUSE_PI_PARENT_SESSION_ID: runId });
   });
 
   it.each(Object.keys(parents))("preserves an operator-set %s independently, including an empty value", name => {
     for (const value of ["operator-value", ""]) {
-      expect(buildPiLangfuseParentEnvironment({ [name]: value }, pi, runId, issueId)).toEqual({ ...parents, [name]: value });
+      expect(buildPiLangfuseParentEnvironment({ [name]: value }, pi, runId, agentId, issueId)).toEqual({ ...parents, [name]: value });
     }
   });
 
-  it.each([{ kind: "codex" }, { kind: "acpx", agent: "claude" }])("does not add Pi context to %j", provider => {
-    const source = { CUSTOM: "retained" };
-    expect(buildPiLangfuseParentEnvironment(source, provider, runId, issueId)).toEqual(source);
+  // Data safety: the exclusion decision must precede both default generation
+  // and controller projection, even when an operator supplied keys or parents.
+  it.each(["false", "FALSE", "FaLsE"])("excludes Langfuse before Pi starts (%s)", enabled => {
+    const source = {
+      CUSTOM: "retained", OPENAI_API_KEY: "model-key",
+      LANGFUSE_TRACING_ENABLED: enabled,
+      LANGFUSE_PUBLIC_KEY: "synthetic-public", LANGFUSE_SECRET_KEY: "synthetic-secret",
+      LANGFUSE_BASE_URL: "https://cloud.langfuse.com", LANGFUSE_FLUSH_AT: "1",
+      LANGFUSE_TRACING_ENVIRONMENT: "test", LANGFUSE_UNRELATED: "must-not-leak",
+      LANGFUSE_PI_PARENT_DEPTH: "4", PI_LANGFUSE_MAX_CHARS: "200000", ...parents,
+      PAPERCLIP_PI_EXTENSIONS: JSON.stringify([
+        "/opt/smarty-pi/extensions/langfuse/node_modules/@langfuse/pi-observability-plugin/src/index.ts",
+        "/opt/pi/other/index.ts",
+      ]),
+    };
+    const original = { ...source };
+    expect(buildPiLangfuseParentEnvironment(source, pi, runId, agentId, issueId)).toEqual({
+      CUSTOM: "retained", OPENAI_API_KEY: "model-key", LANGFUSE_TRACING_ENABLED: "false",
+      PAPERCLIP_PI_EXTENSIONS: '["/opt/pi/other/index.ts"]',
+    });
+    expect(source).toEqual(original);
+  });
+
+  it("keeps the exclusion empty when no keys or extensions were configured", () => {
+    expect(buildPiLangfuseParentEnvironment({ LANGFUSE_TRACING_ENABLED: "false" }, pi, runId, agentId, issueId))
+      .toEqual({ LANGFUSE_TRACING_ENABLED: "false" });
+  });
+
+  it.each(["true", "0", "", "false-ish"])("does not broaden the exclusion signal (%s)", enabled => {
+    const source = { LANGFUSE_TRACING_ENABLED: enabled, LANGFUSE_FLUSH_AT: "1", PI_LANGFUSE_MAX_CHARS: "200000" };
+    expect(buildPiLangfuseParentEnvironment(source, pi, runId, agentId, issueId)).toEqual({ ...source, ...parents });
+  });
+
+  it.each(["not-json", "{}", '[1]'])("fails closed on malformed excluded extension configuration (%s)", raw => {
+    expect(() => buildPiLangfuseParentEnvironment({ LANGFUSE_TRACING_ENABLED: "false", PAPERCLIP_PI_EXTENSIONS: raw }, pi, runId, agentId, issueId))
+      .toThrow("Pi extensions");
+  });
+
+  it.each([{ kind: "codex" }, { kind: "acpx", agent: "claude" }])("does not change another provider's environment (%j)", provider => {
+    const source = { CUSTOM: "retained", LANGFUSE_TRACING_ENABLED: "false", LANGFUSE_SECRET_KEY: "other-provider" };
+    expect(buildPiLangfuseParentEnvironment(source, provider, runId, agentId, issueId)).toBe(source);
   });
 });
 
