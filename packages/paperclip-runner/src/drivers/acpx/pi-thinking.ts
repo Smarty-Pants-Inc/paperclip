@@ -15,8 +15,9 @@ export function resolvePiThinkingLevel(agent: string, mode: unknown): PiThinking
 export function piNativeThinkingValue(level: PiThinkingLevel, modelId?: string) {
   const parts = (modelId ?? "").toLowerCase().split("/");
   const model = parts.pop() ?? "";
-  const isClaude = model.startsWith("claude") || parts.join("/").includes("anthropic");
-  return level === "max" && isClaude ? "xhigh" : level;
+  // Preserve max only for positively identified GPT models; unknown models fail closed.
+  const isGpt = model.startsWith("gpt-") && !parts.join("/").includes("anthropic") && !model.includes("claude");
+  return level === "max" && !isGpt ? "xhigh" : level;
 }
 
 export function createPiThinkingAdmission(expected: PiThinkingLevel, options: { restoring?: boolean; modelId?: string } = {}) {

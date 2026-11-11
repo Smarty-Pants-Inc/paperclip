@@ -690,15 +690,25 @@ describe("Codex ACPX runtime adapter", () => {
   it.each([
     ["cliproxyapi-anthropic/claude-opus-5-5", "xhigh"],
     ["cliproxyapi/Claude-opus-5-5", "xhigh"],
+    ["cliproxyapi-anthropic/claude-fable-5-2", "xhigh"],
+    ["cliproxyapi/gpt-6.1-sol", "max"],
     ["cliproxyapi/gpt-6-luna", "max"],
-    ["custom/gemini", "max"],
+    ["cliproxyapi/gpt-6-astra", "max"],
+    ["custom-ANTHROPIC/gpt-6-astra", "xhigh"],
+    ["cliproxyapi/gpt-6-claude", "xhigh"],
+    ["custom/gemini", "xhigh"],
+    [undefined, "xhigh"],
+    ["", "xhigh"],
+    ["cliproxyapi/some-new-model", "xhigh"],
+    ["gemini-3", "xhigh"],
   ].flatMap(([model, maxNative]) => (["off", "low", "high", "max"] as const).map(level => ({
     model, level, native: level === "max" ? maxNative : level,
   }))))("sets Paperclip Pi $level as native $native for $model and preserves its identity", async ({ model, level, native }) => {
     const runtime = fakeRuntime();
     let created!: AcpRuntimeOptions;
     const options = openOptions(fakeCommand());
-    options.profile = { ...options.profile, agent: "pi", reportedModelId: model };
+    // Exercise missing runtime input as well as the profile's declared string contract.
+    options.profile = { ...options.profile, agent: "pi", reportedModelId: model as string };
     options.piThinkingLevel = level;
     vi.mocked(runtime.setConfigOption!).mockImplementation(async input => {
       expect(input).toMatchObject({ key: "thought_level", value: native });

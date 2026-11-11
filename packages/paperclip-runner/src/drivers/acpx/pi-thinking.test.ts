@@ -23,10 +23,19 @@ describe("Pi thinking native mode admission", () => {
     ["cliproxyapi/Claude-opus-5-5", "xhigh"],
     ["custom/CLAUDE-sonnet", "xhigh"],
     ["custom-ANTHROPIC/model", "xhigh"],
+    ["cliproxyapi-anthropic/claude-fable-5-2", "xhigh"],
+    ["cliproxyapi/gpt-6.1-sol", "max"],
     ["cliproxyapi/gpt-6-luna", "max"],
-    ["custom/gemini", "max"],
-    ["claude-provider/not-claude", "max"],
-    [undefined, "max"],
+    ["cliproxyapi/gpt-6-astra", "max"],
+    ["custom/GPT-6-astra", "max"],
+    ["custom-ANTHROPIC/gpt-6-astra", "xhigh"],
+    ["cliproxyapi/gpt-6-claude", "xhigh"],
+    ["custom/gemini", "xhigh"],
+    ["claude-provider/not-claude", "xhigh"],
+    [undefined, "xhigh"],
+    ["", "xhigh"],
+    ["cliproxyapi/some-new-model", "xhigh"],
+    ["gemini-3", "xhigh"],
   ] as const)("maps and admits levels for model %s (max=%s)", (modelId, maxNative) => {
     for (const level of ["off", "low", "high", "max"] as const) {
       const native = level === "max" ? maxNative : level;
