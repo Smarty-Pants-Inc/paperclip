@@ -6,8 +6,9 @@ Core owns run identity, selected policy, assigned tools, and the PRP journal.
 
 ## Managed AI connection required
 
-A task-capable environment runs only agents with a managed AI connection.
-Core does not use an account installed on the plugin's execution host.
+Except for the Pi lifecycle path below, a task-capable environment runs only
+agents with a managed AI connection. Core does not use other accounts installed
+on the plugin's execution host.
 Before it acquires a lease or calls the plugin, Core fails a new run that has
 no managed AI connection. A `homeMode: "preconfigured"` Runner home does not use
 the agent's AI connection, so Core refuses it in the same way. The run fails as
@@ -20,6 +21,26 @@ managed AI connection, or with a preconfigured home, fails the
 `ai_connection_required` check and calls no task operation. Verification then
 waits for the configuration to change.
 A resumed native run keeps the contract it was admitted under.
+
+### Operator-installed Pi routing
+
+Lifecycle verification and new heartbeat runs allow `paperclip_runner` with
+`provider: "acpx"`, `acpxAgent: "pi"`, an isolated home, and no managed AI binding.
+The plugin owns the installed Pi routing (`PAPERCLIP_PI_PROVIDERS`) and account.
+For Runner-task targets, verification uses the existing native Runner hello probe.
+It checks the exact selected model, sends a tiny read-only prompt, and requires
+confirmed cleanup. Agent/environment account overrides are not transferred by
+that probe; it rejects them rather than silently verifying a different account.
+
+A remote shell-backed sandbox without Runner tasks instead passes setup after
+its platform check. It reports `acpx_remote_runtime_runner_verified`: runtime
+package integrity, admitted runtime/model identity, and the Pi extension readiness
+sentinel remain fail-closed checks before the Runner launches a turn. This
+fallback sends no model prompt and does not prove provider access during setup.
+It excludes managed accounts, preconfigured homes, SSH targets, and other
+providers. Platform, runtime, and authentication failures remain failures.
+No verification digest or image identity rules change. The separate operator
+Test route still requires a managed connection for Runner-task targets.
 
 ## Required hooks
 

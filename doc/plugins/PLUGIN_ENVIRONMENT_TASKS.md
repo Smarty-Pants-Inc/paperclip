@@ -379,11 +379,16 @@ after the probe and its descendants stop. A lost reply keeps the task available
 for `stop`, `status`, and `complete`. Core checks the profile and model before
 it accepts the account. Do not store the token in task metadata or logs.
 
-A native hello probe requires a managed AI connection and an isolated Runner home.
-Without them, the probe fails the `ai_connection_required` check before Core
-acquires a lease or calls a task operation. See
-[Managed AI connection required](PLUGIN_RUNNER_EXECUTION.md#managed-ai-connection-required).
-Only Core can supply the selected account identity and local credential home.
+A native hello probe normally requires a managed AI connection and an isolated
+Runner home. Without them, the probe fails the `ai_connection_required` check
+before Core acquires a lease or calls a task operation. Lifecycle verification
+also supports [operator-installed Pi routing](PLUGIN_RUNNER_EXECUTION.md#operator-installed-pi-routing)
+without a managed connection; Runner-task targets still require the native hello
+and confirmed cleanup. Shell-backed sandbox targets without Runner tasks use the
+separate Pi pre-launch verification fallback described there. The separate
+operator Test route retains its managed-connection guard for Runner-task targets.
+See [Managed AI connection required](PLUGIN_RUNNER_EXECUTION.md#managed-ai-connection-required).
+Only Core can supply the selected managed account identity and local credential home.
 
 ## Fresh attempts
 
