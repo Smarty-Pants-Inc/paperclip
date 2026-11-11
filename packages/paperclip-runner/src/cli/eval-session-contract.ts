@@ -1,5 +1,5 @@
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
-import { resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
+import { resolvePiThinkingLevel, type PiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
 import type {
   CapabilityLiveSessionSnapshot,
   CreateCapabilityLiveSessionInput,
@@ -71,7 +71,7 @@ export interface EvalSessionRequest {
   driver?: EvalSessionDriver;
   opencodeVersion?: string;
   acpxAgent?: QualifiedAcpxAgent;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   managedProfile?: EvalSessionManagedProfile;
   agentCoreProfile?: EvalSessionAgentCoreProfile;
   runnerd: { path: string; sha256: string };

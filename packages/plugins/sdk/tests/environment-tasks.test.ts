@@ -24,6 +24,18 @@ const prepare = {
   },
 };
 
+describe("Pi thinking launch preparation", () => {
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"])("preserves exact Pi thinking %s", piThinkingLevel => {
+    const operation = { ...prepare, requirements: { ...prepare.requirements, provider: "acpx",
+      settings: { acpxAgent: "pi", piThinkingLevel } } };
+    expect(environmentTaskOperationSchema.parse(operation)).toEqual(operation);
+  });
+  it.each(["ultra", "Medium", "", null, 1])("rejects invalid Pi thinking %s", piThinkingLevel => {
+    expect(environmentTaskOperationSchema.safeParse({ ...prepare, requirements: { ...prepare.requirements,
+      provider: "acpx", settings: { acpxAgent: "pi", piThinkingLevel } } }).success).toBe(false);
+  });
+});
+
 describe("retained source launch fields", () => {
   it("uses the existing source identity and resume reference without a recovery mode", () => {
     for (const operation of [prepare, submit]) {

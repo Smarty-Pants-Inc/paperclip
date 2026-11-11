@@ -1,6 +1,6 @@
 import { parseAcpxCandidateAdmission } from "../drivers/acpx/candidate-admission.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
-import { resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
+import { resolvePiThinkingLevel, type PiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
 import { normalizeProviderNotice } from "../drivers/provider-notices.js";
 import { liveRunResultFeedback } from "./run-result-feedback.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -137,7 +137,7 @@ export interface CapabilityLiveSessionConfigSnapshot {
   driver?: "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
   providerVersion?: string | null;
   acpxAgent?: QualifiedAcpxAgent;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   acpxProfile?: QualifiedAcpxProfile;
   managedProfile?: {
     profileId: string;
@@ -328,7 +328,7 @@ export interface CreateCapabilityLiveSessionInput {
   workingDirectory?: string;
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   acpxAgent?: QualifiedAcpxAgent;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   requestedModel?: string;
   managedProfile?: CapabilityLiveSessionConfigSnapshot["managedProfile"];
   agentCoreProfile?: CapabilityLiveSessionConfigSnapshot["agentCoreProfile"];

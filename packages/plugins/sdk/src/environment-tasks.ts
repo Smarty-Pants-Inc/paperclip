@@ -43,7 +43,7 @@ export const environmentRunnerLaunchRequirementsSchema = z.object({
   runtimeContext: z.record(z.string(), z.unknown()).nullable(),
   settings: z.object({ acpxAgent: identifier.optional(), acpxMode: z.string().optional(),
     acpxPermissionMode: z.enum(["approve-all", "approve-paperclip", "approve-reads", "deny-all"]).optional(),
-    acpxPermissionModePinned: z.boolean().optional(), piThinkingLevel: z.enum(["off", "low", "high", "max"]).optional(),
+    acpxPermissionModePinned: z.boolean().optional(), piThinkingLevel: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).optional(),
     claudeEffort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
     opencodePermissionMode: z.enum(["allow", "ask", "deny"]).optional(),
     disableCodexWebSearch: z.literal(true).optional(),

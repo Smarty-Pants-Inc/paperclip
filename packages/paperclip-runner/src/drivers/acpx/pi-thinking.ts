@@ -1,6 +1,7 @@
 import { createAcpxConfigAdmission } from "./config-admission.js";
+import { GENERATED_PI_THINKING_LEVELS } from "./generated-sidecar-contract.js";
 
-export type PiThinkingLevel = "off" | "low" | "high" | "max";
+export type PiThinkingLevel = (typeof GENERATED_PI_THINKING_LEVELS)[number];
 
 export function resolvePiThinkingLevel(agent: string, mode: unknown): PiThinkingLevel | undefined {
   if (agent !== "pi") {
@@ -8,13 +9,13 @@ export function resolvePiThinkingLevel(agent: string, mode: unknown): PiThinking
     return undefined;
   }
   if (mode === undefined) throw new Error("Pi thinking level must be explicit");
-  if (mode !== "off" && mode !== "low" && mode !== "high" && mode !== "max") throw new Error("Invalid Pi thinking level");
-  return mode;
+  if (typeof mode !== "string" || !(GENERATED_PI_THINKING_LEVELS as readonly string[]).includes(mode)) throw new Error("Invalid Pi thinking level");
+  return mode as PiThinkingLevel;
 }
 
 export function createPiThinkingAdmission(expected: PiThinkingLevel, options: { restoring?: boolean } = {}) {
   return createAcpxConfigAdmission(expected, { ...options, label: "Pi thinking mode", configId: "thought_level",
-    supportedValues: ["off", "minimal", "low", "medium", "high", "xhigh", "max"], sessionMode: true });
+    supportedValues: GENERATED_PI_THINKING_LEVELS, sessionMode: true });
 }
 
 function object(value: unknown): Record<string, unknown> {

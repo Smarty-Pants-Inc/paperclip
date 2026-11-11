@@ -359,17 +359,19 @@ test("real pinned Pi tool dispatch admits registered agent files and rejects una
 // This regression crosses Pi 1's real RPC serializer, the owned extension and
 // the patched ACP wrapper. Only an owned loopback HTTP fixture can be reached;
 // dummy authentication is unrelated to any provider account.
-for (const scenario of ["hello", "interleaved-tools", "provider-error", "provider-unknown", "thinking-modes", "warm-recovery", "warm-pending-cancel"]) {
+for (const scenario of ["hello", "interleaved-tools", "provider-error", "provider-unknown", "thinking-modes", "thinking-medium-xhigh", "warm-recovery", "warm-pending-cancel"]) {
   test(`real Pi 1 serialized RPC ${scenario} through owned ACP/MCP bridge`, { timeout: 30_000 }, async t => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "paperclip-pi-stream-")));
     let child; let server;
     const warm = scenario.startsWith("warm-");
+    const thinking = scenario.startsWith("thinking-");
+    let thinkingEvidence;
     const retirements = [];
     t.after(async () => {
       if (child) {
         // Loaded-session command updates can still be pending at EOF. Retire
         // through the owned wrapper handler so every native child is awaited.
-        if (scenario === "thinking-modes" || warm) child.kill("SIGTERM"); else child.stdin.end();
+        if (thinking || warm) child.kill("SIGTERM"); else child.stdin.end();
         if (child.exitCode === null) { const timer = setTimeout(() => child.kill("SIGTERM"), 3000); await once(child, "exit"); clearTimeout(timer); }
       }
       if (server?.listening) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
@@ -379,9 +381,13 @@ for (const scenario of ["hello", "interleaved-tools", "provider-error", "provide
           retirements.push(retirement);
           assert.ok(retirements.every(value => value.allOwnedChildrenClosed && value.spawnErrors === 0));
           if (warm) assert.deepEqual(retirements.map(value => value.count), [1, 1]);
-          if (scenario === "thinking-modes") { assert.equal(retirement.count, 2); assert.equal(retirement.spawnErrors, 0); }
+          if (thinking) { assert.equal(retirement.count, 2); assert.equal(retirement.spawnErrors, 0); }
         }
       } finally { await rm(root, { recursive: true, force: true }); }
+      if (thinkingEvidence) {
+        await assert.rejects(readFile(join(root, "owned-retirement.json")), { code: "ENOENT" });
+        t.diagnostic(JSON.stringify({ scenario, piVersion: metadata.version, platform: `${process.platform}-${process.arch}`, ...thinkingEvidence, retirement: retirements.at(-1), scratchRemoved: true }));
+      }
     });
     await mkdir(join(root, "workspace")); await mkdir(join(root, "agent"));
     const wrapperRoot = process.env.PAPERCLIP_TEST_PI_ACP_PACKAGE
@@ -443,7 +449,7 @@ for (const scenario of ["hello", "interleaved-tools", "provider-error", "provide
           response.end(`data: ${JSON.stringify({ id: "offline-warm", choices: [{ index: 0, delta: {}, finish_reason: step < 2 ? "tool_calls" : "stop" }], usage: { prompt_tokens: 10, completion_tokens: 3, total_tokens: 13 } })}\n\ndata: [DONE]\n\n`);
           return;
         }
-        const toolTurn = scenario !== "thinking-modes" && (n === 1 || scenario === "hello" && n === 2);
+        const toolTurn = !thinking && (n === 1 || scenario === "hello" && n === 2);
         const names = scenario === "interleaved-tools" ? tools.map(tool => tool.name) : [n === 1 ? tools[0].name : tools[1].name];
         const chunks = [];
         if (toolTurn) {
@@ -561,7 +567,7 @@ await import(${JSON.stringify(pathToFileURL(join(wrapperRoot, "dist/index.js")).
     });
     await call("initialize", { protocolVersion: 1, clientCapabilities: {} });
     const session = await call("session/new", { cwd: join(root, "workspace"), mcpServers: [{ type: "http", name: "paperclip", url: `http://127.0.0.1:${port}/mcp`, headers: [{ name: "Authorization", value: "Bearer 0123456789abcdef0123456789abcdef" }] }] });
-    const model = "openrouter/deepseek/deepseek-v4-flash-0731";
+    const model = scenario === "thinking-medium-xhigh" ? "openrouter/openai/gpt-5.4" : "openrouter/deepseek/deepseek-v4-flash-0731";
     const selected = await call("session/set_config_option", { sessionId: session.sessionId, configId: "model", value: model });
     if (warm) {
       const low = await call("session/set_config_option", { sessionId: session.sessionId, configId: "thought_level", value: "low" });
@@ -625,6 +631,35 @@ await import(${JSON.stringify(pathToFileURL(join(wrapperRoot, "dist/index.js")).
       t.diagnostic(JSON.stringify({ scenario, prompts: 2, modelRequests: modelRequests.length, semanticCalls: executed ? 2 : 1, secondFinishStatuses: lifecycle.map(update => update.status), requestedAndEffectiveMode: "low", restoredSession: true, refreshedAgentHome: true, externalConnections: 0 }));
       return;
     }
+    if (scenario === "thinking-medium-xhigh") {
+      const thought = config => config.configOptions.find(option => option.id === "thought_level");
+      const available = thought(selected).options.map(option => option.value);
+      assert.deepEqual(available, ["off", "low", "medium", "high", "xhigh"]);
+      const medium = await call("session/set_config_option", { sessionId: session.sessionId, configId: "thought_level", value: "medium" });
+      assert.equal(thought(medium).currentValue, "medium");
+      const prompt = [{ type: "text", text: "Reply HELLO_COMPLETE." }];
+      assert.equal((await call("session/prompt", { sessionId: session.sessionId, prompt })).stopReason, "end_turn");
+      const xhigh = await call("session/set_config_option", { sessionId: session.sessionId, configId: "thought_level", value: "xhigh" });
+      assert.equal(thought(xhigh).currentValue, "xhigh");
+      assert.equal((await call("session/prompt", { sessionId: session.sessionId, prompt })).stopReason, "end_turn");
+      let unsupportedError;
+      await assert.rejects(call("session/set_mode", { sessionId: session.sessionId, modeId: "max" }), error => {
+        unsupportedError = error.message;
+        return /Unsupported thinking level/.test(error.message);
+      });
+      const loaded = await call("session/load", { sessionId: session.sessionId, cwd: join(root, "workspace"), mcpServers: [] });
+      assert.equal(loaded.modes.currentModeId, "xhigh"); assert.equal(thought(loaded).currentValue, "xhigh");
+      assert.deepEqual(loaded.modes.availableModes.map(mode => mode.id), available);
+      assert.equal((await call("session/prompt", { sessionId: session.sessionId, prompt })).stopReason, "end_turn");
+      assert.deepEqual(reasoningRequests, ["medium", "xhigh", "xhigh"].map(effort => ({ model: "openai/gpt-5.4", reasoning: { effort } })));
+      const modes = notifications.filter(event => event.params?.update?.sessionUpdate === "current_mode_update").map(event => event.params.update.currentModeId);
+      assert.equal(modes.at(-1), "xhigh"); assert.ok(modes.includes("medium"));
+      const networkDenial = JSON.parse(await readFile(join(root, "network-denial.json"), "utf8"));
+      assert.deepEqual(networkDenial, { deniedBeforeConnect: true, underlyingConnections: 0 });
+      assert.equal(calls.filter(call => call.method === "tools/call").length, 0);
+      thinkingEvidence = { afterModelSelection: thought(selected), mediumAcknowledgement: thought(medium), xhighAcknowledgement: thought(xhigh), unsupportedError, requestBodies: reasoningRequests, loadedModes: loaded.modes, loadedThoughtLevel: thought(loaded), modeUpdates: modes, networkDenial, externalProviderCalls: 0, syntheticLoopbackPrompts: 3 };
+      return;
+    }
     if (scenario === "thinking-modes") {
       const thought = config => config.configOptions.find(option => option.id === "thought_level");
       assert.equal(thought(selected).currentValue, "high", "native medium default clamps to high for this exact model");
@@ -648,6 +683,7 @@ await import(${JSON.stringify(pathToFileURL(join(wrapperRoot, "dist/index.js")).
       assert.deepEqual(modes, ["high", "low", "max"]);
       assert.deepEqual(JSON.parse(await readFile(join(root, "network-denial.json"), "utf8")), { deniedBeforeConnect: true, underlyingConnections: 0 });
       assert.equal(calls.filter(call => call.method === "tools/call").length, 0);
+      thinkingEvidence = { afterModelSelection: thought(selected), lowAcknowledgement: thought(low), requestBodies: reasoningRequests, loadedModes: loaded.modes, loadedThoughtLevel: thought(loaded), modeUpdates: modes, networkDenial: JSON.parse(await readFile(join(root, "network-denial.json"), "utf8")), externalProviderCalls: 0, syntheticLoopbackPrompts: 2 };
       return;
     }
     const result = await call("session/prompt", { sessionId: session.sessionId, prompt: [{ type: "text", text: "Call paperclip_get_context, then paperclip_finish. Finally say HELLO_COMPLETE." }] });

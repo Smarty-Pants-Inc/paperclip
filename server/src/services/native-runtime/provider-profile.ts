@@ -9,6 +9,7 @@ import {
   resolvePaperclipRunnerCursorMode,
   resolvePaperclipRunnerPiThinkingLevel,
   type PaperclipRunnerProvider,
+  type PaperclipRunnerPiThinkingLevel,
 } from "@paperclipai/adapter-utils";
 import {
   codexLocalReasoningEffortsForModel,
@@ -143,7 +144,7 @@ export type PaperclipRunnerNativeProviderInput =
       homeMode?: "isolated" | "preconfigured";
       acpxPermissionMode: "approve-all" | "approve-paperclip" | "approve-reads" | "deny-all";
       acpxSessionMode?: "agent" | "plan" | "ask";
-      piThinkingLevel?: "off" | "low" | "high" | "max";
+      piThinkingLevel?: PaperclipRunnerPiThinkingLevel;
       claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
       grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
       grokDisableWebSearch?: boolean;

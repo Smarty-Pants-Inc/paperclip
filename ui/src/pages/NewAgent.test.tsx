@@ -1446,20 +1446,20 @@ describe("New agent setup", () => {
       expect(secrets.create).toHaveBeenCalledTimes(1);
     },
   );
-  it("resumes an empty native Pi draft with account selection and exact thinking controls", async () => {
+  it.each(["medium", "xhigh", "max"])("resumes an empty native Pi draft with account selection and exact %s thinking controls", async piThinkingLevel => {
     const id = "00000000-0000-4000-8000-000000000093";
     settings.getExperimental.mockResolvedValue({ enableNativeRunner: false });
     state.params = new URLSearchParams({ name: "Pi", adapterType: "pi_local", setupAgentId: id });
     state.adapters = state.adapters.map((adapter: any) => adapter.type === "pi_local"
       ? { ...adapter, supportedRunners: ["paperclip", "legacy"], defaultRunner: "paperclip" } : adapter);
-    api.get.mockResolvedValue({ id, companyId: "company-1", name: "Pi", adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "", piThinkingLevel: "max" }, runtimeConfig: {}, pauseReason: "setup", status: "paused" });
+    api.get.mockResolvedValue({ id, companyId: "company-1", name: "Pi", adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "", piThinkingLevel }, runtimeConfig: {}, pauseReason: "setup", status: "paused" });
     await renderCurrentParams();
     await settle();
     expect(container.querySelector('[role="combobox"][aria-label="Connection"]')).not.toBeNull();
     expect((container.querySelector('[aria-label="Model"]') as HTMLInputElement).value).toBe("");
     const thinking = container.querySelector('[aria-label="Thinking effort"]') as HTMLSelectElement;
-    expect(thinking.value).toBe("max");
-    expect([...thinking.options].map(option => option.value)).toEqual(["", "off", "low", "high", "max"]);
+    expect(thinking.value).toBe(piThinkingLevel);
+    expect([...thinking.options].map(option => option.value)).toEqual(["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
     expect(container.querySelector('[aria-label="OPENROUTER_API_KEY"]')).toBeNull();
   });
 

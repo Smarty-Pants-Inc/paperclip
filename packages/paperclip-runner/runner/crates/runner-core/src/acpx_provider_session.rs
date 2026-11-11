@@ -56,8 +56,11 @@ pub enum CursorMode {
 #[serde(rename_all = "lowercase")]
 pub enum PiThinkingLevel {
     Off,
+    Minimal,
     Low,
+    Medium,
     High,
+    Xhigh,
     Max,
 }
 
@@ -2643,8 +2646,11 @@ mod mode_tests {
     fn pi_thinking_level_is_closed_explicit_and_pi_only() {
         for (name, level) in [
             ("off", PiThinkingLevel::Off),
+            ("minimal", PiThinkingLevel::Minimal),
             ("low", PiThinkingLevel::Low),
+            ("medium", PiThinkingLevel::Medium),
             ("high", PiThinkingLevel::High),
+            ("xhigh", PiThinkingLevel::Xhigh),
             ("max", PiThinkingLevel::Max),
         ] {
             assert_eq!(
@@ -2654,9 +2660,7 @@ mod mode_tests {
             assert_eq!(serde_json::to_value(level).unwrap(), json!(name));
         }
         for value in [
-            json!("medium"),
-            json!("minimal"),
-            json!("xhigh"),
+            json!("ultra"),
             json!("Low"),
             json!(" low"),
             json!(null),
@@ -2680,8 +2684,11 @@ mod mode_tests {
         let mut config = pi_config();
         for level in [
             PiThinkingLevel::Off,
+            PiThinkingLevel::Minimal,
             PiThinkingLevel::Low,
+            PiThinkingLevel::Medium,
             PiThinkingLevel::High,
+            PiThinkingLevel::Xhigh,
             PiThinkingLevel::Max,
         ] {
             config.pi_thinking_level = Some(level);
@@ -2698,8 +2705,11 @@ mod mode_tests {
             for wrong in [
                 None,
                 Some(PiThinkingLevel::Off),
+                Some(PiThinkingLevel::Minimal),
                 Some(PiThinkingLevel::Low),
+                Some(PiThinkingLevel::Medium),
                 Some(PiThinkingLevel::High),
+                Some(PiThinkingLevel::Xhigh),
                 Some(PiThinkingLevel::Max),
             ] {
                 if wrong == Some(level) {
@@ -2716,7 +2726,7 @@ mod mode_tests {
                 .remove("piThinkingLevel");
             assert!(verify_open_response(&missing, 100, &config).is_err());
             let mut alias = response.clone();
-            alias["identity"]["piThinkingLevel"] = json!("medium");
+            alias["identity"]["piThinkingLevel"] = json!("ultra");
             assert!(verify_open_response(&alias, 100, &config).is_err());
         }
         let non_pi = self::config();

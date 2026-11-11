@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { admittedPiThinkingLevel, createPiThinkingAdmission, resolvePiThinkingLevel } from "./pi-thinking.js";
+import { GENERATED_PI_THINKING_LEVELS } from "./generated-sidecar-contract.js";
+import { admittedPiThinkingLevel, createPiThinkingAdmission, resolvePiThinkingLevel, type PiThinkingLevel } from "./pi-thinking.js";
 
-const config = (mode: string) => [{ id: "thought_level", type: "select", currentValue: mode, options: ["high", "low", "max"].map(value => ({ value, name: value })) }];
+const config = (mode: string) => [{ id: "thought_level", type: "select", currentValue: mode, options: GENERATED_PI_THINKING_LEVELS.map(value => ({ value, name: value })) }];
 const session = (mode: string) => ({ sessionId: "native", modes: { currentModeId: mode }, configOptions: config(mode) });
 const prompt = { id: 9, method: "session/prompt", params: { sessionId: "native" } };
-function opened(expected: "off" | "low" | "high" | "max", initial: string = expected) {
+function opened(expected: PiThinkingLevel, initial: string = expected) {
   const admission = createPiThinkingAdmission(expected); const guard = admission.createGuard();
   guard("outbound", { id: 0, method: "session/new", params: {} });
   guard("inbound", { id: 0, result: session(initial) });
@@ -16,13 +17,17 @@ function opened(expected: "off" | "low" | "high" | "max", initial: string = expe
 }
 
 describe("Pi thinking native mode admission", () => {
+  it.each(["minimal", "medium", "xhigh"] as const)("preserves exact selected thinking level %s", expected => {
+    expect(resolvePiThinkingLevel("pi", expected)).toBe(expected);
+    expect(admittedPiThinkingLevel("pi", expected, { piThinkingLevel: expected }, { piThinkingLevel: expected })).toBe(expected);
+  });
   it("requires explicit Pi thinking and rejects unadmitted aliases and other providers", () => {
     expect(() => resolvePiThinkingLevel("pi", undefined)).toThrow(/explicit/);
     expect(resolvePiThinkingLevel("codex", undefined)).toBeUndefined();
     for (const mode of ["code", "architect", "search", "chat", "", null]) expect(() => resolvePiThinkingLevel("pi", mode)).toThrow();
     expect(() => resolvePiThinkingLevel("cursor", "high")).toThrow(/only supported/);
   });
-  it.each(["off", "low", "high", "max"] as const)("admits %s only after correlated native acknowledgements", expected => {
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("admits %s only after correlated native acknowledgements", expected => {
     const { admission, guard } = opened(expected);
     admission.assertReady(); guard("outbound", prompt);
     const reloaded = admission.createGuard();
@@ -133,7 +138,9 @@ describe("Pi thinking native mode admission", () => {
 
 // Real ACPX manager/SDK transport, deterministic local child (not the real Pi
 // model). The separate pinned-Pi package contract proves its effective wire.
-it.each(["valid", "wrong-echo", "unsupported"])("actual ACPX initial model selection then low admission: %s", async behavior => {
+it.each(["valid", "wrong-echo", "unsupported"].flatMap(behavior =>
+  GENERATED_PI_THINKING_LEVELS.map(expected => ({ behavior, expected })),
+))("actual ACPX initial model selection then $expected admission: $behavior", async ({ behavior, expected }) => {
   const { spawn } = await import("node:child_process");
   const { mkdtemp, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
@@ -142,20 +149,20 @@ it.each(["valid", "wrong-echo", "unsupported"])("actual ACPX initial model selec
   const root = await mkdtemp(join(tmpdir(), "pi-thinking-wire-"));
   const children: Array<{ child: ReturnType<typeof spawn>; closed: Promise<void> }> = [];
   const methods: string[] = [];
-  const admission = createPiThinkingAdmission("low");
+  const admission = createPiThinkingAdmission(expected);
   const peer = String.raw`
 let mode='medium';
 const send=x=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...x})+'\n');
-const configs=()=>[{id:'thought_level',name:'Thinking',type:'select',currentValue:mode,options:['off','low','medium','high','max'].map(value=>({value,name:value}))},{id:'model',name:'Model',type:'select',currentValue:'qualified',options:[{value:'qualified',name:'Qualified'}]}];
+const configs=()=>[{id:'thought_level',name:'Thinking',type:'select',currentValue:mode,options:['off','minimal','low','medium','high','xhigh','max'].map(value=>({value,name:value}))},{id:'model',name:'Model',type:'select',currentValue:'qualified',options:[{value:'qualified',name:'Qualified'}]}];
 require('node:readline').createInterface({input:process.stdin}).on('line',line=>{
  const m=JSON.parse(line);
  if(m.method==='initialize')send({id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true},authMethods:[]}});
- else if(m.method==='session/new'||m.method==='session/load')send({id:m.id,result:{sessionId:'native',modes:{currentModeId:mode,availableModes:['off','low','medium','high','max'].map(id=>({id,name:id}))},configOptions:configs()}});
+ else if(m.method==='session/new'||m.method==='session/load')send({id:m.id,result:{sessionId:'native',modes:{currentModeId:mode,availableModes:['off','minimal','low','medium','high','xhigh','max'].map(id=>({id,name:id}))},configOptions:configs()}});
  else if(m.method==='session/set_config_option'){
   if(m.params.configId==='model')mode='high';
   else if(m.params.configId==='thought_level'){
    if(process.env.BEHAVIOR==='unsupported')return send({id:m.id,error:{code:-32602,message:'Unsupported level'}});
-   if(process.env.BEHAVIOR!=='wrong-echo')mode=m.params.value;
+   mode=process.env.BEHAVIOR==='wrong-echo'?(m.params.value==='high'?'low':'high'):m.params.value;
   }
   send({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'current_mode_update',currentModeId:mode}}});
   send({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'config_option_update',configOptions:configs()}}});
@@ -178,7 +185,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
     expect(admission.isReady()).toBe(false);
     await runtime.setConfigOption({ handle, key: "model", value: "qualified" });
     expect(admission.isReady()).toBe(false);
-    const selecting = runtime.setConfigOption({ handle, key: "thought_level", value: "low" });
+    const selecting = runtime.setConfigOption({ handle, key: "thought_level", value: expected });
     if (behavior !== "valid") { await expect(selecting).rejects.toThrow(); expect(methods).not.toContain("session/prompt"); return; }
     await selecting; admission.assertReady();
     const turn = runtime.startTurn({ handle, text: "fixture", mode: "prompt", requestId: "once", timeoutMs: 2000 });
@@ -210,5 +217,8 @@ it("preserves effective Pi mode through the persisted harness identity projectio
   const { parseProviderIdentity } = await import("../codex/codex-driver-values.js");
   const value = { kind: "acpx", normalizedSessionId: "session", acpxRecordId: "record", backendSessionId: "backend", agentSessionId: "agent", profileDigest: "sha256:profile", workspaceDigest: "sha256:workspace", requestedModel: "model", effectiveModel: "model", piThinkingLevel: "low", providerLifetimeFenceCandidates: [60001, 60002, 60003] };
   expect(parseProviderIdentity(value)).toMatchObject({ piThinkingLevel: "low" });
-  expect(() => parseProviderIdentity({ ...value, piThinkingLevel: "medium" })).toThrow();
+  for (const piThinkingLevel of ["minimal", "medium", "xhigh"] as const) {
+    expect(parseProviderIdentity({ ...value, piThinkingLevel })).toMatchObject({ piThinkingLevel });
+  }
+  expect(() => parseProviderIdentity({ ...value, piThinkingLevel: "ultra" })).toThrow();
 });

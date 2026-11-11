@@ -1,5 +1,5 @@
 import { ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS } from "@/lib/native-model-catalog";
-import { PAPERCLIP_RUNNER_ACPX_PROFILES } from "@paperclipai/adapter-utils";
+import { PAPERCLIP_RUNNER_ACPX_PROFILES, PAPERCLIP_RUNNER_PI_THINKING_LEVELS } from "@paperclipai/adapter-utils";
 import { ExternalAgentInviteDialog } from "./ExternalAgentInviteDialog";
 import { useConnectionModels } from "../ai-connections/useConnectionModels";
 import { AgentCharacter } from "../AgentCharacter";
@@ -366,7 +366,7 @@ function Setup({
   useEffect(() => { if (antigravityCandidate) setModel(current => current || antigravityCandidate.model); }, [antigravityCandidate?.model]);
   const defaultRunner = adapters.data?.find(adapter => adapter.type === adapterType)?.defaultRunner;
   const efforts = brandType === "pi_local" && (runner === "paperclip" || (runner === "auto" && defaultRunner === "paperclip"))
-    ? ["off", "low", "high", "max"] : isRunner ? [] : setupEfforts(adapterType, model);
+    ? PAPERCLIP_RUNNER_PI_THINKING_LEVELS : isRunner ? [] : setupEfforts(adapterType, model);
   useEffect(() => {
     const transition = qualificationTransition.current;
     if (transition?.run === generation.current && transition.companyId === companyId

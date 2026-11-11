@@ -1363,8 +1363,11 @@ export const providerDescriptorSchema = {
     "piThinkingLevel": {
       "enum": [
         "off",
+        "minimal",
         "low",
+        "medium",
         "high",
+        "xhigh",
         "max"
       ]
     },

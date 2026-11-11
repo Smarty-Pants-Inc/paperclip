@@ -13,7 +13,7 @@ import { bindAcpxCandidateAdmission, parseAcpxCandidateAdmission, type AcpxCandi
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
 import { resolveClaudeEffort, admittedClaudeEffort } from "../drivers/acpx/claude-effort.js";
 import { resolveGrokEffort, admittedGrokEffort } from "../drivers/acpx/grok-effort.js";
-import { admittedPiThinkingLevel, resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
+import { admittedPiThinkingLevel, resolvePiThinkingLevel, type PiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
 import { configuredEnvironment } from "../configured-environment.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
 import { resolveAcpxProviderMode } from "../drivers/acpx/provider-mode.js";
@@ -1534,7 +1534,7 @@ export interface CapabilityRunnerdProcessEvidence {
   agentProcessStartedAt: string | null;
   providerDriver: string | null;
   /** Effective native mode, populated only from the admitted Pi identity. */
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;
@@ -1576,7 +1576,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   acpxCandidateAdmission?: AcpxCandidateAdmission;
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxMode?: string;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;

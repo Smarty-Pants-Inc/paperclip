@@ -1,7 +1,7 @@
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import type { Db } from "@paperclipai/db";
 import { agentHarnessType, paperclipRunnerProfileForHarness, isEnvironmentDriverSupportedForAdapter, paperclipRunnerSupportsPlatform, type AgentRunnerChoice, type AgentRunnerAvailability } from "@paperclipai/shared";
-import { normalizeLegacyRunnerProvider, PAPERCLIP_RUNNER_DEFAULT_MODELS } from "@paperclipai/adapter-utils";
+import { normalizeLegacyRunnerProvider, PAPERCLIP_RUNNER_DEFAULT_MODELS, PAPERCLIP_RUNNER_PI_THINKING_LEVELS } from "@paperclipai/adapter-utils";
 import { resolveClaudeModel } from "@paperclipai/adapter-claude-local";
 import { DEFAULT_GROK_LOCAL_MODEL } from "@paperclipai/adapter-grok-local";
 import { findActiveServerAdapter, hasActiveAdapterOverride, waitForExternalAdapters } from "../adapters/registry.js";
@@ -108,7 +108,7 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
   if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
   if (config.stdoutLogMode !== undefined && config.stdoutLogMode !== "compact") unsupported.push("stdoutLogMode");
   const thinking = config.piThinkingLevel ?? config.thinking;
-  if (thinking !== undefined && !["off", "low", "high", "max"].includes(String(thinking))) unsupported.push("thinking");
+  if (thinking !== undefined && !PAPERCLIP_RUNNER_PI_THINKING_LEVELS.some(level => level === thinking)) unsupported.push("thinking");
   if (config.piThinkingLevel !== undefined && config.thinking !== undefined && config.piThinkingLevel !== config.thinking) unsupported.push("thinking", "piThinkingLevel");
   if (unsupported.length) incompatible(unsupported);
   const translated = { ...config };

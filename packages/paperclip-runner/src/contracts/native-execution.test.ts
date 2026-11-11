@@ -371,6 +371,19 @@ describe("NativeExecutionInputV1", () => {
     })).toThrow("eventExpiryDays");
   });
 
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("round trips exact Pi thinking level %s", piThinkingLevel => {
+    const { permissionPolicy, ...profile } = QUALIFIED_ACPX_PROFILES.pi;
+    const value = { ...input, session: { ...input.session, driverKind: "acpx_runtime" },
+      provider: { kind: "acpx", agent: "pi", model: "explicit-provider-model", piThinkingLevel, permissionPolicy, profile } };
+    const parsed = parseNativeExecutionInput(value);
+    expect(parsed.provider).toEqual(value.provider);
+    expect(parseNativeExecutionInput(parsed)).toEqual(parsed);
+    for (const invalid of ["ultra", " MEDIUM ", null]) {
+      expect(() => parseNativeExecutionInput({ ...value, provider: { ...value.provider, piThinkingLevel: invalid } })).toThrow("piThinkingLevel");
+    }
+    expect(() => parseNativeExecutionInput({ ...value, provider: { ...value.provider, agent: "codex" } })).toThrow("only for Pi");
+  });
+
   it.each([
     [17, "sha256:a1d976c437cb736c9cce8ebe8b8baf59e571761a8d00e8b1885e72dd906d8f21"],
     [18, "sha256:9d3e7d8269f1a0af94616552dfc69671932688b81dbbd5bab9ef356b3a9cbccb"],

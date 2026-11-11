@@ -1,3 +1,4 @@
+import { GENERATED_PI_THINKING_LEVELS } from "../drivers/acpx/generated-sidecar-contract.js";
 import { bindAcpxCandidateAdmission } from "../drivers/acpx/candidate-admission.js";
 import { toolFileChangesFromAcpContent } from "../tool-file-changes.js";
 import { KIMI_DISTRIBUTION_CLOSURE_SHA256 } from "../drivers/acpx/kimi-closure-pins.js";
@@ -1699,7 +1700,7 @@ describe("qualified ACPX runtime sidecar", () => {
       error: { message: "ACPX working directory must be a non-root directory" } });
   });
 
-  it.each(["off", "low", "high", "max"])(
+  it.each(GENERATED_PI_THINKING_LEVELS)(
     "accepts Pi thinking level %s through the actual session.open dispatcher",
     async (piThinkingLevel) => {
       const sidecar = startSidecar();
@@ -1736,7 +1737,7 @@ describe("qualified ACPX runtime sidecar", () => {
   });
 
   it.each([
-    ["pi", { piThinkingLevel: "medium" }, "Pi thinking level"],
+    ["pi", { piThinkingLevel: "ultra" }, "Pi thinking level"],
     ["codex", { piThinkingLevel: "low" }, "only supported by Pi"],
     ["pi", { piThinkingLevel: "low", unknownOption: true }, "unsupported field"],
   ])("rejects invalid %s session.open fields before launch", async (agent, fields, message) => {

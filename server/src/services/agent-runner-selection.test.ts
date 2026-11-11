@@ -215,10 +215,14 @@ describe("server-owned Codex runner selection", () => {
     expect(resolveNewAgentRunner(selected)).toEqual(selected);
     expect(resolveNewAgentRunner({ ...selected, runner: "legacy" })).toEqual({ adapterType: "pi_local", adapterConfig: { model: adapterConfig.model, thinking: "high", cwd: adapterConfig.cwd, env: adapterConfig.env } });
   });
-  it.each(["minimal", "medium", "xhigh"])("keeps unsupported Pi thinking %s explicit", thinking => {
+  it.each(["minimal", "medium", "xhigh"])("preserves Pi thinking %s when selecting native Runner", thinking => {
     const input = { adapterType: "pi_local", target, adapterConfig: { model: "custom/model", thinking } };
-    expect(() => resolveNewAgentRunner(input)).toThrow("cannot honor");
-    expect(resolveNewAgentRunner({ ...input, runner: "legacy" })).toEqual({ adapterType: input.adapterType, adapterConfig: input.adapterConfig });
+    const selected = resolveNewAgentRunner(input);
+    expect(selected).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { piThinkingLevel: thinking } });
+    expect(resolveNewAgentRunner({ ...selected, runner: "legacy" })).toEqual({ adapterType: input.adapterType, adapterConfig: input.adapterConfig });
+  });
+  it.each(["ultra", "Medium", ""])("rejects invalid native Pi thinking %s", thinking => {
+    expect(() => resolveNewAgentRunner({ adapterType: "pi_local", target, adapterConfig: { model: "custom/model", thinking } })).toThrow("cannot honor");
   });
   it.each([{ command: "custom-pi" }, { args: ["--extension", "custom.ts"] }, { extraArgs: "--no-tools" }, { stdoutLogMode: "raw" }, { thinking: "low", piThinkingLevel: "high" }])("rejects unsupported Pi configuration %j", extra => {
     expect(() => resolveNewAgentRunner({ adapterType: "pi_local", target, adapterConfig: { model: "custom/model", ...extra } })).toThrow("cannot honor");

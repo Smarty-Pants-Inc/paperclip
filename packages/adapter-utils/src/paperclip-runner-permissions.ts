@@ -272,13 +272,14 @@ export const PAPERCLIP_RUNNER_ACPX_PROFILES = Object.freeze([
 ] as const);
 
 /** Exact Pi native thinking levels; aliases that silently clamp are not configuration. */
-export type PaperclipRunnerPiThinkingLevel = "off" | "low" | "high" | "max";
+export const PAPERCLIP_RUNNER_PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type PaperclipRunnerPiThinkingLevel = typeof PAPERCLIP_RUNNER_PI_THINKING_LEVELS[number];
 export function resolvePaperclipRunnerPiThinkingLevel(provider: unknown, agent: unknown, value: unknown): PaperclipRunnerPiThinkingLevel | undefined {
   if (provider !== "acpx" || agent !== "pi") {
     if (value !== undefined) throw new Error("piThinkingLevel is supported only for Pi");
     return undefined;
   }
   if (value === undefined) return "low";
-  if (value === "off" || value === "low" || value === "high" || value === "max") return value;
-  throw new Error("Pi thinking level must be off, low, high, or max");
+  if (PAPERCLIP_RUNNER_PI_THINKING_LEVELS.some(level => level === value)) return value as PaperclipRunnerPiThinkingLevel;
+  throw new Error(`Pi thinking level must be ${PAPERCLIP_RUNNER_PI_THINKING_LEVELS.join(", ")}`);
 }

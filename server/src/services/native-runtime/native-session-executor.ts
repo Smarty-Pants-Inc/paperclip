@@ -93,7 +93,7 @@ import { prepareGrokRunnerCredentials } from "./grok-runner-credentials.js";
 import { bindAntigravityCredentialTurn, bindAntigravityTransportRetirement, prepareAntigravityRunnerCredentials } from "./antigravity-runner-credentials.js";
 import { copyBackGrokAuth } from "@paperclipai/adapter-grok-local/server";
 
-import { inferOpenAiCompatibleBiller, type AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
+import { inferOpenAiCompatibleBiller, PAPERCLIP_RUNNER_PI_THINKING_LEVELS, type AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
@@ -7670,7 +7670,7 @@ function acpxRecoveryGrokWebSearchMatches(provider: unknown, ...observed: unknow
 
 function acpxRecoveryPiThinkingMatches(provider: NativeExecutionInput["provider"], ...observed: unknown[]): boolean {
   const expected = record(provider).piThinkingLevel;
-  if (provider.kind === "acpx" && provider.agent === "pi") return ["off", "low", "high", "max"].includes(String(expected)) && observed.every(value => value === expected);
+  if (provider.kind === "acpx" && provider.agent === "pi") return PAPERCLIP_RUNNER_PI_THINKING_LEVELS.some(level => level === expected) && observed.every(value => value === expected);
   return expected === undefined && observed.every(value => value === undefined);
 }
 

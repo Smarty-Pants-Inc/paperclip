@@ -138,7 +138,10 @@ describe("eval-session request contract", () => {
 
   it("requires exact matching Pi mode in request and session and rejects aliases", () => {
     const base = { provider: "acpx", acpxAgent: "pi", model: "openrouter/deepseek/deepseek-v4-flash-0731" };
-    for (const value of [undefined, "medium", "minimal", "xhigh", ""]) expect(() => parseEvalSessionRequest(request({ ...base, piThinkingLevel: value }))).toThrow();
+    for (const piThinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+      expect(parseEvalSessionRequest(request({ ...base, piThinkingLevel, session: { piThinkingLevel } }))).toMatchObject({ piThinkingLevel });
+    }
+    for (const value of [undefined, "ultra", " MEDIUM ", ""]) expect(() => parseEvalSessionRequest(request({ ...base, piThinkingLevel: value }))).toThrow();
     expect(() => parseEvalSessionRequest(request({ ...base, piThinkingLevel: "low", session: { piThinkingLevel: "high" } }))).toThrow(/must match/);
     expect(() => parseEvalSessionRequest(request({ piThinkingLevel: "low" }))).toThrow(/only supported/);
   });

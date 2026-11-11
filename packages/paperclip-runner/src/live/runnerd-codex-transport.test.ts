@@ -6585,7 +6585,11 @@ it.each([
     .toThrow(/acpxMode|Provider mode/);
 });
 
-it.each([undefined, "medium", "minimal", "xhigh", null])("rejects non-exact Pi transport thinking level %s before spawn", piThinkingLevel => {
+it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("admits exact Pi transport thinking level %s before spawn", piThinkingLevel => {
+  expect(() => createCapabilityRunnerdCodexTransport({ provider: "acpx", acpxAgent: "pi", piThinkingLevel })).not.toThrow();
+});
+
+it.each([undefined, "ultra", " MEDIUM ", null])("rejects non-exact Pi transport thinking level %s before spawn", piThinkingLevel => {
   expect(() => createCapabilityRunnerdCodexTransport({ provider: "acpx", acpxAgent: "pi", piThinkingLevel: piThinkingLevel as never })).toThrow(/thinking/);
 });
 

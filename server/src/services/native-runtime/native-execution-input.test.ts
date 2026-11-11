@@ -661,7 +661,7 @@ describe("Cursor mode native execution projection", () => {
 });
 
 describe("Pi thinking native execution projection", () => {
-  function fixture(piThinkingLevel?: "off" | "low" | "high" | "max") {
+  function fixture(piThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max") {
     return {
       companyId: "company-1", runId: "run-1", agentId: "agent-1",
       issue: { id: "issue-1", identifier: "MODE-1", title: "Review a plan", description: null, workMode: "standard" },
@@ -673,11 +673,14 @@ describe("Pi thinking native execution projection", () => {
       runtimeContext: nativeRuntimeContextFixture(),
     };
   }
-  it.each([undefined, "off", "low", "high", "max"] as const)("preserves mode %s independently of permissions and task planning", mode => {
+  it.each([undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("preserves mode %s independently of permissions and task planning", mode => {
     const result = buildNativeExecutionInput(fixture(mode));
     expect(result.provider).toMatchObject({ kind: "acpx", agent: "pi", piThinkingLevel: mode ?? "low", permissionMode: "deny-all" });
     expect(result.executionMode).toBe("default");
     expect(result.task.workMode).toBe("standard");
+  });
+  it.each(["ultra", "Medium", "", null, 1])("rejects invalid Pi thinking %s before projection", piThinkingLevel => {
+    expect(() => buildNativeExecutionInput({ ...fixture(), piThinkingLevel } as unknown as Parameters<typeof buildNativeExecutionInput>[0])).toThrow("Pi thinking level");
   });
   it("rejects a Pi thinking level attached to another harness", () => {
     expect(() => buildNativeExecutionInput({ ...fixture("low"), acpxAgent: "copilot" })).toThrow("only for Pi");

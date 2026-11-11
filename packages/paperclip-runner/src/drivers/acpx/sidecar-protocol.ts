@@ -1,3 +1,4 @@
+import type { PiThinkingLevel } from "./pi-thinking.js";
 import type { AcpxCandidateStartupAdmission } from "./candidate-admission.js";
 import type { ProviderFailure } from "../../contracts/provider-failure.generated.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
@@ -49,7 +50,7 @@ export interface AcpxSidecarOpenParams {
   model: string;
   permissionMode: NativeAcpxPermissionMode;
   mode?: string;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;
@@ -74,7 +75,7 @@ export interface AcpxExpectedSessionIdentity {
   effectiveModel: string;
   permissionMode?: NativeAcpxPermissionMode;
   mode?: string;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;

@@ -1,6 +1,8 @@
 import { parseNativeCursorCloudConfig, type NativeCursorCloudConfig } from "./cursor-cloud.js";
 import { resolveGrokDisableWebSearch } from "../drivers/acpx/grok-web-search.js";
 import { resolveGrokEffort } from "../drivers/acpx/grok-effort.js";
+import { GENERATED_PI_THINKING_LEVELS } from "../drivers/acpx/generated-sidecar-contract.js";
+import type { PiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
 import { resolveClaudeEffort } from "../drivers/acpx/claude-effort.js";
 import type { DotBindingSnapshot, MuseBindingSnapshot, ExternalBotProviderKind } from "./external-provider.js";
 import { QUALIFIED_ACPX_VERSION, QUALIFIED_ACPX_PROFILE_DATA } from "../drivers/acpx/generated-profiles.js";
@@ -147,7 +149,7 @@ export type NativeProviderConfig =
       model: string;
       permissionMode?: NativeAcpxPermissionMode;
       mode?: string;
-      piThinkingLevel?: "off" | "low" | "high" | "max";
+      piThinkingLevel?: PiThinkingLevel;
       /** Present only in persisted v1-v3 inputs. */
       permissionPolicy?: "interactive";
       profile: NativeAcpxProfileSnapshot;
@@ -163,7 +165,7 @@ export type NativeProviderConfigV4 =
       model: string;
       permissionMode: NativeAcpxPermissionMode;
       mode?: string;
-      piThinkingLevel?: "off" | "low" | "high" | "max";
+      piThinkingLevel?: PiThinkingLevel;
       profile: NativeAcpxProfileSnapshot;
     };
 
@@ -716,8 +718,8 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       invocationLimits: { maxIterations, maxOutputTokens, timeoutSeconds },
     };
   } else if (provider.kind === "acpx") {
-    if (provider.piThinkingLevel !== undefined && (provider.agent !== "pi" || (typeof provider.piThinkingLevel !== "string" || !["off", "low", "high", "max"].includes(provider.piThinkingLevel)))) {
-      throw new NativeExecutionInputError("input.provider.piThinkingLevel must be off, low, high, or max and is supported only for Pi");
+    if (provider.piThinkingLevel !== undefined && (provider.agent !== "pi" || (typeof provider.piThinkingLevel !== "string" || !(GENERATED_PI_THINKING_LEVELS as readonly string[]).includes(provider.piThinkingLevel)))) {
+      throw new NativeExecutionInputError("input.provider.piThinkingLevel must be off, minimal, low, medium, high, xhigh, or max and is supported only for Pi");
     }
     if (provider.mode !== undefined && !isProviderMode(provider.mode)) {
       throw new NativeExecutionInputError("input.provider.mode must be a bounded nonempty provider mode identifier");
@@ -779,7 +781,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       ...(claudeEffort === undefined ? {} : { claudeEffort }),
       ...(grokEffort === undefined ? {} : { grokEffort }),
       ...(grokDisableWebSearch === undefined ? {} : { grokDisableWebSearch }),
-      ...(provider.piThinkingLevel === undefined ? {} : { piThinkingLevel: provider.piThinkingLevel as "off" | "low" | "high" | "max" }),
+      ...(provider.piThinkingLevel === undefined ? {} : { piThinkingLevel: provider.piThinkingLevel as PiThinkingLevel }),
       profile: {
         driverKind: "acpx_runtime",
         protocolVersion: 1,

@@ -121,10 +121,10 @@ describe("Cursor session mode admission", () => {
 });
 
 describe("Pi thinking configuration", () => {
-  it.each([undefined, "off", "low", "high", "max"] as const)("persists exact level %s with low as the fresh-config default", value => {
+  it.each([undefined, "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("persists exact level %s with low as the fresh-config default", value => {
     expect(resolvePaperclipRunnerPiThinkingLevel("acpx", "pi", value)).toBe(value ?? "low");
   });
-  it.each(["medium", "minimal", "xhigh", "", null, 1])("rejects unsupported alias %s", value => {
+  it.each(["ultra", "Medium", "", null, 1])("rejects unsupported level %s", value => {
     expect(() => resolvePaperclipRunnerPiThinkingLevel("acpx", "pi", value)).toThrow();
   });
   it("rejects foreign provider settings", () => {

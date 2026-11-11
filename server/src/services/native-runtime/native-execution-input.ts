@@ -1,5 +1,5 @@
 import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-utils";
-import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
+import { resolvePaperclipRunnerCursorMode, resolvePaperclipRunnerPiThinkingLevel, type PaperclipRunnerPiThinkingLevel } from "@paperclipai/adapter-utils";
 import { createHash } from "node:crypto";
 import { buildNativeContinuationPrompt } from "./native-continuation.js";
 import {
@@ -107,7 +107,7 @@ export interface BuildNativeExecutionInput {
   opencodePermissionMode?: NativeOpenCodePermissionMode;
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxSessionMode?: "agent" | "plan" | "ask";
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PaperclipRunnerPiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;

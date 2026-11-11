@@ -99,12 +99,12 @@ test("candidate startup and sidecar admission share one strict identity-bound JS
 
 test("Pi session admission requires an explicit supported thinking level including recovery", () => {
   const open = (params) => ({ protocolVersion, id: 1, command: "session.open", params });
-  for (const piThinkingLevel of ["off", "low", "high", "max"]) {
+  for (const piThinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
     assert.equal(validate(open({ agent: "pi", piThinkingLevel })), true, JSON.stringify(validate.errors));
     assert.equal(validate(open({ agent: "pi", piThinkingLevel, expectedIdentity: null })), true);
     assert.equal(validate(open({ agent: "pi", piThinkingLevel, expectedIdentity: { piThinkingLevel } })), true);
   }
-  for (const piThinkingLevel of [undefined, null, "medium", "minimal", "xhigh", " LOW ", 1]) {
+  for (const piThinkingLevel of [undefined, null, "ultra", " LOW ", 1]) {
     assert.equal(validate(open({ agent: "pi", piThinkingLevel })), false);
     assert.equal(validate(open({ agent: "pi", piThinkingLevel: "low", expectedIdentity: { piThinkingLevel } })), false);
   }
@@ -166,10 +166,10 @@ test("public Pi descriptors preserve effective thinking levels without invalidat
     agentServerPackage: "pi-acp", agentServerVersion: "0.0.33", acpxRecordId: null, agentProcessId: null,
   };
   assert.equal(validateDescriptor(historical), true, JSON.stringify(validateDescriptor.errors));
-  for (const piThinkingLevel of ["off", "low", "high", "max"]) {
+  for (const piThinkingLevel of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
     assert.equal(validateDescriptor({ ...historical, piThinkingLevel }), true);
   }
-  for (const piThinkingLevel of ["medium", null, "xhigh", 1]) {
+  for (const piThinkingLevel of ["ultra", null, " HIGH ", 1]) {
     assert.equal(validateDescriptor({ ...historical, piThinkingLevel }), false);
   }
   assert.equal(validateDescriptor({ ...historical, agent: "copilot", piThinkingLevel: "low" }), false);

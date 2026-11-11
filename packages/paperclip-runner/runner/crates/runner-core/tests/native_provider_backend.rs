@@ -2926,7 +2926,10 @@ fn pi_thinking_change_cannot_attach_to_an_existing_provider_identity() {
     );
     let state_path = directory.join("acpx-provider-state.json");
     let prior = fs::read(&state_path).unwrap();
-    for (index, mode) in ["off", "high", "max"].into_iter().enumerate() {
+    for (index, mode) in ["off", "minimal", "medium", "high", "xhigh", "max"]
+        .into_iter()
+        .enumerate()
+    {
         let mut changed = payload.clone();
         changed["provider"]["piThinkingLevel"] = json!(mode);
         let error = executor
@@ -2941,7 +2944,7 @@ fn pi_thinking_change_cannot_attach_to_an_existing_provider_identity() {
         assert_eq!(fs::read(&state_path).unwrap(), prior);
     }
     executor
-        .execute(&command(6, "run.attach", payload))
+        .execute(&command(9, "run.attach", payload))
         .unwrap();
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();

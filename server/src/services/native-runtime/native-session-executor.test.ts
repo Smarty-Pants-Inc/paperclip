@@ -3417,21 +3417,21 @@ describe("verified native harness backups", () => {
     }
   });
 
-  it("binds Pi thinking across governed and identical recovery identities", () => {
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"])("binds Pi thinking %s across governed and identical recovery identities", piThinkingLevel => {
     const execution = {
       ...backupExecution,
-      provider: { kind: "acpx", agent: "pi", model: "explicit-model", piThinkingLevel: "low" },
+      provider: { kind: "acpx", agent: "pi", model: "explicit-model", piThinkingLevel },
       interactionResponses: [{ interactionId: "interaction-1" }],
     } as unknown as NativeExecutionInputV1;
     const identity = (suffix: string, piThinkingLevel: unknown) => {
       const value = acpxIdentity(suffix);
       return { ...value, providerSessionIdentity: { ...value.providerSessionIdentity, piThinkingLevel } };
     };
-    const previous = identity("previous", "low");
-    const current = identity("current", "low");
+    const previous = identity("previous", piThinkingLevel);
+    const current = identity("current", piThinkingLevel);
     expect(providerSessionIdentityTransitionIsAllowed({ execution, previous, current })).toBe(true);
     expect(providerSessionIdentityTransitionIsAllowed({ execution, previous, current: previous })).toBe(true);
-    for (const mode of [undefined, null, "high", "max", "medium"]) {
+    for (const mode of [undefined, null, "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].filter(value => value !== piThinkingLevel)) {
       const wrong = identity("wrong", mode);
       expect(providerSessionIdentityTransitionIsAllowed({ execution, previous, current: wrong })).toBe(false);
       expect(providerSessionIdentityTransitionIsAllowed({ execution, previous: wrong, current })).toBe(false);
@@ -3446,6 +3446,17 @@ describe("verified native harness backups", () => {
         execution: { ...execution, provider } as unknown as NativeExecutionInputV1, previous, current,
       })).toBe(false);
     }
+  });
+
+  it.each(["ultra", "Medium", "", null, 1])("rejects matching invalid Pi thinking recovery identities %s", piThinkingLevel => {
+    const execution = {
+      ...backupExecution,
+      provider: { kind: "acpx", agent: "pi", model: "explicit-model", piThinkingLevel },
+      interactionResponses: [{ interactionId: "interaction-1" }],
+    } as unknown as NativeExecutionInputV1;
+    const previous = acpxIdentity("previous");
+    const identity = { ...previous, providerSessionIdentity: { ...previous.providerSessionIdentity, piThinkingLevel } };
+    expect(providerSessionIdentityTransitionIsAllowed({ execution, previous: identity, current: identity })).toBe(false);
   });
 
   it("restores a verified continuation into an intentionally fresh non-reusable sandbox", () => {

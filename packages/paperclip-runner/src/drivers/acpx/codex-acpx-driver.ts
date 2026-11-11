@@ -1,3 +1,5 @@
+import { GENERATED_PI_THINKING_LEVELS } from "./generated-sidecar-contract.js";
+import type { PiThinkingLevel } from "./pi-thinking.js";
 import { type CopilotToolEvidence } from "./copilot-tool-evidence.js";
 import { classifyClaudeStatusBanner } from "./claude-status-banners.js";
 import { resolveCompletionContinuation } from "../completion-continuation.js";
@@ -157,7 +159,7 @@ export interface CodexAcpxDriverOptions {
   model: string;
   permissionMode?: NativeAcpxPermissionMode;
   mode?: string;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;
@@ -2254,7 +2256,7 @@ function validateRecoverySnapshot(snapshot: PersistedHarnessSession): void {
     (identity.claudeEffort !== undefined && !["low", "medium", "high", "xhigh", "max"].includes(identity.claudeEffort)) ||
     (identity.grokDisableWebSearch !== undefined && typeof identity.grokDisableWebSearch !== "boolean") ||
     (identity.grokEffort !== undefined && !["minimal", "low", "medium", "high", "xhigh"].includes(identity.grokEffort)) ||
-    (identity.piThinkingLevel !== undefined && !["off", "low", "high", "max"].includes(identity.piThinkingLevel)) ||
+    (identity.piThinkingLevel !== undefined && !GENERATED_PI_THINKING_LEVELS.includes(identity.piThinkingLevel)) ||
     !validProviderLifetimeFenceCandidates(
       identity.providerLifetimeFenceCandidates,
     )

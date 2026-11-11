@@ -120,6 +120,7 @@ export {
   PAPERCLIP_RUNNER_DEFAULT_MODELS,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   PAPERCLIP_RUNNER_ACPX_PROFILES,
+  PAPERCLIP_RUNNER_PI_THINKING_LEVELS,
   isPaperclipRunnerProvider,
   resolvePaperclipRunnerIdleTimeoutMs,
   resolvePaperclipRunnerModel,
@@ -149,6 +150,7 @@ export type {
   PaperclipRunnerPermissionCapability,
   PaperclipRunnerPermissionMode,
   PaperclipRunnerPermissionOption,
+  PaperclipRunnerPiThinkingLevel,
   PaperclipRunnerProvider,
 } from "./paperclip-runner-permissions.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.

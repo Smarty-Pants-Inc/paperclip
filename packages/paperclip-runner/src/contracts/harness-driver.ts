@@ -1,3 +1,4 @@
+import type { PiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
 import type { NativeRunRuntimeGrant } from "./runtime-context.js";
 import type { DurableRecoveryIdentity } from "./durable-recovery.js";
 import type {
@@ -459,7 +460,7 @@ export interface AcpxSessionIdentity {
   permissionMode?: "approve-all" | "approve-paperclip" | "approve-reads" | "deny-all";
   /** Effective provider mode identifier, bound to the session identity. */
   mode?: string;
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;

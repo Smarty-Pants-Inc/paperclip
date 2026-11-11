@@ -325,7 +325,10 @@ fn pi_thinking_level_round_trips_and_rejects_legacy_or_changed_recovery() {
     for level in [
         None,
         Some(PiThinkingLevel::Off),
+        Some(PiThinkingLevel::Minimal),
+        Some(PiThinkingLevel::Medium),
         Some(PiThinkingLevel::High),
+        Some(PiThinkingLevel::Xhigh),
         Some(PiThinkingLevel::Max),
     ] {
         let mut changed_config = config.clone();

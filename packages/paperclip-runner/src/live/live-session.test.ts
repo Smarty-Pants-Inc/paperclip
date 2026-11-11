@@ -1,3 +1,4 @@
+import { GENERATED_PI_THINKING_LEVELS } from "../drivers/acpx/generated-sidecar-contract.js";
 import { resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createHash } from "node:crypto";
@@ -40,14 +41,15 @@ it.each(["copilot"] as const)("requires separately bound evaluation opt-in for %
     .rejects.toThrow("explicit evaluation opt-in");
 });
 
-it("admits Pi live sessions without candidate opt-in while preserving the exact profile", async () => {
+it.each(GENERATED_PI_THINKING_LEVELS)("admits Pi live sessions with %s thinking without candidate opt-in while preserving the exact profile", async piThinkingLevel => {
   const service = new CapabilityLiveSessionService({ transportFactory: fakeTransportFactory(providerState()) });
-  const session = await service.create({ provider: "acpx", acpxAgent: "pi", piThinkingLevel: "low", requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731" });
+  const session = await service.create({ provider: "acpx", acpxAgent: "pi", piThinkingLevel, requestedModel: "openrouter/deepseek/deepseek-v4-flash-0731" });
   try {
     expect(session.snapshot().config.acpxProfile).toMatchObject({
       ...resolveQualifiedAcpxProfile("pi", "openrouter/deepseek/deepseek-v4-flash-0731"), agent: "pi",
     });
-    const custom = await service.create({ provider: "acpx", acpxAgent: "pi", piThinkingLevel: "low", requestedModel: "another-model" });
+    expect(session.snapshot().config.piThinkingLevel).toBe(piThinkingLevel);
+    const custom = await service.create({ provider: "acpx", acpxAgent: "pi", piThinkingLevel, requestedModel: "another-model" });
     expect(custom.snapshot().config.acpxProfile).toMatchObject({ qualificationModel: "another-model", reportedModelId: "another-model" });
     await custom.shutdown("test complete");
   } finally { await session.shutdown("test complete"); }
