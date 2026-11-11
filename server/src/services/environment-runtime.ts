@@ -3093,6 +3093,14 @@ function createSandboxEnvironmentDriver(
     } else {
       cleanupStatus = "failed";
     }
+    // Ordinary reusable release can fail after the provider already stopped.
+    // Persist the existing stop-only intent instead of generic pending_cleanup:
+    // that fallback dispatches destroy and would erase the retained workspace.
+    // Missing stop support stays pending until a capable worker is available.
+    if (cleanupStatus === "failed" && input.lease.leasePolicy === "reuse_by_environment") {
+      const pending = await prepareSandboxStopAndRetain(db, input.lease);
+      return pending ? toEnvironmentLeaseSnapshot(pending) : null;
+    }
     // Daytona and other plugin providers release here, not in the built-in path.
     if (cleanupStatus === "success") crashPoint("environment.lease_release.after_provider_before_lease");
 
