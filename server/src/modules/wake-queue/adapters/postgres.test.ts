@@ -1330,7 +1330,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
 
   it("binds host callbacks to the release transaction so concurrent releases complete on a bounded pool", async () => {
     const poolSize = 3;
-    const boundedDb = createDb(tempDb!.connectionString, { maxConnections: poolSize });
+    const boundedDb = createDb(external ?? tempDb!.connectionString, { maxConnections: poolSize });
     const companyId = await seedCompany();
     const agentId = await seedAgent({ companyId });
     const releasesToRun: Array<{ issueId: string; runId: string }> = [];
