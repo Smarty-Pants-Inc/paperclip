@@ -2140,7 +2140,9 @@ export function IssueProperties({
   }, [allIssues, issue.parentId]);
   const parentAncestor = issue.ancestors?.find((ancestor) => ancestor.id === issue.parentId);
   const parentIdentifier = parentAncestor?.identifier ?? currentParentIssue?.identifier;
-  const parentTitle = parentAncestor?.title ?? currentParentIssue?.title ?? issue.parentId?.slice(0, 8);
+  const parentTitle = (!isLockedIssueStub(parentAncestor) ? parentAncestor?.title : undefined)
+    ?? currentParentIssue?.title
+    ?? issue.parentId?.slice(0, 8);
   const parentTrigger = issue.parentId ? (
     <IssueReferencePill
       variant="property"

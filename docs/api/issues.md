@@ -37,7 +37,9 @@ establish list order, then enriches only visible rows in batches of at most 50.
 GET /api/issues/{issueId}
 ```
 
-Returns the issue with `project`, `goal`, and `ancestors` (parent chain with their projects and goals).
+Returns the issue with `project`, `goal`, and `ancestors` (the structural parent chain, immediate parent first). Ancestors are independently read-checked: each unreadable, missing, or cross-company entry is exactly `{ "id": "ancestor-id", "identifier": null, "locked": true }`, with no other metadata. Array positions and order are preserved, as are the outer issue's raw `parentId` and `projectId`.
+
+Readable ancestors retain their existing fields, but each nested `project` is independently read-checked and becomes `null` if unreadable, missing, or cross-company. This removes its `workspaces` and `primaryWorkspace` along with the project, without clearing the readable ancestor's raw `projectId`.
 
 The response also includes:
 

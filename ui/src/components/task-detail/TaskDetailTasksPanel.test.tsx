@@ -19,10 +19,18 @@ function render(props: React.ComponentProps<typeof TaskDetailTasksPanel>) {
   act(() => root.render(<TaskDetailTasksPanel {...props} />));
 }
 
-const ancestors = [
-  { id: "parent", identifier: "PAP-2", title: "Immediate parent", status: "in_progress" },
-  { id: "root", identifier: null, title: "Root task", status: "done" },
-] as NonNullable<Issue["ancestors"]>;
+const ancestors: NonNullable<Issue["ancestors"]> = [
+  {
+    id: "parent", identifier: "PAP-2", title: "Immediate parent", status: "in_progress",
+    description: null, priority: "medium", assigneeAgentId: null, assigneeUserId: null,
+    projectId: null, goalId: null, project: null, goal: null,
+  },
+  {
+    id: "root", identifier: null, title: "Root task", status: "done",
+    description: null, priority: "medium", assigneeAgentId: null, assigneeUserId: null,
+    projectId: null, goalId: null, project: null, goal: null,
+  },
+];
 
 describe("TaskDetailTasksPanel", () => {
   it("shows ancestors root first above subtasks and folds them independently", () => {
@@ -39,11 +47,25 @@ describe("TaskDetailTasksPanel", () => {
   });
 
   it("renders locked ancestors as non-interactive chips alongside readable ancestors", () => {
-    render({ ancestors: [{ id: "private-parent", identifier: "PAP-99", locked: true }, ancestors[1]] as unknown as Issue["ancestors"], subtasks: [], createdTasks: [], projects: [] });
+    const mixedAncestors: NonNullable<Issue["ancestors"]> = [
+      { id: "private-parent", identifier: null, locked: true },
+      ancestors[1],
+    ];
+    render({ ancestors: mixedAncestors, subtasks: [], createdTasks: [], projects: [] });
     const group = container.querySelector('section[aria-label="Ancestors"]')!;
-    expect(group.querySelector('[data-testid="locked-issue-chip"]')?.textContent).toContain("PAP-99");
+    const chip = group.querySelector('[data-testid="locked-issue-chip"]');
+    expect(chip?.textContent).toBe("Private");
+    expect(chip?.closest('a, [role="link"], button')).toBeNull();
     expect([...group.querySelectorAll('a')].map(link => link.getAttribute("href"))).toEqual(["/issues/root"]);
+    expect([...group.querySelectorAll('a, [data-testid="locked-issue-chip"]')].map(item => item.textContent)).toEqual([
+      expect.stringContaining("Root task"),
+      "Private",
+    ]);
+    expect(group.textContent).not.toContain("Immediate parent");
+    expect(group.textContent).not.toContain("PAP-2");
+    expect(group.querySelector('[title="private-"]')).toBeNull();
     expect(group.textContent).not.toContain("undefined");
+    expect(mixedAncestors.map(ancestor => ancestor.id)).toEqual(["private-parent", "root"]);
   });
 
   it("keeps ancestor-only tasks navigable instead of showing an empty state", () => {

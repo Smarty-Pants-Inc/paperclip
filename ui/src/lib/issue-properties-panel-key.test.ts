@@ -50,6 +50,52 @@ describe("buildIssuePropertiesPanelKey", () => {
     expect(second).not.toBe(first);
   });
 
+  it("changes when the same parent becomes private and readable again", () => {
+    const parent: NonNullable<Issue["ancestors"]>[number] = {
+      id: "parent-1",
+      identifier: "PAP-2",
+      title: "Readable parent",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      projectId: null,
+      goalId: null,
+      project: null,
+      goal: null,
+    };
+    const readable = buildIssuePropertiesPanelKey(
+      createIssue({ parentId: parent.id, ancestors: [parent] }),
+      [],
+    );
+    const locked = buildIssuePropertiesPanelKey(
+      createIssue({ parentId: parent.id, ancestors: [{ id: parent.id, identifier: null, locked: true }] }),
+      [],
+    );
+    const restored = buildIssuePropertiesPanelKey(
+      createIssue({ parentId: parent.id, ancestors: [parent] }),
+      [],
+    );
+    const renamed = buildIssuePropertiesPanelKey(
+      createIssue({ parentId: parent.id, ancestors: [{ ...parent, title: "Renamed parent" }] }),
+      [],
+    );
+
+    expect(JSON.parse(readable).parentSummary).toEqual({
+      id: parent.id,
+      identifier: parent.identifier,
+      title: parent.title,
+    });
+    expect(JSON.parse(locked).parentSummary).toEqual({ id: parent.id, identifier: null, locked: true });
+    expect(locked).not.toBe(readable);
+    expect(locked).not.toContain(parent.title);
+    expect(locked).not.toContain(parent.identifier!);
+    expect(restored).not.toBe(locked);
+    expect(restored).toBe(readable);
+    expect(renamed).not.toBe(restored);
+  });
+
   it("changes when watchdog configuration changes", () => {
     const first = buildIssuePropertiesPanelKey(createIssue({ watchdog: null }), []);
     const second = buildIssuePropertiesPanelKey(

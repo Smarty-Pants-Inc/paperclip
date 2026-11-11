@@ -1559,17 +1559,32 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
-  it("preserves a locked parent stub without manufacturing a title or navigation link", async () => {
-    const root = renderProperties(container, {
-      issue: createIssue({ parentId: "private-parent", ancestors: [{ id: "private-parent", identifier: "PAP-99", locked: true }] as unknown as Issue["ancestors"] }),
+  it("preserves a locked parent stub even when the picker cache has readable metadata", async () => {
+    const { root, queryClient } = renderPropertiesWithQueryClient(container, {
+      issue: createIssue({ parentId: "private-parent", ancestors: [{ id: "private-parent", identifier: null, locked: true }] }),
       childIssues: [],
       onUpdate: vi.fn(),
       inline: true,
     });
     await flush();
-    expect(container.querySelector('[data-testid="locked-issue-chip"]')?.textContent).toContain("PAP-99");
-    expect(container.querySelector('a[href="/issues/PAP-99"]')).toBeNull();
-    expect(container.querySelector('[title="private-"]')).toBeNull();
+    const parentRow = container.querySelector('[data-property-label="Parent"]')!.closest('[data-property-row]')!;
+    const chip = parentRow.querySelector('[data-testid="locked-issue-chip"]');
+    expect(chip?.textContent).toBe("Private");
+    expect(parentRow.querySelector('a, [role="link"]')).toBeNull();
+    expect(parentRow.querySelector('[title="private-"]')).toBeNull();
+
+    await act(async () => {
+      queryClient.setQueryData(queryKeys.issues.list("company-1"), [
+        createIssue({ id: "private-parent", identifier: "PAP-99", title: "Cached private parent title", status: "in_progress" }),
+      ]);
+    });
+    await flush();
+    expect(parentRow.querySelector('[data-testid="locked-issue-chip"]')).toBe(chip);
+    expect(chip?.textContent).toBe("Private");
+    expect(parentRow.textContent).not.toContain("PAP-99");
+    expect(parentRow.textContent).not.toContain("Cached private parent title");
+    expect(parentRow.textContent).not.toContain("in_progress");
+    expect(parentRow.querySelector('a, [role="link"], [title="Cached private parent title"]')).toBeNull();
     act(() => root.unmount());
   });
 

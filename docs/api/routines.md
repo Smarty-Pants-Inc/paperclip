@@ -21,6 +21,15 @@ GET /api/routines/{routineId}
 
 Returns routine details including triggers.
 
+Routine list, detail, and run-history responses return `null` for structured
+project or issue embeds the caller cannot read, or whose target is missing or
+belongs to another company. This covers `project`, `parentIssue`, `activeIssue`,
+and each run's `linkedIssue` (including `lastRun` and `recentRuns`). Each embed
+is authorized independently; a readable issue can remain visible while its
+project embed is `null`. Routine/run records and raw `projectId`, `parentIssueId`,
+and `linkedIssueId` fields are unchanged. This does not make routine definitions
+or run payloads private.
+
 Routine and trigger resource IDs must be complete UUIDs from the API response.
 Short prefixes and malformed IDs return the same `404` as a missing resource.
 UUID lookup accepts PostgreSQL's existing input forms, including uppercase,

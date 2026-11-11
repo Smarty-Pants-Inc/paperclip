@@ -1,4 +1,5 @@
 import type { Issue } from "@paperclipai/shared";
+import { isLockedIssueStub } from "../components/LockedIssueChip";
 
 type IssuePropertiesPanelKeyIssue = Pick<
   Issue,
@@ -34,6 +35,7 @@ export function buildIssuePropertiesPanelKey(
 ) {
   if (!issue) return "";
 
+  const parent = issue.ancestors?.[0];
   return JSON.stringify({
     id: issue.id,
     status: issue.status,
@@ -97,12 +99,10 @@ export function buildIssuePropertiesPanelKey(
           watchdogIssueId: issue.watchdog.watchdogIssueId ?? null,
         }
       : null,
-    parentSummary: issue.ancestors?.[0]
-      ? {
-          id: issue.ancestors[0].id,
-          identifier: issue.ancestors[0].identifier ?? null,
-          title: issue.ancestors[0].title,
-        }
+    parentSummary: parent
+      ? isLockedIssueStub(parent)
+        ? { id: parent.id, identifier: parent.identifier, locked: true }
+        : { id: parent.id, identifier: parent.identifier ?? null, title: parent.title }
       : null,
     childIssues: childIssues.map((child) => ({
       id: child.id,

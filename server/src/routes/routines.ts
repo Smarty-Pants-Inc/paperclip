@@ -1,5 +1,6 @@
 import { Router, type Request } from "express";
-import type { Db } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { issues, projects, type Db } from "@paperclipai/db";
 import {
   createRoutineSchema,
   createDocumentAnnotationCommentSchema,
@@ -10,6 +11,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   updateRoutineSchema,
   updateRoutineTriggerSchema,
+  type RoutineRunSummary,
 } from "@paperclipai/shared";
 import { trackRoutineCreated } from "@paperclipai/shared/telemetry";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
@@ -30,6 +32,69 @@ export function routineRoutes(
   const documentAnnotationsSvc = documentAnnotationService(db);
   const access = accessService(db);
   const routineDocumentKey = "description";
+
+  async function readableRoutineReferences(
+    req: Request,
+    companyId: string,
+    projectIds: (string | null | undefined)[],
+    issueIds: (string | null | undefined)[],
+  ) {
+    const allowedProjectIds = new Set<string>();
+    const allowedIssueIds = new Set<string>();
+    const uniqueProjectIds = [...new Set(projectIds.filter((id): id is string => !!id))];
+    const uniqueIssueIds = [...new Set(issueIds.filter((id): id is string => !!id))];
+    if (!uniqueProjectIds.length && !uniqueIssueIds.length) return { allowedProjectIds, allowedIssueIds };
+
+    // Authorization is not an existence check: only actual same-company rows
+    // may authorize an embed, including when the service supplied a fallback.
+    const [projectRows, issueRows] = await Promise.all([
+      uniqueProjectIds.length
+        ? db.select({ id: projects.id, companyId: projects.companyId }).from(projects)
+          .where(and(eq(projects.companyId, companyId), inArray(projects.id, uniqueProjectIds)))
+        : [],
+      uniqueIssueIds.length
+        ? db.select({
+          id: issues.id,
+          companyId: issues.companyId,
+          projectId: issues.projectId,
+          parentId: issues.parentId,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+          status: issues.status,
+        }).from(issues)
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, uniqueIssueIds)))
+        : [],
+    ]);
+    const resources = [
+      ...projectRows.map((row) => ({ type: "project" as const, companyId: row.companyId, projectId: row.id })),
+      ...issueRows.map((row) => ({
+        type: "issue" as const,
+        companyId: row.companyId,
+        issueId: row.id,
+        projectId: row.projectId,
+        parentIssueId: row.parentId,
+        assigneeAgentId: row.assigneeAgentId,
+        assigneeUserId: row.assigneeUserId,
+        status: row.status,
+      })),
+    ];
+    if (!resources.length) return { allowedProjectIds, allowedIssueIds };
+    const decisions = await access.decideReads(req.actor, resources);
+    for (const [index, resource] of resources.entries()) {
+      if (decisions[index]?.allowed !== true) continue;
+      if (resource.type === "project") allowedProjectIds.add(resource.projectId);
+      else allowedIssueIds.add(resource.issueId);
+    }
+    return { allowedProjectIds, allowedIssueIds };
+  }
+
+  function visibleReference<T extends { id: string } | null | undefined>(reference: T, allowedIds: ReadonlySet<string>): T | null {
+    return reference == null || allowedIds.has(reference.id) ? reference : null;
+  }
+
+  function visibleRun(run: RoutineRunSummary, allowedIssueIds: ReadonlySet<string>): RoutineRunSummary {
+    return { ...run, linkedIssue: visibleReference(run.linkedIssue, allowedIssueIds) };
+  }
 
   function parseBooleanQuery(value: unknown) {
     return value === true || value === "true" || value === "1";
@@ -162,7 +227,15 @@ export function routineRoutes(
     assertCompanyAccess(req, companyId);
     const projectId = typeof req.query.projectId === "string" ? req.query.projectId : undefined;
     const result = await svc.list(companyId, { projectId });
-    res.json(result);
+    const { allowedIssueIds } = await readableRoutineReferences(req, companyId, [], result.flatMap((row) => [
+      row.activeIssue?.id,
+      row.lastRun?.linkedIssue?.id,
+    ]));
+    res.json(result.map((row) => ({
+      ...row,
+      activeIssue: visibleReference(row.activeIssue, allowedIssueIds),
+      lastRun: row.lastRun == null ? row.lastRun : visibleRun(row.lastRun, allowedIssueIds),
+    })));
   });
 
   router.post("/companies/:companyId/routines", validate(createRoutineSchema), async (req, res) => {
@@ -206,7 +279,19 @@ export function routineRoutes(
   router.get("/routines/:id", async (req, res) => {
     const detail = await getAccessibleResource(req, res, svc.getDetail(req.params.id as string), "Routine not found");
     if (!detail) return;
-    res.json({ ...detail, canChangeResponsibleUser: await canChangeResponsibleUser(req, detail.companyId) });
+    const { allowedProjectIds, allowedIssueIds } = await readableRoutineReferences(req, detail.companyId, [detail.project?.id], [
+      detail.parentIssue?.id,
+      detail.activeIssue?.id,
+      ...(detail.recentRuns ?? []).map((run) => run.linkedIssue?.id),
+    ]);
+    res.json({
+      ...detail,
+      project: visibleReference(detail.project, allowedProjectIds),
+      parentIssue: visibleReference(detail.parentIssue, allowedIssueIds),
+      activeIssue: visibleReference(detail.activeIssue, allowedIssueIds),
+      recentRuns: detail.recentRuns?.map((run) => visibleRun(run, allowedIssueIds)) ?? detail.recentRuns,
+      canChangeResponsibleUser: await canChangeResponsibleUser(req, detail.companyId),
+    });
   });
 
   router.get("/routines/:id/revisions", async (req, res) => {
@@ -487,7 +572,8 @@ export function routineRoutes(
     if (!routine) return;
     const limit = Number(req.query.limit ?? 50);
     const result = await svc.listRuns(routine.id, Number.isFinite(limit) ? limit : 50);
-    res.json(result);
+    const { allowedIssueIds } = await readableRoutineReferences(req, routine.companyId, [], result.map((run) => run.linkedIssue?.id));
+    res.json(result.map((run) => visibleRun(run, allowedIssueIds)));
   });
 
   router.post("/routines/:id/triggers", validate(createRoutineTriggerSchema), async (req, res) => {
