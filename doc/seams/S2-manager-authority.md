@@ -32,6 +32,21 @@ Upstream search was bounded, across open/closed issues and PRs; no claim all tho
 
 Detailed evidence ledger: maintainer notes (private) and maintainer notes (private); [owner summary #20045 c6793943839](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045#issuecomment-6793943839). Scratch paths are maintainer working evidence, not portable public upstream references.
 
+
+### Measured on 2026.1111.0-canary.4 (lab, 2026-11-11, own test agents; a live `sleep 75` report run each time)
+| Case | Actor | HTTP | Report's live run | Latency (server / observed) | Run IDs (prefixes) |
+| --- | --- | --- | --- | --- | --- |
+| Comment `interrupt:true` on the report's issue | manager agent key + own run | 403 "Only board users can interrupt active runs from issue comments" | continued, succeeded | n/a | report run b040685c; manager run ee21d153 |
+| `POST /api/heartbeat-runs/{id}/cancel` | manager agent key + own run | 403 `board_access_required` | continued, succeeded | n/a | report run 3cbeba3f; manager run 8f3c1dba |
+| `POST /api/agents/{id}/pause` | manager agent key | 403 `board_access_required` | continued | n/a | report run 62a79321 |
+| Reassign the report's issue | manager agent key, no run context | 403 `cross_issue_influence_run_context_required` | continued, succeeded | n/a | probe d6944f7b |
+| Reassign the report's issue | manager agent key + own run | 200 | cancelled (`issue_reassigned`) | 2.79 s / 19.81 s | case dc836b00; manager run 74401dbf |
+| Cancel the report's issue | manager agent key + own run | 200 | cancelled | 3.63 s / 16.47 s | case 2ac74de3; manager run 80e360dc |
+| Pause the agent (board; the same server path as plugin `ctx.agents.pause`) | board | 200 | cancelled (`agent_paused`) | 0.43 s / 1.82 s; lifecycle settled to paused in 6.92 s | case 468428c1 |
+| Pause again | board | 200 | cancelled (`agent_paused`) | 0.24 s / 1.64 s; settled in 19.08 s; resume to idle 1.36 s | case 37a8e869 |
+| Redirect by plain comment (no interrupt) | board/agent | 201 | ran to completion; picked up on the NEXT turn | successor run started 33-104 s after the comment | run 00b32d12, successor 2bd65992 |
+Conclusion: native reassign/cancel (from the manager's run) and plugin-path pause already stop a report's live run. Terminate/retire-by-manager and run-only cancel/interrupt (stopping a run without changing the issue's ownership or status) have no agent or plugin primitive.
+
 ## Design
 
 **Choice pending step 4; alternatives are mutually exclusive delivery paths, not dual authorities.** Both preserve native lifecycle/heartbeat/queued-input orchestration, grace, durable fencing, cleanup and true actor provenance. Neither introduces a runner/process supervisor, second transcript store or raw DB lifecycle writes.
