@@ -58,6 +58,7 @@ Until upstream's next stable release, the seam branches are based on upstream
 | S1 | Runner Pi configuration: Pi version, thinking levels, named Pi packages | design review | `seam/runner-pi-1.2` | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered |
 | S2 | Manager interrupts or steers a report's run | planned | | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered |
 | S3 | Fork pipeline: upstream sync, CI, release image | planned | | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not applicable |
+| S4 | Sandbox callback bridge admits the run-scoped tool gateway: 4 exact routes plus the gateway session-token header (no allow-all) | built, not deployed | `seam/sandbox-tool-gateway` | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered (upstream [#18748](https://github.com/paperclipai/paperclip/issues/18748); the broader [#18949](https://github.com/paperclipai/paperclip/pull/18949) is not used) |
 
 S1's scope and whether it splits into separate seams are being settled by its design
 review. This table is updated when the review result is recorded.
