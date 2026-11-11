@@ -3438,7 +3438,7 @@ describe("sandbox adapter execution targets", () => {
   // Start a host API server that records each forwarded request, so a test can
   // assert the real token and the run id reach the host, or that a rejected
   // request never forwards.
-  async function startRecordingApiServer(responseStatus = 200): Promise<{
+  async function startRecordingApiServer(responseStatus = 200, toolCallDelayMs = 0): Promise<{
     origin: string;
     requests: Array<{
       method: string;
@@ -3465,7 +3465,7 @@ describe("sandbox adapter execution targets", () => {
       }
       const chunks: Buffer[] = [];
       req.on("data", (chunk: Buffer) => chunks.push(chunk));
-      req.on("end", () => {
+      req.on("end", async () => {
         requests.push({
           method: req.method ?? "GET",
           url: req.url ?? "/",
@@ -3474,6 +3474,9 @@ describe("sandbox adapter execution targets", () => {
           headers,
           body: Buffer.concat(chunks),
         });
+        if (req.url === "/api/tool-gateway/tools/call" && toolCallDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, toolCallDelayMs));
+        }
         // An attachment-content download answers with a binary body, so a
         // test can assert the bytes reach the caller unchanged. Every other
         // route keeps the fixed JSON acknowledgement.
@@ -3548,6 +3551,47 @@ describe("sandbox adapter execution targets", () => {
       },
     };
   }
+
+  it("completes a 12-second gateway tool call and the request queued behind it over queue_v1", async () => {
+    const { remoteCwd } = await createSandboxWorkspace("paperclip-gateway-slow-call-");
+    const api = await startRecordingApiServer(200, 12_000);
+    const bridge = await startTestDuplexBridge("run-slow-gateway", queueSandboxTarget(remoteCwd), api.origin);
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const headers = {
+        authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+        "content-type": "application/json",
+        "x-paperclip-tool-gateway-token": "gateway-session-token",
+      };
+      const slowCall = fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/tool-gateway/tools/call`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ tool: "slow-tool", timeoutMs: 60_000 }),
+      });
+      await vi.waitFor(() => expect(api.requests).toHaveLength(1), { timeout: 5_000 });
+      const queuedRead = fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me`, { headers });
+      // Both requests really enter the generated sandbox queue before the slow
+      // host answer; this is not two sequential client calls or a mocked worker.
+      await vi.waitFor(async () => {
+        expect(await readdir(path.join(bridge!.env.PAPERCLIP_BRIDGE_QUEUE_DIR, "requests")))
+          .toHaveLength(2);
+      }, { timeout: 5_000 });
+      const responses = await Promise.all([slowCall, queuedRead]);
+      expect(responses.map((response) => response.status)).toEqual([200, 200]);
+      expect(await Promise.all(responses.map((response) => response.json())))
+        .toEqual([{ ok: true }, { ok: true }]);
+      expect(api.requests.map((request) => request.url))
+        .toEqual(["/api/tool-gateway/tools/call", "/api/agents/me"]);
+      expect(api.requests[0]).toMatchObject({
+        auth: "Bearer real-run-jwt",
+        runId: "run-slow-gateway",
+        headers: { "x-paperclip-tool-gateway-token": "gateway-session-token" },
+      });
+    } finally {
+      await bridge?.stop();
+      await api.close();
+    }
+  }, 30_000);
 
   it.each([
     ["queue_v1", 200],

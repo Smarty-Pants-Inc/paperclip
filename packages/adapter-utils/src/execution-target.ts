@@ -4386,9 +4386,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   maxBodyBytes?: number | null;
   // The deadline for one forward call, in milliseconds. This is the inner budget
-  // of the duplex broker's nested budget set. The default is the forward budget
-  // in `DEFAULT_DUPLEX_BROKER_BUDGETS` (30 s), so the current behavior does not
-  // change when the caller sets no option.
+  // of the duplex broker's nested budget set. Defaults to 30 s for HTTP/2 and
+  // 75 s for queue_v1, whose worker deadline must allow a 60 s gateway call.
   forwardTimeoutMs?: number | null;
   // The first strict gate for the duplex transport. The host selects duplex only
   // when this is exactly `true` and the resolved capability
@@ -4519,6 +4518,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     signal?: AbortSignal,
     options?: {
       suppressDebugLog?: boolean;
+      forwardTimeoutMs?: number;
       /**
        * Both transports pass the request's reservation owner, so response
        * buffers count toward the same host process ceiling as request buffers.
@@ -4547,7 +4547,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     // Abort the forward when the caller aborts the request (its per-iteration
     // timeout or watchdog fired, or the broker's forward budget ended), or after
     // the forward budget here, whichever comes first.
-    const timeoutSignal = AbortSignal.timeout(forwardTimeoutMs);
+    const timeoutSignal = AbortSignal.timeout(options?.forwardTimeoutMs ?? forwardTimeoutMs);
     const forwardSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     // Build the request-body init. A GET or a HEAD carries no body. The file
     // bridge passes legacy JSON as a string and binary data as a `Buffer`;
@@ -4956,15 +4956,22 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     // the run parent context (see `runWithRuntimeParent` inside that function).
     // So the startup `mkdir` execs stay parented to the step, and every later
     // request `sandbox.exec` span parents to the live run span.
+    // A gateway tools/call can legitimately take 60 s. Keep the worker,
+    // watchdog and sandbox response deadlines ordered, with relay headroom.
+    // The forward backstop stays above the worker deadline so a hung mutation
+    // is aborted by worker recovery and retains its non-retryable outcome.
     worker = await startSandboxCallbackBridgeWorker({
       client,
       queueDir,
       maxBodyBytes,
+      iterationTimeoutMs: 70_000,
+      watchdogTimeoutMs: 80_000,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
+        forwardTimeoutMs: input.forwardTimeoutMs ?? 75_000,
       }),
     });
     server = await startSandboxCallbackBridgeServer({
@@ -4975,6 +4982,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       bridgeToken,
       bridgeAsset,
       timeoutMs: bridgeTimeoutMs,
+      responseTimeoutMs: 90_000,
       maxBodyBytes,
       shellCommand,
     });
