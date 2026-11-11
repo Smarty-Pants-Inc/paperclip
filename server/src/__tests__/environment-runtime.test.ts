@@ -4591,13 +4591,20 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect.anything(),
       expect.anything(),
     );
-    // The failed release verification must enter the pending-cleanup retry flow.
-    // The reaper sweeps only `pending_cleanup` leases, so a `released` status
-    // here would strand the still-active provider resource.
+    // The failed release verification must persist stop-only retry intent.
+    // A released row would strand the resource; generic pending_cleanup would
+    // destroy the reusable workspace once the worker is available again.
     await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
       status: "pending_cleanup",
       cleanupStatus: "failed",
-      failureReason: "release_cleanup_failed",
+      failureReason: "sandbox_stop_pending",
+      metadata: {
+        sandboxStopAndRetain: {
+          runId: lease.heartbeatRunId,
+          providerLeaseId: lease.providerLeaseId,
+          pluginId,
+        },
+      },
     });
   });
 
