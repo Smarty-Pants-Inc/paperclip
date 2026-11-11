@@ -3,7 +3,7 @@ import { NativeControllerRecoveryWaitingError } from "../native-runtime/native-c
 import { createNativeUsageDelivery } from "../native-runtime/native-usage-delivery.js";
 import { flushBudgetEvaluationWork } from "../budgets.js";
 import { NativeSessionCloseUnrecoverableError, type PrpEvent } from "../../vendor/paperclip-runner/index.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -74,9 +74,9 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     vi.mocked(executePaperclipNativeSession).mockResolvedValue({ exitCode: 0, signal: null, timedOut: false });
   });
 
-  async function fixture(native = false, provider: "codex" | "grok_bot" | "openai_dot" = "codex") {
+  async function fixture(native = false, provider: "codex" | "grok_bot" | "openai_dot" | "acpx" = "codex") {
     const [company] = await db.insert(companies).values({ name: "Runtime execution", issuePrefix: "EXE" }).returning();
-    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Executing agent", status: "running", adapterType: native ? "paperclip_runner" : "process", adapterConfig: provider === "codex" ? { provider } : { provider, lifecycleMode: "per_turn", allowUnmeteredProvider: true, [provider === "grok_bot" ? "externalBindingId" : "dotBindingId"]: randomUUID() } }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Executing agent", status: "running", adapterType: native ? "paperclip_runner" : "process", adapterConfig: provider === "acpx" ? { provider, acpxAgent: "pi", model: "openrouter/deepseek/deepseek-v4-flash-0731", acpxPermissionMode: "deny-all" } : provider === "codex" ? { provider } : { provider, lifecycleMode: "per_turn", allowUnmeteredProvider: true, [provider === "grok_bot" ? "externalBindingId" : "dotBindingId"]: randomUUID() } }).returning();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Complete this task", assigneeAgentId: agent.id }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, scopeKind: "issue", status: "running", runtimeMode: native ? "native" : "legacy" }).returning();
     const state = createHeartbeatRunState(db);
@@ -87,6 +87,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       companyId: company.id, agentId: agent.id, runId: run.id, issue,
       taskPrompt: issue.title, workspace: { id: run.id, cwd: home, repoUrl: null, repoRef: null, branchName: null },
       normalizedSessionId: null, provider, runtimeContext: nativeRuntimeContextFixture(),
+      ...(provider === "acpx" ? { acpxAgent: "pi" as const, model: "openrouter/deepseek/deepseek-v4-flash-0731", acpxPermissionMode: "deny-all" as const } : {}),
       dotBinding: { bindingId: randomUUID(), bindingGeneration: 1, companyId: company.id, agentId: agent.id, acceptByUnixMs: Date.now() + 60_000, expiresAtUnixMs: Date.now() + 120_000 },
       completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: issue.title, criteria: [{ id: "output", requirement: issue.title }] } },
     }) : null;
@@ -406,6 +407,34 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(revokeHeartbeatRunGatewayTokens).toHaveBeenCalledWith({ db, companyId: input.agent.companyId, runId: input.run.id });
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   }
+
+  it.each(["issue", "no-issue", "operator"] as const)("projects Pi Langfuse parent context into native Runner dispatch (%s)", async scenario => {
+    const { input } = await fixture(true, "acpx");
+    if (scenario === "no-issue") {
+      input.task.issueId = null;
+      input.task.issueRef = null;
+    }
+    const operator = scenario === "operator" ? {
+      LANGFUSE_PI_PARENT_TRACE_ID: "operator-trace",
+      LANGFUSE_PI_PARENT_SPAN_ID: "operator-span",
+      LANGFUSE_PI_PARENT_SESSION_ID: "operator-session",
+    } : {};
+    input.config.configuredTaskEnvironment = { LANGFUSE_TRACING_ENABLED: "true", ...operator };
+    input.config.adapterEnv = { LANGFUSE_TRACING_ENABLED: "true", ...operator };
+    await executeHeartbeatRuntime(db, input);
+    const environment = vi.mocked(executePaperclipNativeSession).mock.calls[0]![0].runnerEnvironment!;
+    expect(environment).toMatchObject({
+      LANGFUSE_TRACING_ENABLED: "true",
+      LANGFUSE_PI_PARENT_TRACE_ID: createHash("sha256").update(`paperclip.run:${input.run.id}`).digest("hex").slice(0, 32),
+      LANGFUSE_PI_PARENT_SPAN_ID: createHash("sha256").update(`paperclip.run.span:${input.run.id}`).digest("hex").slice(0, 16),
+      LANGFUSE_PI_PARENT_SESSION_ID: input.task.issueId ?? input.run.id,
+      ...operator,
+    });
+    expect(JSON.parse(environment.PAPERCLIP_CONFIGURED_ENV_KEYS!)).toEqual([
+      "LANGFUSE_PI_PARENT_SESSION_ID", "LANGFUSE_PI_PARENT_SPAN_ID", "LANGFUSE_PI_PARENT_TRACE_ID", "LANGFUSE_TRACING_ENABLED",
+    ]);
+    expect(environment).not.toHaveProperty("LANGFUSE_PI_PARENT_DEPTH");
+  });
 
   it("passes preparation renewal ownership to native dispatch", async () => {
     const { input } = await fixture(true);

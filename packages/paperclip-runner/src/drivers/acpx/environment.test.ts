@@ -74,6 +74,19 @@ describe("ACPX launch environment", () => {
     expect(createSanitizedAcpxSpawnInput({ MCP_TOOL_TIMEOUT: "120000" }, "codex").env).not.toHaveProperty("MCP_TOOL_TIMEOUT");
   });
 
+  it.each([
+    "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL",
+    "LANGFUSE_TRACING_ENVIRONMENT", "LANGFUSE_TRACING_ENABLED", "PI_LANGFUSE_MAX_CHARS",
+    "LANGFUSE_PI_PARENT_TRACE_ID", "LANGFUSE_PI_PARENT_SPAN_ID", "LANGFUSE_PI_PARENT_SESSION_ID",
+  ])("requires an explicit Pi-only session binding for %s, never ambient inheritance", name => {
+    vi.stubEnv(name, "ambient-value");
+    expect(createSanitizedAcpxSpawnInput(undefined, "pi").env).not.toHaveProperty(name);
+    expect(createSanitizedAcpxSpawnInput({ [name]: "explicit-value" }, "claude").env).not.toHaveProperty(name);
+    expect(createSanitizedAcpxSpawnInput({ [name]: "explicit-value" }, "pi").env[name]).toBe("explicit-value");
+    expect(() => createAcpxSidecarHostEnvironment({ [name]: "unbound-value" }, "pi", "session-1"))
+      .toThrow("explicit matching session binding");
+  });
+
   it("excludes general IAM from the Pi sidecar and launch, including selected task values", () => {
     const iam = { AWS_ACCESS_KEY_ID: "general-key", AWS_SECRET_ACCESS_KEY: "general-secret", AWS_SESSION_TOKEN: "general-session" };
     const source = { ...iam, ...configuredEnvironmentProjection({ ...iam, CUSTOM_SETTING: "allowed" }), AWS_BEARER_TOKEN_BEDROCK: "provider-key" };

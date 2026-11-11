@@ -22,6 +22,7 @@ import {
   PAPERCLIP_WAKE_PAYLOAD_KEY,
   configuredPaperclipApiBaseUrl,
   buildPaperclipRuntimeMcpServers,
+  buildPiLangfuseParentEnvironment,
   createAdapterRuntimeToolAccess,
   paperclipApiBaseUrl,
   createAdapterRuntimeMcpAccess,
@@ -698,7 +699,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               managedAiCredentialHome: managedAiRuntime ? String((managedAiRuntime.config.env as Record<string, unknown>).CODEX_HOME) : undefined,
               dotWorkspaceRoot: nativeExecution.provider.kind === "openai_dot" && resolvedConfig.dotWorkspaceAccess === true ? executionWorkspace.cwd : undefined,
               runnerEnvironment: {
-                ...configuredEnvironmentProjection(configuredTaskEnvironment),
+                ...configuredEnvironmentProjection(buildPiLangfuseParentEnvironment(
+                  configuredTaskEnvironment,
+                  nativeExecution.provider,
+                  run.id,
+                  issueId,
+                )),
                 ...buildNativeProviderEnvironment(
                   adapterEnv,
                   process.env,

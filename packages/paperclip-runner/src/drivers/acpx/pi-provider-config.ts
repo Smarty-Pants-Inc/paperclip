@@ -15,6 +15,11 @@ export const PI_CREDENTIAL_NAMES = Object.freeze([
   "ANT_LING_API_KEY", "QWEN_TOKEN_PLAN_API_KEY", "QWEN_TOKEN_PLAN_CN_API_KEY",
   "TYPESAFE_API_KEY", "RADIUS_API_KEY", "COPILOT_GITHUB_TOKEN", "AWS_BEARER_TOKEN_BEDROCK",
   "PAPERCLIP_PI_PROVIDERS",
+  // Explicit per-run extension inputs use the same controller/session binding
+  // as provider credentials; never inherit an ambient Langfuse login.
+  "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL",
+  "LANGFUSE_TRACING_ENVIRONMENT", "LANGFUSE_TRACING_ENABLED", "PI_LANGFUSE_MAX_CHARS",
+  "LANGFUSE_PI_PARENT_TRACE_ID", "LANGFUSE_PI_PARENT_SPAN_ID", "LANGFUSE_PI_PARENT_SESSION_ID",
 ]);
 
 // General IAM credentials authorize services beyond the model provider. Bedrock

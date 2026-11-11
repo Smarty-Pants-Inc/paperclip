@@ -11,6 +11,7 @@ import {
 import {
   buildPaperclipRuntimeMcpServers,
   buildPaperclipWakePayload,
+  buildPiLangfuseParentEnvironment,
   ConfigurationIncompleteFailure,
   createHeartbeatRunPreparation,
   resolveExecutionRunAdapterConfig,
@@ -46,6 +47,39 @@ function deferred<T>() {
 }
 
 const emptyRoutineContext = { routineId: null, env: null, responsibleUserId: null };
+
+describe("Pi Langfuse parent environment", () => {
+  const runId = "00000000-0000-4000-8000-000000000001";
+  const issueId = "11111111-1111-4111-8111-111111111111";
+  const pi = { kind: "acpx", agent: "pi" };
+  const parents = {
+    LANGFUSE_PI_PARENT_TRACE_ID: "840666d160dfd7848af5f5e86661e0d6",
+    LANGFUSE_PI_PARENT_SPAN_ID: "53485794c95451df",
+    LANGFUSE_PI_PARENT_SESSION_ID: issueId,
+  };
+
+  // Trust boundary: these exact bytes join the server envelope and Pi spans.
+  it("derives the fixed server-plugin contract vector without setting depth", () => {
+    const source = { LANGFUSE_TRACING_ENABLED: "true" };
+    expect(buildPiLangfuseParentEnvironment(source, pi, runId, issueId)).toEqual({ ...source, ...parents });
+    expect(source).toEqual({ LANGFUSE_TRACING_ENABLED: "true" });
+  });
+
+  it.each([null, undefined])("uses the heartbeat run for a run without an issue (%s)", issue => {
+    expect(buildPiLangfuseParentEnvironment({}, pi, runId, issue)).toEqual({ ...parents, LANGFUSE_PI_PARENT_SESSION_ID: runId });
+  });
+
+  it.each(Object.keys(parents))("preserves an operator-set %s independently, including an empty value", name => {
+    for (const value of ["operator-value", ""]) {
+      expect(buildPiLangfuseParentEnvironment({ [name]: value }, pi, runId, issueId)).toEqual({ ...parents, [name]: value });
+    }
+  });
+
+  it.each([{ kind: "codex" }, { kind: "acpx", agent: "claude" }])("does not add Pi context to %j", provider => {
+    const source = { CUSTOM: "retained" };
+    expect(buildPiLangfuseParentEnvironment(source, provider, runId, issueId)).toEqual(source);
+  });
+});
 
 describe("heartbeat run preparation module", () => {
   it("preserves the legacy error class and public preparation functions", () => {

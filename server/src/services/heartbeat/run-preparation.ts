@@ -666,6 +666,26 @@ export async function resolveExecutionRunAdapterConfig(input: {
   };
 }
 
+/** Join Pi observations to the server's Langfuse run envelope, before projection. */
+export function buildPiLangfuseParentEnvironment(
+  configured: NodeJS.ProcessEnv,
+  provider: { kind: string; agent?: string },
+  runId: string,
+  issueId?: string | null,
+): NodeJS.ProcessEnv {
+  if (provider.kind !== "acpx" || provider.agent !== "pi") return configured;
+  // Byte-exact contract shared with the server-side Langfuse plugin. Defaults
+  // are run-scoped, not session-scoped; operator values (even empty) win.
+  return {
+    ...configured,
+    LANGFUSE_PI_PARENT_TRACE_ID: configured.LANGFUSE_PI_PARENT_TRACE_ID
+      ?? createHash("sha256").update(`paperclip.run:${runId}`).digest("hex").slice(0, 32),
+    LANGFUSE_PI_PARENT_SPAN_ID: configured.LANGFUSE_PI_PARENT_SPAN_ID
+      ?? createHash("sha256").update(`paperclip.run.span:${runId}`).digest("hex").slice(0, 16),
+    LANGFUSE_PI_PARENT_SESSION_ID: configured.LANGFUSE_PI_PARENT_SESSION_ID ?? issueId ?? runId,
+  };
+}
+
 export function extractMentionedSkillIdsFromSources(
   sources: Array<string | null | undefined>,
 ): string[] {
