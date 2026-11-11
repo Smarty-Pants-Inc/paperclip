@@ -1,21 +1,52 @@
 import { describe, expect, it } from "vitest";
-import { admittedPiThinkingLevel, createPiThinkingAdmission, resolvePiThinkingLevel } from "./pi-thinking.js";
+import { admittedPiThinkingLevel, createPiThinkingAdmission, piNativeThinkingValue, resolvePiThinkingLevel } from "./pi-thinking.js";
 
-const config = (mode: string) => [{ id: "thought_level", type: "select", currentValue: mode, options: ["high", "low", "max"].map(value => ({ value, name: value })) }];
+const claudeModel = "cliproxyapi-anthropic/claude-opus-5-5";
+const config = (mode: string) => [{ id: "thought_level", type: "select", currentValue: mode, options: ["off", "low", "high", "xhigh", "max"].map(value => ({ value, name: value })) }];
 const session = (mode: string) => ({ sessionId: "native", modes: { currentModeId: mode }, configOptions: config(mode) });
 const prompt = { id: 9, method: "session/prompt", params: { sessionId: "native" } };
-function opened(expected: "off" | "low" | "high" | "max", initial: string = expected) {
-  const admission = createPiThinkingAdmission(expected); const guard = admission.createGuard();
+function opened(expected: "off" | "low" | "high" | "max", initial: string = expected === "max" ? "xhigh" : expected) {
+  const native = expected === "max" ? "xhigh" : expected;
+  const admission = createPiThinkingAdmission(expected, { modelId: claudeModel }); const guard = admission.createGuard();
   guard("outbound", { id: 0, method: "session/new", params: {} });
   guard("inbound", { id: 0, result: session(initial) });
-  if (initial === expected) {
-    guard("outbound", { id: 100, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: expected } });
-    guard("inbound", { id: 100, result: { configOptions: config(expected) } });
+  if (initial === native) {
+    guard("outbound", { id: 100, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: native } });
+    guard("inbound", { id: 100, result: { configOptions: config(native) } });
   }
   return { admission, guard };
 }
 
 describe("Pi thinking native mode admission", () => {
+  it.each([
+    ["cliproxyapi-anthropic/claude-opus-5-5", "xhigh"],
+    ["cliproxyapi/Claude-opus-5-5", "xhigh"],
+    ["custom/CLAUDE-sonnet", "xhigh"],
+    ["custom-ANTHROPIC/model", "xhigh"],
+    ["cliproxyapi/gpt-6-luna", "max"],
+    ["custom/gemini", "max"],
+    ["claude-provider/not-claude", "max"],
+    [undefined, "max"],
+  ] as const)("maps and admits levels for model %s (max=%s)", (modelId, maxNative) => {
+    for (const level of ["off", "low", "high", "max"] as const) {
+      const native = level === "max" ? maxNative : level;
+      expect(piNativeThinkingValue(level, modelId)).toBe(native);
+      const admission = createPiThinkingAdmission(level, { modelId });
+      const guard = admission.createGuard();
+      guard("outbound", { id: 0, method: "session/new", params: {} });
+      guard("inbound", { id: 0, result: session("high") });
+      guard("outbound", { id: 1, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: native } });
+      guard("inbound", { id: 1, result: { configOptions: config(native) } });
+      admission.assertReady(); guard("outbound", prompt);
+      if (level === "max") {
+        const wrong = native === "xhigh" ? "max" : "xhigh";
+        const rejected = createPiThinkingAdmission(level, { modelId, restoring: true });
+        const reload = rejected.createGuard();
+        reload("outbound", { id: 2, method: "session/load", params: { sessionId: "native" } });
+        expect(() => reload("inbound", { id: 2, result: session(wrong) })).toThrow(/drifted/);
+      }
+    }
+  });
   it("requires explicit Pi thinking and rejects unadmitted aliases and other providers", () => {
     expect(() => resolvePiThinkingLevel("pi", undefined)).toThrow(/explicit/);
     expect(resolvePiThinkingLevel("codex", undefined)).toBeUndefined();
@@ -29,8 +60,23 @@ describe("Pi thinking native mode admission", () => {
     expect(admission.assertReady).toThrow();
     expect(() => guard("outbound", prompt)).toThrow(/replaced/);
     reloaded("outbound", { id: 1, method: "session/load", params: { sessionId: "native" } });
-    reloaded("inbound", { id: 1, result: session(expected) });
+    reloaded("inbound", { id: 1, result: session(expected === "max" ? "xhigh" : expected) });
     admission.assertReady(); reloaded("outbound", prompt);
+  });
+  it("rejects max as a native setter or acknowledgement for Paperclip max", () => {
+    const setter = opened("max", "high");
+    expect(() => setter.guard("outbound", { id: 2, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: "max" } })).toThrow(/selected mode/);
+    const echo = opened("max", "high");
+    echo.guard("outbound", { id: 2, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: "xhigh" } });
+    expect(() => echo.guard("inbound", { id: 2, result: { configOptions: config("max") } })).toThrow(/did not apply/);
+    expect(echo.admission.assertReady).toThrow();
+  });
+  it("rejects a restored native max when Paperclip max requires xhigh", () => {
+    const admission = createPiThinkingAdmission("max", { restoring: true, modelId: claudeModel });
+    const guard = admission.createGuard();
+    guard("outbound", { id: 0, method: "session/load", params: { sessionId: "native" } });
+    expect(() => guard("inbound", { id: 0, result: session("max") })).toThrow(/drifted/);
+    expect(admission.assertReady).toThrow();
   });
   it.each(["medium", "high"])("allows initial %s/model-selection updates but requires a correlated low setter before prompting", initial => {
     const { admission, guard } = opened("low", initial);
@@ -198,6 +244,8 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
 
 it("publishes only independently matching observed Pi mode, never the requested value alone", () => {
   expect(admittedPiThinkingLevel("pi", "low", { piThinkingLevel: "low" }, { piThinkingLevel: "low" })).toBe("low");
+  expect(admittedPiThinkingLevel("pi", "max", { piThinkingLevel: "max" }, { piThinkingLevel: "max" })).toBe("max");
+  expect(() => admittedPiThinkingLevel("pi", "max", { piThinkingLevel: "xhigh" }, { piThinkingLevel: "xhigh" })).toThrow();
   for (const observed of [undefined, "high", "medium", null]) {
     expect(() => admittedPiThinkingLevel("pi", "low", { piThinkingLevel: "low" }, { piThinkingLevel: observed })).toThrow();
     expect(() => admittedPiThinkingLevel("pi", "low", { piThinkingLevel: observed }, { piThinkingLevel: "low" })).toThrow();

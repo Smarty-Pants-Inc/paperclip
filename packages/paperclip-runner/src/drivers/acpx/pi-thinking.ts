@@ -12,8 +12,16 @@ export function resolvePiThinkingLevel(agent: string, mode: unknown): PiThinking
   return mode;
 }
 
-export function createPiThinkingAdmission(expected: PiThinkingLevel, options: { restoring?: boolean } = {}) {
-  return createAcpxConfigAdmission(expected, { ...options, label: "Pi thinking mode", configId: "thought_level",
+export function piNativeThinkingValue(level: PiThinkingLevel, modelId?: string) {
+  const parts = (modelId ?? "").toLowerCase().split("/");
+  const model = parts.pop() ?? "";
+  const isClaude = model.startsWith("claude") || parts.join("/").includes("anthropic");
+  return level === "max" && isClaude ? "xhigh" : level;
+}
+
+export function createPiThinkingAdmission(expected: PiThinkingLevel, options: { restoring?: boolean; modelId?: string } = {}) {
+  const { modelId, ...admissionOptions } = options;
+  return createAcpxConfigAdmission(piNativeThinkingValue(expected, modelId), { ...admissionOptions, label: "Pi thinking mode", configId: "thought_level",
     supportedValues: ["off", "minimal", "low", "medium", "high", "xhigh", "max"], sessionMode: true });
 }
 

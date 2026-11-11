@@ -8,7 +8,7 @@ import { createGrokSessionOpenGuard } from "./grok-session-rules.js";
 import { resolveClaudeEffort, createClaudeEffortAdmission } from "./claude-effort.js";
 import { acpxProviderFailure, acpxTypedSessionFailureClientCapabilities, acpxTypedTerminalSessionFailure, type AcpxTerminalSessionFailure } from "./provider-failure.js";
 import type { ProviderFailure } from "../../contracts/provider-failure.generated.js";
-import { createPiThinkingAdmission, resolvePiThinkingLevel } from "./pi-thinking.js";
+import { createPiThinkingAdmission, piNativeThinkingValue, resolvePiThinkingLevel } from "./pi-thinking.js";
 import { usesPreconfiguredHome } from "../preconfigured-home.js";
 import type { ChildProcess } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -408,7 +408,7 @@ export async function openQualifiedAcpxRuntime(
   const commandLaunches = { count: 0, refreshConsumedCommand: options.refreshConsumedCommand };
   const modeBinding = createAcpxModeBinding(options.profile.agent, options.mode);
   const selectedPiThinkingLevel = resolvePiThinkingLevel(options.profile.agent, options.piThinkingLevel);
-  const piThinking = selectedPiThinkingLevel ? createPiThinkingAdmission(selectedPiThinkingLevel, { restoring: options.restoringSession }) : undefined;
+  const piThinking = selectedPiThinkingLevel ? createPiThinkingAdmission(selectedPiThinkingLevel, { restoring: options.restoringSession, modelId: options.profile.reportedModelId }) : undefined;
   const selectedClaudeEffort = resolveClaudeEffort(options.profile.agent, options.claudeEffort);
   const selectedGrokEffort = resolveGrokEffort(options.profile.agent, options.grokEffort);
   const grokDisableWebSearch = resolveGrokDisableWebSearch(options.profile.agent, options.grokDisableWebSearch);
@@ -703,7 +703,7 @@ export async function openQualifiedAcpxRuntime(
         options.signal?.throwIfAborted();
         if (!piThinking.isReady()) {
           if (!runtime.setConfigOption) throw new Error("Pi thinking admission requires native configuration");
-          await runtime.setConfigOption({ handle: ensuredHandle, key: "thought_level", value: selectedPiThinkingLevel! });
+          await runtime.setConfigOption({ handle: ensuredHandle, key: "thought_level", value: piNativeThinkingValue(selectedPiThinkingLevel!, options.profile.reportedModelId) });
           piThinking.assertReady();
           await children.verifyLifetimeOwnership();
           options.signal?.throwIfAborted();

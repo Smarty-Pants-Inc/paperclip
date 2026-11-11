@@ -687,6 +687,39 @@ describe("Codex ACPX runtime adapter", () => {
     second.settle(); await admittedSecond.result; await port.close({ reason: "test finished" });
   });
 
+  it.each([
+    ["cliproxyapi-anthropic/claude-opus-5-5", "xhigh"],
+    ["cliproxyapi/Claude-opus-5-5", "xhigh"],
+    ["cliproxyapi/gpt-6-luna", "max"],
+    ["custom/gemini", "max"],
+  ].flatMap(([model, maxNative]) => (["off", "low", "high", "max"] as const).map(level => ({
+    model, level, native: level === "max" ? maxNative : level,
+  }))))("sets Paperclip Pi $level as native $native for $model and preserves its identity", async ({ model, level, native }) => {
+    const runtime = fakeRuntime();
+    let created!: AcpRuntimeOptions;
+    const options = openOptions(fakeCommand());
+    options.profile = { ...options.profile, agent: "pi", reportedModelId: model };
+    options.piThinkingLevel = level;
+    vi.mocked(runtime.setConfigOption!).mockImplementation(async input => {
+      expect(input).toMatchObject({ key: "thought_level", value: native });
+      const guard = created.protocolGuardFactory!();
+      guard("outbound", { id: 0, method: "session/load", params: { sessionId: "backend-1" } });
+      guard("inbound", { id: 0, result: { modes: { currentModeId: "medium" }, configOptions: [{ id: "thought_level", currentValue: "medium" }] } });
+      guard("outbound", { id: 1, method: "session/set_config_option", params: { sessionId: "backend-1", configId: input.key, value: input.value } });
+      guard("inbound", { id: 1, result: { configOptions: [{ id: "thought_level", currentValue: native }] } });
+    });
+    const port = await openCodexAcpxRuntime(options, {
+      createRegistry: () => registry(), createStore: () => store(),
+      createRuntime: value => { created = value; return runtime; },
+    });
+    try {
+      expect(runtime.setConfigOption).toHaveBeenCalledExactlyOnceWith({ handle: HANDLE, key: "thought_level", value: native });
+      expect(await port.identity()).toMatchObject({ piThinkingLevel: level });
+    } finally {
+      await port.close({ reason: "Pi thinking fixture cleanup" });
+    }
+  });
+
   it("requires the Pi capability handshake and acknowledgments, preserves follow-up order, and never starts a second prompt", async () => {
     const pending = pendingExtensionTurn("turn-1");
     const runtime = Object.assign(fakeRuntime(), { requestExtension: vi.fn(async (_input: unknown) => ({ accepted: true })) });
