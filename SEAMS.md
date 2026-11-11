@@ -62,6 +62,18 @@ Until upstream's next stable release, the seam branches are based on upstream
 S1's scope and whether it splits into separate seams are being settled by its design
 review. This table is updated when the review result is recorded.
 
+## Upstream-pending carries
+
+A **carry** is an open upstream pull request that this fork applies unchanged before
+upstream merges it. A carry is not a seam: it has no design of our own. Each one is
+cherry-picked with `-x`, keeps its original authors, and stays as its own group of
+commits. When upstream merges the pull request, the next upgrade drops the group.
+Each carry records its test result and whether it is deployed.
+
+| ID | Upstream pull requests | Branch | Status | Evidence |
+| --- | --- | --- | --- | --- |
+| C1 | Pool starvation: [#18744](https://github.com/paperclipai/paperclip/pull/18744), [#17833](https://github.com/paperclipai/paperclip/pull/17833), [#18928](https://github.com/paperclipai/paperclip/pull/18928) (issue [#18700](https://github.com/paperclipai/paperclip/issues/18700)) | `carry/pool-starvation` on `canary/v2026.1111.0-canary.4` | Tested locally, not deployed. Pool size 10: the burst is accepted (80/80, against 0/80 without it). Pool size 40: no proven gain. `DATABASE_POOL_MAX=40` is used instead. | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) |
+
 ## Extensions on Paperclip's own surfaces (no seam)
 
 | Extension | Surface | Tracking |
