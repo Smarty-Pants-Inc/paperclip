@@ -25,6 +25,7 @@ import {
   instanceSettings,
   issues,
   principalPermissionGrants,
+  projectAccessMembers,
   projectWorkspaces,
   projects,
   routineDocuments,
@@ -168,7 +169,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     vi.clearAllMocks();
   });
 
-  async function createApp(actor: Record<string, unknown>) {
+  async function createApp(actor: Record<string, unknown>, includeLinkedResourceRoutes = false) {
     const { errorHandler } = await import("../middleware/index.js");
     const { routineRoutes } = await import("../routes/routines.js");
     const app = express();
@@ -178,6 +179,12 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       next();
     });
     app.use("/api", routineRoutes(db));
+    if (includeLinkedResourceRoutes) {
+      const { issueRoutes } = await import("../routes/issues.js");
+      const { projectRoutes } = await import("../routes/projects.js");
+      app.use("/api", issueRoutes(db, {} as any));
+      app.use("/api", projectRoutes(db));
+    }
     app.use(errorHandler);
     return app;
   }
@@ -369,6 +376,163 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     expect(changedTrigger.status, JSON.stringify(changedTrigger.body)).toBe(200);
     expect(changedTrigger.body.enabled).toBe(false);
   }, 20_000);
+
+  it.each(["detail", "list", "runs"] as const)(
+    "redacts unreadable linked resources from routine %s responses without hiding readable references",
+    async (surface) => {
+      vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+      // Direct GETs and routine reads must use real services and authorization.
+      // Keep only the existing heartbeat stub; these fixtures never dispatch work.
+      vi.doUnmock("../services/index.js");
+      const { companyId, agentId, projectId } = await seedFixture();
+      const includedUserId = randomUUID();
+      const excludedUserId = randomUUID();
+      await db.insert(companyMemberships).values([includedUserId, excludedUserId].map((principalId) => ({
+        companyId, principalType: "user", principalId, membershipRole: "operator", status: "active",
+      })));
+      const [publicProject] = await db.update(projects).set({
+        description: "Public routine project description", targetDate: "2036-08-15",
+      }).where(eq(projects.id, projectId)).returning();
+      const [privateProject] = await db.insert(projects).values({
+        companyId, visibility: "private", name: "CLASSIFIED routine project ORCHID",
+        description: "CLASSIFIED project description ORCHID", targetDate: "2097-11-23",
+      }).returning();
+      await db.insert(projectAccessMembers).values({
+        companyId, projectId: privateProject!.id, subjectType: "user", subjectId: includedUserId,
+      });
+      const privateMarkers = [privateProject!.name, privateProject!.description!, privateProject!.targetDate!];
+      const fixtures: Array<{
+        routineId: string; runId: string; readableByB: boolean;
+        project: typeof projects.$inferSelect;
+        parentIssue: typeof issues.$inferSelect;
+        executionIssue: typeof issues.$inferSelect;
+        publicRunId: string; publicIssue: typeof issues.$inferSelect;
+      }> = [];
+      // Exercise project privacy independently of issue privacy, and preserve
+      // ordinary references rather than blanket-redacting every embedded object.
+      for (const [index, kind] of ["private-project", "private-issue", "public"].entries()) {
+        const routineId = randomUUID();
+        const runId = randomUUID();
+        const heartbeatRunId = randomUUID();
+        const project = kind === "private-project" ? privateProject! : publicProject!;
+        const readableByB = kind === "public";
+        const marker = readableByB ? "PUBLIC" : `CLASSIFIED ${kind}`;
+        const updatedAt = new Date(readableByB ? "2038-06-04T10:20:30.000Z" : "2098-12-17T13:42:19.000Z");
+        await db.insert(heartbeatRuns).values({ id: heartbeatRunId, companyId, agentId, status: "running" });
+        const [parentIssue, executionIssue] = await db.insert(issues).values([
+          {
+            id: randomUUID(), companyId, projectId: project.id,
+            title: `${marker} parent title`, description: `${marker} parent description`,
+            visibility: kind === "private-issue" ? "private" : "open",
+            responsibleUserId: includedUserId, createdByUserId: includedUserId, updatedAt,
+          },
+          {
+            id: randomUUID(), companyId, projectId: project.id,
+            identifier: `RV-${index + 1}`, title: `${marker} execution title`, description: `${marker} execution description`,
+            visibility: kind === "private-issue" ? "private" : "open",
+            responsibleUserId: includedUserId, createdByUserId: includedUserId, updatedAt,
+            status: "in_progress", priority: "high", originKind: "routine_execution",
+            originId: routineId, originRunId: runId, executionRunId: heartbeatRunId,
+          },
+        ]).returning();
+        await db.insert(routines).values({
+          id: routineId, companyId, projectId: project.id, parentIssueId: parentIssue!.id,
+          assigneeAgentId: agentId, title: `Reference routine ${index + 1}`,
+        });
+        await db.insert(routineRuns).values({
+          id: runId, companyId, routineId, source: "manual", status: "issue_created", linkedIssueId: executionIssue!.id,
+        });
+        // Mixed history in the same response: an older open issue remains
+        // readable even when the latest linked issue is private.
+        const publicRunId = randomUUID();
+        const [publicIssue] = await db.insert(issues).values({
+          companyId, projectId, title: `PUBLIC historical execution ${index + 1}`, status: "done",
+          originKind: "routine_execution", originId: routineId, originRunId: publicRunId,
+        }).returning();
+        await db.insert(routineRuns).values({
+          id: publicRunId, companyId, routineId, source: "manual", status: "issue_created",
+          linkedIssueId: publicIssue!.id, createdAt: new Date("2020-01-01T00:00:00.000Z"),
+        });
+        if (!readableByB) privateMarkers.push(
+          parentIssue!.title, parentIssue!.description!, executionIssue!.title, executionIssue!.description!, updatedAt.toISOString(),
+        );
+        fixtures.push({
+          routineId, runId, project, parentIssue: parentIssue!, executionIssue: executionIssue!, readableByB,
+          publicRunId, publicIssue: publicIssue!,
+        });
+      }
+      const included = await createApp({
+        type: "board", userId: includedUserId, source: "session", isInstanceAdmin: false, companyIds: [companyId],
+      }, true);
+      const excluded = await createApp({
+        type: "board", userId: excludedUserId, source: "session", isInstanceAdmin: false, companyIds: [companyId],
+      }, true);
+
+      for (const fixture of fixtures) {
+        // Establish actual direct-resource access, not a mocked allow/deny table.
+        for (const [app, readable] of [[included, true], [excluded, fixture.readableByB]] as const) {
+          await request(app).get(`/api/projects/${fixture.project.id}`)
+            .expect(fixture.project.visibility === "open" || readable ? 200 : 404);
+          await request(app).get(`/api/issues/${fixture.parentIssue.id}`).expect(readable ? 200 : 404);
+          await request(app).get(`/api/issues/${fixture.executionIssue.id}`).expect(readable ? 200 : 404);
+          await request(app).get(`/api/issues/${fixture.publicIssue.id}`).expect(200);
+        }
+      }
+      for (const [app, isIncluded] of [[included, true], [excluded, false]] as const) {
+        // The list is checked as a whole, so a leak in a sibling row cannot hide.
+        const list = surface === "list"
+          ? await request(app).get(`/api/companies/${companyId}/routines`).expect(200)
+          : null;
+        for (const fixture of fixtures) {
+          const response = list ?? await request(app)
+            .get(`/api/routines/${fixture.routineId}${surface === "runs" ? "/runs" : ""}`).expect(200);
+          const item = surface === "list"
+            ? response.body.find((row: { id: string }) => row.id === fixture.routineId)
+            : response.body;
+          const readable = isIncluded || fixture.readableByB;
+          const summary = {
+            id: fixture.executionIssue.id, identifier: fixture.executionIssue.identifier,
+            title: fixture.executionIssue.title, status: fixture.executionIssue.status,
+            priority: fixture.executionIssue.priority, updatedAt: fixture.executionIssue.updatedAt.toISOString(),
+          };
+          if (surface !== "runs") {
+            expect(item).toMatchObject({
+              id: fixture.routineId, projectId: fixture.project.id, parentIssueId: fixture.parentIssue.id,
+            });
+            expect.soft(item.activeIssue).toEqual(readable ? expect.objectContaining(summary) : null);
+          }
+          if (surface === "detail") {
+            expect.soft(item.project).toEqual(fixture.project.visibility === "open" || readable
+              ? expect.objectContaining({
+                id: fixture.project.id, name: fixture.project.name,
+                description: fixture.project.description, targetDate: fixture.project.targetDate,
+              }) : null);
+            expect.soft(item.parentIssue).toEqual(readable ? expect.objectContaining({
+              id: fixture.parentIssue.id, title: fixture.parentIssue.title, description: fixture.parentIssue.description,
+            }) : null);
+            if (readable) expect(item.activeIssue.description).toBe(fixture.executionIssue.description);
+          }
+          const runs = surface === "detail" ? item.recentRuns : surface === "list" ? [item.lastRun] : response.body;
+          const expectedRuns = [expect.objectContaining({
+            id: fixture.runId, linkedIssueId: fixture.executionIssue.id,
+            linkedIssue: readable ? expect.objectContaining(summary) : null,
+          })];
+          if (surface !== "list") expectedRuns.push(expect.objectContaining({
+            id: fixture.publicRunId, linkedIssueId: fixture.publicIssue.id,
+            linkedIssue: expect.objectContaining({
+              id: fixture.publicIssue.id, title: fixture.publicIssue.title, status: fixture.publicIssue.status,
+              priority: fixture.publicIssue.priority, updatedAt: fixture.publicIssue.updatedAt.toISOString(),
+            }),
+          }));
+          expect.soft(runs).toEqual(expectedRuns);
+          if (!isIncluded) {
+            const json = JSON.stringify(response.body);
+            for (const marker of privateMarkers) expect.soft(json).not.toContain(marker);
+          }
+        }
+      }
+    }, 60_000,
+  );
 
   it.each(["bearer", "hmac_sha256", "github_hmac", "none"] as const)(
     "authenticates %s HTTP deliveries, persists payloads, and enforces trigger lifecycle",
