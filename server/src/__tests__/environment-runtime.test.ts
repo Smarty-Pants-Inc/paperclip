@@ -1126,6 +1126,48 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     },
   );
 
+  it.each(["stop_error", "missing_stop_method"])(
+    "F2 ordinary reusable plugin release persists stop-only intent on failure across restart: %s", async outcome => {
+      const seeded = await seedReusablePluginSandboxLease();
+      const lease = seeded.reusableLease;
+      await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, seeded.runId));
+      let retry = false;
+      const call = vi.fn(async (_id: string, method: string) => {
+        // This models the dangerous default: destroy really would delete.
+        if (method === "environmentDestroyLease") return { providerLeaseId: lease.providerLeaseId, state: "destroyed" };
+        if (method === "environmentReleaseLease") throw new Error("Boat stop response/poll unavailable");
+        const saved = await environmentService(db).getLeaseById(lease.id);
+        expect(saved).toMatchObject({ status: "pending_cleanup", metadata: {
+          sandboxStopAndRetain: { providerLeaseId: lease.providerLeaseId, pluginId: seeded.pluginId },
+        } });
+        return { providerLeaseId: lease.providerLeaseId, state: "stopped" };
+      });
+      const runtime = () => environmentRuntimeService(db, { pluginWorkerManager: {
+        isRunning: () => true, call,
+        getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentDestroyLease",
+          ...(retry || outcome !== "missing_stop_method" ? ["environmentStopLease"] : [])] }),
+      } as unknown as PluginWorkerManager });
+      // No explicit stop_and_retain disposition: the ordinary run-release path.
+      await runtime().releaseRunLeases(seeded.runId, "failed");
+      expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({ status: "pending_cleanup", metadata: {
+        sandboxStopAndRetain: { runId: seeded.runId, providerLeaseId: lease.providerLeaseId, pluginId: seeded.pluginId },
+      } });
+      expect(call.mock.calls.map(entry => entry[1])).toEqual(["environmentReleaseLease"]);
+      if (outcome === "missing_stop_method") {
+        await heartbeatService(db, { environmentRuntime: runtime() }).sweepPendingCleanupLeases({ backoffMs: 0 });
+        expect(call.mock.calls.map(entry => entry[1])).toEqual(["environmentReleaseLease"]);
+        expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({ status: "pending_cleanup" });
+      }
+      retry = true;
+      // A fresh runtime/reaper must recover from durable state, not process memory.
+      await heartbeatService(db, { environmentRuntime: runtime() }).sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(await environmentService(db).getLeaseById(lease.id)).toMatchObject({ status: "released", cleanupStatus: "success",
+        metadata: { remoteExecutionTermination: { providerLeaseId: lease.providerLeaseId, state: "stopped" },
+          sandboxStopAndRetainReceipt: { method: "environmentStopLease" } } });
+      expect(call.mock.calls.map(entry => entry[1])).toEqual(["environmentReleaseLease", "environmentStopLease"]);
+    },
+  );
+
   it("renews the stop-only cleanup claim while the provider stop is still running", async () => {
     const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
     const lease = seeded.reusableLease;
