@@ -143,10 +143,13 @@ function restoreCompactedEvent(chunk: string, source: unknown): unknown {
     const encoded = JSON.stringify(value), end = leading.length + omitted;
     if (end >= encoded.length || !encoded.startsWith(leading) || !tail.startsWith(encoded.slice(end))) continue;
     const restored = head + encoded.slice(leading.length, end) + tail;
-    // Records written before invite tokens were redacted still hold the token;
-    // prove them with the compactor of that release.
-    if (![true, false].some(redactInvitations =>
-      compactRunLogChunk(restored, undefined, { redactInvitations }) === chunk)) continue;
+    // A historical cap is not the current environment setting. The retained
+    // head is floor(cap * 0.6), leaving at most two integer cap candidates.
+    // Prove the exact output (including tail and omission count) at that cap.
+    // Older records may also predate invitation-token redaction.
+    const firstCap = Math.ceil(head.length / 0.6);
+    if (![firstCap, firstCap + 1].some(cap => [true, false].some(redactInvitations =>
+      compactRunLogChunk(restored, cap, { redactInvitations }) === chunk))) continue;
     try {
       const envelope = JSON.parse(restored);
       if (envelope.type === "paperclip.prp.event" && matchesPublishedEvent(source, envelope.event))

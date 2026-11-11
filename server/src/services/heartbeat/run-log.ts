@@ -3,7 +3,15 @@ import { REDACTED_EVENT_VALUE, redactSensitiveText, sanitizeRecord } from "../..
 import { redactInvitationTokens } from "../../middleware/invitation-token-redaction.js";
 import { redactCurrentUserText, redactCurrentUserValue, type CurrentUserRedactionOptions } from "../../log-redaction.js";
 
-const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
+const DEFAULT_MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
+
+function persistedLogChunkMaxChars() {
+  const raw = process.env.PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS?.trim();
+  const value = Number(raw);
+  return raw && /^[0-9]+$/.test(raw) && Number.isSafeInteger(value)
+    ? value
+    : DEFAULT_MAX_PERSISTED_LOG_CHUNK_CHARS;
+}
 const MAX_RUN_EVENT_PAYLOAD_STRING_CHARS = 16 * 1024;
 const MAX_RUN_EVENT_PAYLOAD_ARRAY_ITEMS = 50;
 const MAX_RUN_EVENT_PAYLOAD_OBJECT_KEYS = 100;
@@ -116,12 +124,12 @@ function redactRunLogInvitationTokens(text: string, enabled: boolean) {
 
 export function compactRunLogChunk(
   chunk: string,
-  maxChars = MAX_PERSISTED_LOG_CHUNK_CHARS,
+  maxChars = persistedLogChunkMaxChars(),
   options: { redactInvitations?: boolean } = {},
 ) {
   const normalized = redactRunLogInvitationTokens(
     redactSensitiveText(redactInlineBase64ImageData(chunk)), options.redactInvitations !== false);
-  if (normalized.length <= maxChars) return normalized;
+  if (maxChars === 0 || normalized.length <= maxChars) return normalized;
 
   const headChars = Math.max(0, Math.floor(maxChars * 0.6));
   const tailChars = Math.max(0, Math.floor(maxChars * 0.25));

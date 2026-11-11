@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import {
   appendExcerpt,
@@ -174,6 +174,49 @@ describe("heartbeat run-log chunk formatting", () => {
     expect(compacted).not.toContain("fixture-secret-token");
     expect(compacted).toContain("[omitted base64 image data: 70000 chars]");
     expect(compacted).not.toContain("[paperclip truncated");
+  });
+});
+
+describe("run-log chunk limit environment", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([undefined, "", " ", "invalid", "-1", "1.5", "NaN", "Infinity", "1024junk", "1e3", "0x1000", "9007199254740992"])(
+    "keeps the default 64 KiB threshold and truncation for %s", (value) => {
+      vi.stubEnv("PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS", value);
+      const exact = "x".repeat(64 * 1024);
+      expect(compactRunLogChunk(exact)).toBe(exact);
+      const oversized = `${exact}tail`;
+      const result = compactRunLogChunk(oversized);
+      expect(result).toContain("[paperclip truncated run log chunk:");
+      expect(result).toBe(compactRunLogChunk(oversized, 64 * 1024));
+    },
+  );
+
+  it.each(["1024", " 1024 ", "131072"])("uses the configured character threshold %s", (value) => {
+    vi.stubEnv("PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS", value);
+    const limit = Number(value), exact = "x".repeat(limit);
+    expect(compactRunLogChunk(exact)).toHaveLength(limit);
+    const oversized = `${exact}tail`;
+    const result = compactRunLogChunk(oversized);
+    expect(result.length).toBeLessThan(limit);
+    expect(result).toContain("[paperclip truncated run log chunk:");
+    expect(result).toBe(compactRunLogChunk(oversized, limit));
+    // Explicit historical limits must not depend on the current environment.
+    expect(compactRunLogChunk(oversized, 20)).toBe(
+      `${"x".repeat(12)}\n[paperclip truncated run log chunk: omitted ${oversized.length - 17} chars]\nxtail`,
+    );
+  });
+
+  it("keeps a million-character chunk whole with 0 while still redacting secrets", () => {
+    vi.stubEnv("PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS", "0");
+    const header = "Authorization: Bearer fixture-uncapped-secret";
+    const chunk = `${"x".repeat(500_000)}\n${header}\n${"y".repeat(500_000)}`;
+    const expected = chunk.replace(header, "Authorization: ***REDACTED***");
+    const result = compactRunLogChunk(chunk);
+    expect(result).toHaveLength(expected.length);
+    expect(result).toBe(expected);
+    expect(result).not.toContain("fixture-uncapped-secret");
+    expect(result).not.toContain("[paperclip truncated");
   });
 });
 
