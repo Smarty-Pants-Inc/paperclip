@@ -2,6 +2,7 @@ import { kimiManagedConfiguration } from "./kimi-config.js";
 import { kimiInstructionBinding } from "./kimi-instructions.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS, codexObservabilityToml } from "../agent-observability.js";
 import { piProviderConfiguration } from "./pi-provider-config.js";
+import { configuredPiNativeExtensions } from "./pi-extension-snapshot.js";
 import { configuredEnvironmentKeys } from "../../configured-environment.js";
 import { COPILOT_SYSTEM_INSTRUCTIONS_FILE } from "./copilot-profile.js";
 import { preparedHarnessHome, preconfiguredHomeEnvironment, usesPreconfiguredHome } from "../preconfigured-home.js";
@@ -473,8 +474,19 @@ export async function prepareAcpxRuntimeSandbox(input: {
       `${input.binding.grokDisableWebSearch === true ? "disable_web_search = true\n" : ""}[ui]\ndisable_bypass_permissions_mode = true\n`);
   }
   if (input.agent === "pi") {
-    await writePrivateFile(
-      join(agentHomeDirectory, "settings.json"),
+    const settingsPath = join(agentHomeDirectory, "settings.json");
+    let preserveSettings = false;
+    if (configuredPiNativeExtensions(input.environment)) {
+      try {
+        const settings = await lstat(settingsPath);
+        if (!settings.isFile() || settings.nlink !== 1 || await realpath(settingsPath) !== settingsPath) throw new Error("Pi settings require a private regular file");
+        preserveSettings = true;
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    }
+    // pi install writes this file. Never discard personal package declarations
+    // on native-mode reconnect; process flags still own trust/session policy.
+    if (!preserveSettings) await writePrivateFile(
+      settingsPath,
       `${JSON.stringify({
         quietStartup: true,
         defaultProjectTrust: "never",

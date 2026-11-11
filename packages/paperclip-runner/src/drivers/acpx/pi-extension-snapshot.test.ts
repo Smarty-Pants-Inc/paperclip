@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { configuredEnvironmentProjection } from "../../configured-environment.js";
-import { configuredPiExtensions, createPiExtensionSnapshot } from "./pi-extension-snapshot.js";
+import { configuredPiExtensions, configuredPiNativeExtensions, createPiExtensionSnapshot } from "./pi-extension-snapshot.js";
 
 const temporary: string[] = [];
 afterEach(async () => { await Promise.all(temporary.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
@@ -21,12 +21,20 @@ async function fixture() {
 
 describe("explicit Pi extension snapshots (trust boundary)", () => {
   it("accepts only controller-configured bounded absolute paths, not ambient environment", () => {
+    expect(configuredPiExtensions(configuredEnvironmentProjection({ PAPERCLIP_PI_EXTENSIONS: '["/opt/Pi/CAP.ts"]' }))).toEqual(["/opt/Pi/CAP.ts"]);
     expect(configuredPiExtensions(undefined)).toEqual([]);
     expect(configuredPiExtensions({ PAPERCLIP_PI_EXTENSIONS: '["/ambient.ts"]' })).toEqual([]);
     expect(configuredPiExtensions(configuredEnvironmentProjection({ PAPERCLIP_PI_EXTENSIONS: '["/opt/pi/tool.ts"]' }))).toEqual(["/opt/pi/tool.ts"]);
     for (const raw of ['{}', '["relative.ts"]', '["/opt/../escape.ts"]', '["/"]', '[null]', 'not-json', JSON.stringify(Array(33).fill("/a"))]) {
       expect(() => configuredPiExtensions(configuredEnvironmentProjection({ PAPERCLIP_PI_EXTENSIONS: raw }))).toThrow("Pi extensions");
     }
+  });
+
+  it("accepts native mode only through controller configuration and rejects misspellings", () => {
+    expect(configuredPiNativeExtensions(undefined)).toBe(false);
+    expect(configuredPiNativeExtensions({ PAPERCLIP_PI_EXTENSIONS_MODE: "native" })).toBe(false);
+    expect(configuredPiNativeExtensions(configuredEnvironmentProjection({ PAPERCLIP_PI_EXTENSIONS_MODE: "native" }))).toBe(true);
+    expect(() => configuredPiNativeExtensions(configuredEnvironmentProjection({ PAPERCLIP_PI_EXTENSIONS_MODE: "nativ" }))).toThrow("mode");
   });
 
   it("freezes a local file and a package directory with all declared dependency bytes", async () => {
@@ -81,19 +89,37 @@ describe("explicit Pi extension snapshots (trust boundary)", () => {
     await writeFile(join(root, "package", "index.mjs"), `export {value} from ${JSON.stringify(outside)};`);
     const escape = await installation.openCommand({ piExtensions: [join(root, "package")] });
     try {
-      const child = escape.spawn([], { env: { PATH: process.env.PATH } });
+      const child = escape.spawn([], { env: { PATH: process.env.PATH, PAPERCLIP_PI_ADMITTED_NATIVE_EXTENSIONS: "1", PAPERCLIP_PI_EXTENSIONS_MODE: "native" } });
       let stderr = ""; child.stderr!.on("data", value => { stderr += value; });
       const [code] = await once(child, "close");
       expect(code).toBe(1); expect(stderr).toContain("escaped its closed distribution");
     } finally { await escape.close(); }
     const unset = await installation.openCommand();
     try {
-      const child = unset.spawn([], { env: { PATH: process.env.PATH, PAPERCLIP_PI_ADMITTED_EXTENSIONS: JSON.stringify([join(root, "package")]) } });
+      const child = unset.spawn([], { env: { PATH: process.env.PATH, PAPERCLIP_PI_ADMITTED_EXTENSIONS: JSON.stringify([join(root, "package")]), PAPERCLIP_PI_ADMITTED_NATIVE_EXTENSIONS: "1", PAPERCLIP_PI_EXTENSIONS_MODE: "native" } });
       let stdout = ""; child.stdout!.on("data", value => { stdout += value; });
       const [code] = await once(child, "close");
       expect({ code, stdout }).toEqual({ code: 0, stdout: "[]\n" });
     } finally { await unset.close(); }
+    // The operator-native lease admits dependencies exactly as plain Pi does,
+    // including imports outside a package; an ambient flag cannot do this.
+    const trusted = await installation.openCommand({ piExtensions: [join(root, "package")], piNativeExtensions: true });
+    try {
+      const child = trusted.spawn([], { env: { PATH: process.env.PATH } });
+      let stdout = "", stderr = "";
+      child.stdout!.on("data", value => { stdout += value; }); child.stderr!.on("data", value => { stderr += value; });
+      const [code] = await once(child, "close");
+      expect({ code, stdout, stderr }).toEqual({ code: 0, stdout: "[99]\n", stderr: "" });
+    } finally { await trusted.close(); }
   }, 30_000);
+
+  it("rejects directories without valid package metadata before passing -e", async () => {
+    const root = await fixture();
+    const empty = join(root, "empty"); await mkdir(empty);
+    await expect(createPiExtensionSnapshot([empty])).rejects.toThrow("package.json");
+    await writeFile(join(empty, "package.json"), "not-json");
+    await expect(createPiExtensionSnapshot([empty])).rejects.toThrow("package.json");
+  });
 
   it("rejects missing files and escaping symlinks instead of widening code admission", async () => {
     const root = await fixture();

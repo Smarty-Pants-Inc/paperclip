@@ -16,7 +16,7 @@ import { dirname, join } from "node:path";
 import { bindAcpxAgentFiles } from "./agent-files-binding.js";
 import { assertAcpxProfileEnvironment, assertAcpxProfileWorkspace, classifyAcpxProfileError, verifyAcpxProfileInstallation } from "./profile-installation.js";
 import { createAcpxRuntimeSkillLease } from "./runtime-skill-lease.js";
-import { configuredPiExtensions } from "./pi-extension-snapshot.js";
+import { configuredPiExtensions, configuredPiNativeExtensions } from "./pi-extension-snapshot.js";
 import { stageManagedGrokCredential } from "./grok-credentials.js";
 import { stageManagedAntigravityCredential } from "./antigravity-credentials.js";
 import { claudeNativeSkillPrompt } from "./native-skill-prompt.js";
@@ -637,7 +637,8 @@ export class AcpxRuntimeHost {
       }
       admissionStage = "command";
       const piExtensions = options.agent === "pi" ? configuredPiExtensions(options.environment) : [];
-      const commandOptions = { ...(piExtensions.length ? { piExtensions } : {}) };
+      const piNativeExtensions = options.agent === "pi" && configuredPiNativeExtensions(options.environment);
+      const commandOptions = { ...(piExtensions.length ? { piExtensions } : {}), ...(piNativeExtensions ? { piNativeExtensions } : {}) };
       command = await acquireAbortableAdmissionResource({
         signal: options.signal,
         acquire: () => installation.openCommand({ ...commandOptions, signal: options.signal }),

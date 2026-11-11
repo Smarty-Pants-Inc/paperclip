@@ -1,4 +1,4 @@
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { configuredEnvironment } from "../../configured-environment.js";
 import { createAcpxPrivateSnapshot, type AcpxPrivateSnapshot } from "./private-snapshot.js";
@@ -22,6 +22,14 @@ export function configuredPiExtensions(environment: NodeJS.ProcessEnv | undefine
   return checkedPaths(value);
 }
 
+/** Operator configuration, never an ambient or agent-supplied launch variable. */
+export function configuredPiNativeExtensions(environment: NodeJS.ProcessEnv | undefined): boolean {
+  const mode = configuredEnvironment(environment).PAPERCLIP_PI_EXTENSIONS_MODE;
+  if (mode === undefined) return false;
+  if (mode !== "native") throw new Error("Pi extensions mode must be native or unset");
+  return true;
+}
+
 export interface PiExtensionSnapshot {
   snapshot: AcpxPrivateSnapshot;
   paths: string[];
@@ -43,6 +51,14 @@ export async function createPiExtensionSnapshot(paths: readonly string[]): Promi
     if (await realpath(path) !== path) throw new Error("Pi extensions require canonical paths without symlink aliases");
     const stat = await lstat(path);
     if (!stat.isFile() && !stat.isDirectory()) throw new Error("Pi extensions require a regular file or package directory");
+    if (stat.isDirectory()) {
+      const manifest = join(path, "package.json");
+      try {
+        if (!(await lstat(manifest)).isFile() || await realpath(manifest) !== manifest) throw new Error();
+        const metadata: unknown = JSON.parse(await readFile(manifest, "utf8"));
+        if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) throw new Error();
+      } catch { throw new Error("Pi extension package directory requires a regular valid package.json"); }
+    }
     const root = stat.isDirectory() ? path : dirname(path);
     if (root === sep) throw new Error("Pi extensions require a dedicated package directory");
     return root;

@@ -82,7 +82,7 @@ export async function readNativeAcpxDistributionEntries(input: NativeAcpxDistrib
  * Freeze only manifest-admitted bytes. Native trees deliberately have a separate
  * bound; the tighter JavaScript/npm snapshot limits remain unchanged.
  */
-export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDistributionInput, entries: NativeAcpxDistributionEntry[], signal?: AbortSignal, piExtensions?: PiExtensionSnapshot): Promise<NativeAcpxDistributionSnapshot> {
+export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDistributionInput, entries: NativeAcpxDistributionEntry[], signal?: AbortSignal, piExtensions?: PiExtensionSnapshot, piNativeExtensions = false): Promise<NativeAcpxDistributionSnapshot> {
   signal?.throwIfAborted();
   // Callers cannot substitute entries between manifest validation and copying.
   entries = parseNativeAcpxDistributionEntries({ entries }, input.expectedClosureSha256);
@@ -220,11 +220,11 @@ export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDist
       await writeFile(shimPath, shim, { mode: 0o400, flag: "wx" }); digests[shimPath] = sha256(shim);
     }
     if (input.entrypoint !== undefined || copilotEntryDirectory !== undefined) {
-      const guard = Buffer.from(nativeModuleGuard(digests));
+      const guard = Buffer.from(nativeModuleGuard(digests, piNativeExtensions));
       await writeFile(join(packageRoot, GUARD), guard, { mode: 0o400, flag: "wx" });
       digests[join(packageRoot, GUARD)] = sha256(guard);
     }
-    const bootstrap = Buffer.from(nativeBootstrap(executable, digests[executable]!, args, input.isolatedCacheEnvironmentName ? { name: input.isolatedCacheEnvironmentName, value: cacheRoot } : undefined, copilotEntryDirectory, piExtensions));
+    const bootstrap = Buffer.from(nativeBootstrap(executable, digests[executable]!, args, input.isolatedCacheEnvironmentName ? { name: input.isolatedCacheEnvironmentName, value: cacheRoot } : undefined, copilotEntryDirectory, piExtensions, piNativeExtensions));
     await writeFile(join(packageRoot, BOOTSTRAP), bootstrap, { mode: 0o400, flag: "wx" });
     digests[join(packageRoot, BOOTSTRAP)] = sha256(bootstrap);
     // executable is null: commandLease's separately-qualified provider runtime
@@ -241,7 +241,7 @@ export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDist
   } finally { await heldRoot.close(); }
 }
 
-function nativeBootstrap(executable: string, executableDigest: string, args: string[], cache?: { name: string; value: string }, copilotEntryDirectory?: string, piExtensions?: PiExtensionSnapshot): string {
+function nativeBootstrap(executable: string, executableDigest: string, args: string[], cache?: { name: string; value: string }, copilotEntryDirectory?: string, piExtensions?: PiExtensionSnapshot, piNativeExtensions = false): string {
   return [
     'const {spawn}=require("node:child_process");',
     'const fs=require("node:fs");',
@@ -251,7 +251,8 @@ function nativeBootstrap(executable: string, executableDigest: string, args: str
     'const env={...process.env}; delete env.PAPERCLIP_ACPX_NATIVE_GUARDED; delete env.PAPERCLIP_ACPX_PRIVATE_SNAPSHOT; delete env.PAPERCLIP_VERIFIED_RUNTIME_EXECUTABLE;',
     'env.NODE_DISABLE_COMPILE_CACHE="1"; delete env.NODE_COMPILE_CACHE;',
     // Only this immutable command bootstrap can mint supplemental code authority.
-    'delete env.PAPERCLIP_PI_ADMITTED_EXTENSIONS; delete env.PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS;',
+    'delete env.PAPERCLIP_PI_ADMITTED_EXTENSIONS; delete env.PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS; delete env.PAPERCLIP_PI_ADMITTED_NATIVE_EXTENSIONS; delete env.PAPERCLIP_PI_EXTENSIONS_MODE;',
+    ...(piNativeExtensions ? ['env.PAPERCLIP_PI_ADMITTED_NATIVE_EXTENSIONS="1";'] : []),
     ...(piExtensions ? [
       `env.PAPERCLIP_PI_ADMITTED_EXTENSIONS=${JSON.stringify(JSON.stringify(piExtensions.paths))};`,
       `env.PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS=${JSON.stringify(JSON.stringify(piExtensions.snapshot.roots))};`,
@@ -279,14 +280,20 @@ function nativeBootstrap(executable: string, executableDigest: string, args: str
   ].join("\n");
 }
 
-function nativeModuleGuard(digests: Record<string, string>): string {
+/** Native mode deliberately trusts Pi-discovered modules as plain Pi does.
+ * Pinned provider/supplemental files still require their exact admitted digest.
+ * Extension code already has unrestricted fs/child_process authority; this is
+ * not a sandbox for hostile extensions or an integrity claim about their bytes.
+ */
+function nativeModuleGuard(digests: Record<string, string>, piNativeExtensions = false): string {
   return [
     'const {registerHooks,isBuiltin}=require("node:module");',
     'const {readFileSync,realpathSync}=require("node:fs");',
     'const {fileURLToPath}=require("node:url"); const {createHash}=require("node:crypto");',
     `const digests=${JSON.stringify(digests)};`,
-    'const verify=url=>{if(!url.startsWith("file:"))throw new Error("Native ACPX module must be a qualified file or builtin");const path=fileURLToPath(url);if(realpathSync(path)!==path||!Object.hasOwn(digests,path))throw new Error("Native ACPX module escaped its closed distribution");const bytes=readFileSync(path);if(createHash("sha256").update(bytes).digest("hex")!==digests[path])throw new Error("Native ACPX module digest mismatch");return bytes;};',
-    'registerHooks({resolve(specifier,context,next){const result=next(specifier,context);if(!isBuiltin(specifier)&&!result.url.startsWith("node:"))verify(result.url);return result;},load(url,context,next){if(url.startsWith("node:"))return next(url,context);const bytes=verify(url);if(["module","commonjs","json"].includes(context.format))return {format:context.format,source:bytes,shortCircuit:true};return next(url,context);}});',
+    `const nativeExtensions=${JSON.stringify(piNativeExtensions)};`,
+    'const verify=url=>{if(!url.startsWith("file:")){if(nativeExtensions)return;throw new Error("Native ACPX module must be a qualified file or builtin");}const path=fileURLToPath(url);if(nativeExtensions&&!Object.hasOwn(digests,path)&&!Object.hasOwn(digests,realpathSync(path)))return;if(realpathSync(path)!==path||!Object.hasOwn(digests,path))throw new Error("Native ACPX module escaped its closed distribution");const bytes=readFileSync(path);if(createHash("sha256").update(bytes).digest("hex")!==digests[path])throw new Error("Native ACPX module digest mismatch");return bytes;};',
+    'registerHooks({resolve(specifier,context,next){const result=next(specifier,context);if(!isBuiltin(specifier)&&!result.url.startsWith("node:"))verify(result.url);return result;},load(url,context,next){if(url.startsWith("node:"))return next(url,context);const bytes=verify(url);if(bytes!==undefined&&["module","commonjs","json"].includes(context.format))return {format:context.format,source:bytes,shortCircuit:true};return next(url,context);}});',
   ].join("\n");
 }
 

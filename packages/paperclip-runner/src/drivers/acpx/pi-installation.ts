@@ -91,7 +91,7 @@ export async function verifyPiInstallation(profile: AcpxReleaseProfile): Promise
     commandDigest: profile.commandDigest,
     agentServerPackageJsonPath: join(runtimeRoot, "node_modules/pi-acp/package.json"),
     agentRuntimePackageJsonPath: join(runtimeRoot, "node_modules/@earendil-works/pi-coding-agent/package.json"),
-    async openCommand(options?: { signal?: AbortSignal; piExtensions?: readonly string[] }) {
+    async openCommand(options?: { signal?: AbortSignal; piExtensions?: readonly string[]; piNativeExtensions?: boolean }) {
       options?.signal?.throwIfAborted();
       await assertDirectories();
       // The native primitive reads every admitted file through held descriptors

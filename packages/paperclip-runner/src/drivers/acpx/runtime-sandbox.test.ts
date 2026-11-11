@@ -341,6 +341,22 @@ describe("ACPX runtime sandbox", () => {
     },
   );
 
+  it.each([false, true])("preserves pi install settings only with operator-native authority (configured: %s)", async configured => {
+    const fixture = await sandboxFixture("pi");
+    const source = { PAPERCLIP_PI_EXTENSIONS_MODE: "native" };
+    const input = { binding: fixture.binding, agent: "pi" as const, providerPolicy: { readOnly: false },
+      environment: configured ? configuredEnvironmentProjection(source) : source };
+    const first = await prepareAcpxRuntimeSandbox(input);
+    const settingsPath = join(first.agentHomeDirectory, "settings.json");
+    const installed = JSON.stringify({ packages: ["npm:pi-subagents@0.75.0"], sessionDir: "/ignored" });
+    await writeFile(settingsPath, installed);
+    const second = await prepareAcpxRuntimeSandbox(input);
+    expect(second.agentHomeDirectory).toBe(first.agentHomeDirectory);
+    const settings = await readFile(settingsPath, "utf8");
+    if (configured) expect(settings).toBe(installed);
+    else expect(JSON.parse(settings)).toEqual({ quietStartup: true, defaultProjectTrust: "never", enableInstallTelemetry: false });
+  });
+
   it("requires Pi task policy and validates assigned roots independently from approval mode", async () => {
     const fixture = await sandboxFixture("pi");
     await expect(prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent: "pi" })).rejects.toThrow("explicit task execution policy");

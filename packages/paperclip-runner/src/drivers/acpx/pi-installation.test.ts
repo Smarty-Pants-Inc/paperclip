@@ -45,7 +45,7 @@ describe("Pi installation factory", () => {
     const helper = stripTypeScriptTypes(await readFile(new URL("./pi-acp-runtime.ts", import.meta.url), "utf8")).split("\n").map(line => line.trimEnd()).join("\n");
     const materializer = await readFile(new URL("../../../scripts/materialize-pi-distribution.mjs", import.meta.url), "utf8");
     expect(materializer).toContain(`helperSha256: "${hash(helper)}"`);
-    expect(hash(await readFile(new URL("../../../../../patches/pi-acp@0.0.33.patch", import.meta.url)))).toBe("ba72f36f11bf3e9550c302971ccca3af363c1b6c05f43760dc9147bdb121b829");
+    expect(hash(await readFile(new URL("../../../../../patches/pi-acp@0.0.33.patch", import.meta.url)))).toBe("b8eb0243abff4ada5fa63ccce0f5bda218ac121031e445de80f92b0f2973505c");
   });
 
   it("admits only the exact current profile", () => {
@@ -74,11 +74,18 @@ describe("Pi installation factory", () => {
     expect(Object.hasOwn(PI_DISTRIBUTION_CLOSURE_SHA256, "linux-arm64")).toBe(false);
     await expect(verifyPiInstallation(candidate())).rejects.toThrow(/^Pi distribution target is unsupported$/);
   }));
-  it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT).each([false, true])("launches the actual closed Pi snapshot with bound subprocess paths (extensions: %s)", async extensions => {
+  it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT).each([false, true, "native"] as const)("launches the actual Pi snapshot with bound subprocess paths (extensions: %s)", async extensions => {
     const { root, assets } = await fixture();
     await cp(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT!, assets, { recursive: true });
     const workspace = join(root, "workspace"); const agentHome = join(root, "agent");
     await mkdir(workspace); await mkdir(agentHome);
+    if (extensions === "native") {
+      if (!process.env.PAPERCLIP_TEST_PI_NATIVE_AGENT_DIR) throw new Error("Native package proof requires a pi install agent directory");
+      await cp(process.env.PAPERCLIP_TEST_PI_NATIVE_AGENT_DIR, agentHome, { recursive: true });
+      await mkdir(join(workspace, ".pi", "extensions"), { recursive: true });
+      await writeFile(join(workspace, ".pi", "extensions", "project.ts"), `import {writeFileSync} from "node:fs";
+        export default pi=>pi.on("session_start",()=>writeFileSync(${JSON.stringify(join(workspace, "project-loaded"))},JSON.stringify(pi.getCommands())));`);
+    }
     const installation = await verifyPiInstallation(candidate());
     const capRoot = join(root, "operator-extensions"), marker = join(workspace, "extensions-loaded.json");
     await mkdir(capRoot);
@@ -87,7 +94,7 @@ describe("Pi installation factory", () => {
       export default pi=>pi.on("session_start",()=>writeFileSync(${JSON.stringify(marker)},JSON.stringify({
         tools:pi.getAllTools().map(tool=>tool.name),offline:process.env.PI_OFFLINE})));`);
     const packages: string[] = JSON.parse(process.env.PAPERCLIP_TEST_PI_PACKAGES ?? "[]");
-    const command = await installation.openCommand(extensions ? { piExtensions: [cap, ...packages] } : undefined);
+    const command = await installation.openCommand(extensions ? { piExtensions: [cap, ...packages], ...(extensions === "native" ? { piNativeExtensions: true } : {}) } : undefined);
     const child = command.spawn([], { cwd: workspace, env: {
       PATH: "/usr/bin:/bin", HOME: agentHome, PI_CODING_AGENT_DIR: agentHome,
       PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1", PAPERCLIP_PI_READ_ONLY: "1",
@@ -122,6 +129,11 @@ describe("Pi installation factory", () => {
       if (extensions) {
         const loaded = JSON.parse(await readFile(marker, "utf8")); expect(loaded.offline).toBe("1");
         if (packages.length) expect(loaded.tools).toContain("subagent");
+        if (extensions === "native") {
+          const commands = JSON.parse(await readFile(join(workspace, "project-loaded"), "utf8"));
+          expect(commands).toContainEqual(expect.objectContaining({ name: "annotate" }));
+          console.info(JSON.stringify({ nativeBootstrap: true, installedCommand: commands.find((entry: { name: string }) => entry.name === "annotate"), tools: loaded.tools }));
+        }
       } else await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       child.stdin!.end();

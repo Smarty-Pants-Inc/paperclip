@@ -1185,7 +1185,7 @@ describe("ACPX runtime host", () => {
     const fixture = await hostFixture();
     const model = "openrouter/deepseek/deepseek-v4-flash-0731";
     const profile = resolveQualifiedAcpxProfile("pi", model);
-    const source = { PAPERCLIP_PI_EXTENSIONS: '["/operator/pi/cap.ts","/operator/pi/package"]' };
+    const source = { PAPERCLIP_PI_EXTENSIONS: '["/operator/pi/cap.ts","/operator/pi/package"]', PAPERCLIP_PI_EXTENSIONS_MODE: "native" };
     const openCommand = vi.fn(async () => ({ spawn: () => { throw new Error("not used"); }, close: async () => {} }));
     const host = await AcpxRuntimeHost.open({ ...fixture.options, agent: "pi", model, piThinkingLevel: "low",
       permissionMode: "approve-all", providerPolicy: { readOnly: true },
@@ -1197,7 +1197,7 @@ describe("ACPX runtime host", () => {
         identity: async () => ({ acpxRecordId: "record-1", backendSessionId: "backend-1", agentSessionId: "agent-1", piThinkingLevel: "low" }) }),
     }));
     expect(openCommand.mock.calls).toHaveLength(1);
-    expect(openCommand.mock.calls[0]).toEqual([configured ? { signal: undefined, piExtensions: JSON.parse(source.PAPERCLIP_PI_EXTENSIONS) } : { signal: undefined }]);
+    expect(openCommand.mock.calls[0]).toEqual([configured ? { signal: undefined, piExtensions: JSON.parse(source.PAPERCLIP_PI_EXTENSIONS), piNativeExtensions: true } : { signal: undefined }]);
     await host.close({ reason: "extension authority checked" });
   });
 

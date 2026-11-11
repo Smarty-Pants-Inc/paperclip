@@ -392,7 +392,17 @@ export function createPiLaunchSpec(
   if (Buffer.byteLength(configuration) > 64 * 1024) throw new Error("Pi launch configuration exceeds its bound");
   const guard = environment.PAPERCLIP_PI_MODULE_GUARD_PATH === undefined ? []
     : ["--require", requiredFile(environment, "PAPERCLIP_PI_MODULE_GUARD_PATH")];
-  const args = [...guard, entrypoint, "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-approve", "--offline", "-e", extension];
+  const nativeExtensions = environment.PAPERCLIP_PI_ADMITTED_NATIVE_EXTENSIONS === "1";
+  const args = [...guard, entrypoint, "--mode", "rpc",
+    ...(nativeExtensions ? [] : ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes"]),
+    nativeExtensions ? "--approve" : "--no-approve", "--offline", "-e", extension];
+  if (nativeExtensions) {
+    // CLI precedence beats both settings.json and PI_CODING_AGENT_SESSION_DIR.
+    // Pi captures agentDir/sessionDir before it loads extension factories.
+    const home = environment.PI_CODING_AGENT_DIR;
+    if (!home || !isAbsolute(home) || realpathSync(home) !== home || !lstatSync(home).isDirectory()) throw new Error("Pi native extensions require a private agent directory");
+    args.push("--session-dir", resolve(home, "sessions"));
+  }
   const extensionRoots = pathArray(environment.PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS);
   for (const path of pathArray(environment.PAPERCLIP_PI_ADMITTED_EXTENSIONS)) {
     const contained = extensionRoots.some(root => {

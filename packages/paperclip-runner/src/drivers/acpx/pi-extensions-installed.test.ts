@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
@@ -10,9 +10,9 @@ import { createNativeAcpxDistributionSnapshot } from "./native-distribution-inte
 import { verifyPiRuntimeManifest, type PiRuntimeManifest } from "./pi-verified-runtime.js";
 
 // Opt-in actual-distribution coverage: no model request or subagent tool runs.
-it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT && process.env.PAPERCLIP_TEST_PI_PACKAGES)(
-  "loads a local tool cap, pi-subagents and Langfuse through the closed native guard while retaining owned readiness",
-  async () => {
+it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT && process.env.PAPERCLIP_TEST_PI_PACKAGES).each([false, true])(
+  "loads the real tool cap, pi-subagents and Langfuse with owned readiness (native discovery: %s)",
+  async nativeExtensions => {
     const distribution = process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT!;
     const metadata = JSON.parse(await readFile(join(distribution, "pi-distribution.json"), "utf8"));
     const runtime = join(distribution, "runtime");
@@ -24,8 +24,29 @@ it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT && process.env.PAPERCLI
     try {
       const workspace = join(root, "workspace"), home = join(root, "home"), tools = join(root, "tools");
       await mkdir(workspace); await mkdir(home); await mkdir(tools);
+      if (nativeExtensions) {
+        // This directory was installed by the pinned CLI's real pi install.
+        const installedHome = process.env.PAPERCLIP_TEST_PI_NATIVE_AGENT_DIR;
+        if (!installedHome) throw new Error("Native package proof requires a pi install agent directory");
+        await cp(installedHome, home, { recursive: true });
+        const settingsPath = join(home, "settings.json");
+        const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+        expect(settings.packages).toContain("npm:pi-annotate@0.5.2");
+        await writeFile(settingsPath, JSON.stringify({ ...settings, sessionDir: join(root, "user-session-escape") }));
+        await mkdir(join(workspace, ".pi", "extensions"), { recursive: true });
+        await writeFile(join(workspace, ".pi", "extensions", "project.ts"), `export default pi=>pi.registerCommand("project-native-proof",{description:"Project discovery",handler:async()=>{}});`);
+        await writeFile(join(workspace, ".pi", "configured.ts"), `export default pi=>pi.registerCommand("project-settings-proof",{description:"Project settings",handler:async()=>{}});`);
+        await writeFile(join(workspace, ".pi", "settings.json"), JSON.stringify({ extensions: ["./configured.ts"], sessionDir: join(root, "project-session-escape") }));
+        await mkdir(join(workspace, ".pi", "skills", "native-proof"), { recursive: true });
+        await writeFile(join(workspace, ".pi", "skills", "native-proof", "SKILL.md"), "---\nname: native-proof\ndescription: Native package skill discovery\n---\nProof only.\n");
+        await mkdir(join(workspace, ".pi", "prompts"));
+        await writeFile(join(workspace, ".pi", "prompts", "native-template.md"), "---\ndescription: Native prompt discovery\n---\nProof only.\n");
+      }
       const cap = join(tools, "cap.ts");
       await writeFile(cap, `export default function(pi) {
+        const ownedFirst=process.env.PAPERCLIP_PI_RUNTIME_CONFIGURATION===undefined;
+        pi.registerCommand("operator-cap-proof",{description:"Operator file",handler:async()=>{}});
+        pi.on("session_start",(_event,ctx)=>{pi.appendEntry("native-proof",{});ctx.ui.setStatus("native-session-proof",JSON.stringify({ownedFirst,sessionFile:ctx.sessionManager.getSessionFile()}));});
         pi.registerTool({name:"operator_cap",label:"Operator cap",description:"No side effects",parameters:{type:"object",properties:{}},
           async execute(){return {content:[{type:"text",text:"ready"}],details:{}};}});
         pi.on("session_start",(_event,ctx)=>ctx.ui.setStatus("operator-cap",JSON.stringify(pi.getAllTools().map(tool=>tool.name))));
@@ -33,10 +54,11 @@ it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT && process.env.PAPERCLI
       extensions = await createPiExtensionSnapshot([cap, ...JSON.parse(process.env.PAPERCLIP_TEST_PI_PACKAGES!)]);
       const { entries } = JSON.parse(await readFile(join(distribution, "native-closure.json"), "utf8"));
       native = await createNativeAcpxDistributionSnapshot({ distributionRoot: runtime, manifestPath: join(distribution, "native-closure.json"),
-        expectedClosureSha256: metadata.nativeClosureSha256, executable: metadata.manifest.node, entrypoint: "pi-entry.cjs", fixedArguments: [] }, entries, undefined, extensions);
+        expectedClosureSha256: metadata.nativeClosureSha256, executable: metadata.manifest.node, entrypoint: "pi-entry.cjs", fixedArguments: [] }, entries, undefined, extensions, nativeExtensions);
       const bound = native.snapshot.roots[0]!;
       const launch = createPiLaunchSpec({ cwd: workspace }, {
-        PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: home, PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0",
+        PATH: process.env.PATH, HOME: home, PI_CODING_AGENT_DIR: home, PI_CODING_AGENT_SESSION_DIR: join(root, "env-session-escape"), PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0",
+        ...(nativeExtensions ? { PAPERCLIP_PI_ADMITTED_NATIVE_EXTENSIONS: "1" } : {}),
         PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1", PAPERCLIP_PI_READ_ONLY: "1",
         PAPERCLIP_PI_NODE_EXECUTABLE: join(bound, metadata.manifest.node), PAPERCLIP_PI_ENTRYPOINT: join(bound, metadata.manifest.piEntrypoint),
         PAPERCLIP_PI_EXTENSION_PATH: join(bound, metadata.manifest.extension), PAPERCLIP_PI_MODULE_GUARD_PATH: join(bound, ".paperclip-native-module-guard.cjs"),
@@ -69,11 +91,21 @@ it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT && process.env.PAPERCLI
       expect(response.success).toBe(true);
       expect(response.data.commands).toContainEqual(expect.objectContaining({ name: "paperclip-runtime-ready-v1", description: "Paperclip runtime gate v1" }));
       expect(stderr).not.toMatch(/Failed to load extension|escaped its closed distribution|digest mismatch/);
+      if (nativeExtensions) {
+        expect(response.data.commands).toEqual(expect.arrayContaining(["annotate", "project-native-proof", "project-settings-proof", "skill:native-proof", "native-template"].map(name => expect.objectContaining({ name }))));
+        for (const flag of ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-approve"]) expect(launch.args).not.toContain(flag);
+        const sessionProof = JSON.parse(frames.find(frame => frame.statusKey === "native-session-proof")?.statusText ?? "null");
+        expect(sessionProof.ownedFirst).toBe(true);
+        expect(sessionProof.sessionFile.startsWith(join(home, "sessions") + "/")).toBe(true);
+        // Pi creates the JSONL lazily on a conversational message; no model
+        // prompt is sent by this registration-only proof.
+      }
       const toolProof = frames.find(frame => frame.type === "extension_ui_request" && frame.statusKey === "operator-cap");
       expect(JSON.parse(toolProof?.statusText ?? "null")).toEqual(expect.arrayContaining(["operator_cap", "subagent"]));
       const langfuseProof = frames.find(frame => frame.type === "extension_ui_request" && frame.statusKey === "langfuse");
       expect(langfuseProof).toMatchObject({ statusText: "langfuse: off (no keys)" });
-      console.info(JSON.stringify({ launchArgs: launch.args, toolProof, langfuseProof,
+      console.info(JSON.stringify({ nativeExtensions, launchArgs: launch.args, toolProof, langfuseProof,
+        commands: response.data.commands, sessionProof: frames.find(frame => frame.statusKey === "native-session-proof"),
         ownedCommand: response.data.commands.find((command: { name: string }) => command.name === "paperclip-runtime-ready-v1") }, null, 2));
     } finally {
       if (child) {

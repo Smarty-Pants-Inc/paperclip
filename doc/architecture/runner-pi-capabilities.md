@@ -14,9 +14,56 @@ the Runner's ACPX patch with the other Runner contracts. Launch and recovery adm
 and digest. Saved inputs with an earlier profile version still decode, so
 recovery can refuse them.
 
+## Native trusted Pi packages and extensions
+
+Set `PAPERCLIP_PI_EXTENSIONS_MODE=native` in the agent's resolved `env`
+configuration to use Pi's documented package/resource discovery. Like the explicit
+list below, this is controller-projected operator authority, not an ambient host
+export or a setting extensions can enable. An invalid mode fails admission.
+Unset keeps the existing argument vector and owned-only discovery policy.
+
+Native mode removes all four `--no-extensions`, `--no-skills`,
+`--no-prompt-templates`, and `--no-themes` switches. It passes Pi's `--approve`
+instead of `--no-approve`, granting project trust for the run's workspace. Pi
+itself resolves user `settings.json` packages (including `pi install`), user
+resources, project `.pi/settings.json` and `.pi/extensions`, package resource
+filters, and explicit `-e` entries. The existing `PAPERCLIP_PI_EXTENSIONS` list
+continues to supply additional `-e` paths after the owned extension. No new
+package format, installer, registry, or discovery implementation is introduced.
+
+The immutable command bootstrap mints native mode; neither forged launch
+variables nor workspace settings can turn a closed-mode guard into native mode.
+Native admission deliberately trusts **all modules Pi or trusted extensions
+import**, including local package dependencies outside the workspace. It does
+not freeze/hash discovered user/project code or promise those bytes are immutable.
+The pinned provider files and explicitly snapshotted files still require their
+admitted hashes. This is the smallest admission policy preserving plain Pi's
+local-path, symlink, package and dependency semantics. Operators must trust the
+workspace, installed packages and their imports: extensions have the process's
+filesystem, network, credential and child-process authority, not merely tool
+permissions. The outer sandbox remains the security boundary; do not enable this
+mode for untrusted code. Owned-first loading/readiness is not confinement of
+hostile extensions.
+
+Runner retains its private `PI_CODING_AGENT_DIR`; native reconnect preserves its
+`settings.json` rather than erasing declarations written by `pi install`. The
+launch explicitly pins `--session-dir <private-agent-dir>/sessions`, overriding
+both user/project `sessionDir` and `PI_CODING_AGENT_SESSION_DIR`. Pi captures its
+agent directory and effective session directory before extension factories run;
+normal extension session APIs keep that binding. Native session backup therefore
+continues to use the same private directory. Arbitrary trusted JavaScript can
+still write files directly; no in-process mechanism can constrain hostile code.
+
+`--offline` stays: in Pi 1.0.0 it suppresses model refresh, package update checks,
+and fetching/reconciling missing npm/git sources. Already-installed packages and
+local sources still load. Install/update packages beforehand with the pinned Pi
+CLI and the same private agent directory; offline is not a network firewall for
+extensions. The owned extension remains first and its readiness sentinel remains
+mandatory before model work.
+
 ## Explicit trusted Pi extensions
 
-The pinned Runner Pi runtime keeps automatic extension discovery disabled. An
+By default the pinned Runner Pi runtime keeps automatic extension discovery disabled. An
 operator can explicitly authorize additional local extensions with
 `PAPERCLIP_PI_EXTENSIONS`, a JSON array in the agent's **resolved task environment**
 (`env` configuration). An ambient host export alone grants no authority. Example
@@ -30,7 +77,8 @@ values in that configuration, not an instruction to export host environment:
 ```
 
 Every entry must be an existing, canonical absolute local file or package path;
-there are at most 32 entries. An unset value or `[]` retains the default owned-only
+there are at most 32 entries. Package directories require a regular, valid
+`package.json`. An unset value or `[]` retains the default owned-only
 launch. Malformed values, missing paths, symlink aliases, and dependency symlinks
 that escape the selected tree fail admission. Install packages and dependencies
 beforehand; Runner does not install npm/git sources or enable `.pi`/home discovery.

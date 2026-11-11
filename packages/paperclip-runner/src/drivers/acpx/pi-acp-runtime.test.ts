@@ -294,6 +294,10 @@ describe("Pi ACP bridge", () => {
     const launch = createPiLaunchSpec({ cwd: root, mcpServers: [] }, environment);
     expect(launch.command).toBe(join(root, "node"));
     expect(launch.args).toEqual([join(root, "cli.js"), "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-approve", "--offline", "-e", join(root, "extension.js")]);
+    // Native discovery must not inherit the four owned-only resource switches.
+    const native = createPiLaunchSpec({ cwd: root }, { ...environment, PAPERCLIP_PI_ADMITTED_NATIVE_EXTENSIONS: "1", PI_CODING_AGENT_SESSION_DIR: "/escape" });
+    expect(native.args).toEqual([join(root, "cli.js"), "--mode", "rpc", "--approve", "--offline", "-e", join(root, "extension.js"), "--session-dir", join(root, "sessions")]);
+    expect(native.env.PI_CODING_AGENT_DIR).toBe(root);
     const extra = join(root, "tool-cap.ts");
     await writeFile(extra, "export default () => {};");
     const configured = { ...environment, PAPERCLIP_PI_ADMITTED_EXTENSIONS: JSON.stringify([extra]), PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS: JSON.stringify([root]) };
