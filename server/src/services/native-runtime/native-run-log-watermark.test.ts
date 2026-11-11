@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { eq, sql } from "drizzle-orm";
 import { closeRegisteredClients, createDb, heartbeatRunEvents, heartbeatRuns, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { createNativeRunLogTestTables } from "../../__tests__/helpers/native-run-log-database.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -182,13 +182,19 @@ describe.skipIf(!support.supported)("native run log source watermarks", () => {
     return { store, handle: output.handle!, prefix: await readAll(store, output.handle!) };
   }
 
-  it.each([true, false])("cold-recovers an explicit legacy-compacted 64KiB tool event with committed cursor: %s", async (watermark) => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it.each([64 * 1024, 4096].flatMap(persistedCap =>
+    ["0", "1024", "131072"].flatMap(currentCap =>
+      [true, false].map(watermark => ({ persistedCap, currentCap, watermark }))),
+  ))("cold-recovers cap $persistedCap with current cap $currentCap and committed cursor $watermark", async ({ persistedCap, currentCap, watermark }) => {
+    vi.stubEnv("PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS", currentCap);
     const f = await fixture(), store = f.store(), handle = await store.begin(f.binding);
     const event = toolEvent(f, "retained output 再開 ".repeat(4000).slice(0, 65_536));
     await f.persist(event, 2);
     // Immutable old producer format, even when the current canonical writer becomes lossless.
     await store.append(handle, { stream: "stdout", ts: "legacy", seq: 1,
-      ...(watermark ? { sourceCursor: 2 } : {}), chunk: compactRunLogChunk(formatNativeRunLogEvent(event)) });
+      ...(watermark ? { sourceCursor: 2 } : {}), chunk: compactRunLogChunk(formatNativeRunLogEvent(event), persistedCap) });
     await store.finalize(handle);
     const prefix = await readAll(store, handle);
     const chunk = JSON.parse(prefix).chunk as string;
