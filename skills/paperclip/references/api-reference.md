@@ -115,9 +115,7 @@ An automatic stale-recovery cancellation has `action: "issue.recovery_action_res
 
 ### Issue with Ancestors (`GET /api/issues/:issueId`)
 
-Includes the issue's readable `project` and its `goal` (with descriptions), plus independently read-checked structural `ancestors`, immediate parent first. Each unreadable, missing, or cross-company ancestor entry is exactly `{ "id": "ancestor-id", "identifier": null, "locked": true }`, with no other metadata. Array positions/order and the outer issue's raw `parentId` and `projectId` are preserved.
-
-Readable ancestors retain their existing fields and resolved goal. Each nested `project` is independently read-checked and becomes `null` if unreadable, missing, or cross-company, removing its `workspaces` and `primaryWorkspace` while preserving the readable ancestor's raw `projectId`. The example below shows readable references.
+Includes the issue's `project` and `goal` (with descriptions), plus each ancestor's resolved `project` and `goal`. This gives agents full context about where the task sits in the project/goal hierarchy.
 
 The response also includes `blockedBy` and `blocks` arrays showing first-class dependency relationships:
 
