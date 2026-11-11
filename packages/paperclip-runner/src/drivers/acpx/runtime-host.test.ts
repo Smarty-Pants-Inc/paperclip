@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createPiLaunchSpec } from "./pi-acp-runtime.js";
+import { configuredEnvironmentProjection } from "../../configured-environment.js";
 import { createCopilotToolEvidence } from "./copilot-tool-evidence.js";
 import { readNativeSemanticReceipt, type SemanticToolResult } from "../semantic-tool-receipt.js";
 import { validateAcpxRichEvent } from "./profile-extensions.js";
@@ -1178,6 +1179,26 @@ describe("ACPX runtime host", () => {
     }));
     await host.close({ reason: "policy verified" });
     expect(openRuntime).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("passes only explicitly configured Pi extension authority to the command lease (configured: %s)", async configured => {
+    const fixture = await hostFixture();
+    const model = "openrouter/deepseek/deepseek-v4-flash-0731";
+    const profile = resolveQualifiedAcpxProfile("pi", model);
+    const source = { PAPERCLIP_PI_EXTENSIONS: '["/operator/pi/cap.ts","/operator/pi/package"]' };
+    const openCommand = vi.fn(async () => ({ spawn: () => { throw new Error("not used"); }, close: async () => {} }));
+    const host = await AcpxRuntimeHost.open({ ...fixture.options, agent: "pi", model, piThinkingLevel: "low",
+      permissionMode: "approve-all", providerPolicy: { readOnly: true },
+      environment: configured ? configuredEnvironmentProjection(source) : source,
+    }, fixture.dependencies({
+      verifyInstallation: async () => ({ commandDigest: profile.commandDigest, agentServerPackageJsonPath: join(fixture.root, "package.json"),
+        agentRuntimePackageJsonPath: null, openCommand }),
+      openRuntime: async () => runtimePort({ getStatus: async () => ({ models: { currentModelId: model } }),
+        identity: async () => ({ acpxRecordId: "record-1", backendSessionId: "backend-1", agentSessionId: "agent-1", piThinkingLevel: "low" }) }),
+    }));
+    expect(openCommand.mock.calls).toHaveLength(1);
+    expect(openCommand.mock.calls[0]).toEqual([configured ? { signal: undefined, piExtensions: JSON.parse(source.PAPERCLIP_PI_EXTENSIONS) } : { signal: undefined }]);
+    await host.close({ reason: "extension authority checked" });
   });
 
   it.each([undefined, "high"] as const)("retires Pi admission when the runtime reports thinking level %s", async piThinkingLevel => {

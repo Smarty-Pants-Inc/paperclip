@@ -14,6 +14,54 @@ the Runner's ACPX patch with the other Runner contracts. Launch and recovery adm
 and digest. Saved inputs with an earlier profile version still decode, so
 recovery can refuse them.
 
+## Explicit trusted Pi extensions
+
+The pinned Runner Pi runtime keeps automatic extension discovery disabled. An
+operator can explicitly authorize additional local extensions with
+`PAPERCLIP_PI_EXTENSIONS`, a JSON array in the agent's **resolved task environment**
+(`env` configuration). An ambient host export alone grants no authority. Example
+values in that configuration, not an instruction to export host environment:
+
+```json
+{
+  "PAPERCLIP_PI_EXTENSIONS": "[\"/srv/pi/extensions/tool-cap.ts\",\"/srv/pi/packages/pi-subagents\",\"/srv/pi/packages/pi-observability-plugin\"]",
+  "LANGFUSE_BASE_URL": "http://langfuse.internal:3000"
+}
+```
+
+Every entry must be an existing, canonical absolute local file or package path;
+there are at most 32 entries. An unset value or `[]` retains the default owned-only
+launch. Malformed values, missing paths, symlink aliases, and dependency symlinks
+that escape the selected tree fail admission. Install packages and dependencies
+beforehand; Runner does not install npm/git sources or enable `.pi`/home discovery.
+A plain file freezes its **whole parent directory** for sibling imports and
+`node_modules`, so keep it in a dedicated directory. A Pi package freezes its
+whole tree and uses Pi's normal `package.json` resource declaration. Linked
+workspace packages whose dependencies live outside that tree need a standalone
+local installation instead. Package-declared resources are explicitly trusted too.
+
+Before a command is spawned, Runner snapshots and hashes all selected trees,
+including dependencies. The native command handoff and module guard admit only
+those frozen bytes in addition to the unchanged pinned provider distribution.
+The immutable bootstrap supplies the admitted paths; task environment cannot
+forge that handoff. The owned Paperclip extension is always first, supplemental
+`-e` arguments follow it, and `paperclip-runtime-ready-v1` remains mandatory.
+Snapshots retire with the command lease. Changes to source trees do not affect
+an existing lease; a new lease re-admits the current operator-trusted files.
+Third-party bytes are supplemental operator authority, **not** part of the
+reviewed provider-release digest. These extensions run trusted Node code with the
+provider process's authority; this is not a sandbox for untrusted marketplace code.
+
+Credential-free Linux checks exercise a local tool cap, `pi-subagents@0.75.0`,
+and `@langfuse/pi-observability-plugin@0.1.2` in real pinned Pi with the native
+module guard. The subagent tool is registered but not invoked. Langfuse imports
+and reports its disabled/no-key status; this does **not** prove OTLP delivery.
+`pi-subagents@0.88.0` declares Pi AI `>=1.2.0`, outside this runtime's 1.0.0 pin;
+it is not qualified here. Supply any Langfuse export credentials through the
+existing configured secret environment, never through a new loader. Pi's
+`--offline` disables automatic Pi activity, not explicitly trusted extension
+HTTP exports. Test an actual local Langfuse endpoint before claiming trace delivery.
+
 ## Profile chronology
 
 Until 2026-10-30, these digests hashed Paperclip source files, so each change

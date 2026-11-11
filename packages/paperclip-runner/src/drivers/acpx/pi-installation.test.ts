@@ -45,7 +45,7 @@ describe("Pi installation factory", () => {
     const helper = stripTypeScriptTypes(await readFile(new URL("./pi-acp-runtime.ts", import.meta.url), "utf8")).split("\n").map(line => line.trimEnd()).join("\n");
     const materializer = await readFile(new URL("../../../scripts/materialize-pi-distribution.mjs", import.meta.url), "utf8");
     expect(materializer).toContain(`helperSha256: "${hash(helper)}"`);
-    expect(hash(await readFile(new URL("../../../../../patches/pi-acp@0.0.33.patch", import.meta.url)))).toBe("a7c63900b513490cceed9e41bc3bd06f03f2cd56265f434aa2c5dc7925fa76b4");
+    expect(hash(await readFile(new URL("../../../../../patches/pi-acp@0.0.33.patch", import.meta.url)))).toBe("ba72f36f11bf3e9550c302971ccca3af363c1b6c05f43760dc9147bdb121b829");
   });
 
   it("admits only the exact current profile", () => {
@@ -74,18 +74,25 @@ describe("Pi installation factory", () => {
     expect(Object.hasOwn(PI_DISTRIBUTION_CLOSURE_SHA256, "linux-arm64")).toBe(false);
     await expect(verifyPiInstallation(candidate())).rejects.toThrow(/^Pi distribution target is unsupported$/);
   }));
-  it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT)("launches the actual closed Pi snapshot with bound subprocess paths", async () => {
+  it.runIf(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT).each([false, true])("launches the actual closed Pi snapshot with bound subprocess paths (extensions: %s)", async extensions => {
     const { root, assets } = await fixture();
     await cp(process.env.PAPERCLIP_TEST_PI_DISTRIBUTION_ROOT!, assets, { recursive: true });
     const workspace = join(root, "workspace"); const agentHome = join(root, "agent");
     await mkdir(workspace); await mkdir(agentHome);
     const installation = await verifyPiInstallation(candidate());
-    const command = await installation.openCommand();
+    const capRoot = join(root, "operator-extensions"), marker = join(workspace, "extensions-loaded.json");
+    await mkdir(capRoot);
+    const cap = join(capRoot, "cap.js");
+    await writeFile(cap, `import {writeFileSync} from "node:fs";
+      export default pi=>pi.on("session_start",()=>writeFileSync(${JSON.stringify(marker)},JSON.stringify({
+        tools:pi.getAllTools().map(tool=>tool.name),offline:process.env.PI_OFFLINE})));`);
+    const packages: string[] = JSON.parse(process.env.PAPERCLIP_TEST_PI_PACKAGES ?? "[]");
+    const command = await installation.openCommand(extensions ? { piExtensions: [cap, ...packages] } : undefined);
     const child = command.spawn([], { cwd: workspace, env: {
       PATH: "/usr/bin:/bin", HOME: agentHome, PI_CODING_AGENT_DIR: agentHome,
       PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1", PAPERCLIP_PI_READ_ONLY: "1",
       PAPERCLIP_PI_READ_ROOTS: "[]", PAPERCLIP_PI_PROTECTED_ROOTS: JSON.stringify([agentHome]),
-      PAPERCLIP_PI_ENTRYPOINT: "/unverified/ignored.js", PI_TELEMETRY: "0",
+      PAPERCLIP_PI_ENTRYPOINT: "/unverified/ignored.js", PI_TELEMETRY: "0", LANGFUSE_TRACING_ENABLED: "false",
     } });
     let stderr = ""; child.stderr!.on("data", chunk => { stderr += String(chunk); });
     const pending = new Map<number, { resolve(value: any): void; reject(error: Error): void }>();
@@ -111,6 +118,11 @@ describe("Pi installation factory", () => {
       expect(initialized.agentCapabilities._meta.paperclipPi.steering).toBe(true);
       expect(initialized.authMethods).toEqual([]);
       await expect(call("session/new", { cwd: workspace, mcpServers: [] })).rejects.toThrow("Bind the configured OpenRouter API credential");
+      // Reaching the credential gate proves the real wrapper accepted owned readiness.
+      if (extensions) {
+        const loaded = JSON.parse(await readFile(marker, "utf8")); expect(loaded.offline).toBe("1");
+        if (packages.length) expect(loaded.tools).toContain("subagent");
+      } else await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       child.stdin!.end();
       if (child.exitCode === null) { const timer = setTimeout(() => child.kill("SIGKILL"), 3000); await once(child, "close"); clearTimeout(timer); }

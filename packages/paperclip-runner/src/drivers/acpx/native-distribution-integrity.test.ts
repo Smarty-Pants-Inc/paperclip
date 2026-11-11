@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { constants } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { chmod, copyFile, link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile, type FileHandle } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -624,7 +624,11 @@ describe("native ACPX execution closure", () => {
     const rejected = expect(creating).rejects.toThrow("changed while read");
     try {
       await entered.promise;
-      await writeFile(join(declaration.distributionRoot, "file-00"), Buffer.alloc(101, 7));
+      const path = join(declaration.distributionRoot, "file-00");
+      await writeFile(path, Buffer.alloc(101, 7));
+      // Exercise the metadata invariant deterministically even when rapid writes
+      // share timestamps; otherwise the independent digest guard rejects first.
+      await utimes(path, new Date(0), new Date(0));
     } finally { hold.release(); }
     await rejected;
   });

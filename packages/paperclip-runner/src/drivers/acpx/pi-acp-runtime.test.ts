@@ -293,7 +293,17 @@ describe("Pi ACP bridge", () => {
     };
     const launch = createPiLaunchSpec({ cwd: root, mcpServers: [] }, environment);
     expect(launch.command).toBe(join(root, "node"));
-    expect(launch.args).toEqual(expect.arrayContaining(["--no-extensions", "--no-approve", "--no-skills", "--offline"]));
+    expect(launch.args).toEqual([join(root, "cli.js"), "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-approve", "--offline", "-e", join(root, "extension.js")]);
+    const extra = join(root, "tool-cap.ts");
+    await writeFile(extra, "export default () => {};");
+    const configured = { ...environment, PAPERCLIP_PI_ADMITTED_EXTENSIONS: JSON.stringify([extra]), PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS: JSON.stringify([root]) };
+    expect(createPiLaunchSpec({ cwd: root }, configured).args).toEqual([...launch.args, "-e", extra]);
+    for (const path of ["relative.ts", join(root, "..", "escape.ts"), join(root, "missing.ts")]) {
+      expect(() => createPiLaunchSpec({ cwd: root }, { ...configured, PAPERCLIP_PI_ADMITTED_EXTENSIONS: JSON.stringify([path]) })).toThrow();
+    }
+    await symlink(extra, join(root, "linked.ts"));
+    expect(() => createPiLaunchSpec({ cwd: root }, { ...configured, PAPERCLIP_PI_ADMITTED_EXTENSIONS: JSON.stringify([join(root, "linked.ts")]) })).toThrow();
+    expect(() => createPiLaunchSpec({ cwd: root }, { ...configured, PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS: "[]" })).toThrow();
     const ambient = createPiLaunchSpec({ cwd: root }, { ...environment, AGENT_HOME: "/ambient/unregistered" });
     expect(ambient.env.AGENT_HOME).toBeUndefined();
     expect(JSON.parse(ambient.env.PAPERCLIP_PI_RUNTIME_CONFIGURATION!).agentHome).toBeUndefined();

@@ -495,7 +495,7 @@ export interface VerifiedAcpxInstallation {
   readonly commandDigest: string;
   readonly agentServerPackageJsonPath: string | null;
   readonly agentRuntimePackageJsonPath: string | null;
-  openCommand(options?: { signal?: AbortSignal }): Promise<VerifiedAcpxCommandLease>;
+  openCommand(options?: { signal?: AbortSignal; piExtensions?: readonly string[] }): Promise<VerifiedAcpxCommandLease>;
 }
 
 /**
@@ -514,8 +514,14 @@ export async function verifyNativeAcpxInstallation(
     commandDigest: `sha256:${declaration.expectedClosureSha256}`,
     agentServerPackageJsonPath: declaration.manifestPath,
     agentRuntimePackageJsonPath: null,
-    async openCommand(options?: { signal?: AbortSignal }): Promise<VerifiedAcpxCommandLease> {
-      const native = await createNativeAcpxDistributionSnapshot(declaration, entries, options?.signal);
+    async openCommand(options?: { signal?: AbortSignal; piExtensions?: readonly string[] }): Promise<VerifiedAcpxCommandLease> {
+      options?.signal?.throwIfAborted();
+      if (options?.piExtensions?.length && declaration.entrypoint !== "pi-entry.cjs") throw new Error("Supplemental Pi extensions require the Pi distribution");
+      const extensions = options?.piExtensions?.length
+        ? await (await import("./pi-extension-snapshot.js")).createPiExtensionSnapshot(options.piExtensions) : undefined;
+      let native;
+      try { native = await createNativeAcpxDistributionSnapshot(declaration, entries, options?.signal, extensions); }
+      catch (error) { await extensions?.snapshot.close(); throw error; }
       const lease = commandLease(
         native.snapshot.roots[0]!, NATIVE_ACPX_BOOTSTRAP_NAME, "commonjs",
         native.bootstrap, native.commandDirectory, [], 0, "commonjs", [],

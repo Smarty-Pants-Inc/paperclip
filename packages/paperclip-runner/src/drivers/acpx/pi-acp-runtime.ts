@@ -393,6 +393,17 @@ export function createPiLaunchSpec(
   const guard = environment.PAPERCLIP_PI_MODULE_GUARD_PATH === undefined ? []
     : ["--require", requiredFile(environment, "PAPERCLIP_PI_MODULE_GUARD_PATH")];
   const args = [...guard, entrypoint, "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-approve", "--offline", "-e", extension];
+  const extensionRoots = pathArray(environment.PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS);
+  for (const path of pathArray(environment.PAPERCLIP_PI_ADMITTED_EXTENSIONS)) {
+    const contained = extensionRoots.some(root => {
+      const suffix = relative(root, path);
+      return !isAbsolute(suffix) && suffix !== ".." && !suffix.startsWith(`..${sep}`);
+    });
+    if (!contained || resolve(path) !== path || realpathSync(path) !== path) throw new Error("Pi extension escaped its admitted snapshot");
+    const stat = lstatSync(path);
+    if (!stat.isFile() && !stat.isDirectory()) throw new Error("Pi extension is not a file or package directory");
+    args.push("-e", path);
+  }
   for (const root of readRoots) args.push("--skill", root);
   if (params.sessionPath) {
     const home = environment.PI_CODING_AGENT_DIR;

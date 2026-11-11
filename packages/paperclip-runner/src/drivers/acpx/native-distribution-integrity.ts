@@ -4,6 +4,7 @@ import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile, type FileH
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import type { AcpxPrivateSnapshot } from "./private-snapshot.js";
+import type { PiExtensionSnapshot } from "./pi-extension-snapshot.js";
 
 export interface NativeAcpxDistributionEntry { path: string; sha256: string; size: number; executable: boolean }
 export interface NativeAcpxDistributionInput {
@@ -81,7 +82,7 @@ export async function readNativeAcpxDistributionEntries(input: NativeAcpxDistrib
  * Freeze only manifest-admitted bytes. Native trees deliberately have a separate
  * bound; the tighter JavaScript/npm snapshot limits remain unchanged.
  */
-export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDistributionInput, entries: NativeAcpxDistributionEntry[], signal?: AbortSignal): Promise<NativeAcpxDistributionSnapshot> {
+export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDistributionInput, entries: NativeAcpxDistributionEntry[], signal?: AbortSignal, piExtensions?: PiExtensionSnapshot): Promise<NativeAcpxDistributionSnapshot> {
   signal?.throwIfAborted();
   // Callers cannot substitute entries between manifest validation and copying.
   entries = parseNativeAcpxDistributionEntries({ entries }, input.expectedClosureSha256);
@@ -98,6 +99,7 @@ export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDist
   const close = async () => {
     for (const path of directories) await chmod(path, 0o700).catch(() => undefined);
     await rm(privateRoot, { recursive: true, force: true });
+    await piExtensions?.snapshot.close();
   };
   let commandDirectory: FileHandle | undefined;
   try {
@@ -203,6 +205,7 @@ export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDist
     // Completion order must not change the module guard or manifest.
     for (const entry of entries) digests[join(packageRoot, ...entry.path.split("/"))] = entry.sha256;
     if (!same(rootBefore, await heldRoot.stat({ bigint: true })) || !same(rootBefore, await lstat(source, { bigint: true }))) throw new Error("Native ACPX distribution root changed during snapshot");
+    if (piExtensions) Object.assign(digests, piExtensions.snapshot.digests);
     const executable = join(packageRoot, ...input.executable.split("/"));
     const args = [...(input.entrypoint === undefined ? [] : ["--require", join(packageRoot, GUARD), join(packageRoot, ...input.entrypoint.split("/"))]), ...input.fixedArguments];
     let copilotEntryDirectory: string | undefined;
@@ -221,23 +224,24 @@ export async function createNativeAcpxDistributionSnapshot(input: NativeAcpxDist
       await writeFile(join(packageRoot, GUARD), guard, { mode: 0o400, flag: "wx" });
       digests[join(packageRoot, GUARD)] = sha256(guard);
     }
-    const bootstrap = Buffer.from(nativeBootstrap(executable, digests[executable]!, args, input.isolatedCacheEnvironmentName ? { name: input.isolatedCacheEnvironmentName, value: cacheRoot } : undefined, copilotEntryDirectory));
+    const bootstrap = Buffer.from(nativeBootstrap(executable, digests[executable]!, args, input.isolatedCacheEnvironmentName ? { name: input.isolatedCacheEnvironmentName, value: cacheRoot } : undefined, copilotEntryDirectory, piExtensions));
     await writeFile(join(packageRoot, BOOTSTRAP), bootstrap, { mode: 0o400, flag: "wx" });
     digests[join(packageRoot, BOOTSTRAP)] = sha256(bootstrap);
     // executable is null: commandLease's separately-qualified provider runtime
     // slot is unused; this distribution is spawned by the trusted bootstrap.
-    const manifest = Buffer.from(JSON.stringify({ roots: [packageRoot], executable: null, digests }));
+    const roots = [packageRoot, ...(piExtensions?.snapshot.roots ?? [])];
+    const manifest = Buffer.from(JSON.stringify({ roots, executable: null, digests }));
     const manifestPath = join(privateRoot, "manifest.json");
     await writeFile(manifestPath, manifest, { mode: 0o400, flag: "wx" });
     await directoryBatch([...directories], path => chmod(path, 0o500));
     commandDirectory = await open(packageRoot, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
-    return { commandDirectory, bootstrap, snapshot: { roots: [packageRoot], executable: null, digests, handoff: { path: manifestPath, digest: sha256(manifest) }, close } };
+    return { commandDirectory, bootstrap, snapshot: { roots, executable: null, digests, handoff: { path: manifestPath, digest: sha256(manifest) }, close } };
   } catch (error) {
     await commandDirectory?.close(); await close(); throw error;
   } finally { await heldRoot.close(); }
 }
 
-function nativeBootstrap(executable: string, executableDigest: string, args: string[], cache?: { name: string; value: string }, copilotEntryDirectory?: string): string {
+function nativeBootstrap(executable: string, executableDigest: string, args: string[], cache?: { name: string; value: string }, copilotEntryDirectory?: string, piExtensions?: PiExtensionSnapshot): string {
   return [
     'const {spawn}=require("node:child_process");',
     'const fs=require("node:fs");',
@@ -246,6 +250,13 @@ function nativeBootstrap(executable: string, executableDigest: string, args: str
     'const guarded=process.env.PAPERCLIP_ACPX_NATIVE_GUARDED==="1";',
     'const env={...process.env}; delete env.PAPERCLIP_ACPX_NATIVE_GUARDED; delete env.PAPERCLIP_ACPX_PRIVATE_SNAPSHOT; delete env.PAPERCLIP_VERIFIED_RUNTIME_EXECUTABLE;',
     'env.NODE_DISABLE_COMPILE_CACHE="1"; delete env.NODE_COMPILE_CACHE;',
+    // Only this immutable command bootstrap can mint supplemental code authority.
+    'delete env.PAPERCLIP_PI_ADMITTED_EXTENSIONS; delete env.PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS;',
+    ...(piExtensions ? [
+      `env.PAPERCLIP_PI_ADMITTED_EXTENSIONS=${JSON.stringify(JSON.stringify(piExtensions.paths))};`,
+      `env.PAPERCLIP_PI_ADMITTED_EXTENSION_ROOTS=${JSON.stringify(JSON.stringify(piExtensions.snapshot.roots))};`,
+      `env.PAPERCLIP_PI_PROTECTED_ROOTS=JSON.stringify([...JSON.parse(env.PAPERCLIP_PI_PROTECTED_ROOTS??"[]"),...${JSON.stringify(piExtensions.snapshot.roots)}]);`,
+    ] : []),
     ...(cache ? [`env[${JSON.stringify(cache.name)}]=${JSON.stringify(cache.value)};`] : []),
     ...(copilotEntryDirectory ? [
       // Never permit the native loader to choose a different cached version,
