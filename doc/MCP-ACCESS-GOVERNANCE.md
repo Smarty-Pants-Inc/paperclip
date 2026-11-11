@@ -447,6 +447,21 @@ These are intentional gaps as of the MCP Access Governance v1 launch. Track or w
 - **Endpoint mode (Paperclip as MCP server) is not policy-governed.** Tool access governance applies only to *gateway mode* — Paperclip's own MCP endpoint surface (`/mcp`) uses standard Paperclip auth and is not subject to the profile/policy stack.
 - **No multi-region runtime supervisor.** Local stdio slots run on the worker that serves the request that started them. If you scale workers, slots do not migrate. Plan capacity per worker, not per cluster.
 
+## Sandbox callback bridge
+
+Sandbox adapters can use the session API through either the queue callback bridge
+or the HTTP/2 bridge. The allowlist admits only `POST /api/tool-gateway/sessions`,
+`POST /api/tool-gateway/sessions/:sessionId/revoke`, `GET /api/tool-gateway/tools`,
+and `POST /api/tool-gateway/tools/call`. It does not admit gateway administration,
+approval, audit, runtime-management, or MCP endpoints.
+
+Create a session with the bridge's `PAPERCLIP_API_KEY`, then pass the returned
+session token in `x-paperclip-tool-gateway-token` for discovery and calls. The
+bridge forwards that header and supplies host-controlled agent authorization and
+run attribution. The session token is a bearer capability; do not log it or share
+it between runs. Gateway session expiry, revocation, active-run checks, company
+access, tool profiles, policies, approvals, and audit still apply.
+
 ## Reference
 
 | Surface | Path / endpoint | Notes |

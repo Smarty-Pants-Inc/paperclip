@@ -1,5 +1,8 @@
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { createServer, type IncomingMessage } from "node:http";
 import express from "express";
 import { and, eq, sql } from "drizzle-orm";
@@ -61,6 +64,14 @@ import { resolveConnectionGrantSecret } from "../services/connection-credentials
 import { secretService } from "../services/secrets.js";
 import * as cogneeBridge from "../services/cognee-connection.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
+import {
+  buildSandboxCallbackBridgeEnv,
+  createFileSystemSandboxCallbackBridgeQueueClient,
+  createSandboxCallbackBridgeAsset,
+  createSandboxCallbackBridgeToken,
+  sandboxCallbackBridgeDirectories,
+  startSandboxCallbackBridgeWorker,
+} from "../../../packages/adapter-utils/src/sandbox-callback-bridge.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -477,6 +488,77 @@ function createGatewayRouteApp(
   app.use(mcpGatewayProtocolRoutes(gateway));
   app.use("/api", toolGatewayRoutes(db, gateway));
   return app;
+}
+
+// Run the shipped sandbox entrypoint and host queue worker, with their default
+// route/header policies. Only the host's final HTTP hop is supplied by this
+// fixture: Supertest reaches the real gateway router/service/database. Actor
+// authentication is injected by createGatewayRouteApp, as in the route tests.
+async function startGatewayQueueBridge(app: ReturnType<typeof createGatewayRouteApp>) {
+  const asset = await createSandboxCallbackBridgeAsset();
+  const queueDir = join(asset.localDir, "queue");
+  const bridgeToken = createSandboxCallbackBridgeToken();
+  let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | undefined;
+  let child: ReturnType<typeof spawn> | undefined;
+  let closed: Promise<void> | undefined;
+  const close = async () => {
+    try {
+      child?.kill("SIGKILL");
+      await closed;
+    } finally {
+      try { await worker?.stop(); } finally { await asset.cleanup(); }
+    }
+  };
+  try {
+    worker = await startSandboxCallbackBridgeWorker({
+      client: createFileSystemSandboxCallbackBridgeQueueClient(),
+      queueDir,
+      handleRequest: async (forwarded) => {
+        const path = `${forwarded.path}${forwarded.query}`;
+        const call = forwarded.method === "GET" ? request(app).get(path) : request(app).post(path);
+        call.set(forwarded.headers);
+        if (forwarded.body.length) call.send(forwarded.body.toString());
+        const response = await call;
+        return {
+          status: response.status,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(response.body),
+        };
+      },
+    });
+    child = spawn(process.execPath, [asset.entrypoint], {
+      env: { ...process.env, ...buildSandboxCallbackBridgeEnv({ queueDir, bridgeToken }) },
+      stdio: "ignore",
+    });
+    closed = new Promise<void>((resolve) => child!.once("close", () => resolve()));
+    let startupError: Error | undefined;
+    child.on("error", (error) => { startupError = error; });
+    const readyFile = sandboxCallbackBridgeDirectories(queueDir).readyFile;
+    await expect.poll(async () => {
+      if (startupError) throw startupError;
+      return readFile(readyFile, "utf8").then((text) => JSON.parse(text)).catch(() => null);
+    }, { timeout: 5_000 }).toMatchObject({ baseUrl: expect.any(String) });
+    const { baseUrl } = JSON.parse(await readFile(readyFile, "utf8")) as { baseUrl: string };
+    return {
+      send: async (method: "GET" | "POST", path: string, token?: string, body?: unknown) => {
+        const response = await fetch(`${baseUrl}${path}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${bridgeToken}`,
+            "content-type": "application/json",
+            ...(token ? { "x-paperclip-tool-gateway-token": token } : {}),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          signal: AbortSignal.timeout(5_000),
+        });
+        return { status: response.status, body: await response.json() };
+      },
+      close,
+    };
+  } catch (error) {
+    await close();
+    throw error;
+  }
 }
 
 type FakeMcpRequest = {
@@ -5084,6 +5166,125 @@ rl.on("line", (line) => {
       await Promise.allSettled([callA, callB]);
       await fake.close();
     }
+  });
+
+  describe("gateway bridge auth acceptance", () => {
+    it("requires the session header at the actual gateway for discovery and calls", async () => {
+      const app = createGatewayRouteApp(db);
+      const listed = await request(app).get("/api/tool-gateway/tools").expect(401);
+      const called = await request(app).post("/api/tool-gateway/tools/call")
+        .send({ tool: "mcp-remote-fixture:add", parameters: { a: 2, b: 5 } }).expect(401);
+      for (const response of [listed, called]) {
+        expect(response.body).toEqual({ error: "Tool gateway session token is required" });
+      }
+    });
+
+    it("denies other-company session creation at the actual gateway", async () => {
+      const company = await createCompany(db);
+      const otherCompany = await createCompany(db);
+      const otherAgent = await createAgent(db, otherCompany.id);
+      const { run: otherRun } = await createIssueAndRun(db, otherCompany.id, otherAgent.id);
+      const app = createGatewayRouteApp(db, createTestToolGatewayService(db), {
+        type: "board", userId: "board-user", source: "session", companyIds: [company.id],
+        memberships: [{ companyId: company.id, membershipRole: "operator", status: "active" }],
+        isInstanceAdmin: false,
+      });
+      await request(app).post("/api/tool-gateway/sessions").send({
+        companyId: otherCompany.id, agentId: otherAgent.id, runId: otherRun.id,
+      }).expect(403);
+      expect(await db.select().from(toolGatewaySessions)).toEqual([]);
+    });
+
+    it("forwards a queue gateway bridge session flow without bypassing session, owner, company, or tool policy checks", async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      await allowToolsForAgent(db, company.id, agent.id, ["mcp-remote-fixture:add"]);
+      const gateway = createTestToolGatewayService(db);
+      const app = createGatewayRouteApp(db, gateway, {
+        type: "agent", companyId: company.id, agentId: agent.id, runId: run.id, source: "agent_jwt",
+      });
+      const bridge = await startGatewayQueueBridge(app);
+      const callBody = { tool: "mcp-remote-fixture:add", parameters: { a: 2, b: 5 } };
+      const assertUnauthorized = async (token: string, reasonCode: string) => {
+        const listed = await bridge.send("GET", "/api/tool-gateway/tools", token);
+        const called = await bridge.send("POST", "/api/tool-gateway/tools/call", token, callBody);
+        for (const response of [listed, called]) {
+          expect(response.status).toBe(401);
+          expect(response.body.reasonCode).toBe(reasonCode);
+        }
+      };
+      try {
+        // Baseline must fail here with the bridge's route-denied 403, not a
+        // synthetic gateway response. A routes-only fix then fails discovery
+        // because the sandbox still drops the session header.
+        const created = await bridge.send("POST", "/api/tool-gateway/sessions", undefined, {});
+        expect(created.status).toBe(201);
+        const { sessionId, token } = created.body as { sessionId: string; token: string };
+        const listed = await bridge.send("GET", "/api/tool-gateway/tools", token);
+        expect(listed.status).toBe(200);
+        expect(listed.body).toEqual([expect.objectContaining({ name: callBody.tool })]);
+        const called = await bridge.send("POST", "/api/tool-gateway/tools/call", token, callBody);
+        expect(called.status).toBe(200);
+        expect(called.body).toMatchObject({ status: "completed", result: { content: "7" } });
+
+        for (const response of [
+          await bridge.send("GET", "/api/tool-gateway/tools"),
+          await bridge.send("POST", "/api/tool-gateway/tools/call", undefined, callBody),
+        ]) {
+          expect(response.status).toBe(401);
+          expect(response.body).toEqual({ error: "Tool gateway session token is required" });
+        }
+        await assertUnauthorized(tamperToken(token), "session_invalid");
+
+        const denied = await bridge.send("POST", "/api/tool-gateway/tools/call", token, {
+          tool: "mcp-remote-fixture:echo", parameters: { message: "not allowed" },
+        });
+        expect(denied.status).toBe(403);
+        expect(denied.body.reasonCode).toBe("deny_default");
+
+        const otherCompany = await createCompany(db);
+        const foreignAgent = await createAgent(db, otherCompany.id);
+        const { issue: foreignIssue } = await createIssueAndRun(db, otherCompany.id, foreignAgent.id);
+        const crossCompany = await bridge.send("POST", "/api/tool-gateway/sessions", undefined, {
+          companyId: otherCompany.id, agentId: foreignAgent.id, issueId: foreignIssue.id,
+        });
+        expect(crossCompany.status).toBe(403);
+        expect(crossCompany.body.reasonCode).toBe("run_context_mismatch");
+        expect(await db.select().from(toolGatewaySessions)).toEqual([
+          expect.objectContaining({ id: sessionId, companyId: company.id, agentId: agent.id, runId: run.id }),
+        ]);
+
+        const otherOwner = await createAgent(db, company.id);
+        const { run: otherRun } = await createIssueAndRun(db, company.id, otherOwner.id);
+        const otherSession = await gateway.createSession({
+          companyId: company.id, agentId: otherOwner.id, runId: otherRun.id,
+        });
+        const wrongOwner = await bridge.send("POST", `/api/tool-gateway/sessions/${otherSession.id}/revoke`, undefined, {});
+        expect(wrongOwner.status).toBe(403);
+        expect(wrongOwner.body.reasonCode).toBe("session_scope_mismatch");
+        const [untouched] = await db.select().from(toolGatewaySessions).where(eq(toolGatewaySessions.id, otherSession.id));
+        expect(untouched.revokedAt).toBeNull();
+        await expect(gateway.listToolsForSession(otherSession.token)).resolves.toEqual([]);
+
+        const expired = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        await db.update(toolGatewaySessions).set({ expiresAt: new Date(Date.now() - 1_000) })
+          .where(eq(toolGatewaySessions.id, expired.id));
+        await assertUnauthorized(expired.token, "session_expired");
+
+        const revoked = await bridge.send("POST", `/api/tool-gateway/sessions/${sessionId}/revoke`, undefined, {});
+        expect(revoked.status).toBe(200);
+        expect(revoked.body).toMatchObject({ sessionId, revokedAt: expect.any(String) });
+        await assertUnauthorized(token, "session_revoked");
+
+        const ended = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+          .where(eq(heartbeatRuns.id, run.id));
+        await assertUnauthorized(ended.token, "session_run_inactive");
+      } finally {
+        await bridge.close();
+      }
+    }, 30_000);
   });
 
   it("persists hashed sessions and accepts them across gateway service instances", async () => {

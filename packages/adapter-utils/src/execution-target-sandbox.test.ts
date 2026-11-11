@@ -5,7 +5,7 @@ import http2 from "node:http2";
 import net from "node:net";
 import { duplexPair, type Duplex } from "node:stream";
 import { execFile, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -3438,7 +3438,7 @@ describe("sandbox adapter execution targets", () => {
   // Start a host API server that records each forwarded request, so a test can
   // assert the real token and the run id reach the host, or that a rejected
   // request never forwards.
-  async function startRecordingApiServer(): Promise<{
+  async function startRecordingApiServer(responseStatus = 200): Promise<{
     origin: string;
     requests: Array<{
       method: string;
@@ -3482,8 +3482,10 @@ describe("sandbox adapter execution targets", () => {
           res.end(ATTACHMENT_DOWNLOAD_BYTES);
           return;
         }
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.writeHead(responseStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify(responseStatus === 401
+          ? { error: "API authentication required" }
+          : responseStatus === 403 ? { error: "API permission denied" } : { ok: true }));
       });
     });
     await new Promise<void>((resolve, reject) => {
@@ -3500,6 +3502,201 @@ describe("sandbox adapter execution targets", () => {
       close: () => new Promise<void>((resolve) => server.close(() => resolve())),
     };
   }
+
+  async function startGatewayTestBridge(transport: "queue_v1" | "http2_v1", apiStatus = 200) {
+    const { remoteCwd } = await createSandboxWorkspace("paperclip-tool-gateway-");
+    const api = await startRecordingApiServer(apiStatus);
+    let session: http2.ClientHttp2Session | undefined;
+    let bridgeToken = "";
+    const { runner } = makeHttp2SelectionRunner((ctx) => {
+      bridgeToken = ctx.bridgeToken;
+      ctx.emitReady();
+      session = ctx.connectHttp2();
+    });
+    const target = transport === "http2_v1"
+      ? duplexSandboxTarget(remoteCwd, runner)
+      : queueSandboxTarget(remoteCwd);
+    const bridge = await startTestDuplexBridge("run-tool-gateway", target, api.origin);
+    return {
+      api,
+      bridge,
+      request: async (method: string, requestPath: string, token?: string) => {
+        const headers = {
+          authorization: `Bearer ${token ?? (transport === "http2_v1" ? bridgeToken : bridge!.env.PAPERCLIP_API_KEY)}`,
+          "content-type": "application/json",
+          "x-paperclip-tool-gateway-token": "gateway-session-token",
+          "x-paperclip-run-id": "forged-run",
+          "x-not-allowed": "drop-me",
+        };
+        const body = method === "POST" ? JSON.stringify({ gateway: "payload" }) : undefined;
+        if (session) {
+          const response = await http2TestRequest(session, {
+            method,
+            path: requestPath,
+            headers,
+            body: body ? Buffer.from(body) : undefined,
+          });
+          return { status: response.status, body: JSON.parse(response.body.toString("utf8")) };
+        }
+        const response = await fetch(`${bridge!.env.PAPERCLIP_API_URL}${requestPath}`, { method, headers, body });
+        return { status: response.status, body: await response.json() };
+      },
+      close: async () => {
+        session?.destroy();
+        await bridge?.stop();
+        await api.close();
+      },
+    };
+  }
+
+  it.each([
+    ["queue_v1", 200],
+    ["queue_v1", 401],
+    ["queue_v1", 403],
+    ["http2_v1", 200],
+    ["http2_v1", 401],
+    ["http2_v1", 403],
+  ] as const)("forwards exact gateway routes over %s without masking API status %s", async (transport, apiStatus) => {
+    const gateway = await startGatewayTestBridge(transport, apiStatus);
+    try {
+      expect(gateway.bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe(transport);
+      expect(gateway.bridge?.env.PAPERCLIP_API_KEY).not.toBe("real-run-jwt");
+      for (const [method, requestPath] of [
+        ["POST", "/api/tool-gateway/sessions"],
+        ["POST", "/api/tool-gateway/sessions/session-1/revoke"],
+        ["GET", "/api/tool-gateway/tools"],
+        ["POST", "/api/tool-gateway/tools/call"],
+      ]) {
+        const response = await gateway.request(method, requestPath);
+        expect(response.status).toBe(apiStatus);
+        expect(response.body).toEqual(apiStatus === 401
+          ? { error: "API authentication required" }
+          : apiStatus === 403 ? { error: "API permission denied" } : { ok: true });
+        expect(gateway.api.requests.at(-1)).toMatchObject({
+          method,
+          url: requestPath,
+          auth: "Bearer real-run-jwt",
+          runId: "run-tool-gateway",
+          headers: { "x-paperclip-tool-gateway-token": "gateway-session-token" },
+        });
+        expect(gateway.api.requests.at(-1)?.headers["x-not-allowed"]).toBeUndefined();
+        expect(gateway.api.requests.at(-1)?.body.toString("utf8"))
+          .toBe(method === "POST" ? JSON.stringify({ gateway: "payload" }) : "");
+      }
+      expect(gateway.api.requests).toHaveLength(4);
+    } finally {
+      await gateway.close();
+    }
+  }, 20000);
+
+  it.each(["queue_v1", "http2_v1"] as const)("rejects wrong gateway bridge tokens and unlisted routes over %s", async (transport) => {
+    const gateway = await startGatewayTestBridge(transport);
+    try {
+      expect(gateway.bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe(transport);
+      for (const [method, requestPath] of [
+        ["POST", "/api/tool-gateway/sessions"],
+        ["POST", "/api/tool-gateway/sessions/session-1/revoke"],
+        ["GET", "/api/tool-gateway/tools"],
+        ["POST", "/api/tool-gateway/tools/call"],
+      ]) {
+        expect((await gateway.request(method, requestPath, "wrong-bridge-token")).status).toBe(401);
+        expect(gateway.api.requests).toHaveLength(0);
+      }
+      for (const [method, requestPath] of [
+        ["GET", "/api/tool-gateway/sessions"],
+        ["DELETE", "/api/tool-gateway/sessions/session-1/revoke"],
+        ["POST", "/api/tool-gateway/tools"],
+        ["GET", "/api/tool-gateway/tools/call"],
+        ["POST", "/api/tool-gateway/sessions/session-1/revoke/extra"],
+        ["POST", "/api/tool-gateway/sessions/session-1/extra/revoke"],
+        ["POST", "/api/tool-gateway/tools/call/extra"],
+        ["POST", "/api/tool-gateway/admin"],
+        ["POST", "/api/tool-gateway/approvals"],
+        ["POST", "/api/tool-gateway/runtime"],
+        ["POST", "/api/tool-gateway/mcp"],
+      ]) {
+        const response = await gateway.request(method, requestPath);
+        expect(response.status).toBe(403);
+        expect(response.body).toMatchObject({ error: expect.stringContaining("Route not allowed:") });
+        expect(gateway.api.requests).toHaveLength(0);
+      }
+      for (const requestPath of ["/api/tool-gateway%2ftools", "/api/tool-gateway/tools%2fcall"]) {
+        const response = await gateway.request("GET", requestPath);
+        expect([400, 403]).toContain(response.status);
+        expect(gateway.api.requests).toHaveLength(0);
+      }
+    } finally {
+      await gateway.close();
+    }
+  }, 20000);
+
+  it("rejects forged gateway queue destinations and preserves host authorization and run attribution", async () => {
+    const { remoteCwd } = await createSandboxWorkspace("paperclip-gateway-forged-queue-");
+    const api = await startRecordingApiServer();
+    const externalApi = await startRecordingApiServer();
+    const bridge = await startTestDuplexBridge("run-gateway-raw-queue", queueSandboxTarget(remoteCwd), api.origin);
+    try {
+      expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("queue_v1");
+      const queueDir = bridge!.env.PAPERCLIP_BRIDGE_QUEUE_DIR;
+      const paths = [
+        `${externalApi.origin}/api/tool-gateway/tools`,
+        `${externalApi.origin.replace("http:", "")}/api/tool-gateway/tools`,
+        `/\\${new URL(externalApi.origin).host}/api/tool-gateway/tools`,
+        "/api/tool-gateway/sessions/../tools",
+        "/api/tool-gateway/sessions/%2e%2e/tools",
+        "/api/tool-gateway%2ftools",
+        "/api/tool-gateway/tools",
+      ];
+      for (const [index, requestPath] of paths.entries()) {
+        const id = `gateway-forged-${index}`;
+        const filePath = path.join(queueDir, "requests", `${id}.json`);
+        await writeFile(`${filePath}.tmp`, JSON.stringify({
+          id,
+          method: "GET",
+          path: requestPath,
+          query: "?search=read%20only",
+          headers: {
+            accept: "application/json",
+            authorization: "Bearer forged-token",
+            "x-paperclip-run-id": "forged-run",
+            "x-paperclip-tool-gateway-token": "gateway-session-token",
+          },
+          body: "",
+          createdAt: new Date().toISOString(),
+        }));
+        await rename(`${filePath}.tmp`, filePath);
+      }
+      await vi.waitFor(async () => {
+        expect((await readdir(path.join(queueDir, "responses"))).filter(file => file.endsWith(".json")))
+          .toHaveLength(paths.length);
+      }, { timeout: 5000 });
+      for (const [index] of paths.entries()) {
+        const response = JSON.parse(await readFile(path.join(queueDir, "responses", `gateway-forged-${index}.json`), "utf8"));
+        if (index === paths.length - 1) {
+          expect(response.status).toBe(200);
+        } else {
+          expect([400, 403]).toContain(response.status);
+        }
+      }
+      expect(externalApi.requests).toHaveLength(0);
+      expect(api.requests).toHaveLength(1);
+      expect(api.requests[0]).toMatchObject({
+        method: "GET",
+        url: "/api/tool-gateway/tools?search=read%20only",
+        auth: "Bearer real-run-jwt",
+        runId: "run-gateway-raw-queue",
+        headers: {
+          accept: "application/json",
+          host: new URL(api.origin).host,
+          "x-paperclip-tool-gateway-token": "gateway-session-token",
+        },
+      });
+    } finally {
+      await bridge?.stop();
+      await api.close();
+      await externalApi.close();
+    }
+  }, 20000);
 
   it("test_startup_failure_falls_back_to_queue_v1", async () => {
     // The channel open itself fails (a provider startup fault, before any
