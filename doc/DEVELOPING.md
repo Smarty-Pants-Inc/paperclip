@@ -2979,6 +2979,23 @@ store remains service-scoped. Completion reads live excerpt getters so output
 that arrives during finalization is retained. Existing public helpers and flush
 interval constants remain available from `heartbeat.ts`.
 
+`PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS` sets the character threshold for compacting
+legacy/diagnostic run-log chunks. Unset, empty or invalid values keep the existing
+65,536-character default. Set a non-negative decimal safe integer in the server's
+service environment; `0` disables this compaction. For example, a bounded threshold:
+
+```sh
+PAPERCLIP_RUN_LOG_MAX_CHUNK_CHARS=1048576
+```
+
+Restart the server after changing its service environment. Secret, invitation-token
+and inline-image redaction still run before the compaction decision. Positive
+values retain the existing 60% head, omission marker and 25% tail format; the marker
+can exceed very small thresholds. This does not change stdout/stderr excerpt caps,
+database event-payload bounds, lossless canonical native events, or the object
+store's separate 8 MiB encoded-record limit. Existing compacted native prefixes
+are verified against their original retained lengths, not the new setting.
+
 Workspace preparation is in `server/src/services/heartbeat/workspaces.ts`. It
 owns managed checkout materialization, workspace validation and reuse, referenced
 project resolution, and session/workspace configuration freshness. Its
