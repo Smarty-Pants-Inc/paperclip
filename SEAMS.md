@@ -73,6 +73,7 @@ Each carry records its test result and whether it is deployed.
 | ID | Upstream pull requests | Branch | Status | Evidence |
 | --- | --- | --- | --- | --- |
 | C1 | Pool starvation: [#18744](https://github.com/paperclipai/paperclip/pull/18744), [#17833](https://github.com/paperclipai/paperclip/pull/17833), [#18928](https://github.com/paperclipai/paperclip/pull/18928) (issue [#18700](https://github.com/paperclipai/paperclip/issues/18700)) | `carry/pool-starvation` on `canary/v2026.1111.0-canary.4` | Tested locally, not deployed. Pool size 10: the burst is accepted (80/80, against 0/80 without it). Pool size 40: no proven gain. `DATABASE_POOL_MAX=40` is used instead. | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) |
+| C2 | Lock timeout in legacy execution terminalization: [#17846](https://github.com/paperclipai/paperclip/pull/17846) (issue [#16417](https://github.com/paperclipai/paperclip/issues/16417)) | `carry/c2-55p03` on `canary/v2026.1111.0-canary.4` | Tested locally, not deployed. A run whose work succeeded was marked `adapter_failed` (55P03) when a child row held a lock on its run row. Our regression test fails 3/3 without the carry and passes 3/3 with it; the touched suites pass 129/129. | [smarty-dev#20094](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20094) |
 
 ## Extensions on Paperclip's own surfaces (no seam)
 
