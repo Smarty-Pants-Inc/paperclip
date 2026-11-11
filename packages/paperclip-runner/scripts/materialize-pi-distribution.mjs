@@ -17,17 +17,14 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaceRoot = resolve(packageRoot, "../..");
 const lockDirectory = join(packageRoot, "scripts/pi-distribution");
 const patchPath = join(workspaceRoot, "patches/pi-acp@0.0.33.patch");
-const securityPatchPath = join(workspaceRoot, "patches/brace-expansion@5.0.9.patch");
-export const PI_BRACE_SECURITY_PATCH_SHA256 = "5273a195b952f233336122842faaf650193c04f36b9359d20d4d63079b0ce814";
 const supportedTargets = new Set(["darwin-arm64", "darwin-x64", "linux-x64"]);
 export const PI_DISTRIBUTION_PINS = Object.freeze({
-  wrapper: "0.0.33", runtime: "1.0.0", sdk: "0.26.0", zod: "3.25.76", nodeVersion: PI_NODE_VERSION, undici: "8.10.2", nodeBundledUndici: "7.29.1",
+  wrapper: "0.0.33", runtime: "1.5.2", sdk: "0.26.0", zod: "3.25.76", nodeVersion: PI_NODE_VERSION, undici: "8.12.3", nodeBundledUndici: "7.29.1",
   wrapperSha256: "9d129b3d38772e93e97080aa6c4e574ac5df4e47ce5bc331a484a9fbf8188b36",
   helperSha256: "41e0490b617da0d60e0c8ec58ef311236f945129d99f816cff6897f78da7f91d",
 });
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 
-/** Install the published Pi graph; then apply the one pinned security correction. */
 export function piDistributionInstallCommand() {
   return ["ci", "--ignore-scripts", "--include=optional", "--omit=dev", "--no-audit", "--no-fund", "--registry=https://registry.npmjs.org", "--userconfig=.npmrc", "--globalconfig=.npmrc-global"];
 }
@@ -39,7 +36,7 @@ function supports(list, current) {
 /** Prove installed package versions and the complete published Pi graph. */
 export async function verifyLockedPiPackageGraph(root, lock, target = { platform: process.platform, architecture: process.arch }) {
   if (lock.lockfileVersion !== 3 || !lock.packages || typeof lock.packages !== "object") throw new Error("Pi distribution lock is invalid");
-  let verified = 0;
+  const installed = new Map();
   for (const [path, entry] of Object.entries(lock.packages)) {
     if (!path) continue;
     if (!path.startsWith("node_modules/") || path.split("/").some((part) => part === ".." || part === "." || !part) || path.includes("\\") || entry.link || typeof entry.version !== "string" || !/^https:\/\/registry\.npmjs\.org\//.test(entry.resolved ?? "") || !/^sha512-[A-Za-z0-9+/]+=*$/.test(entry.integrity ?? "")) throw new Error("Pi distribution lock contains an unpinned package");
@@ -51,25 +48,26 @@ export async function verifyLockedPiPackageGraph(root, lock, target = { platform
       throw new Error(`Pi distribution is missing locked package ${path}`);
     }
     if (metadata.version !== entry.version) throw new Error(`Pi distribution package differs from its lock: ${path}`);
-    verified++;
+    installed.set(path, metadata);
   }
-  const piPath = "node_modules/@earendil-works/pi-coding-agent";
-  const shrinkwrap = JSON.parse(await readFile(join(root, piPath, "npm-shrinkwrap.json"), "utf8"));
-  if (shrinkwrap.version !== PI_DISTRIBUTION_PINS.runtime || shrinkwrap.lockfileVersion !== 3) throw new Error("Pi upstream shrinkwrap is missing or changed");
-  for (const [path, entry] of Object.entries(shrinkwrap.packages)) {
-    if (!path) continue;
-    const pinned = lock.packages[`${piPath}/${path}`];
-    // Pi bundles its dependency payload, so npm overrides do not replace it.
-    // Only this reviewed build-owned patch may differ from the upstream graph.
-    if (path === "node_modules/brace-expansion" && entry.version === "5.0.9"
-      && entry.integrity === "sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg=="
-      && entry.resolved === "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.9.tgz"
-      && pinned?.version === "5.0.12"
-      && pinned.integrity === "sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ=="
-      && pinned.resolved === "https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.12.tgz") continue;
-    if (!pinned || pinned.version !== entry.version || (entry.integrity !== undefined && pinned.integrity !== entry.integrity) || pinned.resolved !== entry.resolved) throw new Error(`Pi distribution dropped or changed shrinkwrapped package ${path}`);
+  for (const [path, metadata] of installed) {
+    for (const field of ["dependencies", "optionalDependencies"]) {
+      if (JSON.stringify(Object.entries(metadata[field] ?? {}).sort()) !== JSON.stringify(Object.entries(lock.packages[path][field] ?? {}).sort())) throw new Error(`Pi distribution package graph differs from its lock: ${path}`);
+    }
+    for (const name of Object.keys({ ...metadata.dependencies, ...metadata.optionalDependencies })) {
+      let parent = path;
+      let dependency;
+      for (;;) {
+        const candidate = `${parent ? `${parent}/` : ""}node_modules/${name}`;
+        if (Object.hasOwn(lock.packages, candidate)) { dependency = candidate; break; }
+        if (!parent) break;
+        const boundary = parent.lastIndexOf("/node_modules/");
+        parent = boundary < 0 ? "" : parent.slice(0, boundary);
+      }
+      if (!dependency || (!installed.has(dependency) && !Object.hasOwn(metadata.optionalDependencies ?? {}, name))) throw new Error(`Pi distribution is missing locked dependency ${name} for ${path}`);
+    }
   }
-  return verified;
+  return installed.size;
 }
 
 /** Only OS libraries may remain outside the inventoried Node executable. */
@@ -189,7 +187,6 @@ export async function materializePiDistribution({ outputRoot, nodeExecutable, np
   checkCancelled();
   const inputLockDirectory = inputs?.lockDirectory ?? lockDirectory;
   const inputPatchPath = inputs?.patchPath ?? patchPath;
-  const inputSecurityPatchPath = inputs?.securityPatchPath ?? securityPatchPath;
   const helperSourcePath = inputs?.helperSourcePath ?? join(packageRoot, "src/drivers/acpx/pi-acp-runtime.ts");
   const extensionSourcePath = inputs?.extensionSourcePath ?? join(packageRoot, "src/drivers/acpx/pi-runtime-extension.ts");
   if (typeof outputRoot !== "string" || !outputRoot || !isAbsolute(outputRoot)) throw new Error("Pi distribution output must be absolute");
@@ -228,17 +225,10 @@ export async function materializePiDistribution({ outputRoot, nodeExecutable, np
     // .npmrc. Public registry downloads need no private application credential.
     const environment = Object.fromEntries(["PATH", "LANG", "LC_ALL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"].flatMap((key) => typeof process.env[key] === "string" ? [[key, process.env[key]]] : []));
     environment.HOME = buildHome;
-    // npm 10 prunes non-host packages bundled by upstream Pi, unlike the npm
-    // 11.19.0 used to qualify this complete closure. Public setup must use the
-    // npm pinned by the verified Node archive, never whichever npm is on PATH.
     await runOwned(bundledNpm ? node : npmExecutable, [...(bundledNpm ? [bundledNpm] : []), ...piDistributionInstallCommand()], { cwd: runtimeRoot, env: environment, timeout: 300_000, maxBuffer: 4 * 1024 * 1024 });
     const installedLockBytes = await readFile(join(runtimeRoot, "package-lock.json"));
     if (!installedLockBytes.equals(await readFile(join(inputLockDirectory, "package-lock.json")))) throw new Error("Pi installation changed its committed lock");
     const lock = JSON.parse(installedLockBytes.toString("utf8"));
-    if (hash(await readFile(inputSecurityPatchPath)) !== PI_BRACE_SECURITY_PATCH_SHA256) throw new Error("Pi dependency security patch differs from its reviewed pin");
-    const braceRoot = join(runtimeRoot, "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion");
-    await runOwned("git", ["apply", "--check", inputSecurityPatchPath], { cwd: braceRoot, env: environment, timeout: 10_000 });
-    await runOwned("git", ["apply", inputSecurityPatchPath], { cwd: braceRoot, env: environment, timeout: 10_000 });
     const packageCount = await verifyLockedPiPackageGraph(runtimeRoot, lock);
     const wrapper = join(runtimeRoot, "node_modules/pi-acp");
     await runOwned("git", ["apply", "--check", inputPatchPath], { cwd: wrapper, env: environment, timeout: 10_000 });

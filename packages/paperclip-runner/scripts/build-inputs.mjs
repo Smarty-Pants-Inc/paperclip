@@ -37,7 +37,7 @@
 // node_modules, because build:typescript builds that package first; every
 // file under the root patches directory, because check:acpx-profiles hashes
 // the acpx patch and build-verified-provider-entrypoints.mjs copies the pi-acp
-// and brace-expansion patches into dist; and the root files the Runner's
+// patch into dist; and the root files the Runner's
 // tsconfig and dependency graph read. The toolchain pins live inside the
 // package (rust-toolchain.toml, runner/Cargo.lock), and the TypeScript version
 // comes from pnpm-lock.yaml, so both are covered.

@@ -4181,7 +4181,7 @@ mod tests {
         value["agentServerPackage"] = json!("pi-acp");
         value["agentServerVersion"] = json!("0.0.33");
         value["agentRuntimePackage"] = json!("@earendil-works/pi-coding-agent");
-        value["agentRuntimeVersion"] = json!("1.0.0");
+        value["agentRuntimeVersion"] = json!("1.5.2");
         value["piThinkingLevel"] = json!("low");
         value["providerPolicy"] = json!({"readOnly": true});
         value["commandDigest"] = json!(current_digest);

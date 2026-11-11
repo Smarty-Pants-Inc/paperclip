@@ -179,7 +179,7 @@ test("the digest is stable, ignores outputs and caches, and tracks every kind of
     await expectChange("an eval-kernel source", { "packages/paperclip-eval-kernel/src/index.ts": "export const kernel = 2;\n" });
     await expectChange("the pi-acp patch the build copies into dist", { "patches/pi-acp@0.0.33.patch": "--- c\n+++ d\n+e\n" });
     await expectChange("the acpx patch the profile check hashes", { "patches/acpx@0.13.1.patch": "--- a\n+++ b\n+c\n" });
-    await expectChange("a new patch", { "patches/brace-expansion@5.0.9.patch": "--- x\n+++ y\n" });
+    await expectChange("a new patch", { "patches/new-runtime.patch": "--- x\n+++ y\n" });
     await expectChange("the lockfile", { "pnpm-lock.yaml": "lockfileVersion: 9\nchanged: true\n" });
     await expectChange("the base tsconfig", { "tsconfig.base.json": '{"compilerOptions":{}}\n' });
     await expectChange("a new file", { "packages/paperclip-runner/protocol/new.json": "{}\n" });

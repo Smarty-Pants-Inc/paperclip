@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
@@ -27,7 +27,7 @@ test("Pi 1 offline catalog retains the exact qualification model", async () => {
 });
 
 test("owned gate authorizes the actual pinned SDK path expansions and read fallbacks", async () => {
-  assert.equal(metadata.version, "1.0.0");
+  assert.equal(metadata.version, "1.5.2");
   const { resolveToCwd, resolveReadPathAsync } = await import(pathToFileURL(join(packageRoot, "dist/core/tools/path-utils.js")).href);
   const root = await realpath(await mkdtemp(join(tmpdir(), "paperclip-pi-native-paths-")));
   try {
@@ -60,7 +60,7 @@ test("owned gate authorizes the actual pinned SDK path expansions and read fallb
 
 for (const brokenCatalog of [false, true]) {
   test(`real pinned Pi ${brokenCatalog ? "withholds" : "registers"} readiness after MCP initialization`, { timeout: 20_000 }, async (t) => {
-    assert.equal(metadata.version, "1.0.0");
+    assert.equal(metadata.version, "1.5.2");
     const root = await realpath(await mkdtemp(join(tmpdir(), "paperclip-pi-native-contract-")));
     await mkdir(join(root, "workspace")); await mkdir(join(root, "agent"));
     const extension = join(root, "extension.mjs");
@@ -127,7 +127,7 @@ for (const brokenCatalog of [false, true]) {
 }
 
 test("real pinned Pi model iterations align owned identities across warm prompts", { timeout: 20_000 }, async () => {
-  assert.equal(metadata.version, "1.0.0");
+  assert.equal(metadata.version, "1.5.2");
   const load = (name) => import(pathToFileURL(join(packageRoot, `dist/core/${name}.js`)).href);
   const [{ createAgentSession }, { DefaultResourceLoader }, { ModelRuntime }, { SessionManager }, { SettingsManager }, { AuthStorage }] = await Promise.all(
     ["sdk", "resource-loader", "model-runtime", "session-manager", "settings-manager", "auth-storage"].map(load),
@@ -260,7 +260,10 @@ test("real pinned Pi executes all four owned native question methods without per
 });
 
 test("real pinned Pi dispatches aliased MCP tools with their exact original names", { timeout: 20_000 }, async () => {
-  const { getCurrentTools } = await import(pathToFileURL(join(packageRoot, "node_modules/@earendil-works/pi-ai/dist/index.js")).href);
+  const piAiEntry = execFileSync(process.execPath, ["--experimental-import-meta-resolve", "--input-type=module", "--eval",
+    "process.stdout.write(import.meta.resolve('@earendil-works/pi-ai', process.argv[1]))",
+    pathToFileURL(join(packageRoot, "package.json")).href], { encoding: "utf8" }).trim();
+  const { getCurrentTools } = await import(piAiEntry);
   const load = (name) => import(pathToFileURL(join(packageRoot, `dist/core/${name}.js`)).href);
   const [{ createAgentSession }, { DefaultResourceLoader }, { ModelRuntime }, { SessionManager }, { SettingsManager }, { AuthStorage }] = await Promise.all(
     ["sdk", "resource-loader", "model-runtime", "session-manager", "settings-manager", "auth-storage"].map(load),

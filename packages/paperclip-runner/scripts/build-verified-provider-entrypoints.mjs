@@ -152,7 +152,6 @@ export async function bundlePiProvisioner({ write = true, outputRoot = resolve(p
       ["scripts/pi-distribution/package.json", "package.json"],
       ["scripts/pi-distribution/package-lock.json", "package-lock.json"],
       ["../../patches/pi-acp@0.0.33.patch", "pi-acp.patch"],
-      ["../../patches/brace-expansion@5.0.9.patch", "brace-expansion.patch"],
       ["src/drivers/acpx/pi-acp-runtime.ts", "pi-acp-runtime.ts"],
       ["src/drivers/acpx/pi-runtime-extension.ts", "pi-runtime-extension.ts"],
     ]) await cp(resolve(packageRoot, source), resolve(inputs, name));

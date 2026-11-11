@@ -25,7 +25,7 @@ function record(value: unknown): Record<string, unknown> {
 export function assertPiInstallationProfile(profile: AcpxReleaseProfile): void {
   const trusted = QUALIFIED_ACPX_PROFILES.pi;
   if (profile.agentProfileVersion !== trusted.agentProfileVersion) throw new Error(`Pi rich ACP requires profile version ${trusted.agentProfileVersion}; reopen the previous session`);
-  if (profile.agent !== "pi" || profile.driverKind !== trusted.driverKind || profile.protocolVersion !== trusted.protocolVersion || profile.acpxVersion !== trusted.acpxVersion || profile.agentServerPackage !== "pi-acp" || profile.agentServerVersion !== "0.0.33" || profile.agentRuntimePackage !== "@earendil-works/pi-coding-agent" || profile.agentRuntimeVersion !== "1.0.0" || profile.commandDigest !== trusted.commandDigest || profile.permissionPolicy !== "interactive") throw new Error("Pi distribution profile differs from its trusted declaration");
+  if (profile.agent !== "pi" || profile.driverKind !== trusted.driverKind || profile.protocolVersion !== trusted.protocolVersion || profile.acpxVersion !== trusted.acpxVersion || profile.agentServerPackage !== "pi-acp" || profile.agentServerVersion !== "0.0.33" || profile.agentRuntimePackage !== "@earendil-works/pi-coding-agent" || profile.agentRuntimeVersion !== "1.5.2" || profile.commandDigest !== trusted.commandDigest || profile.permissionPolicy !== "interactive") throw new Error("Pi distribution profile differs from its trusted declaration");
 }
 
 async function readDistributionMetadata(path: string): Promise<Record<string, unknown>> {
@@ -68,7 +68,7 @@ export async function verifyPiInstallation(profile: AcpxReleaseProfile): Promise
   const metadata = await readDistributionMetadata(metadataPath);
   const targetMetadata = record(metadata.target);
   const pins = record(metadata.pins);
-  if (metadata.schema !== "paperclip.pi-distribution.v1" || metadata.runtimeRoot !== "runtime" || metadata.nativeClosureSha256 !== expectedClosure || targetMetadata.platform !== process.platform || targetMetadata.architecture !== process.arch || targetMetadata.nodeVersion !== PI_NODE_VERSION || pins.nodeVersion !== PI_NODE_VERSION || pins.wrapper !== "0.0.33" || pins.runtime !== "1.0.0" || pins.sdk !== "0.26.0" || pins.zod !== "3.25.76") throw new Error("Pi distribution metadata does not match its trusted target pin");
+  if (metadata.schema !== "paperclip.pi-distribution.v1" || metadata.runtimeRoot !== "runtime" || metadata.nativeClosureSha256 !== expectedClosure || targetMetadata.platform !== process.platform || targetMetadata.architecture !== process.arch || targetMetadata.nodeVersion !== PI_NODE_VERSION || pins.nodeVersion !== PI_NODE_VERSION || pins.wrapper !== "0.0.33" || pins.runtime !== "1.5.2" || pins.sdk !== "0.26.0" || pins.zod !== "3.25.76") throw new Error("Pi distribution metadata does not match its trusted target pin");
   const manifest = record(metadata.manifest) as unknown as PiRuntimeManifest;
   for (const [key, value] of Object.entries(FIXED_PATHS)) {
     if (manifest[key as keyof typeof FIXED_PATHS] !== value) throw new Error("Pi distribution changed a fixed launch path");

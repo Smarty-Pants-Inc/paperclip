@@ -3,7 +3,7 @@
 ## Current profile identity
 
 Pi runs as **profile 37** on `pi-acp` 0.0.33 and
-`@earendil-works/pi-coding-agent` 1.0.0. Its `commandDigest` attests the
+`@earendil-works/pi-coding-agent` 1.5.2. Its `commandDigest` attests the
 upstream release: the package versions, the Node version and the complete
 distribution closure for each qualified platform. The closure includes the
 patched wrapper, the runtime helper and the Paperclip extension, so a change to

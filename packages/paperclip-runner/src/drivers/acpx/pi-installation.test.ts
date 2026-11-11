@@ -55,7 +55,7 @@ describe("Pi installation factory", () => {
       expect(isSupportedAcpxProfileVersion("pi", prior)).toBe(true);
       expect(() => assertPiInstallationProfile({ ...candidate(), agentProfileVersion: prior })).toThrow(`version ${current}`);
     }
-    for (const changed of [{ agentServerVersion: "latest" }, { commandDigest: `sha256:${"0".repeat(64)}` },
+    for (const changed of [{ agentServerVersion: "latest" }, { agentRuntimeVersion: "1.0.0" }, { commandDigest: `sha256:${"0".repeat(64)}` },
       // The last source-bound Pi identity.
       { commandDigest: "sha256:faafb66c09c1efc7eb4eda6baaa5813c975e8a992f9cd333687695aa5522d7dc" }, { agentRuntimePackage: "ambient-pi" }]) {
       expect(() => assertPiInstallationProfile({ ...candidate(), ...changed })).toThrow("trusted declaration");
@@ -66,7 +66,7 @@ describe("Pi installation factory", () => {
     await writeFile(join(assets, "pi-distribution.json"), JSON.stringify({
       schema: "paperclip.pi-distribution.v1", runtimeRoot: "runtime", nativeClosureSha256: "0".repeat(64),
       target: { platform: process.platform, architecture: process.arch, nodeVersion: "24.21.0" },
-      pins: { nodeVersion: "24.21.0", wrapper: "0.0.33", runtime: "1.0.0", sdk: "0.26.0", zod: "3.25.76" },
+      pins: { nodeVersion: "24.21.0", wrapper: "0.0.33", runtime: "1.5.2", sdk: "0.26.0", zod: "3.25.76" },
     }));
     await expect(verifyPiInstallation(candidate())).rejects.toThrow("trusted target pin");
   }));

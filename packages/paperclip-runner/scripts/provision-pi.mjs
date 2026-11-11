@@ -75,7 +75,6 @@ export async function provisionPi(entrypoint, checkCancelled = () => {}) {
     const inputs = join(cli, "pi-provision-inputs");
     await materializePiDistribution({ outputRoot: stagedOutput, checkCancelled, inputs: {
       lockDirectory: inputs, patchPath: join(inputs, "pi-acp.patch"),
-      securityPatchPath: join(inputs, "brace-expansion.patch"),
       helperSourcePath: join(inputs, "pi-acp-runtime.ts"), extensionSourcePath: join(inputs, "pi-runtime-extension.ts"),
     } });
     await verifiedInstallation(stagingRoot, join(stagingRoot, "package.json"));

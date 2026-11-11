@@ -65,7 +65,7 @@ if (process.argv[2] === "--pi-no-key-probe") {
       assert.ok(report.evidence.some(item => item.runnerExited === true && item.runnerExitCode === 0));
       for (const item of report.evidence) assert.deepEqual(item.childEnvironmentKeys, ["LANG", "PATH"]);
       const state = JSON.parse(await readFile(join(root, "state/runner/acpx-provider-state.json"), "utf8"));
-      assert.equal(state.descriptor.agent, "pi"); assert.equal(state.descriptor.agentRuntimeVersion, "1.0.0");
+      assert.equal(state.descriptor.agent, "pi"); assert.equal(state.descriptor.agentRuntimeVersion, "1.5.2");
       assert.equal(state.activeTurnId, null); assert.equal(state.identity, null);
       assert.equal(state.providerExitUnconfirmed, false);
       console.log(JSON.stringify({ settledMs: report.settledMs, durationMs: report.durationMs, credentials: "none", promptCalls: 0 }));

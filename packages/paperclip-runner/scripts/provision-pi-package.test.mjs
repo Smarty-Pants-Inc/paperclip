@@ -18,7 +18,7 @@ test("public server tar layout carries a self-contained host provisioner and exa
   await writeFile(join(cli, "acpx-runtime-sidecar.cjs"), "// layout fixture only");
   await bundlePiProvisioner({ outputRoot: cli });
   const inputs = join(cli, "pi-provision-inputs");
-  assert.deepEqual((await readdir(inputs)).sort(), ["brace-expansion.patch", "package-lock.json", "package.json", "pi-acp-runtime.ts", "pi-acp.patch", "pi-runtime-extension.ts"]);
+  assert.deepEqual((await readdir(inputs)).sort(), ["package-lock.json", "package.json", "pi-acp-runtime.ts", "pi-acp.patch", "pi-runtime-extension.ts"]);
   const packageRoot = resolve(dirname(new URL(import.meta.url).pathname), "..");
   for (const [source, destination] of [
     ["scripts/pi-distribution/package.json", "package.json"], ["scripts/pi-distribution/package-lock.json", "package-lock.json"],

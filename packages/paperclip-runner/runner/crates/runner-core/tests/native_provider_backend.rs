@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 const CODEX_ACPX_DIGEST: &str =
     "sha256:443491f4e814501a5dc47347e4510e84faeec9c9382e2d4e53bfe69386d5aabc";
 const PI_ACPX_DIGEST: &str =
-    "sha256:42e186b921f36accf3087cf64986a88346dcdb0bdf78c2ef44a2c4f8abd3453a";
+    "sha256:7619ff6a764420c283435b65b0f1bd5e1e024a82b03aa9f5c2d6085c287e316c";
 
 fn temporary_directory(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -488,7 +488,7 @@ fn pi_prepare_payload(directory: &Path, mode: &str) -> Value {
     provider["agentServerPackage"] = json!("pi-acp");
     provider["agentServerVersion"] = json!("0.0.33");
     provider["agentRuntimePackage"] = json!("@earendil-works/pi-coding-agent");
-    provider["agentRuntimeVersion"] = json!("1.0.0");
+    provider["agentRuntimeVersion"] = json!("1.5.2");
     provider["commandDigest"] = json!(PI_ACPX_DIGEST);
     provider["sidecarArgs"][3] = json!(PI_ACPX_DIGEST);
     provider["providerPolicy"] = json!({"readOnly":true});
