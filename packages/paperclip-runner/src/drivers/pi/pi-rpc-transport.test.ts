@@ -90,6 +90,7 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
     } finally { await child.close(); }
   });
 
+
   it("admits a real-shaped cumulative tool update larger than 4 MiB without altering its ID or final result", async () => {
     const child = emittingTransport(`${updateScript}
       await emit(update("original-call", "path\\n".repeat(1024 * 1024)));

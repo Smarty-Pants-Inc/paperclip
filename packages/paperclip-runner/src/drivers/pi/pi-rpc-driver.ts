@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink } from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
+import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
@@ -114,12 +116,10 @@ export class PiRpcDriver implements HarnessDriver {
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
-    // The server's explicit runner environment is authoritative. Its real
-    // agent home may differ from the materialized instruction working copy.
-    if (environment.AGENT_HOME !== undefined && (!isAbsolute(environment.AGENT_HOME)
-      || !(await stat(environment.AGENT_HOME).catch(() => null))?.isDirectory())) {
-      throw new Error("AGENT_HOME must be an absolute existing directory");
-    }
+    // Environment paths may still name a controller-side copy. Only the
+    // authenticated runtime-context grant can select a provider-local home.
+    delete environment.AGENT_HOME;
+    delete environment.PAPERCLIP_PI_AGENT_HOME;
     const credentialMode = environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker";
     if (credentialMode !== "broker" && credentialMode !== "env") throw new Error("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
     delete environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE;
@@ -138,6 +138,13 @@ export class PiRpcDriver implements HarnessDriver {
     environment.PI_CODING_AGENT_DIR = agentHome;
     await configurePiNativeMcp(agentHome, environment);
     await syncPiCompanySkills(agentHome, initialContext.runtimeContext);
+    const agentFiles = bindAcpxAgentFiles(initialContext.runtimeContext as NativeRuntimeContextSnapshot | undefined,
+      [directory, agentHome, ...(this.#options.command && isAbsolute(this.#options.command) ? [dirname(this.#options.command)] : [])]);
+    if (agentFiles) {
+      agentFiles.assertHeld();
+      environment.AGENT_HOME = agentFiles.root;
+      environment.PAPERCLIP_PI_AGENT_HOME = agentFiles.root;
+    }
     const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
     const fatalSessionStartExtensionPaths = [extension, verifiedPiChildBridgePath(pathToFileURL(extension).href)];
     await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));

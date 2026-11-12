@@ -211,6 +211,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let activeRunId = environment.PAPERCLIP_RUN_ID ?? "runnerd-run";
   let inputEnded = false;
   const announcedTurnIds = new Set<string>();
+  const usageTotals: Record<string, number> = {};
 
   const log = (message: string) => options.writeStderr?.(message);
 
@@ -296,22 +297,29 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           payload,
         }));
       } else if (event.eventType === "usage.reported") {
-        // Rust's facade reads tokenUsage.total/last, not cumulative/runDelta.
-        // Keep receipt metadata verbatim; never infer a model, cost or delta.
-        // In particular, an unavailable delta must omit `last`, not reuse total.
+        // The shared Rust facade reads tokenUsage.total/last (not Harness
+        // cumulative/runDelta). Pi receipts carry per-message deltas, including
+        // across warm turns; accumulate totals once at this Pi-only boundary.
+        const delta = record(payload.runDelta);
+        const cumulative = record(payload.cumulative);
+        if (Object.keys(cumulative).length === 0 && payload.runDeltaAvailable === true) {
+          for (const [key, value] of Object.entries(delta)) {
+            if (typeof value === "number" && Number.isFinite(value) && value >= 0) usageTotals[key] = (usageTotals[key] ?? 0) + value;
+          }
+        }
         send({
           method: "thread/tokenUsage/updated",
           params: {
             ...payload,
             threadId: opened.ids().driverSessionId,
-            turnId: typeof event.turnId === "string" ? event.turnId : undefined,
-            cumulative: record(payload.cumulative),
-            runDelta: record(payload.runDelta),
-            runDeltaAvailable: payload.runDeltaAvailable === true,
+            ...(typeof event.turnId === "string" ? { turnId: event.turnId } : {}),
             tokenUsage: {
-              total: record(payload.cumulative),
-              ...(payload.runDeltaAvailable === true ? { last: record(payload.runDelta) } : {}),
+              total: Object.keys(cumulative).length ? cumulative : { ...usageTotals },
+              ...(payload.runDeltaAvailable === true ? { last: delta } : {}),
             },
+            cumulative,
+            runDelta: delta,
+            runDeltaAvailable: payload.runDeltaAvailable === true,
             ...(payload.context === undefined ? {} : { context: record(payload.context) }),
           },
         });

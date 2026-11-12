@@ -176,32 +176,6 @@ describe("Pi RPC app-server facade proxy", () => {
     } finally { await proxy.close(); }
   });
 
-  it("passes actual Pi projector receipts without inventing totals, model or provider billing", async () => {
-    const sink = new FakeSink();
-    const session = new FakeSession();
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
-    try {
-      await request(proxy, sink, 110, "thread/start", { model: "not-receipt/model" });
-      const projector = createPiEventProjector({ runId: "run-1", turnId: "native-turn" });
-      for (const responseId of ["native-1", "native-2"]) {
-        for (const event of projector.project({ type: "message_end", message: {
-          role: "assistant", responseId, timestamp: responseId === "native-1" ? 1 : 2,
-          stopReason: "stop", content: [{ type: "text", text: responseId }],
-          usage: { input: 7, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { total: 0.02 } },
-        } })) if (event.eventType === "usage.reported") session.push(event.eventType, event.payload, event.turnId, event.itemId);
-      }
-      await waitFor(() => sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").length === 2);
-      const frames = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
-      for (const frame of frames) expect(frame).toMatchObject({ params: {
-        threadId: "pi-session", turnId: "native-turn", provider: "pi_rpc", model: null,
-        providerRequestId: expect.any(String), costProvenance: "catalog_estimate", estimatedCostUsd: 0.02,
-        tokenUsage: { total: {}, last: { inputTokens: 7, outputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0 } },
-      } });
-      expect(JSON.stringify(frames)).not.toContain("providerCostUsd");
-      expect(JSON.stringify(frames)).not.toContain("not-receipt/model");
-    } finally { await proxy.close(); }
-  });
-
   it("omits unavailable deltas after cancellation and never attributes old-run usage to a warm run", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });
@@ -221,6 +195,30 @@ describe("Pi RPC app-server facade proxy", () => {
       expect(params.tokenUsage).not.toHaveProperty("last");
       expect(params).not.toHaveProperty("model");
       expect(JSON.stringify(frames)).not.toContain("stale-model");
+    } finally { await proxy.close(); }
+  });
+
+  it("adapts real Pi usage to Rust total/last without double counting warm turns", async () => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 101, "thread/start", { model: "neutral/model" });
+      for (const [index, runId] of ["run-1", "run-2"].entries()) {
+        if (index) await request(proxy, sink, 102, "run.attach", { runId });
+        const projector = createPiEventProjector({ runId, turnId: `usage-${index}` });
+        for (const receipt of [1, 2]) {
+          const native = { type: "message_end", message: { role: "assistant", responseId: `${index}-${receipt}`, provider: "neutral", model: "model", stopReason: "stop", content: [], usage: { input: 11, output: 3, cacheRead: 2, cacheWrite: 0, totalTokens: 16 } } };
+          const events = projector.project(native);
+          expect(projector.project(native)).toEqual([]);
+          for (const event of events.filter(e => e.eventType === "usage.reported")) session.push(event.eventType, event.payload, event.turnId, event.itemId, runId);
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      const usage = sink.decoded().filter(f => f.method === "thread/tokenUsage/updated");
+      expect(usage).toHaveLength(4);
+      for (const [index, frame] of usage.entries()) expect(frame).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 * (index + 1), outputTokens: 3 * (index + 1), cacheReadTokens: 2 * (index + 1) }, last: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 } } } });
+      expect(usage.reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
     } finally { await proxy.close(); }
   });
   // Keep reason: incident439 lost the actionable cause at the facade/Rust wire

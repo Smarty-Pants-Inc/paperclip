@@ -3774,6 +3774,8 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
       const value = input.options.environment?.[name]; return value === undefined ? [] : [[name, value]];
     })), ...(input.options.environment?.PI_CODING_AGENT_DIR ? { PI_CODING_AGENT_DIR: input.options.environment.PI_CODING_AGENT_DIR } : {}),
       PAPERCLIP_PI_RPC_CREDENTIAL_MODE: input.options.environment?.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker",
+      // Server-selected registered instruction-copy executionRoot; Pi only.
+      ...(input.options.environment?.AGENT_HOME ? { AGENT_HOME: input.options.environment.AGENT_HOME } : {}),
       PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
       ...(input.options.piRpcThinkingLevel === undefined ? {} : { PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel }), ...commonIdentity };
   }

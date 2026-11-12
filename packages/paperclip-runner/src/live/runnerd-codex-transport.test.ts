@@ -2921,6 +2921,15 @@ it("resolves the ordinary ~/.codex credential home when CODEX_HOME is unset", ()
   ).toBe("/managed/codex");
 });
 
+it.each(["pi_rpc", "opencode", "codex"] as const)("preserves the explicit instruction executionRoot only for %s Pi transport", provider => {
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider, options: { provider, environment: { PATH: "/bin", AGENT_HOME: "/registered/run-copy/execution-root" } },
+    identity: { runnerInstanceId: "runner-1", environmentLeaseId: "lease-1", runId: "run-1", normalizedSessionId: "session-1", turnId: "turn-1", itemId: "item-1" },
+    codexHome: "/isolated/home", runtimeContextPath: "/isolated/context.json", hasRuntimeContext: false,
+  });
+  expect(environment.AGENT_HOME).toBe(provider === "pi_rpc" || provider === "codex" ? "/registered/run-copy/execution-root" : undefined);
+});
+
 it("preserves OpenCode runtime bindings when a durable runner is respawned", () => {
   const environment = createCapabilityRunnerdProviderEnvironment({
     provider: "opencode",
