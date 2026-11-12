@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import type { AiConnectionPoolMember } from "@paperclipai/shared";
-import { QUALIFIED_PI_RPC_PROFILE, type NativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+import { PI_THINKING_LEVELS, QUALIFIED_PI_RPC_PROFILE, type NativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+import { applyMcpReasoningEffort, mcpAgentModelConfig } from "../services/public-mcp/agent-config.js";
 import { poolMemberRuntimeConfig, applyAiConnectionRouterTaskSettings } from "../services/ai-connection-router.js";
 import { resolveNativeBilling, resolveNativeHarnessPersistenceProfile, resolveNativeProviderEnvironment } from "../services/native-runtime/native-session-executor.js";
 import { usesNativeUsageDelivery } from "../services/native-runtime/native-usage-accounting.js";
@@ -15,6 +16,26 @@ const member: AiConnectionPoolMember = {
 };
 
 describe("native Pi sweep contracts", () => {
+  // Keep reason: MCP is a public configuration boundary; native Pi must not use Codex's effort field.
+  it.each(PI_THINKING_LEVELS)("maps MCP reasoning effort to native Pi thinking: %s", level => {
+    const config = { provider: "pi_rpc", model: provider.model, piRpcThinkingLevel: level };
+    expect(mcpAgentModelConfig("paperclip_runner", config)).toEqual({
+      model: provider.model, reasoningEffort: level, supportedReasoningEfforts: PI_THINKING_LEVELS,
+    });
+    expect(applyMcpReasoningEffort("paperclip_runner", { ...config, piRpcThinkingLevel: "low", reasoningEffort: level }, { reasoningEffort: level }))
+      .toEqual(config);
+    expect(() => applyMcpReasoningEffort("paperclip_runner", config, { model: provider.model })).not.toThrow();
+  });
+
+  it("rejects unsupported Pi effort at the MCP boundary without changing Codex or OpenCode policy", () => {
+    const config = { provider: "pi_rpc", model: provider.model, piRpcThinkingLevel: "ultra" };
+    expect(() => applyMcpReasoningEffort("paperclip_runner", config, { reasoningEffort: "ultra" }))
+      .toThrow(expect.objectContaining({ details: expect.objectContaining({ code: "MCP_REASONING_EFFORT_UNSUPPORTED" }) }));
+    expect(() => applyMcpReasoningEffort("paperclip_runner", config, { model: provider.model })).toThrow();
+    expect(mcpAgentModelConfig("paperclip_runner", { provider: "opencode", model: "openrouter/model" }).supportedReasoningEfforts).toEqual([]);
+    expect(applyMcpReasoningEffort("paperclip_runner", { provider: "codex", model: "gpt-5.6-sol" }, { reasoningEffort: "high" }))
+      .toMatchObject({ modelReasoningEffort: "high" });
+  });
   it("does not promote ambient native Pi credentials when explicit bindings are absent", () => {
     const host = { PATH: "/host/bin", HOME: "/host/home", ANTHROPIC_API_KEY: "ambient-anthropic",
       OPENROUTER_API_KEY: "ambient-openrouter", PAPERCLIP_AI_PROVIDER_KEY: "ambient-gateway" };

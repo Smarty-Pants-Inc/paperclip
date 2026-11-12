@@ -1,10 +1,14 @@
 import { codexLocalReasoningEffortsForModel, DEFAULT_CODEX_LOCAL_MODEL } from "@paperclipai/adapter-codex-local";
 import { claudeLocalReasoningEffortsForModel, DEFAULT_CLAUDE_LOCAL_MODEL } from "@paperclipai/adapter-claude-local";
+import { PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS } from "@paperclipai/adapter-utils";
 import { unprocessable } from "../../errors.js";
 
 function effortSettings(adapterType: string, config: Record<string, unknown>) {
   if (adapterType === "codex_local" || (adapterType === "paperclip_runner" && (config.provider ?? "codex") === "codex")) {
     return { field: "modelReasoningEffort", supported: codexLocalReasoningEffortsForModel(typeof config.model === "string" ? config.model : DEFAULT_CODEX_LOCAL_MODEL) };
+  }
+  if (adapterType === "paperclip_runner" && config.provider === "pi_rpc") {
+    return { field: "piRpcThinkingLevel", supported: PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS };
   }
   if (adapterType === "claude_local") {
     return { field: "effort", supported: claudeLocalReasoningEffortsForModel(typeof config.model === "string" ? config.model : DEFAULT_CLAUDE_LOCAL_MODEL) };
