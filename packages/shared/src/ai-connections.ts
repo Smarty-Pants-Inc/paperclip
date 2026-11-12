@@ -137,7 +137,9 @@ export function isAiConnectionCompatible(
   // connection metadata before resolving credentials or running the harness.
   if (adapterType === "pi_local" || adapterType === "pi_runtime") return (requirement.method === "api_key" || ("mode" in requirement && requirement.mode === "responsible_user"))
     && ["openrouter", "openai", "anthropic", "google"].includes(requirement.provider)
-    && typeof model === "string" && model.startsWith(`${requirement.provider}/`);
+    && typeof model === "string" && (model.startsWith(`${requirement.provider}/`)
+      // Native Pi RPC sends gateway models through the broker loopback as paperclip/<id>.
+      || (adapterType === "pi_runtime" && runnerProvider === "pi_rpc" && model.startsWith("paperclip/")));
   if ("mode" in requirement && requirement.mode !== "responsible_user" && requirement.method === "api_key")
     return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local", "copilot_runtime"].includes(adapterType);
   const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;

@@ -56,6 +56,9 @@ describe("provider routing", () => {
   });
   it.each(["openai", "anthropic", "google", "openrouter"] as const)("accepts Pi %s API keys only for matching models", provider => {
     expect(isAiConnectionCompatible({ provider, method: "api_key" }, "paperclip_runner", `${provider}/model`, "acpx", "pi")).toBe(true);
+    expect(isAiConnectionCompatible({ provider, method: "api_key" }, "paperclip_runner", "paperclip/claude-opus-5-5", "pi_rpc")).toBe(true);
+    expect(isAiConnectionCompatible({ provider, method: "api_key" }, "paperclip_runner", "paperclip/claude-opus-5-5", "acpx", "pi")).toBe(false);
+    expect(isAiConnectionCompatible({ provider, method: "api_key" }, "pi_local", "paperclip/claude-opus-5-5")).toBe(false);
     expect(isAiConnectionCompatible({ provider, method: "subscription" }, "pi_local", `${provider}/model`)).toBe(false);
     expect(isAiConnectionCompatible({ provider, method: "subscription", mode: "responsible_user" }, "pi_local", `${provider}/model`)).toBe(true);
     expect(isAiConnectionCompatible({ provider, method: "api_key" }, "pi_local", "different/model")).toBe(false);
