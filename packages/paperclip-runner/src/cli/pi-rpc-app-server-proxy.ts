@@ -113,6 +113,26 @@ function text(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+/** Display-only bound: at most 8K UTF-16 units (even JSON control escapes
+ * remain under 64KiB). Native records, final receipts and spill files are untouched. */
+function piPartialToolPayload(eventType: string, payload: Record<string, unknown>): Record<string, unknown> {
+  if (eventType !== "tool.execution.progressed" && !(eventType === "item.delta" && ["tool", "commandExecution"].includes(String(payload.kind)))) return payload;
+  const bound = (value: unknown) => {
+    if (typeof value !== "string" || value.length <= 8192) return value;
+    let end = 8192;
+    if (value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff) end--;
+    return `${value.slice(0, end)}\n[Pi tool output truncated for display]`;
+  };
+  const item = record(payload.item);
+  return { ...payload, ...(payload.output === undefined ? {} : { output: bound(payload.output) }),
+    ...(payload.text === undefined ? {} : { text: bound(payload.text) }),
+    ...(payload.item === undefined ? {} : { item: { ...item,
+      ...(item.output === undefined ? {} : { output: bound(item.output) }),
+      ...(item.text === undefined ? {} : { text: bound(item.text) }),
+    } }),
+  };
+}
+
 function requestIdentity(value: unknown): string {
   // Native request ids may be numeric, including zero. Normalize once rather
   // than treating zero as absent or falling back to another request's id.
@@ -245,7 +265,10 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
 
   async function pumpEvents(opened: PiRpcProxySession): Promise<void> {
     for await (const event of opened.events()) {
-      const payload = record(event.payload);
+      // Never project an old resident continuation onto the receiver's current
+      // run. Test each event independently: a later current failure is valid.
+      if (event.runId !== activeRunId && event.eventType !== "runtime_request.created") continue;
+      const payload = piPartialToolPayload(event.eventType, record(event.payload));
       const toolActivity = openCodeProxyToolNotification({
         eventType: event.eventType,
         threadId: opened.ids().driverSessionId,
@@ -319,10 +342,22 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
             resolution: record(controllerResponse.resolution) as HarnessRuntimeRequestResolution,
           });
         })().catch((error) => log(`[pi_rpc] runtime request failed: ${String(error)}\n`));
+      } else if (event.eventType === "session.failed") {
+        // Rust maps `error` to provider.notice.recorded, retaining error.message
+        // even when there is no active turn. Keep captured IDs, never invent one.
+        if (activeTurnId && event.turnId && event.turnId !== activeTurnId) continue;
+        send({ method: "error", params: {
+          threadId: opened.ids().driverSessionId,
+          ...(event.turnId ? { turnId: event.turnId } : {}),
+          message: payload.message ?? payload.code,
+          error: { code: payload.code, message: payload.message ?? payload.code },
+          willRetry: false,
+        } });
       } else if (
         event.eventType === "turn.completed" || event.eventType === "turn.failed" ||
         event.eventType === "turn.interrupted" || event.eventType === "turn.cancelled"
       ) {
+        if (activeTurnId && event.turnId && event.turnId !== activeTurnId) continue;
         send(openCodeProxyTerminalNotification({
           eventType: event.eventType,
           threadId: opened.ids().driverSessionId,
@@ -426,7 +461,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     eventPump = pumpEvents(opened);
     void eventPump.catch((error) => {
       log(`[pi_rpc] fatal proxy event pump error: ${error instanceof Error ? error.message : String(error)}\n`);
-      send({ method: "warning", params: { threadId: opened.ids().driverSessionId, message: "Pi RPC event stream failed" } });
+      send({ method: "warning", params: { threadId: opened.ids().driverSessionId, message: error instanceof Error ? error.message : String(error) } });
     });
     return threadResponse(opened.ids().providerSessionId ?? opened.ids().driverSessionId);
   }

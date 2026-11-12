@@ -115,6 +115,11 @@ export class PiRpcDriver implements HarnessDriver {
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
+    // Only the controller-registered instruction copy may become AGENT_HOME.
+    // Preserve its exact runner environment spelling; ambient/caller paths
+    // without the matching current-run grant confer no filesystem authority.
+    const instructionRoot = record(record(record(this.#options.runtimeContext).instructions).workingCopy).rootPath;
+    if (typeof instructionRoot !== "string" || !instructionRoot || environment.AGENT_HOME !== instructionRoot) delete environment.AGENT_HOME;
     const credentialMode = environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker";
     if (credentialMode !== "broker" && credentialMode !== "env") throw new Error("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
     delete environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE;
@@ -284,6 +289,13 @@ interface PiTurnState extends PiEventOrigin {
   hasAssistantReceipt: boolean;
   failed: boolean;
   settled: boolean;
+}
+
+/** Carries the projector's captured owner across the pump's async failure path. */
+class PiProjectionFailure extends Error {
+  constructor(readonly turn: PiTurnState, readonly failure: unknown) {
+    super(failure instanceof Error ? failure.message : String(failure), { cause: failure });
+  }
 }
 
 class EventQueue implements AsyncIterable<PrpEvent> {
@@ -744,13 +756,23 @@ export class PiRpcHarnessSession implements HarnessSession {
     } catch (error) {
       if (!this.#closed) {
         this.#callbacks?.fence();
-        this.#failure = error instanceof Error ? error : new Error(String(error));
+        const turn = error instanceof PiProjectionFailure ? error.turn : this.#activeTurn;
+        const failure = error instanceof PiProjectionFailure ? error.failure : error;
+        this.#failure = failure instanceof Error ? failure : new Error(String(failure));
         this.#admitted = false;
-        if (this.#activeTurn) await this.#finishTurn(this.#activeTurn, "failed", { error: { code: "pi_rpc_transport_failed" } });
-        else await this.#revokeBinding();
-        this.#emit("session.failed", { code: "pi_rpc_transport_failed", message: error instanceof Error ? error.message : String(error) });
-        this.#events.close(error instanceof Error ? error : new Error(String(error)));
-        await this.close().catch(() => undefined);
+        const detail = { code: "pi_rpc_transport_failed", message: this.#failure.message, recoverable: false };
+        // Publish the original cause BEFORE any awaited revocation/close can
+        // throw or drain the queue. A stale projector never borrows current IDs.
+        this.#emit("session.failed", detail, turn ?? { runId: this.#runId });
+        try {
+          if (turn && !turn.settled) await this.#finishTurn(turn, "failed", { error: detail });
+          else await this.#revokeBinding();
+        } catch {
+          // The original failure is already published; cleanup cannot mask it.
+        } finally {
+          this.#events.close(this.#failure);
+          await this.close().catch(() => undefined);
+        }
       }
     }
   }
@@ -767,14 +789,17 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (event.type === "process_exit" || event.type === "transport_error") {
       const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
       this.#callbacks?.fence();
-      this.#failure = new Error(code);
+      const message = typeof event.message === "string" ? event.message : event.type === "process_exit"
+        ? `Pi RPC process exited (code=${event.code ?? "null"}, signal=${event.signal ?? "none"})` : code;
+      this.#failure = new Error(message);
       this.#admitted = false;
-      if (this.#activeTurn) await this.#finishTurn(this.#activeTurn, "failed", { error: { code } });
-      else {
-        await this.#revokeBinding();
-        this.#emit("session.failed", { code });
-      }
-      await this.close();
+      const turn = this.#activeTurn;
+      const detail = { code, message, recoverable: false };
+      this.#emit("session.failed", detail, turn ?? { runId: this.#runId });
+      try {
+        if (turn) await this.#finishTurn(turn, "failed", { error: detail });
+        else await this.#revokeBinding();
+      } finally { await this.close(); }
       return;
     }
     if (event.type === "agent_start") {
@@ -846,7 +871,9 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (update.type === "toolcall_start") this.#remember(piToolIdentityKeys(update.id), turn);
       if (update.type === "toolcall_end") this.#remember(piToolIdentityKeys(record(update.toolCall).id), turn);
     }
-    for (const mapped of turn.projector.project(event)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
+    try {
+      for (const mapped of turn.projector.project(event)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
+    } catch (error) { throw new PiProjectionFailure(turn, error); }
     if (event.type === "agent_settled") {
       const empty = !turn.lastText && !turn.hasAssistantReceipt;
       const status = event.aborted === true ? "cancelled" : turn.failed || empty ? "failed" : "completed";
@@ -880,7 +907,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#emit(eventType, { status, ...extra }, turn);
   }
 
-  #emit(eventType: PrpEvent["eventType"], payload: Record<string, unknown>, origin: { runId: string; turnId?: string } = { runId: this.#runId }, itemId?: string): void {
+  #emit(eventType: PrpEvent["eventType"], payload: Record<string, unknown>, origin: { runId: string; turnId?: string; debug?: PrpEvent["debug"] } = { runId: this.#runId }, itemId?: string): void {
     const sourceSeq = ++this.#sourceSequence;
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1",
@@ -897,6 +924,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       priority: eventType === "turn.failed" || eventType === "turn.cancelled" ? 0 : 1,
       emittedAt: this.#now().toISOString(),
       payload,
+      ...(origin.debug === undefined ? {} : { debug: structuredClone(origin.debug) }),
     };
     if (!this.#events.push(event)) {
       this.#events.close(new Error("Pi RPC PRP event queue exceeded its limit"));
