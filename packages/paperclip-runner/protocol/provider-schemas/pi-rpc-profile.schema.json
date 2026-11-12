@@ -36,7 +36,7 @@
       "const": "pi_rpc"
     },
     "commandDigest": {
-      "const": "sha256:73974de85a6796cdfc939237aa2bee3cb255d018beadea81bfeada7aae1137fc"
+      "const": "sha256:1892212d32b04c9d35473e0c7fd84650c3dd8b7d14d1b87cec7a6ccd2eb12a9c"
     }
   }
 }

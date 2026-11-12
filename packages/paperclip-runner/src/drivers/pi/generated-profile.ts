@@ -7,5 +7,5 @@ export const QUALIFIED_PI_RPC_PROFILE = {
   "runtimePackage": "@earendil-works/pi-coding-agent",
   "runtimeVersion": "1.5.2",
   "providerKind": "pi_rpc",
-  "commandDigest": "sha256:73974de85a6796cdfc939237aa2bee3cb255d018beadea81bfeada7aae1137fc"
+  "commandDigest": "sha256:1892212d32b04c9d35473e0c7fd84650c3dd8b7d14d1b87cec7a6ccd2eb12a9c"
 } as const;
