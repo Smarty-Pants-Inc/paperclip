@@ -4357,8 +4357,10 @@ export function normalizePaperclipRunnerAdapterConfig(
   }
   const next: Record<string, unknown> = {
     provider: "codex",
-    codexPermissionMode:
-      PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES.codex.defaultMode,
+    // Native Pi RPC refuses Codex selectors (provider-profile.ts), so never inject the Codex default there.
+    ...(config.provider === "pi_rpc"
+      ? {}
+      : { codexPermissionMode: PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES.codex.defaultMode }),
     ...config,
   };
   if (next.provider === "codex") {

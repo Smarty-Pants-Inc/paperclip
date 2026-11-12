@@ -1102,6 +1102,19 @@ describe("agent routes adapter validation", () => {
     else expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
+  it("converts a saved pi_local agent to native Pi RPC without a Codex permission default", async () => {
+    mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: true });
+    mockAgentService.getById.mockResolvedValue({ ...(await mockAgentService.getById()), adapterType: "pi_local", adapterConfig: { model: "paperclip/claude-opus-5-5" } });
+    const app = await createApp();
+    const adapterConfig = { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "xhigh" };
+    const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111")
+      .send({ adapterType: "paperclip_runner", adapterConfig }));
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const saved = mockAgentService.update.mock.calls.at(-1)?.[1];
+    expect(saved).toMatchObject({ adapterType: "paperclip_runner", adapterConfig });
+    expect(saved?.adapterConfig).not.toHaveProperty("codexPermissionMode");
+  });
+
   it("keeps other native provider selection behind its existing flag", async () => {
     const app = await createApp();
     const response = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents").send({ name: "Native Cursor", adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "cursor", model: "provider-model" } }));

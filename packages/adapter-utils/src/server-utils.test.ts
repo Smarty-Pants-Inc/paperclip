@@ -54,6 +54,15 @@ it("keeps Pi draft models empty and preserves saved native Pi settings", () => {
   expect(normalizePaperclipRunnerAdapterConfig("paperclip_runner", saved)).toMatchObject(saved);
 });
 
+it("saves native Pi RPC without injecting the Codex permission default", () => {
+  const config = { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "xhigh", lifecycleMode: "warm" };
+  const saved = normalizePaperclipRunnerAdapterConfig("paperclip_runner", config);
+  expect(saved).toMatchObject(config);
+  expect(saved).not.toHaveProperty("codexPermissionMode");
+  expect(normalizePaperclipRunnerAdapterConfig("paperclip_runner", saved)).toEqual(saved);
+  expect(normalizePaperclipRunnerAdapterConfig("paperclip_runner", { provider: "codex" })).toHaveProperty("codexPermissionMode");
+});
+
 it("preserves Cursor Cloud settings without injecting Codex permission defaults", () => {
   const config = { provider: "cursor_cloud", model: "caller-model", repoUrl: "https://github.com/acme/repo",
     env: { CURSOR_API_KEY: { type: "secret_ref", secretId: "saved-key", version: "latest" } } };
