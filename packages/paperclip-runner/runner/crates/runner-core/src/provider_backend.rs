@@ -915,14 +915,14 @@ fn terminal_events(
     let Some(contract) = state.completion_contract.as_ref() else {
         return Vec::new();
     };
-    let empty_opencode_completion = state.config.provider == "opencode"
+    let empty_facade_completion = matches!(state.config.provider.as_str(), "opencode" | "pi_rpc")
         && event_type == "turn.completed"
         && state.active_provider_result_fingerprint.is_none()
         && state
             .last_agent_message
             .as_deref()
             .is_none_or(|text| text.trim().is_empty());
-    if rejected_completion || empty_opencode_completion {
+    if rejected_completion || empty_facade_completion {
         return vec![
             NormalizedProviderEvent {
                 event_type: "session.failed".to_owned(),
@@ -931,9 +931,9 @@ fn terminal_events(
                     "provider": state.config.provider,
                     "code": if rejected_completion { "semantic_completion_rejected" } else { "opencode_empty_response" },
                     "message": if rejected_completion {
-                        "The turn ended without correcting its rejected completion report."
+                        "The turn ended without correcting its rejected completion report.".to_owned()
                     } else {
-                        "OpenCode ended without a final answer or an accepted completion report."
+                        format!("{} ended without a final answer or an accepted completion report.", facade_provider_name(&state.config.provider))
                     },
                     "recoverable": false,
                 }),
@@ -8442,6 +8442,103 @@ done
             assert_eq!(events[0].event_type, "session.failed");
             assert_eq!(events[0].payload["code"], "opencode_empty_response");
             assert_eq!(events[1].payload["runTerminalState"], "failed");
+        }
+    }
+
+    fn pi_rpc_result_state() -> CodexProviderState {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+        state.config.profile = Some(
+            serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+        );
+        state
+    }
+
+    // B6: provider completion is a trust boundary; an empty turn must not
+    // manufacture a successful result for the controller.
+    #[test]
+    fn pi_rpc_empty_terminal_does_not_fabricate_a_successful_answer() {
+        for message in [None, Some(String::new()), Some(" \t\n".to_owned())] {
+            let mut state = pi_rpc_result_state();
+            state.last_agent_message = message;
+
+            let events = terminal_events(&state, "turn.completed", None);
+
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "session.failed");
+            assert_eq!(events[0].payload["provider"], "pi_rpc");
+            assert_eq!(events[0].payload["code"], "opencode_empty_response");
+            assert_eq!(
+                events[0].payload["message"],
+                "Pi ended without a final answer or an accepted completion report."
+            );
+            assert_eq!(events[0].payload["recoverable"], false);
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["provider"], "pi_rpc");
+            assert_eq!(events[1].payload["turnTerminalState"], "failed");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+            assert_eq!(events[1].payload["reportedWorkDisposition"], "needs_review");
+        }
+    }
+
+    #[test]
+    fn pi_rpc_normal_terminal_preserves_the_successful_answer() {
+        let mut state = pi_rpc_result_state();
+        state.last_agent_message = Some("The actual final answer.".to_owned());
+
+        let events = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(events[0].payload["summary"], "The actual final answer.");
+        assert_eq!(events[0].payload["reportedWorkDisposition"], "done");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            true
+        );
+        assert_eq!(
+            events[0].payload["evidence"][0]["ref"],
+            "provider:pi_rpc:agent-message"
+        );
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["provider"], "pi_rpc");
+        assert_eq!(events[1].payload["runTerminalState"], "succeeded");
+    }
+
+    #[test]
+    fn pi_rpc_empty_interrupted_terminal_remains_cancelled() {
+        let state = pi_rpc_result_state();
+
+        let events = terminal_events(&state, "turn.interrupted", None);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            false
+        );
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["turnTerminalState"], "interrupted");
+        assert_eq!(events[1].payload["runTerminalState"], "cancelled");
+    }
+
+    #[test]
+    fn other_provider_empty_terminal_behavior_is_unchanged() {
+        for (provider, expected_terminal) in [("codex", "succeeded"), ("cursor_cloud", "failed")] {
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+
+            let events = terminal_events(&state, "turn.completed", None);
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["runTerminalState"], expected_terminal);
         }
     }
 
