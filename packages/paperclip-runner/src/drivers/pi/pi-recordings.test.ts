@@ -204,10 +204,6 @@ describe("immutable Pi 1.5.2 recordings through the production Pi facade JSONL b
       expect(event.runId, `${name} ${event.eventType} captured run`).toBe("pi-capture");
       expect(event.turnId, `${name} ${event.eventType} captured turn`).toMatch(/^turn-/);
       const payload = event.payload;
-      if (event.eventType === "context.compacted") {
-        // This Runner-internal marker has no Pi RPC notification equivalent.
-        continue;
-      }
       if (payload.kind === "usage" && isRecord(payload.usage) && payload.usage.runDeltaComplete === false && !incompleteTurns.has(event.turnId)) {
         incompleteTurns.add(event.turnId);
         const invalidation = notifications[outputIndex++];
@@ -260,6 +256,10 @@ describe("immutable Pi 1.5.2 recordings through the production Pi facade JSONL b
             },
           },
         });
+      } else if (event.eventType === "context.compacted") {
+        expect(frame).toEqual({ method: "thread/compacted", params: {
+          ...payload, threadId: "pi-session", turnId: event.turnId, itemId: event.itemId,
+        } });
       } else if (event.eventType === "usage.reported") {
         const lastUsage = turnUsage.get(event.turnId) ?? {};
         turnUsage.set(event.turnId, lastUsage);

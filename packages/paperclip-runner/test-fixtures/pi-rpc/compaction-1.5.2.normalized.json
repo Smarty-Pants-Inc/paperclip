@@ -309,10 +309,12 @@
   {
     "runId": "pi-capture",
     "turnId": "turn-2",
-    "eventType": "harness.diagnostic",
+    "eventType": "item.started",
+    "itemId": "turn-2:pi-compaction:1",
     "payload": {
-      "code": "pi_summarization_activity",
-      "providerMethod": "compaction_start"
+      "kind": "contextCompaction",
+      "channel": "detail",
+      "text": "Compacting context."
     }
   },
   {
@@ -342,6 +344,17 @@
         "costComplete": false,
         "childUsage": "unknown"
       }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-2",
+    "eventType": "item.completed",
+    "itemId": "turn-2:pi-compaction:1",
+    "payload": {
+      "kind": "contextCompaction",
+      "channel": "detail",
+      "text": "Context compaction completed."
     }
   },
   {

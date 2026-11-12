@@ -602,6 +602,36 @@ describe("Pi RPC app-server facade proxy", () => {
     await proxy.close();
   });
 
+  // Keep reason: L17's real projector -> proxy JSON-RPC boundary previously
+  // dropped context.compacted. A failed item must not become turn failure.
+  it("forwards failed native items, typed compaction and nonfatal compaction warnings", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    const projector = createPiEventProjector({ runId: "run-1", turnId: "mapped-turn" });
+    try {
+      await request(proxy, sink, 91, "thread/start", { model: "provider/model" });
+      const projected = [
+        { type: "compaction_start", reason: "threshold" },
+        { type: "compaction_end", reason: "threshold", result: { tokensBefore: 90, estimatedTokensAfter: 30 }, aborted: false },
+        { type: "compaction_start", reason: "manual" },
+        { type: "compaction_end", reason: "manual", errorMessage: "Summarization unavailable", aborted: false },
+        { type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", responseId: "failed-item", stopReason: "error", errorMessage: "Native reply failed", content: [{ type: "text", text: "partial reply" }] } },
+      ].flatMap(event => projector.project(event));
+      for (const event of projected) session.push(event.eventType, event.payload, event.turnId, event.itemId);
+      session.push("turn.completed", {}, "mapped-turn");
+      await waitFor(() => sink.decoded().some(frame => frame.method === "turn/completed"));
+      const frames = sink.decoded();
+      const compaction = projected.find(event => event.eventType === "context.compacted")!;
+      expect(frames.filter(frame => frame.method === "thread/compacted")).toEqual([
+        { method: "thread/compacted", params: { threadId: "pi-session", turnId: "mapped-turn", itemId: compaction.itemId, ...compaction.payload } },
+      ]);
+      expect(frames.find(frame => frame.method === "item/failed")).toMatchObject({ params: { turnId: "mapped-turn", kind: "agentMessage", message: "Native reply failed", item: { text: "partial reply" } } });
+      expect(frames.find(frame => (frame.params as { kind?: string })?.kind === "warning")).toMatchObject({ method: "item/completed", params: { kind: "warning", severity: "warning", code: "pi_compaction_failed", text: expect.stringContaining("Summarization unavailable") } });
+      expect(frames.filter(frame => typeof frame.method === "string" && /^turn\/(?:completed|failed|interrupted|cancelled)$/.test(frame.method))).toMatchObject([{ method: "turn/completed" }]);
+    } finally { await proxy.close(); }
+  });
+
   it("honors stdout backpressure and preserves response frame order", async () => {
     const sink = new FakeSink();
     sink.block();

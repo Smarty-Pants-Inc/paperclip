@@ -78,6 +78,27 @@ activity and warm-run ownership) and `pi-rpc-c2-live.test.ts` (actual Unix callb
 execution and Stop retirement). These hermetic checks do not qualify a live
 provider deployment.
 
+## Typed compaction and failed items
+
+Native `compaction_start`/`compaction_end` receipts share a canonical
+`contextCompaction` item's start/completion identity. Only a successful end emits
+`context.compacted`, with Pi's available pre/post token counts and a distinct ID
+for each compaction, even when one turn compacts repeatedly. An aborted compaction
+does not claim success. The proxy carries successful compaction through the
+existing `thread/compacted` facade notification; Pi-specific Rust normalization
+retains its measurements and identity without changing Codex's defaults.
+
+A native compaction `errorMessage` becomes a bounded, redacted warning item
+(`pi_compaction_failed`), not a turn failure. Likewise, `item.failed` crosses both
+the proxy and Rust normalization as an item failure, never a turn terminal. Pi's
+`agent_settled` remains the turn-settlement authority. Summarization accounting
+stays explicitly incomplete; these display receipts do not establish billing.
+
+`pi-event-projector.test.ts`, `pi-recordings.test.ts`,
+`pi-rpc-app-server-proxy.test.ts`, and the Rust `provider_events` tests cover these
+boundaries, including the captured Pi 1.5.2 compaction recording. They do not
+qualify a live provider deployment.
+
 ## Lost acknowledgments
 
 `PiRpcTransport` gives commands a 30-second client response deadline. Set

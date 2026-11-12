@@ -58,6 +58,10 @@ const fakePi = `
       if (mode === "settled") { finish(); return; }
       data = { disposition: mode === "queued" && promptCount === 1 ? "queued" : "started" };
       emit({ type: "response", id: request.id, command: request.type, success: true, data });
+      if (mode === "compaction-error") {
+        emit({ type: "compaction_start", reason: "threshold" });
+        emit({ type: "compaction_end", reason: "threshold", aborted: false, errorMessage: "Compaction service unavailable" });
+      }
       if (data.disposition !== "queued" && !["accepted-silent", "started-silent"].includes(mode)) finish(); return;
     }
     emit({ type: "response", id: request.id, command: request.type, success: true, data });
@@ -123,6 +127,23 @@ describe("Pi RPC event-idle deadline through real subprocess pipes (L15)", () =>
       await session.close();
       expect(session.processExited()).toBe(true);
       expect(f.events[0].filter(event => event.eventType.startsWith("turn.") && event.eventType !== "turn.started")).toHaveLength(1);
+      expect((await f.commands()).filter(command => command.type === "prompt")).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
+
+// Keep reason: L17's native compaction error must cross real subprocess pipes
+// without overriding the later successful assistant receipt / agent_settled.
+describe("Pi RPC compaction error through the real driver pump (L17)", () => {
+  it("keeps a compaction warning visible and completes only at native settlement", async () => {
+    const f = await fixture("compaction-error");
+    try {
+      const session = await f.open();
+      const turn = await session.startTurn({ message: { role: "user", text: "recover after summarizer failure" } });
+      await expect.poll(() => f.events[0].find(event => event.eventType === "turn.completed" && event.turnId === turn.turnId)).toMatchObject({ payload: { piAgentSettled: true } });
+      expect(f.events[0].find(event => event.payload.kind === "warning")).toMatchObject({ eventType: "item.completed", runId: "run-0", turnId: turn.turnId, payload: { code: "pi_compaction_failed", text: expect.stringContaining("Compaction service unavailable") } });
+      expect(f.events[0].some(event => event.eventType === "turn.failed" || event.eventType === "context.compacted")).toBe(false);
+      expect(session.processExited()).toBe(false);
       expect((await f.commands()).filter(command => command.type === "prompt")).toHaveLength(1);
     } finally { await f.close(); }
   });

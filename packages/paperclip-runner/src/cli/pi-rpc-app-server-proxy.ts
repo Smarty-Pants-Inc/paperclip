@@ -363,6 +363,14 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           itemId: event.itemId,
           payload,
         }));
+      } else if (event.eventType === "context.compacted") {
+        // Use the existing Codex-facade compaction notification. Keep Pi's
+        // typed measurements/identity: one Runner turn can compact repeatedly.
+        if (typeof event.turnId !== "string" || !event.turnId) continue;
+        send({ method: "thread/compacted", params: {
+          ...payload, threadId: opened.ids().driverSessionId,
+          turnId: event.turnId, itemId: event.itemId,
+        } });
       } else if (event.eventType === "usage.reported") {
         reportUsage(opened, event, payload);
       } else if (event.eventType === "run.result.proposed") {
