@@ -15,6 +15,8 @@ const MAX_TEXT_CHARS: usize = 4_000;
 /// preview. It keeps its complete (redacted) text up to this transport-safe
 /// bound; the durable outbox applies its own frame check.
 pub(crate) const MAX_FINAL_AGENT_MESSAGE_CHARS: usize = 32_000;
+/// Pi final replies and synthesized result summaries share the result schema's cap.
+pub(crate) const MAX_PI_FINAL_TEXT_CHARS: usize = 12_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NormalizedProviderEvent {
@@ -1545,6 +1547,39 @@ pub fn normalize_codex_notification_in(
         _ => {}
     }
 
+    events
+}
+
+/// Pi's proxy carries the reply channel on params, not in Codex's item phase.
+/// Keep this adaptation separate so other facade providers retain their phase rules.
+pub(crate) fn normalize_pi_notification_in(
+    method: &str,
+    params: &Value,
+    cwd: Option<&str>,
+) -> Vec<NormalizedProviderEvent> {
+    let mut events = normalize_codex_notification_in(method, params, cwd);
+    if matches!(method, "item/started" | "item/updated" | "item/completed")
+        && string(params.get("channel")) == "final"
+        && string(item(params).get("type")) == "agentMessage"
+    {
+        for event in &mut events {
+            if event.payload.get("kind").and_then(Value::as_str) == Some("agentMessage") {
+                event.payload["channel"] = json!("final");
+                if method == "item/completed" {
+                    event.payload["text"] = item(params)
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(|text| {
+                            json!(redact_sensitive_text_values(text)
+                                .chars()
+                                .take(MAX_PI_FINAL_TEXT_CHARS)
+                                .collect::<String>())
+                        })
+                        .unwrap_or(Value::Null);
+                }
+            }
+        }
+    }
     events
 }
 
