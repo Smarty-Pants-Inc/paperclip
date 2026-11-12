@@ -2899,7 +2899,7 @@ export async function executeNativeSession(
           // A compaction-only run never continues task work after a restart.
           // Runnerd records a restart-lost turn only for these providers, after
           // proving the old process ended and restoring the same conversation.
-          !["codex", "acpx", "opencode"].includes(input.provider.kind) || options.sessionCompaction || options.sessionGoalControl || options.resumeSessionGoalHeartbeat ||
+          !["codex", "acpx", "opencode", "pi_rpc"].includes(input.provider.kind) || options.sessionCompaction || options.sessionGoalControl || options.resumeSessionGoalHeartbeat ||
           recoveredSnapshot.goal || persistedSession?.semanticResult || persistedSession?.pendingRuntimeRequests?.length ||
           event.eventType !== "turn.failed" || !isNativeRestartInterruption(event.payload.error) ||
           event.turnId !== persistedSession?.activeTurnId) return false;

@@ -3352,21 +3352,77 @@ fn pi_rpc_keeps_one_facade_generation_across_two_completed_turns() {
     let mut config = opencode_config(&directory);
     config.pi_launch_profile = config.opencode_launch_profile.take();
     let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
-    executor.execute(&command(1, "run.prepare", pi_rpc_prepare_payload(&directory))).unwrap();
-    let opened = executor.execute(&command(2, "session.open", json!({}))).unwrap();
+    executor
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(&directory),
+        ))
+        .unwrap();
+    let opened = executor
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
     let first_pid = opened.result["processId"].clone();
     assert!(first_pid.as_u64().is_some());
     acknowledge_delivered_events(&mut executor);
     for seq in [3, 4] {
-        executor.execute(&command(seq, "turn.start", json!({"text":"Complete this turn."}))).unwrap();
+        executor
+            .execute(&command(
+                seq,
+                "turn.start",
+                json!({"text":"Complete this turn."}),
+            ))
+            .unwrap();
         poll_opencode_until(&mut executor, "turn.completed");
     }
-    let still_open = executor.execute(&command(5, "session.open", json!({}))).unwrap();
-    assert_eq!(still_open.result["processId"], first_pid, "native Pi must not apply ACPX's next-turn restart policy");
+    let still_open = executor
+        .execute(&command(5, "session.open", json!({})))
+        .unwrap();
+    assert_eq!(
+        still_open.result["processId"], first_pid,
+        "native Pi must not apply ACPX's next-turn restart policy"
+    );
     assert_eq!(opencode_call_count(&directory, "initialize"), 1);
     assert_eq!(opencode_call_count(&directory, "thread/start"), 1);
     assert_eq!(opencode_call_count(&directory, "turn/start"), 2);
     assert!(!directory.join("acpx-provider-state.json").exists());
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_parks_only_after_its_completed_turn_is_quiescent() {
+    let directory = temporary_directory("pi-rpc-host-park");
+    let mut config = opencode_config(&directory);
+    config.pi_launch_profile = config.opencode_launch_profile.take();
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    executor
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(&directory),
+        ))
+        .unwrap();
+    executor
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    assert!(!executor.host_park_ready().unwrap());
+    acknowledge_delivered_events(&mut executor);
+    executor
+        .execute(&command(
+            3,
+            "turn.start",
+            json!({"text":"Complete this turn."}),
+        ))
+        .unwrap();
+    assert!(!executor.host_park_ready().unwrap());
+    poll_opencode_until(&mut executor, "turn.completed");
+    acknowledge_delivered_events(&mut executor);
+    assert!(
+        executor.host_park_ready().unwrap(),
+        "native Pi must join the settled native-facade park gate"
+    );
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }

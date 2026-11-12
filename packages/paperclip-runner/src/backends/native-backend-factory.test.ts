@@ -1,3 +1,4 @@
+import { QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { QUALIFIED_ACPX_PROFILES, resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -979,4 +980,13 @@ describe("native backend factory", () => {
       ]),
     );
   });
+});
+
+// Component boundary: Core must select the daemon transport, not invoke a Pi driver directly.
+it("routes native pi_rpc through the same runnerd factory as OpenCode", async () => {
+  const input = execution({ kind: "pi_rpc", model: "managed/my-model", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" });
+  input.session.driverKind = "pi_rpc";
+  const backend = createNativeSessionBackend(input, { codexTransportFactory: () => new FakeCodexTransport() });
+  const descriptor = await backend.descriptor();
+  expect(descriptor).toMatchObject({ kind: "runner", name: "pi_rpc", version: "1.5.2" });
 });

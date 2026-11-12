@@ -5869,9 +5869,10 @@ impl CommandExecutor for CodexCommandExecutor {
         let Some(state) = self.state.as_ref() else {
             return Ok(false);
         };
-        if state.config.provider != "codex"
-            || state.config.driver != "codex_app_server"
-            || self.provider.is_none()
+        if !matches!(
+            (state.config.provider.as_str(), state.config.driver.as_str()),
+            ("codex", "codex_app_server") | ("pi_rpc", "pi_rpc")
+        ) || self.provider.is_none()
             || !state.completed_turn_authoritative
             || state.completed_turn_process_generation != Some(state.provider_process_generation)
             || state.completed_provider_turn_id.is_none()

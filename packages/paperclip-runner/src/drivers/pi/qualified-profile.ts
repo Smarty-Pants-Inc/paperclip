@@ -17,3 +17,8 @@ export function parsePiRpcProfile(value: unknown): NativePiRpcProfileSnapshot {
  */
 export const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type PiThinkingLevel = typeof PI_THINKING_LEVELS[number];
+
+export function parsePiThinkingLevel(value: unknown): PiThinkingLevel {
+  if (typeof value !== "string" || !PI_THINKING_LEVELS.includes(value as PiThinkingLevel)) throw new Error("Invalid native Pi thinking level");
+  return value as PiThinkingLevel;
+}

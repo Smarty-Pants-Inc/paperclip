@@ -28,7 +28,7 @@ export interface RunnerProviderLaunchRequirements {
   includeCollaborationModeInstructions: boolean;
   settings: Pick<CapabilityRunnerdCodexTransportOptions,
     "acpxAgent" | "acpxMode" | "acpxPermissionMode" | "acpxPermissionModePinned" |
-    "piProfile" | "piThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch" | "disableCodexProjectInstructions">;
+    "piProfile" | "piRpcThinkingLevel" | "piThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch" | "disableCodexProjectInstructions">;
   instructions: string;
   runtimeContext: NativeRuntimeContextSnapshot | null;
 }
@@ -62,7 +62,7 @@ export function runnerProviderLaunchRequirements(
       acpxPermissionMode: options.acpxPermissionMode,
       acpxPermissionModePinned: options.acpxPermissionModePinned,
       piProfile: options.provider === "pi_rpc" ? options.piProfile ?? QUALIFIED_PI_RPC_PROFILE : undefined,
-      piThinkingLevel: options.piThinkingLevel, claudeEffort: options.claudeEffort, grokEffort: options.grokEffort, grokDisableWebSearch: options.grokDisableWebSearch,
+      piRpcThinkingLevel: options.piRpcThinkingLevel, piThinkingLevel: options.piThinkingLevel, claudeEffort: options.claudeEffort, grokEffort: options.grokEffort, grokDisableWebSearch: options.grokDisableWebSearch,
       managedProfile: options.managedProfile, agentCoreProfile: options.agentCoreProfile,
       opencodePermissionMode: options.opencodePermissionMode,
       ...(options.disableCodexWebSearch === true ? { disableCodexWebSearch: true } : {}),
@@ -211,7 +211,7 @@ export function createRunnerProviderLaunch(
     return { kind: "pi_rpc", provider: "pi_rpc", driver: "pi_rpc", driverKind: "pi_rpc", providerVersion: "1.5.2",
       profile: settings.piProfile ?? QUALIFIED_PI_RPC_PROFILE,
       command: input.providerNodeCommand, args: [input.piProxyPath ?? ""], cwd: input.cwd,
-      model: requirements.model, piThinkingLevel: settings.piThinkingLevel ?? "low",
+      model: requirements.model, piRpcThinkingLevel: settings.piRpcThinkingLevel ?? "low",
       instructions: baseInstructions, runtimeContext,
       conversationMode: requirements.preparedConversation ? "prepared" : "task" };
   }

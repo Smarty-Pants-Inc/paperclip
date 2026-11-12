@@ -98,7 +98,7 @@ export function isNativeRestartInterruption(error: unknown): boolean {
   return failure.code === NATIVE_RESTART_INTERRUPTION_CODE && failure.recoverable === true;
 }
 
-const RESTART_CONTINUATION_DRIVER_KINDS: ReadonlySet<string> = new Set(["codex_app_server", "acpx_runtime", "opencode_server"]);
+const RESTART_CONTINUATION_DRIVER_KINDS: ReadonlySet<string> = new Set(["codex_app_server", "acpx_runtime", "opencode_server", "pi_rpc"]);
 
 /** The terminal fingerprint survives a crash between interruption and continuation. */
 export function nativeRestartInterruptedTurnId(snapshot: Pick<PersistedNativeSession,

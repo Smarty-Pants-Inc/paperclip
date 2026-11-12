@@ -1,3 +1,4 @@
+import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { readProviderFailure } from "../contracts/provider-failure.generated.js";
 import { confirmAntigravityProbeNativeRetirement } from "../drivers/acpx/antigravity-probe-retirement.js";
 import { resolveGrokDisableWebSearch, admittedGrokWebSearchPolicy } from "../drivers/acpx/grok-web-search.js";
@@ -1580,6 +1581,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxMode?: string;
   piThinkingLevel?: "off" | "low" | "high" | "max";
+  piRpcThinkingLevel?: import("../drivers/pi/qualified-profile.js").PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;
@@ -3761,7 +3763,7 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     return { ...selected, ...Object.fromEntries(PI_SIDECAR_PROVIDER_ROUTE_NAMES.flatMap(name => {
       const value = input.options.environment?.[name]; return value === undefined ? [] : [[name, value]];
     })), PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
-      PAPERCLIP_PI_THINKING_LEVEL: input.options.piThinkingLevel ?? "low", ...commonIdentity };
+      PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel ?? "low", ...commonIdentity };
   }
   if (input.provider === "opencode") {
     return {
@@ -4149,6 +4151,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     resolveClaudeEffort(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.claudeEffort);
     resolveGrokEffort(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.grokEffort);
     resolveGrokDisableWebSearch(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.grokDisableWebSearch);
+    if (options.provider === "pi_rpc") {
+      parsePiThinkingLevel(options.piRpcThinkingLevel ?? "low");
+      parsePiRpcProfile(options.piProfile ?? QUALIFIED_PI_RPC_PROFILE);
+    }
     resolvePiThinkingLevel(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.piThinkingLevel);
     if (options.acpxMode !== undefined && options.provider !== "acpx") {
       throw new Error("acpxMode requires the ACPX provider");
@@ -6332,6 +6338,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.options.provider === undefined ||
       this.options.provider === "codex" ||
       this.options.provider === "opencode" ||
+      this.options.provider === "pi_rpc" ||
       this.options.provider === "acpx";
     const localStateOwner =
       this.options.readRunnerState === undefined &&
