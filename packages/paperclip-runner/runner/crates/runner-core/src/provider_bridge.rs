@@ -649,6 +649,28 @@ impl ProviderToolBridge {
         Ok(None)
     }
 
+    /// Pi retries identify the original effect by call ID, not by a revised
+    /// evidence payload. Keep this separate from strict Codex replay matching.
+    pub(crate) fn first_held_result(
+        &self,
+        call_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<ToolResult>, ProviderBridgeError> {
+        let Some(held) = self
+            .completed
+            .get(call_id)
+            .or_else(|| self.settled_results.get(call_id))
+        else {
+            return Ok(None);
+        };
+        if held.call.operation_id != operation_id {
+            return Err(ProviderBridgeError::invalid(
+                "provider replayed a completed tool call with a different operation",
+            ));
+        }
+        Ok(Some(held.result.clone()))
+    }
+
     pub fn has_completed_call(&self, call_id: &str) -> bool {
         self.completed.contains_key(call_id) || self.has_settled_call_id(call_id)
     }

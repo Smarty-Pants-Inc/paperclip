@@ -1359,6 +1359,12 @@ struct CodexProviderState {
     active_provider_result_disposition: Option<String>,
     #[serde(default)]
     active_terminal_tool_rejected: bool,
+    // A Pi client waiter can expire before the dispatched operation settles.
+    // Retain its provider terminal fact across runner restarts, but do not
+    // finalize the run or invent a fallback result while an effect is pending.
+    // Older journals have no deferred outcome and deserialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_deferred_terminal: Option<String>,
     last_agent_message: Option<String>,
     #[serde(default)]
     goal_capability: Option<SessionGoalCapability>,
@@ -1452,6 +1458,7 @@ impl CodexProviderState {
             active_provider_result_fingerprint: None,
             active_provider_result_disposition: None,
             active_terminal_tool_rejected: false,
+            pi_deferred_terminal: None,
             last_agent_message: None,
             goal_capability: None,
             goal: None,
@@ -1732,6 +1739,22 @@ impl CodexProviderState {
                             "codex" | "opencode" | "cursor_cloud" | "pi_rpc"
                         )
                 })
+            || self
+                .pi_deferred_terminal
+                .as_deref()
+                .is_some_and(|event_type| {
+                    self.config.provider != "pi_rpc"
+                        || !matches!(
+                            event_type,
+                            "turn.completed"
+                                | "turn.failed"
+                                | "turn.interrupted"
+                                | "turn.cancelled"
+                        )
+                        || !self.tool_bridge.turn_closed()
+                        || self.tool_bridge.pending_calls().next().is_none()
+                        || self.active_provider_turn_id.is_some()
+                })
             || (matches!(
                 self.lifecycle.as_str(),
                 "prepared" | "session_open" | "closed"
@@ -1895,13 +1918,45 @@ impl CodexProviderState {
         Ok(())
     }
 
+    fn defer_pi_terminal_outcome(
+        &mut self,
+        event_type: &str,
+        outcome: Vec<NormalizedProviderEvent>,
+    ) -> Vec<NormalizedProviderEvent> {
+        if self.config.provider == "pi_rpc"
+            && self.tool_bridge.turn_closed()
+            && self.tool_bridge.pending_calls().next().is_some()
+        {
+            // The provider terminal closes delivery, not the operation's
+            // authority. Only its correlated controller result settles that.
+            self.pi_deferred_terminal = Some(event_type.to_owned());
+            Vec::new()
+        } else {
+            outcome
+        }
+    }
+
+    fn settle_deferred_pi_terminal(&mut self) -> Result<(), DurableRunnerError> {
+        if self.tool_bridge.pending_calls().next().is_none() {
+            if let Some(event_type) = self.pi_deferred_terminal.take() {
+                let outcome = terminal_events(self, &event_type, None);
+                self.extend_terminal_events(outcome)?;
+            }
+        }
+        Ok(())
+    }
+
     fn admit_tool_call(
         &mut self,
         call_id: &str,
         operation_id: &str,
         input: &Value,
     ) -> Result<ToolCallAdmission, ProviderBridgeError> {
-        let replay = self.tool_bridge.replay_result(call_id, operation_id, input);
+        let replay = if self.config.provider == "pi_rpc" {
+            self.tool_bridge.first_held_result(call_id, operation_id)
+        } else {
+            self.tool_bridge.replay_result(call_id, operation_id, input)
+        };
         let replay = replay.map_err(|error| {
             self.record_terminal_tool_rejection(operation_id);
             error
@@ -3044,11 +3099,13 @@ impl CodexCommandExecutor {
                         // accepted this exact turn's semantic result before the
                         // runner stopped observing provider output. Resume
                         // finalization without inventing another provider turn.
-                        state.extend_terminal_events(terminal_events(
+                        let outcome = terminal_events(
                             state,
                             "turn.completed",
                             state.goal.as_ref().map(|goal| goal.status.as_str()),
-                        ))?;
+                        );
+                        let outcome = state.defer_pi_terminal_outcome("turn.completed", outcome);
+                        state.extend_terminal_events(outcome)?;
                     } else {
                         // A turn that disappeared while runnerd was offline has no
                         // trustworthy success notification to replay. Terminate it
@@ -3074,6 +3131,7 @@ impl CodexCommandExecutor {
                             // No provider result was observed. Preserve the lost
                             // turn as a fact, but leave the run open for the
                             // controller's bounded same-conversation recovery.
+                            state.defer_pi_terminal_outcome("turn.failed", Vec::new());
                             state.push_terminal_event(provider_terminal)?;
                         } else {
                             let outcome = terminal_events(
@@ -3081,6 +3139,7 @@ impl CodexCommandExecutor {
                                 "turn.failed",
                                 state.goal.as_ref().map(|goal| goal.status.as_str()),
                             );
+                            let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome);
                             state.extend_terminal_events(with_terminal_outcome(
                                 vec![provider_terminal],
                                 outcome,
@@ -4909,6 +4968,7 @@ impl CodexCommandExecutor {
             }),
         };
         let terminal = terminal_events(state, terminal_event_type, None);
+        let terminal = state.defer_pi_terminal_outcome(terminal_event_type, terminal);
         state.extend_terminal_events(with_terminal_outcome(vec![provider_terminal], terminal))?;
         self.save_state()
     }
@@ -5022,12 +5082,19 @@ impl CodexCommandExecutor {
         operation_id: String,
         input: Value,
     ) -> Result<(), DurableRunnerError> {
-        if let Err(error) = validate_semantic_tool_input(&operation_id, &input) {
-            return self.reject_tool_call(
-                call_id,
-                operation_id,
-                ProviderBridgeError::invalid(error.to_string()),
-            );
+        let pi_held_replay = self.state.as_ref().is_some_and(|state| {
+            state.config.provider == "pi_rpc" && state.tool_bridge.has_completed_call(&call_id)
+        });
+        // A held Pi call has already passed input validation and executed. A
+        // retry's changed evidence cannot replace that input or dispatch work.
+        if !pi_held_replay {
+            if let Err(error) = validate_semantic_tool_input(&operation_id, &input) {
+                return self.reject_tool_call(
+                    call_id,
+                    operation_id,
+                    ProviderBridgeError::invalid(error.to_string()),
+                );
+            }
         }
         let identity = self.event_identity()?;
         let admission = self
@@ -5125,6 +5192,7 @@ impl CodexCommandExecutor {
             admit_terminal_tool_authority(&mut next_state, &operation_id, &input, result.is_error)?;
         }
         next_state.push_event(semantic_result_event(&identity, &result))?;
+        next_state.settle_deferred_pi_terminal()?;
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
         if delivery_detached {
@@ -5444,6 +5512,7 @@ impl CodexCommandExecutor {
                             "message": diagnostic["message"], "error": diagnostic }),
                     };
                     let outcome = terminal_events(state, "turn.failed", None);
+                    let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome);
                     state.extend_terminal_events(with_terminal_outcome(
                         vec![provider_terminal],
                         outcome,
@@ -5740,6 +5809,7 @@ impl CodexCommandExecutor {
                     if let Some(ref event_type) = terminal_event_type {
                         let goal_status = state.goal.as_ref().map(|goal| goal.status.as_str());
                         let outcome = terminal_events(state, event_type, goal_status);
+                        let outcome = state.defer_pi_terminal_outcome(event_type, outcome);
                         terminal_goal_events.extend(normalized);
                         state.extend_terminal_events(with_terminal_outcome(
                             terminal_goal_events,
@@ -7992,6 +8062,183 @@ done
         state
     }
 
+    fn tool_result_authority_state(provider: &str, operation_id: &str) -> CodexProviderState {
+        let mut state = declared_finish_state();
+        if operation_id != "paperclip_finish" {
+            let operation = crate::provider_bridge::AuthorizedTool {
+                operation_id: operation_id.to_owned(),
+                version: 1,
+                description: "Read the task context".to_owned(),
+                input_schema: json!({"type":"object"}),
+                response_schema: json!({"type":"object"}),
+            };
+            state.tool_bridge = ProviderToolBridge::default();
+            state
+                .tool_bridge
+                .prepare(AuthorizedToolSet {
+                    schema: TOOL_SET_SCHEMA.to_owned(),
+                    schema_version: 1,
+                    catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(
+                        &operation,
+                    ))
+                    .unwrap(),
+                    operations: vec![operation],
+                })
+                .unwrap();
+        }
+        if provider == "pi_rpc" {
+            state.config.provider = provider.to_owned();
+            state.config.driver = provider.to_owned();
+            state.config.provider_version =
+                crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+            state.config.profile = Some(
+                serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn pi_rpc_first_held_result_is_authoritative_in_completed_and_settled_state() {
+        // Data-safety boundary: changing evidence never authorizes a second
+        // dispatch. Codex retains its strict input equality contract.
+        for provider in ["pi_rpc", "codex"] {
+            for operation_id in ["paperclip_finish", "get_task_context"] {
+                for settled in [false, true] {
+                    for is_error in [false, true] {
+                        let mut state = tool_result_authority_state(provider, operation_id);
+                        let input = valid_opencode_result();
+                        state
+                            .admit_tool_call("first-call", operation_id, &input)
+                            .unwrap();
+                        let result = ToolResult {
+                            call_id: "first-call".to_owned(),
+                            operation_id: operation_id.to_owned(),
+                            result: json!({"receipt":"original"}),
+                            is_error,
+                        };
+                        state.tool_bridge.apply_result(result.clone()).unwrap();
+                        if settled {
+                            state
+                                .tool_bridge
+                                .settle_turn("provider_turn_terminated")
+                                .unwrap();
+                            state.active_provider_turn_id = None;
+                            state.lifecycle = "session_open".to_owned();
+                        }
+                        // This is also the previous-release state shape: absent
+                        // piDeferredTerminal defaults to None without a reset.
+                        let saved = serde_json::to_value(&state).unwrap();
+                        assert!(saved.get("piDeferredTerminal").is_none());
+                        let mut restored: CodexProviderState =
+                            serde_json::from_value(saved).unwrap();
+                        restored.tool_bridge.attach_existing_run().unwrap();
+                        restored.validate().unwrap();
+                        let before = serde_json::to_value(&restored.tool_bridge).unwrap();
+                        let mut changed = input;
+                        changed["summary"] = json!("different summary");
+                        changed["evidence"] = json!([{"ref":"different evidence"}]);
+                        let replay = restored.admit_tool_call("first-call", operation_id, &changed);
+                        if provider == "pi_rpc" {
+                            assert_eq!(replay.unwrap(), ToolCallAdmission::CompletedReplay(result));
+                            assert!(
+                                restored
+                                    .admit_tool_call("first-call", "another_operation", &changed)
+                                    .is_err(),
+                                "call identity must not authorize a different operation"
+                            );
+                        } else {
+                            assert!(replay.unwrap_err().to_string().contains("different input"));
+                        }
+                        assert_eq!(serde_json::to_value(&restored.tool_bridge).unwrap(), before);
+                        assert!(restored.pending_events.is_empty());
+                        assert!(restored.queued_events.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pi_rpc_deferred_terminal_waits_for_every_authoritative_result() {
+        for provider in ["pi_rpc", "codex"] {
+            for operation_id in ["paperclip_finish", "get_task_context"] {
+                for is_error in [false, true] {
+                    let mut state = tool_result_authority_state(provider, operation_id);
+                    let input = valid_opencode_result();
+                    for call_id in ["first-call", "second-call"] {
+                        state
+                            .admit_tool_call(call_id, operation_id, &input)
+                            .unwrap();
+                    }
+                    state
+                        .tool_bridge
+                        .settle_turn("provider_turn_terminated")
+                        .unwrap();
+                    state.active_provider_turn_id = None;
+                    state.lifecycle = "session_open".to_owned();
+                    let outcome = terminal_events(&state, "turn.failed", None);
+                    let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome);
+                    state.extend_terminal_events(outcome).unwrap();
+                    let saved = serde_json::to_value(&state).unwrap();
+                    let mut state: CodexProviderState = serde_json::from_value(saved).unwrap();
+                    state.tool_bridge.attach_existing_run().unwrap();
+                    state.validate().unwrap();
+                    assert_eq!(state.pi_deferred_terminal.is_some(), provider == "pi_rpc");
+                    for (index, call_id) in ["first-call", "second-call"].into_iter().enumerate() {
+                        state
+                            .tool_bridge
+                            .apply_result(ToolResult {
+                                call_id: call_id.to_owned(),
+                                operation_id: operation_id.to_owned(),
+                                result: json!({"ok":!is_error}),
+                                is_error,
+                            })
+                            .unwrap();
+                        admit_terminal_tool_authority(&mut state, operation_id, &input, is_error)
+                            .unwrap();
+                        state.settle_deferred_pi_terminal().unwrap();
+                        state.validate().unwrap();
+                        let terminals: Vec<_> = state
+                            .pending_events
+                            .iter()
+                            .filter(|event| event.event_type == "run.terminal")
+                            .collect();
+                        assert_eq!(
+                            terminals.len(),
+                            usize::from(provider != "pi_rpc" || index == 1)
+                        );
+                    }
+                    assert!(state.pi_deferred_terminal.is_none());
+                    assert!(state.tool_bridge.pending_calls().next().is_none());
+                    assert!(
+                        serde_json::to_value(&state.tool_bridge).unwrap()["completed"]
+                            .as_object()
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let terminals: Vec<_> = state
+                        .pending_events
+                        .iter()
+                        .filter(|event| event.event_type == "run.terminal")
+                        .collect();
+                    assert_eq!(terminals.len(), 1);
+                    let success =
+                        provider == "pi_rpc" && operation_id == "paperclip_finish" && !is_error;
+                    assert_eq!(
+                        terminals[0].payload["runTerminalState"],
+                        if success { "succeeded" } else { "failed" }
+                    );
+                    let before = state.pending_events.clone();
+                    state.settle_deferred_pi_terminal().unwrap();
+                    assert_eq!(
+                        state.pending_events, before,
+                        "draining a settled terminal is idempotent"
+                    );
+                }
+            }
+        }
+    }
     #[test]
     fn controller_rejected_finish_cannot_become_a_successful_terminal_fallback() {
         let mut state = declared_finish_state();
@@ -8548,6 +8795,7 @@ done
             active_provider_result_fingerprint: None,
             active_provider_result_disposition: None,
             active_terminal_tool_rejected: false,
+            pi_deferred_terminal: None,
             last_agent_message: None,
             goal_capability: None,
             goal: None,

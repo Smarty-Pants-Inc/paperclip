@@ -3426,3 +3426,275 @@ fn pi_rpc_parks_only_after_its_completed_turn_is_quiescent() {
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
+
+// Keep reason: #20256's asynchronous result/data-safety boundary. These drive
+// the native selector, a real subprocess facade, and the durable tool ledger.
+#[cfg(unix)]
+fn pi_rpc_finish_fixture(
+    directory: &Path,
+    extra_args: &str,
+) -> (DurableRunnerConfig, Value, Value) {
+    let mut config = opencode_config(directory);
+    let proxy = directory.join("qualified-opencode-proxy-script");
+    let script = fs::read_to_string(&proxy).unwrap();
+    fs::set_permissions(&proxy, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        &proxy,
+        script.replace(
+            "--require-completion-contract\n",
+            &format!(
+                "--require-completion-contract --terminal-result-file '{}' {extra_args}\n",
+                directory.join("finish-input.json").display(),
+            ),
+        ),
+    )
+    .unwrap();
+    config
+        .opencode_launch_profile
+        .as_mut()
+        .unwrap()
+        .proxy_script = qualified_artifact(proxy);
+    config.pi_launch_profile = config.opencode_launch_profile.take();
+    let input = json!({
+        "reportedWorkDisposition":"done", "summary":"First authoritative completion",
+        "completionClaim":{"contractRevision":"revision-1", "objectiveSatisfied":true,
+            "criteria":[{"criterionId":"criterion-1", "status":"satisfied", "evidenceRefs":["first"]}],
+            "remainingWork":[]},
+        "evidence":[{"ref":"first"}], "verification":[]
+    });
+    fs::write(
+        directory.join("finish-input.json"),
+        serde_json::to_vec(&input).unwrap(),
+    )
+    .unwrap();
+    let tool = AuthorizedTool {
+        operation_id: "paperclip_finish".to_owned(),
+        version: 1,
+        description: "Finish the current task".to_owned(),
+        input_schema: json!({"type":"object"}),
+        response_schema: json!({"type":"object"}),
+    };
+    let mut payload = pi_rpc_prepare_payload(directory);
+    payload["authorizedTools"] = json!({
+        "schema":"paperclip.runner.authorized-tools.v1", "schemaVersion":1,
+        "catalogDigest":authorized_tool_catalog_digest(std::slice::from_ref(&tool)).unwrap(),
+        "operations":[tool],
+    });
+    (config, payload, input)
+}
+
+#[cfg(unix)]
+fn start_pi_rpc_finish(
+    directory: &Path,
+    config: &DurableRunnerConfig,
+    payload: Value,
+) -> NativeProviderCommandExecutor {
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(directory, config);
+    executor
+        .execute(&command(1, "run.prepare", payload))
+        .unwrap();
+    executor
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    acknowledge_delivered_events(&mut executor);
+    executor
+        .execute(&command(
+            3,
+            "turn.start",
+            json!({"text":"Finish with the supplied evidence."}),
+        ))
+        .unwrap();
+    executor
+}
+
+#[cfg(unix)]
+fn pi_rpc_state(directory: &Path) -> Value {
+    serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap()).unwrap()
+}
+
+#[cfg(unix)]
+fn finish_result() -> Value {
+    json!({"callId":"terminal-result-call", "operationId":"paperclip_finish",
+        "result":{"accepted":true,"receipt":"first-effect"}, "isError":false})
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_late_finish_result_settles_after_forced_client_timeout() {
+    for restart in [false, true] {
+        let directory = temporary_directory("pi-rpc-forced-finish-timeout");
+        let (config, payload, input) =
+            pi_rpc_finish_fixture(&directory, "--tool-waiter-timeout-ms 30");
+        let mut executor = start_pi_rpc_finish(&directory, &config, payload);
+        let mut events = poll_opencode_until(&mut executor, "turn.failed");
+        assert_eq!(
+            opencode_call_count(&directory, "tool-waiter:timed-out"),
+            1,
+            "the provider-side waiter really expired, not just the test deadline"
+        );
+        let saved = pi_rpc_state(&directory);
+        assert_eq!(
+            saved["toolBridge"]["pending"]["terminal-result-call"]["input"],
+            input
+        );
+        assert!(saved["toolBridge"]["turnClosed"].as_bool().unwrap());
+        assert!(
+            !events.iter().any(|event| matches!(
+                event.event_type.as_str(),
+                "run.result.proposed" | "run.terminal"
+            )),
+            "a client timeout is not an authoritative operation result: {events:?}"
+        );
+        if restart {
+            drop(executor);
+            executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        }
+        let delivered = executor
+            .execute(&command(4, "semantic_tool.result", finish_result()))
+            .unwrap();
+        assert_eq!(delivered.result["status"], "settled_after_turn");
+        events.extend(poll_opencode_until(&mut executor, "run.terminal"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "semantic_tool.input")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "semantic_tool.result")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "run.terminal")
+                .count(),
+            1
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "run.result.proposed"));
+        let terminal = &events
+            .iter()
+            .find(|event| event.event_type == "run.terminal")
+            .unwrap()
+            .payload;
+        assert_eq!(terminal["runTerminalState"], "succeeded");
+        assert_eq!(terminal["reportedWorkDisposition"], "done");
+        let saved = pi_rpc_state(&directory);
+        assert_eq!(saved["toolBridge"]["pending"], json!({}));
+        assert_eq!(saved["toolBridge"]["completed"], json!({}));
+        assert_eq!(
+            saved["toolBridge"]["settledResults"]["terminal-result-call"]["result"],
+            finish_result()
+        );
+        assert_eq!(saved["activeProviderResultDisposition"], "done");
+        assert!(saved.get("piDeferredTerminal").is_none());
+        if restart {
+            drop(executor);
+            executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        }
+        let replay = executor
+            .execute(&command(5, "semantic_tool.result", finish_result()))
+            .unwrap();
+        assert_eq!(replay.result["status"], "duplicate");
+        let replay_events = executor.poll_events().unwrap();
+        assert!(
+            !replay_events.iter().any(|event| matches!(
+                event.event_type.as_str(),
+                "semantic_tool.input"
+                    | "semantic_tool.result"
+                    | "run.result.proposed"
+                    | "run.terminal"
+            )),
+            "restoration may add session facts, never another effect or outcome: {replay_events:?}"
+        );
+        executor.acknowledge_events(replay_events.len()).unwrap();
+        executor.shutdown().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_replays_first_held_finish_result_despite_different_evidence() {
+    let directory = temporary_directory("pi-rpc-first-held-finish");
+    let replay_path = directory.join("replay-input.json");
+    let (config, payload, input) = pi_rpc_finish_fixture(
+        &directory,
+        &format!("--replay-terminal-input-file '{}'", replay_path.display()),
+    );
+    let mut changed = input.clone();
+    changed["summary"] = json!("DIFFERENT completion attempt");
+    changed["evidence"] = json!([{"ref":"different-evidence"}]);
+    changed["completionClaim"]["criteria"][0]["evidenceRefs"] = json!(["different-evidence"]);
+    fs::write(&replay_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+    let mut executor = start_pi_rpc_finish(&directory, &config, payload);
+    let mut events = poll_opencode_until(&mut executor, "semantic_tool.input");
+    executor
+        .execute(&command(4, "semantic_tool.result", finish_result()))
+        .unwrap();
+    events.extend(poll_opencode_until(&mut executor, "run.terminal"));
+    assert_eq!(
+        opencode_call_count(&directory, "terminal-result:accepted"),
+        2,
+        "the replay must receive the first result, not an input-conflict error"
+    );
+    let log = fs::read_to_string(directory.join("fake-opencode-calls.log")).unwrap();
+    let responses: Vec<_> = log
+        .lines()
+        .filter_map(|line| line.strip_prefix("terminal-tool-response:"))
+        .map(|text| serde_json::from_str::<Value>(text).unwrap())
+        .collect();
+    assert_eq!(responses, vec![finish_result()["result"].clone(); 2]);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "semantic_tool.input")
+            .count(),
+        1,
+        "replay must never dispatch a second effect"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "semantic_tool.result")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "run.terminal")
+            .count(),
+        1
+    );
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "run.result.proposed"));
+    let saved = pi_rpc_state(&directory);
+    assert_eq!(saved["toolBridge"]["pending"], json!({}));
+    assert_eq!(saved["toolBridge"]["completed"], json!({}));
+    assert_eq!(
+        saved["toolBridge"]["settledResults"]["terminal-result-call"]["call"]["input"],
+        input
+    );
+    assert_eq!(
+        saved["toolBridge"]["settledResults"]["terminal-result-call"]["result"],
+        finish_result()
+    );
+    assert_eq!(
+        saved["activeProviderResultFingerprint"],
+        format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&input).unwrap())
+        )
+    );
+    assert_eq!(saved["activeProviderResultDisposition"], "done");
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}

@@ -763,6 +763,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
         })
         .transpose()?;
+    // Force the native-facade client's tool waiter to expire independently of
+    // the controller's authoritative operation result.
+    let tool_waiter_timeout_ms = argument(&args, "--tool-waiter-timeout-ms")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+    let replay_terminal_input = argument(&args, "--replay-terminal-input-file")
+        .map(|path| -> Result<Value, Box<dyn std::error::Error>> {
+            Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+        })
+        .transpose()?;
+    let mut terminal_input_replayed = false;
     let replay_completed_tool_call = args
         .iter()
         .any(|value| value == "--replay-completed-tool-call");
@@ -1161,6 +1172,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "terminal-result:rejected"
                 },
             )?;
+            let text = message
+                .pointer("/result/contentItems/0/text")
+                .and_then(Value::as_str);
+            if let Some(text) = text {
+                log_call(
+                    call_log.as_deref(),
+                    &format!("terminal-tool-response:{text}"),
+                )?;
+            }
+            if tool_waiter_timeout_ms.is_some() {
+                // The client has already timed out. A late response cannot
+                // restart its turn or execute the tool a second time.
+                log_call(call_log.as_deref(), "terminal-tool-response:after-timeout")?;
+                continue;
+            }
+            if let Some(input) = replay_terminal_input
+                .as_ref()
+                .filter(|_| !terminal_input_replayed)
+            {
+                terminal_input_replayed = true;
+                send(json!({
+                    "id": "terminal-result-request", "method": "item/tool/call",
+                    "params": {"threadId": state.thread_id, "turnId": state.active_turn_id,
+                        "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": input}
+                }))?;
+                continue;
+            }
             if success && hold_after_terminal_result {
                 continue;
             }
@@ -1251,6 +1289,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         let id = message.get("id").cloned();
         match method {
+            "session.revalidate"
+                if tool_waiter_timeout_ms.is_some() || replay_terminal_input.is_some() =>
+            {
+                send(json!({"id":id,"result":true}))?;
+            }
             "initialize" => {
                 if args
                     .iter()
@@ -2222,6 +2265,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "params": { "threadId": state.thread_id, "turnId": provider_turn_id,
                             "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result }
                     }))?;
+                    if let Some(timeout_ms) = tool_waiter_timeout_ms {
+                        // Deliberately do not read stdin until the client
+                        // deadline: the controller result is delivered later.
+                        std::thread::sleep(Duration::from_millis(timeout_ms));
+                        log_call(call_log.as_deref(), "tool-waiter:timed-out")?;
+                        finish_turn(&state_path, &mut state, "failed")?;
+                    }
                 } else if emit_tool_call {
                     send(json!({
                         "id": "tool-request-1",
