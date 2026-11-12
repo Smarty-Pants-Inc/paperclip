@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
+import { buildGitAuthInvocation } from "./git-credentials.js";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { githubLauncherSource, githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
-import { cleanupGitHubOperationLaunchers, prepareGitHubOperationLaunchers } from "@paperclipai/adapter-utils/execution-target";
+import { cleanupGitHubOperationLaunchers, githubOperationLauncherDirectory, prepareGitHubOperationLaunchers } from "@paperclipai/adapter-utils/execution-target";
 
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 
@@ -30,6 +31,18 @@ export async function prepareHeartbeatGitHubLaunchers(
   prepareLaunchers = prepareGitHubOperationLaunchers,
   cleanupLaunchers = cleanupGitHubOperationLaunchers,
 ) {
+  if (input.env.PAPERCLIP_GITHUB_AUTH_MODE === "agent_env") {
+    // This controller-owned mode receives only this agent's resolved bindings.
+    // Keep ambient helper/SSH isolation, but do not mint a managed capability or
+    // install wrappers that would strip the explicitly selected token again.
+    const env = githubBrokerEnvironment(input.env, { url: "", token: "" });
+    // No image/shared gh login may become a fallback, including when no token is
+    // bound. An absent run-owned config directory is safe for gh to read.
+    env.GH_CONFIG_DIR = `${githubOperationLauncherDirectory(input)}/gh-config`;
+    const token = input.env.GH_TOKEN?.trim() || input.env.GITHUB_TOKEN?.trim();
+    if (token) Object.assign(env, buildGitAuthInvocation({ token, source: "agent_env", secretName: null }).env);
+    return { env, cleanupLocation: null };
+  }
   if (input.target?.kind === "remote" && input.target.transport === "sandbox" && input.target.runnerTask) {
     // Provider-owned tasks decide their own runtime layout and command environment.
     return { env: githubBrokerEnvironment(input.env, {

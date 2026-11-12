@@ -154,6 +154,9 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
   const skillActor: AuthorizationActor = { type: "agent", agentId: agent.id, companyId: agent.companyId,
     runId: run.id, source: "agent_jwt", onBehalfOfUserId: responsibleUserId === "local-board" ? null : responsibleUserId };
+  // Only the persisted agent setting selects this mode, never a task override.
+  const agentAdapterConfig = parseObject(agent.adapterConfig);
+  const useAgentGitHubEnv = agentAdapterConfig.githubAuthenticationMode === "agent_env";
   const [mentionedSkills, githubIdentity] = await Promise.allSettled([
     preconfiguredHome || pinnedSkillTest ? Promise.resolve([]) : time("configuration_mentions", () => resolveRunScopedMentionedSkillKeys({
       db,
@@ -162,7 +165,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       commentIds: extractWakeCommentIds(context),
       actor: skillActor,
     })),
-    time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
+    useAgentGitHubEnv ? Promise.resolve({ configured: false as const }) : time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
       agentId: agent.id, responsibleUserId, allowStandingDelegation: false,
     })),
   ]);
@@ -176,7 +179,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       : runScopedMentionedSkillKeys;
   const githubSelection = githubIdentity.value;
   const useHostGitHub =
-    !githubSelection.configured &&
+    !useAgentGitHubEnv && !githubSelection.configured &&
     trustPreset.kind === "standard" &&
     ["local", "ssh"].includes(
       selectedEnvironmentForConfig?.driver ?? "local",
@@ -186,6 +189,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     await time("configuration_secrets", () => resolveExecutionRunAdapterConfig({
       managedAiCredentials: Boolean(aiBinding),
       managedGitHubCredentials: !useHostGitHub,
+      agentAdapterConfig,
       companyId: agent.companyId,
       agentId: agent.id,
       adapterType: agent.adapterType,
@@ -204,6 +208,13 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       trustPreset,
     }));
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
+  if (useAgentGitHubEnv && !["GH_TOKEN", "GITHUB_TOKEN"].some(key => {
+    const value = parseObject(resolvedConfig.env)[key];
+    return typeof value === "string" && value.trim().length > 0;
+  })) {
+    await appendRunEvent(run, { eventType: "github.agent_env_token_missing", stream: "system", level: "warn",
+      message: 'GitHub agent_env authentication selected, but this agent has no GH_TOKEN or GITHUB_TOKEN. Bind an agent env secret; managed and host credentials will not be used.' });
+  }
   if (aiBinding) {
     try {
       managedAiRuntime = await time("configuration_ai_runtime", () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig }));
@@ -245,6 +256,13 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       throw new ConfigurationIncompleteFailure("The AI account changed while this native run was suspended. Start a new execution.", { configurationIncomplete: { reason: "ai_connection_changed", actionUrl: `/agents/${agent.id}/runtime` } });
     }
     Object.assign(resolvedConfig, managedAiRuntime.config);
+    if (useAgentGitHubEnv) {
+      // Copilot AI credentials are separate from the explicitly selected shell
+      // identity. Its managed home setup must not clear the agent's GitHub env.
+      resolvedConfig.env = { ...parseObject(resolvedConfig.env),
+        ...Object.fromEntries(["GH_TOKEN", "GITHUB_TOKEN"].flatMap(key =>
+          configuredTaskEnvironment[key] !== undefined ? [[key, configuredTaskEnvironment[key]]] : [])) };
+    }
     for (const key of AI_AUTH_ENV_KEYS) secretKeys.add(key);
     context.aiConnection = { ...managedAiRuntime.attribution, accountName: managedAiRuntime.accountName, identity: managedAiRuntime.identity, sessionIdentity: managedAiRuntime.sessionIdentity };
     await db.update(heartbeatRuns).set({ contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify({ aiConnection: context.aiConnection, ...(context.aiRouterTaskKey ? { aiRouterTaskKey: context.aiRouterTaskKey } : {}), ...(context.aiRouterSelection ? { aiRouterSelection: context.aiRouterSelection } : {}) })}::jsonb` }).where(eq(heartbeatRuns.id, run.id));
@@ -415,7 +433,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   if (agentIdentity) secretKeys.add("PAPERCLIP_AGENT_PRIVATE_KEY");
   return {
     prepared: true as const,
-    mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
+    mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub, useAgentGitHubEnv,
     resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
     runtimeSkillEntries, nativeRunnerPreparationSpans, runtimeConfig, agentIdentity, observability,
   };

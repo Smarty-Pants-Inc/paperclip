@@ -52,6 +52,13 @@ export const restoreAgentInstructionSchema = z.object({
 export type UpsertAgentInstructionsFile = z.infer<typeof upsertAgentInstructionsFileSchema>;
 
 const adapterConfigSchema = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
+  if (value.githubAuthenticationMode !== undefined && value.githubAuthenticationMode !== "agent_env") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'adapterConfig.githubAuthenticationMode must be "agent_env" when specified',
+      path: ["githubAuthenticationMode"],
+    });
+  }
   const envValue = value.env;
   if (envValue === undefined) return;
   const parsed = envConfigSchema.safeParse(envValue);

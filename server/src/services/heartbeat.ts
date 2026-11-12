@@ -2817,7 +2817,7 @@ export function heartbeatService(
       }));
       if (!executionConfiguration.prepared) return;
       const {
-        mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub,
+        mergedConfig, configSnapshot, runScopedMentionedSkillKeys, githubSelection, useHostGitHub, useAgentGitHubEnv,
         resolvedConfig, configuredTaskEnvironment, secretKeys, secretManifest,
         runtimeSkillEntries, nativeRunnerPreparationSpans, agentIdentity, observability,
       } = executionConfiguration;
@@ -3111,9 +3111,10 @@ export function heartbeatService(
           trustPreset.kind === "standard" &&
           process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
       }));
+      if (useAgentGitHubEnv) gitExecutionEnv.PAPERCLIP_GITHUB_AUTH_MODE = "agent_env";
       runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
-      context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
+      context.githubAuthenticationMode = useAgentGitHubEnv ? "agent_env" : useHostGitHub ? "host" : "managed";
       if (!useHostGitHub && !providerApiPlacement) {
         const githubLaunchers = await timePreparation("github_launchers", () => prepareHeartbeatGitHubLaunchers({
           native: agent.adapterType === "paperclip_runner",

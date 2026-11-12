@@ -287,7 +287,7 @@ function stripForbiddenEnvFromAdapterConfig(
   };
 }
 
-function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
+function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string, agentGitHubTokens = false) {
   const record = stripForbiddenEnvBindings(envValue);
   if (!record) return;
   for (const [key, rawBinding] of Object.entries(record)) {
@@ -299,7 +299,7 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
       (typeof binding === "object" &&
         binding !== null &&
         binding.type === "plain");
-    if (isPlainBinding && LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key)) {
+    if (isPlainBinding && (LOW_TRUST_SENSITIVE_ENV_KEY_RE.test(key) || (agentGitHubTokens && MANAGED_GITHUB_TOKEN_KEYS.has(key)))) {
       throw new HttpError(
         422,
         `Low-trust execution cannot use inline sensitive env value ${source}.${key}`,
@@ -335,27 +335,41 @@ export async function resolveExecutionRunAdapterConfig(input: {
     reason: string;
     remediation: string;
   };
+  /** Persisted agent config, not issue/project overrides; secret resolution stays agent-scoped. */
+  agentAdapterConfig?: Record<string, unknown>;
   /** Managed GitHub tokens are resolved only when operations start. */
   managedGitHubCredentials?: boolean;
   /** Audited class-3 values resolved by an internal credential broker. */
   trustedEnvProjection?: Record<string, string>;
   trustedEnvSecretKeys?: string[];
 }) {
+  const useAgentGitHubEnv = Boolean(input.agentId) && input.agentAdapterConfig?.githubAuthenticationMode === "agent_env";
   const executionRunConfig = stripForbiddenEnvFromAdapterConfig(
     input.executionRunConfig,
-    input.managedGitHubCredentials,
+    input.managedGitHubCredentials || useAgentGitHubEnv,
   );
+  if (useAgentGitHubEnv) {
+    // Ignore task overrides and other scopes, including a differently named token
+    // that could outrank the agent's selection in gh. Resolve these references
+    // through the ordinary agent/company-scoped resolver and low-trust checks.
+    const ownEnv = parseObject(input.agentAdapterConfig?.env);
+    executionRunConfig.env = {
+      ...parseObject(executionRunConfig.env),
+      ...Object.fromEntries(["GH_TOKEN", "GITHUB_TOKEN"].flatMap(key =>
+        ownEnv[key] !== undefined ? [[key, ownEnv[key]]] : [])),
+    };
+  }
   const environmentEnv = stripForbiddenEnvBindings(
     input.environmentEnv,
-    input.managedGitHubCredentials,
+    input.managedGitHubCredentials || useAgentGitHubEnv,
   );
   const projectEnv = stripForbiddenEnvBindings(
     input.projectEnv,
-    input.managedGitHubCredentials,
+    input.managedGitHubCredentials || useAgentGitHubEnv,
   );
   const routineEnv = stripForbiddenEnvBindings(
     input.routineEnv,
-    input.managedGitHubCredentials,
+    input.managedGitHubCredentials || useAgentGitHubEnv,
   );
   const agentEnv = parseObject(executionRunConfig.env);
   const lowTrustAllowedBindingIds =
@@ -366,7 +380,7 @@ export async function resolveExecutionRunAdapterConfig(input: {
     input.trustPreset?.kind !== "low_trust_review";
   if (input.trustPreset?.kind === "low_trust_review") {
     assertLowTrustEnvConfigAllowed(environmentEnv, "environment.env");
-    assertLowTrustEnvConfigAllowed(executionRunConfig.env, "agent.env");
+    assertLowTrustEnvConfigAllowed(executionRunConfig.env, "agent.env", useAgentGitHubEnv);
     assertLowTrustEnvConfigAllowed(projectEnv, "project.env");
     assertLowTrustEnvConfigAllowed(routineEnv, "routine.env");
   }
@@ -597,7 +611,9 @@ export async function resolveExecutionRunAdapterConfig(input: {
   ) {
     resolvedConfig.env = {
       ...parseObject(resolvedConfig.env),
-      ...input.trustedEnvProjection,
+      ...(useAgentGitHubEnv
+        ? Object.fromEntries(Object.entries(input.trustedEnvProjection).filter(([key]) => !MANAGED_GITHUB_TOKEN_KEYS.has(key)))
+        : input.trustedEnvProjection),
     };
     for (const key of input.trustedEnvSecretKeys ?? []) secretKeys.add(key);
   }
