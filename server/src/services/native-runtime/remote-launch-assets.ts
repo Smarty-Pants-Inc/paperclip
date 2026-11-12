@@ -4,6 +4,7 @@ import { posix, resolve } from "node:path";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { NativeRuntimeContextSnapshot } from "../../vendor/paperclip-runner/index.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
+import { changedRemoteRuntimeAssets, type RuntimeStageAsset } from "./remote-runtime-assets.js";
 
 type StageAsset = {
   sourcePath: string;
@@ -147,23 +148,27 @@ export async function stageRemoteLaunchAssets(input: LaunchAssetsInput): Promise
     const context = input.runtimeContext;
     if (!context) return;
     await measure("stage.asset.runtime_context", async () => {
-      await input.stageDirectory({
+      const assets: RuntimeStageAsset[] = [{
+        kind: "directory",
         sourcePath: context.source.instructions.bundle.rootPath,
         targetPath: context.target.instructions.bundle.rootPath,
         mode: 0o555,
-      });
-      for (let index = 0; index < context.source.skills.length; index += 1) {
-        await input.stageDirectory({
-          sourcePath: context.source.skills[index]!.bundle.rootPath,
-          targetPath: context.target.skills[index]!.bundle.rootPath,
-          mode: 0o555,
-        });
-      }
-      await input.stageFile({
+      }, ...context.source.skills.map((skill, index) => ({
+        kind: "directory" as const,
+        sourcePath: skill.bundle.rootPath,
+        targetPath: context.target.skills[index]!.bundle.rootPath,
+        mode: 0o555,
+      })), {
+        kind: "file",
         sourcePath: resolve(input.root, "runtime-context.json"),
         targetPath: posix.join(context.filesystemRoot, "runtime-context.json"),
         mode: 0o600,
-      });
+      }];
+      const changed = await changedRemoteRuntimeAssets(input.runner.execute.bind(input.runner), assets);
+      for (const { kind, ...asset } of changed) {
+        if (kind === "directory") await input.stageDirectory(asset);
+        else await input.stageFile(asset);
+      }
     });
   };
   const stageCodexSkills = async () => {

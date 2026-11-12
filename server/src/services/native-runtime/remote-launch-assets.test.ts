@@ -41,6 +41,8 @@ function fixture(options: { transport?: "sandbox" | "ssh"; concurrent?: boolean 
   target.instructions.bundle.rootPath = "/session/filesystem/context/instructions";
   source.skills = [{ key: "test", runtimeName: "test", versionId: null, bundle: { ...source.instructions.bundle, rootPath: join(root, "skill") } }] as typeof source.skills;
   target.skills = [{ ...source.skills[0]!, bundle: { ...source.skills[0]!.bundle, rootPath: "/session/filesystem/context/skills/0-digest" } }];
+  for (const path of [source.instructions.bundle.rootPath, source.skills[0]!.bundle.rootPath]) mkdirSync(path);
+  writeFileSync(join(root, "runtime-context.json"), JSON.stringify(target));
   const stageFile = vi.fn(async (input: { sourcePath: string; targetPath: string; mode: number }) => {
     calls.push(`file:${input.targetPath}`);
   });
@@ -48,6 +50,9 @@ function fixture(options: { transport?: "sandbox" | "ssh"; concurrent?: boolean 
     calls.push(`directory:${input.targetPath}`);
   });
   const execute = vi.fn(async (_input: { command: string; args?: string[]; bypassSession?: boolean; timeoutMs?: number }) => {
+    if (_input.command === "node" && _input.args?.[1]?.includes("const hashes = assets.map")) {
+      return { exitCode: 0, signal: null, pid: null, startedAt: null, timedOut: false, stdout: "[null,null,null]", stderr: "" };
+    }
     calls.push("mkdir:codex-home");
     return { exitCode: 0, signal: null, pid: null, startedAt: null, timedOut: false, stdout: "", stderr: "" };
   });
@@ -80,9 +85,9 @@ async function filesystemFixture() {
   const f = fixture();
   const source = f.input.runtimeContext!.source;
   f.input.isolatedCodexSkills = { workspaceRoot: f.root };
-  mkdirSync(source.instructions.bundle.rootPath);
+  mkdirSync(source.instructions.bundle.rootPath, { recursive: true });
   writeFileSync(join(source.instructions.bundle.rootPath, "AGENTS.md"), "Agent instructions\n");
-  mkdirSync(source.skills[0]!.bundle.rootPath);
+  mkdirSync(source.skills[0]!.bundle.rootPath, { recursive: true });
   writeFileSync(join(source.skills[0]!.bundle.rootPath, "SKILL.md"), "---\nname: test\ndescription: Selected skill\n---\nUse a native confirmation.\n");
   mkdirSync(join(source.skills[0]!.bundle.rootPath, "scripts"));
   writeFileSync(join(source.skills[0]!.bundle.rootPath, "scripts", "selected.sh"), "#!/bin/sh\nprintf selected\\n\n", { mode: 0o755 });
@@ -194,6 +199,47 @@ it.each(["missing", "routing"] as const)("removes stale remote authentication wh
 });
 
 describe("remote launch asset staging", () => {
+  it.each(["ssh", "sandbox"] as const)("uploads only changed context assets on a retained %s filesystem", async transport => {
+    const f = fixture({ transport, concurrent: transport === "sandbox" });
+    const context = f.input.runtimeContext!, remoteHome = join(f.root, "remote", "codex-home");
+    context.filesystemRoot = join(f.root, "remote", "filesystem");
+    context.target.instructions.bundle.rootPath = join(context.filesystemRoot, "instructions");
+    context.target.skills[0]!.bundle.rootPath = join(context.filesystemRoot, "skill");
+    f.input.persistenceDirectories[0]!.targetPath = remoteHome;
+    f.input.caBundleMapping = null;
+    writeFileSync(join(context.source.instructions.bundle.rootPath, "AGENTS.md"), "selected instructions");
+    writeFileSync(join(context.source.skills[0]!.bundle.rootPath, "SKILL.md"), "Use a native confirmation.");
+    const stageFile = vi.fn(async (asset: Parameters<typeof f.input.stageFile>[0]) => {
+      mkdirSync(dirname(asset.targetPath), { recursive: true });
+      cpSync(asset.sourcePath, asset.targetPath); chmodSync(asset.targetPath, asset.mode);
+    });
+    const stageDirectory = vi.fn(async (asset: Parameters<typeof f.input.stageDirectory>[0]) => {
+      mkdirSync(dirname(asset.targetPath), { recursive: true });
+      cpSync(asset.sourcePath, asset.targetPath, { recursive: true });
+    });
+    const execute = vi.fn(async ({ command, args }: Parameters<typeof f.input.runner.execute>[0]) => ({
+      exitCode: 0, signal: null, pid: null, startedAt: null, timedOut: false,
+      stdout: execFileSync(command, args, { encoding: "utf8", stdio: "pipe" }).toString(), stderr: "",
+    }));
+    f.input.stageFile = stageFile; f.input.stageDirectory = stageDirectory; f.input.runner.execute = execute;
+    await stageRemoteLaunchAssets(f.input);
+    expect(stageDirectory).toHaveBeenCalledTimes(2);
+    expect(stageFile.mock.calls.filter(([asset]) => asset.targetPath.startsWith(context.filesystemRoot))).toHaveLength(1);
+    stageDirectory.mockClear(); stageFile.mockClear(); execute.mockClear();
+    await stageRemoteLaunchAssets(f.input);
+    expect(stageDirectory).not.toHaveBeenCalled();
+    expect(stageFile.mock.calls.filter(([asset]) => asset.targetPath.startsWith(context.filesystemRoot))).toHaveLength(0);
+    expect(execute.mock.calls.filter(([command]) => command.command === "node")).toHaveLength(1);
+    // A stale marker cannot mask missing/altered bytes: the remote probe hashes
+    // the real retained copies. Auth/config remain uncached on every launch.
+    writeFileSync(join(context.target.skills[0]!.bundle.rootPath, "SKILL.md"), "tampered selected skill");
+    stageFile.mockClear();
+    await stageRemoteLaunchAssets(f.input);
+    expect(stageDirectory).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ targetPath: context.target.skills[0]!.bundle.rootPath }));
+    expect(readFileSync(join(context.target.skills[0]!.bundle.rootPath, "SKILL.md"), "utf8")).toContain("Use a native confirmation.");
+    expect(stageFile.mock.calls.map(([asset]) => asset.targetPath)).toContain(join(remoteHome, "config.toml"));
+  });
+
   it("delivers the selected Codex skills to the same discoverable path used by explicit turn input", async () => {
     const f = await filesystemFixture();
     await stageRemoteLaunchAssets(f.input);
@@ -360,14 +406,21 @@ describe("remote launch asset staging", () => {
 
   it("overlaps disjoint launch material and context only with verified sandbox concurrency", async () => {
     const f = fixture({ concurrent: true });
-    const started = deferred(), release = deferred();
+    const started = deferred(), contextStarted = deferred(), release = deferred();
     f.stageFile.mockImplementationOnce(async () => { started.resolve(); await release.promise; });
+    f.stageDirectory.mockImplementationOnce(async () => { contextStarted.resolve(); });
     const pending = stageRemoteLaunchAssets(f.input);
     await started.promise;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
     try {
+      // Observe actual context-transfer entry, not an arbitrary event-loop turn:
+      // hashing can legitimately await several filesystem operations first.
+      await Promise.race([contextStarted.promise, new Promise<void>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("context did not overlap launch material")), 10_000);
+      })]);
       expect(f.stageDirectory).toHaveBeenCalled();
       expect(f.stageFile.mock.calls.some(([input]) => input.targetPath === "/session/bin/ca.pem")).toBe(false);
-    } finally { release.resolve(); await pending; }
+    } finally { clearTimeout(deadline); release.resolve(); await pending; }
     expect(f.calls.at(-1)).toBe("file:/session/bin/ca.pem");
   });
 
