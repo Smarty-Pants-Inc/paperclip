@@ -3267,8 +3267,8 @@ fn publishes_only_changed_pi_controls_before_the_new_turn() {
 // Native Pi mirrors the resident OpenCode facade, not ACPX's `agent: pi`.
 fn pi_rpc_prepare_payload(directory: &Path) -> Value {
     let mut payload = opencode_prepare_payload(directory);
-    payload["provider"]["kind"] = json!("pi");
-    payload["provider"]["provider"] = json!("pi");
+    payload["provider"]["kind"] = json!("pi_rpc");
+    payload["provider"]["provider"] = json!("pi_rpc");
     payload["provider"]["driver"] = json!("pi_rpc");
     payload["provider"]["providerVersion"] = json!("1.5.2");
     payload["provider"]["profile"] =
@@ -3291,12 +3291,12 @@ fn pi_rpc_selects_the_resident_native_facade_and_keeps_its_identity() {
             pi_rpc_prepare_payload(&directory),
         ))
         .unwrap();
-    assert_eq!(prepared.result["provider"], "pi");
+    assert_eq!(prepared.result["provider"], "pi_rpc");
     assert_eq!(prepared.result["driver"], "pi_rpc");
     let opened = executor
         .execute(&command(2, "session.open", json!({})))
         .unwrap();
-    assert_eq!(opened.result["provider"], "pi");
+    assert_eq!(opened.result["provider"], "pi_rpc");
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
@@ -3342,5 +3342,31 @@ fn pi_rpc_refuses_mutable_commands_and_acpx_driver_aliases() {
             .is_err());
     }
     assert!(!directory.join("codex-provider-state.json").exists());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_keeps_one_facade_generation_across_two_completed_turns() {
+    let directory = temporary_directory("pi-rpc-resident-turns");
+    let mut config = opencode_config(&directory);
+    config.pi_launch_profile = config.opencode_launch_profile.take();
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    executor.execute(&command(1, "run.prepare", pi_rpc_prepare_payload(&directory))).unwrap();
+    let opened = executor.execute(&command(2, "session.open", json!({}))).unwrap();
+    let first_pid = opened.result["processId"].clone();
+    assert!(first_pid.as_u64().is_some());
+    acknowledge_delivered_events(&mut executor);
+    for seq in [3, 4] {
+        executor.execute(&command(seq, "turn.start", json!({"text":"Complete this turn."}))).unwrap();
+        poll_opencode_until(&mut executor, "turn.completed");
+    }
+    let still_open = executor.execute(&command(5, "session.open", json!({}))).unwrap();
+    assert_eq!(still_open.result["processId"], first_pid, "native Pi must not apply ACPX's next-turn restart policy");
+    assert_eq!(opencode_call_count(&directory, "initialize"), 1);
+    assert_eq!(opencode_call_count(&directory, "thread/start"), 1);
+    assert_eq!(opencode_call_count(&directory, "turn/start"), 2);
+    assert!(!directory.join("acpx-provider-state.json").exists());
+    executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }

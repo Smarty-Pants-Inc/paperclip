@@ -1407,7 +1407,7 @@ export const providerDescriptorSchema = {
           {
             "properties": {
               "provider": {
-                "const": "pi"
+                "const": "pi_rpc"
               },
               "driver": {
                 "const": "pi_rpc"
@@ -1420,7 +1420,7 @@ export const providerDescriptorSchema = {
                 "const": "acpx"
               },
               "agent": {
-                "const": "pi"
+                "const": "pi_rpc"
               },
               "piThinkingLevel": {
                 "enum": [
@@ -1580,7 +1580,7 @@ export const providerDescriptorSchema = {
         {
           "properties": {
             "provider": {
-              "const": "pi"
+              "const": "pi_rpc"
             },
             "driver": {
               "const": "pi_rpc"

@@ -101,7 +101,7 @@ export function createNativeSessionBackend(
       dynamicToolHandler: options.dynamicToolHandler,
     });
   }
-  if (input.provider.kind === "pi") {
+  if (input.provider.kind === "pi_rpc") {
     if (!options.piRuntimeDirectory?.trim()) {
       throw new Error(
         "Pi native backend requires an instance runtime directory",

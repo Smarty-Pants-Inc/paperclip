@@ -912,9 +912,9 @@ describe("native Pi RPC registration", () => {
     const { QUALIFIED_PI_RPC_PROFILE } = await import("../drivers/pi/qualified-profile.js");
     const parsed = parseNativeExecutionInput({ ...input,
       session: { ...input.session, driverKind: "pi_rpc" },
-      provider: { kind: "pi", model: "openai/gpt-5", profile: QUALIFIED_PI_RPC_PROFILE },
+      provider: { kind: "pi_rpc", model: "openai/gpt-5", profile: QUALIFIED_PI_RPC_PROFILE },
     });
-    expect(parsed.provider).toEqual({ kind: "pi", model: "openai/gpt-5", profile: QUALIFIED_PI_RPC_PROFILE });
+    expect(parsed.provider).toEqual({ kind: "pi_rpc", model: "openai/gpt-5", profile: QUALIFIED_PI_RPC_PROFILE });
   });
   it("rejects ACPX substitution and release-profile drift", async () => {
     const { QUALIFIED_PI_RPC_PROFILE } = await import("../drivers/pi/qualified-profile.js");
@@ -924,7 +924,7 @@ describe("native Pi RPC registration", () => {
       { ...QUALIFIED_PI_RPC_PROFILE, unexpected: true }]) {
       expect(() => parseNativeExecutionInput({ ...input,
         session: { ...input.session, driverKind: "pi_rpc" },
-        provider: { kind: "pi", model: "openai/gpt-5", profile },
+        provider: { kind: "pi_rpc", model: "openai/gpt-5", profile },
       })).toThrow();
     }
   });

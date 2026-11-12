@@ -1,3 +1,4 @@
+import { QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { createHash } from "node:crypto";
 import { parseNativeRuntimeContext, retargetNativeSystemInstructions } from "../contracts/runtime-context.js";
 import { resolve } from "node:path";
@@ -27,7 +28,7 @@ export interface RunnerProviderLaunchRequirements {
   includeCollaborationModeInstructions: boolean;
   settings: Pick<CapabilityRunnerdCodexTransportOptions,
     "acpxAgent" | "acpxMode" | "acpxPermissionMode" | "acpxPermissionModePinned" |
-    "piThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch" | "disableCodexProjectInstructions">;
+    "piProfile" | "piThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch" | "disableCodexProjectInstructions">;
   instructions: string;
   runtimeContext: NativeRuntimeContextSnapshot | null;
 }
@@ -60,6 +61,7 @@ export function runnerProviderLaunchRequirements(
       acpxAgent: options.acpxAgent, acpxMode: options.acpxMode,
       acpxPermissionMode: options.acpxPermissionMode,
       acpxPermissionModePinned: options.acpxPermissionModePinned,
+      piProfile: options.provider === "pi_rpc" ? options.piProfile ?? QUALIFIED_PI_RPC_PROFILE : undefined,
       piThinkingLevel: options.piThinkingLevel, claudeEffort: options.claudeEffort, grokEffort: options.grokEffort, grokDisableWebSearch: options.grokDisableWebSearch,
       managedProfile: options.managedProfile, agentCoreProfile: options.agentCoreProfile,
       opencodePermissionMode: options.opencodePermissionMode,
@@ -196,6 +198,7 @@ export interface RunnerProviderLaunchEnvironment {
   opencodeProxyPath: string;
   acpxSidecarPath: string;
   cursorCloudProxyPath?: string;
+  piProxyPath?: string;
 }
 
 export function createRunnerProviderLaunch(
@@ -203,6 +206,15 @@ export function createRunnerProviderLaunch(
   input: RunnerProviderLaunchEnvironment,
 ): Record<string, unknown> {
   const { identity, instructions: baseInstructions, runtimeContext, settings, provider } = requirements;
+  if (provider === "pi_rpc") {
+    if (!requirements.model || requirements.readOnly) throw new Error("pi_rpc_launch_policy_unsupported: native Pi requires an explicit model and writable assigned environment");
+    return { kind: "pi_rpc", provider: "pi_rpc", driver: "pi_rpc", driverKind: "pi_rpc", providerVersion: "1.5.2",
+      profile: settings.piProfile ?? QUALIFIED_PI_RPC_PROFILE,
+      command: input.providerNodeCommand, args: [input.piProxyPath ?? ""], cwd: input.cwd,
+      model: requirements.model, piThinkingLevel: settings.piThinkingLevel ?? "low",
+      instructions: baseInstructions, runtimeContext,
+      conversationMode: requirements.preparedConversation ? "prepared" : "task" };
+  }
   if (provider === "cursor_cloud") {
     if (input.options.runnerFilesystemRoot || !requirements.model || requirements.readOnly) {
       throw new Error("cursor_cloud_local_controller_required: experimental Cursor Cloud supports standard tasks with a local controller");

@@ -4,5 +4,6 @@
   "protocolVersion": 1,
   "profileVersion": 1,
   "runtimePackage": "@earendil-works/pi-coding-agent",
-  "runtimeVersion": "1.5.2"
+  "runtimeVersion": "1.5.2",
+  "providerKind": "pi_rpc"
 }

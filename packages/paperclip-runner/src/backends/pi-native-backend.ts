@@ -10,7 +10,7 @@ export function createPiNativeSessionBackend(
   input: NativeExecutionInput,
   options: Omit<PiRpcDriverOptions, "model" | "taskEnvelope">,
 ): NativeSessionBackend {
-  if (input.provider.kind !== "pi" || !input.provider.model) {
+  if (input.provider.kind !== "pi_rpc" || !input.provider.model) {
     throw new Error("Pi native backend requires a persisted Pi provider/model selection");
   }
   const preparedContext = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA

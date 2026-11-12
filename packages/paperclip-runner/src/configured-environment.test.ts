@@ -145,3 +145,9 @@ describe("configured environment authority", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 });
+
+// Trust boundary: controller-assigned native Pi launch policy cannot be replaced by task config.
+it.each(["PAPERCLIP_PI_THINKING_LEVEL", "PAPERCLIP_PI_RUNTIME_DIR", "PI_CODING_AGENT_DIR"])("protects generated native Pi setting %s", name => {
+  expect(configuredEnvironmentProjection({ [name]: "untrusted" })).not.toHaveProperty(name);
+  expect(() => configuredEnvironment({ [CONFIGURED_ENVIRONMENT_KEYS]: JSON.stringify([name]), [name]: "untrusted" })).toThrow();
+});
