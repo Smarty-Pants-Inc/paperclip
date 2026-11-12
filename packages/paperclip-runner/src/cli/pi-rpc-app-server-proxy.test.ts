@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -231,6 +232,29 @@ describe("Pi RPC app-server facade proxy", () => {
     await proxy.close();
   });
 
+  // Keep reason: recorded S11 child receipts must survive the real projector -> facade boundary.
+  it("recovers a complete turn snapshot after native async child usage arrives", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 100, "thread/start", { model: "paperclip/faux" });
+      const projector = createPiEventProjector({ runId: "run-1", turnId: "s11" });
+      const wire = readFileSync(new URL("../../test-fixtures/pi-rpc/s11-child-usage.jsonl", import.meta.url), "utf8")
+        .trim().split("\n").map(line => JSON.parse(line));
+      for (const native of wire) for (const event of projector.project(native)) {
+        session.push(event.eventType, event.payload, event.turnId, event.itemId);
+      }
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const reports = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
+      expect(reports.some(frame => (frame.params as any).runDeltaAvailable === false)).toBe(true);
+      expect(reports.at(-1)).toMatchObject({ params: {
+        runDeltaAvailable: true,
+        tokenUsage: { total: { inputTokens: 35, outputTokens: 20 }, last: { inputTokens: 35, outputTokens: 20 } },
+      } });
+    } finally { await proxy.close(); }
+  });
+
   it("adapts real Pi usage to Rust total/last without double counting warm turns", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });
@@ -332,6 +356,20 @@ describe("Pi RPC app-server facade proxy", () => {
       // Rust uses the presence of tokenUsage.last as runDeltaAvailable. A
       // top-level accountingComplete:false alone does not survive normalization.
       expect((latest.params as any).tokenUsage).not.toHaveProperty("last");
+    } finally { await proxy.close(); }
+  });
+
+  it("never completes a usage snapshot without a stable receipt identity", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 100, "thread/start", { model: "paperclip/faux" });
+      session.push("usage.reported", { provider: "pi_rpc", runDeltaAvailable: true, runDelta: { inputTokens: 7, outputTokens: 4 } }, "turn-1");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const report = sink.decoded().find(frame => frame.method === "thread/tokenUsage/updated")!;
+      expect(report).toMatchObject({ params: { runDeltaAvailable: false } });
+      expect((report.params as any).tokenUsage).not.toHaveProperty("last");
     } finally { await proxy.close(); }
   });
 

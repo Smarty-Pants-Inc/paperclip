@@ -1,5 +1,8 @@
 import { once } from "node:events";
+import { mkdtemp } from "node:fs/promises";
 import { createServer, request, type IncomingHttpHeaders } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPiProviderBinding, directPiProviderConfiguration, startPiProviderLoopback, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
 
@@ -15,6 +18,7 @@ const routes = [
 type Route = typeof routes[number];
 
 async function fixture(route: Route) {
+  const home = await mkdtemp(join(tmpdir(), "pi-provider-binding-"));
   const received: Array<{ path?: string; headers: IncomingHttpHeaders; body: unknown }> = [];
   const server = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -29,6 +33,7 @@ async function fixture(route: Route) {
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Missing test listener");
   const environment: NodeJS.ProcessEnv = {
+    HOME: home,
     PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}${route.basePath}`,
     PAPERCLIP_AI_PROVIDER_PROTOCOL: route.protocol,
     PAPERCLIP_AI_PROVIDER_AUTH: route.auth,
@@ -101,12 +106,18 @@ describe("Pi in-memory provider binding", () => {
     await expect(post(second.provider, route)).rejects.toMatchObject({ code: "ECONNREFUSED" });
   });
 
-  it.each(routes)("preserves the exact legacy $protocol models.json bytes and physical close", async route => {
+  it.each(routes)("preserves capability-aware $protocol models.json configuration and physical close", async route => {
     const { environment } = await fixture(route);
     const loopback = await startPiProviderLoopback({ model: "paperclip/vendor/model", environment });
     cleanups.push(loopback.close);
     const provider = JSON.parse(loopback.json).providers.paperclip;
-    expect(loopback.json).toBe(`${JSON.stringify({ providers: { paperclip: { baseUrl: provider.baseUrl, api: route.api, apiKey: provider.apiKey, models: [{ id: "vendor/model" }] } } })}\n`);
+    expect(JSON.parse(loopback.json)).toEqual({ providers: { paperclip: {
+      baseUrl: expect.stringMatching(route.protocol === "messages" ? /^http:\/\/127\.0\.0\.1:\d+$/ : /^http:\/\/127\.0\.0\.1:\d+\/v1$/),
+      api: route.api, apiKey: expect.any(String),
+      models: [{ id: "vendor/model", reasoning: true, contextWindow: 128000, maxTokens: 8192,
+        thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } }],
+    } } });
+    expect(provider.apiKey.length).toBeGreaterThanOrEqual(32);
     expect(loopback.json).not.toContain(environment.PAPERCLIP_AI_PROVIDER_KEY);
     expect(await post(provider, route)).toEqual({ status: 200, body: '{"ok":true}' });
     await Promise.all([loopback.close(), loopback.close()]);
