@@ -63,7 +63,6 @@ export function validateChildSelection(value: unknown, catalog: ChildModelCatalo
   const physical = catalog(requestedModel);
   if (!physical || !physical.provider || !physical.id || !["claude", "other"].includes(physical.family)) childAdmissionError("physical_model_unknown", "Child catalog must resolve an authoritative physical model before admission.");
   const effectiveModel = `${physical.provider}/${physical.id}`;
-  if ((physical.family === "claude" || /claude/i.test(physical.id)) && PI_NATIVE_THINKING_LEVELS.indexOf(effort) > PI_NATIVE_THINKING_LEVELS.indexOf("xhigh")) childAdmissionError("claude_effort", "Effective Claude child cannot exceed xhigh; selection is not silently clamped.");
   if (!physical.thinkingLevels.includes(effort)) childAdmissionError("thinking_unsupported", "Effective child model does not support the selected effort.");
   return Object.freeze({ selectionId, roleId, roleDigest, paretoRevision, paretoChoice, complexity, rationale, budget, model, requestedModel, effectiveModel, effort });
 }

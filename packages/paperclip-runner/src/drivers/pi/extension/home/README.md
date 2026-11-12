@@ -44,7 +44,7 @@ registerHomeAdmission(fn: (input: {
 An unconfigured registration rejects. Collection happens at the initial native
 `session_start`, after extension factories have loaded. Each bind builds fresh
 in-process load facts for the current session and rechecks the startup manifest's
-settings, package/dependency bytes and model clamp. New/resume/fork sessions reuse
+settings, package/dependency bytes and admitted model metadata. New/resume/fork sessions reuse
 that startup identity, not a newly collected package identity attributed to old
 factories. Session changes and cancellation during admission reject the result.
 `/reload` requires restarting the resident: the initial CLI fatal-startup rule is
@@ -78,7 +78,10 @@ filesystem replacement. Legacy synthetic loader inventories are refused by named
 admission errors; no persisted session or workspace is rewritten.
 
 `admitNativeHome()` returns exactly `{digest}`, the lowercase 64-character SHA-256
-of the `pi-native-home/v1` manifest, or throws. No load fact contains credentials.
+of the `pi-native-home/v1` manifest, or throws. No load fact contains credentials. Explicit model thinking levels are validated
+against the model's physical supported-level catalog. Native admission does not
+impose a provider-family ceiling: Claude `max` metadata is admitted unchanged
+when that installed model supports it.
 
 ## Checks
 
