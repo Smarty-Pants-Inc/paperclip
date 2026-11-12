@@ -1162,14 +1162,15 @@ describe("agent routes adapter validation", () => {
     expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject(input);
   });
 
-  it.each([{ thinking: "high", status: 200 }, { thinking: "medium", status: 200 }, { thinking: "max", status: 422 }, { command: "custom-pi", status: 422 }])("validates saved Pi settings during direct adapter conversion: %j", async ({ status, ...settings }) => {
+  it.each([{ thinking: "high", status: 200 }, { thinking: "medium", status: 200 }, { thinking: "max", status: 422 }, { command: "custom-pi", status: 422 }]
+    .flatMap(settings => [undefined, "pi_rpc"].map(provider => ({ ...settings, provider }))))("validates saved Pi settings during direct adapter conversion: %j", async ({ status, provider, ...settings }) => {
     const selection = await import("../services/agent-runner-selection.js");
     vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
       selection.resolveNewAgentRunner({ ...input, target: { driver: "local", platform: "darwin", architecture: "arm64" } }));
     mockAgentService.getById.mockResolvedValue({ ...(await mockAgentService.getById()), adapterType: "pi_local", adapterConfig: { model: "openrouter/anthropic/claude-sonnet-4.5", ...settings } });
     const app = await createApp();
     const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111")
-      .send({ adapterType: "paperclip_runner", adapterConfig: {} }));
+      .send({ adapterType: "paperclip_runner", adapterConfig: { provider } }));
     expect(response.status, JSON.stringify(response.body)).toBe(status);
     if (status === 200) expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "openrouter/anthropic/claude-sonnet-4.5", piRpcThinkingLevel: (settings as { thinking?: string }).thinking } });
     else expect(mockAgentService.update).not.toHaveBeenCalled();

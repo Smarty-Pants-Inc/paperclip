@@ -6199,13 +6199,15 @@ describe("company portability", () => {
     expect(() => resolvePaperclipRunnerProviderProfile(createdConfig)).toThrow(expect.objectContaining({ code: "paperclip_runner_dot_config_invalid" }));
   });
 
-  it("imports qualified Grok without the experimental flag and preserves its model and effort", async () => {
+  it.each([
+    { provider: "acpx", acpxAgent: "grok", model: "grok-4.7", reasoningEffort: "high" },
+    { provider: "pi_rpc", model: "anthropic/claude-opus-5-5", piRpcThinkingLevel: "xhigh" },
+  ])("imports qualified $provider without the experimental flag and preserves its model and effort", async adapterConfig => {
     const portability = companyPortabilityService({} as any);
     const exported = await portability.exportBundle("company-1", { include: { company: false, agents: true, projects: false, issues: false } });
     agentSvc.list.mockResolvedValue([]);
     agentSvc.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({ id: "agent-created", ...input }));
     instanceSettingsSvc.getExperimental.mockResolvedValue({ enableNativeRunner: false });
-    const adapterConfig = { provider: "acpx", acpxAgent: "grok", model: "grok-4.7", reasoningEffort: "high" };
 
     await portability.importBundle({
       source: { type: "inline", rootPath: exported.rootPath, files: exported.files },

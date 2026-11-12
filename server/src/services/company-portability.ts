@@ -5388,7 +5388,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
               "OpenAI Dot is experimental and disabled on this instance.",
               { code: "paperclip_runner_dot_disabled" },
             );
-          } else if (config.provider !== "codex" && config.provider !== "opencode" && config.provider !== undefined && !["claude_local", "pi_local", "grok_local"].includes(agentHarnessType("paperclip_runner", config)) && experimental.enableNativeRunner !== true) {
+          } else if (config.provider !== "codex" && config.provider !== "opencode" && config.provider !== undefined && !["claude_local", "pi_local", "pi_rpc", "grok_local"].includes(agentHarnessType("paperclip_runner", config)) && experimental.enableNativeRunner !== true) {
             throw unprocessable(
               "Paperclip Runner is experimental and disabled on this instance.",
               { code: "paperclip_runner_rollout_disabled" },

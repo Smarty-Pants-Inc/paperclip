@@ -5643,7 +5643,7 @@ export function agentRoutes(
     let configurationWarnings: AgentConfigurationWarning[] = [];
     const requestedRunnerConfig = asRecord(patchData.adapterConfig) ?? {};
     const convertingPi = existing.adapterType === "pi_local" && patchData.adapterType === "paperclip_runner"
-      && (requestedRunnerConfig.provider === undefined
+      && ([undefined, "pi_rpc"].includes(requestedRunnerConfig.provider as string | undefined)
         || (requestedRunnerConfig.provider === "acpx" && [undefined, "pi"].includes(requestedRunnerConfig.acpxAgent as string | undefined)));
     const convertingGrok = existing.adapterType === "grok_local" && patchData.adapterType === "paperclip_runner"
       && [undefined, "acpx"].includes(requestedRunnerConfig.provider as string | undefined)
