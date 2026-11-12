@@ -6,7 +6,7 @@ import { CODEX_CHATGPT_MODEL_REJECTION_RE, codexChatGptRetirementHint } from "@p
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterEnvironmentTestContext, AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
-import { NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment, resolveSourceCodexHome } from "../../vendor/paperclip-runner/index.js";
+import { NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment, resolveSourceCodexHome, type PiThinkingLevel } from "../../vendor/paperclip-runner/index.js";
 import { resolvePaperclipRunnerBinary, resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { readLocalAiCredentialFile } from "../local-ai-credential-file.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
@@ -82,9 +82,10 @@ async function probePreparedNativeRuntime(runtimeDirectory: string, prepare: () 
   }
 }
 
-async function probeRemoteNativeCodex(options: {
+async function probeRemoteNativeRuntime(options: {
   context: AdapterEnvironmentTestContext;
   model: string | null;
+  provider: "codex" | "pi_rpc";
   reasoningEffort?: string;
   environment: Record<string, string>;
   sourceCodexHome: string;
@@ -111,7 +112,7 @@ async function probeRemoteNativeCodex(options: {
   const remoteFilesystemRoot = posix.join(remoteRoot, "filesystem");
   const remoteWorkspace = posix.join(remoteFilesystemRoot, "workspace");
   const remoteCodexNpmSpec = process.env.PAPERCLIP_RUNNER_REMOTE_CODEX_NPM_SPEC?.trim() || null;
-  const remoteCodexBinary = remoteCodexNpmSpec ? posix.join(remoteRoot, "harnesses", "codex", "node_modules", ".bin", "codex") : posix.join(remoteRoot, "bin", "codex");
+  const remoteCodexBinary = options.provider === "pi_rpc" ? null : remoteCodexNpmSpec ? posix.join(remoteRoot, "harnesses", "codex", "node_modules", ".bin", "codex") : posix.join(remoteRoot, "bin", "codex");
   const explicitRunner = process.env.PAPERCLIP_RUNNER_REMOTE_BINARY_PATH?.trim() || null;
   const controllerRunnerBinary = await resolveRemotePaperclipRunnerBinary({ runner, remoteCwd: target.remoteCwd, configuredPath: explicitRunner });
   const artifacts = createRemoteNativeArtifactPreparation({ target, runner, remoteBinary, controllerRunnerBinary, remoteRuntimeRoot: remoteRoot, remoteCodexBinary,
@@ -120,17 +121,31 @@ async function probeRemoteNativeCodex(options: {
   const requireSuccess = (result: { timedOut: boolean; exitCode: number | null }, message: string) => {
     if (result.timedOut || result.exitCode !== 0) throw new Error(message);
   };
+  const piArtifacts = options.provider === "pi_rpc" ? await (async () => {
+    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget } = await import("./native-session-executor.js");
+    const source = resolveRemoteProviderPackSource(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH);
+    const pack = await prepareRemoteProviderPackOnTarget({ target, runner, configuredProviderPackRoot: source.configuredRoot,
+      manifest: source.manifest, provider: { kind: "pi_rpc" } });
+    const { nodeCommand, piRpcExecutable, piRpcProxy } = pack.manifest.payload.artifacts;
+    if (!piRpcExecutable || !piRpcProxy) throw new Error("Native Pi setup requires the qualified Pi provider pack.");
+    return { providerNodeCommand: posix.join(pack.root, nodeCommand.path), providerNodeCommandSha256: nodeCommand.sha256,
+      piCommand: posix.join(pack.root, piRpcExecutable.path), piCommandSha256: piRpcExecutable.sha256,
+      piProxyPath: posix.join(pack.root, piRpcProxy.path), piProxySha256: piRpcProxy.sha256, providerPackAuthorityDigest: pack.manifest.digest };
+  })() : {};
   const runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-native-setup-")));
   return probePreparedNativeRuntime(runtimeDirectory, async () => {
     const sourceCodexHome = await prepareProbeCodexSource(runtimeDirectory, options.sourceCodexHome, options.sourceAuthJson);
     let remoteDirectoryCreated = false;
     let signalSpawned!: () => void;
     const spawned = new Promise<void>(resolve => { signalSpawned = resolve; });
-    return { runtimeDirectory: runtimeDirectory, provider: "codex", model: options.model, reasoningEffort: options.reasoningEffort,
+    return { runtimeDirectory: runtimeDirectory, provider: options.provider, model: options.model, reasoningEffort: options.reasoningEffort,
       workingDirectory: remoteWorkspace, environment: options.environment, timeoutMs: options.timeoutMs,
       transportOptions: {
         externallySandboxed: target.transport === "sandbox",
-        runnerBinary: controllerRunnerBinary, codexCommand: remoteCodexBinary, sourceCodexHome,
+        runnerBinary: controllerRunnerBinary, ...(remoteCodexBinary ? { codexCommand: remoteCodexBinary } : {}), sourceCodexHome,
+        ...piArtifacts,
+        ...(options.provider === "pi_rpc" ? { piRpcThinkingLevel: options.context.config.piRpcThinkingLevel as PiThinkingLevel | undefined,
+          piRuntimeDirectory: posix.join(remoteFilesystemRoot, "pi") } : {}),
         runnerFilesystemRoot: remoteFilesystemRoot,
         prpIdentity: { runnerInstanceId, runId: id, environmentLeaseId: `setup-${id}`, normalizedSessionId: `setup-${id}`, turnId: `turn-${id}`, itemId: `item-${id}` },
         ...createNativeRunnerExecutionDriver({
@@ -187,7 +202,7 @@ async function probeRemoteNativeCodex(options: {
   });
 }
 
-export async function testNativeRunnerAuthentication(context: AdapterEnvironmentTestContext, provider: "codex", model: string | null): Promise<AdapterEnvironmentTestResult> {
+export async function testNativeRunnerAuthentication(context: AdapterEnvironmentTestContext, provider: "codex" | "pi_rpc", model: string | null): Promise<AdapterEnvironmentTestResult> {
   const remote = context.executionTarget?.kind === "remote";
   const configured = context.config.env;
   const environment: Record<string, string> = Object.fromEntries([
@@ -231,17 +246,21 @@ export async function testNativeRunnerAuthentication(context: AdapterEnvironment
     }
     let receipt: Awaited<ReturnType<typeof probeNativeRunnerEnvironment>>;
     if (context.executionTarget?.kind === "remote") {
-      receipt = await probeRemoteNativeCodex({ context, model, environment, sourceCodexHome: sourceCodexHome ?? "", credentialRefreshAuthPath, sourceAuthJson, timeoutMs,
+      receipt = await probeRemoteNativeRuntime({ context, provider, model, environment, sourceCodexHome: sourceCodexHome ?? "", credentialRefreshAuthPath, sourceAuthJson, timeoutMs,
         ...(typeof effort === "string" && effort ? { reasoningEffort: effort } : {}) });
     } else {
       const runnerBinary = resolvePaperclipRunnerBinary();
+      const piArtifacts = provider === "pi_rpc"
+        ? await (await import("./native-session-executor.js")).resolveLocalPiLaunchArtifacts(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH) : {};
       runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-native-setup-")));
       receipt = await probePreparedNativeRuntime(runtimeDirectory, async () => {
         const probeSourceCodexHome = await prepareProbeCodexSource(runtimeDirectory!, sourceCodexHome ?? "", sourceAuthJson);
         return { runtimeDirectory: runtimeDirectory!, provider, model, environment, timeoutMs,
           ...(provider === "codex" && typeof effort === "string" && effort ? { reasoningEffort: effort } : {}),
           onCleanupConfirmed: async () => { await rm(runtimeDirectory!, { recursive: true, force: true }); },
-          transportOptions: { runnerBinary, sourceCodexHome: probeSourceCodexHome, externallySandboxed: false },
+          transportOptions: { runnerBinary, sourceCodexHome: probeSourceCodexHome, externallySandboxed: false, ...piArtifacts,
+            ...(provider === "pi_rpc" ? { piRpcThinkingLevel: context.config.piRpcThinkingLevel as PiThinkingLevel | undefined,
+              piRuntimeDirectory: join(runtimeDirectory!, "pi") } : {}) },
           ...(credentialRefreshAuthPath ? { onCodexCredentialRefresh: async (filename: string) => {
             if (filename !== join(runtimeDirectory!, "codex-home", "auth.json")) throw new Error("The native Codex credential refresh handoff is invalid.");
             await copyBackCodexAuth({ hostAuthPath: credentialRefreshAuthPath!, log: () => {}, readSandboxAuth: async () => Buffer.from(await readLocalAiCredentialFile(filename)) });
@@ -250,16 +269,18 @@ export async function testNativeRunnerAuthentication(context: AdapterEnvironment
       });
     }
     if (receipt.helloProbePassed !== true || receipt.provider !== provider || typeof receipt.effectiveModel !== "string" || !receipt.effectiveModel.trim() || receipt.effectiveModel === "unknown" || (model !== null && receipt.effectiveModel !== model)
-      || receipt.providerDriver !== "codex_app_server") throw new Error("The selected native runtime returned an incompatible account or model verification receipt.");
+      || receipt.providerDriver !== (provider === "pi_rpc" ? "pi_rpc" : "codex_app_server")) throw new Error("The selected native runtime returned an incompatible account or model verification receipt.");
     return { adapterType: "paperclip_runner", status: "pass", testedAt: new Date().toISOString(), checks: [{ code: `${provider}_hello_probe_passed`, level: "info",
       message: `The native ${provider} runtime verified the selected account and model in ${remote ? "the selected environment" : "the Paperclip host"}.` }] };
   } catch (error) {
     if (error instanceof NativeEnvironmentProbeCleanupError) throw error;
     const message = redactNativeProbeMessage(error instanceof Error ? error.message : "The selected native runtime could not verify this account.", { ...environment, ...(sourceAuthJson ? { [authKey]: sourceAuthJson } : {}) });
-    const authentication = /(?:invalid (?:api[- ]?key|auth(?:entication)? token)|authentication (?:failed|required)|unauthenticated|unauthorized|not authenticated|please (?:log|sign) in|not logged in|\b(?:401|403)\b)/i.test(message);
+    const piMissingAuthentication = provider === "pi_rpc" && /(?:no (?:api[- ]?key|auth(?:entication)?|credentials?)|(?:api[- ]?key|credentials?) (?:is |are )?(?:missing|required|not found))/i.test(message);
+    const authentication = piMissingAuthentication || /(?:invalid (?:api[- ]?key|auth(?:entication)? token)|authentication (?:failed|required)|unauthenticated|unauthorized|not authenticated|please (?:log|sign) in|not logged in|\b(?:401|403)\b)/i.test(message);
+    const modelUnavailable = provider === "pi_rpc" && /(?:model.*(?:unavailable|not found|not available|not supported|unknown|does not exist|mismatch)|(?:unknown|invalid|unsupported|unavailable) model|pi_(?:probe_)?model_)/i.test(message);
     const rejectedModel = provider === "codex" ? CODEX_CHATGPT_MODEL_REJECTION_RE.exec(message)?.[1] : undefined;
     const retirementHint = rejectedModel ? codexChatGptRetirementHint(rejectedModel) : null;
-    return { adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(), checks: [{ code: `${provider}_hello_probe_${authentication ? "auth_required" : /timed out/i.test(message) ? "timeout" : "failed"}`, level: "error", message,
+    return { adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(), checks: [{ code: `${provider}_hello_probe_${authentication ? "auth_required" : modelUnavailable ? "model_unavailable" : /timed out/i.test(message) ? provider === "pi_rpc" ? "timed_out" : "timeout" : "failed"}`, level: "error", message,
       hint: retirementHint ?? "Check the selected account, model access, and native runtime prerequisites, then retry." },
       ...(authentication && provider === "codex" ? [{ code: ADAPTER_AUTH_MISSING_CHECK_CODE, level: "error" as const,
         message: "The selected Codex account needs authentication.",

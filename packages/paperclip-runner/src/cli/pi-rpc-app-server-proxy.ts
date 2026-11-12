@@ -213,6 +213,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let activeRunId = environment.PAPERCLIP_RUN_ID ?? "runnerd-run";
   let inputEnded = false;
   const announcedTurnIds = new Set<string>();
+  const turnFailures = new Map<string, Record<string, unknown>>();
   const usageTotals: Record<string, number> = {};
   const usageByTurn = new Map<string, {
     receipts: Map<string, string>;
@@ -351,6 +352,11 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         // Facade item notifications must be bound to a turn. Do not carry
         // OpenCode's provider-specific unbound-model filtering into Pi.
         if (typeof event.turnId !== "string" || !event.turnId) continue;
+        if (event.eventType === "item.failed") {
+          // Native Pi puts provider errors on failed message items; its final
+          // settled turn may contain status alone. Retain only until settlement.
+          turnFailures.set(event.turnId, { code: payload.code, message: payload.message });
+        }
         // Unaccounted summarization/child work can invalidate a previously
         // complete turn even without another assistant usage receipt.
         if (payload.kind === "usage" && record(payload.usage).runDeltaComplete === false) {
@@ -361,7 +367,13 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           threadId: opened.ids().driverSessionId,
           turnId: event.turnId,
           itemId: event.itemId,
-          payload,
+          // Preserve Pi's admitted assistant channel across the Codex facade;
+          // otherwise the controller sees "unknown" and cannot verify a hello.
+          payload: (payload.kind === "agentMessage" || payload.kind === "text") &&
+            (payload.channel === "final" || payload.channel === "progress")
+            ? { ...payload, item: { ...record(payload.item),
+                phase: payload.channel === "final" ? "final_answer" : "commentary" } }
+            : payload,
         }));
       } else if (event.eventType === "usage.reported") {
         reportUsage(opened, event, payload);
@@ -417,8 +429,13 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           eventType: event.eventType,
           threadId: opened.ids().driverSessionId,
           turnId: event.turnId,
-          payload,
+          // Pi failures carry code/message at the top level, whereas the
+          // facade helper expects error. Keep the real actionable diagnostic.
+          payload: event.eventType === "turn.failed" && payload.error === undefined
+            ? { ...payload, error: turnFailures.get(event.turnId ?? "") ?? { code: payload.code, message: payload.message } }
+            : payload,
         }));
+        if (event.turnId) turnFailures.delete(event.turnId);
         if (event.runId === activeRunId && event.turnId === activeTurnId) activeTurnId = null;
       } else if (event.eventType === "harness.diagnostic") {
         send({

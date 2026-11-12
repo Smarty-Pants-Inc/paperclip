@@ -22,7 +22,13 @@ vi.mock("../../realtime/runner-prp-ws.js", () => ({ registerRunnerPrpAuthority: 
 vi.mock("../../realtime/runner-prp-outbound.js", () => ({ connectRunnerPrpIngress: ingressConnect }));
 vi.mock("./native-codex-runner.js", () => ({ resolvePaperclipRunnerBinary: selectedRunner, resolveRemotePaperclipRunnerBinary: selectedRemoteRunner }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({ ...await original<typeof import("../../vendor/paperclip-runner/index.js")>(), probeNativeRunnerEnvironment: nativeProbe }));
-vi.mock("./native-session-executor.js", async original => ({ ...await original<typeof import("./native-session-executor.js")>(), createRemoteNativeArtifactPreparation: nativeArtifacts, createRemoteRunnerProcessLauncher: remoteLauncher }));
+vi.mock("./native-session-executor.js", async original => ({ ...await original<typeof import("./native-session-executor.js")>(), createRemoteNativeArtifactPreparation: nativeArtifacts, createRemoteRunnerProcessLauncher: remoteLauncher,
+  resolveRemoteProviderPackSource: () => ({ configuredRoot: "/controller/pack", manifest: { digest: "sha256:fixture" } }),
+  prepareRemoteProviderPackOnTarget: vi.fn(async () => ({ root: "/boat/provider-pack", manifest: { digest: "sha256:fixture", payload: { artifacts: {
+    nodeCommand: { path: "node", sha256: "node-digest" }, piRpcExecutable: { path: "pi.js", sha256: "pi-digest" }, piRpcProxy: { path: "proxy.cjs", sha256: "proxy-digest" },
+  } } } })),
+}));
+import { assertHarnessTestPassed } from "../agent-harness-verification.js";
 import { testNativeRunnerAuthentication } from "./setup-readiness.js";
 const context = {
   companyId: "company", adapterType: "paperclip_runner", config: { externallySandboxed: false, env: { PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "false" } },
@@ -51,6 +57,34 @@ describe("Codex selected native account verification", () => {
     vi.unstubAllEnvs();
     for (const root of nativeProbeRuntimeDirectories) await rm(root, { recursive: true, force: true });
   });
+  it.each([
+    [null, "pi_rpc_hello_probe_passed", null],
+    ["Authentication required: no API key for provider", "pi_rpc_hello_probe_auth_required", "harness_auth_failed"],
+    ["No API key found for paperclip", "pi_rpc_hello_probe_auth_required", "harness_auth_failed"],
+    ["Model unavailable: paperclip/missing", "pi_rpc_hello_probe_model_unavailable", "harness_model_unavailable"],
+  ] as const)("verifies Pi in the selected sandbox (%s)", async (failure, checkCode, lifecycleCode) => {
+    nativeProbe.mockImplementation(async input => {
+      expect(input).toMatchObject({ provider: "pi_rpc", model: "paperclip/claude-opus-5-5",
+        environment: { PAPERCLIP_AI_PROVIDER_KEY: "selected-pi-key" },
+        transportOptions: { externallySandboxed: true, piRpcThinkingLevel: "max" } });
+      expect(input.transportOptions.piCommand).toBe("/boat/provider-pack/pi.js");
+      expect(input.transportOptions.piProxyPath).toBe("/boat/provider-pack/proxy.cjs");
+      await input.transportOptions.controlPlaneRegistration({});
+      await input.onCleanupConfirmed();
+      if (failure) throw new Error(failure);
+      return { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: input.model, helloProbePassed: true };
+    });
+    const selected = { ...context, executionTarget: { ...context.executionTarget, runner: { execute: sshExecute } },
+      config: { provider: "pi_rpc", piRpcThinkingLevel: "max", env: { PAPERCLIP_AI_PROVIDER_KEY: "selected-pi-key" } } };
+    const result = await testNativeRunnerAuthentication(selected, "pi_rpc", "paperclip/claude-opus-5-5");
+    expect(result.checks[0].code).toBe(checkCode);
+    expect(nativeProbe).toHaveBeenCalledOnce();
+    expect(selectedRunner).not.toHaveBeenCalled();
+    expect(nativeArtifacts).toHaveBeenCalledWith(expect.objectContaining({ remoteCodexBinary: null }));
+    if (lifecycleCode) expect(() => assertHarnessTestPassed(result)).toThrow(expect.objectContaining({ code: lifecycleCode }));
+    else expect(() => assertHarnessTestPassed(result)).not.toThrow();
+  });
+
   it.each([["codex", "gpt-6.1-sol", "OPENAI_API_KEY"]] as const)("requires the native %s host and only the selected credential", async (provider, model, key) => {
     vi.stubEnv(key, "ambient-account");
     vi.stubEnv("ANTHROPIC_API_KEY", "ambient-anthropic");

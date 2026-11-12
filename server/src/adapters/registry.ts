@@ -599,15 +599,10 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         }],
       };
     }
-    if (profile.provider === "codex") {
+    if (profile.provider === "codex" || profile.provider === "pi_rpc") {
       const { testNativeRunnerAuthentication } = await import("../services/native-runtime/setup-readiness.js");
-      return testNativeRunnerAuthentication(context, "codex", profile.model);
+      return testNativeRunnerAuthentication(context, profile.provider, profile.model);
     }
-    if (profile.provider === "pi_rpc") return {
-      adapterType: "paperclip_runner", status: "fail" as const, testedAt: new Date().toISOString(),
-      checks: [{ code: "pi_rpc_environment_test_unavailable", level: "error" as const,
-        message: "Native Pi environment testing requires a managed AI connection and a supported remote command factory; no hello probe was run." }],
-    };
     const result = await openCodeTestEnvironment(context);
     return { ...result, adapterType: "paperclip_runner" };
   },

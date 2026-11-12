@@ -9321,7 +9321,9 @@ export async function probeNativeRunnerEnvironment(options: {
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     conversationMode: "direct",
-    requestedCollaborationMode: "plan",
+    // Native Pi requires its ordinary writable assigned environment; the Pi
+    // probe still refuses all tool events and requires a real settled response.
+    requestedCollaborationMode: options.provider === "pi_rpc" ? "default" : "plan",
     approvalPolicy: "never",
     includeCollaborationModeInstructions: false,
     dynamicTools: [],

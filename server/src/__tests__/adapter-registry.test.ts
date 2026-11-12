@@ -20,6 +20,8 @@ import {
   hasActiveAdapterOverride,
 } from "../adapters/registry.js";
 
+import { assertHarnessTestPassed } from "../services/agent-harness-verification.js";
+
 const openCodeProbe = vi.hoisted(() => vi.fn(async () => ({ adapterType: "opencode_local", status: "pass", testedAt: "", checks: [] })));
 vi.mock("@paperclipai/adapter-opencode-local/server", async importOriginal => ({
   ...await importOriginal<typeof import("@paperclipai/adapter-opencode-local/server")>(),
@@ -293,6 +295,9 @@ describe("server adapter registry", () => {
 
   it.each(["local", "ssh"] as const)("fails closed for unmanaged native Pi setup on %s instead of probing OpenCode", async target => {
     openCodeProbe.mockClear();
+    nativeSetup.authenticate.mockReset().mockResolvedValue({ adapterType: "paperclip_runner", status: "fail", testedAt: "", checks: [{
+      code: "pi_rpc_hello_probe_failed", level: "error", message: "Native Pi runtime prerequisites are unavailable; no hello probe was run.",
+    }] });
     const result = await requireServerAdapter("paperclip_runner").testEnvironment({
       companyId: "company-1", adapterType: "paperclip_runner",
       config: { provider: "pi_rpc", model: "anthropic/claude-opus-5-5", piRpcThinkingLevel: "xhigh" },
@@ -303,8 +308,12 @@ describe("server adapter registry", () => {
       },
     });
     expect(result).toMatchObject({ adapterType: "paperclip_runner", status: "fail", checks: [{
-      code: "pi_rpc_environment_test_unavailable", level: "error", message: expect.stringMatching(/Native Pi.*managed.*connection/i),
+      code: "pi_rpc_hello_probe_failed", level: "error", message: expect.stringMatching(/Native Pi.*prerequisites.*unavailable/i),
     }] });
+    expect(nativeSetup.authenticate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      executionTarget: expect.objectContaining({ kind: target === "local" ? "local" : "remote" }),
+    }), "pi_rpc", "anthropic/claude-opus-5-5");
+    expect(() => assertHarnessTestPassed(result)).toThrow();
     expect(openCodeProbe).not.toHaveBeenCalled();
   });
 
@@ -312,6 +321,25 @@ describe("server adapter registry", () => {
     const schema = await requireServerAdapter("paperclip_runner").getConfigSchema!();
     const provider = schema.fields.find(field => field.key === "provider");
     expect(provider?.options).toContainEqual({ value: "pi_rpc", label: "Pi" });
+  });
+
+  // Recorded catch: every fresh pi_rpc agent fell through to OpenCode and parked.
+  it.each([
+    ["passed", "pass", null],
+    ["auth_required", "fail", "harness_auth_failed"],
+    ["model_unavailable", "fail", "harness_model_unavailable"],
+  ] as const)("routes native Pi setup and classifies %s", async (suffix, status, failure) => {
+    nativeSetup.authenticate.mockReset().mockResolvedValue({ adapterType: "paperclip_runner", status, testedAt: "",
+      checks: [{ code: `pi_rpc_hello_probe_${suffix}`, level: status === "pass" ? "info" : "error", message: "Selected native Pi account" }] });
+    const context = { companyId: "company-1", adapterType: "paperclip_runner",
+      config: { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "max", env: { PAPERCLIP_AI_PROVIDER_KEY: "selected-pi-key" } },
+      executionTarget: { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: "/boat/workspace", runner: { execute: vi.fn() } } };
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment(context);
+    expect(nativeSetup.authenticate).toHaveBeenCalledExactlyOnceWith(context, "pi_rpc", "paperclip/claude-opus-5-5");
+    expect(openCodeProbe).not.toHaveBeenCalled();
+    expect(result.checks[0].code).toBe(`pi_rpc_hello_probe_${suffix}`);
+    if (failure) expect(() => assertHarnessTestPassed(result)).toThrow(expect.objectContaining({ code: failure }));
+    else expect(() => assertHarnessTestPassed(result)).not.toThrow();
   });
 
   it("identifies only active external overrides for automatic runner selection", () => {

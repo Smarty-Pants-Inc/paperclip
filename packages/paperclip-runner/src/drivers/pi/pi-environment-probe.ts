@@ -9,6 +9,12 @@ export class PiEnvironmentProbeCleanupError extends Error {
   }
 }
 
+function probeFailure(payload: Record<string, unknown>, fallback: string): Error {
+  const error = record(payload.error);
+  const message = typeof error.message === "string" ? error.message : typeof payload.message === "string" ? payload.message : fallback;
+  return Object.assign(new Error(message), typeof error.code === "string" ? { code: error.code } : {});
+}
+
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -63,14 +69,14 @@ export async function observePiNativeHello(options: PiProbeObservation): Promise
       if (received.done) throw new PiNativeAdmissionError("pi_probe_stream_ended", "Pi hello probe ended without a settled successful turn.");
       const current = received.value;
       if (current.runId !== options.runId || current.normalizedSessionId !== options.normalizedSessionId) throw new PiNativeAdmissionError("pi_probe_session_mismatch", "Pi hello probe received a mismatched run/session.");
-      if (current.eventType === "session.failed") throw new PiNativeAdmissionError("pi_probe_session_failed", "Pi hello probe session failed.");
+      if (current.eventType === "session.failed") throw probeFailure(current.payload, "Pi hello probe session failed.");
       if (current.turnId && current.turnId !== started.turnId) throw new PiNativeAdmissionError("pi_probe_turn_mismatch", "Pi hello probe received a stale or mismatched turn.");
       if (current.turnId === started.turnId) {
         if (current.eventType.startsWith("tool.execution.") || (current.eventType.startsWith("item.") && ["tool", "commandExecution", "mcpToolCall"].includes(String(current.payload.kind)))) {
           throw new PiNativeAdmissionError("pi_probe_tool_used", "Pi hello probe unexpectedly used a tool.");
         }
-        if (current.eventType === "item.completed" && current.payload.kind === "agentMessage" && current.payload.channel === "final" && typeof current.payload.text === "string" && current.payload.text.trim()) responseObserved = true;
-        if (["turn.failed", "turn.cancelled", "turn.interrupted", "item.failed"].includes(current.eventType)) throw new PiNativeAdmissionError("pi_probe_turn_failed", "Pi hello probe failed or was interrupted.");
+        if (current.eventType === "item.completed" && current.payload.kind === "agentMessage" && (current.payload.channel === "final" || current.payload.providerPhase === "final_answer") && typeof current.payload.text === "string" && current.payload.text.trim()) responseObserved = true;
+        if (["turn.failed", "turn.cancelled", "turn.interrupted", "item.failed"].includes(current.eventType)) throw probeFailure(current.payload, "Pi hello probe failed or was interrupted.");
         if (current.eventType === "turn.completed") {
           if (!responseObserved) throw new PiNativeAdmissionError("pi_probe_empty_response", "Pi hello probe settled without an assistant response.");
           return providerSessionId;
