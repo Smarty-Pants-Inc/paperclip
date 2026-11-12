@@ -33,6 +33,21 @@ const support = externalDatabaseUrl ? { supported: true } : await getEmbeddedPos
     }
     return { companyId, agentId, issueId, runId, messageIds };
   }
+  it("attributes an authenticated agent-authored steer to its source run's responsible user", async () => {
+    const input = await seed();
+    await initializeRunIdentity(db, { ...input, messageIds: [], responsibleUserId: "worker-owner", cause: "queued" });
+    const sourceAgentId = randomUUID();
+    const sourceRunId = randomUUID();
+    await db.insert(agents).values({ id: sourceAgentId, companyId: input.companyId, name: "Manager agent", role: "engineer" });
+    await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId: input.companyId, agentId: sourceAgentId,
+      status: "running", responsibleUserId: "owner", contextSnapshot: { issueId: randomUUID() } });
+    await db.update(issueComments).set({ authorType: "agent", authorUserId: null, authorAgentId: sourceAgentId,
+      createdByRunId: sourceRunId }).where(eq(issueComments.id, input.messageIds[0]!));
+
+    const identity = await reserveSteeredIdentity(db, { ...input, messageId: input.messageIds[0]! });
+    expect(identity).toMatchObject({ responsibleUserId: "owner", cause: "steering", messageId: input.messageIds[0] });
+  });
+
   it.each(["github_credentials", "request_authentication"] as const)("retains typed trust bindings for %s and keeps other identity reads complete", async (readScope) => {
     const input = await seed();
     await initializeRunIdentity(db, { ...input, responsibleUserId: "owner", cause: "queued" });

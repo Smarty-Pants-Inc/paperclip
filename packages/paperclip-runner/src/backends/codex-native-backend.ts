@@ -218,7 +218,7 @@ function createTransportBackedNativeSessionBackend(
       driverIdentity,
       capabilities: isCodex
         ? {}
-        : { steering: false, goals: false, threadLineage: false,
+        : { steering: input.provider.kind === "pi_rpc", goals: false, threadLineage: false,
             ...(input.provider.kind === "cursor_cloud" ? { runtimeRequestResolution: false } : {}),
             toolRefreshOnResume: input.provider.kind !== "acpx"
               || ACPX_CAPABILITY_PROFILES[input.provider.agent].toolRefreshOnResume === true },
