@@ -33,7 +33,7 @@ import { publishLiveEvent } from "../live-events.js";
 import { nativeSha256 } from "./canonical.js";
 import { redactRunnerApiEvent, redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { createNativeControllerRecovery, NATIVE_CONTROLLER_RECOVERY_MAX_BYTES, type NativeControllerCompatibility } from "./native-controller-recovery.js";
-import { eligibleNativeTaskSessionPublication, publishNativeTaskSessionInTransaction, NATIVE_TASK_SESSION_PUBLICATION_KEY,
+import { eligibleNativeTaskSessionPublication, publishNativeTaskSessionInTransaction, publishPiConversationInTransaction, NATIVE_TASK_SESSION_PUBLICATION_KEY,
   type NativeTaskSessionPublicationContext, type NativeTaskSessionPublicationIssue } from "./native-task-session-publication.js";
 import { lockNativeRunnerCheckpointOwner, nativeRunnerCheckpointOwnerLock, validateNativeRunnerCheckpointOwner, inspectNativeRunnerUpgradeHeader, type NativeRunnerCheckpointOwner } from "./native-runner-checkpoint.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
@@ -249,7 +249,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       || identity.agentId !== this.#binding.agentId
       || this.#sessionId !== identity.sessionId
     ) throw new Error("native_session_checkpoint_binding_mismatch");
-    const publication = this.#taskSessionPublication && eligibleNativeTaskSessionPublication(snapshot)
+    const piConversation = this.#taskSessionPublication?.providerKind === "pi_rpc" && !!snapshot.providerSessionId;
+    const publication = this.#taskSessionPublication && (piConversation || eligibleNativeTaskSessionPublication(snapshot))
       ? this.#taskSessionPublication : null;
     if (publication && !this.#taskSessionPublicationOwner) throw new Error("native_task_session_publication_owner_required");
     await this.#db.transaction(async (tx) => {
@@ -333,10 +334,14 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
             header ? { runId: this.#binding.runId, runnerInstanceId: header.runnerInstanceId,
               normalizedSessionId: header.normalizedSessionId } : null) } : {}),
         };
+      if (publication && piConversation) {
+        await publishPiConversationInTransaction(tx, { binding: this.#binding, context: publication,
+          snapshot, run, issue: selected?.publicationIssue ?? null, recoveryReady: !recovery || header !== null });
+      }
       // Driver/live snapshots may already describe a terminal result before
       // completeRun accepts it. Persist that observation without a handled
       // receipt; the existing post-acceptance checkpoint publishes the pointer.
-      if (publication && selected?.resultId) {
+      if (publication && selected?.resultId && eligibleNativeTaskSessionPublication(snapshot)) {
         const receipt = await publishNativeTaskSessionInTransaction(tx, { binding: this.#binding, context: publication,
           snapshot, run, issue: selected.publicationIssue ?? null, resultId: selected.resultId ?? null,
           recoveryReady: !recovery || header !== null });

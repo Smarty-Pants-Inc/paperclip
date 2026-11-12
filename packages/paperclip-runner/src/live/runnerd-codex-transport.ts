@@ -515,6 +515,33 @@ async function rotateAuthorityEpoch(
   return resumedState ?? controlPlaneState;
 }
 
+/** Pi restores its transcript through session.open, not provider thread/resume.
+ * Retire only the suspended PRP epoch; the sibling pi/ session file stays put.
+ * Reuse the ordinary rotation markers so an interrupted open is retryable. */
+async function rotateLocalPiOpenAuthority(root: string, desired: DurableRecoveryIdentity): Promise<void> {
+  const directory = resolve(root, "control-plane");
+  const active = existsSync(resolve(directory, "control-plane-state.json")) ? readControlPlaneState(directory) : null;
+  if (active && controlPlaneIdentity(active).runId === desired.runId) return;
+  const source = active
+    ? takeCommittedRotation(root, active) ?? active
+    : latestArchivedControlPlaneState(root, desired);
+  if (!source) return;
+  if (source.warmTransition !== undefined || source.stagedRunAttachment !== undefined)
+    throw new Error("native_runner_authority_archive_conflict");
+  await rotateAuthorityEpoch(root, source, desired, localRunnerStateArchive(root));
+  // The Rust facade otherwise auto-restores this process-scoped snapshot in
+  // run.prepare and issues thread/resume. Keep it as evidence, not authority;
+  // Pi's actual history is the independent sibling pi/<normalized id>.jsonl.
+  const live = resolve(root, "runner", "codex-provider-state.json");
+  const archived = resolve(authorityArchiveDirectory(root, controlPlaneIdentity(source)), "codex-provider-state.json");
+  if (existsSync(live)) {
+    if (!lstatSync(live).isFile()) throw new Error("native_runner_authority_archive_unsafe");
+    if (!existsSync(archived)) renameSync(live, archived);
+    else if (sameRegularFile(live, archived)) rmSync(live);
+    else throw new Error("native_runner_authority_archive_conflict");
+  }
+}
+
 function projectCopilotRunGrant(
   grant: NativeRunRuntimeGrant,
   runnerFilesystemRoot?: string,
@@ -6152,6 +6179,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       : [];
     const authorityRunId = this.#authorityRunId;
     this.#captureRetainedSourceIdentity();
+    if (this.options.provider === "pi_rpc" && !this.options.prepareLaunch && !this.options.readRunnerState
+        && this.options.runnerStateDirectory === undefined && this.options.runnerFilesystemRoot === undefined) {
+      await rotateLocalPiOpenAuthority(this.#root, identity);
+    }
     const core = new DurablePrpControlPlane({
       stateDirectory: resolve(this.#root, "control-plane"),
       identity,
@@ -9402,6 +9433,7 @@ export const runnerdRecoveryInternals = Object.freeze({
   rotatedRunAttachPayload,
   localRunnerStateArchive,
   rotateAuthorityEpoch,
+  rotateLocalPiOpenAuthority,
   runnerdRecoveredTurnTerminal,
   runnerdTerminalProviderTurnId,
   terminalMayBelongToPendingTurnStart,

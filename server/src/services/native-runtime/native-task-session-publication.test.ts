@@ -41,7 +41,7 @@ describe("accepted native task session publication", () => {
     await temporary?.cleanup();
   });
 
-  async function fixture(source: "runner" | "control" = "runner", accepted = true) {
+  async function fixture(source: "runner" | "control" = "runner", accepted = true, providerKind?: "pi_rpc") {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const sessionId = randomUUID(), contractId = randomUUID(), runner = randomUUID(), control = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Native pointer", issuePrefix: `P${companyId.slice(0, 7)}` });
@@ -54,7 +54,8 @@ describe("accepted native task session publication", () => {
       canonicalSha256: "publication-contract", createdByActorType: "system", createdByActorId: "test" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
       nativeIssueId: issueId, nativeSessionId: sessionId, runnerInstanceId: runner, completionContractId: contractId,
-      completionContractSha256: "publication-contract", startedAt: new Date(Date.now() - 2_000), runnerProfileJson: {} });
+      completionContractSha256: "publication-contract", startedAt: new Date(Date.now() - 2_000),
+      runnerProfileJson: providerKind ? { nativeExecutionInput: { provider: { kind: providerKind } } } : {} });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     const owner = { companyId, issueId, runId, authorityRunId: runId, bootId: "publication-boot", generation: 1, leaseOwner: "publication-owner" };
     await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed",
@@ -63,7 +64,7 @@ describe("accepted native task session publication", () => {
     const binding: PaperclipControlPlaneBinding = { companyId, agentId, issueId, runId, sessionId,
       completionContractId: contractId, completionContractSha256: "publication-contract", sourceInstanceId: runner,
       controlPlaneSourceInstanceId: control };
-    const context: NativeTaskSessionPublicationContext = { taskKey: issueId, adapterType: "codex_local",
+    const context: NativeTaskSessionPublicationContext = { taskKey: issueId, adapterType: "codex_local", ...(providerKind ? { providerKind } : {}),
       sessionParamsJson: { cwd: "/working", paperclipSessionConfigFingerprint: "prepared-once", opaque: "private-prepared-param" } };
     const snapshot: PersistedNativeSession = { backendKind: "mock", sessionId, identity: { companyId, agentId, issueId, runId, sessionId },
       providerSessionId: "provider-thread", activeTurnId: null, pendingRuntimeRequests: [], goal: null,
@@ -158,6 +159,44 @@ describe("accepted native task session publication", () => {
     expect(completed.session?.lastRunId).toBe(f.binding.runId);
     expect(nativeTaskSessionPublicationHandled(completed.run.runnerProfileJson, { ...f.binding, ...f.context })).toBe(true);
   });
+
+  it("publishes Pi's active conversation before result acceptance and preserves it across Stop", async () => {
+    const f = await fixture("runner", false, "pi_rpc");
+    const active = { ...f.snapshot, semanticResult: null, terminal: null, activeTurnId: "active-pi-turn" };
+    await f.port.checkpointSession(active);
+    const before = await f.read();
+    expect(before.session).toMatchObject({ lastRunId: f.binding.runId, sessionDisplayId: "provider-thread",
+      sessionParamsJson: { ...f.context.sessionParamsJson, sessionId: f.binding.sessionId } });
+    expect(before.run.runnerProfileJson).not.toHaveProperty(NATIVE_TASK_SESSION_PUBLICATION_KEY);
+    expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.binding.runId))).toHaveLength(0);
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.binding.runId));
+    await f.port.checkpointSession({ ...active, activeTurnId: null,
+      terminal: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "cancelled", runTerminalState: "cancelled", reportedWorkDisposition: "needs_review" } });
+    expect((await f.read()).session).toEqual(before.session);
+  });
+
+  it.each(["missing", "foreign_epoch", "newer_execution", "generation_reset", "stop", "stale_owner", "wrong_provider"])(
+    "fences Pi's pre-acceptance conversation pointer for %s", async kind => {
+      const f = await fixture("runner", false, "pi_rpc");
+      if (kind === "missing") await db.delete(agentTaskSessions).where(eq(agentTaskSessions.taskKey, f.binding.issueId));
+      if (kind === "foreign_epoch") await db.update(agentTaskSessions).set({ goalSourceId: `${randomUUID()}:${f.binding.runId}` }).where(eq(agentTaskSessions.taskKey, f.binding.issueId));
+      if (kind === "newer_execution") {
+        const newer = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: newer, companyId: f.binding.companyId, agentId: f.binding.agentId, status: "running" });
+        await db.update(issues).set({ executionRunId: newer }).where(eq(issues.id, f.binding.issueId));
+      }
+      if (kind === "generation_reset") await db.update(issues).set({ conversationAgentId: f.binding.agentId,
+        conversationUserId: "publication-test-user", conversationState: "active", conversationSessionGeneration: 2 }).where(eq(issues.id, f.binding.issueId));
+      if (kind === "stop") await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.binding.runId));
+      if (kind === "stale_owner") await db.update(nativeRunFinalizations).set({ controllerGeneration: 2 }).where(eq(nativeRunFinalizations.runId, f.binding.runId));
+      if (kind === "wrong_provider") await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: { provider: { kind: "codex" } } } }).where(eq(heartbeatRuns.id, f.binding.runId));
+      const checkpoint = f.port.checkpointSession({ ...f.snapshot, semanticResult: null, terminal: null, activeTurnId: "active-pi-turn" });
+      if (kind === "stale_owner") await expect(checkpoint).rejects.toThrow("checkpoint_owner_lost");
+      else await checkpoint;
+      const { run, session } = await f.read();
+      expect(session?.sessionParamsJson?.sessionId).not.toBe(f.binding.sessionId);
+      expect(run.runnerProfileJson).not.toHaveProperty(NATIVE_TASK_SESSION_PUBLICATION_KEY);
+    });
 
   it("does not hold the issue parent lock while a result replay waits for the status coordinator", async () => {
     const f = await fixture();

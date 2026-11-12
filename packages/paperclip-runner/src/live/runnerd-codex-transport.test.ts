@@ -2051,6 +2051,57 @@ describe("authority rotation after the prior controller state is restored", () =
     );
   }
 
+  it("cold Pi open rotates only PRP authority and preserves the exact transcript across retries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-pi-cold-open-"));
+    const transcript = '{"type":"session","id":"pi-private-session"}\n{"type":"message","private":"Pi-only fact"}\n';
+    try {
+      await mkdir(join(root, "control-plane"), { recursive: true });
+      await mkdir(join(root, "runner"));
+      await mkdir(join(root, "pi"));
+      const file = join(root, "pi", `${priorIdentity.normalizedSessionId}.jsonl`);
+      await writeFile(file, transcript);
+      await writeFile(join(root, "control-plane", "control-plane-state.json"), JSON.stringify(controlPlaneState));
+      await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify(suspendedRunnerState));
+      const facade = JSON.stringify({ schema: "paperclip.runner.codex-provider-state.v1", config: { provider: "pi_rpc" } });
+      await writeFile(join(root, "runner", "codex-provider-state.json"), facade);
+      const rotate = () => runnerdRecoveryInternals.rotateLocalPiOpenAuthority(root, desiredIdentity);
+      await rotate();
+      expect(await readFile(file, "utf8")).toBe(transcript);
+      await expect(stat(join(root, "control-plane"))).rejects.toMatchObject({ code: "ENOENT" });
+      // A crash after archival, and then restoration of the prior checkpoint,
+      // both resume the same durable authority rotation without moving Pi.
+      await rotate();
+      await restoreControlPlane(root, "re-serialized");
+      await rotate();
+      expect(await readFile(file, "utf8")).toBe(transcript);
+      const [epoch] = await readdir(join(root, "authority-epochs"));
+      expect(JSON.parse(await readFile(join(root, "authority-epochs", epoch!, "runner-state.json"), "utf8"))).toEqual(suspendedRunnerState);
+      expect(await readFile(join(root, "authority-epochs", epoch!, "codex-provider-state.json"), "utf8")).toBe(facade);
+      await expect(stat(join(root, "runner", "codex-provider-state.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["active_runner", "different_session", "warm_transition", "staged_attachment"])(
+    "cold Pi open fences %s without touching the transcript", async kind => {
+      const root = await mkdtemp(join(tmpdir(), "runner-pi-cold-open-refused-"));
+      try {
+        await mkdir(join(root, "control-plane"), { recursive: true });
+        await mkdir(join(root, "runner"));
+        await mkdir(join(root, "pi"));
+        const file = join(root, "pi", `${priorIdentity.normalizedSessionId}.jsonl`);
+        await writeFile(file, "private Pi transcript\n");
+        const state = { ...controlPlaneState, ...(kind === "warm_transition" ? { warmTransition: {} } : {}),
+          ...(kind === "staged_attachment" ? { stagedRunAttachment: {} } : {}) };
+        await writeFile(join(root, "control-plane", "control-plane-state.json"), JSON.stringify(state));
+        await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify({ ...suspendedRunnerState,
+          ...(kind === "active_runner" ? { lifecycle: "running" } : {}) }));
+        await expect(runnerdRecoveryInternals.rotateLocalPiOpenAuthority(root,
+          { ...desiredIdentity, ...(kind === "different_session" ? { normalizedSessionId: "another-session" } : {}) })).rejects.toThrow();
+        expect(await readFile(file, "utf8")).toBe("private Pi transcript\n");
+        expect(JSON.parse(await readFile(join(root, "control-plane", "control-plane-state.json"), "utf8"))).toEqual(state);
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+
   it.each(cases)("external rotation: %s restored copy", async (copy) => {
     const root = await mkdtemp(join(tmpdir(), "runner-external-rotation-restore-"));
     let activeRunnerState: Record<string, unknown> | null = suspendedRunnerState;
