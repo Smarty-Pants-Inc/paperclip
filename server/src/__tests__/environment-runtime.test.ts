@@ -4784,9 +4784,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       const normalizedSessionId = randomUUID(), runnerInstanceId = "compatible-pi-runner", sessionScopeId = "compatible-pi-scope";
       const current = path.join(backupBase, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
       await mkdir(path.join(current, "runner"), { recursive: true });
-      await mkdir(path.join(current, "pi-agent", "sessions"), { recursive: true });
+      await mkdir(path.join(current, "pi-agent"), { recursive: true });
+      // Image B persists Pi's cold-open transcript separately from its agent home.
+      await mkdir(path.join(current, "pi"), { recursive: true });
       await writeFile(path.join(current, "runner", "runner-state.json"), "settled runner checkpoint");
-      await writeFile(path.join(current, "pi-agent", "sessions", "conversation.jsonl"), '{"role":"user","content":"next message"}\n');
+      await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"role":"user","content":"next message"}\n');
       const manifest = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId,
         sourceProviderLeaseId: first.lease.providerLeaseId!, providerSessionIdentity: { providerSessionId: "pi-thread" },
         execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId: nextRunId, issueId, agentId, executionWorkspaceId: null },
@@ -4813,7 +4815,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           .resolves.toMatchObject({ stdout: "served:snapshot-a:after stale checkpoint" });
         sourceLease = stale.lease;
         // F7 finally covers the later provider event before the drain proceeds.
-        await writeFile(path.join(current, "pi-agent", "sessions", "conversation.jsonl"), '{"content":"next message"}\n{"content":"after stale checkpoint"}\n');
+        await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"content":"next message"}\n{"content":"after stale checkpoint"}\n');
         const refreshed = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId,
           sourceProviderLeaseId: first.lease.providerLeaseId!, providerSessionIdentity: manifest.providerSessionIdentity,
           completedAt: new Date(laterAt.getTime() + 1000).toISOString(), execution: { provider: { kind: "pi_rpc" },
