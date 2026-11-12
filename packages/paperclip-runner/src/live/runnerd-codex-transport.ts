@@ -9340,13 +9340,14 @@ export async function probeNativeRunnerEnvironment(options: {
     ...(options.admissionOnly ? { helloProbePassed: false, admissionOnly: true as const, sessionAdmissionPassed: true as const } : { helloProbePassed: true }) });
 }
 
-/** The transport provider identifies the biller, independently of model family. */
+/** Opened-thread provider metadata follows the configured provider, not the model family. */
 function openedThreadModelProvider(
   provider: CapabilityRunnerdCodexTransportOptions["provider"],
   acpxAgent: QualifiedAcpxAgent,
   model: unknown,
 ): string {
   if (provider === "opencode" && typeof model === "string") return model.split("/", 1)[0]!;
+  if (provider === "pi_rpc" && typeof model === "string") return model.split("/", 1)[0]!;
   if (provider === "cursor_cloud") return "cursor";
   if (provider === "claude_managed") return "anthropic";
   if (provider === "aws_agentcore") return "aws";

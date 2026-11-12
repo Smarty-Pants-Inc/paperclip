@@ -164,6 +164,15 @@ it("attributes opened candidate sessions to the harness biller instead of the mo
   expect(provider("aws_agentcore", "codex", "global.anthropic.claude-sonnet-4-6")).toBe("aws");
 });
 
+it.each([
+  ["anthropic/claude-opus-5-5", "anthropic"],
+  ["openrouter/anthropic/claude-opus-5-5", "openrouter"],
+  ["paperclip/claude-opus-5-5", "paperclip"],
+  ["openai/gpt-5.6-sol", "openai"],
+])("reports the configured provider for an opened native Pi thread: %s", (model, expected) => {
+  expect(runnerdLaunchProfileInternals.openedThreadModelProvider("pi_rpc", "codex", model)).toBe(expected);
+});
+
 it("replaces an owned v1 runner with fresh v2 authorization before warm attachment", async () => {
   const directory = await mkdtemp(join(tmpdir(), "runnerd-v1-v2-replacement-"));
   const handles: durableControlPlane.RunnerProcessHandle[] = [];
