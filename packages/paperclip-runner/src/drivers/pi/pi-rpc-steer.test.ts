@@ -16,6 +16,9 @@ describe("Pi RPC same-turn steering", () => {
     const peer = createPiSteerRecordingPeer(join(root, "commands.jsonl"));
     const driver = new PiRpcDriver({ ...peer.driverOptions, runtimeDirectory: root, runnerInstanceId: "steer-runner" });
     const session = await driver.openSession({ runId: "steer-run", normalizedSessionId: "steer-session", workingDirectory: root });
+    const admittedCommands = await peer.commands();
+    expect(admittedCommands.filter(command => command.type === "get_available_models")).toHaveLength(1);
+    expect(admittedCommands.some(command => ["prompt", "steer"].includes(command.type))).toBe(false);
     const events: PrpEvent[] = [];
     const pump = (async () => { for await (const event of session.events()) events.push(event); })();
     try {
@@ -31,7 +34,11 @@ describe("Pi RPC same-turn steering", () => {
       expect(consumed[0]).toMatchObject({ turnId, runId: "steer-run", normalizedSessionId: "steer-session", sourceInstanceId: "steer-runner" });
       expect(events.filter(event => event.eventType === "turn.started")).toHaveLength(1);
       expect(events.filter(event => event.eventType.startsWith("turn.") && event.eventType !== "turn.started")).toHaveLength(1);
-      expect(events.every(event => event.turnId === turnId && event.runId === "steer-run")).toBe(true);
+      const admissionEvents = events.filter(event => event.eventType === "session.started");
+      expect(admissionEvents).toHaveLength(1);
+      expect(admissionEvents[0]).toMatchObject({ runId: "steer-run", payload: { context: { piMetadata: { providers: ["paperclip"], promptSent: false } } } });
+      expect(admissionEvents[0].turnId).toBeUndefined();
+      expect(events.every(event => event.runId === "steer-run" && (event.eventType === "session.started" || event.turnId === turnId))).toBe(true);
       for (const event of events) expect(validatePrpEvent(event)).toMatchObject({ ok: true });
       expect((await peer.commands()).filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type))).toEqual([
         expect.objectContaining({ type: "prompt", message: "scenario:queue" }),

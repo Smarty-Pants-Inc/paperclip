@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import request from "supertest";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import type { ServerAdapterModule } from "../adapters/index.js";
+import type { PiNativeConfig } from "../../../packages/paperclip-runner/src/drivers/pi/pi-native-config.js";
 
 const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -1022,9 +1023,9 @@ describe("agent routes adapter validation", () => {
     const { createLifecycleWorker } = await import("../modules/agent-lifecycle/application/worker.js");
     const { transition } = await import("../modules/agent-lifecycle/domain/policy.js");
     const model = "paperclip/claude-opus-5-5";
-    const config = { provider: "pi_rpc", model, piRpcThinkingLevel: "xhigh" };
+    const config: PiNativeConfig = { provider: "pi_rpc", model, piRpcThinkingLevel: "xhigh" };
     let transport: InstanceType<typeof FakeCodexTransport> | undefined;
-    const probe = vi.fn(async (context: { config: Record<string, unknown> }) => {
+    const probe = vi.fn(async (context: { config: PiNativeConfig }) => {
       class SetupTransport extends FakeCodexTransport {
         override async request(method: string, params: Record<string, unknown>) {
           const response = await super.request(method, params);

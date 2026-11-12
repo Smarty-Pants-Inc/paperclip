@@ -30,6 +30,7 @@ export function createPiSteerRecordingPeer(commandLog: string, disposition = "qu
         const request = JSON.parse(line);
         appendFileSync(log, JSON.stringify(request) + "\\n");
         if (request.type === "get_state") response(request, wire.find(event => event.command === "get_state").data);
+        else if (request.type === "get_available_models") response(request, { models: [wire.find(event => event.command === "get_state").data.model] });
         else if (request.type === "set_model") response(request, wire.find(event => event.command === "set_model").data);
         else if (request.type === "get_available_thinking_levels") response(request, { levels: ["off"] });
         else if (request.type === "set_thinking_level") response(request);
