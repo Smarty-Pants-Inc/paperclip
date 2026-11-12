@@ -1289,25 +1289,33 @@ describeEmbeddedPostgres(
             eq(issueComments.authorType, "system"),
           ),
         );
-      expect(relayComments).toHaveLength(2);
+      expect(relayComments).toHaveLength(3);
+      const standardChildIdentifier =
+        fixture.issues.standardChild.identifier ?? fixture.issues.standardChild.id;
+      const lowTrustChildIdentifier =
+        fixture.issues.assignedReview.identifier ?? fixture.issues.assignedReview.id;
       expect(relayComments.map((comment) => comment.body)).toEqual(
         expect.arrayContaining([
           expect.stringContaining(`transitioned to \`blocked\``),
           expect.stringContaining(`transitioned to \`cancelled\``),
+          expect.stringContaining(standardChildIdentifier),
         ]),
       );
+      expect(
+        relayComments.filter((comment) =>
+          comment.body.includes(standardChildIdentifier),
+        ),
+      ).toHaveLength(1);
+      expect(
+        relayComments.filter((comment) =>
+          comment.body.includes(lowTrustChildIdentifier),
+        ),
+      ).toHaveLength(2);
       for (const relay of relayComments) {
         expect(relay.authorType).toBe("system");
-        expect(relay.body).toContain(
-          fixture.issues.assignedReview.identifier ??
-            fixture.issues.assignedReview.id,
-        );
         expect(relay.body).not.toContain(fixture.canaries.raw);
         expect(relay.body).not.toContain("in_review");
         expect(relay.body).not.toContain("done");
-        expect(relay.body).not.toContain(
-          fixture.issues.standardChild.identifier,
-        );
       }
 
       const reparentedRelayComments = await db
