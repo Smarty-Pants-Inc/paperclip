@@ -1186,7 +1186,7 @@ export function createHeartbeatRunState(db: Db) {
   async function getRunWorkspaceSettlement(runId: string) {
     const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
     return db.select({
-      id: heartbeatRuns.id, status: heartbeatRuns.status,
+      id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
       error: safeForLegacyEncoding ? heartbeatRunSqlAsciiSafeColumns.error : heartbeatRuns.error,
       runnerProfileJson: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.runnerProfileJson} is null then null
         else jsonb_build_object('nativeWorkspaceSync', ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync',

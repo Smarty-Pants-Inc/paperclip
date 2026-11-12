@@ -36,7 +36,7 @@ describe("saved native resource policy", () => {
     ["keep_running", true, false, "keep_running"],
     ["stop_and_retain", true, false, "stop_and_retain"],
     ["destroy", true, false, "destroy"],
-    ["keep_running", false, false, "stop_and_retain"],
+    ["keep_running", false, false, "keep_running"],
     ["destroy", false, false, "stop_and_retain"],
     ["keep_running", true, true, "stop_and_retain"],
     ["destroy", true, true, "destroy"],
@@ -45,6 +45,17 @@ describe("saved native resource policy", () => {
   ] as const)("settles %s with committed=%s and pending export=%s as %s", (saved, succeeded, pending, expected) => {
     expect(nativeEnvironmentSettlementDisposition({ runnerProfileJson: { nativeResourceDisposition: saved },
       resultJson: pending ? { workspaceExportRetry: { pending: true } } : null }, succeeded)).toBe(expected);
+  });
+  it.each([
+    ["adapter_failed", "keep_running"],
+    ["native_session_interrupted", "keep_running"],
+    ["native_restart_recovery_blocked", "stop_and_retain"],
+    ["native_continuation_requires_reconciliation", "stop_and_retain"],
+    ["native_event_replay_conflict", "stop_and_retain"],
+    ["lease_released_before_terminal", "stop_and_retain"],
+  ] as const)("uses the durable failure classification for recovered %s", (errorCode, expected) => {
+    expect(nativeEnvironmentSettlementDisposition({ status: "failed", errorCode,
+      runnerProfileJson: { nativeResourceDisposition: "keep_running" }, resultJson: null }, false)).toBe(expected);
   });
 });
 
@@ -385,15 +396,17 @@ describe("native environment release scheduling", () => {
     await start(); await flush(); expect(release).not.toHaveBeenCalled();
     expect((await environmentService(db).getLeaseById(acquired.id))?.status).toBe("retained"); await quiet();
   });
-  it.each(["failed", "cancelled"] as const)("stops a %s run despite its selected warm policy", async status => {
+  it.each(["failed", "cancelled"] as const)("retains a %s run's reusable sandbox under its selected warm policy", async status => {
     const binding = await committed();
-    await db.update(heartbeatRuns).set({ status, runnerProfileJson: { nativeResourceDisposition: "keep_running" } })
+    await db.update(heartbeatRuns).set({ status, errorCode: status === "failed" ? "adapter_failed" : "cancelled",
+      runnerProfileJson: { nativeResourceDisposition: "keep_running" } })
       .where(eq(heartbeatRuns.id, binding.runId));
     const acquired = await environmentService(db).acquireLease({ companyId, environmentId, heartbeatRunId: binding.runId,
       issueId: binding.issueId, leasePolicy: "reuse_by_environment", provider: "local", providerLeaseId: randomUUID() });
     await start(); await flush();
-    expect(release).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ resourceDisposition: "stop_and_retain" }));
-    expect((await environmentService(db).getLeaseById(acquired.id))?.status).toBe("released");
+    expect(release).not.toHaveBeenCalled();
+    expect(stopOnly).not.toHaveBeenCalled();
+    expect((await environmentService(db).getLeaseById(acquired.id))?.status).toBe("retained");
     expect((await read(binding.runId)).status).toBe(status);
     await quiet();
   });

@@ -321,8 +321,8 @@ describeEmbeddedPostgres("heartbeat teardown terminalizes the run before releasi
         environmentRuntime: { releaseRunLeases } as unknown as HeartbeatEnvironmentRuntime,
       });
 
-      // Successful workspace copy-back does not make a failed provider turn
-      // successful. Recovery can reach this boundary without the run's finally.
+      // Workspace copy-back does not change the durable provider outcome.
+      // An ordinary terminal outcome does not invalidate selected warm policy.
       await heartbeat.releaseEnvironmentLeasesForRun({
         runId,
         companyId,
@@ -335,7 +335,7 @@ describeEmbeddedPostgres("heartbeat teardown terminalizes the run before releasi
         runId,
         leaseReleaseStatusForRunStatus(status),
         expect.any(Function),
-        status === "succeeded" ? "keep_running" : "stop_and_retain",
+        status === "timed_out" ? "stop_and_retain" : "keep_running",
       );
     },
   );
