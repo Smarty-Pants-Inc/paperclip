@@ -581,13 +581,6 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
       await assertManagedAiProjectAuth(context.config, binding.provider, context.executionTarget);
       return probeManagedNativePiRunner(context);
     }
-    if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc"
-      && context.executionTarget?.kind === "remote" && context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask) return {
-      adapterType, status: "fail" as const, testedAt: new Date().toISOString(), checks: [{
-        code: "pi_rpc_environment_test_unavailable", level: "error" as const,
-        message: "Native Pi connection testing is not supported on plugin-task targets; no hello probe was run.",
-      }],
-    };
     const startedAt = new Date();
     if (adapterType === "paperclip_runner" && binding.provider === "google" && context.config.provider === "acpx"
       && context.config.acpxAgent === "antigravity" && managed.home) {

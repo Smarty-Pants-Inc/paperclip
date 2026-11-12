@@ -327,6 +327,27 @@ describe("plugin-provided Runner execution", () => {
     await expect(executeEnvironmentTask(database(value).db, worker() as never, { companyId: "company", leaseId,
       operation: { ...operation, credential: { type: "claude-env", environment: { ANTHROPIC_API_KEY: "never-leak" } } } })).rejects.toThrow("validation unavailable");
   });
+  // Keep: Pi credential dispatch must match the lease-bound prepared harness.
+  it("dispatches Pi credentials only with native Pi project-auth proof", async () => {
+    const operation = { ...submit, runner: { ...submit.runner, harness: "pi_rpc" }, accountIdentity: "selected-account",
+      credentialIdentity: "selected-revision", credential: { type: "pi-env" as const, environment: {
+        PAPERCLIP_AI_PROVIDER_KEY: "pi-key-canary", PAPERCLIP_AI_PROVIDER_URL: "https://gateway.example/v1",
+        PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages" as const, PAPERCLIP_AI_PROVIDER_AUTH: "bearer" as const } } };
+    const value = row(); Object.assign(value.lease.metadata, { runnerTaskProjectAuthValidation: {
+      configurationId: "configuration", provider: "pi_rpc", projectIds: [projectId] } });
+    const workers = worker();
+    await expect(executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation }))
+      .resolves.toMatchObject({ kind: "accepted" });
+    expect(workers.call).toHaveBeenCalledWith("original", "environmentTask", expect.objectContaining({ operation }), expect.any(Number));
+    for (const harness of ["codex", "claude"]) {
+      const mismatch = row(); Object.assign(mismatch.lease.metadata, { runnerTaskProjectAuthValidation: {
+        configurationId: "configuration", provider: harness === "codex" ? "openai" : "anthropic", projectIds: [projectId] } });
+      const denied = worker();
+      await expect(executeEnvironmentTask(database(mismatch).db, denied as never, { companyId: "company", leaseId,
+        operation: { ...operation, runner: { ...operation.runner, harness } } })).rejects.toThrow("validation unavailable");
+      expect(denied.call).not.toHaveBeenCalled();
+    }
+  });
   it.each(["allowed", "denied", "wrong-configuration", "wrong-provider", "timeout"])("records only a matching successful project validation (%s)", async mode => {
     const operation = { kind: "check_project_auth" as const, configurationId: "configuration", provider: "openai" as const, projectIds: [projectId] };
     const result = { kind: "project_auth", taskId: "attempt-1", configurationId: mode === "wrong-configuration" ? "other" : "configuration",

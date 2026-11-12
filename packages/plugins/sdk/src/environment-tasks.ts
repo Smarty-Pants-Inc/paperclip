@@ -31,6 +31,27 @@ export const environmentTaskCredentialSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("claude-env"), environment: z.object({
     CLAUDE_CODE_OAUTH_TOKEN: credentialValue.optional(), ANTHROPIC_API_KEY: credentialValue.optional(),
   }).strict().refine(env => Object.values(env).filter(Boolean).length === 1, "Select one Claude credential") }).strict(),
+  // Native Pi receives provider auth/routing only; runtime paths and credential
+  // mode remain provider-owned. Never transfer arbitrary process environment.
+  z.object({ type: z.literal("pi-env"), environment: z.object({
+    ANTHROPIC_API_KEY: credentialValue.optional(), OPENAI_API_KEY: credentialValue.optional(),
+    OPENROUTER_API_KEY: credentialValue.optional(), GEMINI_API_KEY: credentialValue.optional(),
+    GOOGLE_API_KEY: credentialValue.optional(), XAI_API_KEY: credentialValue.optional(),
+    PAPERCLIP_AI_PROVIDER_KEY: credentialValue.optional(),
+    PAPERCLIP_AI_PROVIDER_URL: z.string().url().max(2000).refine(value => {
+      const url = new URL(value);
+      return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password && !url.search && !url.hash;
+    }, "Expected a credential-free provider URL").optional(),
+    PAPERCLIP_AI_PROVIDER_PROTOCOL: z.enum(["messages", "responses", "chat"]).optional(),
+    PAPERCLIP_AI_PROVIDER_AUTH: z.enum(["bearer", "api_key", "none"]).optional(),
+  }).strict().refine(env => {
+    const keys = Object.entries(env).filter(([key, value]) => key.endsWith("_KEY") && Boolean(value));
+    const routed = env.PAPERCLIP_AI_PROVIDER_URL !== undefined || env.PAPERCLIP_AI_PROVIDER_PROTOCOL !== undefined || env.PAPERCLIP_AI_PROVIDER_AUTH !== undefined;
+    return routed
+      ? Boolean(env.PAPERCLIP_AI_PROVIDER_URL && env.PAPERCLIP_AI_PROVIDER_PROTOCOL && env.PAPERCLIP_AI_PROVIDER_AUTH)
+        && (env.PAPERCLIP_AI_PROVIDER_AUTH === "none" ? keys.length === 0 : keys.length === 1 && Boolean(env.PAPERCLIP_AI_PROVIDER_KEY))
+      : keys.length === 1 && !env.PAPERCLIP_AI_PROVIDER_KEY;
+  }, "Select one Pi credential or an explicit unauthenticated provider route") }).strict(),
 ]);
 export type PluginEnvironmentTaskCredential = z.infer<typeof environmentTaskCredentialSchema>;
 

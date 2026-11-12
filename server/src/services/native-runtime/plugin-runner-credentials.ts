@@ -40,6 +40,13 @@ export async function preparePluginRunnerCredentials(input: {
       },
     };
   }
+  if (input.provider === "pi_rpc") {
+    const environment = Object.fromEntries([
+      "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY",
+      "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
+    ].flatMap(key => input.environment[key] ? [[key, input.environment[key]]] : []));
+    return { ...github, accountIdentity, credential: environmentTaskCredentialSchema.parse({ type: "pi-env", environment }) };
+  }
   if (input.provider === "claude") {
     if (input.environment.ANTHROPIC_BASE_URL || input.environment.ANTHROPIC_AUTH_TOKEN) {
       throw new Error("Plugin Runner does not support the selected provider routing");

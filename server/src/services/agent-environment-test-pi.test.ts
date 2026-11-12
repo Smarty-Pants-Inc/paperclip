@@ -74,10 +74,20 @@ describe("native managed Pi Setup Test", () => {
     mocks.probe.mockResolvedValueOnce({ ...receipt, helloProbePassed: false });
     expect((await test()).status).toBe("fail");
   });
-  it("keeps plugin-task native Pi fail closed until that run path supports native credentials", async () => {
-    const result = await test(config, { ...target, runnerTask: vi.fn() } as AdapterEnvironmentTestContext["executionTarget"]);
-    expect(result).toMatchObject({ status: "fail", checks: [expect.objectContaining({ code: "pi_rpc_environment_test_unavailable" })] });
-    expect(mocks.probe).not.toHaveBeenCalled();
+  // Keep: the production Boat hire stopped in verifying at this boundary.
+  it("verifies managed native Pi through the plugin task instead of refusing the Boat target", async () => {
+    const runnerTask = vi.fn(async () => ({ kind: "description", taskId: "boat-task", launchPreparationVersion: 1,
+      projectAuthCheckVersion: 1, runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } }));
+    const result = await test(config, { kind: "remote", transport: "sandbox", providerKey: "boat", leaseId: "boat-lease", remoteCwd: ".",
+      runnerTaskProbe: { runId: "boat-probe", sessionId: "boat-session" }, runnerTask });
+    expect(result).toMatchObject({ status: "pass", checks: [expect.objectContaining({ code: "pi_rpc_hello_probe_passed" })] });
+    expect(() => assertHarnessTestPassed(result)).not.toThrow();
+    expect(runnerTask).toHaveBeenCalledWith({ kind: "describe" });
+    expect(mocks.probe).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ provider: "pi_rpc", model,
+      environment: {}, transportOptions: expect.objectContaining({ prepareLaunch: expect.any(Function),
+        runnerProcessLauncher: expect.any(Function), piRpcThinkingLevel: "xhigh" }) }));
+    expect(mocks.adapter).not.toHaveBeenCalled();
+    expect(mocks.verifyKey).not.toHaveBeenCalled();
   });
 });
 
