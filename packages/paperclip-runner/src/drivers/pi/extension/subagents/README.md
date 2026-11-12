@@ -81,10 +81,15 @@ otherwise swallows the failure and can run tools without its gate.
 ## S-1 park / Stop
 
 Install the documented pi-web liveness registry only when absent. Never overwrite
-an existing host registry. For this session, a pi-subagents registration must be
-seen and **every** registered provider must return exactly false. Missing,
-opaque/replaced registries, thrown/nonboolean provider state, owed completion/wake
-work, and prior stop uncertainty block park. The register-only public protocol
+an existing host registry. If the public all-configured-tools list contains
+`subagent` (including hidden/inactive tools), or a current-session pi-subagents
+provider has been observed, its registration must be seen and the status RPC
+must answer. Unknown tool metadata also requires this contract. Once required,
+removing tools/providers cannot downgrade it. An empty home with neither a
+configured child tool nor an observed child provider needs no absent package RPC;
+parent abort must still settle and **every** registered provider must return
+exactly false. Missing, opaque/replaced registries, thrown/nonboolean provider
+state, owed completion/wake work, and prior stop uncertainty block park. The register-only public protocol
 cannot inspect an existing foreign registry; coordinate its observation with its
 host owner instead of guessing idle.
 

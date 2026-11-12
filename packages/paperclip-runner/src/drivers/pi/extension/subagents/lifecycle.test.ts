@@ -20,17 +20,60 @@ class Bus {
 }
 const snapshot = (runs: Array<{ id: string; state: string }> = [], omitted = { runs: 0, children: 0, byteLimitExceeded: false }) => ({ asyncSnapshot: { version: 1, kind: "pi-subagents.async-status-snapshot", runs, omitted } });
 const proof = (id: string, instance = "runner-1", state = "observed") => ({ version: 1, runId: id, runnerProcessInstanceId: instance, state });
-function setup(options: { timeoutMs?: number; sessionId?: string; abortParent?: () => void | Promise<void> } = {}) {
+function setup(options: { timeoutMs?: number; sessionId?: string; abortParent?: () => void | Promise<void>; hasSubagentTool?: () => boolean } = {}) {
   const bus = new Bus();
   const registered: Record<string, Function> = {};
   let aborted = false;
-  const lifecycle = createSubagentLifecycle({ sessionId: options.sessionId ?? "parent", events: bus, abortParent: async () => { aborted = true; await options.abortParent?.(); }, timeoutMs: options.timeoutMs ?? 100, rpcTimeoutMs: 30,
+  const lifecycle = createSubagentLifecycle({ sessionId: options.sessionId ?? "parent", events: bus, abortParent: async () => { aborted = true; await options.abortParent?.(); }, hasSubagentTool: options.hasSubagentTool, timeoutMs: options.timeoutMs ?? 100, rpcTimeoutMs: 30,
     seam: { registerParkReadyContributor: fn => { registered.park = fn; return () => { delete registered.park; }; }, registerStopChildren: fn => { registered.stop = fn; return () => { delete registered.stop; }; } },
   });
   cleanups.push(() => lifecycle.dispose());
   return { bus, lifecycle, registered, aborted: () => aborted, registry: globals[SESSION_LIVENESS_KEY] as LivenessRegistry };
 }
 describe("S-1 pi-web liveness and public RPC Stop (trust boundary)", () => {
+  // Recorded real catch: image-2 HOL completes 131 callbacks, then an empty home
+  // fails retirement because an absent package cannot answer child status RPC.
+  it("returns a certain empty Stop after parent abort when no child runtime is configured", async () => {
+    const f = setup({ hasSubagentTool: () => false });
+    expect(await f.lifecycle.stopAll("empty home retirement")).toEqual({ settled: [], uncertain: [] });
+    expect(f.lifecycle.parkReady()).toEqual({ ready: true, reasons: [] });
+    expect(f.aborted()).toBe(true);
+    expect(f.bus.requests).toEqual([]);
+  });
+  it("still stops and accounts for a registered child runtime even without a configured subagent tool", async () => {
+    const f = setup({ hasSubagentTool: () => false }); let stopped = false;
+    f.registry.register({ name: "pi-subagents", sessionId: "parent", isActive: () => !stopped });
+    f.bus.handle = (method, params) => {
+      if (method === "stop") { stopped = true; return {}; }
+      return params.id ? { details: { lifecycleStatus: { processTerminal: proof("a", "runner-1", stopped ? "observed" : "pending") } } } : snapshot([{ id: "a", state: "running" }]);
+    };
+    expect(await f.lifecycle.stopAll("registered runtime")).toEqual({ settled: ["a"], uncertain: [] });
+    expect(stopped).toBe(true);
+  });
+  it("never treats configured, unobservable or previously observed child runtimes as absent", async () => {
+    for (const kind of ["configured", "opaque", "unregistered", "tool-removed", "tool-query-failed"]) {
+      let configured = kind === "configured" || kind === "tool-removed";
+      if (kind === "opaque") globals[SESSION_LIVENESS_KEY] = { version: 1, register: () => () => {} };
+      const f = setup({ hasSubagentTool: () => { if (kind === "tool-query-failed") throw new Error("unavailable"); return configured; } });
+      if (kind === "unregistered") {
+        const release = f.registry.register({ name: "pi-subagents", sessionId: "parent", isActive: () => false });
+        expect(f.lifecycle.parkReady().ready).toBe(true); release();
+      }
+      if (kind === "tool-removed") { f.lifecycle.parkReady(); configured = false; }
+      expect(f.lifecycle.parkReady().ready).toBe(false);
+      expect((await f.lifecycle.stopAll(kind)).uncertain.length).toBeGreaterThan(0);
+      f.lifecycle.dispose(); delete globals[SESSION_LIVENESS_KEY];
+    }
+  });
+  it("does not turn other active providers or canceled parent abort into certain empty cleanup", async () => {
+    const f = setup({ hasSubagentTool: () => false });
+    f.registry.register({ name: "completion-wakes", sessionId: "parent", isActive: () => true });
+    expect(f.lifecycle.parkReady().ready).toBe(false);
+    expect((await f.lifecycle.stopAll("active provider")).uncertain).toContain("session-liveness");
+    const controller = new AbortController(); controller.abort();
+    const empty = setup({ hasSubagentTool: () => false, sessionId: "empty" });
+    expect((await empty.lifecycle.stopAll("canceled", controller.signal)).uncertain.length).toBeGreaterThan(0);
+  });
   it("registers exact host contributors, requires a session-qualified package registration and all providers idle", async () => {
     const f = setup();
     expect(f.lifecycle.parkReady().ready).toBe(false);

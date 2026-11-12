@@ -38,6 +38,9 @@ export function createSubagentLifecycle(input: {
    * Resolve only when parent abort has been awaited; signal bounds the active stop operation.
    */
   abortParent(signal: AbortSignal): void | Promise<void>;
+  /** Check ALL configured tools, including hidden/inactive ones. Missing metadata
+   * conservatively requires the package's liveness/RPC contract. */
+  hasSubagentTool?: () => boolean;
   seam?: Pick<SubagentSeam, "registerParkReadyContributor" | "registerStopChildren">;
   timeoutMs?: number;
   rpcTimeoutMs?: number;
@@ -47,6 +50,18 @@ export function createSubagentLifecycle(input: {
   const lifetime = new AbortController();
   let stopping: Promise<StoppedChildren> | undefined;
   let uncertainty: string[] = [];
+  let subagentsRequired = false;
+  const requiresSubagents = (): boolean => {
+    const observable = registry as Partial<ObservedRegistry> | null;
+    const providers = observable?.[storeKey];
+    if (providers instanceof Set && [...providers].some(p => p.sessionId === input.sessionId && p.name === "pi-subagents")) subagentsRequired = true;
+    try { if (input.hasSubagentTool?.() !== false) subagentsRequired = true; }
+    catch { subagentsRequired = true; }
+    // Once observed, disappearing tools/providers cannot turn lost cleanup
+    // evidence into proof that this session never had a child runtime.
+    return subagentsRequired;
+  };
+  requiresSubagents();
   const liveness = (): ParkReady => {
     const reasons: string[] = [];
     if (lifetime.signal.aborted) reasons.push("lifecycle-disposed");
@@ -54,7 +69,7 @@ export function createSubagentLifecycle(input: {
     const observable = registry as Partial<ObservedRegistry> | null;
     if (!observable || observable.version !== 1 || !(observable[storeKey] instanceof Set)) reasons.push("liveness-registry-unobservable");
     const providers = observable?.[storeKey] instanceof Set ? [...observable[storeKey]].filter(p => p.sessionId === input.sessionId) : [];
-    if (!providers.some(p => p.name === "pi-subagents")) reasons.push("pi-subagents-liveness-unregistered");
+    if (requiresSubagents() && !providers.some(p => p.name === "pi-subagents")) reasons.push("pi-subagents-liveness-unregistered");
     for (const provider of providers) {
       try { if (provider.isActive() !== false) reasons.push(`active:${provider.name}`); }
       catch { reasons.push(`unavailable:${provider.name}`); }
@@ -145,7 +160,10 @@ export function createSubagentLifecycle(input: {
         }).then(resolve, reject).finally(() => active.removeEventListener("abort", abort));
         if (active.aborted) abort();
       });
-      do {
+      // An empty home has no package to answer status RPC. Only skip that
+      // contract when neither configured tools nor an observed provider require
+      // it; parent settlement and observable, idle liveness are still checked.
+      if (requiresSubagents()) do {
         const prior = revision;
         const status = await rpc("status", {}, active);
         const snapshot = object(status.asyncSnapshot), omitted = object(snapshot.omitted);

@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { beforeAll, describe, expect, it } from "vitest";
 import { PiRpcDriver, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import { PiRpcTransport, type PiRpcRecord } from "./pi-rpc-transport.js";
+import { sendPiBindRequest } from "./pi-bind-protocol.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 
 // Keep reason: the recorded 130-call callback refusal, through real Pi's default
@@ -58,6 +59,14 @@ describe.skipIf(!process.env.PI_TEST_BINARY)("Pi callback head-of-line real-runt
     try {
       session = await new PiRpcDriver({
         command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off",
+        bindRequest: async (socketPath, request, options) => {
+          const receipt = await sendPiBindRequest(socketPath, request, options);
+          if (request.type === "stop_children") {
+            await writeFile(join(proofRoot, `${placement}.stop-children.json`), `${JSON.stringify(receipt, null, 2)}\n`);
+            console.log(`PI_STOP_CHILDREN_RECEIPT ${JSON.stringify(receipt)}`);
+          }
+          return receipt;
+        },
         runtimeDirectory: join(root, "sessions"), startupTimeoutMs: 30_000, shutdownTimeoutMs: 1000,
         dynamicTools: ["hol_work", "paperclip_finish"].map(name => ({ name, description: name, inputSchema: { type: "object", properties: {} } })),
         dynamicToolHandler: async call => {

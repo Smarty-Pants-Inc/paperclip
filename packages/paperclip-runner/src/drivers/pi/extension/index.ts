@@ -54,6 +54,7 @@ export interface PiBindApi {
   }): void;
   unregisterProvider(name: string): void;
   getActiveTools(): string[];
+  getAllTools?(): Array<{ name: string }>;
   setActiveTools(names: string[]): void;
   setModel?(model: any): Promise<boolean>;
   setThinkingLevel?(level: PiThinkingLevel): void;
@@ -456,7 +457,8 @@ export function installPiSubagentComposition(
       // Recheck at registration too: files may change after the factory loaded.
       verifyPiChildBridge(childBridgePath);
       const sessionId = context.sessionManager.getSessionId();
-      lifecycle = createSubagentLifecycle({ sessionId, events, abortParent: async signal => {
+      const hasSubagentTool = pi.getAllTools ? () => pi.getAllTools!().some(tool => tool.name === "subagent") : undefined;
+      lifecycle = createSubagentLifecycle({ sessionId, events, hasSubagentTool, abortParent: async signal => {
         // ctx.abort() is a public void API. Observe agent_settled rather than
         // mistaking that fire-and-forget call for completed parent settlement.
         signal.throwIfAborted();
