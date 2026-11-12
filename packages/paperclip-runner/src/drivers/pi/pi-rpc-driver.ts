@@ -9,7 +9,8 @@ import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderL
 import { RunAuthority, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
-import { mergedPiModelsJson } from "./pi-models-merge.js";
+import { mergedPiModelsJson, piManagedModelFromSnapshot } from "./pi-models-merge.js";
+import type { PiManagedModel } from "./pi-managed-model.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
@@ -158,10 +159,11 @@ export class PiRpcDriver implements HarnessDriver {
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
       await mkdir(agentHome, { recursive: true, mode: 0o700 });
       environment.PI_CODING_AGENT_DIR = agentHome;
+      const modelConfiguration = await piManagedModelFromSnapshot(join(agentHome, "models.json"), this.#options.model, this.#options.command ?? "pi", environment);
       if (credentialMode === "broker") {
         // Broker/models.json is the FIRST bind. INITIAL contains no provider
         // capability and prepares exactly one preallocated host turn, without IPC.
-        const provider = await createPiProviderBinding({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel });
+        const provider = await createPiProviderBinding({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
         closeProvider = provider.close;
         let privateDirectory: string | undefined;
         try {
@@ -177,7 +179,7 @@ export class PiRpcDriver implements HarnessDriver {
           await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
           const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools, toolSocketPath };
           if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
-          resident = { directory: privateDirectory, socketPath, environment: { ...environment }, epoch: 1, context,
+          resident = { directory: privateDirectory, socketPath, environment: { ...environment }, modelConfiguration, epoch: 1, context,
             binding: { origin, close: provider.close, initial: true }, toolSocketPath };
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
@@ -192,7 +194,7 @@ export class PiRpcDriver implements HarnessDriver {
         }
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
       } else {
-        const provider = directPiProviderConfiguration({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel });
+        const provider = directPiProviderConfiguration({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
         await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json));
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
         environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
@@ -253,6 +255,7 @@ interface PiRunContext {
   tools: PiDynamicTool[];
 }
 interface PiResidentState {
+  modelConfiguration: PiManagedModel;
   directory: string;
   socketPath: string;
   environment: NodeJS.ProcessEnv;
@@ -490,7 +493,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     try {
       await this.#revokeBinding();
       signal?.throwIfAborted();
-      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel });
+      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel, modelConfiguration: resident.modelConfiguration });
       const origin = { epoch: resident.epoch + 1, runId, turnId: `pi-turn-${randomUUID()}` };
       resident.binding = { origin, close: broker.close, initial: false };
       const request = { schema: 1, type: "bind", nonce: randomUUID(), sessionId: this.#normalizedSessionId,

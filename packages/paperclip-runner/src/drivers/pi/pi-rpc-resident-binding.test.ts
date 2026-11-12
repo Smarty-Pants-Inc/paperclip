@@ -118,12 +118,10 @@ async function revoked(provider: { baseUrl: string; apiKey: string }) {
 }
 
 describe("resident Pi model binding", () => {
-  it.each(["xhigh", "max"] as const)("carries only admitted %s metadata through initial bind and resident rebind", async level => {
+  it.each(["xhigh", "max"] as const)("does not invent capabilities from requested %s on initial bind or resident rebind", async level => {
     const f = await fixture({ piRpcThinkingLevel: level });
     const models = JSON.parse(await readFile(join(f.launch.env!.PI_CODING_AGENT_DIR!, "models.json"), "utf8"));
-    const expected = { id: "faux", reasoning: true, thinkingLevelMap: Object.fromEntries(
-      ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => [value, value === level ? value : null]),
-    ) };
+    const expected = { id: "faux", contextWindow: 128000, maxTokens: 8192, reasoning: false };
     expect(models.providers.paperclip.models).toEqual([expected]);
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
