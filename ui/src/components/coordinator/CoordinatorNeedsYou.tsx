@@ -2,7 +2,7 @@ import { useQueryView } from "@/components/QueryView";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { ArrowUpRight, History, Loader2 } from "lucide-react";
+import { AlarmClock, ArrowUpRight, ChevronDown, ChevronRight, History, Loader2, RotateCcw } from "lucide-react";
 import { LayoutGroup, motion, useReducedMotion } from "motion/react";
 import type { Agent, AttentionItem, DecisionHistoryItem } from "@paperclipai/shared";
 import { attentionApi } from "@/api/attention";
@@ -12,10 +12,12 @@ import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { usePanel } from "@/context/PanelContext";
 import { useSidebar } from "@/context/SidebarContext";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
+import { useInboxDismissals } from "@/hooks/useInboxBadge";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
-import { coordinatorAttentionQueryKey, COORDINATOR_RECENT_DECISION_MS, recentDecisionReceipts } from "@/lib/coordinator-attention";
+import { coordinatorAttentionInboxQueryKey, COORDINATOR_RECENT_DECISION_MS, recentDecisionReceipts } from "@/lib/coordinator-attention";
 import { attentionDetailLine, isInlineResolvable } from "@/lib/attention";
+import { reappearLabel, SNOOZE_PRESETS } from "@/lib/attention-snooze";
 import { AttentionInteractionResolver } from "@/components/AttentionInteractionResolver";
 import { StalledReviewActions } from "@/components/StalledReviewActions";
 import { DecisionResolver } from "@/components/DecisionResolver";
@@ -23,6 +25,7 @@ import { PROPERTIES_PANE_HEADER_SLOT_ID } from "@/components/PropertiesPanel";
 import { SidePanelTab } from "@/components/side-panel";
 import { ToolbarSearch } from "@/components/ToolbarSearch";
 import { Button } from "@/components/ui/button";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { NativeSelect } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { parseCssTimeMs } from "@/components/task-chat/motion-tokens";
@@ -94,13 +97,15 @@ export function CoordinatorNeedsYou() {
   const [groupBy, setGroupBy] = useState<Group>("none");
   const [sort, setSort] = useState<"newest" | "oldest">("newest");
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [snoozedOpen, setSnoozedOpen] = useState(false);
+  const { snooze, restore, isPending: dismissalPending } = useInboxDismissals(selectedCompanyId);
   const [now, setNow] = useState(Date.now);
   const [settling, setSettling] = useState<AttentionItem[]>([]);
   const [savedIds, setSavedIds] = useState<Set<string>>(() => new Set());
   useEffect(() => { setSettling([]); setSavedIds(new Set()); }, [selectedCompanyId, userId]);
   const [renderLimit, setRenderLimit] = useState(40);
-  const feed = useQuery({ queryKey: coordinatorAttentionQueryKey(selectedCompanyId!),
-    queryFn: () => attentionApi.list(selectedCompanyId!, { all: true }), enabled: !!selectedCompanyId, refetchOnWindowFocus: true });
+  const feed = useQuery({ queryKey: coordinatorAttentionInboxQueryKey(selectedCompanyId!),
+    queryFn: () => attentionApi.list(selectedCompanyId!, { all: true, includeDismissed: true }), enabled: !!selectedCompanyId, refetchOnWindowFocus: true });
   const feedView = useQueryView(feed);
   const feedWaiting = ["loading", "reconnecting"].includes(feedView.kind);
   const agentQuery = useQuery({ queryKey: queryKeys.agents.list(selectedCompanyId!), queryFn: () => agentsApi.list(selectedCompanyId!), enabled: !!selectedCompanyId });
@@ -136,12 +141,14 @@ export function CoordinatorNeedsYou() {
     for (const item of settling) if (!items.has(`${item.sourceKind}:${item.subject.id}`)) items.set(`${item.sourceKind}:${item.subject.id}`, item);
     return [...items].filter(([key]) => settlingIds.has(key) || (!receipts.has(key) && !savedIds.has(key))).map(([, item]) => item);
   }, [feed.data, settling, settlingIds, recentItems, savedIds]);
-  const filtered = useMemo(() => pendingItems.filter((item) => {
+  const activeItems = useMemo(() => pendingItems.filter(item => !item.dismissal?.isActive), [pendingItems]);
+  const snoozedItems = useMemo(() => pendingItems.filter(item => item.dismissal?.isActive && item.dismissal.kind === "snooze"), [pendingItems]);
+  const filtered = useMemo(() => activeItems.filter((item) => {
     const agentId = String(item.subject.metadata?.createdByAgentId ?? item.subject.metadata?.originAgentId ?? "");
     if (agentFilter && agentId !== agentFilter && item.originAgentName !== agentMap.get(agentFilter)?.name) return false;
     if (projectFilter && item.project?.id !== projectFilter) return false;
     return [item.subject.title, item.relatedIssue?.title, item.relatedIssue?.identifier, item.originAgentName, item.project?.name, attentionDetailLine(item)].join(" ").toLocaleLowerCase().includes(query.trim().toLocaleLowerCase());
-  }).sort((a, b) => (sort === "oldest" ? 1 : -1) * (Date.parse(a.activityAt) - Date.parse(b.activityAt))), [pendingItems, agentFilter, projectFilter, query, sort, agentMap]);
+  }).sort((a, b) => (sort === "oldest" ? 1 : -1) * (Date.parse(a.activityAt) - Date.parse(b.activityAt))), [activeItems, agentFilter, projectFilter, query, sort, agentMap]);
   const groups = useMemo(() => {
     const result = new Map<string, AttentionItem[]>();
     for (const item of filtered.slice(0, renderLimit)) {
@@ -173,7 +180,7 @@ export function CoordinatorNeedsYou() {
   const showHistory = () => { setHistoryOpen(true); if (!isMobile) setPanelVisible(true); };
   useEffect(() => { setBreadcrumbs([{ label: "Inbox" }]); }, [setBreadcrumbs]);
   useEffect(() => {
-    setSettling([]); setHistoryOpen(false); setNow(Date.now()); closePanel();
+    setSettling([]); setHistoryOpen(false); setSnoozedOpen(false); setNow(Date.now()); closePanel();
     return closePanel;
   }, [selectedCompanyId, closePanel]);
   useEffect(() => {
@@ -215,7 +222,7 @@ export function CoordinatorNeedsYou() {
     </div>
     {feedWaiting ? <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />Loading decisions…</p> : null}
     {(feedView.kind === "error") ? <div role="alert" className="space-y-2"><p className="text-sm">Decisions could not be loaded.</p><Button variant="outline" onClick={() => void feed.refetch()}>Retry</Button></div> : null}
-    {!feedWaiting && !(feedView.kind === "error") && filtered.length === 0 ? <div className="space-y-3 py-8 text-center"><p className="text-sm text-muted-foreground">{filtersActive && !visibleRecentItems.length ? "No decisions match these filters." : pendingItems.length ? "No open decisions match these filters." : "You're caught up."}</p><Button variant="ghost" onClick={showHistory}>Open decision history<ArrowUpRight className="size-4" /></Button></div> : null}
+    {!feedWaiting && !(feedView.kind === "error") && filtered.length === 0 ? <div className="space-y-3 py-8 text-center"><p className="text-sm text-muted-foreground">{filtersActive && !visibleRecentItems.length ? "No decisions match these filters." : activeItems.length ? "No open decisions match these filters." : "You're caught up."}</p><Button variant="ghost" onClick={showHistory}>Open decision history<ArrowUpRight className="size-4" /></Button></div> : null}
     {groups.map(([label, items]) => <div key={label} className="space-y-4">{label ? <h2 className="text-sm font-medium text-muted-foreground">{label}</h2> : null}{items.map((item) => {
       const issueId = item.relatedIssue?.id ?? String(item.subject.metadata?.issueId ?? "");
       const interaction = item.sourceKind === "issue_thread_interaction" && isInlineResolvable(item) && issueId;
@@ -223,6 +230,19 @@ export function CoordinatorNeedsYou() {
       const stalledReview = item.sourceKind === "review" && item.subject.kind === "issue" && isInlineResolvable(item) && item.subject.metadata?.reviewAttentionState === "stalled";
       const taskRef = item.relatedIssue ?? (item.subject.kind === "issue" ? item.subject : null);
       const taskLink = taskRef?.href ? <button type="button" onClick={() => { if (taskRef.href) navigate(taskRef.href); }} className="flex max-w-full items-center gap-2 text-left text-sm text-muted-foreground hover:text-foreground"><span className="shrink-0">{taskRef.identifier ?? "Open task"}</span><span className="truncate">{taskRef.title}</span><ArrowUpRight className="size-4 shrink-0" /></button> : null;
+      const footer = <div className="flex min-w-0 flex-wrap items-center gap-2">
+        {taskLink}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button type="button" variant="outline" size="sm" disabled={dismissalPending}>
+              <AlarmClock className="size-4" aria-hidden />Snooze
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {SNOOZE_PRESETS.map(preset => <DropdownMenuItem key={preset.label} onSelect={() => snooze(item.dismissalKey, preset.resolve())}>{preset.label}</DropdownMenuItem>)}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>;
       const id = `${item.sourceKind}:${item.subject.id}`;
       const receipt = settlingIds.has(id) ? recentItems.find(entry => entry.id === id) : undefined;
       const phase = !receipt ? "pending" : ["cancelled", "expired"].includes(receipt.outcome) ? "closed" : "resolved";
@@ -230,19 +250,35 @@ export function CoordinatorNeedsYou() {
       <CoordinatorTaskMotion eventId={`decision:${selectedCompanyId}:${userId}:${id}`} phase={phase} createdAt={item.activityAt} className="coordinator-decision-motion"
         onSettled={() => setSettling(current => current.filter(entry => `${entry.sourceKind}:${entry.subject.id}` !== id))}>
       {receipt ? <Receipt item={receipt} onOpen={navigate} /> : <article className="coordinator-decision-card space-y-4 rounded-xl border border-border bg-card p-6">
-        {interaction ? <AttentionInteractionResolver footerSlot={taskLink} presentation="coordinator-decision" companyId={selectedCompanyId} issueId={issueId} interactionId={item.subject.id} agentMap={agentMap} currentUserId={userId} onResolved={resolved => {
+        {interaction ? <AttentionInteractionResolver footerSlot={footer} presentation="coordinator-decision" companyId={selectedCompanyId} issueId={issueId} interactionId={item.subject.id} agentMap={agentMap} currentUserId={userId} onResolved={resolved => {
           if (!resolved || resolved.status === "pending") { void feed.refetch(); void recent.refetch(); return; }
           onResolved(item);
         }} />
           : decision ? <DecisionResolver companyId={selectedCompanyId} decisionId={item.subject.id} originIssue={item.relatedIssue} agentMap={agentMap} onResolved={() => onResolved(item)} />
-          : stalledReview ? <><h2 className="text-lg font-medium">Choose how this task continues</h2><p className="text-sm">This task is still in review with no active reviewer or continuation. Return it to work, request changes, or mark the task done.</p><StalledReviewActions footerSlot={taskLink} issueId={item.subject.id} companyId={selectedCompanyId} reviewPolicy={readIssueReviewPolicyMetadata(item.subject.metadata)} approveLabel="Mark task done" onResolved={() => { void feed.refetch(); void recent.refetch(); }} /></>
+          : stalledReview ? <><h2 className="text-lg font-medium">Choose how this task continues</h2><p className="text-sm">This task is still in review with no active reviewer or continuation. Return it to work, request changes, or mark the task done.</p><StalledReviewActions footerSlot={footer} issueId={item.subject.id} companyId={selectedCompanyId} reviewPolicy={readIssueReviewPolicyMetadata(item.subject.metadata)} approveLabel="Mark task done" onResolved={() => { void feed.refetch(); void recent.refetch(); }} /></>
           : <><h2 className="text-lg font-medium">{item.subject.title ?? item.whyNow}</h2><p className="text-sm">{attentionDetailLine(item) ?? item.whyNow}</p><Button disabled={!item.subject.href} onClick={() => { if (item.subject.href) navigate(item.subject.href); }}>Open to review<ArrowUpRight className="size-4" /></Button></>}
-        {!interaction && !stalledReview ? taskLink : null}
+        {!interaction && !stalledReview ? footer : null}
       </article>}
       </CoordinatorTaskMotion>
       </motion.div>;
     })}</div>)}
     {filtered.length > renderLimit ? <Button variant="outline" onClick={() => setRenderLimit((value) => value + 40)}>Show more decisions</Button> : null}
+    {snoozedItems.length ? <section className="space-y-4" aria-label="Snoozed decisions">
+      <Button type="button" variant="ghost" aria-label="Snoozed" aria-expanded={snoozedOpen} aria-controls="coordinator-snoozed" onClick={() => setSnoozedOpen(open => !open)}>
+        {snoozedOpen ? <ChevronDown className="size-4" aria-hidden /> : <ChevronRight className="size-4" aria-hidden />}Snoozed ({snoozedItems.length})
+      </Button>
+      <div id="coordinator-snoozed" hidden={!snoozedOpen} className="space-y-4">
+        {snoozedOpen ? snoozedItems.slice(0, renderLimit).map(item => <article key={item.id} className="space-y-4 rounded-xl border border-border bg-card p-6">
+          <h2 className="break-words text-lg font-medium">{item.subject.title ?? item.whyNow}</h2>
+          <p className="break-words text-sm text-muted-foreground">{attentionDetailLine(item) ?? item.whyNow}</p>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-sm text-muted-foreground">Reappears {item.dismissal?.snoozedUntil ? <time dateTime={item.dismissal.snoozedUntil} title={new Date(item.dismissal.snoozedUntil).toLocaleString()}>{reappearLabel(item.dismissal.snoozedUntil)}</time> : "soon"}</p>
+            <Button type="button" variant="outline" size="sm" disabled={dismissalPending} onClick={() => restore(item.dismissalKey)}><RotateCcw className="size-4" aria-hidden />Restore</Button>
+          </div>
+        </article>) : null}
+        {snoozedOpen && snoozedItems.length > renderLimit ? <Button variant="outline" onClick={() => setRenderLimit(value => value + 40)}>Show more snoozed decisions</Button> : null}
+      </div>
+    </section> : null}
     {visibleRecentItems.length ? <section className="space-y-3" aria-label="Recent Decisions"><h2 className="text-sm font-medium text-muted-foreground">Recent Decisions</h2>{recentGroups.map(([label, items]) => <div key={label} className="space-y-3">{label ? <h3 className="text-sm font-medium text-muted-foreground">{label}</h3> : null}{items.map((item) => <motion.div layout={!reducedMotion} layoutId={reducedMotion ? undefined : item.id} transition={{ duration }} key={item.id}><Receipt item={item} onOpen={navigate} /></motion.div>)}</div>)}</section> : null}
     {(recentView.kind === "error") ? <p role="alert" className="text-sm text-muted-foreground">Recent decisions could not be loaded. <button className="underline" onClick={() => void recent.refetch()}>Retry</button></p> : null}
   </section></LayoutGroup>;
