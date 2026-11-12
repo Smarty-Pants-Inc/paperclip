@@ -48,6 +48,17 @@ describe("ordinary native Pi setup hello through the run's configured driver", (
     const value = stub({ events: [event("item.completed", { kind: "agentMessage", channel: "progress", providerPhase: "final_answer", text: "hello" }), terminal()] });
     await expect(probe(value.driver)).resolves.toMatchObject({ helloProbePassed: true });
   });
+  it("ignores facade diagnostics tagged with the pending command turn, but requires the actual provider reply and settlement", async () => {
+    const diagnostic = event("harness.diagnostic", { message: "native provider started" }, { turnId: "turn_lab_pending" });
+    const value = stub({ events: [diagnostic, reply(), terminal()] });
+    await expect(probe(value.driver)).resolves.toMatchObject({ helloProbePassed: true });
+    expect(value.close).toHaveBeenCalledOnce();
+  });
+  it("cannot qualify from diagnostics in place of a native provider reply", async () => {
+    const value = stub({ events: [event("harness.diagnostic", { text: "hello" }, { turnId: "turn_lab_pending" }), terminal()] });
+    await expect(probe(value.driver)).rejects.toThrow();
+    expect(value.close).toHaveBeenCalledOnce();
+  });
   it.each([
     ["turn.failed", "authentication_required", "Authentication required: no API key"],
     ["session.failed", "model_unavailable", "Model unavailable"],

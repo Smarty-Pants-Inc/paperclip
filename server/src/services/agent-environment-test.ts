@@ -573,18 +573,19 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
   }
 
   async function testManagedEnvironment(adapterType: string, context: Parameters<ReturnType<typeof requireServerAdapter>["testEnvironment"]>[0], binding: AiConnectionBinding, managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>>, agentId?: string) {
-    // Only the selected remote command factory has a native LocalFacade probe.
-    // Unsupported targets stay fail closed; never fall through to ACPX/CLI.
+    // Remote command factories use their native LocalFacade probe. Local
+    // targets use the registry's native Pi probe below; never ACPX/CLI.
     if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc"
       && context.executionTarget?.kind === "remote"
       && !(context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask)) {
       await assertManagedAiProjectAuth(context.config, binding.provider, context.executionTarget);
       return probeManagedNativePiRunner(context);
     }
-    if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc") return {
+    if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc"
+      && context.executionTarget?.kind === "remote" && context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask) return {
       adapterType, status: "fail" as const, testedAt: new Date().toISOString(), checks: [{
         code: "pi_rpc_environment_test_unavailable", level: "error" as const,
-        message: "Native Pi connection testing requires a selected remote command factory. Local and plugin-task targets are not supported; no hello probe was run.",
+        message: "Native Pi connection testing is not supported on plugin-task targets; no hello probe was run.",
       }],
     };
     const startedAt = new Date();
@@ -646,6 +647,10 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
           home: managed.home ? join(managed.home, "provider") : undefined })
       : await requireServerAdapter(adapterType).testEnvironment(context);
     if (result.status === "fail") return result;
+    // The registry's native Pi hello already used the projected managed key,
+    // endpoint and model. Do not replace it with another provider's CLI or
+    // a provider-default API-key check that ignores the connection's routing.
+    if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc") return result;
     // Antigravity's native admission checks the selected managed account and
     // exact model without a billable turn. Do not invoke another Google CLI.
     if (adapterType === "paperclip_runner" && context.config.provider === "acpx" && context.config.acpxAgent === "antigravity") {

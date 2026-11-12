@@ -1,17 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
-const mocks = vi.hoisted(() => ({ probe: vi.fn(), adapter: vi.fn(), prepare: vi.fn(), launch: vi.fn(), driver: vi.fn() }));
+const mocks = vi.hoisted(() => ({ probe: vi.fn(), adapter: vi.fn(), prepare: vi.fn(), launch: vi.fn(), driver: vi.fn(), markAuthFailed: vi.fn(), verifyKey: vi.fn() }));
+vi.mock("./ai-api-key-test.js", () => ({ validateAiApiKey: mocks.verifyKey }));
+vi.mock("./ai-connections.js", async original => ({ ...await original<object>(), aiConnectionService: () => ({ markAuthenticationFailed: mocks.markAuthFailed }) }));
 vi.mock("../adapters/index.js", () => ({ requireServerAdapter: () => ({ testEnvironment: mocks.adapter }) }));
 vi.mock("../vendor/paperclip-runner/index.js", async original => ({ ...await original<object>(), probeNativeRunnerEnvironment: mocks.probe }));
 vi.mock("./native-runtime/native-session-executor.js", async () => ({
+  resolveLocalPiLaunchArtifacts: async () => ({ piCommand: "/selected/pi.js", piProxyPath: "/selected/proxy.cjs" }),
   resolveRemoteProviderPackSource: () => ({ configuredRoot: "/selected/pack", manifest: { digest: `sha256:${"a".repeat(64)}`, payload: { nativeProviders: { pi_rpc: { version: "1.5.2", profileDigest: QUALIFIED_PI_RPC_PROFILE.commandDigest, path: "provider-assets/pi_rpc/linux-x64", sha256: `sha256:${"b".repeat(64)}`, closureDigest: `sha256:${"c".repeat(64)}` } }, artifacts: {
     nodeCommand: { path: "node", sha256: `sha256:${"d".repeat(64)}` }, piRpcExecutable: { path: "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", sha256: `sha256:${"e".repeat(64)}` }, piRpcProxy: { path: "dist/cli/pi-rpc-app-server-proxy.cjs", sha256: `sha256:${"f".repeat(64)}` },
   } } } }), prepareRemoteProviderPackOnTarget: mocks.prepare, stageRemoteRunnerFile: vi.fn(), createRemoteRunnerProcessLauncher: mocks.launch, readRemoteRunnerState: vi.fn(),
 }));
-vi.mock("./native-runtime/native-codex-runner.js", () => ({ resolveRemotePaperclipRunnerBinary: () => "/selected/runnerd" }));
+vi.mock("./native-runtime/native-codex-runner.js", () => ({ resolveRemotePaperclipRunnerBinary: () => "/selected/runnerd", resolvePaperclipRunnerBinary: () => "/selected/runnerd" }));
 vi.mock("./native-runtime/native-runner-execution-driver.js", () => ({ createNativeRunnerExecutionDriver: mocks.driver, prepareNativeRemoteRunner: async (input: { prepareRemote: () => Promise<void> }) => input.prepareRemote() }));
 import { QUALIFIED_PI_RPC_PROFILE } from "../vendor/paperclip-runner/index.js";
+import { testNativeRunnerAuthentication } from "./native-runtime/setup-readiness.js";
+import { assertHarnessTestPassed } from "./agent-harness-verification.js";
 import { agentEnvironmentTestService } from "./agent-environment-test.js";
 const model = "paperclip/gateway/nested/claude-opus-5-5";
 const runner = { execute: vi.fn() };
@@ -46,12 +51,11 @@ describe("native managed Pi Setup Test", () => {
     expect(mocks.adapter).not.toHaveBeenCalled();
     expect(JSON.stringify(result)).not.toContain("credential-canary");
   });
-  it("rejects Claude max under the existing server admission rule before any metadata or prompt", async () => {
+  it("leaves explicit max admission to the native Pi model catalog", async () => {
     const result = await test({ ...config, piRpcThinkingLevel: "max" });
-    expect(result).toMatchObject({ status: "fail" });
-    expect(result.checks[0].message).toMatch(/at most xhigh/);
-    expect(mocks.probe).not.toHaveBeenCalled();
-    expect(mocks.launch).not.toHaveBeenCalled();
+    expect(result.status).toBe("pass");
+    expect(mocks.probe).toHaveBeenCalledTimes(2);
+    for (const [input] of mocks.probe.mock.calls) expect(input.transportOptions.piRpcThinkingLevel).toBe("max");
   });
   it.each(["handled-but-empty", "tool-only", "stale-session", "EOF", "close-failed"])("reports %s as failure with a safe reason", async reason => {
     mocks.probe.mockResolvedValueOnce({ ...receipt, helloProbePassed: false, admissionOnly: true, sessionAdmissionPassed: true, piMetadata: { version: "1.5.2" } });
@@ -74,5 +78,51 @@ describe("native managed Pi Setup Test", () => {
     const result = await test(config, { ...target, runnerTask: vi.fn() } as AdapterEnvironmentTestContext["executionTarget"]);
     expect(result).toMatchObject({ status: "fail", checks: [expect.objectContaining({ code: "pi_rpc_environment_test_unavailable" })] });
     expect(mocks.probe).not.toHaveBeenCalled();
+  });
+});
+
+// Keep: rung-3 live hire verification rejected every locally probed managed Pi
+// connection before the native probe. This is the credential trust boundary.
+describe("local native Pi managed connection verification", () => {
+  const managedConfig = { ...config, managedAiRouting: { kind: "gateway", protocol: "messages", auth: "bearer" },
+    env: { ...config.env, PAPERCLIP_AI_PROVIDER_URL: "https://selected-gateway.example/v1",
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "bearer" } };
+  beforeEach(() => {
+    mocks.adapter.mockImplementation((context: AdapterEnvironmentTestContext) =>
+      testNativeRunnerAuthentication(context, "pi_rpc", context.config.model as string));
+    mocks.probe.mockImplementation(async options => {
+      await options.onCleanupConfirmed();
+      return receipt;
+    });
+  });
+  it.each([null, "messages", "responses"] as const)("reaches native Pi with the selected managed key, route and model (protocol=%s)", async protocol => {
+    const selected = protocol ? { ...managedConfig, env: { ...managedConfig.env, PAPERCLIP_AI_PROVIDER_PROTOCOL: protocol },
+      managedAiRouting: { ...managedConfig.managedAiRouting, protocol } } : config;
+    const result = await test(selected, null);
+    expect(result.status).toBe("pass");
+    expect(result.checks.map(check => check.code)).toEqual(["pi_rpc_hello_probe_passed"]);
+    expect(() => assertHarnessTestPassed(result)).not.toThrow();
+    expect(mocks.adapter).toHaveBeenCalledOnce();
+    expect(mocks.probe).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ provider: "pi_rpc", model,
+      environment: expect.objectContaining(selected.env),
+      transportOptions: expect.objectContaining({ piCommand: "/selected/pi.js", piProxyPath: "/selected/proxy.cjs", piRpcThinkingLevel: "xhigh" }) }));
+    expect(mocks.verifyKey).not.toHaveBeenCalled();
+    expect(mocks.markAuthFailed).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("credential-canary");
+  });
+  it.each([
+    [401, "Unauthorized 401: credential-canary", "pi_rpc_hello_probe_auth_required", "harness_auth_failed"],
+    [404, "Model unavailable (404): credential-canary", "pi_rpc_hello_probe_model_unavailable", "harness_model_unavailable"],
+  ] as const)("classifies native Pi HTTP %s without another provider probe", async (_status, message, check, failure) => {
+    mocks.probe.mockImplementationOnce(async options => { await options.onCleanupConfirmed(); throw new Error(message); });
+    const result = await test(managedConfig, null);
+    expect(result.status).toBe("fail");
+    expect(result.checks.map(item => item.code)).toEqual([check]);
+    expect(() => assertHarnessTestPassed(result)).toThrow(expect.objectContaining({ code: failure }));
+    expect(mocks.probe).toHaveBeenCalledOnce();
+    expect(mocks.adapter).toHaveBeenCalledOnce();
+    expect(mocks.verifyKey).not.toHaveBeenCalled();
+    expect(mocks.markAuthFailed).toHaveBeenCalledTimes(_status === 401 ? 1 : 0);
+    expect(JSON.stringify(result)).not.toContain("credential-canary");
   });
 });
