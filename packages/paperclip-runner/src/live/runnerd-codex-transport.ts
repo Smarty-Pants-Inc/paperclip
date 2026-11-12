@@ -4096,6 +4096,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #closedSignal: Promise<void>;
   #resolveClosedSignal!: () => void;
   #closePromise: Promise<void> | null = null;
+  #retainUnsettledRemoteRunner = false;
   #shutdownSettled = false;
   #probeRetirement: Promise<void> | null = null;
   readonly prepareConversationResume?: CodexAppServerTransport["prepareConversationResume"];
@@ -5353,11 +5354,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return false;
   }
 
-  close(reason?: string): Promise<void> {
+  close(reason?: string, options?: { retainUnsettledRemoteRunner?: boolean }): Promise<void> {
     // Detachment relinquishes process ownership. A late execution finalizer
     // must not suspend or signal the runner now owned by the next controller.
     if (this.#controllerDetachedForRestart)
       return this.#detachPromise ?? Promise.resolve();
+    if (this.#closePromise === null) this.#retainUnsettledRemoteRunner = options?.retainUnsettledRemoteRunner === true;
     if (reason) {
       this.#diagnostic(
         `runner transport close requested: ${reason.replaceAll(/[\r\n]/g, " ").slice(0, 1_000)}`,
@@ -5546,6 +5548,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     // runnerd exited on its own, unsuspended, while the session was open: it
     // was lost (killed or crashed), not stopped or broken by this close.
     let runnerLost = false;
+    let runnerRetained = false;
+    const remoteRunnerRetainable = this.#retainUnsettledRemoteRunner
+      && this.options.recoveryPurpose !== "stop_cleanup"
+      && (this.options.runnerProcessLauncher !== undefined || adoptedRunner !== undefined);
     let lastSuspensionState: Record<string, unknown> | null = null;
     let suspensionState: {
       commandStatus: string | null;
@@ -5634,9 +5640,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#diagnostic(
           "runner did not prove durable suspension before checkpoint",
         );
+        runnerRetained = remoteRunnerRetainable && !runnerLost && !(await this.#runnerHasExited());
+        if (runnerRetained) this.#diagnostic("remote runner left alive unsettled for same-run reattachment");
       }
       try {
-        if (this.#handle) {
+        if (runnerRetained) {
+          this.#evidence.runnerExited = false;
+        } else if (this.#handle) {
           const result = await waitForProcess(
             this.#handle,
             Math.max(0, closeDeadline - Date.now()),
@@ -5720,7 +5730,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             : this.#controlPlaneCheckpoint,
         forceKill: async () => {
           const handle = this.#handle;
-          if (!handle || this.#evidence.runnerExited) return;
+          if (!handle || this.#evidence.runnerExited || runnerRetained) return;
           handle.child.kill("SIGKILL");
           // A remote kill dispatches an asynchronous, ownership-fenced RPC.
           // Do not release the session for reuse until its process monitor has
@@ -5750,6 +5760,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (suspensionRequired && !runnerSettled && !runnerLossReaped) {
       const settlement = {
         runnerSuspended,
+        runnerRetained,
         providerDrained,
         suspensionState,
         semanticTools: this.#core?.semanticToolSettlementDiagnostics(),
