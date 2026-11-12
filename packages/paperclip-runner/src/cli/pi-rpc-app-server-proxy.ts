@@ -211,6 +211,11 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let inputEnded = false;
   const announcedTurnIds = new Set<string>();
   const usageTotals: Record<string, number> = {};
+  const usageByTurn = new Map<string, {
+    receipts: Map<string, string>;
+    total: Record<string, number>;
+    complete: boolean;
+  }>();
 
   const log = (message: string) => options.writeStderr?.(message);
 
@@ -264,6 +269,62 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     activeRunId = runId;
   }
 
+  function reportUsage(opened: PiRpcProxySession, event: {
+    runId: string; turnId?: string; itemId?: string;
+  }, payload: Record<string, unknown>): void {
+    const delta = record(payload.runDelta);
+    const cumulative = record(payload.cumulative);
+    let total = cumulative;
+    let last = delta;
+    let complete = payload.runDeltaAvailable === true && payload.accountingComplete !== false;
+    if (Object.keys(cumulative).length === 0) {
+      // Pi's final receipts are per MESSAGE, whereas Codex/Rust `last` is a
+      // TURN snapshot. Keep one ledger keyed by captured run/turn and receipt,
+      // including settled turns so late replay cannot charge a message twice.
+      const turnKey = JSON.stringify([event.runId, event.turnId]);
+      const turn = usageByTurn.get(turnKey) ?? { receipts: new Map<string, string>(), total: {} as Record<string, number>, complete: true };
+      const wasComplete = turn.complete;
+      const receiptId = text(payload.providerRequestId) || text(event.itemId);
+      turn.complete &&= complete && !!event.turnId && !!receiptId;
+      usageByTurn.set(turnKey, turn);
+      if (receiptId) {
+        const fingerprint = JSON.stringify(Object.entries(delta).sort(([left], [right]) => left.localeCompare(right)));
+        const previous = turn.receipts.get(receiptId);
+        if (previous !== undefined) {
+          if (previous !== fingerprint) throw new Error("pi_proxy_conflicting_usage_receipt");
+          if (turn.complete === wasComplete) return;
+        } else {
+          turn.receipts.set(receiptId, fingerprint);
+          for (const [key, value] of Object.entries(delta)) {
+            if (typeof value !== "number" || !Number.isFinite(value) || value < 0) continue;
+            const turnSum = (turn.total[key] ?? 0) + value;
+            const sessionSum = (usageTotals[key] ?? 0) + value;
+            if (!Number.isFinite(sessionSum) || (key.endsWith("Tokens") && !Number.isSafeInteger(sessionSum))) throw new Error("pi_proxy_usage_overflow");
+            turn.total[key] = turnSum;
+            usageTotals[key] = sessionSum;
+          }
+        }
+      } else if (!wasComplete && Object.keys(delta).length === 0) return;
+      total = { ...usageTotals };
+      last = { ...turn.total };
+      complete = turn.complete;
+    }
+    send({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: opened.ids().driverSessionId,
+        ...(typeof event.turnId === "string" ? { turnId: event.turnId } : {}),
+        // Rust derives runDeltaAvailable from last's presence. Never put a
+        // partial measurement there, even if some known tokens are non-zero.
+        tokenUsage: { total, ...(complete ? { last } : {}) },
+        cumulative: total,
+        runDelta: last,
+        runDeltaAvailable: complete,
+        ...(payload.context === undefined ? {} : { context: record(payload.context) }),
+      },
+    });
+  }
+
   async function pumpEvents(opened: PiRpcProxySession): Promise<void> {
     for await (const event of opened.events()) {
       const payload = piPartialToolPayload(event.eventType, record(event.payload));
@@ -285,6 +346,11 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         // Facade item notifications must be bound to a turn. Do not carry
         // OpenCode's provider-specific unbound-model filtering into Pi.
         if (typeof event.turnId !== "string" || !event.turnId) continue;
+        // Unaccounted summarization/child work can invalidate a previously
+        // complete turn even without another assistant usage receipt.
+        if (payload.kind === "usage" && record(payload.usage).runDeltaComplete === false) {
+          reportUsage(opened, { runId: event.runId, turnId: event.turnId }, { runDeltaAvailable: false, accountingComplete: false });
+        }
         send(openCodeProxyItemNotification({
           eventType: event.eventType,
           threadId: opened.ids().driverSessionId,
@@ -293,31 +359,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           payload,
         }));
       } else if (event.eventType === "usage.reported") {
-        // The shared Rust facade reads tokenUsage.total/last (not Harness
-        // cumulative/runDelta). Pi receipts carry per-message deltas, including
-        // across warm turns; accumulate totals once at this Pi-only boundary.
-        const delta = record(payload.runDelta);
-        const cumulative = record(payload.cumulative);
-        if (Object.keys(cumulative).length === 0 && payload.runDeltaAvailable === true) {
-          for (const [key, value] of Object.entries(delta)) {
-            if (typeof value === "number" && Number.isFinite(value) && value >= 0) usageTotals[key] = (usageTotals[key] ?? 0) + value;
-          }
-        }
-        send({
-          method: "thread/tokenUsage/updated",
-          params: {
-            threadId: opened.ids().driverSessionId,
-            ...(typeof event.turnId === "string" ? { turnId: event.turnId } : {}),
-            tokenUsage: {
-              total: Object.keys(cumulative).length ? cumulative : { ...usageTotals },
-              ...(payload.runDeltaAvailable === true ? { last: delta } : {}),
-            },
-            cumulative,
-            runDelta: delta,
-            runDeltaAvailable: payload.runDeltaAvailable === true,
-            ...(payload.context === undefined ? {} : { context: record(payload.context) }),
-          },
-        });
+        reportUsage(opened, event, payload);
       } else if (event.eventType === "run.result.proposed") {
         send({
           method: "paperclip/runResult",
@@ -465,6 +507,10 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         workingDirectory: cwd,
       });
     }
+    // A new native thread starts a new session accounting scope. Warm
+    // run.attach/turn.start must not reset its cumulative total.
+    for (const key of Object.keys(usageTotals)) delete usageTotals[key];
+    usageByTurn.clear();
     session = opened;
     eventPump = pumpEvents(opened);
     void eventPump.catch((error) => {

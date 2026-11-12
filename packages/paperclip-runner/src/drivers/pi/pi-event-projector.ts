@@ -142,7 +142,18 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     tool.input = boundedText(JSON.stringify(args)); tool.args = structuredClone(args);
   };
   const usageFor = (message: Record<string, unknown>, key: string, output: PiProjectedEvent[]) => {
-    if (message.usage === undefined) { if (message.role === "assistant") { usageComplete = false; costComplete = false; } return; }
+    if (message.usage === undefined) {
+      if (message.role === "assistant") {
+        usageComplete = false; costComplete = false;
+        // Invalidate an earlier complete snapshot even when this is the last
+        // message of the turn. Absence is not a zero-token receipt.
+        output.push(emit("usage.reported", `${prefix}:pi-usage:${digest(key)}`, {
+          provider: "pi_rpc", providerRequestId: digest(key),
+          runDeltaAvailable: false, runDelta: {}, accountingComplete: false,
+        }));
+      }
+      return;
+    }
     const usage = record(message.usage);
     const names = { input: "inputTokens", output: "outputTokens", cacheRead: "cachedInputTokens", cacheWrite: "cacheWriteTokens" };
     const counts: Record<string, number> = {};

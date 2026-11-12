@@ -136,16 +136,21 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
     projector.project(update("text_delta", { delta: "part" }));
     expect(projector.project(update("text_end", { content: "part" }))).toEqual([]);
     const emitted = projector.project(final({ content: [{ type: "text", text: "authoritative" }] }));
-    expect(emitted).toMatchObject([{ eventType: "item.completed", itemId: "t:pi-message:1:block:0", payload: { text: "authoritative", channel: "final" } }]);
+    expect(emitted).toMatchObject([
+      { eventType: "item.completed", itemId: "t:pi-message:1:block:0", payload: { text: "authoritative", channel: "final" } },
+      { eventType: "usage.reported", payload: { runDeltaAvailable: false, accountingComplete: false } },
+    ]);
     expect(projector.project(final({ content: [{ type: "text", text: "authoritative" }] }))).toEqual([]);
   });
   it("supports final-only text and keeps reasoning separate without signatures", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t", includeThinking: true });
     const events = projector.project(final({ content: [{ type: "thinking", thinking: "reason", thinkingSignature: "private-signature" }, { type: "text", text: "answer" }] }));
-    expect(events.map(event => event.payload.kind)).toEqual(["reasoning", "agentMessage"]);
+    expect(events.filter(event => event.eventType === "item.completed").map(event => event.payload.kind)).toEqual(["reasoning", "agentMessage"]);
     expect(events[0].payload.channel).toBe("detail");
     expect(JSON.stringify(events)).not.toContain("signature");
-    expect(createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ content: [{ type: "thinking", thinking: "private" }] }))).toEqual([]);
+    expect(createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ content: [{ type: "thinking", thinking: "private" }] }))).toMatchObject([
+      { eventType: "usage.reported", payload: { runDeltaAvailable: false, accountingComplete: false } },
+    ]);
   });
   it("supports interleaved block indexes, including zero, without merging their text", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t", includeThinking: true });
@@ -161,7 +166,10 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
   });
   it("does not replace absent usage/cost with zero or call partial totals complete", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
-    expect(projector.project(final()).some(event => event.payload.kind === "usage")).toBe(false);
+    const missing = projector.project(final());
+    expect(missing.some(event => event.payload.kind === "usage")).toBe(false);
+    expect(missing.find(event => event.eventType === "usage.reported")?.payload).toMatchObject({ runDeltaAvailable: false, runDelta: {}, accountingComplete: false });
+    expect(validatePrpEvent(envelope(missing.at(-1)!, 0))).toMatchObject({ ok: true });
     const events = projector.project(final({ responseId: "reply-2", timestamp: 2, usage: { input: 4 } }));
     expect(events.at(-1)?.payload.usage).toMatchObject({ total: { inputTokens: 4 }, runDeltaComplete: false, costProvenance: "unknown", costComplete: false });
     expect(JSON.stringify(events)).not.toContain("estimatedCostUsd");
@@ -231,7 +239,10 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
     const partial = projector.project(update("text_delta", { delta: "unconfirmed partial" }));
     const events = projector.project(final({ stopReason, content: [] }));
-    expect(events).toMatchObject([{ eventType: "item.failed", itemId: partial[0].itemId, payload: { text: "" } }]);
+    expect(events).toMatchObject([
+      { eventType: "item.failed", itemId: partial[0].itemId, payload: { text: "" } },
+      { eventType: "usage.reported", payload: { runDeltaAvailable: false, accountingComplete: false } },
+    ]);
   });
   it.each(["error", "aborted"])("retains native %s as item failure, never turn settlement", stopReason => {
     const events = createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ stopReason, errorMessage: "native failure" }));
