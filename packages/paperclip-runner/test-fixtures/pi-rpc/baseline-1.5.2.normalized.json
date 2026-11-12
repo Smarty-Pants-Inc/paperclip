@@ -1,5 +1,6 @@
 [
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -10,6 +11,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -20,6 +22,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -30,6 +33,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -40,6 +44,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "usage.reported",
     "itemId": "turn-1:pi-usage:097ab55f9ffa267b713f8901fdaa1b720469aef1a418f78121321c0db12215d1",
@@ -61,6 +66,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-usage:097ab55f9ffa267b713f8901fdaa1b720469aef1a418f78121321c0db12215d1",
@@ -93,6 +99,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.started",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -107,6 +114,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -128,6 +136,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -149,6 +158,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "usage.reported",
     "itemId": "turn-2:pi-usage:fee4a8a3f6ae390eaf0cff9145a4e59e788a4fe3848e404959ec331e830004a1",
@@ -170,6 +180,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-usage:fee4a8a3f6ae390eaf0cff9145a4e59e788a4fe3848e404959ec331e830004a1",
@@ -202,6 +213,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -223,6 +235,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "tool.execution.started",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -246,6 +259,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -267,6 +281,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "tool.execution.progressed",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -290,6 +305,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -312,6 +328,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "tool.execution.progressed",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -335,6 +352,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -359,6 +377,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "tool.execution.completed",
     "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
@@ -382,6 +401,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.started",
     "itemId": "turn-2:pi-message:2:block:0",
@@ -392,6 +412,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-message:2:block:0",
@@ -402,6 +423,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-message:2:block:0",
@@ -412,6 +434,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-message:2:block:0",
@@ -422,6 +445,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "usage.reported",
     "itemId": "turn-2:pi-usage:02f96f67b411f781407b6194475503eb405e8d82cf6b53f1b5339665bc5679a6",
@@ -443,6 +467,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-usage:02f96f67b411f781407b6194475503eb405e8d82cf6b53f1b5339665bc5679a6",
@@ -475,6 +500,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.started",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -489,6 +515,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.delta",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -510,6 +537,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.delta",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -531,6 +559,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "usage.reported",
     "itemId": "turn-3:pi-usage:13126369be7ce8cc3eba295326186b41999164f31677ae87fb423fe8e7937bd1",
@@ -552,6 +581,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.completed",
     "itemId": "turn-3:pi-usage:13126369be7ce8cc3eba295326186b41999164f31677ae87fb423fe8e7937bd1",
@@ -584,6 +614,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.delta",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -605,6 +636,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "tool.execution.started",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -628,6 +660,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.delta",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -649,6 +682,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "tool.execution.progressed",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -672,6 +706,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.delta",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -694,6 +729,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "tool.execution.progressed",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -717,6 +753,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.failed",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -742,6 +779,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "tool.execution.completed",
     "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
@@ -765,6 +803,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.started",
     "itemId": "turn-3:pi-message:2:block:0",
@@ -775,6 +814,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.delta",
     "itemId": "turn-3:pi-message:2:block:0",
@@ -785,6 +825,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.delta",
     "itemId": "turn-3:pi-message:2:block:0",
@@ -795,6 +836,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.completed",
     "itemId": "turn-3:pi-message:2:block:0",
@@ -805,6 +847,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "usage.reported",
     "itemId": "turn-3:pi-usage:5debade53f5e0bbcdd4046aef315e007dd930b40a7a41fae28bf287cd2be0d3d",
@@ -826,6 +869,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-3",
     "eventType": "item.completed",
     "itemId": "turn-3:pi-usage:5debade53f5e0bbcdd4046aef315e007dd930b40a7a41fae28bf287cd2be0d3d",

@@ -11,5 +11,5 @@ export {
   type PiNativeThinkingLevel,
   type PiRpcAdmissionPort,
 } from "./pi-native-config.js";
-export { createPiEventProjector, type PiProjectedEvent } from "./pi-event-projector.js";
+export { createPiEventProjector, type PiEventOrigin, type PiProjectedEvent } from "./pi-event-projector.js";
 export { probePiNativeEnvironment, PiEnvironmentProbeCleanupError } from "./pi-environment-probe.js";

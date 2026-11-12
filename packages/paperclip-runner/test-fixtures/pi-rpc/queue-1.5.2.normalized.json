@@ -1,5 +1,6 @@
 [
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -10,6 +11,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -20,6 +22,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "harness.diagnostic",
     "payload": {
@@ -28,6 +31,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "harness.diagnostic",
     "payload": {
@@ -36,6 +40,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -46,6 +51,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -56,6 +62,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "usage.reported",
     "itemId": "turn-1:pi-usage:071344113b85db2fe641305854d3eafe57be9d55b8e8058a994eb1b17dd282d1",
@@ -77,6 +84,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-usage:071344113b85db2fe641305854d3eafe57be9d55b8e8058a994eb1b17dd282d1",
@@ -109,6 +117,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "harness.diagnostic",
     "payload": {
@@ -117,6 +126,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
     "itemId": "turn-1:pi-message:2:block:0",
@@ -127,6 +137,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:2:block:0",
@@ -137,6 +148,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:2:block:0",
@@ -147,6 +159,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-message:2:block:0",
@@ -157,6 +170,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "usage.reported",
     "itemId": "turn-1:pi-usage:b81ef4d5bae2b207a4565f77dd5db7f1b98f8a3e2b99a990ace6b8fee7d277aa",
@@ -178,6 +192,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-usage:b81ef4d5bae2b207a4565f77dd5db7f1b98f8a3e2b99a990ace6b8fee7d277aa",
@@ -210,6 +225,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "harness.diagnostic",
     "payload": {
@@ -218,6 +234,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
     "itemId": "turn-1:pi-message:3:block:0",
@@ -228,6 +245,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:3:block:0",
@@ -238,6 +256,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:3:block:0",
@@ -248,6 +267,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-message:3:block:0",
@@ -258,6 +278,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "usage.reported",
     "itemId": "turn-1:pi-usage:76a90d2f32d2ab6a1966cd522a394b45a81c456cde87c69f75dcd950ed568421",
@@ -279,6 +300,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-usage:76a90d2f32d2ab6a1966cd522a394b45a81c456cde87c69f75dcd950ed568421",

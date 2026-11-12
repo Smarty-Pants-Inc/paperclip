@@ -59,7 +59,7 @@ describe("immutable real Pi 1.5.2 lifecycle recordings against the controlled pe
     expect(commands("extension").map(command => command.type)).toEqual(["clear_queue", "abort"]);
     expect(raw.some(event => event.type === "agent_start")).toBe(true);
     expect(raw.find(event => event.type === "agent_settled")).toMatchObject({ aborted: true });
-    expect(projectPiRecording(raw, true)).toEqual([{ eventType: "harness.diagnostic", payload: { code: "pi_unrequested_agent_start_fenced", providerMethod: "agent_start" } }]);
+    expect(projectPiRecording(raw, true)).toEqual([{ runId: "pi-capture", turnId: "turn-0", eventType: "harness.diagnostic", payload: { code: "pi_unrequested_agent_start_fenced", providerMethod: "agent_start" } }]);
   });
   it("calls the installed subagent tool without launching a child, keeping usage unknown", () => {
     const raw = wire("subagent");

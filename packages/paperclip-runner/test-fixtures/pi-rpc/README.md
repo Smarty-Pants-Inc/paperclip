@@ -7,7 +7,32 @@ These are **real Pi RPC process outputs** from the pinned npm dependency, talkin
 - `.commands.jsonl`: exact stdin RPC commands, including unsupported `high`, queued steer/follow-up and fence cancellation.
 - `.requests.json`: local HTTP-peer request summaries (not secrets or full user messages).
 - `.provenance.json`: runtime version, CLI/capture SHA256, scenario, child exit, model-request count. All eight exit normally with code 0.
-- `.normalized.json`: deterministic replay through the checked-in **current projector**, not hand-authored expected provider events.
+- `.normalized.json`: deterministic replay through the checked-in **current projector**, not hand-authored expected provider events. Each record now includes its explicit replay-driver `runId` and `turnId`; the captured wire, commands, requests and provenance are unchanged.
+
+## Driver-owned attribution (C3)
+
+`createPiEventProjector({ runId, turnId, includeThinking? })` requires the
+Runner driver's admitted origin. It copies both IDs at creation and returns
+that origin on **every** record, including diagnostics, compaction and usage.
+Missing, empty, non-string or over-240-character IDs are refused by name. There
+is no current-run default and native payload fields cannot override ownership.
+
+Keep one projector per admitted Runner turn. Retain that projector in delayed
+event callbacks after the turn settles; do not dispatch old callbacks through
+the next turn's projector. Persist/envelope the returned `runId` and `turnId`
+without replacing them with mutable current-driver context. Usage receipt
+identity, deduplication and totals remain local to the originating projector.
+The projector cannot infer an old turn from an unlabelled native event routed
+to the wrong projector; event routing and terminal authority remain driver-owned.
+
+`pi-event-attribution.test.ts` demonstrates red-before-green delayed text,
+tool-result and usage delivery after next-turn admission (both same-run and
+cross-run), including a driver reusing its mutable origin holder.
+`pi-event-origin.test.ts` checks every output family, native spoofing, output
+mutation, diagnostic suppression and invalid origins. The recording replay
+helper uses explicit fixture-driver origins, not arrival-time stamping. Its
+fenced diagnostic uses the fixture journal's `turn-0`, not a prompt grant.
+These are helper/PRP-boundary checks, not proof of installed driver routing.
 
 Scenarios: baseline text with U+2028 and emoji, real successful/failing Bash calls and streamed thinking opt-in; unsupported-thinking clamped to `off`; streaming abort; steer/follow-up queue; native HTTP-500 auto-retry; automatic threshold compaction with 4096-token context; unsolicited extension turn; installed `pi-subagents@0.88.0` **action:list** (no child launch).
 

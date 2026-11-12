@@ -1,5 +1,6 @@
 [
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -10,6 +11,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -20,6 +22,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.delta",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -30,6 +33,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-message:1:block:0",
@@ -40,6 +44,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "usage.reported",
     "itemId": "turn-1:pi-usage:3a04318e5492f8dff9b15b153ec397f4779cbc71b5bbb1aa49ba2e23171c15d2",
@@ -61,6 +66,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.completed",
     "itemId": "turn-1:pi-usage:3a04318e5492f8dff9b15b153ec397f4779cbc71b5bbb1aa49ba2e23171c15d2",
@@ -93,6 +99,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.started",
     "itemId": "turn-2:pi-message:1:block:0",
@@ -103,6 +110,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-message:1:block:0",
@@ -113,6 +121,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.delta",
     "itemId": "turn-2:pi-message:1:block:0",
@@ -123,6 +132,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-message:1:block:0",
@@ -133,6 +143,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "usage.reported",
     "itemId": "turn-2:pi-usage:27a3ad423c8d1973e9f737da2e5591c51bbff35bf5557a6b4188df2df1c674de",
@@ -154,6 +165,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-usage:27a3ad423c8d1973e9f737da2e5591c51bbff35bf5557a6b4188df2df1c674de",
@@ -186,6 +198,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-usage:unaccounted-summary",
@@ -214,6 +227,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "harness.diagnostic",
     "payload": {
@@ -222,6 +236,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "item.completed",
     "itemId": "turn-2:pi-usage:unaccounted-summary",
@@ -250,6 +265,7 @@
     }
   },
   {
+    "runId": "pi-capture",
     "turnId": "turn-2",
     "eventType": "context.compacted",
     "itemId": "turn-2:pi-compaction:1",

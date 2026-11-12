@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
 
-export interface PiProjectedEvent {
+/** Driver-admitted ownership, captured once for the lifetime of a Runner turn. */
+export interface PiEventOrigin {
+  runId: string;
+  turnId: string;
+}
+export interface PiProjectedEvent extends PiEventOrigin {
   eventType: PrpEvent["eventType"];
   itemId?: string;
   payload: Record<string, unknown>;
@@ -42,10 +47,19 @@ function contentText(value: unknown): string {
  * The transport owns bounded UTF-8/JSONL decoding, run/session fencing, replay
  * cursors and terminal authority. In particular, agent_end is NOT settlement.
  * No display event authorizes completion, artifact registration or delegation.
+ *
+ * The driver supplies the admitted origin and retains this projector for any
+ * delayed callbacks from that turn, even after settlement/next admission. Every
+ * output carries that captured origin; an envelope must not overwrite it with
+ * the driver's current run/turn. Native event payloads cannot select ownership.
  */
-export function createPiEventProjector(options: { turnId: string; includeThinking?: boolean }): { project(value: unknown): PiProjectedEvent[] } {
-  if (!options.turnId || options.turnId.length > 240) throw new Error("pi_projection_turn_id_invalid");
-  const prefix = options.turnId.length <= 120 ? options.turnId : `pi-turn-${digest(options.turnId)}`;
+export function createPiEventProjector(options: PiEventOrigin & { includeThinking?: boolean }): { project(value: unknown): PiProjectedEvent[] } {
+  if (typeof options.runId !== "string" || !options.runId || options.runId.length > 240) throw new Error("pi_projection_run_id_invalid");
+  if (typeof options.turnId !== "string" || !options.turnId || options.turnId.length > 240) throw new Error("pi_projection_turn_id_invalid");
+  // Copy primitive IDs: callers may reuse/mutate their current-origin holder.
+  const origin: PiEventOrigin = { runId: options.runId, turnId: options.turnId };
+  const includeThinking = options.includeThinking === true;
+  const prefix = origin.turnId.length <= 120 ? origin.turnId : `pi-turn-${digest(origin.turnId)}`;
   let ordinal = 0;
   let messageId: string | undefined;
   let blocks = new Map<number, Block>();
@@ -64,9 +78,9 @@ export function createPiEventProjector(options: { turnId: string; includeThinkin
     // Never copy arbitrary native payloads, extension text or paths to diagnostics.
     if (diagnosticCount > 16) return [];
     const suppressed = diagnosticCount++ === 16;
-    return [{ eventType: "harness.diagnostic", payload: { code: suppressed ? "pi_diagnostics_suppressed" : code, providerMethod: suppressed ? "suppressed" : type.slice(0, 160) } }];
+    return [{ ...origin, eventType: "harness.diagnostic", payload: { code: suppressed ? "pi_diagnostics_suppressed" : code, providerMethod: suppressed ? "suppressed" : type.slice(0, 160) } }];
   };
-  const emit = (eventType: PiProjectedEvent["eventType"], itemId: string, payload: Record<string, unknown>): PiProjectedEvent => ({ eventType, itemId, payload });
+  const emit = (eventType: PiProjectedEvent["eventType"], itemId: string, payload: Record<string, unknown>): PiProjectedEvent => ({ ...origin, eventType, itemId, payload });
   const identity = () => { if (++identityCount > MAX_IDENTITIES) throw new Error("pi_projection_identity_limit"); };
   const ensureMessage = () => messageId ??= `${prefix}:pi-message:${++ordinal}`;
   const blockFor = (index: number, kind: string): Block => {
@@ -178,7 +192,7 @@ export function createPiEventProjector(options: { turnId: string; includeThinkin
       const type = text(update.type);
       if (["text_start", "text_delta", "text_end", "thinking_start", "thinking_delta", "thinking_end"].includes(type)) {
         const thinking = type.startsWith("thinking_");
-        if (thinking && options.includeThinking !== true) return [];
+        if (thinking && !includeThinking) return [];
         const kind = thinking ? "reasoning" : "agentMessage";
         const index = update.contentIndex;
         if (typeof index !== "number") throw new Error("pi_projection_content_index_invalid");
@@ -225,7 +239,7 @@ export function createPiEventProjector(options: { turnId: string; includeThinkin
           if (part.type === "toolCall") {
             const tool = toolFor(part.id, part.name); argumentsFor(tool, part.arguments); startTool(tool, output);
             if (!tool.terminal) output.push(emit("item.delta", tool.id, toolPayload(tool)));
-          } else if (part.type === "text" || (part.type === "thinking" && options.includeThinking === true && part.redacted !== true)) {
+          } else if (part.type === "text" || (part.type === "thinking" && includeThinking && part.redacted !== true)) {
             const kind = part.type === "thinking" ? "reasoning" : "agentMessage";
             const block = blockFor(index, kind);
             if (block.terminal) continue;

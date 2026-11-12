@@ -8,9 +8,9 @@ const fixture = (name: string) => readFileSync(new URL(`../../../../packages/pap
 function persisted(name: string): HeartbeatRunEvent[] {
   const wire = fixture(name).trim().split("\n").map(line => JSON.parse(line));
   return projectPiRecording(wire, name.startsWith("extension-")).map((event, index) => ({
-    id: index + 1, companyId: "controlled-peer", runId: "pi-capture", agentId: "capture", seq: index + 1,
+    id: index + 1, companyId: "controlled-peer", runId: event.runId, agentId: "capture", seq: index + 1,
     eventType: event.eventType, stream: "system", level: "info", color: null, message: null,
-    payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `pi-${index + 1}`, sourceSeq: index + 1, sourceInstanceId: "pi-capture", sourceKind: "runner", priority: 1, runId: "pi-capture", normalizedSessionId: "pi-session", emittedAt: "2026-11-12T06:18:00.000Z", ...event } },
+    payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `pi-${index + 1}`, sourceSeq: index + 1, sourceInstanceId: "pi-capture", sourceKind: "runner", priority: 1, normalizedSessionId: "pi-session", emittedAt: "2026-11-12T06:18:00.000Z", ...event } },
     createdAt: new Date("2026-11-12T06:18:00.000Z"),
   }));
 }

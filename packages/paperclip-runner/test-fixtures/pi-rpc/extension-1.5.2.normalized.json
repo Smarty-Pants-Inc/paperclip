@@ -1,5 +1,7 @@
 [
   {
+    "runId": "pi-capture",
+    "turnId": "turn-0",
     "eventType": "harness.diagnostic",
     "payload": {
       "code": "pi_unrequested_agent_start_fenced",

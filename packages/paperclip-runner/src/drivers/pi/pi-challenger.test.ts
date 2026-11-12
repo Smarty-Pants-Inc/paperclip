@@ -47,19 +47,19 @@ describe("binding challenger admission corrections", () => {
 
 describe("binding projector corrections", () => {
   it("emits bounded unknown-type diagnostics without leaking arbitrary payload", () => {
-    const projector = createPiEventProjector({ turnId: "t" });
+    const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
     const events = Array.from({ length: 100 }, (_, i) => projector.project({ type: `unknown-${i}`, secret: "do-not-copy" })).flat();
     expect(events.length).toBeGreaterThan(0); expect(events.length).toBeLessThanOrEqual(17);
     expect(events.every(event => event.eventType === "harness.diagnostic")).toBe(true);
     expect(JSON.stringify(events)).not.toContain("do-not-copy");
   });
   it("emits app context.compacted only for a successful native receipt", () => {
-    const projector = createPiEventProjector({ turnId: "t" });
+    const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
     expect(projector.project({ type: "compaction_end", reason: "threshold", result: { tokensBefore: 100, estimatedTokensAfter: 20 } })).toContainEqual(expect.objectContaining({ eventType: "context.compacted", payload: expect.objectContaining({ schema: "paperclip.context.compacted.v1", preTokens: 100, postTokens: 20 }) }));
     expect(projector.project({ type: "compaction_end", aborted: true }).some(event => event.eventType === "context.compacted")).toBe(false);
   });
   it("marks child usage unknown and total accounting incomplete on subagent calls", () => {
-    const projector = createPiEventProjector({ turnId: "t" });
+    const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
     projector.project({ type: "tool_execution_start", toolCallId: "c", toolName: "subagent", args: {} });
     const events = projector.project({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "m", responseId: "r", stopReason: "stop", content: [], usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } });
     expect(events.find(event => event.eventType === "usage.reported")?.payload).toMatchObject({ childUsage: "unknown", accountingComplete: false });
