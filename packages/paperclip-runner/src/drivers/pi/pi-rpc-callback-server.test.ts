@@ -2,7 +2,7 @@ import { connect, createServer } from "node:net";
 import { chmod, lstat, mkdtemp, readFile, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, RunAuthority, sendPiToolRequest,
   type Origin, type PiToolCallRequest, type PiToolResult,
@@ -93,7 +93,7 @@ describe("Pi host semantic callback server (real Unix socket)", () => {
     expect(handlerCall).toEqual(request);
   });
 
-  it.each(["read", "bash", "context", "write"])("never self-announces or exempts %s", async tool => {
+  it.each(["read", "bash", "context", "write", "paperclip_finish", "paperclip_block"])("never self-announces or exempts %s", async tool => {
     let effects = 0; const f = await fixture({ handleTool: async () => { ++effects; return result; } });
     await expect(sendPiToolRequest(f.socketPath, call({ tool }))).rejects.toThrow(PI_BIND_ERROR);
     expect(effects).toBe(0); expect(f.authority.accept(origin, "call")).toBe(false);
@@ -210,17 +210,97 @@ describe("Pi host semantic callback server (real Unix socket)", () => {
     expect(await raw(f.socketPath, Buffer.from([0x22, 0xff, 0x22, 0x0a]))).toBe(refused);
   });
 
-  it("holds at most eight clients and close aborts all waiters without waiting on hooks", async () => {
+  it("queues the ninth client instead of destroying it, and close aborts all waiters", async () => {
     const signals: AbortSignal[] = []; const entered = deferred<void>();
     const f = await fixture({ waitForAnnouncement: async (_request, signal) => { signals.push(signal); if (signals.length === 8) entered.resolve(); return new Promise(() => {}); } });
     const clients: Awaited<ReturnType<typeof client>>[] = [];
     for (let i = 0; i < 8; i++) { const peer = await client(f.socketPath); clients.push(peer); peer.socket.write(`${JSON.stringify(call({ toolCallId: `call-${i}` }))}\n`); }
     await entered.promise; expect(f.server.pendingCount()).toBe(8);
-    const ninth = await client(f.socketPath); expect(await ninth.closed).toBe("");
-    expect(f.server.pendingCount()).toBe(8);
+    const ninth = await client(f.socketPath); ninth.socket.write(`${JSON.stringify(call({ toolCallId: "call-8" }))}\n`);
+    let dropped = false; void ninth.closed.then(() => { dropped = true; });
+    await vi.waitFor(() => expect(f.server.pendingCount()).toBe(9));
+    expect(dropped).toBe(false); expect(signals).toHaveLength(8);
     await Promise.all([f.server.close(), f.server.close()]);
-    await Promise.all(clients.map(peer => peer.closed));
+    await Promise.all([...clients, ninth].map(peer => peer.closed));
     expect(signals.every(signal => signal.aborted)).toBe(true); expect(f.server.pendingCount()).toBe(0);
+  });
+
+  it("gives each dispatched call a fresh host deadline, not a queue-time budget", async () => {
+    const startedAt = performance.now(); const starts: number[] = [];
+    const f = await fixture({ timeoutMs: 100, handleTool: async () => {
+      starts.push(performance.now() - startedAt);
+      await new Promise<void>(resolve => setTimeout(resolve, 40));
+      return result;
+    } });
+    const calls = Array.from({ length: 41 }, (_, i) => call({ toolCallId: `queued-${i}` }));
+    for (const request of calls) f.authority.announce(request.toolCallId, origin);
+    await expect(Promise.all(calls.map(request => sendPiToolRequest(f.socketPath, request, { timeoutMs: 2000 })))).resolves.toEqual(calls.map(() => result));
+    expect(starts).toHaveLength(41);
+    expect(starts.at(-1)! - starts[0]!).toBeGreaterThan(100);
+  });
+
+  it("does not spend the host deadline waiting for the native announcement", async () => {
+    const f = await fixture({ timeoutMs: 100,
+      waitForAnnouncement: async () => { await new Promise<void>(resolve => setTimeout(resolve, 65)); },
+      handleTool: async () => { await new Promise<void>(resolve => setTimeout(resolve, 65)); return result; },
+    });
+    f.authority.announce("call", origin);
+    await expect(sendPiToolRequest(f.socketPath, call(), { timeoutMs: 1000 })).resolves.toEqual(result);
+  });
+
+  it.each(["paperclip_finish", "paperclip_block"])("reserves a control slot for %s behind a full ordinary batch", async tool => {
+    const entered = deferred<void>(); const release = deferred<void>(); let active = 0, completed = 0;
+    const f = await fixture({ handleTool: async request => {
+      if (request.tool === tool) return result;
+      if (++active === 8) entered.resolve();
+      await release.promise; --active; ++completed; return result;
+    } });
+    const calls = Array.from({ length: 16 }, (_, i) => call({ toolCallId: `ordinary-${i}` }));
+    for (const request of calls) f.authority.announce(request.toolCallId, origin);
+    const ordinary = Promise.all(calls.map(request => sendPiToolRequest(f.socketPath, request)));
+    // Attach rejection observation before any assertion, including on RED.
+    void ordinary.catch(() => {});
+    try {
+      await entered.promise;
+      f.authority.announce("control", origin);
+      await expect(sendPiToolRequest(f.socketPath, call({ toolCallId: "control", tool }))).resolves.toEqual(result);
+      expect(active).toBe(8); expect(completed).toBe(0);
+    } finally { release.resolve(); await ordinary; }
+    expect(completed).toBe(16);
+  });
+
+  it("backpressures bursts larger than the bounded parsed queue without refusing calls", async () => {
+    let active = 0, peak = 0;
+    const f = await fixture({ handleTool: async () => {
+      peak = Math.max(peak, ++active);
+      await new Promise<void>(resolve => setTimeout(resolve, 10));
+      --active; return result;
+    } });
+    const calls = Array.from({ length: 300 }, (_, i) => call({ toolCallId: `burst-${i}` }));
+    for (const request of calls) f.authority.announce(request.toolCallId, origin);
+    await expect(Promise.all(calls.map(request => sendPiToolRequest(f.socketPath, request, { timeoutMs: 5000 })))).resolves.toEqual(calls.map(() => result));
+    expect(peak).toBe(8);
+  });
+
+  it.each(["client", "turn"])("cancels queued work on %s cancellation before any effect", async cancellation => {
+    const entered = deferred<void>(); const release = deferred<void>(); const effects: string[] = [];
+    const f = await fixture({ handleTool: async request => {
+      effects.push(request.toolCallId); if (effects.length === 8) entered.resolve();
+      await release.promise; return result;
+    } });
+    const calls = Array.from({ length: 8 }, (_, i) => call({ toolCallId: `active-${i}` }));
+    for (const request of [...calls, call({ toolCallId: "queued" })]) f.authority.announce(request.toolCallId, origin);
+    const ordinary = Promise.allSettled(calls.map(request => sendPiToolRequest(f.socketPath, request)));
+    await entered.promise;
+    const controller = new AbortController();
+    const queued = sendPiToolRequest(f.socketPath, call({ toolCallId: "queued" }), { signal: controller.signal });
+    const rejected = expect(queued).rejects.toThrow();
+    await vi.waitFor(() => expect(f.server.pendingCount()).toBe(9));
+    if (cancellation === "client") controller.abort(); else f.authority.settle(origin);
+    await rejected;
+    await vi.waitFor(() => expect(f.server.pendingCount()).toBeLessThan(9));
+    release.resolve(); await ordinary;
+    expect(effects).toHaveLength(8); expect(effects).not.toContain("queued");
   });
 
   it("client cancellation aborts the active handler", async () => {
