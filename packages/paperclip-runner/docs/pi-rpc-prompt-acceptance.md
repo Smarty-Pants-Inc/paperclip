@@ -53,6 +53,82 @@ regressions run unchanged in `pi-rpc-driver.test.ts`. Its cross-run late-termina
 case also checks canonical item identity, duplicate suppression, mixed-owner
 refusal and completion of the next prompt.
 
+## Active-turn event-idle deadline
+
+After Pi accepts a prompt (`started` or `queued`), the driver arms a one-shot
+event-idle deadline, defaulting to `max(600_000, longestConfiguredToolTimeoutMs +
+60_000)`. The runner's longest configured Pi tool deadline is the 60-second
+host callback maximum in `pi-bind-protocol.ts` and `extension/index.ts`, so the
+default remains 10 minutes. Pi 1.5.2's native bash tool has **no default timeout**
+and the runner sets none; its optional timeout is not a finite runner-configured
+execution bound. Native tools therefore pause the silence deadline rather than
+relying on an assumed bash limit. `PiRpcDriverOptions.turnIdleTimeoutMs` overrides
+the silence budget (including short regression-test budgets); it must be a
+positive integer within Node's timer range. Prompt acceptance retains its
+separate deadline below.
+
+Every native Pi event resets the deadline, including hidden thinking deltas,
+tool updates, retries, and compaction progress. Any announced native execution
+pauses it from `tool_execution_start` until the matching `tool_execution_end`.
+All outstanding tool IDs count, including nested IDs and tools that produce no
+progress at all. Only the last matching end can start a fresh silence budget;
+an unknown end cannot release another tool's execution. An admitted host callback
+also pauses the timer until result, rejection, or cancellation, independently of
+native execution. A callback result or cancellation does not substitute for Pi's
+native execution-end event. Merely opening a socket or waiting for an unannounced
+call is not host activity.
+
+Expiry belongs only to the captured turn: send Pi `abort` and wait up to five
+seconds for native `agent_settled`, independently of the abort acknowledgment.
+Late successful-looking output cannot change the timeout into completion, and
+next-turn admission waits behind this recovery. The terminal error remains
+`pi_turn_idle_timeout`, with `recoverable: false` meaning the expired input is not
+automatically replayed, **not** that the conversation is retired. If abort
+settles, the same `HarnessSession`, child process, provider session ID and
+`--session` file remain usable. Managed-provider turns revoke the old capability
+and rebind normally for the next input; there is no session-level failure.
+
+Only an abort that fails to settle (or uncertain cleanup) physically retires Pi
+through the existing Stop cleanup path. Retirement does not delete its session
+file. The next open with the same normalized session ID uses that same file;
+the facade retains the actual normalized ID after an idle timeout even without
+`PAPERCLIP_NORMALIZED_SESSION_ID`. Explicit thread close clears that fallback.
+Settlement, Stop, and close cancel the timer; an idle warm session has no
+active-turn deadline and does not poll.
+
+Regression checks live in `pi-rpc-idle.test.ts` (silent streams, nested silent
+tools, progress, hidden activity, bounded abort and same-session reuse),
+`pi-rpc-prompt.test.ts` (real subprocess pipes, same-PID reuse and facade
+same-file reopen after an unresponsive abort), and `pi-rpc-c2-live.test.ts`
+(actual Unix callbacks and managed-provider rebind after timeout).
+`pi-rpc-idle-native.test.ts`, enabled with `PI_TEST_BINARY`, additionally drives
+the actual Pi 1.5.2 process against local SSE inference: a silent inference
+aborts without replacing Pi, and a real silent `sleep 1` native bash call runs
+longer than its 200 ms silence budget. Both cases complete the next turn on
+the same PID/session. These local checks do not qualify a live provider
+deployment.
+
+## Typed compaction and failed items
+
+Native `compaction_start`/`compaction_end` receipts share a canonical
+`contextCompaction` item's start/completion identity. Only a successful end emits
+`context.compacted`, with Pi's available pre/post token counts and a distinct ID
+for each compaction, even when one turn compacts repeatedly. An aborted compaction
+does not claim success. The proxy carries successful compaction through the
+existing `thread/compacted` facade notification; Pi-specific Rust normalization
+retains its measurements and identity without changing Codex's defaults.
+
+A native compaction `errorMessage` becomes a bounded, redacted warning item
+(`pi_compaction_failed`), not a turn failure. Likewise, `item.failed` crosses both
+the proxy and Rust normalization as an item failure, never a turn terminal. Pi's
+`agent_settled` remains the turn-settlement authority. Summarization accounting
+stays explicitly incomplete; these display receipts do not establish billing.
+
+`pi-event-projector.test.ts`, `pi-recordings.test.ts`,
+`pi-rpc-app-server-proxy.test.ts`, and the Rust `provider_events` tests cover these
+boundaries, including the captured Pi 1.5.2 compaction recording. They do not
+qualify a live provider deployment.
+
 ## Lost acknowledgments
 
 `PiRpcTransport` gives commands a 30-second client response deadline. Set

@@ -12,7 +12,9 @@ describe("Pi RPC non-message event disposition", () => {
   });
   it.each(["compaction_start", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"])("marks %s spending unknown without a fabricated success", type => {
     const events = createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type });
-    expect(events).toContainEqual(expect.objectContaining({ eventType: "harness.diagnostic", payload: { code: "pi_summarization_activity", providerMethod: type } }));
+    expect(events[0].payload.usage).toMatchObject({ source: "pi_summarization_unaccounted", runDeltaComplete: false, costComplete: false });
+    if (type === "compaction_start") expect(events).toContainEqual(expect.objectContaining({ eventType: "item.started", payload: { kind: "contextCompaction", channel: "detail", text: "Compacting context." } }));
+    else expect(events).toContainEqual(expect.objectContaining({ eventType: "harness.diagnostic", payload: { code: "pi_summarization_activity", providerMethod: type } }));
     expect(events.some(event => event.eventType === "context.compacted")).toBe(false);
   });
   it.each(["select", "confirm", "input", "editor"])("requires driver response/cancellation for extension dialog %s", method => {

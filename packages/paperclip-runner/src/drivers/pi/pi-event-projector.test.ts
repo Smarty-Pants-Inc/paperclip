@@ -53,6 +53,78 @@ describe("real Pi 1.5.2 RPC -> canonical events -> existing reducer/transcript",
   });
 });
 
+// Keep reason: L17 crosses the native receipt -> closed PRP boundary; errors
+// must remain visible without borrowing the provider's turn-settlement authority.
+describe("Pi compaction lifecycle and warning projection (L17)", () => {
+  it("projects the recorded Pi 1.5.2 compaction as a context item and one typed compaction", () => {
+    const projector = createPiEventProjector({ runId: "pi-capture", turnId: "compaction-turn" });
+    const native: Record<string, unknown>[] = fixture("compaction-1.5.2.jsonl").trim().split("\n").map(line => JSON.parse(line));
+    const events = native.filter(event => ["compaction_start", "compaction_end"].includes(String(event.type))).flatMap(event => projector.project(event));
+    const items = events.filter(event => event.payload.kind === "contextCompaction");
+    expect(items).toMatchObject([
+      { eventType: "item.started", payload: { kind: "contextCompaction", text: expect.stringMatching(/compacting/i) } },
+      { eventType: "item.completed", itemId: items[0]?.itemId, payload: { kind: "contextCompaction" } },
+    ]);
+    expect(events.filter(event => event.eventType === "context.compacted")).toMatchObject([
+      { itemId: items[0]?.itemId, payload: { compactionId: items[0]?.itemId, reason: "context_window", preTokens: 3903, postTokens: 1841, sameSession: true } },
+    ]);
+    for (const event of events.map(envelope)) expect(validatePrpEvent(event), event.eventType).toMatchObject({ ok: true });
+    expect(JSON.stringify(events)).not.toContain("firstKeptEntryId");
+  });
+
+  it("gives successive compactions different IDs, preserves their reason and accepts an end-only receipt", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "t".repeat(240) });
+    const events: PiProjectedEvent[] = [];
+    for (const reason of ["manual", "overflow"]) {
+      events.push(...projector.project({ type: "compaction_start", reason }));
+      events.push(...projector.project({ type: "compaction_end", result: { tokensBefore: 90, estimatedTokensAfter: 30 }, aborted: false }));
+    }
+    events.push(...projector.project({ type: "compaction_end", reason: "threshold", result: { tokensBefore: -1, estimatedTokensAfter: "30" } }));
+    const compacted = events.filter(event => event.eventType === "context.compacted");
+    expect(compacted.map(event => event.payload.reason)).toEqual(["manual", "context_window", "context_window"]);
+    expect(new Set(compacted.map(event => event.itemId)).size).toBe(3);
+    expect(compacted[2].payload).toMatchObject({ preTokens: null, postTokens: null });
+    for (const event of events.map(envelope)) expect(validatePrpEvent(event), event.eventType).toMatchObject({ ok: true });
+  });
+
+  it("surfaces a redacted, bounded compaction error as a warning and leaves final turn authority alone", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const started = projector.project({ type: "compaction_start", reason: "threshold" });
+    const events = projector.project({ type: "compaction_end", reason: "threshold", aborted: false, errorMessage: `Summarizer unavailable; token=compaction-secret ${"\\\"🌍".repeat(90000)}` });
+    const warning = events.find(event => event.payload.kind === "warning");
+    expect(events.find(event => event.payload.kind === "contextCompaction")).toMatchObject({ eventType: "item.completed", itemId: started.find(event => event.payload.kind === "contextCompaction")?.itemId });
+    expect(warning).toMatchObject({ eventType: "item.completed", payload: { kind: "warning", severity: "warning", code: "pi_compaction_failed", text: expect.stringContaining("Summarizer unavailable") } });
+    expect(JSON.stringify(events)).not.toContain("compaction-secret");
+    expect(events.some(event => event.eventType === "context.compacted" || event.eventType.startsWith("turn.") || event.eventType === "run.terminal")).toBe(false);
+    for (const event of events.map(envelope)) expect(validatePrpEvent(event), event.eventType).toMatchObject({ ok: true });
+    const finalEvents = projector.project(final({ usage }));
+    expect(finalEvents.find(event => event.payload.kind === "agentMessage")).toMatchObject({ eventType: "item.completed", payload: { text: "final" } });
+    expect(finalEvents.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({ runDeltaComplete: false });
+    const replay = [...started, ...events, ...finalEvents].map(envelope);
+    const seed = createSessionSnapshotFromMetadata({
+      fixtureName: "pi-compaction-warning", identity: { schema: "paperclip.prp.identity.v1", companyId: "synthetic-peer", issueId: "native-pi", runId: "run", environmentLeaseId: "loopback-only", runnerInstanceId: "capture", normalizedSessionId: "pi-session", driverSessionId: "native-session" },
+      capabilities: { schema: "paperclip.prp.capabilities.v1", sessionReusePolicy: "reuse_per_issue", driver: { kind: "pi_rpc", version: "1.5.2" }, steer: false, interrupt: true, resume: false, runtimeRequests: false, structuredResult: false, typedEvents: true },
+    });
+    const snapshot = reduceSessionEvents(seed, replay);
+    expect(snapshot.integrity).toBe("complete");
+    expect(buildTranscript(snapshot, replay)).toContainEqual(expect.objectContaining({ kind: "item", role: "system", item: expect.objectContaining({ kind: "warning", status: "completed", text: warning!.payload.text }) }));
+    expect(snapshot.terminal).toBeNull();
+  });
+
+  it.each([null, 42, []])("does not invent compaction success from malformed result %j", result => {
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project({ type: "compaction_end", result });
+    expect(events.some(event => event.eventType === "context.compacted" || event.eventType.startsWith("turn."))).toBe(false);
+    expect(events.find(event => event.payload.kind === "contextCompaction" && event.eventType === "item.completed")?.payload.text).toContain("did not complete");
+  });
+
+  it("closes an aborted compaction item without inventing success or an error", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const events = [...projector.project({ type: "compaction_start", reason: "manual" }), ...projector.project({ type: "compaction_end", reason: "manual", aborted: true })];
+    expect(events.filter(event => event.payload.kind === "contextCompaction").map(event => event.eventType)).toEqual(["item.started", "item.completed"]);
+    expect(events.some(event => event.eventType === "context.compacted" || event.payload.kind === "warning")).toBe(false);
+  });
+});
+
 describe("large native tool output projection (synthetic incident regression)", () => {
   it("digests the real 403238-byte custom entry for display without losing the turn", () => {
     const raw = fixture("tool-context-guard-full.json");

@@ -1571,14 +1571,55 @@ pub fn normalize_codex_notification_in(
     events
 }
 
-/// Pi's proxy carries the reply channel on params, not in Codex's item phase.
-/// Keep this adaptation separate so other facade providers retain their phase rules.
+/// Pi's proxy carries typed compaction measurements, failed items and the reply
+/// channel on params. Keep this adaptation separate from other facade providers.
 pub(crate) fn normalize_pi_notification_in(
     method: &str,
     params: &Value,
     cwd: Option<&str>,
 ) -> Vec<NormalizedProviderEvent> {
+    // item/failed is a Pi compatibility notification, not a Codex terminal.
+    // Preserve it as an item failure; only Pi's turn terminal settles the run.
+    if method == "item/failed" {
+        let provider_item = item(params);
+        return vec![NormalizedProviderEvent {
+            event_type: "item.failed".to_owned(),
+            priority: EventPriority::P1,
+            payload: json!({
+                "provider": "pi_rpc",
+                "itemId": stable_id(string(params.get("itemId").or_else(|| provider_item.get("id"))), "pi-item"),
+                "kind": bounded_text(string(params.get("kind").or_else(|| provider_item.get("type"))), 160),
+                "status": "failed",
+                "channel": match string(params.get("channel")) {
+                    "final" => "final",
+                    "progress" => "progress",
+                    _ => "detail",
+                },
+                "text": params.get("text").or_else(|| provider_item.get("text"))
+                    .and_then(Value::as_str).map(|text| bounded_text(text, MAX_TEXT_CHARS)),
+                "message": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
+            }),
+        }];
+    }
     let mut events = normalize_codex_notification_in(method, params, cwd);
+    if method == "thread/compacted"
+        && string(params.get("schema")) == "paperclip.context.compacted.v1"
+    {
+        for event in &mut events {
+            event.payload = json!({
+                "schema": "paperclip.context.compacted.v1",
+                "compactionId": stable_id(string(params.get("compactionId")), "pi-compaction"),
+                "reason": match string(params.get("reason")) {
+                    "manual" => "manual",
+                    "context_window" => "context_window",
+                    _ => "unknown",
+                },
+                "preTokens": params.get("preTokens").and_then(Value::as_u64),
+                "postTokens": params.get("postTokens").and_then(Value::as_u64),
+                "sameSession": true,
+            });
+        }
+    }
     if matches!(method, "item/started" | "item/updated" | "item/completed")
         && string(params.get("channel")) == "final"
         && string(item(params).get("type")) == "agentMessage"
@@ -2445,6 +2486,71 @@ fn has_rfc_uri_scheme_prefix(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep reason: L17's JSON-RPC -> canonical PRP boundary dropped item/failed
+    // after the Pi proxy had already forwarded it. Never turn it into settlement.
+    #[test]
+    fn pi_failed_item_remains_a_failed_item_with_a_bounded_redacted_error() {
+        let events = normalize_pi_notification_in(
+            "item/failed",
+            &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:reply",
+                "kind":"agentMessage", "channel":"final", "text":"partial reply",
+                "message":"Native reply failed; token=pi-failure-secret",
+                "item":{"id":"turn:reply", "type":"agentMessage", "text":"partial reply"}}),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "item.failed");
+        assert_eq!(events[0].payload["itemId"], "turn:reply");
+        assert_eq!(events[0].payload["status"], "failed");
+        assert_eq!(events[0].payload["channel"], "final");
+        assert_eq!(events[0].payload["text"], "partial reply");
+        assert!(events[0].payload["message"]
+            .as_str()
+            .unwrap()
+            .contains("Native reply failed"));
+        assert!(!events[0].payload.to_string().contains("pi-failure-secret"));
+        let codex = normalize_codex_notification("item/failed", &json!({}));
+        assert!(codex.is_empty());
+    }
+
+    #[test]
+    fn pi_compaction_keeps_each_native_identity_reason_and_typed_measurements() {
+        let compaction = |id: &str| {
+            normalize_pi_notification_in(
+                "thread/compacted",
+                &json!({"schema":"paperclip.context.compacted.v1", "threadId":"native",
+                "turnId":"turn", "compactionId":id, "reason":"context_window",
+                "preTokens":3903, "postTokens":1841, "sameSession":true}),
+                None,
+            )
+        };
+        let first = compaction("turn:pi-compaction:1");
+        let second = compaction("turn:pi-compaction:2");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].event_type, "context.compacted");
+        assert_ne!(
+            first[0].payload["compactionId"],
+            second[0].payload["compactionId"]
+        );
+        assert_eq!(first[0].payload["reason"], "context_window");
+        assert_eq!(first[0].payload["preTokens"], 3903);
+        assert_eq!(first[0].payload["postTokens"], 1841);
+        let malformed = normalize_pi_notification_in(
+            "thread/compacted",
+            &json!({"schema":"paperclip.context.compacted.v1", "preTokens":-1,
+                "postTokens":"1841", "reason":"untrusted"}),
+            None,
+        );
+        assert_eq!(malformed[0].payload["preTokens"], Value::Null);
+        assert_eq!(malformed[0].payload["postTokens"], Value::Null);
+        assert_eq!(malformed[0].payload["reason"], "unknown");
+        let legacy = normalize_codex_notification(
+            "thread/compacted",
+            &json!({"threadId":"native", "turnId":"turn"}),
+        );
+        assert_eq!(legacy[0].payload["reason"], "provider");
+    }
 
     #[test]
     fn acpx_turn_cost_is_not_a_cumulative_session_price() {

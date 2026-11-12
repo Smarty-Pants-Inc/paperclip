@@ -122,6 +122,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   let costComplete = true;
   let diagnosticCount = 0;
   let compactionCount = 0;
+  let compaction: { id: string; reason: string } | undefined;
   let childUsageUnknown = false;
   let displayTruncated = false;
   const projectText = (value: string, budget = MAX_TEXT_BYTES): string => {
@@ -435,10 +436,31 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       // capability. The integrator may qualify its native receipt path later.
       usageComplete = false; costComplete = false;
       output.push(emit("item.completed", `${prefix}:pi-usage:unaccounted-summary`, { kind: "usage", usage: { source: "pi_summarization_unaccounted", total: { ...totals }, runDelta: { ...totals }, runDeltaComplete: false, costComplete: false, childUsage: "unknown" } }));
-      const result = record(event.result);
-      if (event.type === "compaction_end" && event.aborted !== true && event.errorMessage === undefined && event.result !== undefined) {
-        const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-        output.push(emit("context.compacted", `${prefix}:pi-compaction:${++compactionCount}`, { schema: "paperclip.context.compacted.v1", compactionId: `${prefix}:pi-compaction:${compactionCount}`, reason: event.reason === "manual" ? "manual" : ["threshold", "overflow"].includes(text(event.reason)) ? "context_window" : "unknown", preTokens: count(result.tokensBefore), postTokens: count(result.estimatedTokensAfter), sameSession: true }));
+      if (event.type === "compaction_start" || event.type === "compaction_end") {
+        // Match Codex's contextCompaction item lifecycle, retaining one identity
+        // through the native start/end pair (including an end-only receipt).
+        if (!compaction) {
+          compaction = { id: `${prefix}:pi-compaction:${++compactionCount}`, reason: text(event.reason) };
+          output.push(emit("item.started", compaction.id, { kind: "contextCompaction", channel: "detail", text: "Compacting context." }));
+        }
+        if (event.type === "compaction_end") {
+          const { id, reason: startedReason } = compaction;
+          compaction = undefined;
+          const failed = event.errorMessage !== undefined;
+          const succeeded = !failed && event.aborted !== true && record(event.result) === event.result;
+          output.push(emit("item.completed", id, { kind: "contextCompaction", channel: "detail", text: succeeded ? "Context compaction completed." : event.aborted === true ? "Context compaction cancelled." : "Context compaction did not complete." }));
+          if (failed) {
+            // This is a summarizer warning, NOT permission to fail the turn.
+            // displayValue already redacted the native error; bound the copy.
+            const message = projectText(`Context compaction failed: ${text(event.errorMessage) || "Unknown summarization error."}`);
+            output.push(emit("item.completed", `${id}:warning`, { kind: "warning", channel: "detail", severity: "warning", code: "pi_compaction_failed", text: message, message }));
+          } else if (succeeded) {
+            const result = record(event.result);
+            const reason = text(event.reason) || startedReason;
+            const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+            output.push(emit("context.compacted", id, { schema: "paperclip.context.compacted.v1", compactionId: id, reason: reason === "manual" ? "manual" : ["threshold", "overflow"].includes(reason) ? "context_window" : "unknown", preTokens: count(result.tokensBefore), postTokens: count(result.estimatedTokensAfter), sameSession: true }));
+          }
+        }
       } else output.push(...diagnostic(text(event.type), "pi_summarization_activity"));
     } else if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(text(event.type))) {
       projectTool(event, output);

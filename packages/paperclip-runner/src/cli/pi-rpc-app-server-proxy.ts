@@ -210,6 +210,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let activeModel = "";
   let piNativeAdmission: Record<string, unknown> | undefined;
   let activeTurnId: string | null = null;
+  // An idle-abort retirement replaces the process, not the conversation. Keep
+  // its actual normalized ID even without the runner's usual environment grant.
+  let idleTimeoutSessionId: string | undefined;
   let activeRunId = environment.PAPERCLIP_RUN_ID ?? "runnerd-run";
   let inputEnded = false;
   const announcedTurnIds = new Set<string>();
@@ -375,6 +378,14 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
                 phase: payload.channel === "final" ? "final_answer" : "commentary" } }
             : payload,
         }));
+      } else if (event.eventType === "context.compacted") {
+        // Use the existing Codex-facade compaction notification. Keep Pi's
+        // typed measurements/identity: one Runner turn can compact repeatedly.
+        if (typeof event.turnId !== "string" || !event.turnId) continue;
+        send({ method: "thread/compacted", params: {
+          ...payload, threadId: opened.ids().driverSessionId,
+          turnId: event.turnId, itemId: event.itemId,
+        } });
       } else if (event.eventType === "usage.reported") {
         reportUsage(opened, event, payload);
       } else if (event.eventType === "run.result.proposed") {
@@ -425,6 +436,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         event.eventType === "turn.completed" || event.eventType === "turn.failed" ||
         event.eventType === "turn.interrupted" || event.eventType === "turn.cancelled"
       ) {
+        idleTimeoutSessionId = event.eventType === "turn.failed" && record(payload.error).code === "pi_turn_idle_timeout"
+          ? event.normalizedSessionId : undefined;
         send(openCodeProxyTerminalNotification({
           eventType: event.eventType,
           threadId: opened.ids().driverSessionId,
@@ -526,7 +539,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     } else {
       opened = await driver.openSession({
         runId: activeRunId,
-        normalizedSessionId: environment.PAPERCLIP_NORMALIZED_SESSION_ID ?? `runnerd-${Date.now()}`,
+        normalizedSessionId: environment.PAPERCLIP_NORMALIZED_SESSION_ID ?? idleTimeoutSessionId ?? `runnerd-${Date.now()}`,
         workingDirectory: cwd,
       });
     }
@@ -658,6 +671,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           activeTurnId = null;
           output.flush();
         }
+        idleTimeoutSessionId = undefined;
         result = true;
         break;
       case "collaborationMode/list":
