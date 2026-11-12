@@ -20,15 +20,15 @@ describe("composer run settings", () => {
     expect(composerCatalogProvider(nativePi)).toBe("pi_rpc");
     expect(composerEfforts({ ...nativePi, runtimeConfig: { aiConnection: { mode: "router", connectionId: "00000000-0000-4000-8000-000000000001" } } }, "gpt-6-astra", [])).toEqual(levels);
   });
-  it("filters Pi capability rows in native order and caps Claude without aliasing GPT max", () => {
+  it("filters Pi capability rows in native order using only catalog/config capabilities", () => {
     expect(composerEfforts(nativePi, "paperclip/custom", [{ id: "paperclip/custom", thinkingLevels: ["max", "low", "off", "medium"] }])).toEqual(["off", "low", "medium", "max"]);
     expect(composerEfforts(nativePi, "paperclip/nonreasoning", [{ id: "paperclip/nonreasoning", thinkingLevels: ["off"] }])).toEqual(["off"]);
     expect(composerEfforts(nativePi, "paperclip/empty", [{ id: "paperclip/empty", thinkingLevels: [] }])).toEqual([]);
-    expect(composerEfforts(nativePi, "paperclip/ClAuDe-opus", [])).toEqual(levels.slice(0, -1));
-    expect(composerEfforts(nativePi, "gateway/alias", [{ id: "gateway/alias", family: "Claude" }])).toEqual(levels.slice(0, -1));
+    expect(composerEfforts(nativePi, "paperclip/ClAuDe-opus", [])).toEqual(levels);
+    expect(composerEfforts(nativePi, "gateway/alias", [{ id: "gateway/alias", family: "Claude" }])).toEqual(levels);
     expect(composerEfforts(nativePi, "claude-gateway/gpt-custom", [])).toEqual(levels);
-    expect(composerEfforts(nativePi, "openrouter/anthropic/claude-exact", [])).toEqual(levels.slice(0, -1));
-    expect(composerEfforts(nativePi, "paperclip/claude-exact", [{ id: "paperclip/claude-exact", thinkingLevels: ["max", "medium", "off"] }])).toEqual(["off", "medium"]);
+    expect(composerEfforts(nativePi, "openrouter/anthropic/claude-exact", [])).toEqual(levels);
+    expect(composerEfforts(nativePi, "paperclip/claude-exact", [{ id: "paperclip/claude-exact", thinkingLevels: ["max", "medium", "off"] }])).toEqual(["off", "medium", "max"]);
     expect(composerEfforts(nativePi, "paperclip/gpt-custom", [{ id: "other-model", thinkingLevels: ["off"] }])).toContain("max");
   });
   it("reads/writes the native Pi key only and clears it on reset, reassignment and model change", () => {

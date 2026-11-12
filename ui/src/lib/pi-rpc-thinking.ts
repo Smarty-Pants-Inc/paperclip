@@ -4,8 +4,6 @@ export type PiRpcModelCapabilities = Pick<AdapterModel, "id" | "thinkingLevels" 
 
 /** Catalog capabilities narrow native Pi choices; admission remains server-owned. */
 export function piRpcThinkingLevelsForModel(model: string, row?: PiRpcModelCapabilities): readonly string[] {
-  const modelId = model.slice(model.indexOf("/") + 1);
-  const claude = /claude/i.test(modelId) || /claude/i.test(row?.family ?? "");
   return PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS.filter(level =>
-    (!row?.thinkingLevels || row.thinkingLevels.includes(level)) && !(claude && level === "max"));
+    (!row?.thinkingLevels || row.thinkingLevels.includes(level)));
 }

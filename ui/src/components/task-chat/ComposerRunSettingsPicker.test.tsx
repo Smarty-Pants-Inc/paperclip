@@ -61,19 +61,20 @@ afterEach(() => {
 });
 
 describe("composer assignee picker", () => {
-  it.each([false, true])("keeps native Pi capabilities, validates remembered effort and accepts manual models (mobile: %s)", async mobile => {
+  it.each([[false, false], [false, true], [true, false], [true, true]])("picker follows only catalog/config capabilities (mobile: %s, max supported: %s)", async (mobile, supportsMax) => {
     const pi = { ...agent, adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/claude-exact" } } as Agent;
     rememberComposerEffort("company-1", "max");
     const changed = vi.fn();
     render(vi.fn(), changed, false, { mobile, settings: null, agents: new Map([[agent.id, pi]]),
-      modelOptionsOverride: [{ id: "paperclip/claude-exact", label: "Claude gateway", thinkingLevels: ["off", "high", "xhigh", "max"] }] });
-    expect(changed).not.toHaveBeenCalled();
+      modelOptionsOverride: [{ id: "paperclip/claude-exact", label: "Claude gateway", thinkingLevels: ["off", "high", "xhigh", ...(supportsMax ? ["max"] : [])] }] });
+    if (supportsMax) expect(changed).toHaveBeenLastCalledWith({ model: null, effort: "max", fast: false });
+    else expect(changed).not.toHaveBeenCalled();
     await click("Select model and effort");
-    expect(document.querySelector<HTMLInputElement>('[aria-label="Thinking"]')?.max).toBe("3");
+    expect(document.querySelector<HTMLInputElement>('[aria-label="Thinking"]')?.max).toBe(supportsMax ? "4" : "3");
     expect(document.querySelector('[aria-label="Effort"]')).toBeNull();
     await click("Choose exact model");
     await click("Claude gateway");
-    expect(changed).toHaveBeenLastCalledWith({ model: "paperclip/claude-exact", effort: null, fast: false });
+    expect(changed).toHaveBeenLastCalledWith({ model: "paperclip/claude-exact", effort: supportsMax ? "max" : null, fast: false });
     await click("Choose exact model");
     const search = document.querySelector<HTMLInputElement>('[aria-label="Search or paste a model ID"]')!;
     await act(async () => {
