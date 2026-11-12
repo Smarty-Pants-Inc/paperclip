@@ -363,7 +363,11 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   });
   pi.on("session_shutdown", close);
   pi.on("input", (event, context) => {
-    if (event.source !== "rpc" || !prepared || admitted || running || !authority.accept(prepared) || context.hasPendingMessages()) return { action: "handled" };
+    if (event.source !== "rpc" || closed || failed) return { action: "handled" };
+    // Native steer/follow_up input is already inside this admitted turn. Never
+    // consume a prepared future origin or mint a new authority for queued input.
+    if (running) return { action: authority.accept(running) ? "continue" : "handled" };
+    if (!prepared || admitted || !authority.accept(prepared) || context.hasPendingMessages()) return { action: "handled" };
     admitted = prepared; prepared = null; return { action: "continue" };
   });
   pi.on("before_agent_start", (event, context) => {

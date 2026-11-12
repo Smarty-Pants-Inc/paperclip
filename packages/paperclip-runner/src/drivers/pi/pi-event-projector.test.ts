@@ -53,6 +53,17 @@ describe("real Pi 1.5.2 RPC -> canonical events -> existing reducer/transcript",
 });
 
 describe("synthetic boundary cases (not claimed as native capture)", () => {
+  it("projects distinct queued user messages with the same native timestamp once under their captured origin", () => {
+    const origin = { runId: "original-run", turnId: "original-turn" };
+    const projector = createPiEventProjector(origin);
+    const receipts = ["steering-marker", "followup-marker"].map(body => ({ type: "message_end", message: { role: "user", timestamp: 42, content: [{ type: "text", text: body }] } }));
+    origin.runId = "new-run"; origin.turnId = "new-turn";
+    const events = receipts.flatMap(receipt => projector.project(receipt));
+    expect(events.map(event => event.payload.text)).toEqual(["steering-marker", "followup-marker"]);
+    expect(new Set(events.map(event => event.itemId)).size).toBe(2);
+    for (const event of events) expect(event).toMatchObject({ eventType: "item.completed", runId: "original-run", turnId: "original-turn", payload: { kind: "userMessage" } });
+    expect(receipts.flatMap(receipt => projector.project(receipt))).toEqual([]);
+  });
   it("replaces streamed partials with final authoritative receipts, not another delta", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
     projector.project(update("text_start"));

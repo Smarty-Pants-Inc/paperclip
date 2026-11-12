@@ -1,4 +1,9 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
+import { createPiSteerRecordingPeer } from "../../test-support/pi-rpc-steer-peer.js";
 import type { HarnessDriver, HarnessSession } from "../contracts/harness-driver.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import {
@@ -210,6 +215,68 @@ describe("Pi RPC app-server facade proxy", () => {
     await request(proxy, sink, 5, "thread/close");
     expect(session.closed).toEqual(["thread_close"]);
     await proxy.close();
+  });
+
+  // Keep reason: real facade -> driver -> Pi JSONL contract and input ownership.
+  it("bridges the executor's turn/steer to Pi and consumes it in the same facade turn", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rpc-proxy-steer-"));
+    const peer = createPiSteerRecordingPeer(join(root, "commands.jsonl"));
+    const sink = new FakeSink();
+    const proxy = createPiRpcAppServerProxy({
+      stdout: sink,
+      createDriver: () => new PiRpcDriver({ ...peer.driverOptions, runtimeDirectory: root }),
+      environment: { PAPERCLIP_RUN_ID: "steer-run", PAPERCLIP_NORMALIZED_SESSION_ID: "steer-session" },
+    });
+    try {
+      const opened = await request(proxy, sink, 31, "thread/start", { cwd: root, model: "provider/model" });
+      const threadId = (opened.result as { thread: { id: string } }).thread.id;
+      const started = await request(proxy, sink, 32, "turn/start", { input: [{ type: "text", text: "scenario:queue" }] });
+      const turnId = ((started.result as { turn: { id: string } }).turn.id);
+      const params = { threadId, expectedTurnId: turnId, input: [{ type: "text", text: "steering-marker", text_elements: [] }] };
+      for (const [index, expectedTurnId] of ["wrong-turn", "", undefined].entries()) {
+        expect(await request(proxy, sink, 33 + index, "turn/steer", { ...params, expectedTurnId })).toMatchObject({ error: { code: -32000, message: expect.stringMatching(/not the active turn/) } });
+      }
+      expect(await request(proxy, sink, 36, "turn/steer", { ...params, mode: "follow_up" })).toMatchObject({ error: { code: -32000, message: expect.stringMatching(/follow.up.*unavailable/i) } });
+      expect(await request(proxy, sink, 37, "turn/steer", params)).toEqual({ id: 37, result: { accepted: true } });
+      const consumed = () => sink.decoded().filter(frame => frame.method === "item/completed" && (frame.params as { item?: { type?: string; text?: string } })?.item?.type === "userMessage" && (frame.params as { text?: string }).text === "steering-marker");
+      expect(consumed()).toEqual([]);
+      await peer.releaseConsumption();
+      await waitFor(() => sink.decoded().some(frame => frame.method === "turn/completed"));
+      expect(consumed()).toHaveLength(1);
+      expect(consumed()[0]).toMatchObject({ params: { threadId, turnId, item: { type: "userMessage", content: [{ type: "text", text: "steering-marker" }] } } });
+      expect(sink.decoded().filter(frame => frame.method === "turn/started")).toHaveLength(1);
+      expect(sink.decoded().filter(frame => frame.method === "turn/completed")).toHaveLength(1);
+      expect(await request(proxy, sink, 38, "turn/steer", params)).toMatchObject({ error: { code: -32000, message: expect.stringMatching(/not the active turn/) } });
+      expect((await peer.commands()).filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type))).toEqual([
+        expect.objectContaining({ type: "prompt", message: "scenario:queue" }),
+        expect.objectContaining({ type: "steer", message: "steering-marker" }),
+      ]);
+    } finally {
+      await proxy.close();
+      await peer.transport.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["started", "handled", ""])("returns an error instead of accepting a non-queued Pi steer (%j)", async disposition => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rpc-proxy-ack-"));
+    const peer = createPiSteerRecordingPeer(join(root, "commands.jsonl"), disposition);
+    const sink = new FakeSink();
+    const proxy = createPiRpcAppServerProxy({
+      stdout: sink,
+      createDriver: () => new PiRpcDriver({ ...peer.driverOptions, runtimeDirectory: root }),
+    });
+    try {
+      await request(proxy, sink, 41, "thread/start", { cwd: root, model: "provider/model" });
+      const started = await request(proxy, sink, 42, "turn/start", { input: [{ type: "text", text: "scenario:queue" }] });
+      const turnId = (started.result as { turn: { id: string } }).turn.id;
+      expect(await request(proxy, sink, 43, "turn/steer", { expectedTurnId: turnId, input: [{ type: "text", text: "steering-marker" }] }))
+        .toMatchObject({ error: { code: -32000, message: expect.stringContaining("did not queue") } });
+    } finally {
+      await proxy.close();
+      await peer.transport.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("returns a facade error on driver bootstrap failure and does not hang later requests", async () => {

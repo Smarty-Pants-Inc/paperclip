@@ -9,7 +9,8 @@ describe("PiRpcDriver", () => {
   it("declares the pi_rpc native driver and conservative capabilities", async () => {
     const descriptor = await new PiRpcDriver({ runtimeDirectory: "/tmp/pi-test" }).descriptor();
     expect(descriptor).toMatchObject({ kind: "pi_rpc", displayName: "Pi RPC", version: "1.5.2" });
-    expect(descriptor.capabilities).toMatchObject({ interruption: true, resume: false, steering: false, structuredResult: false });
+    expect(descriptor.capabilities).toMatchObject({ interruption: true, resume: false, steering: true, queuedFollowUp: false, structuredResult: false });
+    expect(descriptor.capabilities.unsupported).not.toContain("steering");
   });
 
   it("fails closed on an unknown managed credential mode before spawning Pi", async () => {

@@ -38,6 +38,36 @@ Scenarios: baseline text with U+2028 and emoji, real successful/failing Bash cal
 
 The extension scenario permits a single already-starting HTTP request before clear_queue→abort and records that honestly. Output is fenced, but this is not proof of a production pre-inference authority/budget barrier. The production broker must deny absent Runner authority before forwarding inference.
 
+## Active-turn steering bridge
+
+The Pi RPC app-server facade accepts `turn/steer` only when
+`expectedTurnId` exactly matches its active turn. It forwards the text through
+`HarnessSession.steer` as native Pi `steer` and returns `{ accepted: true }`
+only after Pi replies with `data.disposition: "queued"`. A queue acknowledgement
+is not consumption: native user `message_start` / `message_end` events project
+as `userMessage` items in that same admitted run and turn. Low-level Pi
+`turn_end` does not settle the Runner turn; `agent_settled` does.
+
+`queuedFollowUp` stays false. The Codex executor used by this facade rejects
+`mode: "follow_up"`, so both facade and driver refuse it rather than silently
+sending a steer or starting another prompt. Board-only permission is unchanged.
+
+`pi-rpc-steer.test.ts` and `pi-rpc-app-server-proxy.test.ts` exercise the real
+JSONL transport against a controlled peer replaying this recording's steer
+slice. The peer releases consumption separately from the queued response.
+They cover same-turn/origin consumption, stale and settled turns, and refusal
+of non-queued dispositions. This is protocol/fixture proof, not live hq or
+agent-to-agent authority qualification.
+
+The owned extension admits queued RPC input only inside its still-authorized,
+immutable running origin. It does not consume another prepared origin or grant
+another prompt. `pi-rpc-steer.integration.test.ts` also runs real Pi 1.5.2 against
+a paused local SSE peer when `PI_TEST_BINARY` is set: one prompt, one steer,
+consumption at the next response boundary, one terminal, unchanged process and
+session, and no paid provider. This catches native input-admission failures that
+recording peers cannot reproduce. `PI_STEER_PROOF_PATH` optionally saves its
+commands, model requests, projected events and native session trace.
+
 ## Reproduce (no provider credentials required)
 
 From `packages/paperclip-runner`, with the repo's dependencies already installed and `tsx` available:

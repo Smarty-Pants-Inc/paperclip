@@ -184,7 +184,25 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     if (!serialized || Buffer.byteLength(serialized) > MAX_RECORD_BYTES) throw new Error("pi_projection_record_limit");
     const event = record(displayValue(value));
     const output: PiProjectedEvent[] = [];
-    if (event.type === "message_start" && record(event.message).role === "assistant") {
+    if (["message_start", "message_end"].includes(text(event.type)) && record(event.message).role === "user") {
+      const message = record(event.message);
+      const body = contentText(message.content);
+      const timestamp = nativeId(message.timestamp);
+      // Pi can assign the same millisecond to multiple queued user inputs.
+      const native = nativeId(message.id) ?? (timestamp === undefined ? undefined : `${timestamp}:${digest(body)}`);
+      if (native === undefined) throw new Error("pi_projection_receipt_identity_missing");
+      const key = `user:${native}:${event.type}`;
+      const fingerprint = digest(JSON.stringify(message));
+      const previous = receipts.get(key);
+      if (previous !== undefined) { if (previous !== fingerprint) throw new Error("pi_projection_conflicting_receipt"); return []; }
+      identity(); receipts.set(key, fingerprint);
+      const itemId = `${prefix}:pi-user:${digest(native)}`;
+      // A native message receipt, not queue_update or the steer response, is
+      // consumption. Retain this projector's original run/turn for every item.
+      output.push(emit(event.type === "message_start" ? "item.started" : "item.completed", itemId, {
+        kind: "userMessage", text: body, item: { id: itemId, type: "userMessage", content: [{ type: "text", text: body }] },
+      }));
+    } else if (event.type === "message_start" && record(event.message).role === "assistant") {
       messageId = `${prefix}:pi-message:${++ordinal}`;
       blocks = new Map();
     } else if (event.type === "message_update") {

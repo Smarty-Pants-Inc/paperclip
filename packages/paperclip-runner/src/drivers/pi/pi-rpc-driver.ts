@@ -20,6 +20,7 @@ import type {
   OpenHarnessSessionInput,
   PersistedHarnessSession,
 } from "../../contracts/harness-driver.js";
+import { HarnessCapabilityUnavailableError, HarnessOperationAlreadyTerminalError, HarnessStaleTurnError } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 
@@ -65,7 +66,7 @@ const PI_CAPABILITIES: NativeSessionCapabilities = {
   resume: false,
   typedEvents: true,
   providerTranscriptStreaming: true,
-  steering: false,
+  steering: true,
   queuedFollowUp: false,
   interruption: true,
   structuredResult: false,
@@ -77,7 +78,7 @@ const PI_CAPABILITIES: NativeSessionCapabilities = {
   runtimeRequestHandoff: false,
   goals: false,
   threadLineage: false,
-  unsupported: ["resume", "steering", "queuedFollowUp", "structuredResult", "runtimeRequests", "dynamicTools", "goals", "threadLineage"],
+  unsupported: ["resume", "queuedFollowUp", "structuredResult", "runtimeRequests", "dynamicTools", "goals", "threadLineage"],
 };
 
 export class PiRpcDriver implements HarnessDriver {
@@ -543,6 +544,23 @@ export class PiRpcHarnessSession implements HarnessSession {
     });
   }
 
+  async steer(input: Parameters<NonNullable<HarnessSession["steer"]>>[0]): Promise<void> {
+    // The Codex executor admits active-turn steering, not queued follow-ups.
+    if (input.mode === "follow_up") throw new HarnessCapabilityUnavailableError("follow-up", "Pi RPC follow-up is not admitted by the executor");
+    const turn = this.#activeTurn;
+    if (this.#closed || !turn || turn.settled) throw new HarnessOperationAlreadyTerminalError("steering");
+    if (input.turnId !== turn.turnId) throw new HarnessStaleTurnError(input.turnId);
+    this.#pendingInput++;
+    const response = await this.#transport.request("steer", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+    const disposition = stringValue(record(response.data).disposition);
+    if (disposition !== "queued") {
+      throw new Error(`Pi RPC steer did not queue input (disposition=${disposition ?? "missing"})`);
+    }
+    if (this.#closed || turn.settled || this.#activeTurn !== turn) throw new HarnessOperationAlreadyTerminalError("steering");
+    // Acceptance is not consumption. The native user message is projected only
+    // when Pi emits it; agent_settled remains the single turn-terminal authority.
+  }
+
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
     if (input.turnId && input.turnId !== this.#activeTurn?.turnId) return;
     // Stop is a physical retirement, not a reusable prompt cancellation.
@@ -773,13 +791,13 @@ export class PiRpcHarnessSession implements HarnessSession {
       turn = owner;
       known = true;
     }
-    if (event.type === "message_start" && record(event.message).role === "assistant") {
+    if (event.type === "message_start" && ["assistant", "user"].includes(String(record(event.message).role))) {
       // A new native message may be announced only within the prompt's captured
       // agent lifecycle. Later callbacks use this binding, not active run state.
       turn ??= keys.length > 0 && !known ? this.#agentTurn : null;
       if (!turn || turn.settled) return;
       this.#remember(keys, turn);
-      this.#streamTurn = turn;
+      if (record(event.message).role === "assistant") this.#streamTurn = turn;
     } else if (!turn && event.type === "tool_execution_start" && keys.length > 0 && keys.every(key => key.startsWith("tool:")) && !known) {
       // Native execution_start is the announcement source. Initial tool IDs can
       // arrive without message IDs; retain that captured lifecycle owner.

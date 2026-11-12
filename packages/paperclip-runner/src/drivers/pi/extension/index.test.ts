@@ -74,6 +74,21 @@ describe("owned Pi bind extension", () => {
     expect(await f.emit("input", { source: "extension" })).toEqual({ action: "handled" });
     expect(await f.emit("cache_warming_decision")).toEqual({ action: "stop" });
   });
+  it("admits queued RPC input only under the immutable running origin, never as a new prompt", async () => {
+    const f = await fixture();
+    await f.emit("input", { source: "rpc" });
+    expect(await f.emit("input", { source: "rpc" })).toEqual({ action: "handled" });
+    await f.emit("before_agent_start", { systemPrompt: "native" });
+    const origin = captureOrigin(); f.busy(); f.pending();
+    expect(await f.emit("input", { source: "rpc" })).toEqual({ action: "continue" });
+    expect(await f.emit("input", { source: "extension" })).toEqual({ action: "handled" });
+    expect(captureOrigin()).toBe(origin);
+    expect(origin).toEqual(first);
+    f.control.authority.end();
+    expect(await f.emit("input", { source: "rpc" })).toEqual({ action: "handled" });
+    await f.emit("agent_settled");
+    expect(await f.emit("input", { source: "rpc" })).toEqual({ action: "handled" });
+  });
   it("rejects cross-session commands and never acquires future state in before_agent_start", async () => {
     const f = await fixture();
     expect(await raw(f.socketPath, { schema: 1, type: "announce", nonce: "x", sessionId: "other-session", toolCallId: "call", origin: first })).toEqual({ error: "Pi private request rejected" });

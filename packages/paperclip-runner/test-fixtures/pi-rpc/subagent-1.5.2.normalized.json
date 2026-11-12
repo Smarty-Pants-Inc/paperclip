@@ -12,6 +12,46 @@
     "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
+    "itemId": "turn-1:pi-user:aa5b26bf19b6487296495fcf86784a2518e16cc0b6bd176f22d11db03bdec211",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:subagent",
+      "item": {
+        "id": "turn-1:pi-user:aa5b26bf19b6487296495fcf86784a2518e16cc0b6bd176f22d11db03bdec211",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:subagent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-user:aa5b26bf19b6487296495fcf86784a2518e16cc0b6bd176f22d11db03bdec211",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:subagent",
+      "item": {
+        "id": "turn-1:pi-user:aa5b26bf19b6487296495fcf86784a2518e16cc0b6bd176f22d11db03bdec211",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:subagent"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.started",
     "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
     "payload": {
       "kind": "tool",

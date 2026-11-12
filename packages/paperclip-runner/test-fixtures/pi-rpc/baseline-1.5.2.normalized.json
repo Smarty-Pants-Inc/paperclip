@@ -3,6 +3,46 @@
     "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
+    "itemId": "turn-1:pi-user:9e8fa78010cdbdc62a66118cc5bb2d178a246d8faf620a55c8ecaf23bab8eaec",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:text",
+      "item": {
+        "id": "turn-1:pi-user:9e8fa78010cdbdc62a66118cc5bb2d178a246d8faf620a55c8ecaf23bab8eaec",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:text"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-user:9e8fa78010cdbdc62a66118cc5bb2d178a246d8faf620a55c8ecaf23bab8eaec",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:text",
+      "item": {
+        "id": "turn-1:pi-user:9e8fa78010cdbdc62a66118cc5bb2d178a246d8faf620a55c8ecaf23bab8eaec",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:text"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.started",
     "itemId": "turn-1:pi-message:1:block:0",
     "payload": {
       "kind": "agentMessage",
@@ -95,6 +135,46 @@
         "estimatedCostUsd": 0.0000172,
         "costProvenance": "catalog_estimate",
         "costComplete": true
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-2",
+    "eventType": "item.started",
+    "itemId": "turn-2:pi-user:3299a5af8e2b4cd59a6a04ddc05b84e644b5e32665d50fcfb0f2e1e4d4cdd25b",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:tool-success",
+      "item": {
+        "id": "turn-2:pi-user:3299a5af8e2b4cd59a6a04ddc05b84e644b5e32665d50fcfb0f2e1e4d4cdd25b",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:tool-success"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-2",
+    "eventType": "item.completed",
+    "itemId": "turn-2:pi-user:3299a5af8e2b4cd59a6a04ddc05b84e644b5e32665d50fcfb0f2e1e4d4cdd25b",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:tool-success",
+      "item": {
+        "id": "turn-2:pi-user:3299a5af8e2b4cd59a6a04ddc05b84e644b5e32665d50fcfb0f2e1e4d4cdd25b",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:tool-success"
+          }
+        ]
       }
     }
   },
@@ -496,6 +576,46 @@
         "estimatedCostUsd": 0.00003540000000000001,
         "costProvenance": "catalog_estimate",
         "costComplete": true
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-3",
+    "eventType": "item.started",
+    "itemId": "turn-3:pi-user:13322ea05e01258f1f995d05c48501baf5bf8d48a8a4fbb1f3b35bf7d788c227",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:tool-error",
+      "item": {
+        "id": "turn-3:pi-user:13322ea05e01258f1f995d05c48501baf5bf8d48a8a4fbb1f3b35bf7d788c227",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:tool-error"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-3",
+    "eventType": "item.completed",
+    "itemId": "turn-3:pi-user:13322ea05e01258f1f995d05c48501baf5bf8d48a8a4fbb1f3b35bf7d788c227",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:tool-error",
+      "item": {
+        "id": "turn-3:pi-user:13322ea05e01258f1f995d05c48501baf5bf8d48a8a4fbb1f3b35bf7d788c227",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:tool-error"
+          }
+        ]
       }
     }
   },
