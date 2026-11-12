@@ -12,7 +12,7 @@ const fakePi = `
   const { appendFileSync } = require("node:fs");
   const { createInterface } = require("node:readline");
   const mode = process.env.TEST_PROMPT_MODE;
-  let streaming = false, prompted = false, messageId = 0;
+  let streaming = false, prompted = false, promptCount = 0, messageId = 0;
   const emit = value => process.stdout.write(JSON.stringify(value) + "\\n");
   const answer = request => emit({ type: "response", id: request.id, command: request.type, success: true });
   const start = () => {
@@ -37,14 +37,27 @@ const fakePi = `
     else if (request.type === "get_available_thinking_levels") data = { levels: ["high"] };
     else if (request.type === "test_finish") { finish(); answer(request); return; }
     else if (request.type === "prompt") {
-      prompted = true;
+      prompted = true; promptCount++;
       if (mode === "silent" || mode === "silent-state") return;
+      if (promptCount === 1 && ["handled", "handled-independent", "handled-independent-after"].includes(mode)) {
+        if (mode === "handled-independent") { start(); finish(); }
+        data = { disposition: "handled" };
+        emit({ type: "response", id: request.id, command: request.type, success: true, data });
+        if (mode === "handled-independent-after") { start(); finish(); }
+        return;
+      }
+      if (promptCount === 1 && mode === "rejected") {
+        emit({ type: "response", id: request.id, command: request.type, success: false, error: "rejected before acceptance" }); return;
+      }
+      if (promptCount === 1 && mode === "invalid") {
+        emit({ type: "response", id: request.id, command: request.type, success: true, data: { disposition: "not-a-disposition" } }); return;
+      }
       start();
       if (mode === "streaming" || mode === "wrong-session") return;
       if (mode === "settled") { finish(); return; }
-      data = { disposition: "started" };
+      data = { disposition: mode === "queued" && promptCount === 1 ? "queued" : "started" };
       emit({ type: "response", id: request.id, command: request.type, success: true, data });
-      finish(); return;
+      if (data.disposition !== "queued") finish(); return;
     }
     emit({ type: "response", id: request.id, command: request.type, success: true, data });
   }).on("close", () => process.exit(0));
@@ -146,6 +159,61 @@ describe("Pi RPC prompt acceptance deadline (K3)", () => {
       expect(f.events[0].filter(event => event.eventType === "turn.completed")).toMatchObject([{ turnId: turn.turnId }]);
       expect(f.events[0].some(event => event.eventType === "turn.failed" || event.eventType === "session.failed")).toBe(false);
       expect((await f.commands()).filter(command => command.type === "prompt")).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
+
+describe("Pi RPC prompt dispositions (K4)", () => {
+  it.each(["handled", "handled-independent", "handled-independent-after"])("completes %s with an explicit no-model-output outcome, no settlement wait and no session fence", async mode => {
+    const f = await fixture(mode);
+    try {
+      const session = await f.open();
+      const pid = session.processPid();
+      const first = await bounded(session.startTurn({ message: { role: "user", text: "/extension-command" } }));
+      expect(f.events[0].filter(event => event.eventType === "turn.completed")).toMatchObject([
+        { turnId: first.turnId, payload: { status: "completed", outcome: "handled", modelOutput: false } },
+      ]);
+      expect(f.events[0].find(event => event.eventType === "turn.completed")?.payload.piAgentSettled).toBeUndefined();
+      expect(f.events[0].some(event => event.turnId === first.turnId && event.eventType.startsWith("item."))).toBe(false);
+      expect((await session.snapshot()).activeTurnId).toBeNull();
+      expect(session.processExited()).toBe(false);
+      const second = await bounded(session.startTurn({ message: { role: "user", text: "real model work" } }));
+      await expect.poll(() => f.events[0].find(event => event.eventType === "turn.completed" && event.turnId === second.turnId)).toBeDefined();
+      expect(session.processPid()).toBe(pid);
+      expect(f.events[0].some(event => event.eventType === "turn.failed" || event.eventType === "session.failed")).toBe(false);
+      expect(f.events[0].filter(event => event.turnId === first.turnId && event.eventType.startsWith("item."))).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it.each(["started", "queued"])("accepts %s and completes only on the owned agent_settled", async disposition => {
+    const f = await fixture(disposition);
+    try {
+      const session = await f.open();
+      const turn = await bounded(session.startTurn({ message: { role: "user", text: "model work" } }));
+      if (disposition === "queued") {
+        expect(f.events[0].some(event => event.eventType === "turn.completed")).toBe(false);
+        await f.transports[0].request("test_finish");
+      }
+      await expect.poll(() => f.events[0].find(event => event.eventType === "turn.completed" && event.turnId === turn.turnId)).toBeDefined();
+      expect(f.events[0].find(event => event.eventType === "turn.completed")?.payload).toMatchObject({ status: "completed", piAgentSettled: true });
+      expect(f.events[0].some(event => event.eventType === "turn.failed" || event.eventType === "session.failed")).toBe(false);
+    } finally { await f.close(); }
+  });
+
+  it.each(["rejected", "invalid"])("fails %s input without retiring the session and the next prompt works", async mode => {
+    const f = await fixture(mode);
+    try {
+      const session = await f.open();
+      const pid = session.processPid();
+      await expect(bounded(session.startTurn({ message: { role: "user", text: "not accepted" } }))).rejects.toThrow();
+      expect(f.events[0].filter(event => event.eventType === "turn.failed")).toMatchObject([
+        { payload: { error: { code: "pi_prompt_rejected" } } },
+      ]);
+      expect(session.processExited()).toBe(false);
+      const turn = await bounded(session.startTurn({ message: { role: "user", text: "accepted" } }));
+      await expect.poll(() => f.events[0].find(event => event.eventType === "turn.completed" && event.turnId === turn.turnId)).toBeDefined();
+      expect(session.processPid()).toBe(pid);
+      expect(f.events[0].some(event => event.eventType === "session.failed")).toBe(false);
     } finally { await f.close(); }
   });
 });
