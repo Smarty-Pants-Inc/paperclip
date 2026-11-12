@@ -13,6 +13,7 @@ import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { configurePiNativeMcp } from "./pi-native-mcp.js";
 import { piHostInstructionSegment, verifiedPiChildBridgePath } from "./extension/index.js";
+import { piRpcUserInput } from "./pi-user-input.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
@@ -563,6 +564,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
+    const message = piRpcUserInput(input.message);
     return this.#serialize(async () => {
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
@@ -595,7 +597,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // only by this host prompt, never attach/bind or callback arrival.
         if (binding) this.#callbacks?.activate(binding.origin, this.#resident!.context.toolNames);
         this.#pendingInput++;
-        const response = await this.#transport.request("prompt", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+        const response = await this.#transport.request("prompt", message).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
         if (disposition !== "started") throw new PiNativeAdmissionError("pi_prompt_rejected", `Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
       } catch (error) {
@@ -613,8 +615,9 @@ export class PiRpcHarnessSession implements HarnessSession {
     const turn = this.#activeTurn;
     if (this.#closed || !turn || turn.settled) throw new HarnessOperationAlreadyTerminalError("steering");
     if (input.turnId !== turn.turnId) throw new HarnessStaleTurnError(input.turnId);
+    const message = piRpcUserInput(input.message);
     this.#pendingInput++;
-    const response = await this.#transport.request("steer", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+    const response = await this.#transport.request("steer", message).finally(() => { this.#pendingInput--; });
     const disposition = stringValue(record(response.data).disposition);
     if (disposition !== "queued") {
       throw new Error(`Pi RPC steer did not queue input (disposition=${disposition ?? "missing"})`);

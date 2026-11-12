@@ -55,6 +55,8 @@ export interface NativeSessionCapabilities {
 export interface NativeUserMessage {
   role: "user";
   text: string;
+  /** Optional native image content; currently mapped by the Pi RPC facade. */
+  images?: Array<{ type: "image"; data: string; mimeType: string }>;
 }
 import type { TypedEventFamilyCapability } from "../provider-events.js";
 
