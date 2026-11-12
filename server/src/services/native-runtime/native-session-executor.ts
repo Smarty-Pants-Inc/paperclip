@@ -7375,7 +7375,7 @@ type NativeProviderKind = NativeExecutionInput["provider"]["kind"];
 type NativeDriverKind = NativeExecutionInput["session"]["driverKind"];
 
 export interface NativeHarnessPersistenceDirectory {
-  name: "runner" | "codex-home" | "opencode" | "acpx" | "pi-agent";
+  name: "runner" | "codex-home" | "opencode" | "acpx" | "pi-agent" | "pi";
   location: "runner" | "filesystem";
   excludeEntries: readonly string[];
 }
@@ -7468,6 +7468,10 @@ export function resolveNativeHarnessPersistenceProfile(
     directories: [
       { name: "runner", location: "runner", excludeEntries: [] },
       ...(providerDirectory ? [providerDirectory] : []),
+      // Pi RPC cold-opens conversation JSONL here, not inside pi-agent/.
+      ...(execution.provider.kind === "pi_rpc"
+        ? [{ name: "pi" as const, location: "filesystem" as const, excludeEntries: [] }]
+        : []),
     ],
   };
 }
