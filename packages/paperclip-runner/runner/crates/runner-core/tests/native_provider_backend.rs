@@ -3941,3 +3941,54 @@ fn pi_rpc_bad_stdout_line_does_not_stop_polling(kind: &str) {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+#[cfg(unix)]
+fn pi_rpc_missing_result_deadline_emits_failure_and_next_turn_starts() {
+    let directory = temporary_directory("pi-rpc-missing-result-deadline");
+    let (config, payload, _) = pi_rpc_finish_fixture(
+        &directory,
+        "--tool-waiter-timeout-ms 30 --durable-turn-ids --durable-tool-ids",
+    );
+    let mut executor = start_pi_rpc_finish(&directory, &config, payload);
+    let events = poll_opencode_until(&mut executor, "turn.failed");
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "run.terminal"));
+    drop(executor);
+    let mut saved = pi_rpc_state(&directory);
+    assert_eq!(saved["piDeferredTerminal"], "turn.failed");
+    // Test clock: configure the saved deadline to 20ms from this observation.
+    let deadline = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 20;
+    saved["piDeferredTerminalDeadlineUnixMs"] = json!(deadline);
+    fs::write(
+        directory.join("codex-provider-state.json"),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    let events = poll_opencode_until(&mut executor, "run.terminal");
+    let terminal = events
+        .iter()
+        .find(|event| event.event_type == "run.terminal")
+        .unwrap();
+    assert_eq!(terminal.payload["runTerminalState"], "failed");
+    assert_eq!(terminal.payload["code"], "pi_deferred_terminal_timeout");
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "semantic_tool.result"));
+    executor
+        .execute(&command(
+            4,
+            "turn.start",
+            json!({"text":"Start the next turn."}),
+        ))
+        .unwrap();
+    poll_opencode_until(&mut executor, "turn.started");
+    assert_eq!(opencode_call_count(&directory, "turn/start"), 2);
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
