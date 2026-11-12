@@ -593,6 +593,31 @@ pub struct CodexSkillInput {
 pub struct CodexTurnOptions<'a> {
     pub skills: &'a [CodexSkillInput],
     pub reasoning_mode: Option<&'a str>,
+    pub local_image_paths: &'a [String],
+}
+
+/// The controller supplies paths in the admitted Runner's filesystem. Only Pi
+/// consumes these inputs; document paths remain in the ordinary prompt text.
+pub(crate) fn pi_local_image_input(
+    provider: &str,
+    paths: &[String],
+) -> Result<Vec<Value>, LocalRunnerError> {
+    if paths.len() > 128 || (!paths.is_empty() && provider != "pi_rpc") {
+        return Err(LocalRunnerError::invalid(
+            "local images require Pi and at most 128 files",
+        ));
+    }
+    paths
+        .iter()
+        .map(|path| {
+            if path.is_empty() || path.len() > 4096 || path.bytes().any(|byte| byte.is_ascii_control()) {
+                return Err(LocalRunnerError::invalid(
+                    "local image requires a valid Runner path",
+                ));
+            }
+            Ok(json!({"type": "localImage", "path": path}))
+        })
+        .collect()
 }
 
 impl CodexSkillInput {
@@ -2245,7 +2270,9 @@ impl CodexProvider {
         let CodexTurnOptions {
             skills,
             reasoning_mode,
+            local_image_paths,
         } = options;
+        let image_input = pi_local_image_input(&self.config.provider, local_image_paths)?;
         if reasoning_mode.is_some_and(|mode| {
             self.config.provider != "opencode" || !matches!(mode, "default" | "disabled")
         }) {
@@ -2333,6 +2360,7 @@ impl CodexProvider {
         let runtime_request_scope = new_runtime_request_scope()?;
         let mut input = vec![json!({"type": "text", "text": message, "text_elements": []})];
         input.extend(skills.iter().map(|skill| json!(skill)));
+        input.extend(image_input);
         let mut turn_params = json!({
             "threadId": self.thread_id,
             "cwd": cwd,
@@ -2638,6 +2666,15 @@ impl CodexProvider {
     }
 
     pub fn steer_turn(&mut self, message: &str) -> Result<Value, LocalRunnerError> {
+        self.steer_turn_with_images(message, &[])
+    }
+
+    pub(crate) fn steer_turn_with_images(
+        &mut self,
+        message: &str,
+        local_image_paths: &[String],
+    ) -> Result<Value, LocalRunnerError> {
+        let image_input = pi_local_image_input(&self.config.provider, local_image_paths)?;
         let turn_id = self
             .active_provider_turn_id
             .clone()
@@ -2647,12 +2684,14 @@ impl CodexProvider {
                 "Codex steering text is empty or oversized",
             ));
         }
+        let mut input = vec![json!({"type": "text", "text": message, "text_elements": []})];
+        input.extend(image_input);
         self.request(
             "turn/steer",
             json!({
                 "threadId": self.thread_id,
                 "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": message, "text_elements": []}],
+                "input": input,
             }),
         )
     }
@@ -5533,6 +5572,9 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
     *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"reader-tail-thread"}}}' ;;
+    *'"method":"turn/steer"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '{"id":%s,"result":{}}\n' "$id" ;;
     *'"method":"run.attach"'*|*'"method":"session.revalidate"'*|*'"method":"paperclip/host_park_ready"'*)
       id=${line#*\"id\":}; id=${id%%,*}
       printf '{"id":%s,__PI_REPLY__}\n' "$id" ;;
@@ -6765,6 +6807,49 @@ done
         }
     }
 
+    #[test]
+    fn pi_local_images_reject_other_providers_and_invalid_runner_paths() {
+        assert!(pi_local_image_input("pi_rpc", &["/runner/screenshot.png".to_owned()]).is_ok());
+        assert!(pi_local_image_input("codex", &["/runner/screenshot.png".to_owned()]).is_err());
+        assert!(pi_local_image_input("pi_rpc", &[".paperclip/attachments/staged.png".to_owned()]).is_ok());
+        assert!(pi_local_image_input("pi_rpc", &["".to_owned()]).is_err());
+        assert!(pi_local_image_input("pi_rpc", &["/runner/invalid\0.png".to_owned()]).is_err());
+        assert!(pi_local_image_input("pi_rpc", &vec!["/runner/a.png".to_owned(); 129]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_steer_preserves_image_and_document_paths() {
+        let mut provider = completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
+        provider.config.provider = "pi_rpc".to_owned();
+        provider.active_provider_turn_id = Some("steer-turn".to_owned());
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&frames);
+        provider.sent_frame_observer = Some(Box::new(move |frame| {
+            recorded.lock().unwrap().push(frame.clone());
+        }));
+        provider
+            .steer_turn_with_images(
+                "Read PDF /runner/attachments/brief.pdf",
+                &["/runner/attachments/screenshot.png".to_owned()],
+            )
+            .unwrap();
+        provider.shutdown().unwrap();
+        let frames = frames.lock().unwrap();
+        let steer = frames
+            .iter()
+            .find(|frame| frame["method"] == "turn/steer")
+            .unwrap();
+        assert!(steer["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("/runner/attachments/brief.pdf"));
+        assert_eq!(
+            steer["params"]["input"][1],
+            json!({"type": "localImage", "path": "/runner/attachments/screenshot.png"})
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn pi_attachment_turn_sends_fresh_context_before_prompt() {
@@ -6795,9 +6880,12 @@ done
         let cwd = provider.config.cwd.clone();
         let result = provider
             .start_turn_with_options_and_effort(
-                "Next prompt",
+                "Inspect PNG and PDF /runner/attachments/brief.pdf",
                 &cwd,
-                CodexTurnOptions::default(),
+                CodexTurnOptions {
+                    local_image_paths: &["/runner/attachments/screenshot.png".to_owned()],
+                    ..CodexTurnOptions::default()
+                },
                 None,
                 Some("second-run"),
             )
@@ -6810,6 +6898,14 @@ done
             .find(|frame| frame["method"] == "turn/start")
             .unwrap();
         assert_eq!(start["params"]["paperclipRunId"], "second-run");
+        assert!(start["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("/runner/attachments/brief.pdf"));
+        assert_eq!(
+            start["params"]["input"][1],
+            json!({"type": "localImage", "path": "/runner/attachments/screenshot.png"})
+        );
         assert!(start["params"]["baseInstructions"]
             .as_str()
             .unwrap()

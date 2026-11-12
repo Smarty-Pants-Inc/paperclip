@@ -5,6 +5,43 @@ must be attached to the Paperclip issue before the agent chooses a final
 disposition. A local workspace path is not enough, because cloud users and
 reviewers often cannot access the agent's disk.
 
+## Read attached files in native runs
+
+Native runs receive readable paths for the exact files admitted in their
+current wake. A compatible remote Runner downloads files over HTTPS from the
+configured tenant origin using short-lived grants. The tenant verifies each
+grant against the live run and the exact authorized attachment. Runner verifies
+the size and SHA-256 and clears its local copy at turn end. Linux SSH and
+command-backed sandbox targets can also stage files through their bound
+transport when Runner download is unavailable. Image inputs must be opened
+with the provider's image-capable file reader.
+
+Native Pi RPC also sends current-wake PNG, JPEG, GIF, and WebP attachments
+through Pi 1.5.2's `prompt.images` input. The server selects authenticated staged
+paths separately from prompt text; Runner carries them as `localImage` inputs,
+and Pi's provider-host driver reads the bounded file bytes and constructs image
+blocks. Inline base64 image items and image data URLs use that same prompt and
+steering image list, alongside any staged images, without dropping either form.
+Unmappable input or an unreadable/invalid staged image rejects only that request;
+it does not retire the session or send an empty prompt. Active-turn steering
+uses the same image mapping. PDFs and other
+documents remain files at their staged `workspaceRelativePath` or
+`runnerLocalPath`, referenced in prompt text for the agent to read. A new turn
+never implicitly reuses the previous turn's images. Unavailable staging does
+not grant an image read, and prompt text alone never grants a file read.
+
+The same paths support authorized historical external-chat reads. Their
+existing conversation and source-comment checks still apply. External-chat
+history tools grant access only within the authorized conversation.
+Plugin Runner tasks require a compatible Runner build and HTTPS access to
+the tenant download endpoint.
+
+Temporary slots are isolated per staging operation. Cleanup clears the verified
+file after the turn and refuses symlinks or replacement files. Abrupt controller
+or remote-host failure can interrupt cleanup; sandbox disposal remains the
+backstop for ephemeral environments. Retained provider sessions and checkpoints
+keep their existing format and identity across this change.
+
 ## Upload files from a task
 
 People can open the task's Artifacts tab and use the upload icon, or drop files

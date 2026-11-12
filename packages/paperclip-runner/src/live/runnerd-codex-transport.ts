@@ -1,6 +1,7 @@
 import { admitPiProbeSession, observePiNativeHello } from "../drivers/pi/pi-environment-probe.js";
 import { resolvePiNativeConfig } from "../drivers/pi/pi-native-config.js";
 import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
+import type { RunnerAttachmentDownloadGrant } from "../contracts/harness-driver.js";
 import { readProviderFailure } from "../contracts/provider-failure.generated.js";
 import { confirmAntigravityProbeNativeRetirement } from "../drivers/acpx/antigravity-probe-retirement.js";
 import { resolveGrokDisableWebSearch, admittedGrokWebSearchPolicy } from "../drivers/acpx/grok-web-search.js";
@@ -851,6 +852,20 @@ async function awaitProviderDrainBarrier(input: {
     }
   }
   return false;
+}
+
+// Paths belong to the Runner filesystem, not the controller. Preserve them in
+// durable commands and let the admitted Pi facade read/encode them locally.
+export function runnerdPiLocalImagePaths(input: readonly Record<string, unknown>[], provider: string): string[] {
+  const images = input.filter(item => item.type === "localImage");
+  if (!images.length) return [];
+  if (provider !== "pi_rpc" || images.length > 128) throw new Error("local image inputs require Pi and at most 128 files");
+  return images.map(item => {
+    if (typeof item.path !== "string" || !item.path || item.path.length > 4096 || /[\x00-\x1f\x7f]/u.test(item.path)) {
+      throw new Error("local image input requires a valid Runner path");
+    }
+    return item.path;
+  });
 }
 
 export function committedEventWindowComplete(state: { committedEvents: readonly { sourceSeq: number }[]; ackedSourceSeq: number } | undefined): boolean {
@@ -4031,6 +4046,51 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #providerIdentity: Record<string, unknown> | null = null;
   #turnControls: NativeTurnControlCapabilities = { steering: false, queuedFollowUp: false };
 
+  #attachmentDownloadSupport?: Promise<boolean>;
+  #attachmentDownloadTail = Promise.resolve();
+
+  downloadAttachment(grant: (turnId: string) => RunnerAttachmentDownloadGrant) {
+    const turnId = this.#durableTurnId;
+    const download = this.#attachmentDownloadTail.then(() => this.#downloadAttachment(turnId, grant));
+    this.#attachmentDownloadTail = download.then(() => undefined, () => undefined);
+    return download;
+  }
+
+  async #downloadAttachment(turnId: string, grant: (turnId: string) => RunnerAttachmentDownloadGrant) {
+    const core = this.#core;
+    if (!turnId || this.#durableTurnId !== turnId || !core || (core.activeRunnerProtocolVersion() ?? 0) < 3) return null;
+    this.#attachmentDownloadSupport ??= this.#commandResult("session.snapshot", {}, this.#waitNow() + 5_000, true)
+      .then(result => result.attachmentDownloadVersion === 1);
+    if (!await this.#attachmentDownloadSupport || this.#durableTurnId !== turnId) return null;
+    const deadline = this.#waitNow() + 18_000;
+    const started = await this.#commandResult("runner.attachment.download", {
+      ...grant(turnId), turnId,
+    }, deadline, true);
+    const downloadId = started.downloadId;
+    if (started.status !== "pending" || typeof downloadId !== "string") {
+      throw new Error("runner_attachment_download_invalid_receipt");
+    }
+    let result: Record<string, unknown> = {};
+    while (!this.#closed && this.#core === core && this.#durableTurnId === turnId && this.#waitNow() < deadline) {
+      this.#throwIfFailed();
+      this.#assertRunWorkAdmission("runner.attachment.download");
+      const event = core.store.state.committedEvents.find(event => event.eventType === "runner.attachment.settled"
+        && record(record(event.envelope.payload).payload).downloadId === downloadId);
+      if (event) {
+        result = record(record(event.envelope.payload).payload);
+        break;
+      }
+      await new Promise(resolveWait => setTimeout(resolveWait, 50));
+    }
+    const path = result.path;
+    if (result.status !== "ready" || this.#durableTurnId !== turnId
+      || typeof path !== "string" || path.length > 4096
+      || !path.startsWith("/") || /[\x00-\x1f\x7f]/u.test(path)) {
+      throw new Error("runner_attachment_download_invalid_path");
+    }
+    return path;
+  }
+
   supportsTurnReasoning(): boolean {
     if (this.options.provider !== "opencode") return false;
     // Use the durable selected model on both fresh and recovered sessions.
@@ -4387,6 +4447,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const text = input
         .map((item) => (typeof item.text === "string" ? item.text : ""))
         .join("\n");
+      const localImagePaths = runnerdPiLocalImagePaths(input, this.options.provider ?? "codex");
       const expectedTurnId =
         typeof params.expectedTurnId === "string"
           ? params.expectedTurnId
@@ -4405,6 +4466,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           text,
           turnId: this.#durableTurnId,
           providerTurnId: expectedTurnId,
+          ...(localImagePaths.length ? { localImagePaths } : {}),
           ...(params.mode === "follow_up" ? { mode: "follow_up" } : {}),
           ...(correlationId ? { correlationId } : {}),
         },
@@ -7526,6 +7588,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       .filter((item) => item.type !== "skill")
       .map((item) => (typeof item.text === "string" ? item.text : ""))
       .join("\n");
+    const localImagePaths = runnerdPiLocalImagePaths(input, this.options.provider ?? "codex");
     const reasoningMode = params.reasoningMode;
     if (reasoningMode !== undefined && (
       !this.supportsTurnReasoning()
@@ -7567,7 +7630,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const startResult = await this.#commandResult(
         "turn.start",
         {
-          ...(compactionPayload ?? { text: message }),
+          ...(compactionPayload ?? { text: message, ...(localImagePaths.length ? { localImagePaths } : {}) }),
           ...(this.options.recordTimingReceipt ? {performance:true} : {}),
           ...((this.options.provider ?? "codex") === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
           ...(reasoningMode === undefined ? {} : { reasoningMode }),
@@ -8039,6 +8102,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // full, new events replace its prefix without increasing its length.
       if (fromDeferredQueue) this.#deferredTurnStartEvents.shift();
       else this.#eventSourceSeq = event.sourceSeq;
+      if (event.eventType === "runner.attachment.settled") continue;
       if (event.eventType === "auth.credentials.updated" && this.options.onCredentialsUpdated) continue;
       if (event.eventType === "runtime.activity.recorded") {
         this.#queue.push({ method: "paperclip/runtimeActivityRecorded", params: {
