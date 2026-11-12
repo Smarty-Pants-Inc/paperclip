@@ -14,7 +14,7 @@ import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skil
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
-import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -57,6 +57,8 @@ export interface PiRpcDriverOptions {
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
   startupTimeoutMs?: number;
+  /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
+  promptTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
@@ -224,6 +226,7 @@ export class PiRpcDriver implements HarnessDriver {
         instructionFile,
         instructionBoundary,
         admissionTimeoutMs: this.#options.startupTimeoutMs,
+        promptTimeoutMs: this.#options.promptTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
@@ -278,6 +281,7 @@ interface PiSessionState {
   instructionBoundary: string;
   bindRequest: typeof sendPiBindRequest;
   admissionTimeoutMs?: number;
+  promptTimeoutMs?: number;
 }
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
@@ -359,6 +363,9 @@ export class PiRpcHarnessSession implements HarnessSession {
   // Park blockers outlive settlement, but need no retained projector/display.
   readonly #pendingNativeTools = new Map<string, { runId: string; turnId: string; toolName: string | undefined }>();
   #pendingInput = 0;
+  // Prompt acceptance gates lifecycle ownership, not transport/error delivery.
+  // A handled prompt retains a false gate while independent extension work drains.
+  #promptAcceptance: Promise<boolean> | null = null;
   #cleanupFailure: Error | null = null;
   readonly #bindRequest: typeof sendPiBindRequest;
   #closing?: Promise<void>;
@@ -371,6 +378,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #instructionFile: string;
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
+  readonly #promptTimeoutMs?: number;
   // Active identities alone own a turn/projector. Settlement replaces values
   // with compact hash-key tombstones: late/reused IDs still cannot authorize
   // new work, but completed projectors and their display bodies are released.
@@ -405,6 +413,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#instructionFile = state.instructionFile;
     this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
+    this.#promptTimeoutMs = state.promptTimeoutMs;
     void this.#pump();
   }
 
@@ -540,6 +549,9 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
       if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
+      // handled may have launched independent extension work. Prove idle before
+      // replacing its discard gate with a new prompt owner (resident bind admits too).
+      if (this.#promptAcceptance && !this.#resident) await this.#admit();
       if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
       if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
       const binding = this.#resident?.binding;
@@ -553,21 +565,70 @@ export class PiRpcHarnessSession implements HarnessSession {
       this.#activeTurn = turn;
       this.#streamTurn = null;
       this.#emit("turn.started", { status: "inProgress" }, turn);
+      let settleAcceptance!: (consume: boolean) => void;
+      const acceptance = new Promise<boolean>(resolve => { settleAcceptance = resolve; });
+      this.#promptAcceptance = acceptance;
+      const releaseAcceptance = (consume: boolean, retain = false) => {
+        settleAcceptance(consume);
+        if (!retain && this.#promptAcceptance === acceptance) this.#promptAcceptance = null;
+      };
       try {
         // Host authority is independent from extension authority and activated
         // only by this host prompt, never attach/bind or callback arrival.
         if (binding) this.#callbacks?.activate(binding.origin);
         this.#pendingInput++;
-        const response = await this.#transport.request("prompt", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+        const response = await this.#transport.request("prompt", { message: input.message.text }, { timeoutMs: this.#promptTimeoutMs }).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
-        if (disposition !== "started") throw new Error(`Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
+        if (disposition === "handled") {
+          // Valid consumption without a model run: there will be no owned
+          // agent_settled, and extension-started work must not borrow this turn.
+          try { await this.#finishTurn(turn, "completed", { outcome: "handled", modelOutput: false }); }
+          catch (cleanup) { await this.#fenceFailure(cleanup); throw cleanup; }
+          releaseAcceptance(false, true);
+        } else if (disposition === "started" || disposition === "queued") releaseAcceptance(true);
+        else throw new Error(`Pi RPC prompt returned an invalid disposition (${disposition ?? "missing"})`);
       } catch (error) {
-        await this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } });
-        if (this.#resident) await this.#fenceFailure(error);
+        const unknown = error instanceof PiRpcRequestTimeoutError && error.command === "prompt";
+        // On a lost ACK, let the captured lifecycle drain before inspecting Pi.
+        // A genuine rejection/handled result never assigns those events a turn.
+        releaseAcceptance(unknown);
+        if (unknown) {
+          // A lost ACK is not a rejection. Keep the sole input owner while
+          // inspecting Pi; never submit the prompt a second time.
+          if (await this.#reconcilePrompt(turn)) return { turnId: turn.turnId };
+          this.#callbacks?.fence();
+          this.#admitted = false;
+          const failure = new Error(error.message, { cause: error });
+          const detail = { code: "pi_prompt_deadline_exceeded", message: failure.message, acceptance: "unknown", recoverable: false };
+          try { await this.#finishTurn(turn, "failed", { error: detail }); }
+          finally { await this.#fenceFailure(failure); }
+          throw failure;
+        }
+        try { await this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } }); }
+        catch (cleanup) { await this.#fenceFailure(cleanup); throw cleanup; }
+        // A pre-acceptance prompt error belongs to this input, not the resident
+        // session. Normal turn finalization revokes its capability for rebind.
         throw error;
       }
       return { turnId: turn.turnId };
     });
+  }
+
+  async #reconcilePrompt(turn: PiTurnState): Promise<boolean> {
+    // Fast completion can precede both the ACK and its deadline. The captured
+    // terminal already proves this input was consumed, even if Pi is now idle.
+    if (turn.settled) return !this.#closed && !this.#failure;
+    try {
+      const response = await this.#transport.request("get_state", {}, {
+        timeoutMs: Math.min(this.#admissionTimeoutMs ?? 5000, this.#promptTimeoutMs ?? 30_000),
+      });
+      const state = record(response.data);
+      if (this.#closed || this.#failure) return false;
+      return turn.settled || (this.#activeTurn === turn && this.#agentTurn === turn
+        && state.sessionId === this.#providerSessionId && state.isStreaming === true);
+    } catch {
+      return turn.settled && !this.#closed && !this.#failure;
+    }
   }
 
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
@@ -773,6 +834,11 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async #consume(event: PiRpcRecord): Promise<void> {
+    const acceptance = this.#promptAcceptance;
+    // A known old receipt already has an owner; prompt disposition must not
+    // discard it or make it borrow the pending input's origin.
+    const knownOwner = acceptance && piRecordIdentityKeys(event).some(key => this.#owners.has(key));
+    if (acceptance && !knownOwner && event.type !== "process_exit" && event.type !== "transport_error" && !(await acceptance)) return;
     if (event.type === "process_exit" || event.type === "transport_error") {
       const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
       this.#callbacks?.fence();

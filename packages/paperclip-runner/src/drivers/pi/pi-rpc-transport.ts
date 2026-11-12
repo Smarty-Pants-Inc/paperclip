@@ -17,6 +17,8 @@ export interface PiRpcTransportOptions {
   commandFd?: number;
   commandLifecycle?: { beforeSpawn(): void; afterSpawn(): void; afterExit(): void };
   maxRecordBytes?: number;
+  /** Client-side ACK deadline; expiration never proves command rejection. */
+  requestTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
 }
@@ -30,6 +32,13 @@ export class PiRpcCommandError extends Error {
     this.name = "PiRpcCommandError";
     this.command = command;
     this.response = response;
+  }
+}
+
+export class PiRpcRequestTimeoutError extends Error {
+  constructor(readonly command: string, readonly timeoutMs: number) {
+    super(`Pi RPC ${command} response deadline exceeded after ${timeoutMs}ms; acceptance is unknown`);
+    this.name = "PiRpcRequestTimeoutError";
   }
 }
 
@@ -111,6 +120,7 @@ export class PiRpcTransport {
   readonly #pending = new Map<string, { command: string; resolve: (value: PiRpcRecord) => void; reject: (error: Error) => void }>();
   readonly #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   readonly #maxRecordBytes: number;
+  readonly #requestTimeoutMs: number;
   readonly #shutdownTimeoutMs: number;
   readonly #killTimeoutMs: number;
   #buffer = Buffer.alloc(0);
@@ -123,6 +133,7 @@ export class PiRpcTransport {
 
   constructor(options: PiRpcTransportOptions) {
     this.#maxRecordBytes = options.maxRecordBytes ?? 64 * 1024 * 1024;
+    this.#requestTimeoutMs = requestTimeout(options.requestTimeoutMs);
     this.#shutdownTimeoutMs = boundedTimeout(options.shutdownTimeoutMs, 1500);
     this.#killTimeoutMs = boundedTimeout(options.killTimeoutMs, 750);
     const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "pipe"];
@@ -200,25 +211,53 @@ export class PiRpcTransport {
     return this.#records;
   }
 
-  async request(command: string, params: PiRpcRecord = {}): Promise<PiRpcRecord> {
+  async request(command: string, params: PiRpcRecord = {}, options: { timeoutMs?: number } = {}): Promise<PiRpcRecord> {
     if (this.#closed || this.#exited) throw new Error("Pi RPC transport is closed");
     const id = `paperclip-pi-${++this.#nextId}`;
+    // Serialize before allocating an obligation: a cyclic payload must not leave
+    // behind a pending request or timer.
+    const line = `${JSON.stringify({ ...params, id, type: command })}\n`;
+    const timeoutMs = requestTimeout(options.timeoutMs ?? this.#requestTimeoutMs);
+    let cancelDrain = () => {};
     const response = new Promise<PiRpcRecord>((resolve, reject) => {
-      this.#pending.set(id, { command, resolve, reject });
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.#pending.delete(id);
+        cancelDrain();
+      };
+      const timer = setTimeout(() => {
+        this.#pending.get(id)?.reject(new PiRpcRequestTimeoutError(command, timeoutMs));
+      }, timeoutMs);
+      this.#pending.set(id, { command,
+        resolve: value => { cleanup(); resolve(value); },
+        reject: error => { cleanup(); reject(error); },
+      });
     });
     try {
-      const line = `${JSON.stringify({ ...params, id, type: command })}\n`;
       if (!this.#child.stdin.write(line)) {
-        await new Promise<void>((resolve, reject) => {
-          this.#child.stdin.once("drain", resolve);
-          this.#child.stdin.once("error", reject);
+        const drain = new Promise<void>((resolve, reject) => {
+          const stdin = this.#child.stdin;
+          const onDrain = () => resolve();
+          const onError = (error: Error) => reject(error);
+          const onClose = () => reject(new Error("Pi RPC stdin closed before command drained"));
+          cancelDrain = () => {
+            stdin.removeListener("drain", onDrain);
+            stdin.removeListener("error", onError);
+            stdin.removeListener("close", onClose);
+          };
+          stdin.once("drain", onDrain);
+          stdin.once("error", onError);
+          stdin.once("close", onClose);
         });
+        // The ACK deadline also covers a child that never drains stdin. Observe
+        // response immediately so a timeout cannot become an unhandled rejection.
+        await Promise.race([drain, response.then(() => undefined)]);
       }
+      return await response;
     } catch (error) {
-      this.#pending.delete(id);
-      throw error;
-    }
-    return response;
+      this.#pending.get(id)?.reject(error instanceof Error ? error : new Error(String(error)));
+      return response;
+    } finally { cancelDrain(); }
   }
 
   async sendExtensionUiResponse(input: PiRpcExtensionUiResponseInput): Promise<void> {
@@ -351,6 +390,11 @@ function extensionUiResponseRecord(input: PiRpcExtensionUiResponseInput): PiRpcR
     ...(hasConfirmed ? { confirmed: input.confirmed } : {}),
     ...(hasCancelled ? { cancelled: true } : {}),
   };
+}
+
+function requestTimeout(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value)
+    ? Math.min(2_147_483_647, Math.max(1, Math.floor(value))) : 30_000;
 }
 
 function boundedTimeout(value: number | undefined, fallback: number): number {
