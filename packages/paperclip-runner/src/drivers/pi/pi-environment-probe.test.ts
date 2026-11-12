@@ -41,7 +41,12 @@ describe("ordinary native Pi setup hello through the run's configured driver", (
     await expect(probe(value.driver)).resolves.toEqual({ provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: config.model, providerSessionId: "native-session", piRpcThinkingLevel: "off", helloProbePassed: true });
     expect(value.openSession).toHaveBeenCalledWith(expect.objectContaining({ runId: "probe-run", normalizedSessionId: "probe-session", workingDirectory: "/prepared/selected-remote-target", signal: expect.any(AbortSignal) }));
     expect(value.startTurn).toHaveBeenCalledOnce();
-    expect(value.startTurn.mock.calls[0]).toEqual([{ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." }, model: config.model, piRpcThinkingLevel: config.piRpcThinkingLevel }]);
+    expect(value.startTurn.mock.calls[0]).toEqual([{ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." } }]);
+    expect(value.close).toHaveBeenCalledOnce();
+  });
+  it("ignores the facade's previous turn while requiring the hello turn's own reply and terminal", async () => {
+    const value = stub({ events: [event("turn.completed", {}, { turnId: "previous-turn" }), reply(), terminal()] });
+    await expect(probe(value.driver)).resolves.toMatchObject({ helloProbePassed: true });
     expect(value.close).toHaveBeenCalledOnce();
   });
   it("accepts the explicit final phase when the facade cached a progress start", async () => {
