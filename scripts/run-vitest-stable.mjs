@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -409,6 +409,20 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return shardFiles.map((file) => byRepoPath.get(file));
 }
 
+function makeTestDirectoriesWritable(directory) {
+  let entries;
+  try {
+    const stats = lstatSync(directory);
+    if (!stats.isDirectory()) return; // Never follow fixture symlinks.
+    chmodSync(directory, stats.mode | 0o700);
+    entries = readdirSync(directory);
+  } catch {
+    // Best effort: still try removal, and let its result determine the warning.
+    return;
+  }
+  for (const entry of entries) makeTestDirectoriesWritable(path.join(directory, entry));
+}
+
 async function runVitest(args, label, testShard = null, exactFiles = false) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
@@ -489,7 +503,13 @@ async function runVitest(args, label, testShard = null, exactFiles = false) {
     });
   } finally {
     if (process.env.PAPERCLIP_TEST_KEEP_TMP !== "1") {
-      rmSync(testRoot, { recursive: true, force: true });
+      try {
+        makeTestDirectoriesWritable(testRoot);
+        rmSync(testRoot, { recursive: true, force: true });
+      } catch (error) {
+        // Cleanup must never mask a child failure or turn a passing run red.
+        console.warn(`[test:run] warning: could not remove temporary root ${JSON.stringify(testRoot)}: ${JSON.stringify(error.message)}`);
+      }
     }
   }
 }

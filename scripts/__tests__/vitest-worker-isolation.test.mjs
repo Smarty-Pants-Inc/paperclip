@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,20 +78,31 @@ for (const parallel of [false, true]) test(`isolated forks retain fresh state wi
 
 // Regression: abandoned wrapper roots exhausted ryzen4's /tmp inodes. Exercise
 // the actual wrapper boundary, including collection failures before the run.
-for (const [name, keep, failure] of [
+for (const [name, keep, failure, readOnly = false, blockRemoval = false] of [
   ["successful run", "", ""],
   ["failed run", "", "run"],
   ["failed collection", "", "list"],
   ["explicit keep", "1", ""],
   ["keep after failure", "1", "run"],
   ["keep=0 still cleans up", "0", ""],
+  ["successful run with read-only fixture", "", "", true],
+  ["failed run with read-only fixture", "", "run", true],
+  ["explicit keep with read-only fixture", "1", "", true],
+  ["successful run warns when removal fails", "", "", false, true],
+  ["failed run warns when removal fails", "", "run", false, true],
 ]) test(`wrapper temp roots honor TMPDIR and cleanup policy: ${name}`, { skip: process.platform === "win32" }, () => {
   const directory = realpathSync(mkdtempSync(path.join(os.tmpdir(), "pc-root-proof-")));
   const parent = path.join(directory, "tmp");
   const receipt = path.join(directory, "root.json");
   const fakePnpm = path.join(directory, "pnpm");
+  const externalBundle = path.join(directory, "external-bundle");
   mkdirSync(parent);
   try {
+    if (readOnly) {
+      mkdirSync(externalBundle);
+      writeFileSync(path.join(externalBundle, "asset"), "outside the root");
+      chmodSync(externalBundle, 0o555);
+    }
     writeFileSync(fakePnpm, `#!${process.execPath}
       const fs = require('node:fs');
       const path = require('node:path');
@@ -103,6 +114,14 @@ for (const [name, keep, failure] of [
       }));
       // Leave nested content behind to require recursive cleanup.
       fs.writeFileSync(path.join(process.env.TMPDIR, 'fixture'), 'temporary');
+      if (${readOnly}) {
+        const bundle = path.join(process.env.TMPDIR, 'read-only-bundle');
+        fs.mkdirSync(bundle);
+        fs.writeFileSync(path.join(bundle, 'asset'), 'runtime asset');
+        fs.chmodSync(bundle, 0o555);
+        fs.symlinkSync(${JSON.stringify(externalBundle)}, path.join(process.env.TMPDIR, 'external-link'));
+      }
+      if (${blockRemoval}) fs.chmodSync(path.dirname(root), 0o555);
       if (process.argv.includes('list')) process.exit(7);
       process.exit(${failure === "run" ? 7 : 0});
     `);
@@ -120,15 +139,33 @@ for (const [name, keep, failure] of [
       cwd: root, encoding: "utf8", timeout: 30_000, env,
     });
     assert.equal(result.status, failure ? 1 : 0, `${result.error ?? ""}\n${result.stdout}\n${result.stderr}`);
+    if (failure === "run") assert.match(result.stderr, /failed \(7\)/);
     const observed = JSON.parse(readFileSync(receipt, "utf8"));
     assert.equal(path.dirname(observed.root), parent, "root must be created under TMPDIR");
     assert.match(path.basename(observed.root), /^pv-/);
     assert.equal(observed.home, path.join(observed.root, "h"));
     assert.equal(observed.tmpdir, path.join(observed.root, "t"));
     assert.ok(observed.homeExists && observed.tmpExists, "root must exist while the child runs");
-    assert.equal(existsSync(observed.root), keep === "1", "only KEEP_TMP=1 retains the root");
-    assert.deepEqual(readdirSync(parent), keep === "1" ? [path.basename(observed.root)] : []);
+    const retained = keep === "1" || blockRemoval;
+    assert.equal(existsSync(observed.root), retained, "only explicit keep or failed removal retains the root");
+    assert.deepEqual(readdirSync(parent), retained ? [path.basename(observed.root)] : []);
+    if (readOnly) {
+      assert.equal(statSync(externalBundle).mode & 0o777, 0o555, "cleanup must not chmod symlink targets");
+      assert.equal(readFileSync(path.join(externalBundle, "asset"), "utf8"), "outside the root");
+      if (keep === "1") assert.equal(statSync(path.join(observed.tmpdir, "read-only-bundle")).mode & 0o777, 0o555);
+    }
+    const warnings = result.stderr.split("\n").filter(line => line.includes("warning: could not remove temporary root"));
+    assert.equal(warnings.length, blockRemoval ? 1 : 0, result.stderr);
+    if (blockRemoval) assert.ok(warnings[0].includes(observed.root), "warning must identify the root");
   } finally {
+    // Repair retained fixtures (and failed RED runs) so test teardown cannot
+    // hide the assertion failure or leave its own read-only tree behind.
+    chmodSync(parent, 0o755);
+    if (existsSync(externalBundle)) chmodSync(externalBundle, 0o755);
+    for (const entry of readdirSync(parent)) {
+      const bundle = path.join(parent, entry, "t", "read-only-bundle");
+      if (existsSync(bundle)) chmodSync(bundle, 0o755);
+    }
     rmSync(directory, { recursive: true, force: true });
   }
 });
