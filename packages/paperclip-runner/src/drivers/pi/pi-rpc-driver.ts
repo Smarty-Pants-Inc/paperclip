@@ -15,6 +15,7 @@ import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -356,7 +357,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #closeProvider?: () => Promise<void>;
   readonly #resident?: PiResidentState;
   readonly #callbacks?: PiHostCallbacks;
-  readonly #dialogs = new Map<string, { id: string | number; method: string; origin: Readonly<Origin>; turn: PiTurnState; diagnosticOrigin: Record<string, unknown>; resolving: boolean }>();
+  readonly #dialogs = new Map<string, { id: string | number; dialog: PiRuntimeDialog; origin: Readonly<Origin>; turn: PiTurnState; diagnosticOrigin: Record<string, unknown>; expiresAt?: number; resolving: boolean }>();
   readonly #dialogIds = new Set<string>();
   readonly #pendingNativeTools = new Map<string, PiTurnState>();
   #pendingInput = 0;
@@ -613,32 +614,49 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#dialogIds.has(requestId)) return;
     if (this.#dialogIds.size >= 4096) throw new Error("Pi UI identity limit exceeded");
     this.#dialogIds.add(requestId);
+    let dialog: PiRuntimeDialog;
+    try {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}(?![\s\S])/.test(requestId)) throw new Error("Invalid Pi UI identity");
+      dialog = normalizePiRuntimeDialog(event);
+    } catch {
+      await this.#transport.sendExtensionUiResponse({ id, cancelled: true });
+      this.#emit("harness.diagnostic", { code: "pi_runtime_dialog_refused" });
+      return;
+    }
+    // No await precedes validation + capture of a valid frame. The sole pump
+    // consumes native stdout FIFO: old UI precedes old agent_settled; settlement
+    // fences and removes its dialogs before warm admission/new agent_start.
+    const captured = this.#callbacks?.authority.capture();
     let turn: PiTurnState | null = null;
     let origin: Readonly<Origin> | null = null;
     if (Object.hasOwn(event, "origin")) {
-      if (validateOrigin(event.origin) && this.#callbacks?.authority.accept(event.origin)) {
+      if (captured && validateOrigin(event.origin) && this.#callbacks?.authority.accept(event.origin)) {
         const active = this.#activeTurn;
-        if (active?.runId === event.origin.runId && active.turnId === event.origin.turnId) { turn = active; origin = Object.freeze({ ...event.origin }); }
+        if (active?.runId === captured.runId && active.turnId === captured.turnId) { turn = active; origin = captured; }
       }
       // Explicit old/unknown attribution NEVER falls back to the current run.
     } else if (keys.length > 0 && keys.every(key => this.#owners.has(key))) {
       const owners = keys.map(key => this.#owners.get(key));
       if (owners[0] && owners.every(owner => owner === owners[0])) {
-        const captured = this.#callbacks?.authority.capture();
         if (captured && captured.runId === owners[0].runId && captured.turnId === owners[0].turnId) { turn = owners[0]; origin = captured; }
       }
+    } else if (keys.length === 0) {
+      // The unmodified SDK emits no origin/message/tool fields for ctx.ui.
+      // Bind only inside the already admitted native agent lifecycle, using
+      // the host's captured epoch, never provider-supplied controller IDs.
+      const active = this.#agentTurn;
+      if (this.#admitted && this.#providerSessionId && captured && active === this.#activeTurn && active?.runId === captured.runId && active.turnId === captured.turnId) { turn = active; origin = captured; }
     }
     if (turn && keys.length > 0 && !keys.every(key => this.#owners.get(key) === turn)) { turn = null; origin = null; }
     if (!turn || turn.settled || !origin) {
-      // Anonymous native RPC UI has no provable origin. Cancel fail-closed;
-      // this is cancellation only, never an answer or a runtime capability.
+      // Idle, unknown and stale UI never borrows the current run. Cancellation
+      // uses Pi's method-specific default, never an answer or capability.
       await this.#transport.sendExtensionUiResponse({ id, cancelled: true });
       return;
     }
-    const method = String(event.method);
-    const diagnosticOrigin = Object.freeze({ adapter: "pi_rpc", provider: "pi", method: `extension_ui_request.${method}`, ...origin });
-    this.#dialogs.set(requestId, { id, method, turn, origin, diagnosticOrigin, resolving: false });
-    this.#emit("runtime_request.created", { request: { requestId, requestKind: method === "confirm" ? "elicitation" : "user_input", method: `extension_ui_request.${method}`, turnId: turn.turnId, itemId: `pi-ui-${requestId}`, status: "pending", prompt: typeof event.title === "string" ? event.title : "Pi requests input", details: structuredClone(event), origin: diagnosticOrigin } }, turn);
+    const diagnosticOrigin = PI_RUNTIME_DIALOG_ORIGIN;
+    this.#dialogs.set(requestId, { id, dialog, turn, origin, diagnosticOrigin, ...(dialog.timeout ? { expiresAt: this.#now().getTime() + dialog.timeout } : {}), resolving: false });
+    this.#emit("runtime_request.created", { request: { schema: "paperclip.runtime_request.v2", requestId, requestKind: "runtime", type: "input", turnId: turn.turnId, itemId: `pi-ui-${createHash("sha256").update(requestId).digest("hex")}`, status: "pending", prompt: dialog.input.questions[0]!.prompt, input: dialog.input, origin: diagnosticOrigin } }, turn);
   }
 
   async resolveRuntimeRequest(input: Parameters<NonNullable<HarnessSession["resolveRuntimeRequest"]>>[0] & { runId?: string; origin?: unknown }): Promise<void> {
@@ -647,23 +665,14 @@ export class PiRpcHarnessSession implements HarnessSession {
     const dialog = this.#dialogs.get(requestId);
     const valid = () => dialog && !this.#closed && !this.#failure && !dialog.turn.settled
       && runId === dialog.origin.runId && turnId === dialog.origin.turnId
-      && sameJson(origin, dialog.diagnosticOrigin) && this.#callbacks?.authority.accept(dialog.origin);
+      && sameJson(origin, dialog.diagnosticOrigin) && (dialog.expiresAt === undefined || this.#now().getTime() < dialog.expiresAt)
+      && this.#callbacks?.authority.accept(dialog.origin);
     if (!dialog || dialog.resolving || !valid()) throw new Error("Pi UI resolution refused");
     const resolution = structuredClone(input.resolution);
+    // Invalid answers remain pending and never consume a native Promise.
+    const response = piRuntimeDialogReply(dialog.dialog, dialog.id, resolution);
     dialog.resolving = true;
     try {
-      const response: { id: string | number; value?: string; confirmed?: boolean; cancelled?: true } = { id: dialog.id };
-      if (resolution.action === "cancel" || resolution.action === "decline") response.cancelled = true;
-      else if (dialog.method === "confirm" && ["accept", "accept_for_session"].includes(resolution.action)) response.confirmed = true;
-      else if (resolution.action === "submit") {
-        const content = record(record(resolution).content);
-        const answers = record(record(resolution).answers);
-        const values = Object.values(answers).flatMap(value => Array.isArray(record(value).answers) ? record(value).answers as unknown[] : []);
-        if (dialog.method === "confirm" && typeof content.confirmed === "boolean") response.confirmed = content.confirmed;
-        else if (typeof content.value === "string") response.value = content.value;
-        else if (values.length === 1 && typeof values[0] === "string") response.value = values[0];
-        else throw new Error("Pi UI resolution refused");
-      } else throw new Error("Pi UI resolution refused");
       await Promise.resolve();
       if (!valid()) throw new Error("Pi UI resolution refused");
       await this.#transport.sendExtensionUiResponse(response);

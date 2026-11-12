@@ -3447,136 +3447,132 @@ impl CodexProvider {
                 ) {
                     return self.reject_post_terminal_request(rpc_id, method);
                 }
-                let active_turn_id = self.active_provider_turn_id.clone().ok_or_else(|| {
-                    LocalRunnerError::invalid(
-                        "Codex runtime request arrived outside an active turn",
-                    )
-                })?;
-                if runtime_request_turn_id(&params) != Some(active_turn_id.as_str()) {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex runtime request named another turn",
-                    ));
-                }
-                let (provider_request_id, question_set, option_labels) =
-                    if method == OPENCODE_RUNTIME_REQUEST_METHOD {
-                        match opencode_question_set(&params) {
-                            Ok(mapping) => mapping,
-                            Err(error) => {
-                                // Keep the strict envelope/authority validator. Like
-                                // malformed tool calls, invalid params reject only
-                                // this RPC, before any pending state is admitted.
-                                let message = error.to_string();
-                                let _ = self.send_courtesy_response(&json!({
-                                    "id": rpc_id,
-                                    "error": {"code": -32602, "message": message},
-                                }));
-                                return Ok(Some(CodexProviderEvent::Notification {
-                                    method: "warning".to_owned(),
-                                    params: json!({
-                                        "code": "provider_runtime_request_refused",
-                                        "message": message,
-                                        "providerMethod": method,
-                                    }),
-                                }));
-                            }
-                        }
-                    } else if method == "mcpServer/elicitation/request" {
-                        let servers = self
-                            ._stdio_mcp
-                            .as_ref()
-                            .map(|session| {
-                                session
-                                    .entries
-                                    .iter()
-                                    .map(|(name, _)| name.as_str())
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
-                        crate::stdio_mcp::validate_tool_approval(&params, &servers)?;
-                        (rpc_id.to_string(), Value::Null, BTreeMap::new())
-                    } else {
-                        codex_question_set(&rpc_id, &params)?
-                    };
-                let retained_bytes = pending_runtime_request_size(
-                    &rpc_id,
-                    &active_turn_id,
-                    method,
-                    &params,
-                    &question_set,
-                    &option_labels,
-                )?;
-                let mcp_params =
-                    (method == "mcpServer/elicitation/request").then(|| params.clone());
-                let pending = PendingRuntimeRequest {
-                    rpc_id: rpc_id.clone(),
-                    turn_id: active_turn_id.clone(),
-                    method: method.to_owned(),
-                    params,
-                    question_set: question_set.clone(),
-                    option_labels,
-                    retained_bytes,
-                };
-                if let Some(existing) = self
-                    .pending_runtime_requests
-                    .values()
-                    .find(|existing| existing.rpc_id == rpc_id)
-                {
-                    if existing != &pending {
+                // Match tool-call containment: validate every admission condition
+                // before changing pending state, and refuse only this provider RPC.
+                let accepted = (|| {
+                    if !matches!(&rpc_id, Value::String(_) | Value::Number(_)) {
                         return Err(LocalRunnerError::invalid(
-                            "Codex reused a runtime request id with different input",
+                            "Codex runtime request JSON-RPC id is invalid",
                         ));
                     }
-                    return Ok(None);
-                }
-                let retained_request_bytes = retain_pending_runtime_request_bytes(
-                    self.pending_runtime_request_bytes,
-                    retained_bytes,
-                );
-                if self.pending_runtime_requests.len() >= MAX_PENDING_RUNTIME_REQUESTS
-                    || retained_request_bytes.is_none()
-                {
-                    self.send_courtesy_response(&json!({
-                        "id": rpc_id,
-                        "error": {
-                            "code": -32000,
-                            "message": "Paperclip rejected this runtime request because the pending input capacity was reached",
-                        },
-                    }))?;
-                    return Ok(Some(CodexProviderEvent::Notification {
-                        method: "warning".to_owned(),
-                        params: json!({
-                            "message": "rejected a Codex runtime request at the bounded pending-input limit",
-                            "providerMethod": bounded_method(method),
-                        }),
-                    }));
-                }
-                let request_sequence = self.next_runtime_request_sequence;
-                self.next_runtime_request_sequence = self
-                    .next_runtime_request_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        LocalRunnerError::invalid("Codex runtime request sequence overflowed")
+                    let active_turn_id = self.active_provider_turn_id.clone().ok_or_else(|| {
+                        LocalRunnerError::invalid(
+                            "Codex runtime request arrived outside an active turn",
+                        )
                     })?;
-                let request_id = scoped_runtime_request_id(
-                    &self.runtime_request_scope,
-                    &active_turn_id,
-                    &provider_request_id,
-                    request_sequence,
-                );
-                self.pending_runtime_requests
-                    .insert(request_id.clone(), pending);
-                self.pending_runtime_request_bytes =
-                    retained_request_bytes.expect("bounded runtime request bytes checked above");
-                if let Some(params) = mcp_params {
-                    return Ok(Some(CodexProviderEvent::McpPermissionRequest {
-                        request_id,
+                    if runtime_request_turn_id(&params) != Some(active_turn_id.as_str()) {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex runtime request named another turn",
+                        ));
+                    }
+                    let (provider_request_id, question_set, option_labels) =
+                        if method == OPENCODE_RUNTIME_REQUEST_METHOD {
+                            opencode_question_set(&params, &self.config.provider)?
+                        } else if method == "mcpServer/elicitation/request" {
+                            let servers = self
+                                ._stdio_mcp
+                                .as_ref()
+                                .map(|session| {
+                                    session
+                                        .entries
+                                        .iter()
+                                        .map(|(name, _)| name.as_str())
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            crate::stdio_mcp::validate_tool_approval(&params, &servers)?;
+                            (rpc_id.to_string(), Value::Null, BTreeMap::new())
+                        } else {
+                            codex_question_set(&rpc_id, &params)?
+                        };
+                    let retained_bytes = pending_runtime_request_size(
+                        &rpc_id,
+                        &active_turn_id,
+                        method,
+                        &params,
+                        &question_set,
+                        &option_labels,
+                    )?;
+                    let mcp_params =
+                        (method == "mcpServer/elicitation/request").then(|| params.clone());
+                    let pending = PendingRuntimeRequest {
+                        rpc_id: rpc_id.clone(),
+                        turn_id: active_turn_id.clone(),
+                        method: method.to_owned(),
                         params,
-                    }));
-                }
-                return Ok(Some(CodexProviderEvent::RuntimeRequest {
-                    request_id,
-                    question_set,
-                }));
+                        question_set: question_set.clone(),
+                        option_labels,
+                        retained_bytes,
+                    };
+                    if let Some(existing) = self
+                        .pending_runtime_requests
+                        .values()
+                        .find(|existing| existing.rpc_id == rpc_id)
+                    {
+                        if existing != &pending {
+                            return Err(LocalRunnerError::invalid(
+                                "Codex reused a runtime request id with different input",
+                            ));
+                        }
+                        return Ok(None);
+                    }
+                    let retained_request_bytes = retain_pending_runtime_request_bytes(
+                        self.pending_runtime_request_bytes,
+                        retained_bytes,
+                    );
+                    if self.pending_runtime_requests.len() >= MAX_PENDING_RUNTIME_REQUESTS
+                        || retained_request_bytes.is_none()
+                    {
+                        return Err(LocalRunnerError::invalid(
+                            "rejected a Codex runtime request at the bounded pending-input limit",
+                        ));
+                    }
+                    let request_sequence = self.next_runtime_request_sequence;
+                    let next_request_sequence =
+                        request_sequence.checked_add(1).ok_or_else(|| {
+                            LocalRunnerError::invalid("Codex runtime request sequence overflowed")
+                        })?;
+                    let request_id = scoped_runtime_request_id(
+                        &self.runtime_request_scope,
+                        &active_turn_id,
+                        &provider_request_id,
+                        request_sequence,
+                    );
+                    // No fallible operation may follow the first admission mutation.
+                    self.pending_runtime_requests
+                        .insert(request_id.clone(), pending);
+                    self.pending_runtime_request_bytes = retained_request_bytes
+                        .expect("bounded runtime request bytes checked above");
+                    self.next_runtime_request_sequence = next_request_sequence;
+                    Ok(Some(if let Some(params) = mcp_params {
+                        CodexProviderEvent::McpPermissionRequest { request_id, params }
+                    } else {
+                        CodexProviderEvent::RuntimeRequest {
+                            request_id,
+                            question_set,
+                        }
+                    }))
+                })();
+                return match accepted {
+                    Ok(event) => Ok(event),
+                    Err(error) => {
+                        let message = error.to_string();
+                        // H1R courtesy writes are best effort: bad input must not
+                        // become a fatal poll error even when provider stdin closed.
+                        let _ = self.send_courtesy_response(&json!({
+                            "id": rpc_id,
+                            "error": {"code": -32602, "message": message},
+                        }));
+                        Ok(Some(CodexProviderEvent::Notification {
+                            method: "warning".to_owned(),
+                            params: json!({
+                                "code": "provider_runtime_request_refused",
+                                "message": message,
+                                "providerMethod": method,
+                            }),
+                        }))
+                    }
+                };
             }
             self.send_courtesy_response(&json!({
                 "id": rpc_id,
@@ -4871,7 +4867,10 @@ fn bounded_method(method: &str) -> String {
         .collect()
 }
 
-fn opencode_question_set(params: &Value) -> Result<QuestionSetMapping, LocalRunnerError> {
+fn opencode_question_set(
+    params: &Value,
+    provider: &str,
+) -> Result<QuestionSetMapping, LocalRunnerError> {
     let params = params
         .as_object()
         .ok_or_else(|| LocalRunnerError::invalid("OpenCode runtime request params are invalid"))?;
@@ -4941,15 +4940,24 @@ fn opencode_question_set(params: &Value) -> Result<QuestionSetMapping, LocalRunn
         let origin = origin.as_object().ok_or_else(|| {
             LocalRunnerError::invalid("OpenCode runtime request origin is invalid")
         })?;
+        // The native Pi launch profile is admitted before this provider exists.
+        // Only its exact canonical producer origin joins the existing OpenCode
+        // contract; raw Pi UI events and arbitrary provider origins remain invalid.
+        let pi_origin = provider == "pi_rpc"
+            && origin.get("adapter").and_then(Value::as_str) == Some("pi-rpc")
+            && origin.get("provider").and_then(Value::as_str) == Some("pi_rpc")
+            && origin.get("method").and_then(Value::as_str) == Some("extension_ui_request");
+        let opencode_origin = origin.get("adapter").and_then(Value::as_str)
+            == Some("opencode-server")
+            && origin.get("provider").and_then(Value::as_str) == Some("opencode")
+            && origin
+                .get("method")
+                .and_then(Value::as_str)
+                .is_some_and(|method| !method.is_empty() && method.chars().count() <= 500);
         if origin
             .keys()
             .any(|key| !matches!(key.as_str(), "adapter" | "provider" | "method"))
-            || origin.get("adapter").and_then(Value::as_str) != Some("opencode-server")
-            || origin.get("provider").and_then(Value::as_str) != Some("opencode")
-            || origin
-                .get("method")
-                .and_then(Value::as_str)
-                .is_none_or(|method| method.is_empty() || method.chars().count() > 500)
+            || (!opencode_origin && !pi_origin)
         {
             return Err(LocalRunnerError::invalid(
                 "OpenCode runtime request origin is invalid",
@@ -5680,10 +5688,12 @@ done
     fn malformed_runtime_envelope_refusals_preserve_state_and_accept_fresh_requests() {
         fn queue(provider: &mut CodexProvider, message: Value) {
             provider.pending_message_bytes += json_size(&message, "fixture").unwrap();
-            provider.pending_messages.push_back(BufferedProviderMessage {
-                value: message,
-                trace_frame_id: None,
-            });
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: message,
+                    trace_frame_id: None,
+                });
         }
         let valid = json!({"request": {
             "schema":"paperclip.runtime_request.v2", "requestKind":"runtime",
@@ -5695,13 +5705,24 @@ done
                 "options":[{"id":"yes","label":"Yes"}]
             }]}
         }});
-        for case in ["pi-origin", "unknown-field", "invalid-schema", "invalid-input"] {
+        for case in [
+            "pi-origin",
+            "unknown-field",
+            "invalid-schema",
+            "invalid-input",
+        ] {
             let mut provider = completion_tail_provider();
             provider.active_provider_turn_id = Some("active-turn".to_owned());
             provider.completed_turn_authority = None;
             let accepted_params = valid.clone();
-            queue(&mut provider, json!({"id":"existing-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":accepted_params}));
-            assert!(matches!(provider.poll().unwrap(), Some(CodexProviderEvent::RuntimeRequest { .. })));
+            queue(
+                &mut provider,
+                json!({"id":"existing-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":accepted_params}),
+            );
+            assert!(matches!(
+                provider.poll().unwrap(),
+                Some(CodexProviderEvent::RuntimeRequest { .. })
+            ));
             let pending = provider.pending_runtime_requests.clone();
             let bytes = provider.pending_runtime_request_bytes;
             let sequence = provider.next_runtime_request_sequence;
@@ -5710,7 +5731,9 @@ done
             let active_turn = provider.active_provider_turn_id.clone();
             let mut invalid = valid.clone();
             match case {
-                "pi-origin" => invalid["request"]["origin"] = json!({"adapter":"pi-rpc","provider":"pi_rpc","method":"extension_ui_request"}),
+                "pi-origin" => {
+                    invalid["request"]["origin"] = json!({"adapter":"pi-rpc","provider":"pi_rpc","method":"extension_ui_request"})
+                }
                 "unknown-field" => invalid["request"]["unexpected"] = json!(true),
                 "invalid-schema" => invalid["request"]["schema"] = json!("not-runtime-v2"),
                 "invalid-input" => invalid["request"]["input"] = json!({}),
@@ -5718,11 +5741,19 @@ done
             }
             let frames = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&frames);
-            provider.sent_frame_observer = Some(Box::new(move |frame| recorded.lock().unwrap().push(frame.clone())));
-            queue(&mut provider, json!({"id":"invalid-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":invalid}));
-            assert!(matches!(provider.poll().expect("invalid envelope must not escape poll"),
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone())
+            }));
+            queue(
+                &mut provider,
+                json!({"id":"invalid-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":invalid}),
+            );
+            assert!(
+                matches!(provider.poll().expect("invalid envelope must not escape poll"),
                 Some(CodexProviderEvent::Notification { method, params })
-                    if method == "warning" && params["code"] == "provider_runtime_request_refused"), "{case}");
+                    if method == "warning" && params["code"] == "provider_runtime_request_refused"),
+                "{case}"
+            );
             assert_eq!(provider.pending_runtime_requests, pending, "{case}");
             assert_eq!(provider.pending_runtime_request_bytes, bytes, "{case}");
             assert_eq!(provider.next_runtime_request_sequence, sequence, "{case}");
@@ -5734,10 +5765,521 @@ done
             assert_eq!(frames.lock().unwrap()[0]["id"], "invalid-rpc", "{case}");
             assert_eq!(frames.lock().unwrap()[0]["error"]["code"], -32602, "{case}");
             // A new strict OpenCode request still uses the normal admission path.
-            queue(&mut provider, json!({"id":"fresh-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":valid}));
-            assert!(matches!(provider.poll().unwrap(), Some(CodexProviderEvent::RuntimeRequest { .. })), "{case}");
-            assert_eq!(provider.pending_runtime_requests.len(), pending.len() + 1, "{case}");
-            assert_eq!(provider.next_runtime_request_sequence, sequence + 1, "{case}");
+            queue(
+                &mut provider,
+                json!({"id":"fresh-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":valid}),
+            );
+            assert!(
+                matches!(
+                    provider.poll().unwrap(),
+                    Some(CodexProviderEvent::RuntimeRequest { .. })
+                ),
+                "{case}"
+            );
+            assert_eq!(
+                provider.pending_runtime_requests.len(),
+                pending.len() + 1,
+                "{case}"
+            );
+            assert_eq!(
+                provider.next_runtime_request_sequence,
+                sequence + 1,
+                "{case}"
+            );
+            provider.shutdown().unwrap();
+        }
+    }
+
+    // Keep: malformed provider input is a call-local trust boundary, including
+    // capacity/sequence failures that the native dialog flow cannot reach cheaply.
+    #[cfg(unix)]
+    #[test]
+    fn runtime_admission_errors_are_call_local_before_any_state_change() {
+        for case in [
+            "outside-turn",
+            "missing-turn",
+            "invalid-codex",
+            "invalid-mcp",
+            "conflicting-rpc",
+            "pending-capacity",
+            "retained-bytes",
+            "byte-overflow",
+            "sequence-overflow",
+            "invalid-rpc-id",
+            "invalid-params",
+            "large-request",
+        ] {
+            let mut provider = completion_tail_provider();
+            provider.active_provider_turn_id = Some("active-turn".to_owned());
+            provider.completed_turn_authority = None;
+            let params = json!({"threadId":provider.thread_id,"turnId":"active-turn",
+                "questions":[{"id":"value","question":"Choose.","options":[{"label":"Yes"}]}]});
+            let mut message =
+                json!({"id":"new-rpc","method":"item/tool/requestUserInput","params":params});
+            let existing = PendingRuntimeRequest {
+                rpc_id: json!("existing-rpc"),
+                turn_id: "active-turn".to_owned(),
+                method: "item/tool/requestUserInput".to_owned(),
+                params: json!({}),
+                question_set: json!({}),
+                option_labels: BTreeMap::new(),
+                retained_bytes: 32,
+            };
+            provider
+                .pending_runtime_requests
+                .insert("existing".to_owned(), existing.clone());
+            provider.pending_runtime_request_bytes = 32;
+            match case {
+                "outside-turn" => {
+                    provider.active_provider_turn_id = None;
+                    message["params"].as_object_mut().unwrap().remove("turnId");
+                }
+                "missing-turn" => {
+                    message["params"].as_object_mut().unwrap().remove("turnId");
+                }
+                "invalid-codex" => message["params"]["questions"] = json!([]),
+                "invalid-mcp" => {
+                    message["method"] = json!("mcpServer/elicitation/request");
+                    message["params"]["_meta"] = json!({"codex_approval_kind":"mcp_tool_call"});
+                }
+                "conflicting-rpc" => message["id"] = json!("existing-rpc"),
+                "pending-capacity" => {
+                    for index in 1..MAX_PENDING_RUNTIME_REQUESTS {
+                        let mut p = existing.clone();
+                        p.rpc_id = json!(index);
+                        provider
+                            .pending_runtime_requests
+                            .insert(format!("existing-{index}"), p);
+                    }
+                }
+                "large-request" => {
+                    message["params"]["questions"][0]["question"] =
+                        json!("x".repeat(MAX_PENDING_RUNTIME_REQUEST_BYTES))
+                }
+                "retained-bytes" => {
+                    provider.pending_runtime_request_bytes = MAX_PENDING_RUNTIME_REQUEST_BYTES
+                }
+                "byte-overflow" => provider.pending_runtime_request_bytes = usize::MAX,
+                "sequence-overflow" => provider.next_runtime_request_sequence = u64::MAX,
+                "invalid-rpc-id" => message["id"] = json!({"not":"an rpc id"}),
+                "invalid-params" => {
+                    message["method"] = json!(OPENCODE_RUNTIME_REQUEST_METHOD);
+                    message["params"] = json!([]);
+                }
+                _ => unreachable!(),
+            }
+            let rpc_id = message["id"].clone();
+            let pending = provider.pending_runtime_requests.clone();
+            let bytes = provider.pending_runtime_request_bytes;
+            let sequence = provider.next_runtime_request_sequence;
+            let active = provider.active_provider_turn_id.clone();
+            let tools = provider.pending_tool_requests.clone();
+            let tool_bytes = provider.pending_tool_request_bytes;
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone())
+            }));
+            provider.pending_message_bytes = json_size(&message, "fixture").unwrap();
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: message,
+                    trace_frame_id: None,
+                });
+            assert!(
+                matches!(provider.poll().expect("admission errors must not escape poll"),
+                Some(CodexProviderEvent::Notification { method, params })
+                    if method == "warning" && params["code"] == "provider_runtime_request_refused"),
+                "{case}"
+            );
+            assert_eq!(provider.pending_runtime_requests, pending, "{case}");
+            assert_eq!(provider.pending_runtime_request_bytes, bytes, "{case}");
+            assert_eq!(provider.next_runtime_request_sequence, sequence, "{case}");
+            assert_eq!(provider.active_provider_turn_id, active, "{case}");
+            assert_eq!(provider.pending_tool_requests, tools, "{case}");
+            assert_eq!(provider.pending_tool_request_bytes, tool_bytes, "{case}");
+            assert!(!provider.quarantined, "{case}");
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames.len(), 1, "{case}");
+            assert_eq!(frames[0]["id"], rpc_id, "{case}");
+            assert_eq!(frames[0]["error"]["code"], -32602, "{case}");
+            drop(frames);
+            // Restore only synthetic exhaustion/no-turn conditions. A fresh
+            // uniquely correlated Codex request must still use normal admission.
+            provider.active_provider_turn_id = Some("active-turn".to_owned());
+            provider.pending_runtime_requests.clear();
+            provider.pending_runtime_request_bytes = 0;
+            provider.next_runtime_request_sequence = 1;
+            let fresh =
+                json!({"id":"fresh-rpc","method":"item/tool/requestUserInput","params":params});
+            provider.pending_message_bytes = json_size(&fresh, "fixture").unwrap();
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: fresh,
+                    trace_frame_id: None,
+                });
+            assert!(
+                matches!(
+                    provider.poll().unwrap(),
+                    Some(CodexProviderEvent::RuntimeRequest { .. })
+                ),
+                "{case}"
+            );
+            provider.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_origin_is_exact_profile_bound_and_keeps_the_closed_runtime_contract() {
+        let valid = json!({"request":{
+            "schema":"paperclip.runtime_request.v2","requestKind":"runtime","requestId":"pi-ui",
+            "type":"input","status":"pending","prompt":"Choose.","turnId":"active-turn",
+            "origin":{"adapter":"pi-rpc","provider":"pi_rpc","method":"extension_ui_request"},
+            "input":{"schema":"paperclip.question_set.v1","questions":[{
+                "id":"value","prompt":"Choose.","required":true,"answerMode":"text"}]}
+        }});
+        assert!(opencode_question_set(&valid, "pi_rpc").is_ok());
+        for provider in ["codex", "opencode", "cursor_cloud", "pi"] {
+            assert!(
+                opencode_question_set(&valid, provider).is_err(),
+                "{provider}"
+            );
+        }
+        for case in [
+            "adapter",
+            "provider",
+            "method",
+            "origin-extra",
+            "origin-type",
+            "request-extra",
+            "raw-pi",
+            "schema",
+            "kind",
+            "status",
+            "type",
+            "request-id",
+            "turn-id",
+            "item-id",
+            "prompt",
+            "params-extra",
+            "input-extra",
+            "question-extra",
+            "inverted-text",
+            "invalid-pattern",
+        ] {
+            let mut invalid = valid.clone();
+            match case {
+                "adapter" => invalid["request"]["origin"]["adapter"] = json!("pi_rpc"),
+                "provider" => invalid["request"]["origin"]["provider"] = json!("pi"),
+                "method" => {
+                    invalid["request"]["origin"]["method"] = json!("extension_ui_request.input")
+                }
+                "origin-extra" => invalid["request"]["origin"]["runId"] = json!("forged-run"),
+                "origin-type" => invalid["request"]["origin"] = json!(false),
+                "request-extra" => invalid["request"]["details"] = json!({}),
+                "raw-pi" => {
+                    invalid["request"] =
+                        json!({"type":"extension_ui_request","id":"pi-ui","method":"input"})
+                }
+                "schema" => invalid["request"]["schema"] = json!("paperclip.runtime_request.v1"),
+                "kind" => invalid["request"]["requestKind"] = json!("user_input"),
+                "status" => invalid["request"]["status"] = json!("resolved"),
+                "type" => invalid["request"]["type"] = json!("permission"),
+                "request-id" => invalid["request"]["requestId"] = json!(""),
+                "turn-id" => invalid["request"]["turnId"] = json!(null),
+                "item-id" => invalid["request"]["itemId"] = json!([]),
+                "prompt" => invalid["request"]["prompt"] = json!(""),
+                "params-extra" => invalid["extra"] = json!(true),
+                "input-extra" => invalid["request"]["input"]["extra"] = json!(true),
+                "question-extra" => {
+                    invalid["request"]["input"]["questions"][0]["extra"] = json!(true)
+                }
+                "inverted-text" => {
+                    invalid["request"]["input"]["questions"][0]["textValidation"] =
+                        json!({"minLength":2,"maxLength":1})
+                }
+                "invalid-pattern" => {
+                    invalid["request"]["input"]["questions"][0]["textValidation"] =
+                        json!({"pattern":"["})
+                }
+                _ => unreachable!(),
+            }
+            assert!(opencode_question_set(&invalid, "pi_rpc").is_err(), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_canonical_dialogs_admit_and_use_existing_question_responses() {
+        for (kind, question, answer) in [
+            (
+                "select",
+                json!({"id":"value","prompt":"Choose.","required":true,"answerMode":"single_select","options":[{"id":"option-1","label":"Alpha"},{"id":"option-2","label":"Beta"}]}),
+                json!({"selectedOptionIds":["option-2"]}),
+            ),
+            (
+                "confirm",
+                json!({"id":"value","prompt":"Confirm.","required":true,"answerMode":"single_select","options":[{"id":"yes","label":"Yes"},{"id":"no","label":"No"}]}),
+                json!({"selectedOptionIds":["no"]}),
+            ),
+            (
+                "input",
+                json!({"id":"value","prompt":"Input.","required":true,"answerMode":"text"}),
+                json!({"text":"value"}),
+            ),
+            (
+                "editor",
+                json!({"id":"value","prompt":"Edit.","required":true,"answerMode":"text","initialText":"draft"}),
+                json!({"text":"edited\nvalue"}),
+            ),
+        ] {
+            let mut provider = completion_tail_provider();
+            provider.config.provider = "pi_rpc".to_owned();
+            provider.active_provider_turn_id = Some("active-turn".to_owned());
+            provider.completed_turn_authority = None;
+            let message = json!({"id":kind,"method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":{"request":{
+                "schema":"paperclip.runtime_request.v2","requestKind":"runtime","requestId":kind,
+                "type":"input","status":"pending","prompt":"Pi dialog.","turnId":"active-turn",
+                "origin":{"adapter":"pi-rpc","provider":"pi_rpc","method":"extension_ui_request"},
+                "input":{"schema":"paperclip.question_set.v1","questions":[question]}
+            }}});
+            provider.pending_message_bytes = json_size(&message, "fixture").unwrap();
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: message,
+                    trace_frame_id: None,
+                });
+            let Some(CodexProviderEvent::RuntimeRequest { request_id, .. }) =
+                provider.poll().unwrap()
+            else {
+                panic!("Pi {kind} must admit");
+            };
+            let response =
+                json!({"schema":"paperclip.question_response.v1","answers":{"value":answer}});
+            assert_eq!(
+                codex_question_response(&provider.pending_runtime_requests[&request_id], &response)
+                    .unwrap(),
+                json!({"resolution":{"action":"submit","response":response}})
+            );
+            provider.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_runtime_refusals_preserve_state_and_fresh_assigned_requests_still_admit() {
+        for case in [
+            "parser",
+            "typed-params",
+            "capacity",
+            "retained-bytes",
+            "oversize",
+            "rpc-id",
+        ] {
+            let mut provider = completion_tail_provider();
+            provider.active_provider_turn_id = Some("active-turn".to_owned());
+            provider.completed_turn_authority = None;
+            let directory =
+                std::env::temp_dir().join(format!("runtime-mcp-unit-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            provider._stdio_mcp = Some(crate::stdio_mcp::StdioMcpSession::test_fixture(
+                directory.clone(),
+                vec![("assigned".to_owned(), directory.join("assigned.json"))],
+            ));
+            let params = json!({"threadId":provider.thread_id,"turnId":"active-turn",
+                "serverName":"assigned","mode":"form","message":"Allow this tool?",
+                "_meta":{"codex_approval_kind":"mcp_tool_call"},
+                "requestedSchema":{"type":"object","properties":{}}});
+            let mut invalid = json!({"id":"invalid-mcp","method":"mcpServer/elicitation/request","params":params});
+            match case {
+                "parser" => invalid["params"]["serverName"] = json!("unassigned"),
+                "typed-params" => invalid["params"]["requestedSchema"] = json!([]),
+                "oversize" => invalid["params"]["extra"] = json!("x".repeat(64 * 1024)),
+                "rpc-id" => invalid["id"] = json!(false),
+                "retained-bytes" => {
+                    provider.pending_runtime_request_bytes = MAX_PENDING_RUNTIME_REQUEST_BYTES
+                }
+                "capacity" => {
+                    let pending = PendingRuntimeRequest {
+                        rpc_id: json!(0),
+                        turn_id: "active-turn".to_owned(),
+                        method: "mcpServer/elicitation/request".to_owned(),
+                        params: params.clone(),
+                        question_set: Value::Null,
+                        option_labels: BTreeMap::new(),
+                        retained_bytes: 0,
+                    };
+                    for index in 0..MAX_PENDING_RUNTIME_REQUESTS {
+                        let mut pending = pending.clone();
+                        pending.rpc_id = json!(index);
+                        provider
+                            .pending_runtime_requests
+                            .insert(format!("existing-{index}"), pending);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let pending = provider.pending_runtime_requests.clone();
+            let bytes = provider.pending_runtime_request_bytes;
+            let sequence = provider.next_runtime_request_sequence;
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone())
+            }));
+            provider.pending_message_bytes = json_size(&invalid, "fixture").unwrap();
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: invalid.clone(),
+                    trace_frame_id: None,
+                });
+            assert!(
+                matches!(provider.poll().unwrap(), Some(CodexProviderEvent::Notification { params, .. })
+                if params["code"] == "provider_runtime_request_refused"),
+                "{case}"
+            );
+            assert_eq!(provider.pending_runtime_requests, pending, "{case}");
+            assert_eq!(provider.pending_runtime_request_bytes, bytes, "{case}");
+            assert_eq!(provider.next_runtime_request_sequence, sequence, "{case}");
+            assert_eq!(
+                provider.active_provider_turn_id.as_deref(),
+                Some("active-turn"),
+                "{case}"
+            );
+            assert!(!provider.quarantined, "{case}");
+            assert_eq!(frames.lock().unwrap()[0]["id"], invalid["id"], "{case}");
+            assert_eq!(frames.lock().unwrap()[0]["error"]["code"], -32602, "{case}");
+            // Release synthetic exhaustion, not request authority. A new MCP
+            // RPC must validate against the assigned server and admit normally.
+            provider.pending_runtime_requests.clear();
+            provider.pending_runtime_request_bytes = 0;
+            let fresh =
+                json!({"id":"fresh-mcp","method":"mcpServer/elicitation/request","params":params});
+            provider.pending_message_bytes = json_size(&fresh, "fixture").unwrap();
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: fresh,
+                    trace_frame_id: None,
+                });
+            let Some(CodexProviderEvent::McpPermissionRequest {
+                request_id,
+                params: accepted,
+            }) = provider.poll().unwrap()
+            else {
+                panic!("fresh MCP after {case} must admit");
+            };
+            assert_eq!(accepted, params, "{case}");
+            provider
+                .resolve_runtime_request(&request_id, &json!({"action":"accept"}))
+                .unwrap();
+            assert!(provider.pending_runtime_requests.is_empty());
+            assert_eq!(provider.pending_runtime_request_bytes, 0);
+            provider.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_refusal_tolerates_closed_stdin_but_valid_response_delivery_does_not() {
+        let mut provider = completion_tail_provider();
+        provider.expected_shutdown = false;
+        provider.active_provider_turn_id = Some("active-turn".to_owned());
+        provider.completed_turn_authority = None;
+        let request = json!({"id":"invalid-rpc","method":"item/tool/requestUserInput",
+            "params":{"threadId":provider.thread_id,"turnId":"active-turn","questions":[]}});
+        provider.pending_message_bytes = json_size(&request, "fixture").unwrap();
+        provider
+            .pending_messages
+            .push_back(BufferedProviderMessage {
+                value: request,
+                trace_frame_id: None,
+            });
+        provider.process.terminate_group_immediately().unwrap();
+        assert!(
+            matches!(provider.poll().unwrap(), Some(CodexProviderEvent::Notification { params, .. })
+            if params["code"] == "provider_runtime_request_refused")
+        );
+        let pending = PendingRuntimeRequest {
+            rpc_id: json!("valid-rpc"),
+            turn_id: "active-turn".to_owned(),
+            method: OPENCODE_RUNTIME_REQUEST_METHOD.to_owned(),
+            params: json!({}),
+            question_set: json!({"schema":"paperclip.question_set.v1","questions":[{
+                "id":"value","prompt":"Input.","required":true,"answerMode":"text"}]}),
+            option_labels: BTreeMap::new(),
+            retained_bytes: 32,
+        };
+        provider
+            .pending_runtime_requests
+            .insert("valid".to_owned(), pending);
+        provider.pending_runtime_request_bytes = 32;
+        assert!(provider
+            .resolve_runtime_request(
+                "valid",
+                &json!({
+                    "schema":"paperclip.question_response.v1","answers":{"value":{"text":"reply"}}
+                })
+            )
+            .is_err());
+        assert_eq!(provider.pending_runtime_requests.len(), 1);
+        assert_eq!(provider.pending_runtime_request_bytes, 32);
+        provider.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_runtime_stale_fences_never_admit_pi_or_opencode_requests() {
+        for (active, requested, settled) in [
+            (None, "old-turn", false),
+            (Some("active-turn"), "old-turn", false),
+            (Some("active-turn"), "active-turn", true),
+        ] {
+            let mut provider = completion_tail_provider();
+            provider.config.provider = "pi_rpc".to_owned();
+            provider.active_provider_turn_id = active.map(str::to_owned);
+            provider.completed_turn_authority = None;
+            if settled {
+                provider
+                    .settled_provider_turn_ids
+                    .insert(requested.to_owned());
+            }
+            let sequence = provider.next_runtime_request_sequence;
+            let request = json!({"id":"stale-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,
+            "params":{"request":{
+                "schema":"paperclip.runtime_request.v2","requestKind":"runtime","requestId":"stale",
+                "type":"input","status":"pending","prompt":"Input.","turnId":requested,
+                "origin":{"adapter":"pi-rpc","provider":"pi_rpc","method":"extension_ui_request"},
+                "input":{"schema":"paperclip.question_set.v1","questions":[{
+                    "id":"value","prompt":"Input.","required":true,"answerMode":"text"}]}
+            }}});
+            provider.pending_message_bytes = json_size(&request, "fixture").unwrap();
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: request,
+                    trace_frame_id: None,
+                });
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone())
+            }));
+            assert!(
+                matches!(provider.poll().unwrap(), Some(CodexProviderEvent::Notification { method, .. }) if method == "warning")
+            );
+            assert!(provider.pending_runtime_requests.is_empty());
+            assert_eq!(provider.pending_runtime_request_bytes, 0);
+            assert_eq!(provider.next_runtime_request_sequence, sequence);
+            assert_eq!(provider.active_provider_turn_id.as_deref(), active);
+            assert_eq!(
+                frames.lock().unwrap().as_slice(),
+                &[json!({"id":"stale-rpc","result":{"resolution":{"action":"cancel"}}})]
+            );
             provider.shutdown().unwrap();
         }
     }
@@ -7159,8 +7701,8 @@ done
                 "itemId": "opencode-question-1"
             }
         });
-        let (request_id, question_set, option_labels) =
-            opencode_question_set(&params).expect("accept the proxy's canonical request");
+        let (request_id, question_set, option_labels) = opencode_question_set(&params, "opencode")
+            .expect("accept the proxy's canonical request");
         assert_eq!(request_id, "opencode-question-1");
         assert_eq!(question_set, params["request"]["input"]);
         assert!(option_labels.is_empty());
@@ -7205,7 +7747,7 @@ done
                 "turnId": "turn-1"
             }
         });
-        assert!(opencode_question_set(&permission)
+        assert!(opencode_question_set(&permission, "opencode")
             .unwrap_err()
             .to_string()
             .contains("structured input"));
@@ -7234,7 +7776,7 @@ done
                 "turnId": "turn-1"
             }
         });
-        assert!(opencode_question_set(&duplicate_options)
+        assert!(opencode_question_set(&duplicate_options, "opencode")
             .unwrap_err()
             .to_string()
             .contains("option ids must be unique"));

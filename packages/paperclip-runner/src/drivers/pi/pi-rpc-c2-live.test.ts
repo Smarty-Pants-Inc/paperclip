@@ -119,20 +119,20 @@ describe("live host Pi C2 authority", () => {
     await expect(sendPiToolRequest(f.initial.toolSocketPath, old)).rejects.toThrow(); const current = f.call("new", { origin }); await f.announce(current); await expect(sendPiToolRequest(f.initial.toolSocketPath, current)).resolves.toMatchObject({ content: [{ text: "new" }] });
     expect(f.ipc.find(r => r.type === "bind")).toMatchObject({ toolSocketPath: f.initial.toolSocketPath });
   });
-  it("routes captured UI zero/empty once, cancels anonymous and never relabels explicit unknown/old origins", async () => {
+  it("routes captured UI zero/empty once, cancels malformed anonymous UI and never relabels explicit unknown/old origins", async () => {
     const f = await fixture(); await f.start(); const origin = f.call().origin;
     f.transport.send({ type: "extension_ui_request", id: 0, method: "input", title: "Value?", origin });
     await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(true));
     const request = f.events.find(e => e.eventType === "runtime_request.created")!.payload.request as Record<string, unknown>;
-    const resolution = { runId: "run-1", turnId: origin.turnId, requestId: "0", origin: request.origin, resolution: { action: "submit", answers: { value: { answers: [""] } } } };
+    const resolution = { runId: "run-1", turnId: origin.turnId, requestId: "0", origin: request.origin, resolution: { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { text: "" } } } } };
     await f.session.resolveRuntimeRequest!(resolution as never); expect(f.transport.writes).toEqual([{ id: 0, value: "" }]); await expect(f.session.resolveRuntimeRequest!(resolution as never)).rejects.toThrow();
     f.transport.send({ type: "extension_ui_request", id: "anonymous", method: "confirm" });
-    f.transport.send({ type: "extension_ui_request", id: "unknown", method: "input", origin: { ...origin, runId: "unknown" } }); await tick(); await tick();
+    f.transport.send({ type: "extension_ui_request", id: "unknown", method: "input", title: "Value?", origin: { ...origin, runId: "unknown" } }); await tick(); await tick();
     expect(f.transport.writes).toContainEqual({ id: "anonymous", cancelled: true }); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(1);
-    f.transport.send({ type: "extension_ui_request", id: "old", method: "input", origin }); await vi.waitFor(() => expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(2));
+    f.transport.send({ type: "extension_ui_request", id: "old", method: "input", title: "Value?", origin }); await vi.waitFor(() => expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(2));
     const oldRequest = f.events.filter(e => e.eventType === "runtime_request.created")[1]!.payload.request as Record<string, unknown>; await f.settle(); await f.session.attachRun({ runId: "run-2" }); await f.start();
     const count = f.transport.writes.length; await expect(f.session.resolveRuntimeRequest!({ ...resolution, requestId: "old", origin: oldRequest.origin } as never)).rejects.toThrow(); expect(f.transport.writes).toHaveLength(count);
-    f.transport.send({ type: "extension_ui_request", id: "late", method: "input", origin }); await tick(); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(2);
+    f.transport.send({ type: "extension_ui_request", id: "late", method: "input", title: "Value?", origin }); await tick(); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(2);
   });
   it("fences immediately while child cleanup is still pending, then physically closes on interrupt", async () => {
     const f = await fixture(); const turn = await f.start(); const request = f.call(); await f.announce(request);
@@ -150,7 +150,7 @@ describe("live host Pi C2 authority", () => {
   });
   it("accepts a UI request attributed by a previously captured native message owner", async () => {
     const f = await fixture(); await f.start(); const message = { role: "assistant", id: "native-message", provider: "paperclip", model: "faux", timestamp: 1, content: [] };
-    f.transport.send({ type: "message_start", message }); f.transport.send({ type: "extension_ui_request", id: "known", method: "input", messageId: "native-message" });
+    f.transport.send({ type: "message_start", message }); f.transport.send({ type: "extension_ui_request", id: "known", method: "input", title: "Value?", messageId: "native-message" });
     await vi.waitFor(() => expect(f.events.some(event => event.eventType === "runtime_request.created")).toBe(true));
     const request = f.events.find(event => event.eventType === "runtime_request.created")!.payload.request as Record<string, unknown>;
     await f.session.resolveRuntimeRequest!({ requestId: "known", runId: "run-1", turnId: f.initial.turnId, origin: request.origin, resolution: { action: "cancel" } } as never); expect(f.transport.writes).toEqual([{ id: "known", cancelled: true }]);
@@ -161,23 +161,23 @@ describe("live host Pi C2 authority", () => {
   });
   it("captures UI identity before awaits and preserves cancellation and false confirmation", async () => {
     const f = await fixture(); await f.start(); const origin = f.call().origin;
-    const ui = async (id: string, method: string) => { f.transport.send({ type: "extension_ui_request", id, method, origin }); await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created" && (e.payload.request as Record<string, unknown>).requestId === id)).toBe(true)); const request = f.events.find(e => e.eventType === "runtime_request.created" && (e.payload.request as Record<string, unknown>).requestId === id)!.payload.request as Record<string, unknown>; return { requestId: id, runId: origin.runId, turnId: origin.turnId, origin: request.origin }; };
-    const captured = await ui("captured", "input"); const input = { ...captured, resolution: { action: "submit", answers: { value: { answers: [""] } } } };
-    const pending = f.session.resolveRuntimeRequest!(input as never); input.requestId = "relabeled"; input.runId = "old"; input.resolution.answers.value.answers[0] = "changed";
+    const ui = async (id: string, method: string) => { f.transport.send({ type: "extension_ui_request", id, method, title: "Value?", ...(method === "confirm" ? { message: "Continue?" } : {}), origin }); await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created" && (e.payload.request as Record<string, unknown>).requestId === id)).toBe(true)); const request = f.events.find(e => e.eventType === "runtime_request.created" && (e.payload.request as Record<string, unknown>).requestId === id)!.payload.request as Record<string, unknown>; return { requestId: id, runId: origin.runId, turnId: origin.turnId, origin: request.origin }; };
+    const captured = await ui("captured", "input"); const input = { ...captured, resolution: { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { text: "" } } } } };
+    const pending = f.session.resolveRuntimeRequest!(input as never); input.requestId = "relabeled"; input.runId = "old"; input.resolution.response.answers.value.text = "changed";
     await pending; expect(f.transport.writes).toContainEqual({ id: "captured", value: "" }); expect(f.events.find(e => e.eventType === "runtime_request.resolved")!.payload.requestId).toBe("captured");
     await f.session.resolveRuntimeRequest!({ ...await ui("cancel", "editor"), resolution: { action: "cancel" } } as never);
-    await f.session.resolveRuntimeRequest!({ ...await ui("false", "confirm"), resolution: { action: "submit", content: { confirmed: false } } } as never);
+    await f.session.resolveRuntimeRequest!({ ...await ui("false", "confirm"), resolution: { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { selectedOptionIds: ["no"] } } } } } as never);
     expect(f.transport.writes).toContainEqual({ id: "cancel", cancelled: true }); expect(f.transport.writes).toContainEqual({ id: "false", confirmed: false });
   });
   it("refuses stale UI before stdin and rechecks after transport awaits", async () => {
     const f = await fixture(); await f.start(); const origin = f.call().origin;
-    f.transport.send({ type: "extension_ui_request", id: "closing", method: "input", origin });
+    f.transport.send({ type: "extension_ui_request", id: "closing", method: "input", title: "Value?", origin });
     await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(true));
     const request = f.events.find(e => e.eventType === "runtime_request.created")!.payload.request as Record<string, unknown>;
-    const pending = f.session.resolveRuntimeRequest!({ requestId: "closing", runId: origin.runId, turnId: origin.turnId, origin: request.origin, resolution: { action: "submit", answers: { value: { answers: ["late"] } } } } as never);
+    const pending = f.session.resolveRuntimeRequest!({ requestId: "closing", runId: origin.runId, turnId: origin.turnId, origin: request.origin, resolution: { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { text: "late" } } } } } as never);
     const refused = expect(pending).rejects.toThrow(); const close = f.session.close(); await refused; await close; expect(f.transport.writes).toEqual([]);
     const g = await fixture(); await g.start(); const secondOrigin = g.call().origin;
-    g.transport.send({ type: "extension_ui_request", id: "draining", method: "input", origin: secondOrigin }); await vi.waitFor(() => expect(g.events.some(e => e.eventType === "runtime_request.created")).toBe(true));
+    g.transport.send({ type: "extension_ui_request", id: "draining", method: "input", title: "Value?", origin: secondOrigin }); await vi.waitFor(() => expect(g.events.some(e => e.eventType === "runtime_request.created")).toBe(true));
     const second = g.events.find(e => e.eventType === "runtime_request.created")!.payload.request as Record<string, unknown>;
     const gate = deferred<void>(); g.transport.uiGate = gate.promise;
     const draining = g.session.resolveRuntimeRequest!({ requestId: "draining", runId: secondOrigin.runId, turnId: secondOrigin.turnId, origin: second.origin, resolution: { action: "cancel" } } as never); const stale = expect(draining).rejects.toThrow();
@@ -188,7 +188,7 @@ describe("live host Pi C2 authority", () => {
   });
   it("does not relabel explicitly old/unknown UI message identities onto current native work", async () => {
     const f = await fixture(); await f.start(); const origin = f.call().origin;
-    f.transport.send({ type: "extension_ui_request", id: "unknown-message", method: "input", messageId: "unknown-native-message", origin }); await tick(); await tick();
+    f.transport.send({ type: "extension_ui_request", id: "unknown-message", method: "input", title: "Value?", messageId: "unknown-native-message", origin }); await tick(); await tick();
     expect(f.events.filter(e => e.eventType === "runtime_request.created")).toEqual([]); expect(f.transport.writes).toEqual([{ id: "unknown-message", cancelled: true }]);
   });
   it("keeps unfinished native tools as park blockers even after settlement", async () => {

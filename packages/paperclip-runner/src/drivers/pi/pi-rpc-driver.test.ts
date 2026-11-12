@@ -2,11 +2,14 @@ import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mapPiRpcRecord, PiRpcDriver } from "./pi-rpc-driver.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
 import { createPiRpcAppServerProxy } from "../../cli/pi-rpc-app-server-proxy.js";
+import { bindContent, type PiBindCommand } from "./pi-bind-protocol.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import { questionSetSchema, requestSchema } from "../../protocol/generated/schema-bundle.js";
 
 // Keep reason: recorded large-output incident439 and failure attribution across
 // resident runs. Drive the real session pump rather than a projector surrogate.
@@ -17,6 +20,8 @@ class FailureTransport {
   wake?: () => void;
   queue: PiRpcRecord[] = [];
   failure?: Error;
+  ui: PiRpcRecord[] = [];
+  async sendExtensionUiResponse(response: PiRpcRecord) { this.ui.push(structuredClone(response)); }
   async request(type: string) {
     return { data: type === "get_state" ? { sessionId: "native-session", model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "set_model" ? { provider: "neutral", id: "model" }
@@ -43,8 +48,116 @@ async function failureFixture(capture = true) {
     .openSession({ runId: "run-old", normalizedSessionId: "normalized", workingDirectory: root });
   const events: PrpEvent[] = [];
   const drained = capture ? (async () => { try { for await (const event of session.events()) events.push(event); } catch { /* terminal message must precede iterator rejection */ } })() : Promise.resolve();
-  return { session, transport, events, async close() { await session.close(); await drained; await rm(root, { recursive: true, force: true }); } };
+  return { session, transport, events, async close() { await session.close({ reason: "unit cleanup" }); await drained; await rm(root, { recursive: true, force: true }); } };
 }
+
+async function dialogFixture() {
+  const root = await mkdtemp(join(tmpdir(), "pi-dialog-"));
+  const transport = new class extends FailureTransport {
+    override async request(type: string) {
+      return { data: type === "get_state" ? { sessionId: "native-dialog", model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+        : type === "set_model" ? { provider: "paperclip", id: "faux" }
+        : type === "get_available_thinking_levels" ? { levels: ["off"] }
+        : type === "prompt" ? { disposition: "started" } : undefined };
+    }
+  }();
+  const session = await new PiRpcDriver({ runtimeDirectory: join(root, "runtime"), model: "paperclip/faux", piRpcThinkingLevel: "off",
+    environment: { PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+    transportFactory: () => transport as unknown as PiRpcTransport,
+    bindRequest: (async (_path: string, command: PiBindCommand) => command.type === "bind"
+      ? { schema: 1, type: "bind", nonce: command.nonce, sessionId: command.sessionId, epoch: command.epoch, runId: command.runId, provider: command.provider.name, model: command.model, thinkingLevel: command.thinkingLevel, ...bindContent(command) }
+      : command.type === "stop_children" ? { ...command, settled: [], uncertain: [] } : { ...command, ack: true }) as never,
+  }).openSession({ runId: "run-dialog", normalizedSessionId: "dialog", workingDirectory: root });
+  const events: PrpEvent[] = [];
+  const drained = (async () => { for await (const event of session.events()) events.push(event); })();
+  const turn = await session.startTurn({ message: { role: "user", text: "ask" } });
+  transport.send({ type: "agent_start" }); await flushFailure();
+  return { root, transport, session, events, turn, async close() { await session.close({ reason: "unit cleanup" }); await drained; await rm(root, { recursive: true, force: true }); } };
+}
+
+describe("Pi canonical SDK dialogs", () => {
+  it.each([
+    { method: "select", fields: { options: ["Alpha", "Beta"] }, answer: { selectedOptionIds: ["option-2"] }, reply: { value: "Beta" } },
+    { method: "confirm", fields: { message: "Continue?" }, answer: { selectedOptionIds: ["no"] }, reply: { confirmed: false } },
+    { method: "input", fields: { placeholder: "Type here" }, answer: { text: "hello\nworld" }, reply: { value: "hello\nworld" } },
+    { method: "editor", fields: { prefill: "old\ntext" }, answer: { text: "new\ntext\n" }, reply: { value: "new\ntext\n" } },
+  ])("normalizes genuine unannotated SDK $method and returns its exact native reply", async ({ method, fields, answer, reply }) => {
+    const f = await dialogFixture();
+    try {
+      f.transport.send({ type: "extension_ui_request", id: "sdk-id", method, title: "Choose", ...fields });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(true), { timeout: 500 });
+      const request = f.events.find(e => e.eventType === "runtime_request.created")!.payload.request as Record<string, any>;
+      expect(request).toMatchObject({ schema: "paperclip.runtime_request.v2", requestKind: "runtime", type: "input", origin: { adapter: "pi-rpc", provider: "pi_rpc", method: "extension_ui_request" } });
+      expect(Object.keys(request.origin).sort()).toEqual(["adapter", "method", "provider"]);
+      const ajv = new Ajv2020({ strict: true, strictRequired: false });
+      ajv.addSchema(questionSetSchema);
+      const validate = ajv.compile(requestSchema); expect(validate(request), JSON.stringify(validate.errors)).toBe(true);
+      expect(ajv.compile(questionSetSchema)(request.input)).toBe(true);
+      if (method === "editor") expect(request.input.questions[0].initialText).toBe("old\ntext");
+      await f.session.resolveRuntimeRequest!({ requestId: request.requestId, turnId: f.turn.turnId, runId: "run-dialog", origin: request.origin,
+        resolution: { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: answer } } } } as never);
+      expect(f.transport.ui).toEqual([{ id: "sdk-id", ...reply }]);
+      expect(f.events.some(e => e.eventType === "runtime_request.resolved")).toBe(true);
+    } finally { await f.close(); }
+  });
+
+  it("captures queued old SDK UI before settlement; late answers cannot borrow the warm run", async () => {
+    const f = await dialogFixture();
+    try {
+      // Queue without yielding: native FIFO is UI -> old settlement. The
+      // downstream controller may consume the saved UI only after warm attach.
+      f.transport.send({ type: "extension_ui_request", id: "old-sdk", method: "input", title: "Old?" });
+      const message = { role: "assistant", id: "old-done", responseId: "old-receipt", timestamp: 1, provider: "paperclip", model: "faux", content: [{ type: "text", text: "done" }], usage: {}, stopReason: "stop" };
+      f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message }); f.transport.send({ type: "agent_settled" });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "turn.completed")).toBe(true));
+      const oldEvent = f.events.find(e => e.eventType === "runtime_request.created")!;
+      expect(oldEvent).toMatchObject({ runId: "run-dialog", turnId: f.turn.turnId });
+      const old = oldEvent.payload.request as Record<string, any>;
+      const answer = { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { text: "late" } } } };
+      f.transport.send({ type: "extension_ui_request", id: "idle-sdk", method: "input", title: "Idle?" });
+      await vi.waitFor(() => expect(f.transport.ui).toContainEqual({ id: "idle-sdk", cancelled: true }));
+      await f.session.attachRun!({ runId: "run-new" });
+      const next = await f.session.startTurn({ message: { role: "user", text: "new" } }); f.transport.send({ type: "agent_start" }); await flushFailure();
+      const writes = f.transport.ui.length;
+      for (const runId of ["run-dialog", "run-new"]) await expect(f.session.resolveRuntimeRequest!({ requestId: old.requestId, runId, turnId: runId === "run-dialog" ? f.turn.turnId : next.turnId, origin: old.origin, resolution: answer } as never)).rejects.toThrow();
+      expect(f.transport.ui).toHaveLength(writes);
+      // Old explicit attribution never falls through into the new lifecycle.
+      f.transport.send({ type: "extension_ui_request", id: "forged-sdk", method: "input", title: "Forged?", origin: { epoch: 1, runId: "run-dialog", turnId: f.turn.turnId } });
+      f.transport.send({ type: "extension_ui_request", id: "new-sdk", method: "input", title: "New?" });
+      await vi.waitFor(() => expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(2));
+      const current = f.events.filter(e => e.eventType === "runtime_request.created")[1]!;
+      expect(current).toMatchObject({ runId: "run-new", turnId: next.turnId });
+      const request = current.payload.request as Record<string, any>;
+      await f.session.resolveRuntimeRequest!({ requestId: request.requestId, runId: "run-new", turnId: next.turnId, origin: request.origin, resolution: answer } as never);
+      expect(f.transport.ui).toContainEqual({ id: "new-sdk", value: "late" }); expect(f.transport.ui).toContainEqual({ id: "forged-sdk", cancelled: true });
+      expect(f.transport.ui.some(value => value.id === "old-sdk")).toBe(false);
+    } finally { await f.close(); }
+  });
+
+  it("keeps malformed frames, unknown choices, duplicate IDs and cross-run answers fail-closed", async () => {
+    const f = await dialogFixture();
+    try {
+      for (const [id, fields] of Object.entries({ blank: { method: "input" }, badOptions: { method: "select", title: "Choose", options: [42] }, noMessage: { method: "confirm", title: "Confirm" }, badPrefill: { method: "editor", title: "Edit", prefill: {} } })) f.transport.send({ type: "extension_ui_request", id, ...fields });
+      await vi.waitFor(() => expect(f.transport.ui).toHaveLength(4)); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toEqual([]);
+      f.transport.send({ type: "extension_ui_request", id: "choice", method: "select", title: "Choose", options: ["Same", "Same"] });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(true));
+      const request = f.events.find(e => e.eventType === "runtime_request.created")!.payload.request as Record<string, any>;
+      const input = { requestId: request.requestId, turnId: f.turn.turnId, runId: "run-dialog", origin: request.origin };
+      for (const response of [
+        { schema: "paperclip.question_response.v1", answers: { value: { selectedOptionIds: ["not-offered"] } } },
+        { schema: "paperclip.question_response.v1", answers: { value: { selectedOptionIds: ["option-1", "option-2"] } } },
+        { schema: "paperclip.question_response.v1", answers: { value: { text: "Same" } } },
+        { schema: "paperclip.question_response.v1", answers: { unexpected: { text: "bad" } } },
+      ]) await expect(f.session.resolveRuntimeRequest!({ ...input, resolution: { action: "submit", response } } as never)).rejects.toThrow();
+      expect(f.transport.ui).toHaveLength(4);
+      const resolution = { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { selectedOptionIds: ["option-2"] } } } };
+      await expect(f.session.resolveRuntimeRequest!({ ...input, runId: "wrong", resolution } as never)).rejects.toThrow();
+      await f.session.resolveRuntimeRequest!({ ...input, resolution } as never); expect(f.transport.ui).toContainEqual({ id: "choice", value: "Same" });
+      f.transport.send({ type: "extension_ui_request", id: "choice", method: "select", title: "Changed", options: ["Malicious"] }); await flushFailure();
+      await expect(f.session.resolveRuntimeRequest!({ ...input, resolution } as never)).rejects.toThrow(); expect(f.transport.ui).toHaveLength(5); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
 
 describe("PiRpcDriver", () => {
   it("opens a partial runtime context without granting an agent-files home", async () => {
@@ -61,7 +174,7 @@ describe("PiRpcDriver", () => {
         expect(launched).toBeDefined();
         expect(launched?.AGENT_HOME).toBeUndefined();
         expect(launched?.PAPERCLIP_PI_AGENT_HOME).toBeUndefined();
-      } finally { await session.close(); }
+      } finally { await session.close({ reason: "unit cleanup" }); }
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -88,7 +201,7 @@ describe("PiRpcDriver", () => {
           const expected = mode === "registered" || mode === "controller-path" ? home : undefined;
           expect(launched?.AGENT_HOME).toBe(expected);
           expect(launched?.PAPERCLIP_PI_AGENT_HOME).toBe(expected);
-        } finally { await session.close(); }
+        } finally { await session.close({ reason: "unit cleanup" }); }
       }
     } finally { await rm(root, { recursive: true, force: true }); }
   });
