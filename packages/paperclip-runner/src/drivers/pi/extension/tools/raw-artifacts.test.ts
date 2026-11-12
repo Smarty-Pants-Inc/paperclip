@@ -54,6 +54,26 @@ describe("tool-context-guard raw artifacts (data safety boundary)", () => {
     expect((await collectGuardRawArtifacts({ ...f.input, retain: async () => { throw new Error("PRIVATE_SENTINEL"); } })).completeness).toBe(false);
     expect(JSON.stringify(await collectGuardRawArtifacts({ ...f.input, retain: async () => { throw new Error("PRIVATE_SENTINEL"); } }))).not.toContain("PRIVATE_SENTINEL");
   });
+  it("preserves Unicode, image blocks and structured-only native payloads without re-capping", async () => {
+    const f = await fixture();
+    const data = { toolCallId: "call-1", toolName: "fixture", content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }], structuredContent: { message: "雪🌕", nested: [1, null, true] }, details: { native: true } };
+    const bytes = Buffer.from(JSON.stringify(data)); await writeFile(f.path, bytes);
+    const result = await collectGuardRawArtifacts({ ...f.input, entries: [{ ...f.input.entries[0], data }] });
+    expect(result.completeness).toBe(true); expect(result.artifacts[0].sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+    expect(await readFile(f.path)).toEqual(bytes);
+    const structuredOnly = { ...data, content: [] }; await writeFile(f.path, JSON.stringify(structuredOnly));
+    expect((await collectGuardRawArtifacts({ ...f.input, entries: [{ ...f.input.entries[0], data: structuredOnly }] })).completeness).toBe(true);
+  });
+  it.skipIf(process.getuid?.() === 0)("marks EACCES incomplete without leaking source bytes", async () => {
+    const f = await fixture(); await chmod(f.path, 0);
+    try { const result = await collectGuardRawArtifacts(f.input); expect(result.completeness).toBe(false); expect(result.recoveryRequired).toBe(true); expect(result.artifacts).toEqual([]); }
+    finally { await chmod(f.path, 0o600); }
+  });
+  it("marks malformed serialization and cancellation incomplete", async () => {
+    const f = await fixture(); await writeFile(f.path, "not-json PRIVATE_SENTINEL");
+    const result = await collectGuardRawArtifacts(f.input); expect(result.completeness).toBe(false); expect(JSON.stringify(result)).not.toContain("PRIVATE_SENTINEL");
+    expect((await collectGuardRawArtifacts({ ...f.input, signal: AbortSignal.abort() })).completeness).toBe(false);
+  });
   it("checks evidence-store readback before claiming retained export", async () => {
     const f = await fixture();
     const good = await collectGuardRawArtifacts({ ...f.input, retain: async (artifact, bytes) => ({ sha256: createHash("sha256").update(bytes).digest("hex"), length: artifact.length }) });

@@ -84,9 +84,33 @@ describe("pi-native-home/v1 (private manifest, data safety boundary)", () => {
     await rm(join(f.subagents, "node_modules"), { recursive: true });
     await expect(computeNativeHomeManifest(f.options)).rejects.toMatchObject({ code: "pi_home_dependency_missing" });
   });
+  it("does not let cache/log directory names hide executable package assets", async () => {
+    const f = await fixture(); await mkdir(join(f.guard, "cache"));
+    await writeFile(join(f.guard, "cache", "runtime.js"), "first");
+    const before = await computeNativeHomeManifest(f.options);
+    await writeFile(join(f.guard, "cache", "runtime.js"), "other");
+    expect((await computeNativeHomeManifest(f.options)).digest).not.toBe(before.digest);
+  });
+  it("supports admitted settings symlinks and does not accept a declaration without its resolved closure", async () => {
+    const f = await fixture(), path = join(f.agentDir, "settings.json"), target = join(f.guard, "native-settings.json");
+    await writeFile(target, await readFile(path)); await rm(path); await symlink(target, path);
+    const manifest = await computeNativeHomeManifest(f.options);
+    expect(manifest.entries.some(entry => entry.logicalPath === "home/settings.json" && entry.kind === "symlink")).toBe(true);
+    await expect(computeNativeHomeManifest({ ...f.options, packages: [] })).rejects.toMatchObject({ code: "pi_home_package_unresolved" });
+  });
+  it("does not spread unallowlisted runtime/resource properties into stable identity", async () => {
+    const f = await fixture(), before = await computeNativeHomeManifest(f.options);
+    const after = await computeNativeHomeManifest({ ...f.options, runtime: { ...f.options.runtime, ...{ pid: 123, secret: "PRIVATE_SENTINEL" } }, resources: f.options.resources.map(resource => ({ ...resource, secret: "PRIVATE_SENTINEL" })) });
+    expect(after.digest).toBe(before.digest); expect(JSON.stringify(after)).not.toContain("PRIVATE_SENTINEL");
+  });
   it("requires every configured package to have a native resolved root (no install guessing)", async () => {
     const f = await fixture();
     await expect(computeNativeHomeManifest({ ...f.options, packages: f.options.packages.slice(0, 1) })).rejects.toMatchObject({ code: "pi_home_package_unresolved" });
+  });
+  it("does not leak malformed private configuration bytes in errors", async () => {
+    const f = await fixture(); await writeFile(join(f.agentDir, "settings.json"), "PRIVATE_SENTINEL");
+    const error = await computeNativeHomeManifest(f.options).then(() => undefined, error => error);
+    expect(error).toMatchObject({ code: "pi_home_config_invalid" }); expect(String(error)).not.toContain("PRIVATE_SENTINEL");
   });
   it("records allowlisted env presence exactly, but never arbitrary env secrets", async () => {
     const f = await fixture();
