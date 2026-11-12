@@ -18,12 +18,14 @@ class FailureTransport {
   wake?: () => void;
   queue: PiRpcRecord[] = [];
   failure?: Error;
-  async request(type: string) {
+  requests: Array<{ type: string; input?: PiRpcRecord }> = [];
+  async request(type: string, input?: PiRpcRecord) {
+    this.requests.push({ type, input });
     return { data: type === "get_state" ? { sessionId: "native-session", model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "set_model" ? { provider: "neutral", id: "model" }
       : type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
       : type === "get_available_thinking_levels" ? { levels: ["high"] }
-      : type === "prompt" ? { disposition: "started" } : undefined };
+      : type === "prompt" ? { disposition: "started" } : type === "steer" ? { disposition: "queued" } : undefined };
   }
   send(value: PiRpcRecord) { this.queue.push(value); this.wake?.(); }
   fail(error: Error) { this.failure = error; this.wake?.(); }
@@ -48,7 +50,98 @@ async function failureFixture(capture = true) {
   return { session, transport, events, async close() { await session.close(); await drained; await rm(root, { recursive: true, force: true }); } };
 }
 
+async function inputProxyFixture() {
+  const f = await failureFixture(false); const frames: PiRpcRecord[] = [];
+  const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(JSON.parse(frame)); return true; }, once() {} },
+    environment: { PAPERCLIP_RUN_ID: "run-old" }, createDriver: () => ({ async descriptor() { throw new Error("unused"); }, async openSession() { return f.session; } }) });
+  let nextId = 0;
+  const request = async (method: string, params: PiRpcRecord = {}) => {
+    const id = ++nextId; proxy.acceptLine(JSON.stringify({ id, method, params }));
+    await vi.waitFor(() => expect(frames.some(frame => frame.id === id)).toBe(true));
+    return frames.find(frame => frame.id === id)! as { result?: any; error?: { message: string } };
+  };
+  await request("thread/start", { model: "neutral/model" });
+  return { ...f, request, async close() { await proxy.close(); await f.close(); } };
+}
 describe("PiRpcDriver", () => {
+  it.each(["native", "data-url", "mixed-native", "mixed-data-url"])("passes %s images through the facade into prompt and steer RPC images", async shape => {
+    const f = await inputProxyFixture();
+    const image = shape.endsWith("native") ? { type: "image", data: "aGVsbG8=", mimeType: "image/png" } : { type: "image", url: "data:image/png;base64,aGVsbG8=" };
+    const input = [...(shape.startsWith("mixed") ? [{ type: "text", text: "look" }] : []), image];
+    const expected = { message: shape.startsWith("mixed") ? "look" : "", images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }] };
+    try {
+      const started = await f.request("turn/start", { input }); expect(started.error).toBeUndefined();
+      expect(f.transport.requests.find(req => req.type === "prompt")?.input).toEqual(expected);
+      const steered = await f.request("turn/steer", { expectedTurnId: started.result.turn.id, input }); expect(steered.error).toBeUndefined();
+      expect(f.transport.requests.find(req => req.type === "steer")?.input).toEqual(expected);
+    } finally { await f.close(); }
+  });
+  it.each([[], [null], [{ type: "audio", text: "not text input" }], [{ type: "image", url: "https://example.invalid/image.png" }], [{ type: "localImage", path: "/not-read.png" }], [{ type: "image", data: "not base64!", mimeType: "image/png" }], [{ type: "image", url: "data:image/png;base64," }]].map(input => ({ input })))("refuses unmappable input $input only for that prompt or steer, never sending an empty prompt", async ({ input }) => {
+    const f = await inputProxyFixture();
+    try {
+      expect((await f.request("turn/start", { input })).error?.message).toMatch(/Pi.*input/i);
+      expect(f.transport.requests.filter(req => req.type === "prompt")).toEqual([]);
+      expect(f.transport.closed).toBe(false);
+      const started = await f.request("turn/start", { input: [{ type: "text", text: "valid next prompt" }] }); expect(started.error).toBeUndefined();
+      expect((await f.request("turn/steer", { expectedTurnId: started.result.turn.id, input })).error?.message).toMatch(/Pi.*input/i);
+      expect(f.transport.requests.filter(req => req.type === "steer")).toEqual([]);
+      expect((await f.request("turn/steer", { expectedTurnId: started.result.turn.id, input: [{ type: "text", text: "valid steer" }] })).error).toBeUndefined();
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+  it.each([undefined, "", "unknown"])("does not retire an idle session for interrupt turnId=%s", async turnId => {
+    const f = await failureFixture();
+    try {
+      await f.session.interrupt!({ turnId });
+      expect(f.transport.closed).toBe(false);
+      await expect(f.session.startTurn({ message: { role: "user", text: "still usable" } })).resolves.toHaveProperty("turnId");
+    } finally { await f.close(); }
+  });
+  it.each(["interrupt", "failure"])("opens a fresh Pi after %s, then completes the next turn through the facade", async mode => {
+    const first = await failureFixture(false), second = await failureFixture(false);
+    const frames: string[] = []; let opens = 0;
+    const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(frame); return true; }, once() {} },
+      environment: { PAPERCLIP_RUN_ID: "run-old" }, createDriver: () => ({ async descriptor() { throw new Error("unused"); },
+        async openSession() { return opens++ === 0 ? first.session : second.session; } }) });
+    const request = async (id: number, method: string, params: Record<string, unknown> = {}) => {
+      proxy.acceptLine(JSON.stringify({ id, method, params }));
+      await vi.waitFor(() => expect(frames.map(frame => JSON.parse(frame)).some(frame => frame.id === id)).toBe(true));
+      return frames.map(frame => JSON.parse(frame)).find(frame => frame.id === id);
+    };
+    try {
+      await request(1, "thread/start", { model: "neutral/model" });
+      const firstTurn = await request(2, "turn/start", { input: [{ text: "first" }] });
+      if (mode === "interrupt") await request(3, "turn/interrupt", { turnId: firstTurn.result.turn.id });
+      else { first.transport.send({ type: "process_exit", code: 1 }); await vi.waitFor(() => expect(first.transport.closed).toBe(true)); }
+      await flushFailure();
+      const opened = await request(4, "thread/start", { model: "neutral/model" }); expect(opened.error).toBeUndefined();
+      expect(opens).toBe(2);
+      const next = await request(5, "turn/start", { input: [{ text: "next" }] }); expect(next.error).toBeUndefined();
+      second.transport.send({ type: "agent_start" });
+      const message = { role: "assistant", responseId: "next", provider: "neutral", model: "model", content: [{ type: "text", text: "fresh Pi answer" }], stopReason: "stop" };
+      second.transport.send({ type: "message_start", message }); second.transport.send({ type: "message_end", message }); second.transport.send({ type: "agent_settled" });
+      await vi.waitFor(() => expect(frames.map(frame => JSON.parse(frame)).some(frame => frame.method === "turn/completed" && frame.params.turnId === next.result.turn.id)).toBe(true));
+    } finally { await proxy.close(); await first.close(); await second.close(); }
+  });
+  it("forwards Pi provider error items and the last errorMessage on turn/failed", async () => {
+    const f = await failureFixture(false); const frames: string[] = [];
+    const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(frame); return true; }, once() {} },
+      environment: { PAPERCLIP_RUN_ID: "run-old" }, createDriver: () => ({ async descriptor() { throw new Error("unused"); }, async openSession() { return f.session; } }) });
+    try {
+      proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/start", params: { model: "neutral/model" } })); await flushFailure();
+      proxy.acceptLine(JSON.stringify({ id: 2, method: "turn/start", params: { input: [{ text: "work" }] } })); await flushFailure();
+      f.transport.send({ type: "agent_start" });
+      for (const [id, errorMessage] of [["first", "earlier provider error"], ["last", "Provider context window exceeded: 321 > 123"]]) {
+        const message = { role: "assistant", id, responseId: id, provider: "neutral", model: "model", content: [], stopReason: "error", errorMessage, usage: {} };
+        f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message });
+      }
+      f.transport.send({ type: "agent_settled", aborted: false }); await flushFailure();
+      const decoded = frames.map(frame => JSON.parse(frame));
+      expect(decoded.filter(frame => frame.method === "item/failed")).toHaveLength(2);
+      expect(decoded.find(frame => frame.method === "turn/failed")?.params).toMatchObject({ turn: { error: { message: "Provider context window exceeded: 321 > 123" } } });
+      expect(f.transport.closed).toBe(false);
+    } finally { await proxy.close(); await f.close(); }
+  });
   it("does not inherit ambient AGENT_HOME when server omits it", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-home-ambient-"));
     vi.stubEnv("AGENT_HOME", root);

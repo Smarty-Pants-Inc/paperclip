@@ -1,18 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
-import { RunAuthority, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
+import { PI_BIND_MAX_FRAME_BYTES, RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { configurePiNativeMcp } from "./pi-native-mcp.js";
 import { piHostInstructionSegment, verifiedPiChildBridgePath } from "./extension/index.js";
+import { piRpcUserInput } from "./pi-user-input.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
@@ -58,6 +59,8 @@ export interface PiRpcDriverOptions {
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
   startupTimeoutMs?: number;
+  /** Dynamic tools have their own end-to-end deadline (protocol maximum: 60 s). */
+  dynamicToolTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
@@ -174,7 +177,7 @@ export class PiRpcDriver implements HarnessDriver {
           callbacks = new PiHostCallbacks(input.normalizedSessionId, this.#options.dynamicToolHandler);
           const toolSocketPath = join(privateDirectory, "tool.sock");
           // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
-          await callbacks.listen(toolSocketPath, this.#options.startupTimeoutMs);
+          await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
           const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools, toolSocketPath };
           if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
           resident = { directory: privateDirectory, socketPath, environment: { ...environment }, epoch: 1, context,
@@ -182,8 +185,13 @@ export class PiRpcDriver implements HarnessDriver {
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
           await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json));
+          const initialJson = JSON.stringify(initial);
+          if (Buffer.byteLength(initialJson) > PI_BIND_MAX_FRAME_BYTES) throw new Error("Pi initial binding exceeds its private frame limit");
+          const initialFile = join(privateDirectory, "initial.json");
+          await writeFile(initialFile, initialJson, { mode: 0o600, flag: "wx" });
           environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
-          environment.PAPERCLIP_PI_BIND_INITIAL = JSON.stringify(initial);
+          delete environment.PAPERCLIP_PI_BIND_INITIAL;
+          environment.PAPERCLIP_PI_BIND_INITIAL_FILE = initialFile;
         } catch (error) {
           await callbacks?.close();
           await provider.close();
@@ -261,6 +269,8 @@ interface PiRunContext {
   runtimeContext: unknown;
   instructions: string;
   tools: PiDynamicTool[];
+  toolNames: Record<string, string>;
+  diagnostics: Array<{ code: string; message: string }>;
 }
 interface PiResidentState {
   directory: string;
@@ -305,6 +315,7 @@ interface PiTurnState extends PiEventOrigin {
   projector: ReturnType<typeof createPiEventProjector>;
   lastText: string;
   hasAssistantReceipt: boolean;
+  lastErrorMessage?: string;
   failed: boolean;
   settled: boolean;
 }
@@ -416,6 +427,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     this.#piMetadata = state.piMetadata;
     this.#emit("session.started", { context: { model: state.config.model, piRpcThinkingLevel: state.config.piRpcThinkingLevel, piMetadata: state.piMetadata } });
+    for (const diagnostic of state.initialContext.diagnostics) this.#emit("harness.diagnostic", diagnostic);
     void this.#pump();
   }
 
@@ -442,8 +454,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (this.#resident) {
         const previous = this.#resident.context;
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
-          input.dynamicTools !== undefined ? input.dynamicTools : previous.tools,
-          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
+          input.dynamicTools,
+          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
         // The proxy sends attach before every turn, including the bootstrap and
         // same-run post-claim admission. Do not consume INITIAL or rotate twice.
         if (this.#resident.binding) {
@@ -455,8 +467,8 @@ export class PiRpcHarnessSession implements HarnessSession {
         // not gain a managed broker secrecy or dynamic-refresh guarantee.
         const previous = this.#initialContext;
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
-          input.dynamicTools !== undefined ? input.dynamicTools : previous.tools,
-          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
+          input.dynamicTools,
+          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
         if (JSON.stringify(context.tools) !== JSON.stringify(previous.tools)) throw new Error("Pi RPC tool refresh requires a provider bind receipt");
         await this.#admit(input.signal);
         await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
@@ -464,6 +476,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         this.#initialContext = context;
       }
       this.#runId = input.runId;
+      for (const diagnostic of (this.#resident?.context ?? this.#initialContext).diagnostics) this.#emit("harness.diagnostic", diagnostic);
     });
   }
 
@@ -551,6 +564,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
+    const message = piRpcUserInput(input.message);
     return this.#serialize(async () => {
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
@@ -581,9 +595,9 @@ export class PiRpcHarnessSession implements HarnessSession {
       try {
         // Host authority is independent from extension authority and activated
         // only by this host prompt, never attach/bind or callback arrival.
-        if (binding) this.#callbacks?.activate(binding.origin);
+        if (binding) this.#callbacks?.activate(binding.origin, this.#resident!.context.toolNames);
         this.#pendingInput++;
-        const response = await this.#transport.request("prompt", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+        const response = await this.#transport.request("prompt", message).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
         if (disposition !== "started") throw new PiNativeAdmissionError("pi_prompt_rejected", `Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
       } catch (error) {
@@ -601,8 +615,9 @@ export class PiRpcHarnessSession implements HarnessSession {
     const turn = this.#activeTurn;
     if (this.#closed || !turn || turn.settled) throw new HarnessOperationAlreadyTerminalError("steering");
     if (input.turnId !== turn.turnId) throw new HarnessStaleTurnError(input.turnId);
+    const message = piRpcUserInput(input.message);
     this.#pendingInput++;
-    const response = await this.#transport.request("steer", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+    const response = await this.#transport.request("steer", message).finally(() => { this.#pendingInput--; });
     const disposition = stringValue(record(response.data).disposition);
     if (disposition !== "queued") {
       throw new Error(`Pi RPC steer did not queue input (disposition=${disposition ?? "missing"})`);
@@ -613,7 +628,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
-    if (input.turnId && input.turnId !== this.#activeTurn?.turnId) return;
+    if (!this.#activeTurn || (input.turnId && input.turnId !== this.#activeTurn.turnId)) return;
     // Stop is a physical retirement, not a reusable prompt cancellation.
     this.#callbacks?.fence();
     this.#admitted = false;
@@ -896,6 +911,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (text) turn.lastText = text;
       turn.hasAssistantReceipt ||= Boolean(text) || isRecord(message.usage);
       if (message.stopReason === "error" || message.stopReason === "aborted") turn.failed = true;
+      if (typeof message.errorMessage === "string" && message.errorMessage) turn.lastErrorMessage = message.errorMessage;
       if (this.#streamTurn === turn) this.#streamTurn = null;
       // Bind full native tool IDs before execution callbacks can arrive.
       for (const part of Array.isArray(message.content) ? message.content : []) {
@@ -912,7 +928,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (event.type === "agent_settled") {
       const empty = !turn.lastText && !turn.hasAssistantReceipt;
       const status = event.aborted === true ? "cancelled" : turn.failed || empty ? "failed" : "completed";
-      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
+      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(status === "failed" && turn.lastErrorMessage ? { error: { code: "pi_provider_error", message: turn.lastErrorMessage } } : empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
     }
   }
 
@@ -993,22 +1009,23 @@ class PiHostCallbacks {
   #server?: Awaited<ReturnType<typeof startPiCallbackServer>>;
   readonly #announcements = new Map<string, { origin: Readonly<Origin>; tool: string; arguments: unknown }>();
   readonly #waiters = new Map<string, Set<() => void>>();
+  #toolNames: Record<string, string> = Object.create(null);
   constructor(sessionId: string, handler: PiRpcDriverOptions["dynamicToolHandler"]) { this.#sessionId = sessionId; this.#handler = handler; }
   setNativeSessionId(id: string): void { if (this.#nativeSessionId !== null) throw new Error("Pi callback identity already assigned"); this.#nativeSessionId = id; }
-  async listen(socketPath: string, timeoutMs = 5000): Promise<void> {
+  async listen(socketPath: string, timeoutMs = 60000): Promise<void> {
     this.#server = await startPiCallbackServer({ socketPath, sessionId: this.#sessionId, authority: this.authority, timeoutMs,
       waitForAnnouncement: (call, signal) => this.#wait(call, signal),
       handleTool: async (call, signal) => {
         if (!this.#handler || !this.#nativeSessionId || !this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
         const { runId, turnId } = call.origin;
-        const result = await this.#handler({ runId, turnId, threadId: this.#nativeSessionId, tool: call.tool, callId: call.toolCallId, arguments: structuredClone(call.arguments), signal });
+        const result = await this.#handler({ runId, turnId, threadId: this.#nativeSessionId, tool: Object.hasOwn(this.#toolNames, call.tool) ? this.#toolNames[call.tool]! : call.tool, callId: call.toolCallId, arguments: structuredClone(call.arguments), signal });
         signal.throwIfAborted();
         if (!this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
         return normalizePiToolResult(result);
       },
     });
   }
-  activate(origin: Origin): void { this.authority.bind(origin); this.authority.beginTurn(origin); }
+  activate(origin: Origin, toolNames: Record<string, string>): void { this.#toolNames = structuredClone(toolNames); this.authority.bind(origin); this.authority.beginTurn(origin); }
   fence(): void { this.authority.end(); this.#announcements.clear(); for (const set of this.#waiters.values()) for (const wake of set) wake(); }
   pendingCount(): number { return this.#server?.pendingCount() ?? 0; }
   async close(): Promise<void> { this.fence(); await this.#server?.close(); }
@@ -1062,21 +1079,24 @@ function sameJson(a: unknown, b: unknown): boolean {
   try { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); } catch { return false; }
 }
 
-function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[], runtimeContext: unknown): PiRunContext {
-  if (typeof baseInstructions !== "string" || !Array.isArray(tools)) throw new Error("Pi binding context rejected");
+function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[] | undefined, runtimeContext: unknown, previous?: PiRunContext): PiRunContext {
+  if (typeof baseInstructions !== "string" || (tools !== undefined && !Array.isArray(tools))) throw new Error("Pi binding context rejected");
   // Freeze serializable context NOW. Never hash one object then look it up again
   // from a mutable caller when the request is eventually admitted.
   const contextJson = runtimeContext === undefined ? undefined : JSON.stringify(runtimeContext);
   if (runtimeContext !== undefined && contextJson === undefined) throw new Error("Pi runtime context is not serializable");
   const frozenContext: unknown = contextJson === undefined ? undefined : JSON.parse(contextJson);
-  const normalizedTools = JSON.parse(JSON.stringify(tools.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })))) as PiDynamicTool[];
+  const normalized = tools === undefined && previous
+    ? { tools: previous.tools, toolNames: previous.toolNames, diagnostics: previous.diagnostics }
+    : normalizePiDynamicTools(tools ?? []);
   return { baseInstructions, runtimeContext: frozenContext,
-    instructions: contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`, tools: normalizedTools };
+    instructions: contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`, ...normalized };
 }
 
 async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPath" | "directory">): Promise<void> {
   // Only this allocation's private IPC endpoint/root; NEVER delete session JSONL.
   await unlink(resident.socketPath).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+  await unlink(join(resident.directory, "initial.json")).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
   await rmdir(resident.directory).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
 }
 

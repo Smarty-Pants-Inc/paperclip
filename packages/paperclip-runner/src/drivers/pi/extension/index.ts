@@ -479,10 +479,22 @@ export function installPiSubagentComposition(
   return { dispose };
 }
 
+/** File bootstrap avoids the OS per-environment-string limit. The legacy inline
+ * value remains readable for older hosts; a selected file never falls back. */
+export function readPiBindInitial(environment: NodeJS.ProcessEnv): PiBindInitial | undefined {
+  const path = environment.PAPERCLIP_PI_BIND_INITIAL_FILE;
+  let json: string | undefined;
+  try { json = path ? readFileSync(path, "utf8") : environment.PAPERCLIP_PI_BIND_INITIAL; }
+  catch { throw new Error(PI_BIND_ERROR); }
+  if (json === undefined) return undefined;
+  if (Buffer.byteLength(json) > PI_BIND_MAX_FRAME_BYTES) throw new Error(PI_BIND_ERROR);
+  try { return JSON.parse(json) as PiBindInitial; } catch { throw new Error(PI_BIND_ERROR); }
+}
+
 export default function paperclipPiBindExtension(pi: PiBindApi): void {
   const socketPath = process.env.PAPERCLIP_PI_BIND_SOCKET;
-  const initialJson = process.env.PAPERCLIP_PI_BIND_INITIAL;
-  if (!socketPath && !initialJson) {
+  const initial = readPiBindInitial(process.env);
+  if (!socketPath && initial === undefined) {
     // Native/custom providers still load the host prompt refresher independently
     // of broker routing. This does not grant managed callback/broker authority.
     const path = process.env.PAPERCLIP_PI_INSTRUCTIONS_FILE;
@@ -497,9 +509,7 @@ export default function paperclipPiBindExtension(pi: PiBindApi): void {
     });
     return;
   }
-  if (!socketPath || !initialJson || Buffer.byteLength(initialJson) > PI_BIND_MAX_FRAME_BYTES) throw new Error(PI_BIND_ERROR);
-  let initial: PiBindInitial;
-  try { initial = JSON.parse(initialJson) as PiBindInitial; } catch { throw new Error(PI_BIND_ERROR); }
+  if (!socketPath || !initial) throw new Error(PI_BIND_ERROR);
   const composition = installPiSubagentComposition(pi);
   try { installPiBindExtension(pi, { socketPath, initial }); }
   catch (error) { composition.dispose(); throw error; }

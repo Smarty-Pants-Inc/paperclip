@@ -1,5 +1,6 @@
 import { createServer as httpServer, type Server as HttpServer } from "node:http";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -42,7 +43,7 @@ async function fixture(options: Partial<PiRpcDriverOptions> = {}, Driver: typeof
   });
   const session = await driver.openSession({ runId: "run-1", normalizedSessionId: "host", workingDirectory: join(root, "workspace") }) as PiRpcHarnessSession;
   cleanups.push(async () => { await session.close().catch(() => {}); for (const socket of sockets) socket.destroy(); await new Promise<void>(r => peer.close(() => r())); });
-  const initial = JSON.parse(launch.env!.PAPERCLIP_PI_BIND_INITIAL!); const events: PrpEvent[] = []; void (async () => { for await (const e of session.events()) events.push(e); })();
+  const initial = JSON.parse(readFileSync(launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8")); const events: PrpEvent[] = []; void (async () => { for await (const e of session.events()) events.push(e); })();
   function call(id = "call", change: Partial<PiToolCallRequest> = {}): PiToolCallRequest { return { schema: 1, type: "tool_call", nonce: id, sessionId: "host", origin: { epoch: initial.epoch, runId: initial.runId, turnId: initial.turnId }, toolCallId: id, tool: "context", arguments: {}, ...change }; }
   async function start() { const turn = await session.startTurn({ message: { role: "user", text: "one" } }); transport.send({ type: "agent_start" }); await tick(); return turn; }
   async function announce(request: PiToolCallRequest) { transport.send({ type: "tool_execution_start", toolCallId: request.toolCallId, toolName: request.tool, args: request.arguments }); await tick(); }
@@ -72,6 +73,16 @@ async function packagedDriver(verified = true) {
 }
 
 describe("live host Pi C2 authority", () => {
+  it("returns a seven-second dynamic tool's real result independently of the startup deadline", async () => {
+    const f = await fixture({ dynamicToolHandler: async call => {
+      await new Promise<void>(resolve => setTimeout(resolve, 7000));
+      call.signal.throwIfAborted();
+      return { content: [{ type: "text", text: "seven-second-real-result" }], details: {} };
+    } });
+    await f.start(); const request = f.call("slow"); await f.announce(request);
+    await expect(sendPiToolRequest(f.initial.toolSocketPath, request, { timeoutMs: 60000 })).resolves.toMatchObject({ content: [{ text: "seven-second-real-result" }] });
+    await f.settle(); expect(f.transport.closed).toBe(false);
+  }, 12_000);
   it("resolves the real owned extension in official verified CJS cli layout, not cwd", async () => {
     const packaged = await packagedDriver(); const f = await fixture({}, packaged.Driver);
     expect(f.launch.fatalSessionStartExtensionPaths).toEqual([
@@ -143,9 +154,12 @@ describe("live host Pi C2 authority", () => {
     gate.resolve(); await stopping; expect(f.transport.closed).toBe(true);
     await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.cancelled" && event.turnId === turn.turnId)).toBe(true));
   });
-  it("retires idle sessions on interrupt but ignores a stale turn-specific stop", async () => {
+  it("ignores idle or stale interrupts, but physically retires an active turn", async () => {
     const f = await fixture(); const turn = await f.start(); await f.session.interrupt({ turnId: "old-turn" }); expect(f.transport.closed).toBe(false); await f.settle();
-    await f.session.interrupt(); expect(f.transport.closed).toBe(true); expect(f.ipc.some(command => command.type === "stop_children")).toBe(true); expect(turn.turnId).toBe(f.initial.turnId);
+    await f.session.interrupt(); expect(f.transport.closed).toBe(false);
+    expect(f.ipc.some(command => command.type === "stop_children")).toBe(false); expect(turn.turnId).toBe(f.initial.turnId);
+    const next = await f.start(); await f.session.interrupt({ turnId: turn.turnId }); expect(f.transport.closed).toBe(false);
+    await f.session.interrupt({ turnId: next.turnId }); expect(f.transport.closed).toBe(true); expect(f.ipc.some(command => command.type === "stop_children")).toBe(true);
   });
   it("accepts a UI request attributed by a previously captured native message owner", async () => {
     const f = await fixture(); await f.start(); const message = { role: "assistant", id: "native-message", provider: "paperclip", model: "faux", timestamp: 1, content: [] };
@@ -208,7 +222,7 @@ describe.skipIf(!process.env.PI_TEST_BINARY)("real Pi semantic roundtrip", () =>
     const root = await mkdtemp(join(tmpdir(), "pi-real-c2-")); await mkdir(join(root, "workspace")); const requests: unknown[] = []; let effects = 0; let captured: unknown; let initial!: Record<string, any>; let native!: PiRpcTransport; const privateCommands: string[] = []; const nativeRecords: PiRpcRecord[] = [];
     const server: HttpServer = httpServer((req, res) => { let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; }); req.on("end", () => { requests.push(JSON.parse(body)); const first = requests.length === 1; res.writeHead(200, { "content-type": "text/event-stream" }); const chunks = first ? [{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "native-semantic", type: "function", function: { name: "context", arguments: "{}" } }] }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }] : [{ choices: [{ index: 0, delta: { content: "roundtrip complete" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } }]; for (const chunk of chunks) res.write(`data: ${JSON.stringify({ id: `faux-${requests.length}`, object: "chat.completion.chunk", ...chunk })}\n\n`); res.end("data: [DONE]\n\n"); }); });
     await new Promise<void>(r => server.listen(0, "127.0.0.1", r)); cleanups.push(async () => { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }); const address = server.address(); if (!address || typeof address === "string") throw new Error("bind");
-    const session = await new Driver({ bindRequest: async (path, command, options) => { privateCommands.push(command.type); return sendPiBindRequest(path, command, options); }, command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), dynamicTools: [tool], dynamicToolHandler: async call => { ++effects; captured = { ...call, signal: undefined }; return { contentItems: [{ type: "inputText", text: "HOST_SEMANTIC_OK" }], success: true }; }, environment: { PI_OFFLINE: "1", PI_CODING_AGENT_DIR: join(root, "agent"), PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: "local-faux-only" }, transportFactory: options => { initial = JSON.parse(options.env!.PAPERCLIP_PI_BIND_INITIAL!); native = new PiRpcTransport(options); const stream = native.events.bind(native); native.events = () => ({ async *[Symbol.asyncIterator]() { for await (const event of stream()) { nativeRecords.push(structuredClone(event)); yield event; } } }); return native; }, shutdownTimeoutMs: 1000 }).openSession({ runId: "real-run", normalizedSessionId: "real-host", workingDirectory: join(root, "workspace") }) as PiRpcHarnessSession;
+    const session = await new Driver({ bindRequest: async (path, command, options) => { privateCommands.push(command.type); return sendPiBindRequest(path, command, options); }, command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), dynamicTools: [tool], dynamicToolHandler: async call => { ++effects; captured = { ...call, signal: undefined }; return { contentItems: [{ type: "inputText", text: "HOST_SEMANTIC_OK" }], success: true }; }, environment: { PI_OFFLINE: "1", PI_CODING_AGENT_DIR: join(root, "agent"), PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: "local-faux-only" }, transportFactory: options => { initial = JSON.parse(readFileSync(options.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8")); native = new PiRpcTransport(options); const stream = native.events.bind(native); native.events = () => ({ async *[Symbol.asyncIterator]() { for await (const event of stream()) { nativeRecords.push(structuredClone(event)); yield event; } } }); return native; }, shutdownTimeoutMs: 1000 }).openSession({ runId: "real-run", normalizedSessionId: "real-host", workingDirectory: join(root, "workspace") }) as PiRpcHarnessSession;
     cleanups.push(() => session.close()); const events: PrpEvent[] = []; const iterator = session.events()[Symbol.asyncIterator](); await session.startTurn({ message: { role: "user", text: "call context" } });
     for (;;) { const next = await iterator.next(); if (next.done) throw new Error("early close"); events.push(next.value); if (next.value.eventType === "turn.failed") throw new Error(JSON.stringify(next.value)); if (next.value.eventType === "turn.completed") break; }
     expect(privateCommands.filter(type => type === "bind" || type === "begin_turn")).toEqual([]);

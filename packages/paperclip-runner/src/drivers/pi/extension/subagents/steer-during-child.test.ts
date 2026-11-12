@@ -1,4 +1,5 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -62,7 +63,7 @@ describe("Pi RPC steer while an in-process child is running", () => {
         ...peer.driverOptions, runtimeDirectory: join(root, "parent"),
         environment: { ...peer.driverOptions.environment, PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1/v1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
         transportFactory(options) {
-          initial = JSON.parse(options.env!.PAPERCLIP_PI_BIND_INITIAL!);
+          initial = JSON.parse(readFileSync(options.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
           bindSocket = options.env!.PAPERCLIP_PI_BIND_SOCKET!;
           control = installPiBindExtension(api, { socketPath: bindSocket, initial: initial! });
           const startup = Promise.resolve(emit("session_start"));

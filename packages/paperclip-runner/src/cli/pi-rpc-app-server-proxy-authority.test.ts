@@ -379,12 +379,12 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
 
   it("uses captured old/current runs and admitted session IDs even when the native composite is identical", async () => {
     const h = await setup();
-    await h.request("turn/start", { input: [] });
+    await h.request("turn/start", { input: [{ type: "text", text: "work" }] });
     const nativeId = "call_same|fc_same";
     const input = call("run-1", "turn-1", nativeId);
     const old = h.invoke(input).then(value => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }));
     const oldFrame = await h.nextController("item/tool/call");
-    await h.request("turn/start", { paperclipRunId: "run-2", input: [] });
+    await h.request("turn/start", { paperclipRunId: "run-2", input: [{ type: "text", text: "next" }] });
     input.runId = "run-2"; input.turnId = "turn-2";
     const current = h.invoke(call("run-2", "turn-2", nativeId));
     const currentFrame = await h.nextController("item/tool/call", 1);
@@ -404,7 +404,7 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
     call("old-run", "old-turn", "call_x|fc_y"),
   ])("does not guess current origin to normalize an unbound/stale native call: %j", async (input) => {
     const h = await setup();
-    await h.request("turn/start", { input: [] });
+    await h.request("turn/start", { input: [{ type: "text", text: "work" }] });
     await expect(h.invoke(input)).rejects.toThrow(/authority|captured|stale|identity/i);
     expect(h.controllerFrames("item/tool/call")).toEqual([]);
   });
@@ -451,14 +451,14 @@ describe("Pi RPC proxy captured run authority", () => {
 
   it("rejects an old awaited callback during run two, but permits an announced current call with zero ID and empty input", async () => {
     const h = await setup();
-    await h.request("turn/start", { input: [] });
+    await h.request("turn/start", { input: [{ type: "text", text: "work" }] });
     h.session.announce("run-1", "turn-1", "old-call");
     const mutableCall = call("run-1", "turn-1", "old-call");
     const oldOutcome = h.invoke(mutableCall).then(
       (value) => ({ value, error: undefined }), (error: Error) => ({ value: undefined, error }),
     );
     const oldRequest = await h.nextController("item/tool/call");
-    expect(await h.request("turn/start", { paperclipRunId: "run-2", input: [] }))
+    expect(await h.request("turn/start", { paperclipRunId: "run-2", input: [{ type: "text", text: "next" }] }))
       .toHaveProperty("result");
     // A caller mutating its object cannot rewrite the identity captured before await.
     mutableCall.runId = "run-2";
@@ -478,8 +478,8 @@ describe("Pi RPC proxy captured run authority", () => {
     h.respond(currentRequest, { contentItems: [{ text: "" }] });
     await expect(currentOutcome).resolves.toEqual({ contentItems: [{ text: "" }] });
     expect(h.session.turns).toEqual([
-      { message: { role: "user", text: "" }, model: "test/model" },
-      { message: { role: "user", text: "" }, model: "test/model" },
+      { message: { role: "user", text: "work" }, model: "test/model" },
+      { message: { role: "user", text: "next" }, model: "test/model" },
     ]);
   });
 
@@ -510,7 +510,7 @@ describe("Pi RPC proxy captured run authority", () => {
     const h = await setup();
     const event = h.session.emit("run-1", "turn-1", "runtime_request.created", { request: runtimeRequest() });
     const frame = await h.nextController("paperclip/runtimeRequest");
-    await h.request("turn/start", { paperclipRunId: "run-2", input: [] });
+    await h.request("turn/start", { paperclipRunId: "run-2", input: [{ type: "text", text: "next" }] });
     event.runId = "run-2";
     event.turnId = "turn-2";
     h.respond(frame, { resolution: { action: "accept" } });
@@ -525,7 +525,7 @@ describe("Pi RPC proxy captured run authority", () => {
     { runId: "run-1", turnId: "turn-1", request: runtimeRequest("other-turn") },
   ])("does not inherit current authority for stale or unbound runtime requests: %j", async (input) => {
     const h = await setup();
-    await h.request("turn/start", { input: [] });
+    await h.request("turn/start", { input: [{ type: "text", text: "work" }] });
     h.session.emit(input.runId, input.turnId, "runtime_request.created", { request: input.request });
     await vi.waitFor(() => expect(h.logs.some((line) => /authority|captured|stale|identity/i.test(line))).toBe(true));
     expect(h.controllerFrames("paperclip/runtimeRequest")).toEqual([]);
@@ -536,7 +536,7 @@ describe("Pi RPC proxy captured run authority", () => {
     const h = await setup();
     const frame = await h.request(method, {
       ...(method === "run.attach" ? { runId: "run-2" } : { paperclipRunId: "run-2" }),
-      baseInstructions: "", dynamicTools: [], runtimeContext: null, input: [],
+      baseInstructions: "", dynamicTools: [], runtimeContext: null, input: [{ type: "text", text: "work" }],
     });
     expect(frame).toHaveProperty("result");
     expect(h.session.attachments).toEqual([{
@@ -547,7 +547,7 @@ describe("Pi RPC proxy captured run authority", () => {
   it("refreshes an explicitly attached current run rather than skipping admission", async () => {
     const h = await setup();
     expect(await h.request("turn/start", {
-      paperclipRunId: "run-1", baseInstructions: "refreshed", dynamicTools: [], input: [],
+      paperclipRunId: "run-1", baseInstructions: "refreshed", dynamicTools: [], input: [{ type: "text", text: "work" }],
     })).toHaveProperty("result");
     expect(h.session.attachments).toEqual([{
       runId: "run-1", baseInstructions: "refreshed", dynamicTools: [],

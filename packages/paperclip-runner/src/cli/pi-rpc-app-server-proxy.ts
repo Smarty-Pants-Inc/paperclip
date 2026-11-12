@@ -12,6 +12,7 @@ import type {
   PersistedHarnessSession,
 } from "../contracts/harness-driver.js";
 import { HarnessStaleTurnError } from "../contracts/harness-driver.js";
+import { parsePiUserInput } from "../drivers/pi/pi-user-input.js";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 import {
@@ -284,7 +285,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       } else if (
         event.eventType === "item.started" ||
         event.eventType === "item.delta" ||
-        event.eventType === "item.completed"
+        event.eventType === "item.completed" ||
+        event.eventType === "item.failed"
       ) {
         // Facade item notifications must be bound to a turn. Do not carry
         // OpenCode's provider-specific unbound-model filtering into Pi.
@@ -477,7 +479,17 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     piNativeAdmission = (opened as PiRpcProxySession & { piNativeAdmission?(): Record<string, unknown> }).piNativeAdmission?.();
     if (!options.createDriver && !piNativeAdmission) throw new Error("Native Pi omitted admitted model/thinking metadata");
     if (piNativeAdmission) activeModel = String(piNativeAdmission.model);
-    eventPump = pumpEvents(opened);
+    eventPump = pumpEvents(opened).finally(() => {
+      // Stop/failure physically retires Pi. Never advertise that dead thread on
+      // the next thread/start, and never clear a newer session's authority.
+      if (session === opened) {
+        session = null;
+        activeTurnId = null;
+        piNativeAdmission = undefined;
+        announcedTurnIds.clear();
+        for (const key of Object.keys(usageTotals)) delete usageTotals[key];
+      }
+    });
     void eventPump.catch((error) => {
       log(`[pi_rpc] fatal proxy event pump error: ${error instanceof Error ? error.message : String(error)}\n`);
       send({ method: "warning", params: { threadId: opened.ids().driverSessionId, message: error instanceof Error ? error.message : String(error) } });
@@ -509,16 +521,15 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       case "turn/start": {
         if (!session) throw new Error("Pi RPC thread is not open");
         assertPiCollaborationMode(params);
+        const userMessage = parsePiUserInput(params.input);
         if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
         if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
         if (params.model !== undefined && params.model !== activeModel) throw new Error("Pi turn model differs from the admitted session");
-        const inputItems = Array.isArray(params.input) ? params.input.map(record) : [];
-        const messageText = inputItems.map((entry) => text(entry.text)).filter(Boolean).join("\n");
         const piRpcThinkingLevel = parsePiThinkingLevel(
           params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
         );
         const turnInput = {
-          message: { role: "user" as const, text: messageText },
+          message: userMessage,
           model: activeModel,
           ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
         } as Parameters<HarnessSession["startTurn"]>[0] & { piRpcThinkingLevel?: PiThinkingLevel };
@@ -559,9 +570,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (!activeTurnId || turnId !== activeTurnId) throw new HarnessStaleTurnError(turnId);
         if (!session?.steer) throw new Error("Pi RPC steering is unavailable");
         if (params.mode !== undefined && params.mode !== "steer") throw new Error("Pi RPC follow-up is unavailable");
-        const inputItems = Array.isArray(params.input) ? params.input.map(record) : [];
-        const messageText = inputItems.map((entry) => text(entry.text)).filter(Boolean).join("\n");
-        await session.steer({ turnId, message: { role: "user", text: messageText } });
+        await session.steer({ turnId, message: parsePiUserInput(params.input) });
         result = { accepted: true };
         break;
       }

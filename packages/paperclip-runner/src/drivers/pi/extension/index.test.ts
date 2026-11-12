@@ -1,10 +1,10 @@
 import { connect, createServer, type Server } from "node:net";
-import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  installPiBindExtension, announce, captureOrigin, authorizeCallback,
+  installPiBindExtension, readPiBindInitial, announce, captureOrigin, authorizeCallback,
   registerParkReadyContributor, registerStopChildren, registerHomeAdmission, configurePiBindHooks,
   type PiBindApi, type PiBindContext, type PiBindInitial, type PiBindTool,
 } from "./index.js";
@@ -61,6 +61,17 @@ async function raw(path: string, request: unknown): Promise<any> {
 }
 
 describe("owned Pi bind extension", () => {
+  it("reads legacy inline INITIAL, preferring the selected private file without fallback on file errors", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-initial-")); roots.push(root);
+    const path = join(root, "initial.json");
+    const fileInitial = { ...initial, instructions: "x".repeat(200 * 1024) };
+    await writeFile(path, JSON.stringify(fileInitial), { mode: 0o600 });
+    const inline = JSON.stringify(initial);
+    expect(readPiBindInitial({ PAPERCLIP_PI_BIND_INITIAL: inline })).toEqual(initial);
+    expect(readPiBindInitial({ PAPERCLIP_PI_BIND_INITIAL: inline, PAPERCLIP_PI_BIND_INITIAL_FILE: path })).toEqual(fileInitial);
+    await rm(path);
+    expect(() => readPiBindInitial({ PAPERCLIP_PI_BIND_INITIAL: inline, PAPERCLIP_PI_BIND_INITIAL_FILE: path })).toThrow("rejected");
+  });
   it("bootstraps immutable first authority without any socket roundtrip or provider registration", async () => {
     const f = await fixture();
     expect(f.pi.registerProvider).not.toHaveBeenCalled();

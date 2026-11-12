@@ -205,13 +205,6 @@ describe("immutable Pi 1.5.2 recordings through the production Pi facade JSONL b
         // This Runner-internal marker has no Pi RPC notification equivalent.
         continue;
       }
-      if (event.eventType === "item.failed") {
-        // The Pi facade does not forward PRP item failures directly; the same
-        // recording's tool or turn settlement carries the native terminal state.
-        expect(notifications.some(frame => frame.method === "item/failed"
-          && (frame.params as Record<string, unknown> | undefined)?.itemId === event.itemId)).toBe(false);
-        continue;
-      }
       const frame = notifications[outputIndex++];
       expect(frame, `${name} ${event.eventType} has its native facade frame`).toBeDefined();
       const params = frame!.params as Record<string, unknown>;

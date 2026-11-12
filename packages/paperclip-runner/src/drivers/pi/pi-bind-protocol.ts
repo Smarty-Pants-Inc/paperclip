@@ -86,6 +86,49 @@ export function validateOrigin(value: unknown): value is Origin {
   return object(value) && integer(value.epoch, 1) && text(value.runId, 256) && text(value.turnId, 256);
 }
 function sameOrigin(a: Origin, b: Origin): boolean { return a.epoch === b.epoch && a.runId === b.runId && a.turnId === b.turnId; }
+function validDynamicTool(value: unknown): value is PiDynamicTool {
+  return object(value) && text(value.name, 128) && /^[a-zA-Z_][a-zA-Z0-9_-]*$/u.test(value.name)
+    && text(value.description, 8192) && object(value.inputSchema) && value.inputSchema.type === "object";
+}
+
+/** Catalog input is untrusted: one unusable definition must not reject a session.
+ * Reserve the alias namespace so native names cannot impersonate generated names.
+ * The reverse map stays host-private; Pi and its receipts use only normalized tools.
+ */
+export function normalizePiDynamicTools(values: readonly unknown[]): {
+  tools: PiDynamicTool[]; toolNames: Record<string, string>; diagnostics: Array<{ code: string; message: string }>;
+} {
+  const tools: PiDynamicTool[] = [], toolNames: Record<string, string> = Object.create(null);
+  const diagnostics: Array<{ code: string; message: string }> = [];
+  for (const [index, value] of values.entries()) {
+    if (tools.length === 128) {
+      diagnostics.push({ code: "pi_dynamic_tool_limit", message: `Pi kept 128 dynamic tools; omitted ${values.length - index} remaining definitions.` });
+      break;
+    }
+    try {
+      if (!object(value) || typeof value.name !== "string" || !value.name.trim() || !object(value.inputSchema)) throw new Error();
+      const originalName = value.name;
+      const prefix = "pi_dynamic_";
+      const name = text(originalName, 128) && /^[a-zA-Z_][a-zA-Z0-9_-]*$/u.test(originalName) && !originalName.startsWith(prefix)
+        ? originalName : `${prefix}${originalName.replace(/[^a-zA-Z0-9_-]/gu, "_").slice(0, 45)}_${digest(originalName)}`;
+      if (Object.hasOwn(toolNames, name)) throw new Error();
+      let description = typeof value.description === "string" ? value.description.replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ").trim() : "";
+      description ||= originalName.replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ").trim() || name;
+      const bytes = Buffer.from(description);
+      let end = Math.min(bytes.length, 8192);
+      while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
+      description = bytes.subarray(0, end).toString("utf8");
+      const inputSchema: unknown = JSON.parse(JSON.stringify({ ...value.inputSchema, type: value.inputSchema.type ?? "object" }));
+      const tool = { name, description, inputSchema };
+      if (!validDynamicTool(tool)) throw new Error();
+      tools.push(tool); toolNames[name] = originalName;
+    } catch {
+      // Never echo arbitrary schema/description data in a diagnostic.
+      diagnostics.push({ code: "pi_dynamic_tool_dropped", message: `Pi dropped unusable dynamic tool definition ${index + 1}.` });
+    }
+  }
+  return { tools, toolNames, diagnostics };
+}
 export function validateBindingConfig(value: unknown): value is PiBindingConfig {
   if (!object(value) || !integer(value.epoch, 1) || !text(value.runId, 256) || !text(value.model, 512)
     || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.thinkingLevel as string)
@@ -95,8 +138,7 @@ export function validateBindingConfig(value: unknown): value is PiBindingConfig 
     || (value.toolSocketPath !== undefined && !validSocketPath(value.toolSocketPath))) return false;
   const names = new Set<string>();
   return value.tools.every(tool => {
-    if (!object(tool) || !text(tool.name, 128) || !/^[a-zA-Z_][a-zA-Z0-9_-]*$/u.test(tool.name)
-      || !text(tool.description, 8192) || !object(tool.inputSchema) || tool.inputSchema.type !== "object" || names.has(tool.name)) return false;
+    if (!validDynamicTool(tool) || names.has(tool.name)) return false;
     names.add(tool.name); return true;
   });
 }
