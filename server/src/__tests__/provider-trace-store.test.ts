@@ -281,21 +281,19 @@ describe("provider trace retention", () => {
     expect(returning).toHaveBeenCalledOnce();
   });
 
-  it("keeps an expired row denied and retries failed raw-file cleanup", async () => {
-    const unlinkError = Object.assign(new Error("permission denied"), { code: "EACCES" });
+  it("keeps an expired row denied but never deletes its raw files or pointer (R-keep-all-traces)", async () => {
     mockUnlink.mockReset();
-    mockUnlink.mockRejectedValueOnce(unlinkError).mockResolvedValue(undefined);
+    mockUnlink.mockResolvedValue(undefined);
     const { db, row } = statefulExpiredTraceDb();
+    const originalRef = row().traceRef;
     const store = providerTraceStore(db as never);
 
-    await expect(store.inspect("run-1", "company-1")).rejects.toThrow("permission denied");
-    expect(row()).toMatchObject({ status: "expired", deletedAt: expect.any(Date) });
-
-    await expect(store.inspect("run-1", "company-1")).resolves.toEqual({
-      trace: null,
-      entries: [],
-    });
-    expect(row().traceRef).toBe("00000000-0000-0000-0000-000000000000.ndjson");
+    await expect(store.inspect("run-1", "company-1")).resolves.toEqual({ trace: null, entries: [] });
+    expect(row()).toMatchObject({ status: "expired", deletedAt: expect.any(Date), traceRef: originalRef });
+    expect(originalRef).not.toBe("00000000-0000-0000-0000-000000000000.ndjson");
+    await expect(store.cleanupExpired(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000))).resolves.toEqual([]);
+    await expect(store.nextRetentionDeadline()).resolves.toBeNull();
+    expect(mockUnlink).not.toHaveBeenCalled();
   });
 
   it("never returns a writable capture path for an expired existing trace", async () => {
@@ -312,17 +310,15 @@ describe("provider trace retention", () => {
     })).rejects.toThrow("provider_trace_unavailable");
   });
 
-  it("does not let concurrent finalization overwrite expiry or strand raw files", async () => {
+  it("does not let concurrent finalization overwrite expiry, and keeps the raw files (R-keep-all-traces)", async () => {
     mockUnlink.mockReset();
     mockUnlink.mockResolvedValue(undefined);
     const { db, row } = finalizeExpiryRaceDb();
     const store = providerTraceStore(db as never);
 
     await expect(store.finalize("run-1", "company-1")).resolves.toBeNull();
-    expect(row()).toMatchObject({
-      status: "expired",
-      deletedAt: expect.any(Date),
-      traceRef: "00000000-0000-0000-0000-000000000000.ndjson",
-    });
+    expect(row()).toMatchObject({ status: "expired", deletedAt: expect.any(Date) });
+    expect(row().traceRef).not.toBe("00000000-0000-0000-0000-000000000000.ndjson");
+    expect(mockUnlink).not.toHaveBeenCalled();
   });
 });

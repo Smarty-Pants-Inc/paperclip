@@ -18,6 +18,8 @@ import { logActivity } from "./activity-log.js";
 
 export const PROVIDER_TRACE_MAX_BYTES = 64 * 1024 * 1024;
 export const PROVIDER_TRACE_RETENTION_MS = 24 * 60 * 60 * 1_000;
+/** R-keep-all-traces: the retention sweep never runs, so raw traces are kept forever. */
+export const PROVIDER_TRACE_KEEP_FOREVER = true;
 const EXPIRED_PROVIDER_TRACE_REF = "00000000-0000-0000-0000-000000000000.ndjson";
 
 export function providerTraceRequiredChannels(provider: string): string[] {
@@ -279,17 +281,10 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
       catch { return [{ kind: "trace_status", status: "incomplete", reason: "invalid_sidecar_record" }]; }
     });
   }
-  async function removeTraceFiles(traceRef: string, signal?: AbortSignal) {
+  // R-keep-all-traces: raw provider traces are never deleted. Expiry and removal
+  // only hide a trace (status + tombstone); its files and objects stay where they are.
+  async function removeTraceFiles(_traceRef: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
-    const cleanupRef = providerTraceCleanupRef(traceRef);
-    if (cleanupRef) await objectStore().remove(cleanupRef, signal);
-    for (const filePath of [tracePath(traceRef), rehydrationTracePath(traceRef)]) {
-      try {
-        await fs.unlink(filePath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    }
   }
 
   async function expireRow(row: TraceRow, now: Date, signal?: AbortSignal) {
@@ -316,6 +311,7 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
       newlyExpired = true;
     } else if (row.expiresAt.getTime() > now.getTime()) {
       if (row.status !== "deleted" || !providerTraceCleanupRef(row.traceRef)) return null;
+      if (PROVIDER_TRACE_KEEP_FOREVER) return null;
       await removeTraceFiles(row.traceRef, signal);
       const [cleaned] = await db.update(providerTraceRecords).set({ traceRef: EXPIRED_PROVIDER_TRACE_REF, updatedAt: now })
         .where(and(eq(providerTraceRecords.id, row.id), eq(providerTraceRecords.traceRef, row.traceRef))).returning();
@@ -326,7 +322,8 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
     // concurrent readers fail closed. traceRef becomes a durable completion
     // marker only after both raw sidecars are absent; failures are retried by
     // later reads and cleanup passes.
-    if (expired.traceRef !== EXPIRED_PROVIDER_TRACE_REF) {
+    // R-keep-all-traces: an expired trace is only hidden; keep its pointer and bytes.
+    if (!PROVIDER_TRACE_KEEP_FOREVER && expired.traceRef !== EXPIRED_PROVIDER_TRACE_REF) {
       await removeTraceFiles(expired.traceRef, signal);
       await db
         .update(providerTraceRecords)
@@ -362,6 +359,10 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
   }
 
   async function cleanupExpired(now = new Date(), signal?: AbortSignal) {
+    // R-keep-all-traces: no retention sweep. Nothing expires, moves or is deleted.
+    signal?.throwIfAborted();
+    void now;
+    if (PROVIDER_TRACE_KEEP_FOREVER) return [] as TraceRow[];
     const expired = await db
       .select()
       .from(providerTraceRecords)
@@ -628,6 +629,8 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
       });
 
       await removeTraceFiles(row.traceRef);
+      // R-keep-all-traces: keep the object pointer; a removed trace is hidden, never lost.
+      if (PROVIDER_TRACE_KEEP_FOREVER) return (await getByRun(runId, companyId)) ?? null;
       return (await db.update(providerTraceRecords).set({ traceRef: EXPIRED_PROVIDER_TRACE_REF, updatedAt: new Date() })
         .where(and(eq(providerTraceRecords.id, row.id), eq(providerTraceRecords.traceRef, row.traceRef))).returning())[0] ?? null;
     }
@@ -639,6 +642,7 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
   }
 
   async function nextRetentionDeadline() {
+    if (PROVIDER_TRACE_KEEP_FOREVER) return null;
     const [row] = await db.select({ at: providerTraceRecords.expiresAt, deletedAt: providerTraceRecords.deletedAt })
       .from(providerTraceRecords).where(and(ne(providerTraceRecords.traceRef, EXPIRED_PROVIDER_TRACE_REF),
         or(isNull(providerTraceRecords.deletedAt), lte(providerTraceRecords.expiresAt, new Date()),
