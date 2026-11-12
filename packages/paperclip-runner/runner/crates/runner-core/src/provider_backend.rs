@@ -3124,7 +3124,15 @@ impl CodexCommandExecutor {
                                     "code": "provider_turn_lost_on_restore",
                                     "recoverable": true,
                                     "message": "The runner restored the conversation after process loss, but the previous turn is no longer active.",
-                                }) } else { Value::Null },
+                                }) } else if provider_label == "pi_rpc" {
+                                    // Pi has no native session recovery yet: fail the
+                                    // lost turn with a typed, non-recoverable cause.
+                                    json!({
+                                        "code": "provider_turn_lost_on_restore",
+                                        "recoverable": false,
+                                        "message": "The runner lost the Pi process; Pi RPC session recovery is not available, so the turn cannot continue.",
+                                    })
+                                } else { Value::Null },
                             }),
                         };
                         if restart_continuable && !state.active_terminal_tool_rejected {

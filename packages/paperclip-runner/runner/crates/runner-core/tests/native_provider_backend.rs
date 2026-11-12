@@ -2275,7 +2275,9 @@ fn rejects_a_mutable_opencode_command_outside_the_runner_launch_profile() {
 #[test]
 #[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
 fn restart_lost_local_facade_turn_records_a_recoverable_cause() {
-    // Native Pi and OpenCode restart locally with runnerd, unlike Cursor Cloud.
+    // OpenCode restarts locally with runnerd and continues the lost turn. Native
+    // Pi has no session recovery yet (1b' e2ee9d91): its lost turn must fail with
+    // a typed, NON-recoverable cause and must not be continued.
     for provider in ["opencode", "pi_rpc"] {
         let directory = temporary_directory(&format!("{provider}-restart-lost-turn"));
         let mut config = opencode_config(&directory);
@@ -2312,6 +2314,15 @@ fn restart_lost_local_facade_turn_records_a_recoverable_cause() {
         let lost = events.iter().find(|event| event.event_type == "turn.failed")
             .expect("the lost turn is terminated");
         assert_eq!(lost.payload["error"]["code"], "provider_turn_lost_on_restore", "{provider}");
+        if provider == "pi_rpc" {
+            assert_eq!(lost.payload["error"]["recoverable"], false, "a lost Pi turn is not continuable");
+            assert!(events.iter().any(|event| event.event_type == "run.terminal"),
+                "a lost Pi turn ends the run instead of waiting for a continuation");
+            assert_eq!(opencode_call_count(&directory, "turn/start"), 1);
+            restored.shutdown().unwrap();
+            fs::remove_dir_all(directory).unwrap();
+            continue;
+        }
         assert_eq!(lost.payload["error"]["recoverable"], true);
         assert!(!events.iter().any(|event| event.event_type == "run.terminal"));
         assert_eq!(opencode_call_count(&directory, "turn/start"), 1);
