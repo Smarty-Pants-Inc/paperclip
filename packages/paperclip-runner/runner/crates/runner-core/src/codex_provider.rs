@@ -117,6 +117,9 @@ const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_AGENT_KEY_ID",
     "PAPERCLIP_AGENT_PUBLIC_KEY",
     "PAPERCLIP_AGENT_PRIVATE_KEY",
+    "PAPERCLIP_NATIVE_MCP_NAME",
+    "PAPERCLIP_NATIVE_MCP_URL",
+    "PAPERCLIP_NATIVE_MCP_TOKEN",
     "PAPERCLIP_PI_RUNTIME_DIR",
     "PAPERCLIP_PI_THINKING_LEVEL",
     "PAPERCLIP_PI_RPC_CREDENTIAL_MODE",
@@ -6747,6 +6750,27 @@ done
             ]
         );
         assert!(opencode_turn_identity_params(None, None).is_empty());
+    }
+
+    #[test]
+    fn pi_native_mcp_environment_is_bounded_and_keeps_safe_ordering() {
+        let keys = [
+            "PAPERCLIP_NATIVE_MCP_NAME",
+            "PAPERCLIP_NATIVE_MCP_URL",
+            "PAPERCLIP_NATIVE_MCP_TOKEN",
+        ];
+        for key in keys {
+            assert!(PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
+            assert!(OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
+            assert_eq!(PI_RPC_PROVIDER_ENVIRONMENT_KEYS.iter().filter(|candidate| **candidate == key).count(), 1);
+            assert!(!CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
+            assert!(!CODEX_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
+        }
+        let first = PI_RPC_PROVIDER_ENVIRONMENT_KEYS.iter().position(|key| *key == keys[0]).unwrap();
+        assert_eq!(&PI_RPC_PROVIDER_ENVIRONMENT_KEYS[first..first + keys.len()], &keys);
+        for key in ["NODE_OPTIONS", "NODE_PATH", "PAPERCLIP_PI_COMMAND", "PAPERCLIP_NATIVE_MCP_SECRET"] {
+            assert!(!PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
+        }
     }
 
     #[test]
