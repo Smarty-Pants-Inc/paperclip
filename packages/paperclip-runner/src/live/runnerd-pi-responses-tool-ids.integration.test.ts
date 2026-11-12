@@ -126,6 +126,14 @@ async function productionRuntime(root: string) {
   await mkdir(packageRoot);
   await cp(closure.nodeModules, join(packageRoot, "node_modules"), { recursive: true, dereference: true });
   await runtimeReadOnly(packageRoot);
+  const installedSubagents = realpathSync("node_modules/pi-subagents");
+  expect(JSON.parse(readFileSync(join(installedSubagents, "package.json"), "utf8")).version).toBe("0.88.0");
+  const subagentsPackageRoot = join(root, "subagents-package");
+  await mkdir(subagentsPackageRoot);
+  // Retain its own installed closure so dependency versions cannot overwrite Pi's.
+  await cp(dirname(installedSubagents), join(subagentsPackageRoot, "node_modules"), { recursive: true, dereference: true });
+  await runtimeReadOnly(subagentsPackageRoot);
+  const subagentsRoot = join(subagentsPackageRoot, "node_modules", "pi-subagents");
   const executable = join(packageRoot, "node_modules", closure.executableRelative);
   expect(execFileSync(process.execPath, [executable, "--version"], { encoding: "utf8", timeout: 10_000 }).trim()).toBe("1.5.2");
   const proxy = join(root, "dist", "cli", "pi-rpc-app-server-proxy.cjs");
@@ -161,7 +169,7 @@ async function productionRuntime(root: string) {
   const payload = { artifacts: { piChildBridge: { path: "dist/drivers/pi/extension/child-bridge.js", sha256: digest(childBridge) } } };
   await writeFile(join(root, "provider-pack.json"), `${JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1", digest: `sha256:${createHash("sha256").update(JSON.stringify(payload)).digest("hex")}`, payload })}\n`, { mode: 0o444 });
   await writeFile(join(root, "production-bundle-metafiles.json"), `${JSON.stringify({ proxy: artifacts.proxyMetafile, extension: artifacts.extensionMetafile, childBridge: artifacts.childBridgeMetafile }, null, 2)}\n`);
-  return { executable, proxy, extension, childBridge, closure };
+  return { executable, proxy, extension, childBridge, subagentsRoot, closure };
 }
 
 type ModelRequest = { method: string | undefined; url: string | undefined; raw: string; body: Record<string, unknown>; rawSse: string };
@@ -355,11 +363,13 @@ it.skipIf(process.platform !== "linux" || !pi)(`real runnerd/Pi ${modelProtocol}
   };
   await writeFile(join(root, "setup-proof.json"), `${JSON.stringify(proof, null, 2)}\n`);
   const runtime = await productionRuntime(root);
-  Object.assign(proof, { piVersion: "1.5.2", piSha256: digest(runtime.executable), proxySha256: digest(runtime.proxy), extensionSha256: digest(runtime.extension), childBridgeSha256: digest(runtime.childBridge), installedClosure: runtime.closure });
+  Object.assign(proof, { piVersion: "1.5.2", piSha256: digest(runtime.executable), proxySha256: digest(runtime.proxy), extensionSha256: digest(runtime.extension), childBridgeSha256: digest(runtime.childBridge), subagentsVersion: "0.88.0", subagentsManifestSha256: digest(join(runtime.subagentsRoot, "package.json")), installedClosure: runtime.closure });
   expect(proof.piSha256, "exact installed Pi 1.5.2 CLI pin").toBe("sha256:e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774");
   expect(Object.fromEntries(sourcePaths.map(path => [path, digest(path)])), "source frozen during bundle").toEqual(sourceHashes);
   const workspace = join(root, "workspace"), agentDirectory = join(root, "pi-agent");
   await mkdir(workspace); await mkdir(agentDirectory);
+  // The real package owns the liveness/status RPC that sub-wire7's Stop awaits.
+  await writeFile(join(agentDirectory, "settings.json"), `${JSON.stringify({ packages: [runtime.subagentsRoot], cacheWarming: "off" })}\n`, { mode: 0o600 });
   const faux = await fauxResponses(root);
   const environment = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: agentDirectory, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: faux.url,
     PAPERCLIP_AI_PROVIDER_PROTOCOL: modelProtocol, PAPERCLIP_AI_PROVIDER_AUTH: "none", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker" };
