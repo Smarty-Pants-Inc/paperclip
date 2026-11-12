@@ -6,7 +6,7 @@ import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-conte
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
-import { RunAuthority, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
+import { RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
@@ -261,6 +261,8 @@ interface PiRunContext {
   runtimeContext: unknown;
   instructions: string;
   tools: PiDynamicTool[];
+  toolNames: Record<string, string>;
+  diagnostics: Array<{ code: string; message: string }>;
 }
 interface PiResidentState {
   directory: string;
@@ -416,6 +418,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     this.#piMetadata = state.piMetadata;
     this.#emit("session.started", { context: { model: state.config.model, piRpcThinkingLevel: state.config.piRpcThinkingLevel, piMetadata: state.piMetadata } });
+    for (const diagnostic of state.initialContext.diagnostics) this.#emit("harness.diagnostic", diagnostic);
     void this.#pump();
   }
 
@@ -442,8 +445,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (this.#resident) {
         const previous = this.#resident.context;
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
-          input.dynamicTools !== undefined ? input.dynamicTools : previous.tools,
-          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
+          input.dynamicTools,
+          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
         // The proxy sends attach before every turn, including the bootstrap and
         // same-run post-claim admission. Do not consume INITIAL or rotate twice.
         if (this.#resident.binding) {
@@ -455,8 +458,8 @@ export class PiRpcHarnessSession implements HarnessSession {
         // not gain a managed broker secrecy or dynamic-refresh guarantee.
         const previous = this.#initialContext;
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
-          input.dynamicTools !== undefined ? input.dynamicTools : previous.tools,
-          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
+          input.dynamicTools,
+          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
         if (JSON.stringify(context.tools) !== JSON.stringify(previous.tools)) throw new Error("Pi RPC tool refresh requires a provider bind receipt");
         await this.#admit(input.signal);
         await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
@@ -464,6 +467,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         this.#initialContext = context;
       }
       this.#runId = input.runId;
+      for (const diagnostic of (this.#resident?.context ?? this.#initialContext).diagnostics) this.#emit("harness.diagnostic", diagnostic);
     });
   }
 
@@ -581,7 +585,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       try {
         // Host authority is independent from extension authority and activated
         // only by this host prompt, never attach/bind or callback arrival.
-        if (binding) this.#callbacks?.activate(binding.origin);
+        if (binding) this.#callbacks?.activate(binding.origin, this.#resident!.context.toolNames);
         this.#pendingInput++;
         const response = await this.#transport.request("prompt", { message: input.message.text }).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
@@ -993,6 +997,7 @@ class PiHostCallbacks {
   #server?: Awaited<ReturnType<typeof startPiCallbackServer>>;
   readonly #announcements = new Map<string, { origin: Readonly<Origin>; tool: string; arguments: unknown }>();
   readonly #waiters = new Map<string, Set<() => void>>();
+  #toolNames: Record<string, string> = Object.create(null);
   constructor(sessionId: string, handler: PiRpcDriverOptions["dynamicToolHandler"]) { this.#sessionId = sessionId; this.#handler = handler; }
   setNativeSessionId(id: string): void { if (this.#nativeSessionId !== null) throw new Error("Pi callback identity already assigned"); this.#nativeSessionId = id; }
   async listen(socketPath: string, timeoutMs = 5000): Promise<void> {
@@ -1001,14 +1006,14 @@ class PiHostCallbacks {
       handleTool: async (call, signal) => {
         if (!this.#handler || !this.#nativeSessionId || !this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
         const { runId, turnId } = call.origin;
-        const result = await this.#handler({ runId, turnId, threadId: this.#nativeSessionId, tool: call.tool, callId: call.toolCallId, arguments: structuredClone(call.arguments), signal });
+        const result = await this.#handler({ runId, turnId, threadId: this.#nativeSessionId, tool: Object.hasOwn(this.#toolNames, call.tool) ? this.#toolNames[call.tool]! : call.tool, callId: call.toolCallId, arguments: structuredClone(call.arguments), signal });
         signal.throwIfAborted();
         if (!this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
         return normalizePiToolResult(result);
       },
     });
   }
-  activate(origin: Origin): void { this.authority.bind(origin); this.authority.beginTurn(origin); }
+  activate(origin: Origin, toolNames: Record<string, string>): void { this.#toolNames = structuredClone(toolNames); this.authority.bind(origin); this.authority.beginTurn(origin); }
   fence(): void { this.authority.end(); this.#announcements.clear(); for (const set of this.#waiters.values()) for (const wake of set) wake(); }
   pendingCount(): number { return this.#server?.pendingCount() ?? 0; }
   async close(): Promise<void> { this.fence(); await this.#server?.close(); }
@@ -1062,16 +1067,18 @@ function sameJson(a: unknown, b: unknown): boolean {
   try { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); } catch { return false; }
 }
 
-function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[], runtimeContext: unknown): PiRunContext {
-  if (typeof baseInstructions !== "string" || !Array.isArray(tools)) throw new Error("Pi binding context rejected");
+function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[] | undefined, runtimeContext: unknown, previous?: PiRunContext): PiRunContext {
+  if (typeof baseInstructions !== "string" || (tools !== undefined && !Array.isArray(tools))) throw new Error("Pi binding context rejected");
   // Freeze serializable context NOW. Never hash one object then look it up again
   // from a mutable caller when the request is eventually admitted.
   const contextJson = runtimeContext === undefined ? undefined : JSON.stringify(runtimeContext);
   if (runtimeContext !== undefined && contextJson === undefined) throw new Error("Pi runtime context is not serializable");
   const frozenContext: unknown = contextJson === undefined ? undefined : JSON.parse(contextJson);
-  const normalizedTools = JSON.parse(JSON.stringify(tools.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })))) as PiDynamicTool[];
+  const normalized = tools === undefined && previous
+    ? { tools: previous.tools, toolNames: previous.toolNames, diagnostics: previous.diagnostics }
+    : normalizePiDynamicTools(tools ?? []);
   return { baseInstructions, runtimeContext: frozenContext,
-    instructions: contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`, tools: normalizedTools };
+    instructions: contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`, ...normalized };
 }
 
 async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPath" | "directory">): Promise<void> {

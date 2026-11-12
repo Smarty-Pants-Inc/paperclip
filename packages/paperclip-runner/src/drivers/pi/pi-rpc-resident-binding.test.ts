@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { bindContent, sendPiBindRequest, type PiBindCommand } from "./pi-bind-protocol.js";
+import { bindContent, sendPiBindRequest, sendPiToolRequest, validateBindingConfig, type PiBindCommand } from "./pi-bind-protocol.js";
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import { PiRpcTransport, type PiRpcExtensionUiResponseInput, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
@@ -119,6 +119,54 @@ async function revoked(provider: { baseUrl: string; apiKey: string }) {
 }
 
 describe("resident Pi model binding", () => {
+  it("normalizes dynamic tools independently and maps native aliases back to controller names", async () => {
+    const original = { name: "issues.create", description: "Create\n\tissue", inputSchema: { properties: {} } };
+    const handler = vi.fn(async (_call: { tool: string }) => ({ content: [{ type: "text", text: "created" }], details: {} }));
+    const f = await fixture({ dynamicTools: [original, { name: "empty", description: "", inputSchema: { type: "object" } },
+      { name: "long", description: "😀".repeat(3000), inputSchema: { type: "object" } },
+      { name: "bad", description: "bad", inputSchema: null }], dynamicToolHandler: handler });
+    const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    expect(validateBindingConfig(initial)).toBe(true);
+    expect(initial.tools).toHaveLength(3);
+    expect(initial.tools[0]).toMatchObject({ description: "Create issue", inputSchema: { type: "object", properties: {} } });
+    expect(initial.tools[0].name).toMatch(/^[a-zA-Z_][a-zA-Z0-9_-]*$/u);
+    expect(initial.tools[1].description).toBe("empty");
+    expect(Buffer.byteLength(initial.tools[2].description)).toBeLessThanOrEqual(8192);
+    expect(initial.tools[2].description).not.toContain("�");
+    expect(original).toEqual({ name: "issues.create", description: "Create\n\tissue", inputSchema: { properties: {} } });
+    await vi.waitFor(() => expect(f.events.some(event => event.eventType === "harness.diagnostic" && event.payload.code === "pi_dynamic_tool_dropped")).toBe(true));
+    const turn = await f.session.startTurn({ message: { role: "user", text: "create" } });
+    f.transport.send({ type: "agent_start" });
+    f.transport.send({ type: "tool_execution_start", toolCallId: "mapped", toolName: initial.tools[0].name, args: {} });
+    const result = await sendPiToolRequest(initial.toolSocketPath, { schema: 1, type: "tool_call", nonce: "mapped", sessionId: initial.sessionId,
+      origin: { epoch: initial.epoch, runId: initial.runId, turnId: turn.turnId }, toolCallId: "mapped", tool: initial.tools[0].name, arguments: {} });
+    expect(result.content).toEqual([{ type: "text", text: "created" }]);
+    expect(handler.mock.calls[0]?.[0]).toMatchObject({ tool: "issues.create" });
+    f.transport.send({ type: "agent_settled", aborted: true });
+    await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.cancelled")).toBe(true));
+    await f.session.attachRun({ runId: "run-b" });
+    expect(f.ipc.find(command => command.type === "bind")).toMatchObject({ tools: initial.tools });
+  });
+  it("keeps 128 usable tools and diagnoses an oversized catalog instead of rejecting the binding", async () => {
+    const f = await fixture({ dynamicTools: Array.from({ length: 129 }, (_, i) => tool(`tool_${i}`)) });
+    const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    expect(initial.tools).toHaveLength(128);
+    expect(initial.tools.at(-1).name).toBe("tool_127");
+    await vi.waitFor(() => expect(f.events.some(event => event.eventType === "harness.diagnostic" && event.payload.code === "pi_dynamic_tool_limit")).toBe(true));
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+  });
+  it("uses stable distinct aliases independent of catalog order and isolates unserializable schemas", async () => {
+    const circular: Record<string, unknown> = {}; circular.self = circular;
+    const tools = [tool("issues.create"), tool("issues_create"), tool("9/other"), { ...tool("circular"), inputSchema: circular }];
+    const f = await fixture({ dynamicTools: tools });
+    const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    expect(initial.tools).toHaveLength(3);
+    expect(new Set(initial.tools.map((entry: { name: string }) => entry.name)).size).toBe(3);
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.attachRun({ runId: "run-b", dynamicTools: tools.slice(0, 3).reverse() });
+    const bind = f.ipc.find(command => command.type === "bind");
+    expect(bind).toMatchObject({ tools: initial.tools.slice().reverse() });
+  });
   it.each(["xhigh", "max"] as const)("carries only admitted %s metadata through initial bind and resident rebind", async level => {
     const f = await fixture({ piRpcThinkingLevel: level });
     const models = JSON.parse(await readFile(join(f.launch.env!.PI_CODING_AGENT_DIR!, "models.json"), "utf8"));
