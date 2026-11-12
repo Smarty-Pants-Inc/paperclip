@@ -70,7 +70,9 @@ export async function observePiNativeHello(options: PiProbeObservation): Promise
       const current = received.value;
       if (current.runId !== options.runId || current.normalizedSessionId !== options.normalizedSessionId) throw new PiNativeAdmissionError("pi_probe_session_mismatch", "Pi hello probe received a mismatched run/session.");
       if (current.eventType === "session.failed") throw probeFailure(current.payload, "Pi hello probe session failed.");
-      if (current.turnId && current.turnId !== started.turnId) throw new PiNativeAdmissionError("pi_probe_turn_mismatch", "Pi hello probe received a stale or mismatched turn.");
+      // Facade diagnostics may retain the pending command ID rather than the
+      // provider-assigned turn ID. They cannot prove a reply or settlement.
+      if (current.eventType !== "harness.diagnostic" && current.turnId && current.turnId !== started.turnId) throw new PiNativeAdmissionError("pi_probe_turn_mismatch", "Pi hello probe received a stale or mismatched turn.");
       if (current.turnId === started.turnId) {
         if (current.eventType.startsWith("tool.execution.") || (current.eventType.startsWith("item.") && ["tool", "commandExecution", "mcpToolCall"].includes(String(current.payload.kind)))) {
           throw new PiNativeAdmissionError("pi_probe_tool_used", "Pi hello probe unexpectedly used a tool.");
