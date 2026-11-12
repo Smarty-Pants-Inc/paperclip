@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,18 +47,32 @@ async function failureFixture(capture = true) {
 }
 
 describe("PiRpcDriver", () => {
-  it.each(["registered", "unregistered"])("preserves the runner executionRoot independently of the projected instruction root (%s)", async mode => {
+  it.each(["registered", "controller-path", "unregistered", "legacy", "symlink", "overlap"] as const)("binds AGENT_HOME from the authenticated runtime context, never env (%s)", async mode => {
     const root = await mkdtemp(join(tmpdir(), "pi-agent-home-"));
     const home = join(root, "instruction-copy"); await mkdir(home);
+    const runtime = join(root, "sessions"); await mkdir(runtime);
+    const link = join(root, "linked-copy"); if (mode === "symlink") await symlink(home, link);
+    const rootPath = mode === "overlap" ? runtime : mode === "symlink" ? link : home;
     let launched: NodeJS.ProcessEnv | undefined;
     const transport = new FailureTransport();
-    const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piThinkingLevel: "high",
-      environment: { PI_CODING_AGENT_DIR: join(root, "agent"), ...(mode === "registered" ? { AGENT_HOME: home } : {}) },
-      ...(mode === "unregistered" ? {} : { runtimeContext: { instructions: { workingCopy: { rootPath: join(root, "source") } }, skills: [] } }),
+    const opening = new PiRpcDriver({ runtimeDirectory: runtime, model: "neutral/model", piThinkingLevel: "high",
+      environment: { PI_CODING_AGENT_DIR: join(root, "agent"), ...(mode === "registered" ? {} : { AGENT_HOME: "/controller/stale-copy", PAPERCLIP_PI_AGENT_HOME: "/caller/forged-copy" }) },
+      ...(mode === "unregistered" ? {} : { runtimeContext: { instructions: { workingCopy: { ...(mode === "legacy" ? {} : { kind: "agent_files" }), rootPath, entryPath: "AGENTS.md" } }, skills: [] } }),
       transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
     }).openSession({ runId: "home", normalizedSessionId: "home", workingDirectory: root });
-    try { expect(launched?.AGENT_HOME).toBe(mode === "registered" ? home : undefined); }
-    finally { await session.close(); await rm(root, { recursive: true, force: true }); }
+    try {
+      if (mode === "symlink" || mode === "overlap") {
+        await expect(opening).rejects.toThrow(mode === "symlink" ? "real directory" : "overlaps");
+        expect(launched).toBeUndefined();
+      } else {
+        const session = await opening;
+        try {
+          const expected = mode === "registered" || mode === "controller-path" ? home : undefined;
+          expect(launched?.AGENT_HOME).toBe(expected);
+          expect(launched?.PAPERCLIP_PI_AGENT_HOME).toBe(expected);
+        } finally { await session.close(); }
+      }
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("replays >4096 updates, >4MiB cumulative output and a >256KiB terminal through driver/projector/proxy without mutating native final", async () => {
@@ -156,7 +170,8 @@ describe("PiRpcDriver", () => {
       await flushFailure();
       expect(f.events.find(event => event.eventType === "item.completed" && event.payload.output === final)?.payload.output).toBe(final);
     } finally { await f.close(); }
-  });
+  // The >4MiB digest replay also crosses the 5s default on shared gate hosts.
+  }, 20_000);
 
   it("declares the pi_rpc native driver and conservative capabilities", async () => {
     const descriptor = await new PiRpcDriver({ runtimeDirectory: "/tmp/pi-test" }).descriptor();
