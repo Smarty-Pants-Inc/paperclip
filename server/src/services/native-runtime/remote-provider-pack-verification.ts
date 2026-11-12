@@ -155,7 +155,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     args: ["-e", verifyScript, packRoot, expected],
     cwd: cwd,
     bypassSession: true,
-    timeoutMs: 30_000,
+    timeoutMs: 120_000,
   }), "provider pack verification");
   const opencodeCommand = posix.join(
     packRoot,
@@ -166,7 +166,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     args: ["--version"],
     cwd: cwd,
     bypassSession: true,
-    timeoutMs: 30_000,
+    timeoutMs: 120_000,
   }), "OpenCode version verification");
   if (
     opencodeVersion.stdout.trim() !== manifest.payload.pins.opencode

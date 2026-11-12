@@ -260,7 +260,9 @@ describe("native Pi remote provider pack verification", () => {
       const verified = await verifyRemoteProviderPack(fixture.input);
       expect(verified).toEqual(fixture.pack);
       expect(verified).not.toBe(fixture.pack);
-      expect(fixture.execute).toHaveBeenCalledWith(expect.objectContaining({ bypassSession: true, timeoutMs: 30_000 }));
+      expect(fixture.execute).toHaveBeenCalledTimes(2);
+      expect(fixture.execute.mock.calls.map(([request]) => ({ argument: request.args?.[0], bypassSession: request.bypassSession, timeoutMs: request.timeoutMs })))
+        .toEqual([{ argument: "-e", bypassSession: true, timeoutMs: 120_000 }, { argument: "--version", bypassSession: true, timeoutMs: 120_000 }]);
     } finally { await fixture.cleanup(); }
   });
 
