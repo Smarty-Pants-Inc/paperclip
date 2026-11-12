@@ -15,7 +15,7 @@ import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skil
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
-import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
 import type {
   HarnessDriver,
@@ -61,6 +61,8 @@ export interface PiRpcDriverOptions {
   startupTimeoutMs?: number;
   /** Dynamic tools have their own end-to-end deadline (protocol maximum: 60 s). */
   dynamicToolTimeoutMs?: number;
+  /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
+  promptTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
@@ -229,6 +231,7 @@ export class PiRpcDriver implements HarnessDriver {
         instructionFile,
         instructionBoundary,
         admissionTimeoutMs: this.#options.startupTimeoutMs,
+        promptTimeoutMs: this.#options.promptTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
@@ -284,6 +287,7 @@ interface PiSessionState {
   instructionBoundary: string;
   bindRequest: typeof sendPiBindRequest;
   admissionTimeoutMs?: number;
+  promptTimeoutMs?: number;
 }
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
@@ -376,6 +380,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #instructionFile: string;
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
+  readonly #promptTimeoutMs?: number;
   // Values retain the originating turn/projector after settlement and attach.
   // Ambiguous reused native identities are tombstoned, never rebound.
   readonly #owners = new Map<string, PiTurnState | null>();
@@ -407,6 +412,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#instructionFile = state.instructionFile;
     this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
+    this.#promptTimeoutMs = state.promptTimeoutMs;
     void this.#pump();
   }
 
@@ -560,16 +566,45 @@ export class PiRpcHarnessSession implements HarnessSession {
         // only by this host prompt, never attach/bind or callback arrival.
         if (binding) this.#callbacks?.activate(binding.origin);
         this.#pendingInput++;
-        const response = await this.#transport.request("prompt", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+        const response = await this.#transport.request("prompt", { message: input.message.text }, { timeoutMs: this.#promptTimeoutMs }).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
         if (disposition !== "started") throw new Error(`Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
       } catch (error) {
+        if (error instanceof PiRpcRequestTimeoutError && error.command === "prompt") {
+          // A lost ACK is not a rejection. Keep the sole input owner while
+          // inspecting Pi; never submit the prompt a second time.
+          if (await this.#reconcilePrompt(turn)) return { turnId: turn.turnId };
+          this.#callbacks?.fence();
+          this.#admitted = false;
+          const failure = new Error(error.message, { cause: error });
+          const detail = { code: "pi_prompt_deadline_exceeded", message: failure.message, acceptance: "unknown", recoverable: false };
+          try { await this.#finishTurn(turn, "failed", { error: detail }); }
+          finally { await this.#fenceFailure(failure); }
+          throw failure;
+        }
         await this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } });
         if (this.#resident) await this.#fenceFailure(error);
         throw error;
       }
       return { turnId: turn.turnId };
     });
+  }
+
+  async #reconcilePrompt(turn: PiTurnState): Promise<boolean> {
+    // Fast completion can precede both the ACK and its deadline. The captured
+    // terminal already proves this input was consumed, even if Pi is now idle.
+    if (turn.settled) return !this.#closed && !this.#failure;
+    try {
+      const response = await this.#transport.request("get_state", {}, {
+        timeoutMs: Math.min(this.#admissionTimeoutMs ?? 5000, this.#promptTimeoutMs ?? 30_000),
+      });
+      const state = record(response.data);
+      if (this.#closed || this.#failure) return false;
+      return turn.settled || (this.#activeTurn === turn && this.#agentTurn === turn
+        && state.sessionId === this.#providerSessionId && state.isStreaming === true);
+    } catch {
+      return turn.settled && !this.#closed && !this.#failure;
+    }
   }
 
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
