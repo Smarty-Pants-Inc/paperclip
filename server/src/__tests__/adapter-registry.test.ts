@@ -20,6 +20,11 @@ import {
   hasActiveAdapterOverride,
 } from "../adapters/registry.js";
 
+const openCodeProbe = vi.hoisted(() => vi.fn(async () => ({ adapterType: "opencode_local", status: "pass", testedAt: "", checks: [] })));
+vi.mock("@paperclipai/adapter-opencode-local/server", async importOriginal => ({
+  ...await importOriginal<typeof import("@paperclipai/adapter-opencode-local/server")>(),
+  testEnvironment: openCodeProbe,
+}));
 const nativeSetup = vi.hoisted(() => ({ authenticate: vi.fn() }));
 vi.mock("../services/native-runtime/setup-readiness.js", () => ({
   testNativeRunnerAuthentication: nativeSetup.authenticate,
@@ -284,6 +289,27 @@ describe("server adapter registry", () => {
     const result = await requireServerAdapter("paperclip_runner").testEnvironment(context);
     expect(result.status).toBe(status);
     expect(nativeSetup.authenticate).toHaveBeenCalledWith(context, "codex", "gpt-5.6-sol");
+  });
+
+  it.each(["local", "ssh"] as const)("fails closed for unmanaged native Pi setup on %s instead of probing OpenCode", async target => {
+    openCodeProbe.mockClear();
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment({
+      companyId: "company-1", adapterType: "paperclip_runner",
+      config: { provider: "pi_rpc", model: "anthropic/claude-opus-5-5", piRpcThinkingLevel: "xhigh" },
+      executionTarget: target === "local" ? { kind: "local" } : {
+        kind: "remote", transport: "ssh", remoteCwd: "/workspace",
+        spec: { host: "unused.invalid", port: 22, username: "test" },
+      },
+    });
+    expect(result).toMatchObject({ adapterType: "paperclip_runner", status: "fail", checks: [{
+      code: "pi_rpc_environment_test_unavailable", level: "error", message: expect.stringMatching(/Native Pi.*managed.*connection/i),
+    }] });
+    expect(openCodeProbe).not.toHaveBeenCalled();
+  });
+
+  it("exposes native Pi in the Runner provider configuration options", () => {
+    const provider = requireServerAdapter("paperclip_runner").getConfigSchema!().fields.find(field => field.key === "provider");
+    expect(provider?.options).toContainEqual({ value: "pi_rpc", label: "Pi" });
   });
 
   it("identifies only active external overrides for automatic runner selection", () => {

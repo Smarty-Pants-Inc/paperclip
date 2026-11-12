@@ -603,6 +603,11 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       const { testNativeRunnerAuthentication } = await import("../services/native-runtime/setup-readiness.js");
       return testNativeRunnerAuthentication(context, "codex", profile.model);
     }
+    if (profile.provider === "pi_rpc") return {
+      adapterType: "paperclip_runner", status: "fail" as const, testedAt: new Date().toISOString(),
+      checks: [{ code: "pi_rpc_environment_test_unavailable", level: "error" as const,
+        message: "Native Pi environment testing requires a managed AI connection and a supported remote command factory; no hello probe was run." }],
+    };
     const result = await openCodeTestEnvironment(context);
     return { ...result, adapterType: "paperclip_runner" };
   },
@@ -656,6 +661,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
         options: [
           { value: "codex", label: "Codex" },
           { value: "opencode", label: `OpenCode ${QUALIFIED_OPENCODE_RUNNER_VERSION}` },
+          { value: "pi_rpc", label: "Pi" },
           { value: "claude_managed", label: "Claude Managed" },
           { value: "aws_agentcore", label: "AWS AgentCore" },
           { value: "acpx", label: "ACP agents" },
