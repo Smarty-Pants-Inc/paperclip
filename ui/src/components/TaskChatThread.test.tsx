@@ -24,6 +24,7 @@ import type {
 } from "@paperclipai/shared";
 import { heartbeatsApi } from "@/api/heartbeats";
 import { nativeRunEventsToTranscript } from "./transcript/native-run-events";
+import * as nativeTranscriptTransport from "./transcript/useNativeRunTranscripts";
 import { genericPendingRequestConfirmationInteraction, pendingConnectionIntentInteraction } from "@/fixtures/issueThreadInteractionFixtures";
 import { TaskChatScrollNavigation, useTaskChatScrollNavigation } from "./task-chat/scroll-navigation";
 import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
@@ -1576,6 +1577,72 @@ describe("TaskChatThread draft pass-through", () => {
 });
 
 describe("TaskChatThread runtime transcript selection", () => {
+  // Keep: real production catch, Agent Chat work disappearing after reload (2026-11-12).
+  it("rebuilds Agent Chat tool activity after a cold remount with compact message history", () => {
+    const run = nativeRunningRun();
+    const event = (seq: number, eventType: string, payload: Record<string, unknown>): HeartbeatRunEvent => ({
+      id: seq, runId: run.id, companyId: "company", agentId: run.agentId, seq,
+      eventType, stream: "system", level: "info", color: null, message: null,
+      createdAt: new Date(`2026-08-25T18:00:0${seq}.000Z`),
+      payload: { prpEvent: {
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: run.id,
+        eventType, itemId: seq < 3 ? "read-reload" : "reply-reload",
+        sourceEventId: `reload-${seq}`, emittedAt: `2026-08-25T18:00:0${seq}.000Z`, payload,
+      } },
+    });
+    const persistedEvents = [
+      event(1, "item.started", { kind: "dynamicToolCall", item: {
+        id: "read-reload", type: "tool_use", name: "read_file", input: { path: "reload-proof.txt" },
+      } }),
+      event(2, "item.completed", { kind: "dynamicToolCall", item: {
+        id: "read-reload", tool_use_id: "read-reload", type: "tool_result", result: "Read complete",
+      } }),
+      event(3, "item.completed", { kind: "agentMessage", channel: "final", text: "Final reload answer" }),
+    ];
+    const conversationEvents = persistedEvents.slice(2);
+    // Model the API contract: the live stream contains tools; the compact
+    // historical endpoint contains only the answer. Use the real projector
+    // and renderer, not a pre-filled transcript that masks source selection.
+    const transport = vi.spyOn(nativeTranscriptTransport, "useNativeRunTranscripts")
+      .mockImplementation((runs) => ({
+        transcriptByRun: new Map(runs.map(source => [source.id, nativeRunEventsToTranscript(
+          source.status === "running" || !source.conversationOnly ? persistedEvents : conversationEvents,
+        )])),
+        errorsByRun: new Map(), hydratedRunIds: new Set(runs.map(source => source.id)),
+        terminalHydratedRunIds: new Set(runs.filter(source => source.status === "succeeded").map(source => source.id)),
+        isInitialHydrating: false, retry: () => {},
+      }));
+    const props = {
+      issueId: "reload-chat", companyId: "company", compactHistory: true,
+      conversationMode: true, comments: [], onAdd: async () => {},
+    };
+    const revealActivity = () => {
+      const toggle = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-activity-phase-toggle"]');
+      expect(toggle).not.toBeNull();
+      if (toggle!.getAttribute("aria-expanded") !== "true") flushSync(() => toggle!.click());
+      expect(container.textContent).toContain("reload-proof.txt");
+    };
+    render(<TaskChatThread key="live" {...props} activeRun={run} />);
+    revealActivity();
+    // New component key and an empty query cache: no live transcript survives.
+    queryClient.clear();
+    render(<TaskChatThread key="cold-open" {...props} linkedRuns={[{
+      ...run, runId: run.id, status: "succeeded", finishedAt: "2026-08-25T18:00:04.000Z",
+    }]} />);
+    expect(transport.mock.calls.at(-1)?.[0]).toMatchObject([{ id: run.id, conversationOnly: false }]);
+    revealActivity();
+    expect(container.textContent?.split("Final reload answer")).toHaveLength(2);
+  });
+
+  it("keeps ordinary task previews on the compact conversation endpoint", () => {
+    renderThread({
+      issueId: "task-preview", compactHistory: true, conversationMode: false,
+      comments: [], onAdd: async () => {},
+      linkedRuns: [{ ...nativeRunningRun(), runId: "native-run", status: "succeeded" }],
+    });
+    expect(transcriptHookRuns.native.at(-1)).toMatchObject([{ id: "native-run", conversationOnly: true }]);
+  });
+
   it.each(["queued", "running"])("retains the live log transport for a %s native run with event history", (status) => {
     nativeTranscriptState.hydratedRunIds = new Set(["native-run"]);
     nativeTranscriptState.transcriptByRun.set("native-run", [

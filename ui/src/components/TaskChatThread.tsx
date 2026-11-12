@@ -1055,9 +1055,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const nativeRuns = useMemo(
     () => transcriptRuns.filter((run) => run.runtimeMode === "native").map((run) => ({
       ...run,
-      conversationOnly: Boolean(props.compactHistory && (!run.createdAt || new Date(run.createdAt).getTime() <= openedAt)),
+      // Agent Chat paginates messages, not the work inside each retained turn.
+      // The conversation-only endpoint deliberately omits ordinary tool events.
+      conversationOnly: Boolean(props.compactHistory && !conversationMode && (!run.createdAt || new Date(run.createdAt).getTime() <= openedAt)),
     })),
-    [transcriptRuns, props.compactHistory, openedAt],
+    [transcriptRuns, props.compactHistory, conversationMode, openedAt],
   );
   const {
     transcriptByRun: nativeTranscriptByRun,
