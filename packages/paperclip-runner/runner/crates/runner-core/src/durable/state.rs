@@ -1223,7 +1223,7 @@ impl DurableStateStore {
                     DurableRunnerError::invalid(format!("failed to commit durable state: {error}"))
                 })?;
             drop(file);
-            fs::rename(&temporary, &self.path).map_err(|error| {
+            replace_file_from_temporary(&temporary, &self.path).map_err(|error| {
                 DurableRunnerError::invalid(format!(
                     "failed to atomically replace durable state: {error}"
                 ))
@@ -1565,6 +1565,40 @@ const fn no_follow_flag() -> i32 {
 ))]
 const fn no_follow_flag() -> i32 {
     0
+}
+
+/// Replace `path` with the fully written and synced `temporary` beside it.
+/// A rename is atomic. Some sandbox filesystems (Boat's lazily restored
+/// workspace mount) refuse a rename onto a file that hasn't been materialized
+/// yet with EXDEV ("Invalid cross-device link") even inside one directory;
+/// then copy the synced bytes over the destination in place and sync it, so
+/// runnerd keeps working instead of exiting mid-turn. Any other error stays
+/// an error.
+pub(crate) fn replace_file_from_temporary(temporary: &Path, path: &Path) -> io::Result<()> {
+    replace_file_with(temporary, path, |from, to| fs::rename(from, to))
+}
+
+pub(crate) fn replace_file_with(
+    temporary: &Path,
+    path: &Path,
+    rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
+    match rename(temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(18) => {
+            let bytes = fs::read(temporary)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600).custom_flags(no_follow_flag());
+            let mut file = options.open(path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::remove_file(temporary)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn create_private_temporary_file(
@@ -4706,4 +4740,33 @@ mod tests {
     }
 
     include!("tests/redaction_display_bounds.rs");
+}
+
+#[cfg(test)]
+mod replace_file_tests {
+    use super::*;
+
+    #[test]
+    fn exdev_rename_falls_back_to_an_in_place_synced_copy() {
+        let directory = std::env::temp_dir().join(format!("replace-exdev-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+        let temporary = directory.join(".state.json.tmp");
+        fs::write(&path, b"old").unwrap();
+        fs::write(&temporary, b"new").unwrap();
+        replace_file_with(&temporary, &path, |_, _| {
+            Err(io::Error::from_raw_os_error(18))
+        })
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(!temporary.exists());
+        fs::write(&temporary, b"newer").unwrap();
+        let error = replace_file_with(&temporary, &path, |_, _| {
+            Err(io::Error::from_raw_os_error(13))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(13));
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        fs::remove_dir_all(&directory).unwrap();
+    }
 }
