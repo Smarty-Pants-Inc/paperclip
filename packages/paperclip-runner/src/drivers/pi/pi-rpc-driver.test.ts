@@ -212,10 +212,14 @@ describe("PiRpcDriver", () => {
     const transport = new FailureTransport();
     try {
       const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piRpcThinkingLevel: "high",
-        environment: { ...environment, PI_CODING_AGENT_DIR: join(root, "agent") },
+        environment: { ...environment, PI_CODING_AGENT_DIR: join(root, "agent"), NODE_COMPILE_CACHE: "/tmp/node-compile-cache", NODE_DISABLE_COMPILE_CACHE: "0" },
         transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
       }).openSession({ runId: "home", normalizedSessionId: "home", workingDirectory: root });
-      try { expect(launched?.AGENT_HOME).toBeUndefined(); } finally { await session.close(); }
+      try {
+        expect(launched?.AGENT_HOME).toBeUndefined();
+        expect(launched?.NODE_COMPILE_CACHE).toBe(join(root, "sessions/node-compile-cache"));
+        expect(launched?.NODE_DISABLE_COMPILE_CACHE).toBeUndefined();
+      } finally { await session.close(); }
     } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
   });
 });

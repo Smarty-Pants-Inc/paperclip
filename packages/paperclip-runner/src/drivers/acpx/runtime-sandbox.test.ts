@@ -273,6 +273,10 @@ describe("ACPX runtime sandbox", () => {
       expect(sandbox.launchEnvironment.XDG_CACHE_HOME).toBe(
         sandbox.cacheDirectory,
       );
+      expect(sandbox.launchEnvironment).toMatchObject({
+        NODE_COMPILE_CACHE: join(sandbox.cacheDirectory, "node-compile-cache"),
+        NODE_DISABLE_COMPILE_CACHE: "1",
+      });
       expect(Object.isFrozen(sandbox.launchEnvironment)).toBe(true);
       expect(sandbox.persistedEnvironment[credentialName]).toBeUndefined();
       expect(sandbox.persistedEnvironment.HTTPS_PROXY).toBeUndefined();

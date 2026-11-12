@@ -1,6 +1,7 @@
 import { safeErrorCauseCode } from "./safe-error-cause.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../drivers/agent-observability.js";
 import { configuredEnvironment } from "../configured-environment.js";
+import { nodeCompileCacheEnvironment } from "../node-compile-cache-environment.js";
 import { spawn } from "node:child_process";
 import {
   createCipheriv,
@@ -4901,7 +4902,10 @@ export function spawnRunner(options: {
   }
 
   const command = options.runnerBinaryPath ?? runnerBinary;
-  const environment = runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment);
+  const environment = {
+    ...runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment),
+    ...nodeCompileCacheEnvironment(options.stateDirectory),
+  };
   // Only the explicitly prepared native Pi launch may carry this run's executionRoot.
   if (options.piLaunchProfile && options.environment?.AGENT_HOME !== undefined) environment.AGENT_HOME = options.environment.AGENT_HOME;
   const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => handle.restart === null ? handle : ({

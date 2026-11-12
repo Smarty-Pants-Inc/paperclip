@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
+import { nodeCompileCacheEnvironment } from "../../node-compile-cache-environment.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -135,7 +136,7 @@ export class PiRpcDriver implements HarnessDriver {
     const sessionFile = join(directory, filename);
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
-    const environment = { ...(this.#options.environment ?? {}) };
+    const environment = { ...(this.#options.environment ?? {}), ...nodeCompileCacheEnvironment(directory, { enableLocalCache: true }) };
     // Capture the runner's original Pi home before selecting the managed home.
     const originalModelsFile = originalPiModelsFile({ ...process.env, ...environment, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR });
     // Environment paths may still name a controller-side copy. Only the

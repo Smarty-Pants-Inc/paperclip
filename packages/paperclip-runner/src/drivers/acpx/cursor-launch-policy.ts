@@ -2,6 +2,7 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import { QUALIFIED_ACPX_PROFILES } from "./qualified-profiles.js";
+import { nodeCompileCacheEnvironment } from "../../node-compile-cache-environment.js";
 
 export const CURSOR_PINNED_VERSION = QUALIFIED_ACPX_PROFILES.cursor.agentServerVersion;
 export const CURSOR_FIXED_ARGUMENTS = ["--disable-project-configs", "--disable-auto-update", "acp"] as const;
@@ -12,7 +13,7 @@ export function cursorPrivateEnvironment(paths: { agentHomeDirectory: string; da
   return {
     CURSOR_CONFIG_DIR: paths.agentHomeDirectory,
     CURSOR_DATA_DIR: paths.dataDirectory,
-    NODE_COMPILE_CACHE: join(paths.cacheDirectory, "cursor-compile-cache"),
+    ...nodeCompileCacheEnvironment(paths.cacheDirectory),
     AGENT_CLI_CREDENTIAL_STORE: "memory",
     NO_OPEN_BROWSER: "1",
   };
