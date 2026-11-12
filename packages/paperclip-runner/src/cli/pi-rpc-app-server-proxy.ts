@@ -140,6 +140,7 @@ function requestIdentity(value: unknown): string {
 
 const PI_TOOL_ALIAS_PREFIX = "pi_tool_";
 
+// Lookup: take nativeToolCallId from Pi's kept session trace and recompute its SHA alias with the original run/native-session inputs.
 function controllerToolCallId(callId: string | number, runId: string, nativeSessionId: string): string | number {
   // Preserve existing malformed/non-string refusal at its owning boundary.
   if (typeof callId !== "string" || !callId) return callId;
