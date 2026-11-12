@@ -164,12 +164,13 @@ describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
       await session?.close();
       expect(session?.processExited()).toBe(true);
       if (provider) {
-        const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+        // After close the session capability is refused: the loopback listener is gone.
+        const refused = await fetch(`${provider.baseUrl}/chat/completions`, {
           method: "POST",
           headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
           body: JSON.stringify({ model: "faux", messages: [] }),
-        });
-        expect(response.status).toBe(401);
+        }).then(response => response.status === 401, () => true);
+        expect(refused).toBe(true);
       }
       await rm(root, { recursive: true, force: true });
     }
