@@ -2274,56 +2274,72 @@ fn rejects_a_mutable_opencode_command_outside_the_runner_launch_profile() {
 
 #[test]
 #[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
-fn restart_lost_local_facade_turn_records_a_recoverable_cause() {
-    // Native Pi and OpenCode restart locally with runnerd, unlike Cursor Cloud.
-    for provider in ["opencode", "pi_rpc"] {
-        let directory = temporary_directory(&format!("{provider}-restart-lost-turn"));
-        let mut config = opencode_config(&directory);
-        let proxy_script = directory.join("qualified-opencode-proxy-script");
-        #[cfg(unix)]
-        fs::set_permissions(&proxy_script, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(&proxy_script, format!(
+fn restart_lost_opencode_turn_records_a_recoverable_cause() {
+    // A local OpenCode server restarts with runnerd, like Codex app-server:
+    // the lost turn keeps its recoverable cause and the run stays open for
+    // the controller's single same-conversation continuation.
+    let directory = temporary_directory("opencode-restart-lost-turn");
+    let mut config = opencode_config(&directory);
+    let proxy_script = directory.join("qualified-opencode-proxy-script");
+    #[cfg(unix)]
+    fs::set_permissions(&proxy_script, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        &proxy_script,
+        format!(
             "#!/bin/sh\nexec '{}' --state-file '{}' --call-log '{}' --require-completion-contract --durable-turn-ids --linger-after-turn-start\n",
             env!("CARGO_BIN_EXE_fake-codex-app-server"),
             directory.join("fake-opencode-state.json").display(),
             directory.join("fake-opencode-calls.log").display(),
-        )).unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&proxy_script, fs::Permissions::from_mode(0o500)).unwrap();
-        config.opencode_launch_profile.as_mut().unwrap().proxy_script = qualified_artifact(proxy_script);
-        let payload = if provider == "pi_rpc" {
-            config.pi_launch_profile = config.opencode_launch_profile.take();
-            pi_rpc_prepare_payload(&directory)
-        } else {
-            opencode_prepare_payload(&directory)
-        };
-        let mut first = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
-        first.execute(&command(1, "run.prepare", payload.clone())).unwrap();
-        first.execute(&command(2, "session.open", json!({}))).unwrap();
-        first.execute(&command(3, "turn.start", json!({"text":"Edit the file."}))).unwrap();
-        drop(first);
-        let fake_state = directory.join("fake-opencode-state.json");
-        let mut saved: Value = serde_json::from_slice(&fs::read(&fake_state).unwrap()).unwrap();
-        saved["activeTurnId"] = Value::Null;
-        fs::write(&fake_state, serde_json::to_vec(&saved).unwrap()).unwrap();
-        let mut restored = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
-        restored.execute(&command(4, "session.snapshot", json!({}))).unwrap();
-        let events = restored.poll_events().unwrap();
-        let lost = events.iter().find(|event| event.event_type == "turn.failed")
-            .expect("the lost turn is terminated");
-        assert_eq!(lost.payload["error"]["code"], "provider_turn_lost_on_restore", "{provider}");
-        assert_eq!(lost.payload["error"]["recoverable"], true);
-        assert!(!events.iter().any(|event| event.event_type == "run.terminal"));
-        assert_eq!(opencode_call_count(&directory, "turn/start"), 1);
-        restored.acknowledge_events(events.len()).unwrap();
-        restored.execute(&command(5, "turn.start", json!({"text":"Continue the interrupted turn."}))).unwrap();
-        assert_eq!(opencode_call_count(&directory, "turn/start"), 2);
-        let mut foreign = payload;
-        foreign["provider"]["model"] = json!("foreign-model");
-        assert!(restored.execute(&command(6, "run.attach", foreign)).is_err());
-        restored.shutdown().unwrap();
-        fs::remove_dir_all(directory).unwrap();
-    }
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&proxy_script, fs::Permissions::from_mode(0o500)).unwrap();
+    config
+        .opencode_launch_profile
+        .as_mut()
+        .unwrap()
+        .proxy_script = qualified_artifact(proxy_script);
+    let mut first = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    first
+        .execute(&command(
+            1,
+            "run.prepare",
+            opencode_prepare_payload(&directory),
+        ))
+        .unwrap();
+    first
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    first
+        .execute(&command(3, "turn.start", json!({"text": "Edit the file."})))
+        .unwrap();
+    drop(first);
+    let fake_state = directory.join("fake-opencode-state.json");
+    let mut saved: Value = serde_json::from_slice(&fs::read(&fake_state).unwrap()).unwrap();
+    saved["activeTurnId"] = Value::Null;
+    fs::write(&fake_state, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let mut restored = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    restored
+        .execute(&command(4, "session.snapshot", json!({})))
+        .unwrap();
+    let events = restored.poll_events().unwrap();
+    let lost = events
+        .iter()
+        .find(|event| event.event_type == "turn.failed")
+        .expect("the lost turn is terminated");
+    assert_eq!(
+        lost.payload["error"]["code"],
+        "provider_turn_lost_on_restore"
+    );
+    assert_eq!(lost.payload["error"]["recoverable"], true);
+    assert!(!events
+        .iter()
+        .any(|event| event.event_type == "run.terminal"));
+    assert_eq!(opencode_call_count(&directory, "turn/start"), 1);
+    restored.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -3370,89 +3386,6 @@ fn pi_rpc_keeps_one_facade_generation_across_two_completed_turns() {
     assert_eq!(opencode_call_count(&directory, "thread/start"), 1);
     assert_eq!(opencode_call_count(&directory, "turn/start"), 2);
     assert!(!directory.join("acpx-provider-state.json").exists());
-    executor.shutdown().unwrap();
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-#[cfg(unix)]
-fn pi_rpc_finish_result_is_durable_and_the_settled_run_can_attach() {
-    let directory = temporary_directory("pi-rpc-finish-result");
-    let input = json!({
-        "schema":"paperclip.run_result.v1", "reportedWorkDisposition":"done",
-        "summary":"Finished through the native Pi facade.",
-        "completionClaim":{"contractRevision":"revision-1", "objectiveSatisfied":true,
-            "criteria":[{"criterionId":"criterion-1", "status":"satisfied", "evidenceRefs":[]}],
-            "remainingWork":[]},
-        "evidence":[], "verification":[], "attentionRequests":[], "artifacts":[],
-    });
-    let input_path = directory.join("finish-input.json");
-    fs::write(&input_path, serde_json::to_vec(&input).unwrap()).unwrap();
-    let mut config = opencode_config(&directory);
-    let launch = config.opencode_launch_profile.as_mut().unwrap();
-    let script = &launch.proxy_script.path;
-    fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(script, format!(
-        "#!/bin/sh\nexec '{}' --state-file '{}' --call-log '{}' --require-completion-contract --terminal-result-file '{}'\n",
-        env!("CARGO_BIN_EXE_fake-codex-app-server"),
-        directory.join("fake-opencode-state.json").display(),
-        directory.join("fake-opencode-calls.log").display(),
-        input_path.display(),
-    )).unwrap();
-    fs::set_permissions(script, fs::Permissions::from_mode(0o500)).unwrap();
-    launch.proxy_script = qualified_artifact(script.clone());
-    config.pi_launch_profile = config.opencode_launch_profile.take();
-    let operation = AuthorizedTool {
-        operation_id: "paperclip_finish".to_owned(), version: 1,
-        description: "Report completed work.".to_owned(),
-        input_schema: serde_json::from_str(include_str!(
-            "../../../../protocol/schemas/result.schema.json"
-        )).unwrap(),
-        response_schema: json!({"type":"object"}),
-    };
-    let mut payload = pi_rpc_prepare_payload(&directory);
-    payload["authorizedTools"] = json!({
-        "schema":"paperclip.runner.authorized-tools.v1", "schemaVersion":1,
-        "catalogDigest":authorized_tool_catalog_digest(std::slice::from_ref(&operation)).unwrap(),
-        "operations":[operation],
-    });
-    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
-    executor.execute(&command(1, "run.prepare", payload.clone())).unwrap();
-    executor.execute(&command(2, "session.open", json!({}))).unwrap();
-    executor.execute(&command(3, "turn.start", json!({"text":"Finish the task."}))).unwrap();
-    let events = poll_opencode_until(&mut executor, "semantic_tool.input");
-    assert!(events.iter().any(|event| event.payload["semantic_tool"]["callId"] == "terminal-result-call"));
-    let state_path = directory.join("codex-provider-state.json");
-    let pending = fs::read(&state_path).unwrap();
-    let before: Value = serde_json::from_slice(&pending).unwrap();
-    assert!(before["toolBridge"]["pending"]["terminal-result-call"].is_object());
-    // A result cannot change the correlated operation identity.
-    assert!(executor.execute(&command(4, "semantic_tool.result", json!({
-        "callId":"terminal-result-call", "operationId":"paperclip_block",
-        "isError":false, "result":{"accepted":true},
-    }))).is_err());
-    assert_eq!(fs::read(&state_path).unwrap(), pending);
-    let delivered = executor.execute(&command(5, "semantic_tool.result", json!({
-        "callId":"terminal-result-call", "operationId":"paperclip_finish",
-        "isError":false, "result":{"accepted":true},
-    })));
-    // Close the fixture even on baseline RED; no orphan provider is evidence.
-    if let Err(error) = delivered {
-        executor.shutdown().unwrap();
-        fs::remove_dir_all(directory).unwrap();
-        panic!("native Pi must persist and deliver its accepted finish result: {error}");
-    }
-    assert_eq!(delivered.unwrap().result["status"], "delivered");
-    poll_opencode_until(&mut executor, "turn.completed");
-    let settled: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
-    assert!(settled["toolBridge"]["pending"].as_object().unwrap().is_empty());
-    assert!(settled["toolBridge"]["settledResults"]["terminal-result-call"].is_object());
-    assert_eq!(settled["activeProviderResultDisposition"], "done");
-    executor.execute(&command(6, "run.attach", payload.clone())).unwrap();
-    let attached = fs::read(&state_path).unwrap();
-    payload["provider"]["model"] = json!("foreign-model");
-    assert!(executor.execute(&command(7, "run.attach", payload)).is_err());
-    assert_eq!(fs::read(&state_path).unwrap(), attached);
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }

@@ -1274,17 +1274,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             }
             "initialized" => {}
-            "session.revalidate" | "run.attach" => {
-                if !message.pointer("/params/baseInstructions").is_some_and(Value::is_string) {
-                    return Err("Pi facade admission omitted baseInstructions".into());
-                }
-                send(json!({"id":id,"result":true}))?;
-            }
-            "paperclip/host_park_ready" => {
-                let ready = state.active_turn_id.is_none();
-                send(json!({"id":id,"result":{"ready":ready,
-                    "reasons":if ready { json!([]) } else { json!(["active_turn"]) }}}))?;
-            }
             "paperclip/ackTerminal" => {
                 let path = argument(&args, "--cursor-cloud-terminal-file")
                     .ok_or("terminal fixture missing")?;
