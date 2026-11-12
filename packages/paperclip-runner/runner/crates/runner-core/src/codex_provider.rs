@@ -610,7 +610,10 @@ pub(crate) fn pi_local_image_input(
     paths
         .iter()
         .map(|path| {
-            if path.is_empty() || path.len() > 4096 || path.bytes().any(|byte| byte.is_ascii_control()) {
+            if path.is_empty()
+                || path.len() > 4096
+                || path.bytes().any(|byte| byte.is_ascii_control())
+            {
                 return Err(LocalRunnerError::invalid(
                     "local image requires a valid Runner path",
                 ));
@@ -6811,7 +6814,10 @@ done
     fn pi_local_images_reject_other_providers_and_invalid_runner_paths() {
         assert!(pi_local_image_input("pi_rpc", &["/runner/screenshot.png".to_owned()]).is_ok());
         assert!(pi_local_image_input("codex", &["/runner/screenshot.png".to_owned()]).is_err());
-        assert!(pi_local_image_input("pi_rpc", &[".paperclip/attachments/staged.png".to_owned()]).is_ok());
+        assert!(
+            pi_local_image_input("pi_rpc", &[".paperclip/attachments/staged.png".to_owned()])
+                .is_ok()
+        );
         assert!(pi_local_image_input("pi_rpc", &["".to_owned()]).is_err());
         assert!(pi_local_image_input("pi_rpc", &["/runner/invalid\0.png".to_owned()]).is_err());
         assert!(pi_local_image_input("pi_rpc", &vec!["/runner/a.png".to_owned(); 129]).is_err());
