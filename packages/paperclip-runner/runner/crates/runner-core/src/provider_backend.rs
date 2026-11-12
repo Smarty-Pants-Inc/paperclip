@@ -465,12 +465,12 @@ fn semantic_result_event(
     }
 }
 
-/// Local Codex app-server and OpenCode server restart their own process and
+/// Local Codex, OpenCode and Pi RPC restart their own process and
 /// restore the same conversation after runner loss, so a turn that vanished
 /// meanwhile is a restart interruption the controller may continue once. A
 /// Cursor Cloud agent runs remotely; its lost turn is not a process restart.
 fn restart_lost_turn_is_continuable(provider: &str) -> bool {
-    matches!(provider, "codex" | "opencode")
+    matches!(provider, "codex" | "opencode" | "pi_rpc")
 }
 
 /// True only when signal 0 reports that no such process (or process group)
@@ -1727,7 +1727,7 @@ impl CodexProviderState {
                     !matches!(disposition, "done" | "blocked" | "needs_review" | "yielded")
                         || !matches!(
                             self.config.provider.as_str(),
-                            "codex" | "opencode" | "cursor_cloud"
+                            "codex" | "opencode" | "cursor_cloud" | "pi_rpc"
                         )
                 })
             || (matches!(
@@ -6218,6 +6218,10 @@ mod tests {
     fn restart_lost_turns_continue_only_for_locally_restored_providers() {
         assert!(super::restart_lost_turn_is_continuable("codex"));
         assert!(super::restart_lost_turn_is_continuable("opencode"));
+        assert!(super::restart_lost_turn_is_continuable("pi_rpc"));
+        for provider in ["acpx", "claude_managed", "unknown"] {
+            assert!(!super::restart_lost_turn_is_continuable(provider));
+        }
         assert!(!super::restart_lost_turn_is_continuable("cursor_cloud"));
     }
 
@@ -8248,6 +8252,26 @@ done
         assert_eq!(terminal[0].payload["turnTerminalState"], "completed");
         assert_eq!(terminal[0].payload["reportedWorkDisposition"], "done");
         assert!(state.validate().is_ok());
+    }
+
+    #[test]
+    fn pi_rpc_terminal_tool_authority_is_valid_durable_state() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+        state.config.profile = Some(serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap());
+        admit_terminal_tool_authority(&mut state, "paperclip_finish", &valid_opencode_result(), false).unwrap();
+        assert_eq!(state.active_provider_result_disposition.as_deref(), Some("done"));
+        state.validate().expect("accepted Pi finish must persist without leaving a durable pending callback");
+        let saved = serde_json::to_vec(&state).unwrap();
+        let restored: CodexProviderState = serde_json::from_slice(&saved).unwrap();
+        restored.validate().unwrap();
+        let terminal = terminal_events(&restored, "turn.completed", None);
+        assert_eq!(terminal.len(), 1);
+        assert_eq!(terminal[0].payload["runTerminalState"], "succeeded");
+        state.config.provider = "acpx".to_owned();
+        assert!(state.validate().is_err(), "do not widen terminal authority for other providers");
     }
 
     #[test]

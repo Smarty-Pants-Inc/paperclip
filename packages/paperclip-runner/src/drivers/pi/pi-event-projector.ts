@@ -11,6 +11,7 @@ export interface PiProjectedEvent extends PiEventOrigin {
   eventType: PrpEvent["eventType"];
   itemId?: string;
   payload: Record<string, unknown>;
+  debug?: Record<string, unknown>;
 }
 interface Block { id: string; kind: string; text: string; terminal: boolean }
 interface Tool { id: string; name: string; args?: unknown; input: string; terminal: boolean; started: boolean }
@@ -36,7 +37,35 @@ function displayValue(value: unknown, depth = 0): unknown {
   return value;
 }
 function contentText(value: unknown): string {
-  return boundedText((Array.isArray(value) ? value : []).map(block => record(block)).filter(block => block.type === "text").map(block => text(block.text)).join("\n"));
+  return (Array.isArray(value) ? value : []).map(block => record(block)).filter(block => block.type === "text").map(block => text(block.text)).join("\n");
+}
+/** Display-only preview; budget counts JSON escaping, not just native UTF-8. */
+function toolOutputPreview(value: string, budget: number): string {
+  if (Buffer.byteLength(JSON.stringify(value)) <= budget) return value;
+  const marker = "[Pi tool output truncated] ";
+  let low = 0, high = Math.min(value.length, budget);
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(JSON.stringify(marker + value.slice(0, mid))) <= budget) low = mid;
+    else high = mid - 1;
+  }
+  if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low--;
+  return marker + value.slice(0, low);
+}
+/** Remove only observed tool display data when checking the control/input budget. */
+function toolControlRecord(event: Record<string, unknown>): Record<string, unknown> {
+  const key = event.type === "message_end" && record(event.message).role === "toolResult" ? "message"
+    : event.type === "tool_execution_update" ? "partialResult"
+    : event.type === "tool_execution_end" ? "result" : undefined;
+  if (!key) return event;
+  const result = record(event[key]);
+  if (result !== event[key]) return event;
+  const { details: _details, structuredContent, content, ...control } = result;
+  const structured = record(structuredContent);
+  return { ...event, [key]: { ...control,
+    content: Array.isArray(content) ? content.map(part => record(part).type === "text" ? { ...record(part), text: "" } : part) : content,
+    structuredContent: { exit_code: structured.exit_code, truncated: structured.truncated },
+  } };
 }
 
 /**
@@ -74,6 +103,8 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   let diagnosticCount = 0;
   let compactionCount = 0;
   let childUsageUnknown = false;
+  let displayTruncated = false;
+  let originalToolOutput: { body: string; truncated: boolean } | undefined;
   const diagnostic = (type: string, code = "pi_unknown_event"): PiProjectedEvent[] => {
     // Never copy arbitrary native payloads, extension text or paths to diagnostics.
     if (diagnosticCount > 16) return [];
@@ -166,7 +197,10 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     startTool(tool, output);
     const end = event.type === "tool_execution_end";
     const result = record(end ? event.result : event.partialResult);
-    const body = contentText(result.content);
+    const fullBody = contentText(result.content);
+    const body = Buffer.byteLength(fullBody) <= MAX_TEXT_BYTES ? fullBody : toolOutputPreview(fullBody, MAX_TEXT_BYTES);
+    const outputWasTruncated = originalToolOutput?.truncated === true || body !== fullBody;
+    if (outputWasTruncated) displayTruncated = true;
     const failed = event.isError === true;
     const duration = typeof event.durationMs === "number" && Number.isSafeInteger(event.durationMs) && event.durationMs >= 0 ? event.durationMs : null;
     if (end) tool.terminal = true;
@@ -175,14 +209,38 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       schema: "paperclip.tool.execution.v1", executionId: tool.id,
       transport: tool.name === "bash" ? "process" : "dynamic", operation: tool.name === "bash" ? "execute" : "unknown", name: (tool.name === "bash" ? text(record(tool.args).command) : tool.name) || tool.name || null,
       target: null, namespace: null, readOnly: null, status: end ? failed ? "failed" : "completed" : "running", durationMs: duration, exitCode: Number.isSafeInteger(record(result.structuredContent).exit_code) ? record(result.structuredContent).exit_code : null,
-      progress: null, output: body || null, outputBytes: Buffer.byteLength(body), outputTruncated: record(result.structuredContent).truncated === true, outputDigest: body ? `sha256:${digest(body)}` : null,
+      progress: null, output: body || null, outputBytes: Buffer.byteLength(originalToolOutput?.body ?? fullBody), outputTruncated: outputWasTruncated || record(result.structuredContent).truncated === true, outputDigest: (originalToolOutput?.body ?? fullBody) ? `sha256:${digest(originalToolOutput?.body ?? fullBody)}` : null,
     }));
   };
   return { project(value: unknown): PiProjectedEvent[] {
-    // Reject, don't silently approve a truncated tool input/final receipt.
+    // Only tool output display is lossy. Inputs, receipts, usage and control
+    // remain authoritative and fail clearly if they alone exceed the budget.
     const serialized = JSON.stringify(value);
-    if (!serialized || Buffer.byteLength(serialized) > MAX_RECORD_BYTES) throw new Error("pi_projection_record_limit");
-    const event = record(displayValue(value));
+    if (!serialized) throw new Error("pi_projection_record_limit");
+    const recordBytes = Buffer.byteLength(serialized);
+    const source = record(value);
+    // Custom session entries are extension display history, not executable
+    // inputs or final receipts. Digest an oversized body before redaction.
+    const customDisplay = source.type === "entry_appended" && record(source.entry).type === "custom"
+      && source.toolCallId === undefined && recordBytes > MAX_RECORD_BYTES;
+    const control = customDisplay ? { ...source, entry: { ...record(source.entry), data: undefined } } : toolControlRecord(source);
+    if (recordBytes > MAX_RECORD_BYTES && (control === source || Buffer.byteLength(JSON.stringify(control)) > MAX_RECORD_BYTES)) throw new Error("pi_projection_record_limit");
+    displayTruncated = recordBytes > MAX_RECORD_BYTES;
+    originalToolOutput = undefined;
+    let observed: unknown = customDisplay ? control : value;
+    if (control !== source && !customDisplay) {
+      const key = source.type === "message_end" ? "message" : source.type === "tool_execution_update" ? "partialResult" : "result";
+      const nativeResult = record(source[key]);
+      const fullBody = contentText(nativeResult.content);
+      const preview = Buffer.byteLength(fullBody) <= MAX_TEXT_BYTES ? fullBody : toolOutputPreview(fullBody, MAX_TEXT_BYTES);
+      if (displayTruncated || preview !== fullBody) {
+        // Bound before diagnostic redaction: ignored megabyte details and
+        // cumulative output must not enter its regular-expression passes.
+        originalToolOutput = { body: fullBody, truncated: preview !== fullBody };
+        observed = { ...control, [key]: { ...record(control[key]), content: [{ type: "text", text: preview }] } };
+      }
+    }
+    const event = record(displayValue(observed));
     const output: PiProjectedEvent[] = [];
     if (["message_start", "message_end"].includes(text(event.type)) && record(event.message).role === "user") {
       const message = record(event.message);
@@ -309,6 +367,25 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       output.push(...diagnostic(text(event.type), "pi_native_activity"));
     } else if (!["response", "session", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "extension_ui_response"].includes(text(event.type))) {
       output.push(...diagnostic(text(event.type)));
+    }
+    // Bound the actual wire payload, including duplicate text fields and JSON
+    // escapes. Never shorten input/arguments, identities, names or usage.
+    for (const projected of output) {
+      if (Buffer.byteLength(JSON.stringify(projected)) <= MAX_RECORD_BYTES - 2048) continue;
+      const isTool = projected.eventType.startsWith("tool.execution.") || ["tool", "commandExecution"].includes(text(projected.payload.kind));
+      if (!isTool) throw new Error("pi_projection_record_limit");
+      const keys = ["text", "output", "message"].filter(key => typeof projected.payload[key] === "string");
+      const base = { ...projected, payload: { ...projected.payload } };
+      for (const key of keys) base.payload[key] = "";
+      const budget = Math.floor((MAX_RECORD_BYTES - 2048 - Buffer.byteLength(JSON.stringify(base))) / Math.max(keys.length, 1));
+      if (!keys.length || budget < 128) throw new Error("pi_projection_record_limit");
+      for (const key of keys) projected.payload[key] = toolOutputPreview(text(projected.payload[key]), budget);
+      if (projected.eventType.startsWith("tool.execution.")) projected.payload.outputTruncated = true;
+      displayTruncated = true;
+    }
+    if (displayTruncated) {
+      const piProjection = { truncated: true, recordBytes, recordSha256: digest(serialized) };
+      for (const projected of output) projected.debug = { piProjection };
     }
     return output;
   } };

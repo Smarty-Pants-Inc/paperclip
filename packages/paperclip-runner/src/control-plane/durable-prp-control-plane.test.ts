@@ -1999,6 +1999,32 @@ it("does not release or replace a remote runner until its exit is confirmed", as
   expect(launch).toHaveBeenCalledTimes(2);
 });
 
+it.each(["pi-explicit", "pi-ambient", "other-explicit"] as const)("forwards registered AGENT_HOME only for an explicit native Pi launch (%s)", mode => {
+  vi.stubEnv("AGENT_HOME", "/ambient/must-not-cross");
+  const launches: RunnerProcessLaunchSpec[] = [];
+  const profile = { command: "/provider-pack/node", commandSha256: `sha256:${"b".repeat(64)}`,
+    proxyScript: "/provider-pack/pi-proxy.cjs", proxyScriptSha256: `sha256:${"c".repeat(64)}`,
+    executable: "/provider-pack/pi.js", executableSha256: `sha256:${"d".repeat(64)}` };
+  try {
+    const handle = spawnRunner({
+      connection: { mode: "connect", connectUrl: "ws://127.0.0.1:43127" },
+      stateDirectory: "/tmp/paperclip-runner-test", identity, ticket: "bootstrap-ticket",
+      maxOutboxBytes: 256 * 1024, p0ReserveBytes: 64 * 1024,
+      runnerVersion: expectedRunnerVersion, runnerDigest: expectedRunnerDigest,
+      ...(mode === "other-explicit" ? {} : { piLaunchProfile: profile }),
+      environment: mode === "pi-ambient" ? {} : { AGENT_HOME: "/registered/run/executionRoot" },
+      processLauncher: spec => {
+        launches.push(spec);
+        return { child: { pid: 42, exitCode: null, signalCode: null, kill: () => true },
+          completion: Promise.resolve({ code: 0, signal: null, stdout: "", stderr: "" }) };
+      },
+    });
+    restartRunner(handle, "replacement-ticket");
+    expect(launches).toHaveLength(2);
+    for (const launch of launches) expect(launch.environment.AGENT_HOME).toBe(mode === "pi-explicit" ? "/registered/run/executionRoot" : undefined);
+  } finally { vi.unstubAllEnvs(); }
+});
+
 it("pins the ACPX launch profile in runner startup arguments and restarts", () => {
   const launches: RunnerProcessLaunchSpec[] = [];
   const handle = spawnRunner({

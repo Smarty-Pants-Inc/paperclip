@@ -38,22 +38,50 @@ export class PiRpcCommandError extends Error {
 
 class AsyncRecordQueue implements AsyncIterable<PiRpcRecord> {
   #records: PiRpcRecord[] = [];
+  #pendingUpdates = new Map<string, PiRpcRecord>();
   #waiters: Array<{ resolve: (result: IteratorResult<PiRpcRecord>) => void; reject: (error: Error) => void }> = [];
   #closed = false;
   #failure: Error | null = null;
 
   push(record: PiRpcRecord): boolean {
     if (this.#closed) return false;
+    const updateId = record.type === "tool_execution_update"
+      && typeof record.toolCallId === "string" && record.toolCallId.length > 0 ? record.toolCallId : null;
+    // Only pending partial snapshots are replaceable. Every other record is an
+    // ordering barrier, including tool completion, turn boundaries and errors.
+    if (updateId === null) this.#pendingUpdates.clear();
+    else {
+      const previous = this.#pendingUpdates.get(updateId);
+      if (previous) {
+        // Only display content can be replaced. Changed args, state, identity
+        // or receipt metadata must reach the consumer in their original order.
+        const control = (value: PiRpcRecord) => {
+          const result = value.partialResult;
+          if (!result || typeof result !== "object" || Array.isArray(result)) return JSON.stringify(value);
+          const { content: _content, ...rest } = result as PiRpcRecord;
+          return JSON.stringify({ ...value, partialResult: rest });
+        };
+        if (control(previous) === control(record)) {
+          this.#records[this.#records.indexOf(previous)] = record;
+          this.#pendingUpdates.set(updateId, record);
+          return true;
+        }
+        this.#pendingUpdates.clear();
+      }
+    }
     const waiter = this.#waiters.shift();
     if (waiter) waiter.resolve({ value: record, done: false });
-    else if (this.#records.length < 4096) this.#records.push(record);
-    else return false;
+    else if (this.#records.length < 4096) {
+      this.#records.push(record);
+      if (updateId !== null) this.#pendingUpdates.set(updateId, record);
+    } else return false;
     return true;
   }
 
   close(error?: Error): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#pendingUpdates.clear();
     this.#failure = error ?? null;
     for (const waiter of this.#waiters.splice(0)) {
       if (error) waiter.reject(error);
@@ -65,7 +93,12 @@ class AsyncRecordQueue implements AsyncIterable<PiRpcRecord> {
     return {
       next: () => {
         const record = this.#records.shift();
-        if (record) return Promise.resolve({ value: record, done: false });
+        if (record) {
+          if (typeof record.toolCallId === "string" && this.#pendingUpdates.get(record.toolCallId) === record) {
+            this.#pendingUpdates.delete(record.toolCallId);
+          }
+          return Promise.resolve({ value: record, done: false });
+        }
         if (this.#failure) return Promise.reject(this.#failure);
         if (this.#closed) return Promise.resolve({ value: undefined, done: true });
         return new Promise((resolve, reject) => this.#waiters.push({ resolve, reject }));
@@ -95,7 +128,7 @@ export class PiRpcTransport {
   #failure: Error | null = null;
 
   constructor(options: PiRpcTransportOptions) {
-    this.#maxRecordBytes = options.maxRecordBytes ?? 4 * 1024 * 1024;
+    this.#maxRecordBytes = options.maxRecordBytes ?? 64 * 1024 * 1024;
     this.#fatalSessionStartExtensionPaths = new Set(options.fatalSessionStartExtensionPaths);
     this.#shutdownTimeoutMs = boundedTimeout(options.shutdownTimeoutMs, 1500);
     this.#killTimeoutMs = boundedTimeout(options.killTimeoutMs, 750);

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { createPiSteerRecordingPeer } from "../../test-support/pi-rpc-steer-peer.js";
+import { createPiEventProjector } from "../drivers/pi/pi-event-projector.js";
 import type { HarnessDriver, HarnessSession } from "../contracts/harness-driver.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import {
@@ -67,14 +68,14 @@ class FakeSession {
     }
   }
 
-  push(eventType: string, payload: Record<string, unknown> = {}, turnId?: string, itemId?: string) {
+  push(eventType: string, payload: Record<string, unknown> = {}, turnId?: string, itemId?: string, runId = "run-1") {
     const event = {
       schema: "paperclip.prp.event.v3",
       sourceEventId: `e-${Date.now()}-${Math.random()}`,
       sourceSeq: this.#queued.length + 1,
       sourceInstanceId: "fake",
       sourceKind: "runner",
-      runId: "run-1",
+      runId,
       normalizedSessionId: "session-1",
       eventType,
       schemaVersion: 3,
@@ -153,6 +154,70 @@ async function request(
 }
 
 describe("Pi RPC app-server facade proxy", () => {
+  it("adapts real Pi usage to Rust total/last without double counting warm turns", async () => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 101, "thread/start", { model: "neutral/model" });
+      for (const [index, runId] of ["run-1", "run-2"].entries()) {
+        if (index) await request(proxy, sink, 102, "run.attach", { runId });
+        const projector = createPiEventProjector({ runId, turnId: `usage-${index}` });
+        for (const receipt of [1, 2]) {
+          const native = { type: "message_end", message: { role: "assistant", responseId: `${index}-${receipt}`, provider: "neutral", model: "model", stopReason: "stop", content: [], usage: { input: 11, output: 3, cacheRead: 2, cacheWrite: 0, totalTokens: 16 } } };
+          const events = projector.project(native);
+          expect(projector.project(native)).toEqual([]);
+          for (const event of events.filter(e => e.eventType === "usage.reported")) session.push(event.eventType, event.payload, event.turnId, event.itemId, runId);
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      const usage = sink.decoded().filter(f => f.method === "thread/tokenUsage/updated");
+      expect(usage).toHaveLength(4);
+      for (const [index, frame] of usage.entries()) expect(frame).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 * (index + 1), outputTokens: 3 * (index + 1), cacheReadTokens: 2 * (index + 1) }, last: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 } } } });
+      expect(usage.reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
+    } finally { await proxy.close(); }
+  });
+  // Keep reason: incident439 lost the actionable cause at the facade/Rust wire
+  // boundary. A stale diagnostic must not poison a later current-run failure.
+  it("forwards session failure cause to the receiver, rejects stale origin, then accepts a legitimate current failure", async () => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 80, "thread/start", { model: "neutral/model" });
+      await request(proxy, sink, 81, "run.attach", { runId: "run-2" });
+      session.push("session.failed", { code: "pi_rpc_transport_failed", message: "OLD_ECONNREFUSED" }, "old-turn", undefined, "run-1");
+      session.push("turn.failed", { error: { code: "pi_rpc_transport_failed", message: "OLD_CONTINUATION" } }, "old-turn", undefined, "run-1");
+      session.push("session.failed", { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" }, undefined, undefined, "run-2");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(sink.frames.join("")).not.toContain("OLD_ECONNREFUSED");
+      expect(sink.frames.join("")).not.toContain("OLD_CONTINUATION");
+      expect(sink.decoded().find(frame => frame.method === "error")).toMatchObject({ params: { threadId: "pi-session", message: "CURRENT_ECONNREFUSED", error: { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" } } });
+    } finally { await proxy.close(); }
+  });
+
+  it.each(["plain", "\\u0000\\u0001\\n\\\"\\\\", "😀漢字"])("bounds projected partial facade frames with a visible marker (%s) and leaves final/short text untouched", async alphabet => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 90, "thread/start", { model: "neutral/model" });
+      const large = alphabet.repeat(Math.ceil(4 * 1024 * 1024 / alphabet.length));
+      const payload = { kind: "commandExecution", output: large, item: { id: "tool", type: "tool_use", name: "bash", input: { command: "cat" }, arguments: { command: "cat" } } };
+      session.push("item.delta", payload, "turn-1", "tool");
+      session.push("item.delta", { ...payload, output: "short output" }, "turn-1", "short");
+      const final = "FINAL_" + "z".repeat(49_750);
+      session.push("item.completed", { ...payload, text: final, output: final }, "turn-1", "tool");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const frames = sink.decoded().filter(frame => typeof frame.method === "string" && frame.method.startsWith("item/"));
+      expect(JSON.stringify(frames[0])).toContain("[Pi tool output truncated");
+      for (const frame of frames) expect(Buffer.byteLength(JSON.stringify(frame))).toBeLessThan(1024 * 1024);
+      expect(frames[1]).toMatchObject({ params: { output: "short output" } });
+      expect(frames[2]).toMatchObject({ params: { output: final, text: final } });
+      expect(payload.output).toBe(large);
+    } finally { await proxy.close(); }
+  });
+
   it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)(
     "preserves the Pi thinking level %s verbatim",
     (level) => expect(parsePiThinkingLevel(level)).toBe(level),

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { buildTranscript } from "../../browser/transcript-model.js";
@@ -49,6 +50,82 @@ describe("real Pi 1.5.2 RPC -> canonical events -> existing reducer/transcript",
     expect(receipts).toHaveLength(5);
     expect(receipts.at(-1)?.payload.usage).toMatchObject({ total: { inputTokens: 23, outputTokens: 6, cachedInputTokens: 4, cacheWriteTokens: 0, totalTokens: 33 }, runDeltaComplete: true, costProvenance: "catalog_estimate" });
     expect(JSON.stringify(receipts)).not.toContain('"costUsd"');
+  });
+});
+
+describe("large native tool output projection (synthetic incident regression)", () => {
+  it("digests the real 403238-byte custom entry for display without losing the turn", () => {
+    const raw = fixture("tool-context-guard-full.json");
+    const input = JSON.parse(raw);
+    const before = JSON.stringify(input);
+    expect(Buffer.byteLength(before)).toBe(403238);
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const events = projector.project(input);
+    expect(events).toMatchObject([{ eventType: "harness.diagnostic", payload: { code: "pi_native_activity", providerMethod: "entry_appended" }, debug: { piProjection: { truncated: true, recordBytes: 403238, recordSha256: createHash("sha256").update(before).digest("hex") } } }]);
+    expect(Buffer.byteLength(JSON.stringify(events))).toBeLessThan(2048);
+    expect(JSON.stringify(input)).toBe(before);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
+  it("preserves a safe small escaped record exactly instead of applying a blanket JSON text cap", () => {
+    const body = "\\".repeat(50000);
+    const input = { type: "tool_execution_end", toolCallId: "ordinary", toolName: "bash", isError: false, result: { content: [{ type: "text", text: body }] } };
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(events.find(event => event.eventType === "item.completed")?.payload).toMatchObject({ text: body, output: body });
+    expect(events.at(-1)?.payload).toMatchObject({ output: body, outputTruncated: false, outputBytes: 50000 });
+    for (const event of events) {
+      expect(event.debug).toBeUndefined();
+      expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    }
+  });
+  it("rejects oversized native inputs without silently truncating executable arguments", () => {
+    const args = { command: "\"\\\n".repeat(300000), nested: { enabled: true, count: 3 } };
+    const input = { type: "tool_execution_start", toolCallId: "typed", toolName: "bash", args };
+    const serialized = JSON.stringify(input);
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    expect(() => projector.project(input)).toThrow(/pi_projection_record_limit/);
+    expect(JSON.stringify(input)).toBe(serialized);
+    projector.project({ ...input, args: { command: "echo ordinary" } });
+    expect(() => projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "other", result: {} })).toThrow(/name_changed/);
+    expect(() => projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))).toThrow(/pi_projection_record_limit/);
+    expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).toThrow(/pi_projection_record_limit/);
+  });
+  it("projects an accumulated >4MiB tool update without copying full native output", () => {
+    const input = { type: "tool_execution_update", toolCallId: "streamed", toolName: "bash", partialResult: { content: [{ type: "text", text: "x".repeat(4 * 1024 * 1024 + 1) }] } };
+    const serialized = JSON.stringify(input);
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(events.at(-1)).toMatchObject({ payload: { output: expect.stringMatching(/^\[Pi tool output truncated/) }, debug: { piProjection: { truncated: true, recordSha256: createHash("sha256").update(serialized).digest("hex") } } });
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    expect(JSON.stringify(input)).toBe(serialized);
+  });
+  it.each([false, true])("bounds escaped output and retains error status %s", isError => {
+    const input = { type: "tool_execution_end", toolCallId: 0, toolName: "bash", isError, result: { content: [{ type: "text", text: "\u0000\\\"🌍".repeat(100000) }], structuredContent: { exit_code: isError ? 7 : 0 } } };
+    const serialized = JSON.stringify(input);
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(events.some(event => event.eventType === (isError ? "item.failed" : "item.completed"))).toBe(true);
+    expect(events.at(-1)).toMatchObject({ payload: { status: isError ? "failed" : "completed", outputTruncated: true }, debug: { piProjection: { recordSha256: createHash("sha256").update(serialized).digest("hex") } } });
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    expect(JSON.stringify(input)).toBe(serialized);
+  });
+  it.each(["tool_execution_end", "message_end"])("bounds %s without changing the native result or terminal ownership", type => {
+    const result = { role: "toolResult", toolCallId: "large-tool", toolName: "bash", isError: false, content: [{ type: "text", text: "final output\n".repeat(4000) }], details: { fullOutput: "find-result\n".repeat(110000) }, structuredContent: { fullOutput: "structured\n".repeat(110000), exit_code: 0 } };
+    const input = type === "message_end" ? { type, message: result } : { type, toolCallId: result.toolCallId, toolName: result.toolName, result, isError: false };
+    const serialized = JSON.stringify(input);
+    const original = structuredClone(input);
+    const projector = createPiEventProjector({ runId: "owned-run", turnId: "owned-turn" });
+    const started = projector.project({ type: "tool_execution_start", toolCallId: "large-tool", toolName: "bash", args: { command: "find synthetic" } });
+    const events = projector.project(input);
+    expect(input).toEqual(original);
+    expect(JSON.stringify(input)).toBe(serialized);
+    expect(events.map(event => event.eventType)).toEqual(["item.completed", "tool.execution.completed"]);
+    for (const event of events) {
+      expect(event).toMatchObject({ runId: "owned-run", turnId: "owned-turn", itemId: started[0].itemId, debug: { piProjection: { truncated: true, recordBytes: Buffer.byteLength(serialized), recordSha256: createHash("sha256").update(serialized).digest("hex") } } });
+      expect(Buffer.byteLength(JSON.stringify(event))).toBeLessThanOrEqual(256 * 1024);
+      expect(validatePrpEvent(envelope(event, 0))).toMatchObject({ ok: true });
+    }
+    expect(events[0].payload.output).toBe(result.content[0].text);
+    expect(events[1].payload).toMatchObject({ status: "completed", exitCode: 0, name: "find synthetic", output: result.content[0].text });
+    expect(JSON.stringify(events)).not.toContain("fullOutput");
+    expect(projector.project(input)).toEqual([]);
   });
 });
 

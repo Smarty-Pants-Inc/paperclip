@@ -3768,6 +3768,8 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     return { ...selected, ...Object.fromEntries(PI_SIDECAR_PROVIDER_ROUTE_NAMES.flatMap(name => {
       const value = input.options.environment?.[name]; return value === undefined ? [] : [[name, value]];
     })), ...(input.options.environment?.PI_CODING_AGENT_DIR ? { PI_CODING_AGENT_DIR: input.options.environment.PI_CODING_AGENT_DIR } : {}),
+      // Server-selected registered instruction-copy executionRoot; Pi only.
+      ...(input.options.environment?.AGENT_HOME ? { AGENT_HOME: input.options.environment.AGENT_HOME } : {}),
       PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
       PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel ?? "low", ...commonIdentity };
   }
