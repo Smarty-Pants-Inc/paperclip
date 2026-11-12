@@ -30,7 +30,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   if (message.id === undefined) return;
   let result = {};
   if (message.method === "initialize") result = { user: { sessionId: "pi_rpc" }, serverInfo: { name: "fixture", version: "1" } };
-  else if (["thread/start", "thread/resume", "thread/read"].includes(message.method)) result = { thread: { id: "pi-attach-fixture", sessionId: "pi-attach-fixture", cwd: ${JSON.stringify(root)}, turns: [] }, model: "localFaux/faux" };
+  else if (["thread/start", "thread/resume", "thread/read"].includes(message.method)) result = { thread: { id: "pi-attach-fixture", sessionId: "pi-attach-fixture", cwd: ${JSON.stringify(root)}, turns: [] }, model: "localFaux/faux", piNativeAdmission: { model: "localFaux/faux", piRpcThinkingLevel: "low" } };
   else if (["run.attach", "session.revalidate"].includes(message.method)) result = true;
   else if (message.method === "paperclip/host_park_ready") result = { ready: true, reasons: [] };
   else if (message.method === "collaborationMode/list") result = { data: [] };
@@ -38,13 +38,14 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   else if (message.method === "turn/interrupt") result = true;
   send({ id: message.id, result });
 });
-`);
+`, { mode: 0o600 });
   const payloads: Record<string, unknown>[] = [];
   const catalogs: Record<string, unknown>[] = [];
   let core: DurablePrpControlPlane | undefined;
   let rejectNext = false;
   const bundle = createRunnerdCodexTransport({
     provider: "pi_rpc", runnerBinary: process.env.PAPERCLIP_RUNNERD_PATH ?? defaultCapabilityRunnerdBinary(),
+    piRpcThinkingLevel: "low",
     stateDirectory: join(root, "state"), sourceCodexHome: "", baseInstructions: "unchanged instructions",
     providerNodeCommand: process.execPath, providerNodeCommandSha256: digest(process.execPath),
     // The provider child is the explicitly faux facade above, not a model.
