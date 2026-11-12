@@ -109,3 +109,14 @@ requests the supported effective effort (`xhigh` with the cap, `max` without).
 Both cases retain their capabilities after warm attach/rebind and leave the
 user file unchanged. Driver turns use a local loopback protocol peer, not an
 upstream account or a simulated Pi runtime.
+
+## Managed compaction reserve
+
+Native `pi_rpc` startup writes `compaction.reserveTokens` to the managed Pi
+`settings.json` when no explicit reserve exists. The default is
+`min(100000, floor(contextWindow * 0.25))`: 100,000 tokens for a 1M window,
+32,000 for the 128k fallback window. Other Pi compaction defaults are unchanged.
+An explicit managed-home reserve (including an exact `provider/model` override)
+wins; otherwise the original user Pi home's explicit reserve is honored. Only
+that token value is imported, not unrelated user settings. Project settings
+continue to override agent-directory settings through Pi's normal resolution.

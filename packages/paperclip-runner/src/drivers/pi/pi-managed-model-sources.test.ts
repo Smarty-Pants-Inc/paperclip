@@ -26,13 +26,15 @@ afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 const model = (fields: Record<string, unknown>) => ({ id: "source-proof", ...fields });
 const provider = (fields: Record<string, unknown>) => ({ models: [model(fields)] });
 
-async function fixture(primary: unknown, user: unknown, originalPiDir = false, managedPiDir = false) {
+async function fixture(primary: unknown, user: unknown, originalPiDir = false, managedPiDir = false, settings?: { managed?: unknown; user?: unknown }) {
   const root = await mkdtemp(join(tmpdir(), "pi-model-sources-"));
   const home = join(root, "home", "user"), runtime = join(root, "run"), agent = join(runtime, "agent");
   const original = originalPiDir ? join(root, "original-pi") : join(home, ".pi", "agent");
   await mkdir(agent, { recursive: true }); await mkdir(original, { recursive: true });
   const agentFile = join(agent, "models.json"), userFile = join(original, "models.json");
   await writeFile(agentFile, JSON.stringify(primary));
+  if (settings?.managed !== undefined) await writeFile(join(agent, "settings.json"), JSON.stringify(settings.managed));
+  if (settings?.user !== undefined) await writeFile(join(original, "settings.json"), JSON.stringify(settings.user));
   if (user === "unreadable") await mkdir(userFile);
   else if (user !== undefined) await writeFile(userFile, typeof user === "string" ? user : JSON.stringify(user));
   vi.stubEnv("HOME", home);
@@ -49,7 +51,7 @@ async function fixture(primary: unknown, user: unknown, originalPiDir = false, m
   }).openSession({ runId: "source-run", normalizedSessionId: "source-session", workingDirectory: root }) as PiRpcHarnessSession;
   try {
     const disk = JSON.parse(await readFile(agentFile, "utf8"));
-    return { root, userFile, disk, metadata: disk.providers.paperclip.models[0], diagnostics: warn.mock.calls.map(call => String(call[0])) };
+    return { root, userFile, disk, settings: JSON.parse(await readFile(join(agent, "settings.json"), "utf8").catch(error => { if (error.code === "ENOENT") return "{}"; throw error; })), metadata: disk.providers.paperclip.models[0], diagnostics: warn.mock.calls.map(call => String(call[0])) };
   } finally { await session.close(); expect(transport.exited).toBe(true); }
 }
 
@@ -94,4 +96,54 @@ it.each([undefined, "{invalid-json", "[]", "unreadable", { providers: { native: 
   expect(f.diagnostics).toHaveLength(1);
   expect(f.diagnostics[0]!.length).toBeLessThanOrEqual(256);
   expect(f.diagnostics[0]!.split("\n")).toHaveLength(1);
+});
+
+// Keep: V2-R2 row 1 caught Pi's 16,384-token default delaying 1M compaction.
+it.each([[1000000, 100000], [128000, 32000], [32000, 8000]])("writes a window-safe compaction reserve for %i tokens", async (contextWindow, reserveTokens) => {
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow }) } }, {});
+  expect(f.settings).toEqual({ compaction: { reserveTokens } });
+});
+
+it.each([0, 42000, 120000])("preserves an explicit managed-home reserve of %i", async reserveTokens => {
+  const settings = { packages: ["local-package"], compaction: { reserveTokens, enabled: false, keepRecentTokens: 12345 } };
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, false, false, { managed: settings });
+  expect(f.settings).toEqual(settings);
+});
+
+it("respects the user's original Pi reserve without importing unrelated settings", async () => {
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, true, false,
+    { user: { compaction: { reserveTokens: 54321 }, packages: ["do-not-import"] } });
+  expect(f.settings).toEqual({ compaction: { reserveTokens: 54321 } });
+});
+
+it("keeps managed settings ahead of the original user's reserve", async () => {
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, true, false,
+    { managed: { compaction: { reserveTokens: 22222 } }, user: { compaction: { reserveTokens: 54321 } } });
+  expect(f.settings.compaction.reserveTokens).toBe(22222);
+});
+
+it("respects an explicit per-model user reserve", async () => {
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, true, false,
+    { user: { compaction: { modelOverrides: { "paperclip/source-proof": { reserveTokens: 67890 } } } } });
+  expect(f.settings.compaction.reserveTokens).toBe(67890);
+});
+
+it("adds only the reserve while retaining other managed compaction settings", async () => {
+  const settings = { quietStartup: true, compaction: { enabled: false, keepRecentTokens: 23456,
+    modelOverrides: { "unrelated/model": { reserveTokens: 1111 } } } };
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, false, false, { managed: settings });
+  expect(f.settings).toEqual({ ...settings, compaction: { ...settings.compaction, reserveTokens: 100000 } });
+});
+
+it("preserves an exact managed model override byte-for-byte semantically", async () => {
+  const settings = { compaction: { reserveTokens: 11111,
+    modelOverrides: { "paperclip/source-proof": { reserveTokens: 0, keepRecentTokens: 12345 } } } };
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, false, false, { managed: settings });
+  expect(f.settings).toEqual(settings);
+});
+
+it("honors an explicit original-user reserve of zero", async () => {
+  const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, true, false,
+    { user: { compaction: { reserveTokens: 0 } } });
+  expect(f.settings.compaction.reserveTokens).toBe(0);
 });

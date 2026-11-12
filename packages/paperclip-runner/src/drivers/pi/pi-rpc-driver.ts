@@ -13,6 +13,7 @@ import { loadPiBuiltinModelCatalog, mergedPiModelsJson, readPiModelsSnapshot } f
 import { buildPiManagedModel, originalPiModelsFile, type PiManagedModel } from "./pi-managed-model.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { configurePiNativeMcp } from "./pi-native-mcp.js";
+import { configurePiManagedCompaction } from "./pi-managed-settings.js";
 import { piHostInstructionSegment, verifiedPiChildBridgePath } from "./extension/index.js";
 import { piRpcUserInput } from "./pi-user-input.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
@@ -190,6 +191,8 @@ export class PiRpcDriver implements HarnessDriver {
         id: this.#options.model.slice("paperclip/".length), api: piManagedProviderApi(environment),
         originalModelsFile: originalModelsFile === modelsFile ? undefined : originalModelsFile,
         catalog: await loadPiBuiltinModelCatalog(this.#options.command ?? "pi", environment), warn });
+      await configurePiManagedCompaction({ agentHome, originalAgentHome: dirname(originalModelsFile),
+        model: config.model, contextWindow: modelConfiguration.contextWindow });
       if (credentialMode === "broker") {
         // Broker/models.json is the FIRST bind. INITIAL contains no provider
         // capability and prepares exactly one preallocated host turn, without IPC.
