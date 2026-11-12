@@ -4167,41 +4167,6 @@ export function issueRoutes(
     });
   }
 
-  async function directParentReportDisabledForIssue(issue: {
-    companyId: string;
-    projectId?: string | null;
-    executionPolicy?: unknown;
-    assigneeAgentId?: string | null;
-    checkoutRunId?: string | null;
-    executionRunId?: string | null;
-  }) {
-    const resolution = issue.assigneeAgentId
-      ? await resolveAgentTrustForIssue(
-          {
-            agentId: issue.assigneeAgentId,
-            runId: issue.checkoutRunId ?? issue.executionRunId,
-          },
-          issue.companyId,
-          issue,
-        )
-      : null;
-    if (resolution) return resolution.kind !== "standard";
-
-    const project = issue.projectId
-      ? await projectsSvc.getById(issue.projectId)
-      : null;
-    return (
-      resolveCoreTrustPreset({
-        companyId: issue.companyId,
-        project: project?.companyId === issue.companyId ? project : null,
-        issue: {
-          companyId: issue.companyId,
-          executionPolicy: issue.executionPolicy,
-        },
-      }).kind !== "standard"
-    );
-  }
-
   async function assertLowTrustControlPlaneDenied(
     req: Request,
     res: Response,
@@ -15670,25 +15635,14 @@ export function issueRoutes(
         plannedParentId === undefined
           ? existing.parentId
           : (plannedParentId as string | null);
+      // Direct-parent comments are permitted under standard trust, but permission
+      // does not mean the worker actually reported the stop. Always relay a
+      // blocked/cancelled child transition so its parent receives the event.
       const shouldRelayStop =
         Boolean(nextParentId) &&
         existing.status !== updateFields.status &&
         (updateFields.status === "blocked" ||
-          updateFields.status === "cancelled") &&
-        (await directParentReportDisabledForIssue({
-          companyId: existing.companyId,
-          projectId:
-            updateFields.projectId === undefined
-              ? existing.projectId
-              : (updateFields.projectId as string | null),
-          executionPolicy:
-            updateFields.executionPolicy === undefined
-              ? existing.executionPolicy
-              : updateFields.executionPolicy,
-          assigneeAgentId: nextAssigneeAgentId,
-          checkoutRunId: existing.checkoutRunId,
-          executionRunId: existing.executionRunId,
-        }));
+          updateFields.status === "cancelled");
       const stopRelayResult: {
         value: Awaited<ReturnType<typeof svc.addStopRelayCommentIfNeeded>>;
       } = { value: null };
