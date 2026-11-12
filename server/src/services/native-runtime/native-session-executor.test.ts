@@ -64,6 +64,7 @@ import {
   CURSOR_DISTRIBUTION_PINS,
   KIMI_DISTRIBUTION_CLOSURE_SHA256,
   QUALIFIED_ACPX_PROFILES,
+  QUALIFIED_PI_RPC_PROFILE,
   acpxRuntimeSessionDirectoryName,
   resolveAcpxRuntimeRoot,
   createPrpSemanticToolInputEnvelope,
@@ -2335,7 +2336,7 @@ describe("remote provider pack manifest", () => {
     return JSON.stringify(value);
   };
 
-  it.each(["opencode", "opencode-new-durable", "opencode-new-durable-reset", "opencode-new-durable-inspect-reset", "opencode-new-durable-provider-reset", "opencode-new-durable-store-failed", "opencode-new-durable-publish-failed", "opencode-continuation", "opencode-continuation-missing", "opencode-continuation-no-receipt", "opencode-continuation-replacement", "opencode-continuation-cold", "opencode-continuation-legacy-durable", "opencode-dirty", "opencode-diagnostics", "opencode-diagnostics-stale", "cursor", "claude-x64", "claude-arm64"] as const)("uses the bundled Linux image authority for remote %s without controller overrides", async provider => {
+  it.each(["opencode", "opencode-new-durable", "opencode-new-durable-reset", "opencode-new-durable-inspect-reset", "opencode-new-durable-provider-reset", "opencode-new-durable-store-failed", "opencode-new-durable-publish-failed", "opencode-continuation", "opencode-continuation-missing", "opencode-continuation-no-receipt", "opencode-continuation-replacement", "opencode-continuation-cold", "opencode-continuation-legacy-durable", "opencode-dirty", "opencode-diagnostics", "opencode-diagnostics-stale", "cursor", "claude-x64", "claude-arm64", "pi-rpc-low", "pi-rpc-xhigh", "pi-rpc-max", "pi-rpc-missing-native"] as const)("uses the bundled Linux image authority for remote %s without controller overrides", async provider => {
     const firstDurable = provider.startsWith("opencode-new-durable");
     // A sandbox connection drops once while the settled state is read out.
     let checkpointReadResets = provider === "opencode-new-durable-reset" ? 1 : 0;
@@ -2345,6 +2346,8 @@ describe("remote provider pack manifest", () => {
       : provider === "opencode-new-durable-provider-reset" ? "codex-provider-state.json" : null;
     const architecture = provider === "claude-arm64" ? "arm64" : "x64";
     const claude = provider.startsWith("claude-");
+    const nativePi = provider.startsWith("pi-rpc-");
+    const piRpcThinkingLevel = provider === "pi-rpc-xhigh" ? "xhigh" : provider === "pi-rpc-max" ? "max" : "low";
     const opencode = provider.startsWith("opencode");
     const diagnostics = provider.startsWith("opencode-diagnostics");
     const root = await mkdtemp(join(tmpdir(), "paperclip-bundled-image-"));
@@ -2371,6 +2374,19 @@ describe("remote provider pack manifest", () => {
       closureDigest: `sha256:${CURSOR_DISTRIBUTION_PINS["linux-x64"].closureSha256}`, qualification: "qualified",
       path: "provider-assets/cursor/linux-x64", sha256: digest,
     } } });
+    if (nativePi) {
+      Object.assign(payload.pins, { piRpc: QUALIFIED_PI_RPC_PROFILE.runtimeVersion });
+      Object.assign(payload, { piRpcProfileDigest: QUALIFIED_PI_RPC_PROFILE.commandDigest,
+        ...(provider === "pi-rpc-missing-native" ? {} : { nativeProviders: { pi_rpc: {
+          version: QUALIFIED_PI_RPC_PROFILE.runtimeVersion, profileDigest: QUALIFIED_PI_RPC_PROFILE.commandDigest,
+          closureDigest: digest, path: "provider-assets/pi_rpc/linux-x64", sha256: digest,
+        } } }),
+      });
+      Object.assign(artifacts, {
+        piRpcProxy: { path: "dist/cli/pi-rpc-app-server-proxy.cjs", sha256: digest },
+        piRpcExecutable: { path: "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", sha256: digest },
+      });
+    }
     const manifest = { schema: "paperclip-runner/remote-provider-pack/v1", payload,
       digest: "sha256:" + createHash("sha256").update(canonical(payload)).digest("hex") };
     state.bundledPackManifestPath = join(root, "provider-pack.json");
@@ -2380,10 +2396,11 @@ describe("remote provider pack manifest", () => {
     daemon.writeUInt16LE(architecture === "arm64" ? 183 : 62, 18);
     await writeFile(state.bundledRunnerBinary, daemon);
     if (claude) state.resolveRemoteRunnerBinary.mockResolvedValue(state.bundledRunnerBinary);
-    const remoteExecution = { ...execution, provider: opencode
+    const remoteExecution = { ...execution, provider: nativePi
+      ? { kind: "pi_rpc", model: "paperclip/selected-model-exactly", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel } : opencode
       ? { kind: "opencode", model: null } : { kind: "acpx", agent: claude ? "claude" : "cursor", model: null },
       workspace: { ...execution.workspace, cwd: root },
-      session: { ...execution.session, normalizedSessionId: `bundled-${provider}-${randomUUID()}`, driverKind: opencode ? "opencode_server" : "acpx_runtime" },
+      session: { ...execution.session, normalizedSessionId: `bundled-${provider}-${randomUUID()}`, driverKind: nativePi ? "pi_rpc" : opencode ? "opencode_server" : "acpx_runtime" },
     } as unknown as NativeExecutionInputV1;
     const syncIn = vi.fn(async (_operations: { files: { kind: string }[] }[]) => undefined);
     const installed = structuredClone(manifest);
@@ -2472,6 +2489,11 @@ describe("remote provider pack manifest", () => {
         expect(state.createBackend).not.toHaveBeenCalled();
         return;
       }
+      if (provider === "pi-rpc-missing-native") {
+        await expect(prepare).rejects.toThrow("image provider pack did not match the bundled release identity");
+        expect(state.createBackend).not.toHaveBeenCalled();
+        return;
+      }
       const managedBackend = await prepare;
       state.createTransport.mockClear();
       state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
@@ -2480,6 +2502,17 @@ describe("remote provider pack manifest", () => {
         environment?: NodeJS.ProcessEnv;
         runnerArtifact?: { version: string; digest: string };
       };
+      if (nativePi) {
+        expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel,
+          piCommand: "/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+          piCommandSha256: digest, piProxyPath: "/opt/paperclip-runner/provider-pack/dist/cli/pi-rpc-app-server-proxy.cjs",
+          piProxySha256: digest,
+        });
+        expect(transport.environment?.PI_CODING_AGENT_DIR).toMatch(/^\/workspace\/\.paperclip-runtime\/paperclip-runner\/.+\/pi-agent$/);
+        expect(state.createBackend.mock.calls.at(-1)![0].provider).toMatchObject({
+          kind: "pi_rpc", model: "paperclip/selected-model-exactly", piRpcThinkingLevel,
+        });
+      }
       expect(transport.runnerBinary).toBe(state.bundledRunnerBinary);
       expect(transport.onCredentialsUpdated).toBeUndefined();
       if (opencode) {
@@ -15819,6 +15852,18 @@ describe("runnerd provider runtime wiring", () => {
     expect(close).toHaveBeenCalledTimes(timing === "during-close" ? 1 : 0);
     expect(state.copyBackCodexAuth).not.toHaveBeenCalled();
     await expect(readFile(authPath, "utf8")).resolves.toBe(auth);
+  });
+
+  it.each(["low", "xhigh", "max"] as const)("native Pi transport preserves exact model and thinking %s", async piRpcThinkingLevel => {
+    const current = { ...scopedNativeExecution(`pi-rpc-${piRpcThinkingLevel}`),
+      provider: { kind: "pi_rpc", model: "paperclip/selected-model-exactly", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel },
+    } as unknown as NativeExecutionInput;
+    await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "pi-rpc-controller", runnerEnvironment: {} });
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const transport = state.createTransport.mock.calls.at(-1)![0];
+    expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel });
+    expect(state.createBackend.mock.calls.at(-1)![0].provider).toMatchObject(current.provider);
+    expect(transport.environment?.PI_CODING_AGENT_DIR).toBe(join(transport.stateDirectory!, "pi-agent"));
   });
 
   it.each(["isolated", "preconfigured"] as const)("pins Claude v9 permissions and effort at daemon startup in %s mode", async homeMode => {

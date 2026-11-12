@@ -45,7 +45,7 @@ import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-pre
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { nativeProviderPackAdmissionFailureCode, nativeProviderPackAdmissionPending, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
-import { type ProviderPackInstallation, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
@@ -78,7 +78,7 @@ import { apiKeyBillingType } from "@paperclipai/adapter-utils/api-billing-type";
 import { agents } from "@paperclipai/db";
 import { isCloudManagedInstance } from "../cloud-instance.js";
 import { dotRunnerBroker } from "../dot-runner-broker.js";
-import { CURSOR_DISTRIBUTION_PINS, KIMI_DISTRIBUTION_CLOSURE_SHA256, QUALIFIED_ACPX_PROFILES, QUALIFIED_ACPX_VERSION } from "../../vendor/paperclip-runner/index.js";
+import { CURSOR_DISTRIBUTION_PINS, KIMI_DISTRIBUTION_CLOSURE_SHA256, QUALIFIED_ACPX_PROFILES, QUALIFIED_ACPX_VERSION, QUALIFIED_PI_RPC_PROFILE } from "../../vendor/paperclip-runner/index.js";
 import { isProviderMode } from "../../vendor/paperclip-runner/index.js";
 import { codexUsageBaselineForNextRun } from "../../vendor/paperclip-runner/index.js";
 import { PROVIDER_PACK_COMPATIBILITY, bundledRemoteProviderPackManifestPath, runnerBinaryTarget } from "../../vendor/paperclip-runner/index.js";
@@ -13303,7 +13303,9 @@ type RemoteProviderPackManifest = {
   digest: string;
   payload: {
     compatibility?: { opencode: number; acpx: number };
-    pins: typeof REMOTE_PROVIDER_PACK_PINS;
+    pins: typeof REMOTE_PROVIDER_PACK_PINS & { piRpc?: string };
+    piRpcProfileDigest?: string;
+    nativeProviders?: Record<string, { path: string; sha256: string }>;
     target: { platform: string; architecture: string };
     runnerSourceRevision: string;
     distDigest: string;
@@ -13325,6 +13327,8 @@ type RemoteProviderPackManifest = {
       opencodeExecutable: { path: string; sha256: string };
       opencodeProxy: { path: string; sha256: string };
       acpxSidecar: { path: string; sha256: string };
+      piRpcExecutable?: { path: string; sha256: string };
+      piRpcProxy?: { path: string; sha256: string };
     };
   };
 };
@@ -13452,7 +13456,10 @@ function* providerPackIdentityChecks(
     manifest?.schema !== REMOTE_PROVIDER_PACK_SCHEMA ||
     !payload ||
     (payload.compatibility !== undefined && canonicalJson(payload.compatibility) !== canonicalJson(PROVIDER_PACK_COMPATIBILITY)) ||
-    canonicalJson(payload.pins) !== canonicalJson(REMOTE_PROVIDER_PACK_PINS) ||
+    canonicalJson(payload.pins) !== canonicalJson(payload.pins?.piRpc === undefined ? REMOTE_PROVIDER_PACK_PINS
+      : { ...REMOTE_PROVIDER_PACK_PINS, piRpc: QUALIFIED_PI_RPC_PROFILE.runtimeVersion }) ||
+    (payload.nativeProviders?.pi_rpc !== undefined && (payload.pins.piRpc !== QUALIFIED_PI_RPC_PROFILE.runtimeVersion
+      || payload.piRpcProfileDigest !== QUALIFIED_PI_RPC_PROFILE.commandDigest)) ||
     canonicalJson(payload.acpxProfileDigests) !==
       canonicalJson(REMOTE_PROVIDER_PACK_PROFILE_DIGESTS) ||
     typeof payload.target?.platform !== "string" ||
@@ -13465,7 +13472,7 @@ function* providerPackIdentityChecks(
     );
   }
   const digest = `sha256:${createHash("sha256")
-    .update(canonicalJson(payload))
+    .update(canonicalProviderPackDigestJson(payload))
     .digest("hex")}`;
   if (manifest.digest !== digest) {
     throw new Error(
@@ -13504,6 +13511,11 @@ function* providerPackIdentityChecks(
       payload.artifacts?.acpxSidecar,
       REMOTE_PROVIDER_PACK_ARTIFACT_PATHS.acpxSidecar,
     ],
+    ...(payload.nativeProviders?.pi_rpc ? [
+      ["native Pi proxy", payload.artifacts?.piRpcProxy, "dist/cli/pi-rpc-app-server-proxy.cjs"],
+      ["native Pi executable", payload.artifacts?.piRpcExecutable,
+        "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"],
+    ] as const : []),
   ] as const;
   for (const [label, artifact, expectedPath] of artifactEntries) {
     const artifactPath = providerPackRelativePath(
@@ -13517,7 +13529,7 @@ function* providerPackIdentityChecks(
     }
     if (
       !/^sha256:[a-f0-9]{64}$/.test(artifact?.sha256 ?? "") ||
-      (verifyControllerFiles && (yield { kind: "file", path: resolve(packRoot, artifactPath) }) !== artifact.sha256)
+      (verifyControllerFiles && (yield { kind: "file", path: resolve(packRoot, artifactPath) }) !== artifact?.sha256)
     ) {
       throw new Error(
         `runner_remote_provider_artifact_incompatible: ${label} digest mismatch`,
@@ -13818,6 +13830,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
   runner: CommandManagedRuntimeRunner;
   configuredProviderPackRoot: string | null;
   manifest: RemoteProviderPackManifest;
+  provider?: PackProvider;
   signal?: AbortSignal;
   trace?: NativeRunTrace;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => void | Promise<void>;
@@ -13830,7 +13843,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
   let preinstalledProviderPackRoots: string[] = [];
   const verifyRemoteProviderPack = async (packRoot: string) => {
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
-      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest });
+      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: input.provider });
   };
   const discoverPreinstalledProviderPack = async () => {
     if (!remoteTarget || !remoteCommandRunner) return [];
@@ -15705,7 +15718,10 @@ async function createRunnerdBackendWithinSessionClaim(
   const requiresRemoteProviderPack =
     remoteTarget !== null &&
     (input.execution.provider.kind === "opencode" ||
-      input.execution.provider.kind === "acpx");
+      input.execution.provider.kind === "acpx" || input.execution.provider.kind === "pi_rpc");
+  const packProvider: PackProvider | undefined = input.execution.provider.kind === "pi_rpc"
+    ? { kind: "pi_rpc" } : input.execution.provider.kind === "opencode" ? { kind: "opencode" }
+      : input.execution.provider.kind === "acpx" ? { kind: "acpx", agent: input.execution.provider.agent } : undefined;
   const artifactStorage = remoteTarget?.transport === "sandbox" && input.controllerPersistence
     && input.execution.provider.kind === "opencode" ? durableNativeHarnessStorage() : null;
   const providerArtifactsSignal = () => input.executionContext?.signal
@@ -15750,7 +15766,7 @@ async function createRunnerdBackendWithinSessionClaim(
     input.runnerRemoteProviderPackPath?.trim() || remotePiCompanion?.providerPack || bundledClaudeRoot || null;
   const useBundledRemoteImageAssets =
     (requiresRemoteProviderPack && !configuredProviderPackRoot &&
-      (input.execution.provider.kind === "opencode" || remoteClaude)) ||
+      (input.execution.provider.kind === "opencode" || input.execution.provider.kind === "pi_rpc" || remoteClaude)) ||
     shouldUseBundledAcpxImageAssets({
       requiresRemoteProviderPack, configuredProviderPackRoot,
       provider: input.execution.provider,
@@ -15913,7 +15929,7 @@ async function createRunnerdBackendWithinSessionClaim(
     if (!remoteTarget || !remoteCommandRunner || !expectedProviderPackManifest)
       return;
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
-      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest });
+      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: packProvider });
     providerPackVerified = true;
   };
 
@@ -15946,7 +15962,7 @@ async function createRunnerdBackendWithinSessionClaim(
         const manifest = await measureNativeRunnerSpan(input.trace, "provider_pack.compatibility", () => verifyRemoteProviderPackIdentity({
           runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot: installation.root,
           manifest: expected, installation,
-          provider: input.execution.provider as { kind: "opencode" } | { kind: "acpx"; agent: string },
+          provider: packProvider,
           requireExactIdentity: retainProviderPack || explicitProviderPackSelection,
           requireCurrentOpenCodeProxy: !retainProviderPack
             && runnerEnvironment?.PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS === "1",
@@ -16012,7 +16028,7 @@ async function createRunnerdBackendWithinSessionClaim(
       const sourceSignals = [startupSignal, contextSignal].filter((signal): signal is AbortSignal => !!signal);
       const prepared = await prepareRemoteProviderPackOnTarget({
         target: remoteTarget, runner: remoteCommandRunner, configuredProviderPackRoot,
-        manifest: expectedProviderPackManifest, trace: input.trace, onLog: input.onLog,
+        manifest: expectedProviderPackManifest, provider: packProvider, trace: input.trace, onLog: input.onLog,
         signal: sourceSignals.length ? AbortSignal.any(sourceSignals) : undefined,
       });
       activeRemoteProviderPackRoot = prepared.root;
@@ -17066,6 +17082,10 @@ async function createRunnerdBackendWithinSessionClaim(
         ...effectiveRunnerEnvironmentBase,
         PAPERCLIP_WORKSPACE_CWD: input.execution.workspace.cwd,
       };
+  if (input.execution.provider.kind === "pi_rpc") {
+    // Pi state belongs to this runner session, never the controller account.
+    effectiveRunnerEnvironment.PI_CODING_AGENT_DIR = posix.join(remoteRunnerFilesystemRoot ?? root, "pi-agent");
+  }
   const archiveContinuityState = async (previous?: PersistedNativeSession) => {
     if (hasRetainedWarmTransitionEvidence(root)) {
       throw new Error("native_runner_warm_transition_recovery_unproven");
@@ -17248,7 +17268,7 @@ async function createRunnerdBackendWithinSessionClaim(
         ...accountingTransportOptions,
         onCredentialsUpdated: credentialUpdates?.onCredentialsUpdated,
         provider:
-          input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud" : input.execution.provider.kind === "codex"
+          input.execution.provider.kind === "pi_rpc" ? "pi_rpc" : input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud" : input.execution.provider.kind === "codex"
             ? "codex"
             : input.execution.provider.kind === "opencode"
               ? "opencode"
@@ -17259,6 +17279,10 @@ async function createRunnerdBackendWithinSessionClaim(
                   : input.execution.provider.kind === "acpx"
                     ? "acpx"
                     : undefined,
+        ...(input.execution.provider.kind === "pi_rpc" ? {
+          piRpcThinkingLevel: input.execution.provider.piRpcThinkingLevel,
+          piRuntimeDirectory: posix.join(remoteRunnerFilesystemRoot ?? root, "pi"),
+        } : {}),
         ...(input.execution.provider.kind === "acpx"
           ? {
               acpxAgent: input.execution.provider.agent,
@@ -17335,6 +17359,12 @@ async function createRunnerdBackendWithinSessionClaim(
                 expectedProviderPackManifest.payload.artifacts.nodeCommand
                   .sha256,
               providerPackAuthorityDigest: expectedProviderPackManifest.digest,
+              ...(input.execution.provider.kind === "pi_rpc" ? {
+                piCommand: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.artifacts.piRpcExecutable!.path),
+                piCommandSha256: expectedProviderPackManifest.payload.artifacts.piRpcExecutable!.sha256,
+                piProxyPath: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.artifacts.piRpcProxy!.path),
+                piProxySha256: expectedProviderPackManifest.payload.artifacts.piRpcProxy!.sha256,
+              } : {}),
               opencodeCommand: posix.join(
                 activeRemoteProviderPackRoot,
                 expectedProviderPackManifest.payload.artifacts
