@@ -138,8 +138,9 @@ export class PiRpcDriver implements HarnessDriver {
     environment.PI_CODING_AGENT_DIR = agentHome;
     await configurePiNativeMcp(agentHome, environment);
     await syncPiCompanySkills(agentHome, initialContext.runtimeContext);
-    const agentFiles = bindAcpxAgentFiles(initialContext.runtimeContext as NativeRuntimeContextSnapshot | undefined,
-      [directory, agentHome, ...(this.#options.command && isAbsolute(this.#options.command) ? [dirname(this.#options.command)] : [])]);
+    const runtimeContext = initialContext.runtimeContext as NativeRuntimeContextSnapshot | undefined;
+    const agentFiles = runtimeContext?.instructions ? bindAcpxAgentFiles(runtimeContext,
+      [directory, agentHome, ...(this.#options.command && isAbsolute(this.#options.command) ? [dirname(this.#options.command)] : [])]) : null;
     if (agentFiles) {
       agentFiles.assertHeld();
       environment.AGENT_HOME = agentFiles.root;
