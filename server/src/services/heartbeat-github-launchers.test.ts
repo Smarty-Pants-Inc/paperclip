@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { cleanupGitHubOperationLaunchers } from "@paperclipai/adapter-utils/execution-target";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { describe, expect, it, vi } from "vitest";
+import type { EnvironmentLease } from "@paperclipai/shared";
 import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
 
 const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "daytona", remoteCwd: "/workspace" };
@@ -109,12 +110,20 @@ process.stdout.write(JSON.stringify({token:process.env.GH_TOKEN || '', githubTok
       const result = await child;
       return { ...result, exitCode: 0, signal: null, timedOut: false, pid: null, startedAt };
     };
-    const sandboxTarget = { ...target, remoteCwd: root, runner: { execute } };
+    const executeCounted = vi.fn(execute);
+    const lease = { id: "real-lease", companyId: "company", environmentId: "env", providerLeaseId: "real-box",
+      status: "active", metadata: {} } as EnvironmentLease;
+    const sandboxTarget = { ...target, leaseId: lease.id, remoteCwd: root, runner: { execute: executeCounted } };
     const base = { native: true, githubConfigured: false, agentId: "agent-a", target: sandboxTarget,
-      cwd: root, env: imageEnv, brokerUrl: "https://unused.invalid", createBrokerToken: () => { throw new Error("must not mint a capability"); } };
+      cwd: root, env: imageEnv, preparation: { lease, configuration: {},
+        save: async (receipt: unknown) => { lease.metadata = { anonymousGitHubLaunchers: receipt }; } },
+      brokerUrl: "https://unused.invalid", createBrokerToken: () => { throw new Error("must not mint a capability"); } };
     const first = await prepareHeartbeatGitHubLaunchers({ ...base, runId: "run-one" });
     await cleanupGitHubOperationLaunchers({ runId: "run-one", target: sandboxTarget });
+    const callsAfterFirst = executeCounted.mock.calls.length;
+    expect(callsAfterFirst).toBeGreaterThan(0);
     const second = await prepareHeartbeatGitHubLaunchers({ ...base, runId: "run-two" });
+    expect(executeCounted).toHaveBeenCalledTimes(callsAfterFirst);
     expect(first.env.PAPERCLIP_GITHUB_LAUNCHER_DIR).toBe(second.env.PAPERCLIP_GITHUB_LAUNCHER_DIR);
     expect(await readFile(path.join(first.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), "utf8")).not.toContain("ambient-token");
     // A still-live provider uses its first-turn environment, not the new one.
@@ -133,3 +142,47 @@ process.stdout.write(JSON.stringify({token:process.env.GH_TOKEN || '', githubTok
     await rm(root, { recursive: true, force: true });
   }
 }, 20_000);
+
+// Keep reason: image credentials must stay isolated when staging is skipped.
+it("reuses anonymous layout only on the same live lease and launcher configuration", async () => {
+  const lease = { id: "lease-a", companyId: "company-a", environmentId: "environment-a", providerLeaseId: "box-a",
+    status: "active", metadata: {} } as EnvironmentLease;
+  const mint = vi.fn(() => "must-not-cache-this");
+  const prepare = vi.fn(async ({ env }) => ({ ...env, PATH: "/wrappers:" + env.PATH,
+    ZDOTDIR: "/wrappers", BASH_ENV: "/wrappers/.bashrc", GH_CONFIG_DIR: "/wrappers/gh-config", PAPERCLIP_GITHUB_LAUNCHER_DIR: "/wrappers" }));
+  const inputs = { native: true, githubConfigured: false, agentId: "agent-a", target: { ...target, leaseId: lease.id },
+    cwd: "/workspace", env: { PATH: "/usr/bin", GH_TOKEN: "image-secret" }, brokerUrl: "", createBrokerToken: mint,
+    preparation: { lease, configuration: { plugin: "config-one" }, save: async (receipt: unknown) => { lease.metadata = { anonymousGitHubLaunchers: receipt }; } } };
+  const first = await prepareHeartbeatGitHubLaunchers({ ...inputs, runId: "one" }, prepare);
+  const second = await prepareHeartbeatGitHubLaunchers({ ...inputs, runId: "two" }, prepare);
+  expect(prepare).toHaveBeenCalledTimes(1);
+  expect(second).toEqual(first);
+  expect(second.env.GH_TOKEN).toBe("");
+  expect(JSON.stringify(lease.metadata)).not.toContain("image-secret");
+  expect(mint).not.toHaveBeenCalled();
+  inputs.preparation.configuration.plugin = "config-two";
+  await prepareHeartbeatGitHubLaunchers({ ...inputs, runId: "three" }, prepare);
+  expect(prepare).toHaveBeenCalledTimes(2);
+  lease.id = inputs.target.leaseId = "lease-b";
+  await prepareHeartbeatGitHubLaunchers({ ...inputs, runId: "four" }, prepare);
+  expect(prepare).toHaveBeenCalledTimes(3);
+  lease.providerLeaseId = "box-b";
+  await prepareHeartbeatGitHubLaunchers({ ...inputs, runId: "five" }, prepare);
+  expect(prepare).toHaveBeenCalledTimes(4);
+  lease.expiresAt = new Date(0);
+  await prepareHeartbeatGitHubLaunchers({ ...inputs, runId: "six" }, prepare);
+  expect(prepare).toHaveBeenCalledTimes(5);
+});
+
+it("does not publish a launcher reuse receipt after failed staging", async () => {
+  const save = vi.fn();
+  const lease = { id: "lease", companyId: "company", environmentId: "env", providerLeaseId: "box", status: "active", metadata: {} } as EnvironmentLease;
+  const prepare = vi.fn().mockRejectedValueOnce(new Error("stage failed")).mockResolvedValue({ PATH: "/bin" });
+  const input = { native: true, githubConfigured: false, agentId: "agent", runId: "run", cwd: "/workspace",
+    target: { ...target, leaseId: lease.id }, env: {}, brokerUrl: "", createBrokerToken: () => "",
+    preparation: { lease, configuration: {}, save } };
+  await expect(prepareHeartbeatGitHubLaunchers(input, prepare)).rejects.toThrow("stage failed");
+  expect(save).not.toHaveBeenCalled();
+  await prepareHeartbeatGitHubLaunchers(input, prepare);
+  expect(prepare).toHaveBeenCalledTimes(2);
+});

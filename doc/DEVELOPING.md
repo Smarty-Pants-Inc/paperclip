@@ -5308,3 +5308,18 @@ records rotation, unchanged credential, changed binding, undispatched task, or a
 null export. No secret bytes appear in PRP events or lease metadata. The plugin
 provider must support live account-bound exports before enabling the paired Core
 handler.
+
+### Native anonymous GitHub launcher preparation
+
+Token-free native sandbox GitHub wrappers reuse a content-keyed layout receipt
+in the existing environment lease metadata. The key binds the company, agent,
+lease/allocation, workspace path, launcher implementation, PATH and execution
+configuration. Missing, expired or changed lease/configuration state stages the
+wrappers again. Only layout variables are saved; ambient credentials and broker
+tokens are never saved. Configured native access remains session-owner-managed;
+run-scoped broker capabilities are still minted per run and are not cached.
+Previous releases have no receipt and stage normally on their first turn.
+
+Focused coverage: `pnpm exec vitest run server/src/services/heartbeat-github-launchers.test.ts`.
+The real shell-backed wrapper test checks that the second turn makes no staging
+commands, still excludes image credentials and keeps local Git identity usable.

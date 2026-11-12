@@ -3124,6 +3124,17 @@ export function heartbeatService(
           cwd: executionWorkspace.cwd,
           env: gitExecutionEnv,
           brokerUrl: configuredPaperclipApiBaseUrl() ?? "",
+          ...(activeEnvironmentLease ? { preparation: {
+            lease: activeEnvironmentLease.lease,
+            configuration: { environment: selectedEnvironment?.config, adapter: agent.adapterConfig, runtime: agent.runtimeConfig },
+            save: async (receipt: import("./heartbeat-github-launchers.js").AnonymousGitHubLauncherReceipt) => {
+              await db.update(environmentLeases).set({
+                metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ anonymousGitHubLaunchers: receipt })}::jsonb`,
+              }).where(and(eq(environmentLeases.id, activeEnvironmentLease.lease.id),
+                eq(environmentLeases.companyId, agent.companyId), eq(environmentLeases.status, "active"),
+                eq(environmentLeases.heartbeatRunId, run.id)));
+            },
+          } } : {}),
           createBrokerToken: () => createRuntimeToolsToken({
             agentId: agent.id,
             companyId: agent.companyId,
