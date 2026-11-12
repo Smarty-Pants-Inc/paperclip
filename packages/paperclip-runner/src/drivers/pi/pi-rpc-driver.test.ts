@@ -85,6 +85,33 @@ describe("PiRpcDriver P0 regressions", () => {
     } finally { await f.close(); }
   // Real-sized homogeneous argument previews exercise diagnostic redaction too.
   }, 30_000);
+  it("P0-1 completes six 50KB reads despite agent_end carrying all results", async () => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "read six files" } });
+      f.transport.send({ type: "agent_start" });
+      const messages = Array.from({ length: 6 }, (_, i) => auditToolRound(f.transport, `read-${i}`, i * 10 + 1, { path: `f${i}` }, "x".repeat(50_000))).flat();
+      auditFinal(f.transport, 100, messages); await flushFailure();
+      expect(f.events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType)).toEqual(["turn.started", "turn.completed"]);
+      expect(f.events.at(-1)).toMatchObject({ turnId: turn.turnId, payload: { status: "completed" } });
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  }, 30_000);
+  it("P0-1 completes after a 300KB image tool result without closing Pi", async () => {
+    const f = await failureFixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "read an image" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "image", toolName: "read", args: { path: "shot.png" } });
+      const result = { role: "toolResult", toolCallId: "image", toolName: "read", timestamp: 1, content: [{ type: "image", data: "A".repeat(300_000), mimeType: "image/png" }] };
+      f.transport.send({ type: "tool_execution_end", toolCallId: "image", toolName: "read", result, isError: false });
+      f.transport.send({ type: "message_start", message: result }); f.transport.send({ type: "message_end", message: result });
+      auditFinal(f.transport, 100, [result]); await flushFailure();
+      expect(f.events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType)).toEqual(["turn.started", "turn.completed"]);
+      expect(f.events.some(event => event.eventType === "tool.execution.completed" && event.payload.status === "completed")).toBe(true);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
 });
 
 describe("PiRpcDriver", () => {

@@ -57,7 +57,9 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
     try {
       const records = await queuedRecords(child);
       const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
-      expect(() => projector.project(records[0])).toThrow("pi_projection_record_limit");
+      const projected = projector.project(records[0]);
+      expect(projected[0]).toMatchObject({ eventType: "item.started", payload: { input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+      expect(projector.project(records[1]).some(event => event.payload.output === "new")).toBe(true);
       expect(records.slice(0, 2).map(record => record.state)).toEqual(["first", "second"]);
       expect(records[1]).toMatchObject({ args: { input: "small" } });
     } finally { await child.close(); }

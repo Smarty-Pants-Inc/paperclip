@@ -46,7 +46,15 @@ function displayValue(value: unknown, depth = 0, preview = (value: string) => va
   return value;
 }
 function contentText(value: unknown): string {
-  return (Array.isArray(value) ? value : []).map(block => record(block)).filter(block => block.type === "text").map(block => text(block.text)).join("\n");
+  return (Array.isArray(value) ? value : []).map(block => record(block)).map(block => block.type === "text" ? text(block.text)
+    : `[Pi ${text(block.type).slice(0, 40) || "content"} omitted from projection]`).join("\n");
+}
+/** Receipts need counts and cost provenance, not arbitrary provider metadata. */
+function projectionUsage(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  const usage = record(value), cost = record(usage.cost);
+  return { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, totalTokens: usage.totalTokens,
+    cost: { total: cost.total, totalFromProvider: cost.totalFromProvider } };
 }
 /** Display-only preview; budget counts JSON escaping, not just native UTF-8. */
 function toolOutputPreview(value: string, budget: number): string {
@@ -61,7 +69,7 @@ function toolOutputPreview(value: string, budget: number): string {
   if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low--;
   return marker + value.slice(0, low);
 }
-/** Remove only observed tool display data when checking the control/input budget. */
+/** Keep only tool receipt fields the display consumes; binary/details stay in Pi. */
 function toolControlRecord(event: Record<string, unknown>): Record<string, unknown> {
   const key = event.type === "message_end" && record(event.message).role === "toolResult" ? "message"
     : event.type === "tool_execution_update" ? "partialResult"
@@ -69,10 +77,9 @@ function toolControlRecord(event: Record<string, unknown>): Record<string, unkno
   if (!key) return event;
   const result = record(event[key]);
   if (result !== event[key]) return event;
-  const { details: _details, structuredContent, content, ...control } = result;
-  const structured = record(structuredContent);
-  return { ...event, [key]: { ...control,
-    content: Array.isArray(content) ? content.map(part => record(part).type === "text" ? { ...record(part), text: "" } : part) : content,
+  const structured = record(result.structuredContent);
+  return { ...event, [key]: { role: result.role, toolCallId: result.toolCallId, toolName: result.toolName, isError: result.isError,
+    durationMs: result.durationMs, timestamp: result.timestamp, usage: projectionUsage(result.usage), content: [],
     structuredContent: { exit_code: structured.exit_code, truncated: structured.truncated },
   } };
 }
@@ -229,32 +236,35 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     }));
   };
   return { project(value: unknown): PiProjectedEvent[] {
-    // Only tool output display is lossy. Inputs, receipts, usage and control
-    // remain authoritative and fail clearly if they alone exceed the budget.
-    const serialized = JSON.stringify(value);
-    if (!serialized) throw new Error("pi_projection_record_limit");
-    const recordBytes = Buffer.byteLength(serialized);
     const source = record(value);
-    // Custom session entries are extension display history, not executable
-    // inputs or final receipts. Digest an oversized body before redaction.
-    const customDisplay = source.type === "entry_appended" && record(source.entry).type === "custom"
-      && source.toolCallId === undefined && recordBytes > MAX_RECORD_BYTES;
-    const control = customDisplay ? { ...source, entry: { ...record(source.entry), data: undefined } } : toolControlRecord(source);
-    if (recordBytes > MAX_RECORD_BYTES && (control === source || Buffer.byteLength(JSON.stringify(control)) > MAX_RECORD_BYTES)) throw new Error("pi_projection_record_limit");
+    // These records carry redundant history, user prompts or binary results
+    // which this projector never displays. In particular, agent_end is NOT
+    // settlement; its full message list is already persisted by Pi.
+    if (["response", "session", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "extension_ui_response"].includes(text(source.type))
+      || (source.type === "message_start" && record(source.message).role !== "assistant")
+      || (source.type === "message_end" && !["assistant", "toolResult"].includes(text(record(source.message).role)))) return [];
+    const serialized = JSON.stringify(value) ?? "null";
+    const recordBytes = Buffer.byteLength(serialized);
     displayTruncated = recordBytes > MAX_RECORD_BYTES;
     originalToolOutput = undefined;
-    let observed: unknown = customDisplay ? control : value;
-    if (control !== source && !customDisplay) {
+    const control = toolControlRecord(source);
+    let observed: unknown = source.type === "message_start" ? { type: source.type, message: { role: "assistant" } }
+      : source.type === "message_end" && record(source.message).role === "assistant" ? { ...source, message: { ...record(source.message), usage: projectionUsage(record(source.message).usage) } }
+      : source;
+    // Diagnostics consume only method/type; don't walk unknown or extension
+    // payloads, however large or deeply nested they happen to be.
+    if (!["message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end", "compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"].includes(text(source.type))) observed = { type: source.type, method: source.method };
+    if (control !== source) {
       const key = source.type === "message_end" ? "message" : source.type === "tool_execution_update" ? "partialResult" : "result";
       const nativeResult = record(source[key]);
       const fullBody = contentText(nativeResult.content);
       const preview = Buffer.byteLength(fullBody) <= MAX_TEXT_BYTES ? fullBody : toolOutputPreview(fullBody, MAX_TEXT_BYTES);
-      if (displayTruncated || preview !== fullBody) {
-        // Bound before diagnostic redaction: ignored megabyte details and
-        // cumulative output must not enter its regular-expression passes.
-        originalToolOutput = { body: fullBody, truncated: preview !== fullBody };
-        observed = { ...control, [key]: { ...record(control[key]), content: [{ type: "text", text: preview }] } };
-      }
+      const omittedContent = Array.isArray(nativeResult.content) && nativeResult.content.some(part => record(part).type !== "text");
+      if (omittedContent) displayTruncated = true;
+      // Bound before diagnostic redaction: ignored megabyte details, images and
+      // cumulative output must not enter its regular-expression passes.
+      originalToolOutput = { body: fullBody, truncated: preview !== fullBody || omittedContent };
+      observed = { ...control, [key]: { ...record(control[key]), content: [{ type: "text", text: preview }] } };
     }
     const event = record(displayValue(observed, 0, projectText));
     const output: PiProjectedEvent[] = [];
@@ -379,12 +389,21 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     for (const projected of output) {
       if (Buffer.byteLength(JSON.stringify(projected)) <= MAX_RECORD_BYTES - 2048) continue;
       const isTool = projected.eventType.startsWith("tool.execution.") || ["tool", "commandExecution"].includes(text(projected.payload.kind));
-      if (!isTool) throw new Error("pi_projection_record_limit");
-      const keys = ["text", "output", "message"].filter(key => typeof projected.payload[key] === "string");
+      // Duplicate structured arguments can dominate the wire budget even when
+      // each preview fits. Degrade only display fields, retaining identity,
+      // terminal status and accounting. Never throw a record-size failure.
+      if (isTool) {
+        const item = record(projected.payload.item);
+        if (item.input !== undefined || item.arguments !== undefined) {
+          const preview = projectText(JSON.stringify(item.input ?? item.arguments), 8192);
+          projected.payload.item = { ...item, input: { truncated: true, preview }, arguments: { truncated: true, preview } };
+        }
+        if (typeof projected.payload.input === "string") projected.payload.input = projectText(projected.payload.input, 8192);
+      }
+      const keys = ["text", "output", "message", "name", "model"].filter(key => typeof projected.payload[key] === "string");
       const base = { ...projected, payload: { ...projected.payload } };
       for (const key of keys) base.payload[key] = "";
-      const budget = Math.floor((MAX_RECORD_BYTES - 2048 - Buffer.byteLength(JSON.stringify(base))) / Math.max(keys.length, 1));
-      if (!keys.length || budget < 128) throw new Error("pi_projection_record_limit");
+      const budget = Math.max(128, Math.floor((MAX_RECORD_BYTES - 2048 - Buffer.byteLength(JSON.stringify(base))) / Math.max(keys.length, 1)));
       for (const key of keys) projected.payload[key] = toolOutputPreview(text(projected.payload[key]), budget);
       if (projected.eventType.startsWith("tool.execution.")) projected.payload.outputTruncated = true;
       displayTruncated = true;
