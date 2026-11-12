@@ -84,7 +84,7 @@ export async function selectPiConversation(db: Db, input: {
         legacyUnverified = true;
         legacyId = undefined;
       }
-      if (!legacyUnverified && owner && execution?.provider?.kind && execution.binding) previous = { schema: "paperclip.pi-conversation.v1", id: legacyId, generation: 1,
+      if (!legacyUnverified && typeof legacyId === "string" && owner && execution?.provider?.kind && execution.binding) previous = { schema: "paperclip.pi-conversation.v1", id: legacyId, generation: 1,
         boundary: { ...input.boundary, provider: execution.provider.kind === "codex" ? "codex_app_server" : execution.provider.kind,
           cwd: execution.workspace?.cwd ?? null,
           workspaceId: execution.binding.executionWorkspaceId === owner.id ? null : execution.binding.executionWorkspaceId ?? null },
