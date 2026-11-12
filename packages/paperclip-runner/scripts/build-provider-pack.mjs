@@ -1,3 +1,5 @@
+import { materializePiRpcDistribution } from "./materialize-pi-rpc-distribution.mjs";
+import { QUALIFIED_PI_RPC_PROFILE } from "../dist/drivers/pi/qualified-profile.js";
 import profiles from "../acpx-profiles.json" with { type: "json" };
 import compatibility from "../src/live/provider-pack-contract.json" with { type: "json" };
 import { createHash } from "node:crypto";
@@ -176,6 +178,14 @@ try {
     throw new Error("Provider pack Node is not portable after relocation; build with a standalone Node distribution");
   }
 
+  // Independent native Pi payload. Never reuse providers.pi (the preserved ACPX lane).
+  const nativeProviders = {};
+  if (process.platform === "linux" && process.arch === "x64") {
+    const path = "provider-assets/pi_rpc/linux-x64";
+    const native = await materializePiRpcDistribution({ outputRoot: join(temporaryRoot, path), nodeExecutable: stableNodeCommand });
+    nativeProviders.pi_rpc = { version: native.version, profileDigest: QUALIFIED_PI_RPC_PROFILE.commandDigest,
+      closureDigest: native.closureDigest, path, sha256: sha256Tree(join(temporaryRoot, path)) };
+  }
   const candidateProviders = {};
   for (const provider of providerPackProviders(process.platform, process.arch, candidates)) {
     const assetPath = `provider-assets/${provider}/${process.platform}-${process.arch}`;
@@ -272,6 +282,8 @@ try {
     );
   }
 
+  const piRpcProxyPath = "dist/cli/pi-rpc-app-server-proxy.cjs";
+  const piRpcExecutablePath = "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
   const opencodeProxyPath = "dist/cli/opencode-app-server-proxy.cjs";
   const acpxSidecarPath = "dist/cli/acpx-runtime-sidecar.cjs";
   const opencodeCommand = "node_modules/.bin/opencode";
@@ -286,6 +298,8 @@ try {
     nodeCommand,
     productionLock,
     opencodeProxyPath,
+    piRpcProxyPath,
+    ...(nativeProviders.pi_rpc ? [piRpcExecutablePath] : []),
     acpxSidecarPath,
     opencodeCommand,
     opencodeExecutable,
@@ -323,6 +337,7 @@ try {
       nodeMinimum: minimumNodeVersion.join("."),
       codex: profiles.profiles.codex.agentRuntimeVersion,
       opencode: "1.18.34",
+      ...(nativeProviders.pi_rpc ? { piRpc: "1.5.2" } : {}),
       acpx: profiles.acpxVersion,
       grok: profiles.profiles.grok.agentRuntimeVersion,
       claudeAcp: profiles.profiles.claude.agentServerVersion,
@@ -338,6 +353,8 @@ try {
       .update("\n")
       .update(distDigest)
       .digest("hex")}`,
+    nativeProviders,
+    piRpcProfileDigest: QUALIFIED_PI_RPC_PROFILE.commandDigest,
     acpxProfileDigests: {
       grok: profiles.profiles.grok.commandDigest,
       claude:
@@ -347,6 +364,9 @@ try {
     },
     ...providerPackManifestFields(candidateProviders, candidates),
     artifacts: {
+      piRpcProxy: { path: piRpcProxyPath, sha256: sha256File(join(temporaryRoot, piRpcProxyPath)) },
+      ...(nativeProviders.pi_rpc ? { piRpcExecutable: { path: piRpcExecutablePath,
+        sha256: sha256File(join(temporaryRoot, piRpcExecutablePath)) } } : {}),
       grokLauncher: {
         path: "dist/providers/grok/launcher.cjs",
         sha256: sha256File(join(temporaryRoot, "dist/providers/grok/launcher.cjs")),

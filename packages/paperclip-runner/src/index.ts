@@ -151,3 +151,5 @@ export { PiRpcDriver, type PiRpcDriverOptions } from "./drivers/pi/pi-rpc-driver
 export { createPiNativeSessionBackend } from "./backends/pi-native-backend.js";
 export { QUALIFIED_PI_RPC_PROFILE, parsePiRpcProfile, PI_THINKING_LEVELS, type PiThinkingLevel, type NativePiRpcProfileSnapshot } from "./drivers/pi/qualified-profile.js";
 
+
+export { PI_RPC_DISTRIBUTION, verifyPiRpcDistribution } from "./drivers/pi/pi-rpc-installation.js";

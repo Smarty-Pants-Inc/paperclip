@@ -19,6 +19,11 @@ const DOC_KEYS = new Set(["description", "title", "$comment", "examples", "markd
  * is built. A TypeScript contract joins the digest by moving its definition
  * into a schema under protocol/ and generating the TypeScript from it. */
 export const CONTRACTS = [
+  { id: "pi-rpc-release", probes: [
+    { kind: "json", path: `${R}/pi-rpc-profile.json` },
+    { kind: "json", path: `${R}/pi-rpc-distribution.json` },
+    { kind: "json", path: `${R}/scripts/pi-rpc-distribution/package-lock.json` },
+  ] },
   { id: "prp.schemas", expand: { kind: "json-dir", dirs: [`${R}/protocol/schemas`, `${R}/protocol/provider-schemas`] } },
   { id: "generated", expand: { dirs: [`${R}/generated`], suffix: ".json", idPrefix: "generated.", probes: [{ kind: "json", stripDocs: true }] } },
   // Rust file and module names are private, so the crate is one contract whose

@@ -154,3 +154,9 @@ test("a build context without a registered source fails instead of producing ano
     rmSync(empty, { recursive: true, force: true });
   }
 });
+
+test("native Pi release/distribution/lock inputs invalidate the pack independently of ACPX", () => {
+  for (const path of [`${R}/pi-rpc-profile.json`, `${R}/pi-rpc-distribution.json`, `${R}/scripts/pi-rpc-distribution/package-lock.json`]) {
+    assert.notEqual(digestWith(path, source => { const data = JSON.parse(source); data.nativePiReleaseProbe = true; return JSON.stringify(data); }), baseline);
+  }
+});

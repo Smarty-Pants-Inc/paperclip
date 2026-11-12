@@ -110,7 +110,8 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
 ];
 const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
-    "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
+    "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+    "PAPERCLIP_AI_PROVIDER_AUTH",
     "PAPERCLIP_AI_PROVIDER_KEY",
     "PAPERCLIP_AI_PROVIDER_URL",
     "PAPERCLIP_AGENT_KEY_ID",
@@ -247,7 +248,9 @@ fn warm_attachment_keeps_provider(
         return false;
     }
     current == next
-        || (current.is_some() && next.is_some() && matches!(provider, "codex" | "opencode" | "pi_rpc"))
+        || (current.is_some()
+            && next.is_some()
+            && matches!(provider, "codex" | "opencode" | "pi_rpc"))
 }
 
 /// Run-scoped identity a retained OpenCode proxy needs on each turn/start: its
@@ -1452,7 +1455,10 @@ impl CodexProvider {
             } else {
                 params_object.insert("permissions".to_owned(), json!(provider.permission_profile));
             }
-            if matches!(config.provider.as_str(), "opencode" | "pi_rpc" | "cursor_cloud") {
+            if matches!(
+                config.provider.as_str(),
+                "opencode" | "pi_rpc" | "cursor_cloud"
+            ) {
                 if let Some(mode) = &config.conversation_mode {
                     params_object.insert("conversationMode".to_owned(), json!(mode));
                 }
