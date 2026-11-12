@@ -203,13 +203,13 @@ describe("resident Pi model binding", () => {
     await finish(f, 2);
     const spans = f.events.filter(event => event.runId === "run-b")
       .flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
-    expect(f.transport.commands.slice(commandStart)).toEqual([...admission, ...admission, "prompt"]);
+    expect(f.transport.commands.slice(commandStart)).toEqual([...admission, "get_state", "prompt"]);
     expect(spans.map(span => span.name)).toEqual(expect.arrayContaining([
       "runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn", "runner.pi.prompt_to_started",
       ...admission.map(command => `runner.pi.admission.${command}`),
     ]));
-    expect(spans.filter(span => span.name === "runner.pi.admission.get_state")).toHaveLength(4);
-    expect(spans).toHaveLength(14);
+    expect(spans.filter(span => span.name === "runner.pi.admission.get_state")).toHaveLength(3);
+    expect(spans).toHaveLength(10);
     for (const span of spans) {
       expect(span.outcome).toBe("ok");
       expect(span.startedAtMs).toBeGreaterThanOrEqual(startedAtMs);
@@ -339,7 +339,7 @@ describe("resident Pi model binding", () => {
     const socket = f.launch.env!.PAPERCLIP_PI_BIND_SOCKET!; expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(103);
     expect((await stat(dirname(socket))).mode & 0o777).toBe(0o700);
     const turn = await f.session.startTurn({ message: { role: "user", text: "one" } }); expect(turn.turnId).toBe(initial.turnId);
-    expect(f.ipc).toEqual([]); expect(f.transport.commands).toEqual(["get_state", ...admission, "get_available_models", ...admission, "prompt"]);
+    expect(f.ipc).toEqual([]); expect(f.transport.commands).toEqual(["get_state", ...admission, "get_available_models", "get_state", "prompt"]);
     await finish(f);
   });
   it("keeps INITIAL for initial/same-context attach and post-claim admission, without bind/begin IPC", async () => {
@@ -349,7 +349,7 @@ describe("resident Pi model binding", () => {
     expect((await f.session.snapshot()).binding).toMatchObject({ epoch: 1, preparedTurnId: initial.turnId });
     const turn = await f.session.startTurn({ message: { role: "user", text: "one" } });
     expect(turn.turnId).toBe(initial.turnId); expect(f.ipc).toEqual([]);
-    expect(f.transport.commands).toEqual(["get_state", ...admission, "get_available_models", ...admission, ...admission, ...admission, "prompt"]); await finish(f);
+    expect(f.transport.commands).toEqual(["get_state", ...admission, "get_available_models", "get_state", "get_state", "prompt"]); await finish(f);
     await f.session.attachRun({ runId: "run-a", baseInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 } });
     await f.session.attachRun({ runId: "run-a", baseInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 } });
     await f.session.revalidateAfterClaim(); await f.session.startTurn({ message: { role: "user", text: "two" } });
@@ -363,7 +363,7 @@ describe("resident Pi model binding", () => {
     await f.session.startTurn({ message: { role: "user", text: "two" } });
     const secondBind = f.ipc.find(command => command.type === "bind")!;
     expect(secondBind).toMatchObject({ type: "bind", sessionId: "host-session", expectedPriorEpoch: 1, epoch: 2, runId: "run-a" });
-    expect(f.transport.order.slice(13)).toEqual(["ipc:bind", ...admission, "ipc:begin_turn", "prompt"]);
+    expect(f.transport.order.slice(9)).toEqual(["ipc:bind", ...admission, "ipc:begin_turn", "prompt"]);
     await finish(f, 2);
     expect(await revoked((secondBind as any).provider)).toBe(true);
     await f.session.attachRun({ runId: "run-b", baseInstructions: "", dynamicTools: [], runtimeContext: null });
@@ -412,7 +412,7 @@ describe("resident Pi model binding", () => {
     expect(handler).not.toHaveBeenCalled();
     expect(f.transport.uiResponses).toEqual([{ id: "old-ui", cancelled: true }, { id: 0, cancelled: true }]);
     expect(f.events.some(event => event.eventType === "runtime_request.created")).toBe(false);
-    expect(f.transport.commands).toEqual(["get_state", ...admission, "get_available_models", ...admission, "prompt"]);
+    expect(f.transport.commands).toEqual(["get_state", ...admission, "get_available_models", "get_state", "prompt"]);
     expect(f.ipc).toEqual([]);
   });
 });
