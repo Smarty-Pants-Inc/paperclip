@@ -1,0 +1,10 @@
+{
+  "name": "paperclip-pi-langfuse-e2e-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@langfuse/pi-observability-plugin": "0.1.2",
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/otlp-exporter-base": "0.221.0"
+  }
+}
