@@ -62,6 +62,7 @@ Until upstream's next stable release, the seam branches are based on upstream
 | S5 | Runner Pi extensions: operator-named extension list (`PAPERCLIP_PI_EXTENSIONS`) and native mode (`PAPERCLIP_PI_EXTENSIONS_MODE=native`: Pi's own settings, packages, project .pi and -e, owned extension first, private session dir) | built, in review | `hq/2026-11-11c` @ 877b6be5 + e2104449 | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | draft for the owner's approval |
 | S6 | Runner Pi thinking: a Claude model's top level runs as Pi xhigh, never max; only an identified GPT model keeps max (fail closed) | in tonight's hq image (build in progress) | `hq/2026-11-11c` @ e4e01bb7 + d892d229 | independent review PASS | not offered |
 | S7 | Managed custom gateways for Runner Pi: a protocol-generic runner loopback broker (Chat, Messages, Responses) plus a per-harness custom-protocol declaration | building | `seam/runner-provider-broker` | [smarty-dev#20018](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20018), review `doc/seams/runner-provider-broker.md` | not offered |
+| S8 | Provider-generic sandbox snapshot qualification: any sandbox provider plugin qualifies its snapshot through the existing `resolveSnapshotIdentity` handshake (`lease.metadata.snapshotIdentity`), not only Daytona | built, in review | `seam/provider-snapshot-qualification` @ 9e2f6e77 | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045), research `SNAPQ-A` | not offered |
 
 S1's scope and whether it splits into separate seams are being settled by its design
 review. This table is updated when the review result is recorded.
@@ -92,6 +93,22 @@ S4 follow-ups (all under 5, only if S4 is un-parked): N1 the issue-update helper
   - the hello outcome;
   - the Rust allowlist.
 - **Upstream**: not offered. The PR text is drafted, and offering it needs the product owner's yes.
+
+### S8 Provider snapshot qualification
+
+- **Problem**: a Runner agent on a non-Daytona sandbox provider (Boat) that starts from a provider snapshot gets no platform qualification. Discovery offers only Legacy, and converting to the Runner throws `agent_runner_unavailable`.
+- **No existing way**:
+  - `isQualifiableDaytonaSnapshot` and the probe accept only `provider === "daytona"` (`sandbox-snapshot-qualification.ts` L14-41, `environment-probe.ts` L38-68 at e053f733).
+  - Template capture hooks capture a reference but don't qualify it.
+  - The OCI-digest route is generic, but only for providers that boot from an immutable image digest.
+  - The managed-Cloud exception doesn't apply to self-hosted instances.
+  - Upstream has not changed this since 76da2fec, and no open pull request covers it.
+- **Design**: `readSnapshotIdentity(value, ref, provider)` and `isQualifiableSandboxSnapshot`, with a deprecated Daytona alias kept. Daytona keeps its UUID rule. The probe requires the selected provider, the lease provider and the identity provider to be the same. The identity sits inside the existing v2 proof, so there is no migration.
+  - The plugin returns `{provider, requestedRef, id, name, organizationId, createdAt}` only when asked with `resolveSnapshotIdentity:true`.
+  - A pinned id creates by that id or fails; it never resolves a replacement name.
+- **Extensions built on it**: the Boat sandbox plugin (cluster-lead) for the native Runner Pi harness.
+- **Tests**: `sandbox-snapshot-qualification.test.ts` and `environment-probe.test.ts`, red 7 and green 89/89. The `environment-runtime` and `agent-runner-selection` regressions pass.
+- **Upstream**: not offered. It is written to be offered, and needs the product owner's yes.
 
 ## Upstream-pending carries
 
