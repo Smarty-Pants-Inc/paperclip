@@ -242,6 +242,64 @@ describe("P0-3 bounded display text and arguments", () => {
   });
 });
 
+// Keep reason: S11-real on image 033be069 supplied child usage on bg_wait,
+// but permanent child-incomplete state discarded the parent+child run delta.
+describe("S11 native child usage receipts (prompt/path-free capture)", () => {
+  it("includes four parent replies and the async child's native bg_wait receipt exactly once", () => {
+    const wire = fixture("s11-child-usage.jsonl").trim().split("\n").map(line => JSON.parse(line));
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const events = wire.flatMap(receipt => projector.project(receipt));
+    const report = events.filter(event => event.eventType === "usage.reported").at(-1)!;
+    expect(report.payload).toMatchObject({ accountingComplete: true });
+    expect(events.filter(event => event.payload.kind === "usage").at(-1)?.payload.usage)
+      .toMatchObject({ runDelta: { inputTokens: 35, outputTokens: 20 }, runDeltaComplete: true });
+    expect(wire.flatMap(receipt => projector.project(receipt))).toEqual([]);
+  });
+  it("does not clear an unreported sibling when one async child completes", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    for (const id of ["a", "b"]) {
+      projector.project({ type: "tool_execution_start", toolCallId: id, toolName: "subagent", args: {} });
+      projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: id, toolName: "subagent", details: { asyncId: id }, content: [] } });
+    }
+    const complete = (id: string) => projector.project({ type: "message_end", message: {
+      role: "toolResult", toolCallId: `wait-${id}`, toolName: "bg_wait", content: [], usage,
+      details: { completions: [{ runId: id, state: "complete", results: [{ usage }] }] },
+    } }).find(event => event.eventType === "usage.reported")!;
+    expect(complete("a").payload.accountingComplete).toBe(false);
+    expect(complete("b").payload.accountingComplete).toBe(true);
+  });
+  it("does not call an aggregate complete when one completed child has no measurement", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    for (const id of ["a", "b"]) {
+      projector.project({ type: "tool_execution_start", toolCallId: id, toolName: "subagent", args: {} });
+      projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: id, toolName: "subagent", details: { asyncId: id }, content: [] } });
+    }
+    const reports = projector.project({ type: "message_end", message: {
+      role: "toolResult", toolCallId: "wait", toolName: "bg_wait", content: [], usage,
+      details: { completions: [
+        { runId: "a", state: "complete", results: [{ usage }] },
+        { runId: "b", state: "complete", results: [{}] },
+      ] },
+    } });
+    expect(reports.find(event => event.eventType === "usage.reported")?.payload.accountingComplete).toBe(false);
+  });
+  it("does not clear pending children from an unrelated or incomplete receipt", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    projector.project({ type: "tool_execution_start", toolCallId: "a", toolName: "subagent", args: {} });
+    projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "a", toolName: "subagent", details: { asyncId: "a" }, content: [] } });
+    const reports = projector.project({ type: "message_end", message: {
+      role: "toolResult", toolCallId: "wait-other", toolName: "bg_wait", content: [], usage,
+      details: { completions: [{ runId: "other", state: "complete", results: [{ usage }] }] },
+    } });
+    expect(reports.find(event => event.eventType === "usage.reported")?.payload.accountingComplete).toBe(false);
+    const partial = projector.project({ type: "message_end", message: {
+      role: "toolResult", toolCallId: "wait-a", toolName: "bg_wait", content: [], usage: { input: 7, output: 4 },
+      details: { completions: [{ runId: "a", state: "complete", results: [{ usage }] }] },
+    } });
+    expect(partial.find(event => event.eventType === "usage.reported")?.payload.accountingComplete).toBe(false);
+  });
+});
+
 describe("synthetic boundary cases (not claimed as native capture)", () => {
   it("replaces streamed partials with final authoritative receipts, not another delta", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });

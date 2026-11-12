@@ -571,6 +571,13 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
       }
     }
     const finalRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    // Keep reason: S11-parent succeeded with real model usage in the wire but
+    // usageJson=0 after a display-only usage item erased the measured snapshot.
+    for (const run of finalRuns.filter(run => run.status === "succeeded")) {
+      const usage = run.usageJson;
+      expect(Number(usage?.inputTokens ?? 0) + Number(usage?.outputTokens ?? 0) + Number(usage?.cachedInputTokens ?? 0),
+        `succeeded Pi run ${run.id} retains the scripted model's reported usage`).toBeGreaterThan(0);
+    }
     expect(finalRuns.some(run => run.errorCode === "pi_rpc_transport_failed")).toBe(false);
     expect(finalRuns.every(run => run.status !== "failed" && run.status !== "timed_out")).toBe(true);
     const finalEvents = [];

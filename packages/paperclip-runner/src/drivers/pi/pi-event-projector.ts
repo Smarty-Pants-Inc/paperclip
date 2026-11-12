@@ -71,7 +71,7 @@ function toolOutputPreview(value: string, budget: number): string {
   if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low--;
   return marker + value.slice(0, low);
 }
-/** Keep only tool receipt fields the display consumes; binary/details stay in Pi. */
+/** Keep tool receipt fields and bounded child correlation; arbitrary details stay in Pi. */
 function toolControlRecord(event: Record<string, unknown>): Record<string, unknown> {
   const key = event.type === "message_end" && record(event.message).role === "toolResult" ? "message"
     : event.type === "tool_execution_update" ? "partialResult"
@@ -80,9 +80,26 @@ function toolControlRecord(event: Record<string, unknown>): Record<string, unkno
   const result = record(event[key]);
   if (result !== event[key]) return event;
   const structured = record(result.structuredContent);
+  const details = record(result.details);
+  const childId = (value: unknown) => typeof value === "string" && value.length <= 240 ? value : "";
+  // Only bounded native child correlation identities survive control projection;
+  // never walk transcripts, prompts, artifact paths or arbitrary tool details.
+  const childDetails = {
+    runId: childId(details.runId), asyncId: childId(details.asyncId),
+    completions: Array.isArray(details.completions) ? details.completions.slice(0, MAX_ACTIVE_TOOLS).map(value => {
+      const completion = record(value);
+      const results = completion.results;
+      const usageAvailable = Array.isArray(results) && results.length > 0 && results.length <= MAX_ACTIVE_TOOLS && results.every(result => {
+        const usage = record(record(result).usage);
+        return [usage.input, usage.output, usage.cacheRead, usage.cacheWrite]
+          .every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+      });
+      return { runId: childId(completion.runId), state: childId(completion.state), usageAvailable };
+    }) : [],
+  };
   return { ...event, [key]: { role: result.role, toolCallId: result.toolCallId, toolName: result.toolName, isError: result.isError,
     durationMs: result.durationMs, timestamp: result.timestamp, usage: projectionUsage(result.usage), content: [],
-    structuredContent: { exit_code: structured.exit_code, truncated: structured.truncated },
+    structuredContent: { exit_code: structured.exit_code, truncated: structured.truncated }, details: childDetails,
   } };
 }
 
@@ -122,7 +139,8 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   let costComplete = true;
   let diagnosticCount = 0;
   let compactionCount = 0;
-  let childUsageUnknown = false;
+  const pendingChildren = new Set<string>();
+  const childRunTools = new Map<string, string>();
   let displayTruncated = false;
   const projectText = (value: string, budget = MAX_TEXT_BYTES): string => {
     const preview = boundedText(value, budget);
@@ -233,6 +251,18 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       else { estimatedCostUsd = (estimatedCostUsd ?? 0) + cost; costProvenance = "catalog_estimate"; }
       if (!Number.isFinite(estimatedCostUsd ?? 0) || !Number.isFinite(providerReportedCostUsd ?? 0)) throw new Error("pi_projection_cost_overflow");
     } else costComplete = false;
+    if (message.role === "toolResult" && Object.keys(counts).length >= 5) {
+      if (message.toolName === "subagent") pendingChildren.delete(toolFor(message.toolCallId, message.toolName).id);
+      const completions = record(message.details).completions;
+      if (message.toolName === "bg_wait" && Array.isArray(completions)) {
+        for (const value of completions) {
+          const completion = record(value);
+          const child = childRunTools.get(text(completion.runId));
+          if (completion.state === "complete" && completion.usageAvailable === true && child) pendingChildren.delete(child);
+        }
+      }
+    }
+    const childUsageUnknown = pendingChildren.size > 0;
     const receiptItemId = `${prefix}:pi-usage:${digest(key)}`;
     // App native task chat folds per-receipt runDelta, not accumulated totals
     // (native-run-events.ts:1364-1405). Catalog prices are NOT provider billing.
@@ -246,14 +276,14 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     output.push(emit("item.completed", receiptItemId, {
       kind: "usage", usage: { receiptId: digest(receiptItemId), scope: message.role === "toolResult" ? "nested_tool_message" : "assistant_message", source: "pi_message_usage",
         total: { ...totals }, runDelta: { ...totals }, runDeltaComplete: usageComplete && !childUsageUnknown, childUsage: "unknown",
-        ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }), ...(providerReportedCostUsd === undefined ? {} : { providerReportedCostUsd }), costProvenance, costComplete,
+        ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }), ...(providerReportedCostUsd === undefined ? {} : { providerReportedCostUsd }), costProvenance, costComplete: costComplete && !childUsageUnknown,
       },
     }));
   };
   const projectTool = (event: Record<string, unknown>, output: PiProjectedEvent[]) => {
     const tool = toolFor(event.toolCallId, event.toolName);
-    if (tool.name === "subagent") { childUsageUnknown = true; usageComplete = false; costComplete = false; }
     if (tool.terminal) return;
+    if (tool.name === "subagent") pendingChildren.add(tool.id);
     if (event.args !== undefined) argumentsFor(tool, event.args);
     startTool(tool, output);
     const end = event.type === "tool_execution_end";
@@ -403,6 +433,13 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         messageId = undefined; blocks = new Map();
       } else if (message.role === "toolResult") {
         projectTool({ type: "tool_execution_end", toolCallId: message.toolCallId, toolName: message.toolName, result: message, isError: message.isError, durationMs: message.durationMs }, output);
+        // Async launch has no usage yet. Its native identity lets a later
+        // bg_wait receipt settle this child without clearing unpaid siblings.
+        if (message.toolName === "subagent") {
+          const details = record(message.details);
+          const child = toolFor(message.toolCallId, message.toolName).id;
+          for (const runId of [text(details.runId), text(details.asyncId)].filter(Boolean)) childRunTools.set(runId, child);
+        }
         if (message.usage !== undefined) {
           const id = nativeId(message.toolCallId);
           if (id === undefined) throw new Error("pi_projection_tool_id_missing");

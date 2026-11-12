@@ -216,6 +216,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     receipts: Map<string, string>;
     total: Record<string, number>;
     complete: boolean;
+    accountingComplete: boolean;
   }>();
 
   const log = (message: string) => options.writeStderr?.(message);
@@ -272,7 +273,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
 
   function reportUsage(opened: PiRpcProxySession, event: {
     runId: string; turnId?: string; itemId?: string;
-  }, payload: Record<string, unknown>): void {
+  }, payload: Record<string, unknown>, accountingOnly = false): void {
     const delta = record(payload.runDelta);
     const cumulative = record(payload.cumulative);
     let total = cumulative;
@@ -283,17 +284,21 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       // TURN snapshot. Keep one ledger keyed by captured run/turn and receipt,
       // including settled turns so late replay cannot charge a message twice.
       const turnKey = JSON.stringify([event.runId, event.turnId]);
-      const turn = usageByTurn.get(turnKey) ?? { receipts: new Map<string, string>(), total: {} as Record<string, number>, complete: true };
-      const wasComplete = turn.complete;
+      const turn = usageByTurn.get(turnKey) ?? { receipts: new Map<string, string>(), total: {} as Record<string, number>, complete: true, accountingComplete: true };
+      const wasComplete = turn.accountingComplete;
       const receiptId = text(payload.providerRequestId) || text(event.itemId);
-      turn.complete &&= complete && !!event.turnId && !!receiptId;
+      // Missing message measurements are permanent; a pending native child is
+      // not. Its later receipt can complete accounting without recounting the
+      // parent's tokens. An explicit missing receipt still fails closed.
+      if (!accountingOnly) turn.complete &&= payload.runDeltaAvailable === true && !!event.turnId && !!receiptId;
+      complete &&= turn.complete;
       usageByTurn.set(turnKey, turn);
       if (receiptId) {
         const fingerprint = JSON.stringify(Object.entries(delta).sort(([left], [right]) => left.localeCompare(right)));
         const previous = turn.receipts.get(receiptId);
         if (previous !== undefined) {
           if (previous !== fingerprint) throw new Error("pi_proxy_conflicting_usage_receipt");
-          if (turn.complete === wasComplete) return;
+          if (complete === wasComplete) return;
         } else {
           turn.receipts.set(receiptId, fingerprint);
           for (const [key, value] of Object.entries(delta)) {
@@ -308,7 +313,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       } else if (!wasComplete && Object.keys(delta).length === 0) return;
       total = { ...usageTotals };
       last = { ...turn.total };
-      complete = turn.complete;
+      turn.accountingComplete = complete;
     }
     send({
       method: "thread/tokenUsage/updated",
@@ -350,7 +355,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         // Unaccounted summarization/child work can invalidate a previously
         // complete turn even without another assistant usage receipt.
         if (payload.kind === "usage" && record(payload.usage).runDeltaComplete === false) {
-          reportUsage(opened, { runId: event.runId, turnId: event.turnId }, { runDeltaAvailable: false, accountingComplete: false });
+          // This is a snapshot invalidation, not a missing message receipt.
+          reportUsage(opened, { runId: event.runId, turnId: event.turnId }, { runDeltaAvailable: false, accountingComplete: false }, true);
         }
         send(openCodeProxyItemNotification({
           eventType: event.eventType,
