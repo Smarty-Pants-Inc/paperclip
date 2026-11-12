@@ -323,16 +323,16 @@ describe("runner E2E catalog", () => {
   });
 
   it("validates the core, local-integrity, breadth, and warm suites", () => {
-    expect(runnerProfiles).toHaveLength(8);
+    expect(runnerProfiles).toHaveLength(9);
     expect(openRouterBreadthProfiles).toHaveLength(4);
     expect(runnerEnvironments).toHaveLength(2);
     expect(runnerTasks).toHaveLength(3);
     expect(localIntegrityTasks).toHaveLength(2);
     expect(openRouterBreadthTasks).toHaveLength(3);
     expect(runnerSuites.map((suite) => suite.expectedMatrixSize)).toEqual([
-      1, 9, 2, 9, 2, 4, 1, 1, 3, 2, 2, 4, 4, 4, 4, 4, 4, 8, 10, 6, 63, 12, 6, 4, 2, 4, 2, 30, 3, 16, 16, 20, 2, 2, 1, 6, 8, 46, 2, 23, 15, 68, 6, 6, 20, 26, 2, 56, 1, 247, 28, 18, 2, 6, 6, 13, 10, 4, 48, 16, 10, 2, 1, 1, 4, 116, 2, 1, 2,
+      1, 10, 2, 10, 2, 4, 1, 1, 3, 2, 2, 4, 4, 4, 4, 4, 4, 8, 10, 6, 63, 12, 6, 4, 2, 4, 2, 30, 3, 16, 16, 20, 2, 2, 1, 6, 8, 46, 2, 23, 15, 68, 6, 6, 20, 26, 2, 56, 1, 247, 28, 18, 2, 6, 6, 13, 10, 4, 54, 18, 10, 2, 1, 1, 4, 116, 2, 1, 2,
     ]);
-    expect(validateRunnerCatalog()).toHaveLength(1089);
+    expect(validateRunnerCatalog()).toHaveLength(1099);
     const frozenDirectory = new URL("./chat-scenarios/", import.meta.url);
     const frozenIds = readdirSync(frozenDirectory).filter(name => name.endsWith(".yaml") && name !== "defaults.yaml")
       .flatMap(name => parseDocument(readFileSync(new URL(name, frozenDirectory), "utf8")).toJS().scenarios.map((scenario: { id: string }) => scenario.id));
@@ -343,15 +343,15 @@ describe("runner E2E catalog", () => {
     expect(chat.map(cell => legacyScenarioIds[cell.task.id] ?? cell.task.id).sort()).toEqual(frozenIds.sort());
     for (const cell of chat) expect(selectRunnerExecutions(parseRunnerSelectors(["--id", cell.id]))).toEqual([cell]);
     expect(selectRunnerExecutions(parseRunnerSelectors(["--all"])).some(cell => ["chat-features", "chat-setup-health"].includes(cell.suite.id))).toBe(false);
-    expect(new Set(runnerMatrix.map((entry) => entry.id)).size).toBe(1089);
+    expect(new Set(runnerMatrix.map((entry) => entry.id)).size).toBe(1099);
     expect(
       runnerMatrix.filter((entry) => entry.suite.id === "core-compatibility"),
-    ).toHaveLength(48);
+    ).toHaveLength(54);
     expect(
       runnerMatrix.filter(
         (entry) => entry.suite.id === "local-session-integrity",
       ),
-    ).toHaveLength(16);
+    ).toHaveLength(18);
     expect(
       runnerMatrix.filter(
         (entry) => entry.suite.id === "openrouter-model-breadth",
@@ -367,7 +367,7 @@ describe("runner E2E catalog", () => {
         (total, execution) => total + execution.task.expectedRunCount,
         0,
       ),
-    ).toBe(405);
+    ).toBe(419);
     expect(
       runnerTasks.find((task) => task.id === "plan-revise-accept")
         ?.attemptTimeoutMs,
@@ -952,7 +952,7 @@ describe("runner E2E selectors", () => {
       "daytona",
     ]);
     const selected = selectRunnerExecutions(options);
-    expect(selected).toHaveLength(16);
+    expect(selected).toHaveLength(19);
     expect(
       selected.every(
         (entry) =>
@@ -971,10 +971,10 @@ describe("runner E2E selectors", () => {
     const jobs = buildMatrixJobs(
       selectRunnerExecutions(parseRunnerSelectors(["--all"])),
     );
-    expect(jobs).toHaveLength(183);
-    expect(jobs.filter((job) => job.needsDaytona)).toHaveLength(26);
-    expect(jobs.filter((job) => !job.needsDaytona)).toHaveLength(157);
-    expect(new Set(jobs.map((job) => job.executionId)).size).toBe(183);
+    expect(jobs).toHaveLength(191);
+    expect(jobs.filter((job) => job.needsDaytona)).toHaveLength(29);
+    expect(jobs.filter((job) => !job.needsDaytona)).toHaveLength(162);
+    expect(new Set(jobs.map((job) => job.executionId)).size).toBe(191);
     expect(
       jobs.find(
         (job) =>

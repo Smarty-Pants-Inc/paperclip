@@ -62,6 +62,7 @@ import { DEFAULT_CODEX_LOCAL_MODEL } from "../../packages/adapters/codex-local/s
 import { models as claudeModels } from "../../packages/adapters/claude-local/src/index.js";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "../../packages/adapters/kimi-local/src/index.js";
 import { DEFAULT_GROK_LOCAL_MODEL } from "../../packages/adapters/grok-local/src/index.js";
+import { QUALIFIED_PI_RPC_PROFILE } from "../../packages/paperclip-runner/src/drivers/pi/qualified-profile.js";
 import { QUALIFIED_ACPX_PROFILES } from "../../packages/paperclip-runner/src/drivers/acpx/qualified-profiles.js";
 import { ACPX_QUALIFICATION_MODELS } from "../acpx-qualification-models.js";
 import { QUALIFIED_OPENCODE_MODEL } from "../../packages/paperclip-runner/src/drivers/opencode/opencode-server-driver.js";
@@ -205,10 +206,16 @@ function legacyProfile(input: {
 
 const PI_QUALIFICATION_THINKING_LEVEL = "low" as const;
 
+// Acceptance inputs are explicit, not inferred from the production RPC declaration.
+const PI_RPC_ACCEPTANCE_MODEL = "cliproxyapi-anthropic/claude-opus-5-5";
+const PI_RPC_ACCEPTANCE_THINKING_LEVEL = "xhigh" as const;
+
 function nativeProfile(input: {
   id: string;
   label: string;
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
+  piRpcProfile?: RunnerProfileFixture["piRpcProfile"];
+  piRpcThinkingLevel?: RunnerProfileFixture["piRpcThinkingLevel"];
   model: string;
   credential: RunnerProfileFixture["credential"];
   acpxAgent?: "claude" | "codex" | "grok" | "cursor" | "copilot" | "pi" | "kimi";
@@ -248,10 +255,13 @@ function nativeProfile(input: {
           ? { codexPermissionMode: "never" }
           : input.provider === "opencode"
             ? { opencodePermissionMode: "allow" }
-            : { acpxPermissionMode: "approve-all", acpxAgent: input.acpxAgent };
+            : input.provider === "pi_rpc"
+              ? {}
+              : { acpxPermissionMode: "approve-all", acpxAgent: input.acpxAgent };
       return commonAgent(buildInput, input.id, "paperclip_runner", {
         provider: input.provider,
         model: input.model,
+        ...(input.provider === "pi_rpc" ? { piRpcProfile: input.piRpcProfile, piRpcThinkingLevel: input.piRpcThinkingLevel } : {}),
         ...(input.qualificationCandidate ? { timeoutSec: 120 } : {}),
         lifecycleMode: "per_turn",
         idleTimeoutMs: 300_000,
@@ -339,6 +349,19 @@ export const runnerProfiles: readonly RunnerProfileFixture[] = [
     provider: "codex",
     model: DEFAULT_CODEX_LOCAL_MODEL,
     credential: "OPENAI_API_KEY",
+  }),
+  nativeProfile({
+    id: "runner-pi-rpc",
+    label: "Runner Pi RPC",
+    provider: QUALIFIED_PI_RPC_PROFILE.providerKind,
+    piRpcProfile: QUALIFIED_PI_RPC_PROFILE,
+    piRpcThinkingLevel: PI_RPC_ACCEPTANCE_THINKING_LEVEL,
+    model: PI_RPC_ACCEPTANCE_MODEL,
+    credential: "ANTHROPIC_API_KEY",
+    modelQualification: {
+      source: "candidate_runner_profile",
+      qualificationId: `pi_rpc:${QUALIFIED_PI_RPC_PROFILE.runtimePackage}:${QUALIFIED_PI_RPC_PROFILE.runtimeVersion}:profile${QUALIFIED_PI_RPC_PROFILE.profileVersion}`,
+    },
   }),
   nativeProfile({
     id: "runner-opencode",
@@ -1216,9 +1239,9 @@ const daytonaControllerOutageEnvironment: EnvironmentFixture = {
   },
 };
 
-function managedWarmProfiles(profiles: readonly RunnerProfileFixture[]): RunnerProfileFixture[] {
+export function managedWarmProfiles(profiles: readonly RunnerProfileFixture[]): RunnerProfileFixture[] {
   return profiles.filter(profile => {
-    const backend = profile.provider === "codex" ? "codex_app_server" : profile.provider === "opencode" ? "opencode_server" : "acpx_runtime";
+    const backend = profile.provider === "codex" ? "codex_app_server" : profile.provider === "opencode" ? "opencode_server" : profile.provider === "pi_rpc" ? "pi_rpc" : "acpx_runtime";
     return supportsManagedNativeWarmSession({ backend, acpxAgent: "acpxAgent" in profile ? profile.acpxAgent : undefined },
       profile.credential === "COPILOT_GITHUB_TOKEN" ? { provider: "github", method: "api_key" } : undefined);
   }).map(profile => ({ ...profile, buildAgent(input: AgentFixtureBuildInput) {
@@ -2000,7 +2023,7 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     profiles: runnerProfiles,
     environments: runnerEnvironments,
     tasks: runnerTasks,
-    expectedMatrixSize: 48,
+    expectedMatrixSize: runnerProfiles.length * runnerEnvironments.length * runnerTasks.length,
   },
   {
     id: "local-session-integrity",
@@ -2011,7 +2034,7 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     profiles: runnerProfiles,
     environments: [localEnvironment],
     tasks: localIntegrityTasks,
-    expectedMatrixSize: 16,
+    expectedMatrixSize: runnerProfiles.length * localIntegrityTasks.length,
   },
   {
     id: "openrouter-model-breadth",
@@ -2138,6 +2161,7 @@ export function suiteDefinitionHash(suite: RunnerSuiteFixture) {
           id: profile.id,
           model: profile.model,
           qualification: profile.modelQualification,
+          ...(profile.provider === "pi_rpc" ? { provider: profile.provider, piRpcProfile: profile.piRpcProfile, piRpcThinkingLevel: profile.piRpcThinkingLevel } : {}),
           ...(profile.qualificationCandidate === "pi" ? { piThinkingLevel: PI_QUALIFICATION_THINKING_LEVEL } : {}),
         })),
         environments: suite.environments.map((environment) => ({

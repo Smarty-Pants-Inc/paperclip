@@ -1,3 +1,5 @@
+import type { NativePiRpcProfileSnapshot, PiThinkingLevel } from "../../packages/paperclip-runner/src/drivers/pi/qualified-profile.js";
+
 export const CREDENTIAL_NAMES = [
   "OPENAI_API_KEY",
   "ANTHROPIC_API_KEY",
@@ -97,6 +99,9 @@ export interface RunnerProfileFixture {
       | "openrouter_rankings_snapshot";
     qualificationId: string;
   };
+  /** Native RPC declaration and acceptance thinking; never ACPX Pi settings. */
+  piRpcProfile?: NativePiRpcProfileSnapshot;
+  piRpcThinkingLevel?: PiThinkingLevel;
   qualificationCandidate?: "cursor" | "copilot" | "pi" | "kimi";
   ranking?: {
     rank: number;
