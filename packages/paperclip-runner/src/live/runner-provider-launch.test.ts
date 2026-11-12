@@ -201,6 +201,12 @@ describe("built-in provider launch preparation", () => {
 
 // Trust boundary: prevent native Pi falling through the Codex or ACPX launch path.
 describe("native Pi qualified launch", () => {
+  it.each([[undefined, "max"], ["low", "low"]] as const)("uses the shared default in prepared launch requirements (%s)", (configured, expected) => {
+    const requested = runnerProviderLaunchRequirements({ provider: "pi_rpc", piRpcThinkingLevel: configured }, requirements.identity,
+      { model: "paperclip/claude-opus-5-5" }, null, "Native instructions");
+    expect(createRunnerProviderLaunch(requested, { ...environment, piProxyPath: "/runtime/pi-proxy.cjs" }))
+      .toMatchObject({ model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: expected });
+  });
   it.each(PI_THINKING_LEVELS)("preserves native thinking %s without ACPX defaults", level => {
     const requested = runnerProviderLaunchRequirements({ provider: "pi_rpc", piRpcThinkingLevel: level }, requirements.identity,
       { model: "managed/my-model" }, null, "Native instructions");

@@ -14,6 +14,10 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./pi-rpc-default-thinking": {
+      "types": "./dist/pi-rpc-default-thinking.d.ts",
+      "import": "./dist/pi-rpc-default-thinking.js"
+    },
     "./*": "./src/*.ts"
   },
   "publishConfig": {
@@ -49,6 +53,7 @@
     "smol-toml": "^1.9.1"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
     "@types/node": "^24.0.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"

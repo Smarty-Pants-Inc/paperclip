@@ -262,6 +262,18 @@ describe("Pi RPC app-server facade proxy", () => {
     } finally { await proxy.close(); }
   });
 
+  // Keep reason: executor's per-turn wire field must reach native Pi unchanged.
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("accepts per-turn effort=%s, ahead of the session environment", async effort => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_PI_THINKING_LEVEL: "low" } });
+    try {
+      await request(proxy, sink, 200, "thread/start", { model: "paperclip/claude-opus-5-5" });
+      expect(await request(proxy, sink, 201, "turn/start", { effort, input: [{ type: "text", text: "hello" }] })).toHaveProperty("result");
+      expect(session.turnInputs[0]).toMatchObject({ piRpcThinkingLevel: effort });
+    } finally { await proxy.close(); }
+  });
+
   it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)(
     "preserves the Pi thinking level %s verbatim",
     (level) => expect(parsePiThinkingLevel(level)).toBe(level),
