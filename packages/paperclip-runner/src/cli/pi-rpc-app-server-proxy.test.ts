@@ -160,8 +160,10 @@ describe("Pi RPC app-server facade proxy", () => {
     expect(withoutAmbientPiCommand(original)).toEqual({ MODEL_API_KEY: "kept" });
     expect(original.PAPERCLIP_PI_RPC_COMMAND).toBe("/tmp/unverified-pi");
     if (process.platform === "linux") {
-      expect(trustedPiLaunchBinding([TRUSTED_PI_EXECUTABLE_ARG, "/proc/self/fd/7"]))
-        .toEqual({ command: "/proc/self/fd/7", commandFd: 7 });
+      // Node cannot run a JS entrypoint from a sealed memfd, so runnerd must
+      // also pass the verified original path; the descriptor alone is refused.
+      expect(() => trustedPiLaunchBinding([TRUSTED_PI_EXECUTABLE_ARG, "/proc/self/fd/7"]))
+        .toThrow(/unavailable/);
     }
   });
 
