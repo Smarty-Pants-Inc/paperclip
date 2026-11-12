@@ -295,22 +295,16 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           payload,
         }));
       } else if (event.eventType === "usage.reported") {
-        // Rust's facade reads tokenUsage.total/last, not cumulative/runDelta.
-        // Keep receipt metadata verbatim; never infer a model, cost or delta.
-        // In particular, an unavailable delta must omit `last`, not reuse total.
+        // Preserve the Harness usage receipt fields that runnerd's strict
+        // facade rehydrates; never estimate Pi usage from streamed text.
         send({
           method: "thread/tokenUsage/updated",
           params: {
-            ...payload,
             threadId: opened.ids().driverSessionId,
-            turnId: typeof event.turnId === "string" ? event.turnId : undefined,
+            ...(typeof event.turnId === "string" ? { turnId: event.turnId } : {}),
             cumulative: record(payload.cumulative),
             runDelta: record(payload.runDelta),
             runDeltaAvailable: payload.runDeltaAvailable === true,
-            tokenUsage: {
-              total: record(payload.cumulative),
-              ...(payload.runDeltaAvailable === true ? { last: record(payload.runDelta) } : {}),
-            },
             ...(payload.context === undefined ? {} : { context: record(payload.context) }),
           },
         });

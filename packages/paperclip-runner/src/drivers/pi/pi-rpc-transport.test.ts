@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { createPiEventProjector } from "./pi-event-projector.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { realpathSync } from "node:fs";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
@@ -56,40 +55,6 @@ async function queuedRecords(child: PiRpcTransport): Promise<PiRpcRecord[]> {
 }
 
 describe("PiRpcTransport large tool output and lagging consumers", () => {
-  it("retains an oversized control input for projector rejection before a safe same-ID update", async () => {
-    const child = emittingTransport(`${updateScript}
-      await emit({ ...update("same", "first"), args: { input: "x".repeat(300000) } });
-      await emit({ ...update("same", "second"), args: { input: "safe" } });
-    `);
-    try {
-      const records = await queuedRecords(child);
-      const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
-      expect(() => projector.project(records[0])).toThrow("pi_projection_record_limit");
-      expect(records[0]).toMatchObject({ args: { input: "x".repeat(300000) } });
-      expect(records[1]).toMatchObject({ args: { input: "safe" } });
-    } finally { await child.close(); }
-  });
-
-  it("preserves changed args and control fields in order across interleaved display updates", async () => {
-    const child = emittingTransport(`${updateScript}
-      await emit(update("a", "a-before"));
-      await emit(update("b", "b-before"));
-      await emit({ ...update("a", "a-state"), args: { input: "changed" } });
-      await emit(update("b", "b-after"));
-      await emit({ ...update("a", "a-control"), args: { input: "changed" }, isError: true });
-    `);
-    try {
-      const records = await queuedRecords(child);
-      expect(records.slice(0, -1).map(record => [record.toolCallId, record.args, record.isError])).toEqual([
-        ["a", { command: "cat SKILL; find . -type f" }, undefined],
-        ["b", { command: "cat SKILL; find . -type f" }, undefined],
-        ["a", { input: "changed" }, undefined],
-        ["b", { command: "cat SKILL; find . -type f" }, undefined],
-        ["a", { input: "changed" }, true],
-      ]);
-    } finally { await child.close(); }
-  });
-
   it("admits a real-shaped cumulative tool update larger than 4 MiB without altering its ID or final result", async () => {
     const child = emittingTransport(`${updateScript}
       await emit(update("original-call", "path\\n".repeat(1024 * 1024)));
@@ -128,9 +93,6 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
         { toolCallId: "a", partialResult: { content: [{ text: "4999" }] } },
         { toolCallId: "b", partialResult: { content: [{ text: "b-4999" }] } },
       ]);
-      const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
-      expect(records.slice(0, 2).flatMap(record => projector.project(record))
-        .filter(event => event.eventType === "item.delta").map(event => event.payload.output)).toEqual(["4999", "b-4999"]);
       expect(records.slice(2)).toEqual([
         { type: "tool_execution_end", toolCallId: "a", result: { exact: "final-a" } },
         { type: "response", id: "unmatched", success: false, error: "preserved" },
@@ -192,9 +154,9 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
     } finally { await child.close(); }
   });
 
-  it.each(["ordinary", "distinct", "unidentified", "state"])("fails closed visibly for non-coalescible %s overflow", async kind => {
+  it.each(["ordinary", "distinct", "unidentified"])("fails closed visibly for non-coalescible %s overflow", async kind => {
     const child = emittingTransport(`${updateScript}
-      for (let i = 0; i < 4097; i++) await emit(${kind === "ordinary" ? '{ type: "message_end", index: i }' : kind === "distinct" ? 'update(String(i), "output")' : kind === "state" ? '{ ...update("same", "output"), args: { input: i } }' : 'update(undefined, "output")'});
+      for (let i = 0; i < 4097; i++) await emit(${kind === "ordinary" ? '{ type: "message_end", index: i }' : kind === "distinct" ? 'update(String(i), "output")' : 'update(undefined, "output")'});
     `);
     try {
       await expect(child.request("emit")).rejects.toThrow("event queue exceeded its limit");

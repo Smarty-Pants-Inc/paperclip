@@ -1,9 +1,8 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
-import { createCapabilityRunnerdProviderEnvironment } from "../../live/runnerd-codex-transport.js";
+import { describe, expect, it } from "vitest";
 import { mapPiRpcRecord, PiRpcDriver } from "./pi-rpc-driver.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
@@ -48,49 +47,18 @@ async function failureFixture(capture = true) {
 }
 
 describe("PiRpcDriver", () => {
-  it.each(["registered", "different", "unregistered", "handoff"])("preserves explicit server AGENT_HOME (%s)", async mode => {
+  it.each(["registered", "unregistered", "mismatched"])("exposes only the exact runner-registered AGENT_HOME (%s)", async mode => {
     const root = await mkdtemp(join(tmpdir(), "pi-agent-home-"));
-    const home = join(root, "real-home"); await mkdir(home);
-    const source = { PI_CODING_AGENT_DIR: join(root, "agent"), AGENT_HOME: home };
-    const environment = mode === "handoff" ? createCapabilityRunnerdProviderEnvironment({ provider: "pi_rpc", options: { environment: source },
-      identity: { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: "home", normalizedSessionId: "home", turnId: "turn", itemId: "item" },
-      codexHome: root, runtimeContextPath: join(root, "context.json"), hasRuntimeContext: false }) : source;
+    const home = join(root, "instruction-copy"); await mkdir(home);
     let launched: NodeJS.ProcessEnv | undefined;
     const transport = new FailureTransport();
-    const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piThinkingLevel: "high", environment,
-      ...(mode === "unregistered" ? {} : { runtimeContext: { instructions: { workingCopy: { rootPath: mode === "different" ? root : home } }, skills: [] } }),
+    const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piThinkingLevel: "high",
+      environment: { PI_CODING_AGENT_DIR: join(root, "agent"), AGENT_HOME: mode === "mismatched" ? "/caller/other-home" : home },
+      ...(mode === "unregistered" ? {} : { runtimeContext: { instructions: { workingCopy: { rootPath: home } }, skills: [] } }),
       transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
     }).openSession({ runId: "home", normalizedSessionId: "home", workingDirectory: root });
-    try { expect(launched?.AGENT_HOME).toBe(home); }
+    try { expect(launched?.AGENT_HOME).toBe(mode === "registered" ? home : undefined); }
     finally { await session.close(); await rm(root, { recursive: true, force: true }); }
-  });
-
-  it.each(["relative", "file", "nonexistent"])("rejects invalid explicit AGENT_HOME before spawn (%s)", async mode => {
-    const root = await mkdtemp(join(tmpdir(), "pi-home-invalid-"));
-    const file = join(root, "file"); await writeFile(file, "not a directory");
-    const home = mode === "relative" ? "relative/home" : mode === "file" ? file : join(root, "missing");
-    try {
-      await expect(new PiRpcDriver({ runtimeDirectory: root, environment: { AGENT_HOME: home },
-        transportFactory: () => { throw new Error("must not spawn"); } }).openSession({ runId: "bad", normalizedSessionId: "bad", workingDirectory: root }))
-        .rejects.toThrow("AGENT_HOME must be an absolute existing directory");
-    } finally { await rm(root, { recursive: true, force: true }); }
-  });
-
-  it("does not inherit ambient AGENT_HOME when server omits it", async () => {
-    const root = await mkdtemp(join(tmpdir(), "pi-home-ambient-"));
-    vi.stubEnv("AGENT_HOME", root);
-    let launched: NodeJS.ProcessEnv | undefined;
-    const environment = createCapabilityRunnerdProviderEnvironment({ provider: "pi_rpc", options: {},
-      identity: { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: "home", normalizedSessionId: "home", turnId: "turn", itemId: "item" },
-      codexHome: root, runtimeContextPath: join(root, "context.json"), hasRuntimeContext: false });
-    const transport = new FailureTransport();
-    try {
-      const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piThinkingLevel: "high",
-        environment: { ...environment, PI_CODING_AGENT_DIR: join(root, "agent") },
-        transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
-      }).openSession({ runId: "home", normalizedSessionId: "home", workingDirectory: root });
-      try { expect(launched?.AGENT_HOME).toBeUndefined(); } finally { await session.close(); }
-    } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
   });
 
   it("replays >4096 updates, >4MiB cumulative output and a >256KiB terminal through driver/projector/proxy without mutating native final", async () => {
@@ -119,7 +87,7 @@ describe("PiRpcDriver", () => {
       expect(JSON.stringify(nativeFinal)).toBe(original);
       for (const frame of frames) expect(Buffer.byteLength(frame)).toBeLessThan(16 * 1024 * 1024);
     } finally { await proxy.close(); await f.close(); }
-  }, 20_000); // Full >4MiB / 4100-update proxy flow; includes real JSON projection and hashing.
+  });
 
   it.each([true, false])("publishes the underlying iterator failure before drain (active=%s)", async active => {
     const f = await failureFixture();

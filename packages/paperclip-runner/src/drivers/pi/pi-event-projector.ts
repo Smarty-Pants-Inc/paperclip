@@ -52,13 +52,6 @@ function toolOutputPreview(value: string, budget: number): string {
   if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low--;
   return marker + value.slice(0, low);
 }
-/** The toolcap journal entry stores display output, not executable input. */
-function toolcapControlRecord(event: Record<string, unknown>): Record<string, unknown> {
-  const entry = record(event.entry), data = record(entry.data);
-  if (event.type !== "entry_appended" || entry.type !== "custom" || entry.customType !== "tool-context-guard-full" || typeof data.fullOutput !== "string") return event;
-  // Keep every other field in the cap: custom records are not a general exemption.
-  return { ...event, entry: { ...entry, data: { ...data, fullOutput: "" } } };
-}
 /** Remove only observed tool display data when checking the control/input budget. */
 function toolControlRecord(event: Record<string, unknown>): Record<string, unknown> {
   const key = event.type === "message_end" && record(event.message).role === "toolResult" ? "message"
@@ -71,7 +64,7 @@ function toolControlRecord(event: Record<string, unknown>): Record<string, unkno
   const structured = record(structuredContent);
   return { ...event, [key]: { ...control,
     content: Array.isArray(content) ? content.map(part => record(part).type === "text" ? { ...record(part), text: "" } : part) : content,
-    structuredContent: { exit_code: structured.exit_code, truncated: structured.truncated === true || record(record(result.details).truncation).truncated === true },
+    structuredContent: { exit_code: structured.exit_code, truncated: structured.truncated },
   } };
 }
 
@@ -216,7 +209,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       schema: "paperclip.tool.execution.v1", executionId: tool.id,
       transport: tool.name === "bash" ? "process" : "dynamic", operation: tool.name === "bash" ? "execute" : "unknown", name: (tool.name === "bash" ? text(record(tool.args).command) : tool.name) || tool.name || null,
       target: null, namespace: null, readOnly: null, status: end ? failed ? "failed" : "completed" : "running", durationMs: duration, exitCode: Number.isSafeInteger(record(result.structuredContent).exit_code) ? record(result.structuredContent).exit_code : null,
-      progress: null, output: body || null, outputBytes: Buffer.byteLength(originalToolOutput?.body ?? fullBody), outputTruncated: outputWasTruncated || record(result.structuredContent).truncated === true || record(record(result.details).truncation).truncated === true, outputDigest: (originalToolOutput?.body ?? fullBody) ? `sha256:${digest(originalToolOutput?.body ?? fullBody)}` : null,
+      progress: null, output: body || null, outputBytes: Buffer.byteLength(originalToolOutput?.body ?? fullBody), outputTruncated: outputWasTruncated || record(result.structuredContent).truncated === true, outputDigest: (originalToolOutput?.body ?? fullBody) ? `sha256:${digest(originalToolOutput?.body ?? fullBody)}` : null,
     }));
   };
   return { project(value: unknown): PiProjectedEvent[] {
@@ -226,20 +219,12 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     if (!serialized) throw new Error("pi_projection_record_limit");
     const recordBytes = Buffer.byteLength(serialized);
     const source = record(value);
-    const customControl = toolcapControlRecord(source);
-    const control = customControl !== source ? customControl : toolControlRecord(source);
+    const control = toolControlRecord(source);
     if (recordBytes > MAX_RECORD_BYTES && (control === source || Buffer.byteLength(JSON.stringify(control)) > MAX_RECORD_BYTES)) throw new Error("pi_projection_record_limit");
     displayTruncated = recordBytes > MAX_RECORD_BYTES;
     originalToolOutput = undefined;
     let observed: unknown = value;
-    if (customControl !== source) {
-      if (recordBytes > MAX_RECORD_BYTES || Buffer.byteLength(text(record(record(source.entry).data).fullOutput)) > MAX_TEXT_BYTES) {
-        // No custom output is projected; omit its display body before redaction.
-        // The untouched native journal owns the full bytes and this record's digest.
-        observed = customControl;
-        displayTruncated = true;
-      }
-    } else if (control !== source) {
+    if (control !== source) {
       const key = source.type === "message_end" ? "message" : source.type === "tool_execution_update" ? "partialResult" : "result";
       const nativeResult = record(source[key]);
       const fullBody = contentText(nativeResult.content);
