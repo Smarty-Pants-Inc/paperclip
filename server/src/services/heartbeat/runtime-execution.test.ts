@@ -411,8 +411,11 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     const { input } = await fixture(true);
     const acquired = vi.fn(async () => undefined);
     input.runtime.runOptions.onNativeExecutionLeaseAcquired = acquired;
+    const prepareGitHubEnvironment = vi.fn(async () => ({ PAPERCLIP_GIT_METADATA_ROOTS: '["/workspace/.git"]' }));
+    input.config.prepareGitHubEnvironment = prepareGitHubEnvironment;
     await executeHeartbeatRuntime(db, input);
-    expect(executePaperclipNativeSession).toHaveBeenCalledWith(expect.objectContaining({ onExecutionLeaseAcquired: acquired }));
+    expect(executePaperclipNativeSession).toHaveBeenCalledWith(expect.objectContaining({ onExecutionLeaseAcquired: acquired, prepareGitHubEnvironment }));
+    expect(prepareGitHubEnvironment).not.toHaveBeenCalled();
     // Preparation is still protected until the native executor claims its lease.
     expect(acquired).not.toHaveBeenCalled();
   });

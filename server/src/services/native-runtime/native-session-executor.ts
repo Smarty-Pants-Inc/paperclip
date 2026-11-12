@@ -47,6 +47,7 @@ import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemot
 import { nativeProviderPackAdmissionFailureCode, nativeProviderPackAdmissionPending, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
 import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
+import { verifySnapshotProviderPack } from "./remote-provider-pack-snapshot.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
@@ -1089,6 +1090,15 @@ async function measureNativeRunnerSpan<T>(
         typeof options === "string" ? { parentName: options } : options,
       )
     : fn();
+}
+
+/** Persist controller waits in the same run trace as provider-pack admission.
+ * OpenTelemetry-only timing left this interval invisible in the span table. */
+function createNativeControllerTiming(runId: string, currentTrace: () => NativeRunTrace | undefined) {
+  const time = createRunPreparationTiming(runId, "native.controller");
+  return <T>(phase: Parameters<typeof time>[0], work: () => T | Promise<T>): Promise<T> =>
+    phase === "span_persistence" ? time(phase, work)
+      : measureNativeRunnerSpan(currentTrace(), `native.controller.${phase}`, () => time(phase, work), "task.provider_session");
 }
 
 /**
@@ -9934,6 +9944,8 @@ export async function executePaperclipNativeSession(input: {
   preparationSpans?: NativeRunHistoricalSpan[];
   /** Use a session-owned GitHub broker, rebound only after run ownership is acquired. */
   managedGitHub?: boolean;
+  /** Fresh remote Git/sandbox discovery, delayed until the native startup claim. */
+  prepareGitHubEnvironment?: () => Promise<Record<string, string>>;
   /** Resolved adapter env; the runner transport applies a provider allowlist before spawn. */
   dotWorkspaceRoot?: string;
   observability?: ProviderObservabilityLaunch;
@@ -10355,7 +10367,8 @@ async function executePaperclipNativeSessionAttempt(
     : null;
   const stagedRestart = input.restartRecovery?.kind === "reattach_remote_runner"
     ? await verifyStagedAttachmentRestart(input) : null;
-  const timeController = createRunPreparationTiming(input.execution.binding.runId, "native.controller");
+  let controllerTrace: NativeRunTrace | undefined;
+  const timeController = createNativeControllerTiming(input.execution.binding.runId, () => controllerTrace);
   if (input.useRunnerd) await timeController("warm_restore", () => restoreWarmRunnerdController(input));
   const identityRedactor = createAgentIdentityRedactor(input.runnerEnvironment?.PAPERCLIP_AGENT_PRIVATE_KEY);
   const redactIdentityText = (text: string) => redactSensitiveText(
@@ -10396,6 +10409,7 @@ async function executePaperclipNativeSessionAttempt(
       restartRecovery: Boolean(input.restartRecovery),
     },
   });
+  controllerTrace = trace;
   nativeRunRecoveryFlushers.set(traceRunId, flushRecovery);
   await emitStartupReuse(input.onEvent, "environment", environmentStartupReuse(input.runnerExecutionTarget));
   if (!input.runnerExecutionTarget || input.runnerExecutionTarget.kind === "local") {
@@ -10996,11 +11010,11 @@ async function executePaperclipNativeSessionAttempt(
   // Rebuild per-turn state from the durable event log when a controller resumes.
   const turnAccounting = ["opencode", "acpx", "pi_rpc"].includes(input.execution.provider.kind) ? createNativeTurnAccounting(input.execution.provider) : null;
   if (turnAccounting || cursorCloudAccounting) {
-    const history = await input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+    const history = await timeController("accounting_history", async () => input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, input.execution.binding.companyId), eq(heartbeatRunEvents.runId, input.execution.binding.runId),
       or(sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'usage'`,
         inArray(heartbeatRunEvents.eventType, ["turn.started", "turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted", "session.resumed"])),
-    )).orderBy(heartbeatRunEvents.seq);
+    )).orderBy(heartbeatRunEvents.seq));
     for (const row of history) {
       const event = record(row.payload).prpEvent as PrpEvent;
       if (turnAccounting) turnAccounting.observe(event);
@@ -11010,11 +11024,11 @@ async function executePaperclipNativeSessionAttempt(
   let fallbackUsageRecorder: ReturnType<typeof createRunUsageRecorder> | undefined;
   const producerOwnsUsage = usesNativeUsageDelivery({ runnerd: input.useRunnerd === true,
     remote: input.runnerExecutionTarget?.kind === "remote", provider: input.execution.provider });
-  const producerUsage = producerOwnsUsage ? await createNativeUsageDelivery(input.db, {
+  const producerUsage = producerOwnsUsage ? await timeController("usage_delivery", () => createNativeUsageDelivery(input.db, {
     companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,
     runnerInstanceId: effectiveRunnerInstanceId, provider: input.execution.provider,
     billing: resolveNativeBilling(input.execution.provider, input.runnerEnvironment, input.billingIdentity),
-  }) : undefined;
+  })) : undefined;
   const persistAccountingUsage = async (usage: Record<string, unknown> | null, complete: boolean) => {
     if (producerOwnsUsage) return;
     const accountingUsage = input.execution.provider.kind === "cursor_cloud" ? undefined : normalizeNativeUsage(usage, { inputIncludesCacheReads: input.execution.provider.kind === "codex" });
@@ -11691,6 +11705,11 @@ async function executePaperclipNativeSessionAttempt(
   try {
     const usesPluginTask = input.runnerExecutionTarget?.kind === "remote" && input.runnerExecutionTarget.transport === "sandbox" && !!input.runnerExecutionTarget.runnerTask;
     const prepareRunnerEnvironment = async () => {
+      if (input.prepareGitHubEnvironment) {
+        const environment = await timeController("github_environment", input.prepareGitHubEnvironment);
+        executionContext?.assertOpen();
+        input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...environment } };
+      }
       if (needsCoreGitHubAccess(input) && input.execution.schema !== "paperclip.native-execution-input.v6" && input.execution.schema !== "paperclip.native-execution-input.v8") {
         if (!input.execution.workspace.cwd) throw new Error("native_workspace_required");
         githubAccess ??= await timeController("github_access", () => createNativeGitHubAccess({
@@ -11707,9 +11726,12 @@ async function executePaperclipNativeSessionAttempt(
       }
       return input.runnerEnvironment;
     };
-    const overlapGitHubPreparation = needsCoreGitHubAccess(input) && input.useRunnerd && input.backend === undefined
+    const overlapGitHubPreparation = (needsCoreGitHubAccess(input) || input.prepareGitHubEnvironment !== undefined)
+      && input.useRunnerd && input.backend === undefined
       && input.runnerExecutionTarget?.kind === "remote"
-      && (input.execution.provider.kind === "codex" || input.execution.provider.kind === "opencode")
+      && (input.execution.provider.kind === "codex" || input.execution.provider.kind === "opencode"
+        || input.execution.provider.kind === "pi_rpc" && input.runnerExecutionTarget.transport === "sandbox"
+          && input.runnerExecutionTarget.runner?.allowConcurrentSyncOperations === true)
       && input.execution.schema !== "paperclip.native-execution-input.v6"
       && input.execution.schema !== "paperclip.native-execution-input.v8";
     if (!overlapGitHubPreparation) {
@@ -14089,8 +14111,15 @@ export async function prepareRemoteProviderPackOnTarget(input: {
   const expectedProviderPackManifest = input.manifest;
   const stagedRemoteProviderPackRoot = posix.join(remoteTarget.remoteCwd, ".paperclip-runtime", "paperclip-runner", "provider-pack");
   let activeRemoteProviderPackRoot: string | null = null;
-  let preinstalledProviderPackRoots: string[] = [];
-  const verifyRemoteProviderPack = async (packRoot: string) => {
+  let preinstalledProviderPackRoots: string[] | undefined;
+  const verifyRemoteProviderPack = async (packRoot: string, snapshot = false) => {
+    if (snapshot) {
+      // A failed seal cannot admit a pack. The selection owner tries the
+      // scoped staged memo next, then full verification of other candidates.
+      await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot,
+        manifest: expectedProviderPackManifest, provider: input.provider ?? { kind: "opencode" } });
+      return;
+    }
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
       cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: input.provider,
       memoScope: remoteProviderPackMemoScope(remoteTarget),
@@ -14115,54 +14144,56 @@ export async function prepareRemoteProviderPackOnTarget(input: {
     return result.stdout.split(/\r?\n/).map(parseRemoteExecutableCandidate)
       .filter((candidate): candidate is string => candidate !== null);
   };
+  const usePreinstalled = async (snapshot: boolean) => useVerifiedPreinstalledRemoteProviderPack({
+    candidates: preinstalledProviderPackRoots ??= await measureNativeRunnerSpan(input.trace, "provider_pack.discover", discoverPreinstalledProviderPack),
+    verifyAndLink: async (preinstalledProviderPack) => {
+      await measureNativeRunnerSpan(
+        input.trace,
+        "provider_pack.verify_preinstalled",
+        () => verifyRemoteProviderPack(preinstalledProviderPack, snapshot),
+      );
+      const escapedSource = preinstalledProviderPack.replaceAll(
+        "'",
+        "'\\''",
+      );
+      const escapedTarget = stagedRemoteProviderPackRoot.replaceAll(
+        "'",
+        "'\\''",
+      );
+      const escapedParent = posix
+        .dirname(stagedRemoteProviderPackRoot)
+        .replaceAll("'", "'\\''");
+      const linked = await measureNativeRunnerSpan(input.trace, "provider_pack.link_preinstalled", () => remoteCommandRunner.execute({
+        command: "sh",
+        args: [
+          "-c",
+          `umask 077; mkdir -p '${escapedParent}' && rm -rf '${escapedTarget}' && ln -s '${escapedSource}' '${escapedTarget}'`,
+        ],
+        cwd: remoteTarget.remoteCwd,
+        bypassSession: true,
+        timeoutMs: 10_000,
+      }));
+      if (linked.exitCode !== 0 || linked.timedOut) {
+        throw new Error(
+          "runner_remote_provider_artifact_incompatible: preinstalled provider pack could not be linked",
+        );
+      }
+      activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
+      await input.onLog?.(
+        "stderr",
+        "[paperclip-runner] using manifest-matched preinstalled provider pack\n",
+      );
+    },
+  });
   const packSource = await prepareVerifiedRemoteProviderPack({
     trace: input.trace,
+    useSealedPreinstalled: () => usePreinstalled(true),
     verifyStaged: () => measureNativeRunnerSpan(
       input.trace,
       "provider_pack.verify",
       () => verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
     ),
-    usePreinstalled: async () => useVerifiedPreinstalledRemoteProviderPack({
-      candidates: preinstalledProviderPackRoots = await measureNativeRunnerSpan(input.trace, "provider_pack.discover", discoverPreinstalledProviderPack),
-      verifyAndLink: async (preinstalledProviderPack) => {
-        await measureNativeRunnerSpan(
-          input.trace,
-          "provider_pack.verify_preinstalled",
-          () => verifyRemoteProviderPack(preinstalledProviderPack),
-        );
-        const escapedSource = preinstalledProviderPack.replaceAll(
-          "'",
-          "'\\''",
-        );
-        const escapedTarget = stagedRemoteProviderPackRoot.replaceAll(
-          "'",
-          "'\\''",
-        );
-        const escapedParent = posix
-          .dirname(stagedRemoteProviderPackRoot)
-          .replaceAll("'", "'\\''");
-        const linked = await measureNativeRunnerSpan(input.trace, "provider_pack.link_preinstalled", () => remoteCommandRunner.execute({
-          command: "sh",
-          args: [
-            "-c",
-            `umask 077; mkdir -p '${escapedParent}' && rm -rf '${escapedTarget}' && ln -s '${escapedSource}' '${escapedTarget}'`,
-          ],
-          cwd: remoteTarget.remoteCwd,
-          bypassSession: true,
-          timeoutMs: 10_000,
-        }));
-        if (linked.exitCode !== 0 || linked.timedOut) {
-          throw new Error(
-            "runner_remote_provider_artifact_incompatible: preinstalled provider pack could not be linked",
-          );
-        }
-        activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
-        await input.onLog?.(
-          "stderr",
-          "[paperclip-runner] using manifest-matched preinstalled provider pack\n",
-        );
-      },
-    }),
+    usePreinstalled: () => usePreinstalled(false),
     stageAndVerify: async () => {
       if (!configuredProviderPackRoot) {
         throw new Error("runner_remote_provider_artifact_incompatible: install the matching Paperclip package and Daytona image; the image provider pack did not match the bundled release identity");
@@ -14181,7 +14212,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
         runner: remoteCommandRunner,
         cwd: remoteTarget.remoteCwd,
         targetPath: stagedRemoteProviderPackRoot,
-        reuseRoots: preinstalledProviderPackRoots,
+        reuseRoots: preinstalledProviderPackRoots ?? [],
         trace: input.trace,
         verifyDirectory: async (sourceRoot) => { await verifyRemoteProviderPackManifest(sourceRoot, input.provider); },
         stageDirectory: (sourceRoot) => stageRemoteRunnerDirectory({
@@ -15515,9 +15546,10 @@ async function createRunnerdBackendWithinSessionClaim(
   sessionScopeId: string,
   retainedTransition?: VerifiedWarmTransitionBinding,
 ): Promise<ManagedRunnerdBackend> {
-  const timeController = createRunPreparationTiming(input.execution.binding.runId, "native.controller");
+  const timeController = createNativeControllerTiming(input.execution.binding.runId, () => input.trace);
   if ("runtimeContext" in input.execution) {
-    await rehydratePinnedInstructionAsset(input.db, input.execution.binding, input.execution.runtimeContext).catch(() => undefined);
+    const runtimeContext = input.execution.runtimeContext;
+    await timeController("instruction_rehydrate", () => rehydratePinnedInstructionAsset(input.db, input.execution.binding, runtimeContext)).catch(() => undefined);
   }
   let recoveryPending = retainedTransition !== undefined;
   const target = input.runnerExecutionTarget ?? { kind: "local" as const };
@@ -15555,11 +15587,11 @@ async function createRunnerdBackendWithinSessionClaim(
   ));
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
   const connectorAssignments = input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
-  const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+  const reviewRun = await timeController("review_binding", async () => input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
     .from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
-    )).limit(1).then((rows) => rows[0]);
+    )).limit(1).then((rows) => rows[0]));
   const nativeReview = readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
   if (nativeReview && !await getNativeReviewAssignment(input.db, {
     ...input.execution.binding, contextSnapshot: nativeReview,
@@ -15587,7 +15619,22 @@ async function createRunnerdBackendWithinSessionClaim(
     && input.retainedPluginTaskOwner && !input.remoteWarmRecovery && !input.restartRecovery
     ? pluginTaskOwner = preparePluginTaskOwner().then(prepared => { input.beginRetainedRunAttachment!(); return prepared; })
     : undefined;
-  const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner] = await Promise.allSettled([
+  // Read-only snapshot selection is independent of Git discovery and assigned
+  // MCP resolution. Only opt into concurrent remote calls on a capable direct
+  // runner; the later authority check still decides which exact pack is usable.
+  const snapshotSelection = input.execution.provider.kind === "pi_rpc" && !pluginTask && remoteTarget && remoteCommandRunner
+    && remoteCommandRunner.allowConcurrentSyncOperations === true && input.prepareRunnerEnvironment
+    ? measureNativeRunnerSpan(input.trace, "provider_pack.snapshot_select", async () => {
+        const expected = input.runnerRemoteProviderPackPath?.trim()
+          ? resolveRemoteProviderPackSource(input.runnerRemoteProviderPackPath).manifest
+          : readBundledRemoteProviderPackManifest();
+        const root = "/opt/paperclip-runner/provider-pack";
+        const manifest = await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd,
+          packRoot: root, manifest: expected, provider: { kind: "pi_rpc" } });
+        return { root, manifest, immutable: true as const };
+      }).catch(() => null)
+    : Promise.resolve(null);
+  const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner, preparedSnapshot] = await Promise.allSettled([
     Promise.resolve().then(() => input.prepareRunnerEnvironment?.() ?? input.runnerEnvironment),
     Promise.resolve().then(() => relayAssignedMcp && !nativeReview && assignedMcpUrl && assignedMcpToken
       ? timeController("assigned_mcp", () => createAssignedMcpTools({
@@ -15599,6 +15646,7 @@ async function createRunnerdBackendWithinSessionClaim(
       }))
       : undefined),
     earlyPluginTaskOwner,
+    snapshotSelection,
   ]);
   if (preparedEnvironment.status === "rejected") throw preparedEnvironment.reason;
   if (preparedAssignedMcp.status === "rejected") throw preparedAssignedMcp.reason;
@@ -16273,7 +16321,8 @@ async function createRunnerdBackendWithinSessionClaim(
   const useInstalledProviderPack = async () => {
     const expected = expectedProviderPackManifest;
     if (!expected || !remoteTarget || !remoteCommandRunner) return false;
-    for (const installation of remoteNativeArtifacts?.providerPackInventory() ?? []) {
+    const snapshot = preparedSnapshot.status === "fulfilled" ? preparedSnapshot.value : null;
+    for (const installation of [...(snapshot ? [snapshot] : []), ...(remoteNativeArtifacts?.providerPackInventory() ?? [])]) {
       try {
         const manifest = await measureNativeRunnerSpan(input.trace, "provider_pack.compatibility", () => verifyRemoteProviderPackIdentity({
           runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot: installation.root,

@@ -153,6 +153,7 @@ export interface HeartbeatRuntimeExecutionInput {
     runtimeEnv: Selection["runtimeEnv"];
     useHostGitHub: boolean;
     githubSelection: { configured: boolean };
+    prepareGitHubEnvironment?: () => Promise<Record<string, string>>;
   };
   session: {
     runtimeSessionParamsForAdapter: Record<string, unknown> | null;
@@ -692,6 +693,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               // configured provider values and the server-selected
               // workspace boundary authoritative.
               managedGitHub: !useHostGitHub && githubSelection.configured,
+              prepareGitHubEnvironment: input.config.prepareGitHubEnvironment,
               billingIdentity: managedAiRuntime ? { provider: managedAiRuntime.attribution.provider, biller: managedAiRuntime.attribution.provider === "openai" ? resolveManagedOpenAiBilling(managedAiRuntime.config.managedAiRouting)?.biller ?? managedAiRuntime.attribution.provider : managedAiRuntime.attribution.provider, billingType: managedAiRuntime.attribution.method === "subscription" ? "subscription_included" : "metered_api" } : undefined,
               managedAiCredentialIdentity: managedAiRuntime?.identity,
               managedAiAccountIdentity: managedAiRuntime?.sessionIdentity,
