@@ -3308,7 +3308,10 @@ impl CodexCommandExecutor {
             .validate()
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         let pi_runtime_context = if config.provider == "pi_rpc" {
-            payload.pointer("/provider/runtimeContext").cloned().unwrap_or(Value::Null)
+            payload
+                .pointer("/provider/runtimeContext")
+                .cloned()
+                .unwrap_or(Value::Null)
         } else {
             Value::Null
         };
@@ -3320,7 +3323,8 @@ impl CodexCommandExecutor {
         let completion_contract = completion_contract(payload)?;
         let tool_set = authorized_tool_set(payload)?;
         if let Some(state) = self.state.as_mut() {
-            if state.config != config || state.completion_contract != completion_contract
+            if state.config != config
+                || state.completion_contract != completion_contract
                 || (config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context)
             {
                 return Err(DurableRunnerError::invalid(
@@ -3742,9 +3746,14 @@ impl CodexCommandExecutor {
         next_state.active_terminal_tool_rejected = false;
         next_state.last_agent_message = None;
         let pi_run_id = if next_state.config.provider == "pi_rpc" {
-            payload.pointer("/paperclipNextAuthority/identity/runId")
+            payload
+                .pointer("/paperclipNextAuthority/identity/runId")
                 .and_then(Value::as_str)
-                .or_else(|| self.event_identity.as_ref().map(|identity| identity.run_id.as_str()))
+                .or_else(|| {
+                    self.event_identity
+                        .as_ref()
+                        .map(|identity| identity.run_id.as_str())
+                })
         } else {
             None
         };
@@ -3752,7 +3761,9 @@ impl CodexCommandExecutor {
             Some((
                 next_state.config.instructions.as_str(),
                 &next_state.pi_runtime_context,
-                pi_run_id.ok_or_else(|| DurableRunnerError::invalid("Pi run attachment omitted run identity"))?,
+                pi_run_id.ok_or_else(|| {
+                    DurableRunnerError::invalid("Pi run attachment omitted run identity")
+                })?,
             ))
         } else {
             None
@@ -6043,9 +6054,9 @@ impl CommandExecutor for CodexCommandExecutor {
             .map_err(|_| DurableRunnerError::invalid("native Codex parking proof failed"))?
             .is_empty();
         if locally_ready && state.config.provider == "pi_rpc" {
-            return provider.pi_host_park_ready().map_err(|_| {
-                DurableRunnerError::invalid("native Pi parking proof failed")
-            });
+            return provider
+                .pi_host_park_ready()
+                .map_err(|_| DurableRunnerError::invalid("native Pi parking proof failed"));
         }
         Ok(locally_ready)
     }
@@ -7481,11 +7492,17 @@ done
         include_skill_instructions: bool,
     ) -> (PathBuf, CodexCommandExecutor, Value) {
         let directory = std::env::temp_dir().join(format!(
-            "paperclip-provider-skill-normalization-{}", uuid::Uuid::new_v4()
+            "paperclip-provider-skill-normalization-{}",
+            uuid::Uuid::new_v4()
         ));
         let mut config = opencode_result_state().config;
         config.provider = provider.to_owned();
-        config.driver = if provider == "pi_rpc" { "pi_rpc" } else { "codex_app_server" }.to_owned();
+        config.driver = if provider == "pi_rpc" {
+            "pi_rpc"
+        } else {
+            "codex_app_server"
+        }
+        .to_owned();
         config.command = directory.join("must-not-start-during-attachment");
         config.args = vec![directory.join("proxy.js").to_string_lossy().into_owned()];
         config.instructions = "original instructions".to_owned();
@@ -7493,9 +7510,9 @@ done
         let mut executor = CodexCommandExecutor::new(&directory);
         if provider == "pi_rpc" {
             config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
-            config.profile = Some(serde_json::from_str(
-                crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON
-            ).unwrap());
+            config.profile = Some(
+                serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+            );
             let artifact = |path| crate::durable::QualifiedLaunchArtifact {
                 path,
                 sha256: format!("sha256:{:x}", Sha256::digest(b"normalization fixture")),
@@ -7510,15 +7527,24 @@ done
         if provider == "pi_rpc" {
             payload["provider"]["runtimeContext"] = json!({"runId": "original-run"});
         }
-        executor.prepare(&payload).expect("real prepare accepts the controller payload");
-        let saved_json: Value = serde_json::from_slice(
-            &fs::read(executor.state_path()).unwrap()
-        ).unwrap();
+        executor
+            .prepare(&payload)
+            .expect("real prepare accepts the controller payload");
+        let saved_json: Value =
+            serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
         if provider == "codex" {
-            assert_eq!(saved_json["config"]["includeSkillInstructions"], include_skill_instructions);
+            assert_eq!(
+                saved_json["config"]["includeSkillInstructions"],
+                include_skill_instructions
+            );
         } else {
-            assert!(saved_json["config"].get("includeSkillInstructions").is_none());
-            assert_eq!(saved_json["piRuntimeContext"], json!({"runId": "original-run"}));
+            assert!(saved_json["config"]
+                .get("includeSkillInstructions")
+                .is_none());
+            assert_eq!(
+                saved_json["piRuntimeContext"],
+                json!({"runId": "original-run"})
+            );
         }
         let mut saved: CodexProviderState = serde_json::from_value(saved_json).unwrap();
         // Prepare alone has no thread to attach. Model only the stopped-thread
@@ -7536,16 +7562,18 @@ done
     #[test]
     fn pi_attachment_normalizes_older_controller_skill_flag_after_prepare() {
         for include in [true, false] {
-            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", include);
-            executor.attach_run(&payload)
+            let (directory, mut executor, mut payload) =
+                prepared_skill_checkpoint("pi_rpc", include);
+            executor
+                .attach_run(&payload)
                 .expect("the same Pi payload accepted by prepare must attach");
             payload["provider"]["instructions"] = json!("fresh run instructions");
             payload["provider"]["runtimeContext"] = json!({"runId": "fresh-run"});
-            executor.attach_run(&payload)
+            executor
+                .attach_run(&payload)
                 .expect("normalization must still allow Pi run context refresh");
-            let saved: CodexProviderState = serde_json::from_slice(
-                &fs::read(executor.state_path()).unwrap()
-            ).unwrap();
+            let saved: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
             assert_eq!(saved.config.include_skill_instructions, None);
             assert_eq!(saved.config.instructions, "fresh run instructions");
             assert_eq!(saved.pi_runtime_context, json!({"runId": "fresh-run"}));
@@ -7558,15 +7586,30 @@ done
     #[test]
     fn codex_attachment_retains_prepared_skill_flag_and_refuses_changes() {
         for include in [true, false] {
-            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("codex", include);
-            executor.attach_run(&payload).expect("Codex preserves its explicit skill setting");
+            let (directory, mut executor, mut payload) =
+                prepared_skill_checkpoint("codex", include);
+            executor
+                .attach_run(&payload)
+                .expect("Codex preserves its explicit skill setting");
             let before = fs::read(executor.state_path()).unwrap();
             payload["provider"]["includeSkillInstructions"] = json!(!include);
-            let error = executor.attach_run(&payload)
+            let error = executor
+                .attach_run(&payload)
                 .expect_err("Codex skill setting remains immutable");
-            assert!(error.to_string().contains("durable Codex provider profile"), "{error}");
+            assert!(
+                error.to_string().contains("durable Codex provider profile"),
+                "{error}"
+            );
             assert_eq!(fs::read(executor.state_path()).unwrap(), before);
-            assert_eq!(executor.state.as_ref().unwrap().config.include_skill_instructions, Some(include));
+            assert_eq!(
+                executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .config
+                    .include_skill_instructions,
+                Some(include)
+            );
             fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -7580,20 +7623,31 @@ done
                 "pi_rpc" => "pi_rpc",
                 "codex" => "codex_app_server",
                 _ => "opencode_server",
-            }.to_owned();
+            }
+            .to_owned();
             if provider == "pi_rpc" {
-                state.config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
-                state.config.profile = Some(serde_json::from_str(
-                    crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON
-                ).unwrap());
+                state.config.provider_version =
+                    crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+                state.config.profile = Some(
+                    serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON)
+                        .unwrap(),
+                );
             }
             state.config.instructions = "old run instructions".to_owned();
             state.active_provider_turn_id = None;
             state.provider_process_generation = 1;
             state.lifecycle = "prepared".to_owned();
-            for changed_field in ["run_context", "model", "command", "args", "readOnly", "conversationMode"] {
+            for changed_field in [
+                "run_context",
+                "model",
+                "command",
+                "args",
+                "readOnly",
+                "conversationMode",
+            ] {
                 let directory = std::env::temp_dir().join(format!(
-                    "paperclip-pi-attach-profile-{}", uuid::Uuid::new_v4()
+                    "paperclip-pi-attach-profile-{}",
+                    uuid::Uuid::new_v4()
                 ));
                 fs::create_dir_all(&directory).unwrap();
                 let mut config = serde_json::to_value(&state.config).unwrap();
@@ -7605,7 +7659,7 @@ done
                     "args" => config["args"] = json!(["--different-argument"]),
                     "readOnly" => config["readOnly"] = json!(true),
                     "conversationMode" => config["conversationMode"] = json!("prepared"),
-                    _ => {},
+                    _ => {}
                 }
                 let before = serde_json::to_value(&state).unwrap();
                 let mut executor = CodexCommandExecutor::new(&directory);
@@ -7615,27 +7669,33 @@ done
                     result.expect("Pi instructions and runtime context are run-scoped");
                     let rebound = executor.state.as_ref().unwrap();
                     assert_eq!(rebound.config.instructions, "fresh run instructions");
-                    assert_eq!(serde_json::to_value(rebound).unwrap()["piRuntimeContext"],
-                        json!({"runId": "fresh-run"}));
+                    assert_eq!(
+                        serde_json::to_value(rebound).unwrap()["piRuntimeContext"],
+                        json!({"runId": "fresh-run"})
+                    );
                     assert_eq!(rebound.thread_id, state.thread_id);
                     assert!(executor.provider.is_none());
-                    let saved: CodexProviderState = serde_json::from_slice(
-                        &fs::read(executor.state_path()).unwrap()
-                    ).unwrap();
+                    let saved: CodexProviderState =
+                        serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
                     assert_eq!(saved.pi_runtime_context, json!({"runId": "fresh-run"}));
                     let mut cleared = serde_json::to_value(&rebound.config).unwrap();
                     cleared["runtimeContext"] = Value::Null;
                     let mut restored = CodexCommandExecutor::new(&directory);
                     restored.state = Some(saved);
                     restored.attach_run(&json!({"provider": cleared})).unwrap();
-                    let saved: CodexProviderState = serde_json::from_slice(
-                        &fs::read(restored.state_path()).unwrap()
-                    ).unwrap();
+                    let saved: CodexProviderState =
+                        serde_json::from_slice(&fs::read(restored.state_path()).unwrap()).unwrap();
                     assert!(saved.pi_runtime_context.is_null());
                 } else {
                     let error = result.expect_err("other durable profile fields stay immutable");
-                    assert!(error.to_string().contains("durable Codex provider profile"), "{error}");
-                    assert_eq!(serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(), before);
+                    assert!(
+                        error.to_string().contains("durable Codex provider profile"),
+                        "{error}"
+                    );
+                    assert_eq!(
+                        serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                        before
+                    );
                 }
                 fs::remove_dir_all(directory).unwrap();
             }
@@ -8518,10 +8578,23 @@ done
         state.config.provider = "pi_rpc".to_owned();
         state.config.driver = "pi_rpc".to_owned();
         state.config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
-        state.config.profile = Some(serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap());
-        admit_terminal_tool_authority(&mut state, "paperclip_finish", &valid_opencode_result(), false).unwrap();
-        assert_eq!(state.active_provider_result_disposition.as_deref(), Some("done"));
-        state.validate().expect("accepted Pi finish must persist without leaving a durable pending callback");
+        state.config.profile = Some(
+            serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+        );
+        admit_terminal_tool_authority(
+            &mut state,
+            "paperclip_finish",
+            &valid_opencode_result(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state.active_provider_result_disposition.as_deref(),
+            Some("done")
+        );
+        state
+            .validate()
+            .expect("accepted Pi finish must persist without leaving a durable pending callback");
         let saved = serde_json::to_vec(&state).unwrap();
         let restored: CodexProviderState = serde_json::from_slice(&saved).unwrap();
         restored.validate().unwrap();
@@ -8529,7 +8602,10 @@ done
         assert_eq!(terminal.len(), 1);
         assert_eq!(terminal[0].payload["runTerminalState"], "succeeded");
         state.config.provider = "acpx".to_owned();
-        assert!(state.validate().is_err(), "do not widen terminal authority for other providers");
+        assert!(
+            state.validate().is_err(),
+            "do not widen terminal authority for other providers"
+        );
     }
 
     #[test]
@@ -8577,14 +8653,23 @@ done
         state.config.driver = "pi_rpc".to_owned();
         // Pi's current finish authority comes from the correlated semantic tool,
         // not an independently emitted paperclip/runResult notification.
-        let params = json!({"threadId":"thread-1", "turnId":"turn-1", "result":valid_opencode_result()});
-        assert!(normalize_provider_notification(&mut state, "paperclip/runResult", &params)
-            .unwrap_err().to_string().contains("reserved for verified provider proxies"));
+        let params =
+            json!({"threadId":"thread-1", "turnId":"turn-1", "result":valid_opencode_result()});
+        assert!(
+            normalize_provider_notification(&mut state, "paperclip/runResult", &params)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved for verified provider proxies")
+        );
         for disposition in ["blocked", "invalid"] {
             let mut input = valid_opencode_result();
             input["reportedWorkDisposition"] = json!(disposition);
-            assert!(admit_terminal_tool_authority(&mut state, "paperclip_finish", &input, false)
-                .unwrap_err().to_string().contains("incompatible work disposition"));
+            assert!(
+                admit_terminal_tool_authority(&mut state, "paperclip_finish", &input, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("incompatible work disposition")
+            );
             assert!(state.active_provider_result_fingerprint.is_none());
             assert!(state.active_provider_result_disposition.is_none());
         }

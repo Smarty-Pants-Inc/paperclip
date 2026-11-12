@@ -269,8 +269,7 @@ fn batched_frame_state_is_saved_before_events_leave_and_survives_a_restart() {
 #[cfg(unix)]
 #[test]
 fn batched_frame_state_is_saved_when_a_later_frame_fails() {
-    let (directory, mut executor) =
-        streamed_turn(20, 0, "not valid JSON-RPC", true, |_| {});
+    let (directory, mut executor) = streamed_turn(20, 0, "not valid JSON-RPC", true, |_| {});
     assert!(executor.poll_events().is_err());
     assert!(!executor.unsaved_frame_state.get());
     let saved = saved_provider_state(&executor);
