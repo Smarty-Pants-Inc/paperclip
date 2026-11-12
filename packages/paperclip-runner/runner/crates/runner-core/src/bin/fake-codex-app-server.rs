@@ -1303,6 +1303,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }))?;
             }
             "initialized" => {}
+            // The resident Pi facade revalidates the claimed grant before each
+            // prompt. Model the proxy's acknowledgement, not an unknown method.
+            "session.revalidate" => {
+                if state.thread_id.is_empty()
+                    || message
+                        .pointer("/params/baseInstructions")
+                        .is_some_and(|value| !value.is_string())
+                {
+                    send(json!({
+                        "id": id,
+                        "error": {"code": -32602, "message": "invalid fake Pi revalidation"}
+                    }))?;
+                } else {
+                    send(json!({"id": id, "result": true}))?;
+                }
+            }
+            // Native Pi requires the proxy's own quiescence proof in addition
+            // to Runner's settled-turn and drained-event checks.
+            "paperclip/host_park_ready" => {
+                let reasons = if state.thread_id.is_empty() {
+                    vec!["session_not_open"]
+                } else if state.active_turn_id.is_some() {
+                    vec!["active_turn"]
+                } else {
+                    Vec::new()
+                };
+                send(json!({
+                    "id": id,
+                    "result": {"ready": reasons.is_empty(), "reasons": reasons}
+                }))?;
+            }
             "paperclip/ackTerminal" => {
                 let path = argument(&args, "--cursor-cloud-terminal-file")
                     .ok_or("terminal fixture missing")?;

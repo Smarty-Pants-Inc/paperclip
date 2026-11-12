@@ -16,8 +16,6 @@ use sha2::{Digest, Sha256};
 
 const CODEX_ACPX_DIGEST: &str =
     "sha256:443491f4e814501a5dc47347e4510e84faeec9c9382e2d4e53bfe69386d5aabc";
-const PI_ACPX_DIGEST: &str =
-    "sha256:42e186b921f36accf3087cf64986a88346dcdb0bdf78c2ef44a2c4f8abd3453a";
 
 fn temporary_directory(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -288,6 +286,14 @@ fn candidate_verified_cold_session_retires_on_suspend_instead_of_warm_adoption()
     fs::remove_dir_all(directory).unwrap();
 }
 
+// Exercise Pi lifecycle behavior with the release that this build qualifies,
+// rather than failing admission on a copied digest from an older release.
+fn pi_acpx_profile() -> Value {
+    let profiles: Value =
+        serde_json::from_str(include_str!("../../../../acpx-profiles.json")).unwrap();
+    profiles["profiles"]["pi"].clone()
+}
+
 fn pi_acpx_config(state_dir: &Path, mode: &str) -> DurableRunnerConfig {
     let mut config = acpx_config(state_dir, mode);
     *config
@@ -296,7 +302,7 @@ fn pi_acpx_config(state_dir: &Path, mode: &str) -> DurableRunnerConfig {
         .unwrap()
         .args
         .last_mut()
-        .unwrap() = PI_ACPX_DIGEST.to_owned();
+        .unwrap() = pi_acpx_profile()["commandDigest"].as_str().unwrap().to_owned();
     config
 }
 
@@ -486,12 +492,17 @@ fn prepare_payload_with_mode(directory: &Path, agent: &str, mode: &str) -> Value
 fn pi_prepare_payload(directory: &Path, mode: &str) -> Value {
     let mut payload = prepare_payload_with_mode(directory, "pi", mode);
     let provider = &mut payload["provider"];
-    provider["agentServerPackage"] = json!("pi-acp");
-    provider["agentServerVersion"] = json!("0.0.33");
-    provider["agentRuntimePackage"] = json!("@earendil-works/pi-coding-agent");
-    provider["agentRuntimeVersion"] = json!("1.0.0");
-    provider["commandDigest"] = json!(PI_ACPX_DIGEST);
-    provider["sidecarArgs"][3] = json!(PI_ACPX_DIGEST);
+    let profile = pi_acpx_profile();
+    for field in [
+        "agentServerPackage",
+        "agentServerVersion",
+        "agentRuntimePackage",
+        "agentRuntimeVersion",
+        "commandDigest",
+    ] {
+        provider[field] = profile[field].clone();
+    }
+    provider["sidecarArgs"][3] = profile["commandDigest"].clone();
     provider["providerPolicy"] = json!({"readOnly":true});
     provider["piThinkingLevel"] = json!("low");
     payload
