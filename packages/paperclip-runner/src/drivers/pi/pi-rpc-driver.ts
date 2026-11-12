@@ -146,7 +146,7 @@ export class PiRpcDriver implements HarnessDriver {
       if (credentialMode === "broker") {
         // Broker/models.json is the FIRST bind. INITIAL contains no provider
         // capability and prepares exactly one preallocated host turn, without IPC.
-        const provider = await createPiProviderBinding({ model: this.#options.model, environment });
+        const provider = await createPiProviderBinding({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel });
         closeProvider = provider.close;
         let privateDirectory: string | undefined;
         try {
@@ -177,7 +177,7 @@ export class PiRpcDriver implements HarnessDriver {
         }
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
       } else {
-        const provider = directPiProviderConfiguration({ model: this.#options.model, environment });
+        const provider = directPiProviderConfiguration({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel });
         await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json));
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
         environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
@@ -466,7 +466,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     try {
       await this.#revokeBinding();
       signal?.throwIfAborted();
-      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment });
+      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel });
       const origin = { epoch: resident.epoch + 1, runId, turnId: `pi-turn-${randomUUID()}` };
       resident.binding = { origin, close: broker.close, initial: false };
       const request = { schema: 1, type: "bind", nonce: randomUUID(), sessionId: this.#normalizedSessionId,

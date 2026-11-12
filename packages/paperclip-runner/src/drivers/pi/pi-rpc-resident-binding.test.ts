@@ -35,13 +35,14 @@ class FakeTransport {
   ready: Promise<void> = Promise.resolve();
   mismatch = false;
   effortMismatch = false;
+  thinkingLevel = "off";
   #records: PiRpcRecord[] = [];
   #wake?: (value: IteratorResult<PiRpcRecord>) => void;
   async request(type: string, _params: PiRpcRecord = {}): Promise<PiRpcRecord> {
     await this.ready; this.commands.push(type); this.order.push(type);
     const model = { provider: "paperclip", id: this.mismatch ? "wrong" : "faux" };
-    return { success: true, data: type === "get_state" ? { sessionId: "native-session", model, thinkingLevel: this.effortMismatch ? "high" : "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
-      : type === "set_model" ? model : type === "get_available_thinking_levels" ? { levels: ["off"] }
+    return { success: true, data: type === "get_state" ? { sessionId: "native-session", model, thinkingLevel: this.effortMismatch ? "high" : this.thinkingLevel, isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+      : type === "set_model" ? model : type === "get_available_thinking_levels" ? { levels: [this.thinkingLevel] }
       : type === "prompt" ? { disposition: "started" } : undefined };
   }
   async sendExtensionUiResponse(input: PiRpcExtensionUiResponseInput): Promise<void> {
@@ -76,6 +77,7 @@ async function faux() {
 async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale" | "lost" | "begin-lost") {
   const root = await mkdtemp(join(tmpdir(), "pi-resident-binding-")); const workspace = join(root, "workspace"); await mkdir(workspace);
   const upstream = await faux(); const transport = new FakeTransport(); const ipc: PiBindCommand[] = [];
+  transport.thinkingLevel = options.piRpcThinkingLevel ?? "off";
   let launch!: PiRpcTransportOptions;
   const driver = new PiRpcDriver({ model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), systemInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 }, startupTimeoutMs: 120,
     environment: { ...upstream.environment, PI_CODING_AGENT_DIR: join(root, "agent") }, ...options,
@@ -116,6 +118,18 @@ async function revoked(provider: { baseUrl: string; apiKey: string }) {
 }
 
 describe("resident Pi model binding", () => {
+  it.each(["xhigh", "max"] as const)("carries only admitted %s metadata through initial bind and resident rebind", async level => {
+    const f = await fixture({ piRpcThinkingLevel: level });
+    const models = JSON.parse(await readFile(join(f.launch.env!.PI_CODING_AGENT_DIR!, "models.json"), "utf8"));
+    const expected = { id: "faux", reasoning: true, thinkingLevelMap: Object.fromEntries(
+      ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => [value, value === level ? value : null]),
+    ) };
+    expect(models.providers.paperclip.models).toEqual([expected]);
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.attachRun({ runId: "run-b" });
+    const bind = f.ipc.find(command => command.type === "bind");
+    expect(bind).toMatchObject({ type: "bind", thinkingLevel: level, provider: { models: [expected] } });
+  });
   it("bootstraps nonsecret INITIAL + merged models before spawn; turn 1 has zero bind/begin IPC", async () => {
     const f = await fixture();
     expect(f.launch.args).not.toContain("--no-extensions"); expect(f.launch.args).toContain("--extension");

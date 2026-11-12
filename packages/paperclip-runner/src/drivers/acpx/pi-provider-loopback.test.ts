@@ -9,6 +9,7 @@ import { createSanitizedAcpxSpawnInput } from "./environment.js";
 import { resolveQualifiedAcpxProfile } from "./qualified-profiles.js";
 import { createAcpxRecoveryBinding } from "./recovery-identity.js";
 import { prepareAcpxRuntimeSandbox } from "./runtime-sandbox.js";
+import { createPiProviderBinding, directPiProviderConfiguration, startPiProviderLoopback } from "./pi-provider-loopback.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
@@ -29,6 +30,37 @@ async function binding(model = "paperclip/vendor/model") {
 }
 
 describe("Pi managed provider loopback", () => {
+  it.each(["low", "xhigh", "max"] as const)("projects only the already-admitted native Pi thinking level %s", async thinkingLevel => {
+    const metadata = { id: "vendor/model", reasoning: true, thinkingLevelMap: Object.fromEntries(
+      ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => [level, level === thinkingLevel ? level : null]),
+    ) };
+    const binding = await createPiProviderBinding({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel });
+    cleanups.push(binding.close);
+    expect(binding.provider.models).toEqual([metadata]);
+    const direct = directPiProviderConfiguration({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel });
+    expect(JSON.parse(direct.json).providers.paperclip.models).toEqual([metadata]);
+  });
+
+  it("keeps ACPX Pi models.json byte-identical without the explicit native option", async () => {
+    const binding = await startPiProviderLoopback({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1") });
+    cleanups.push(binding.close);
+    const provider = JSON.parse(binding.json).providers.paperclip;
+    expect(binding.json).toBe(`${JSON.stringify({ providers: { paperclip: { baseUrl: provider.baseUrl, api: "anthropic-messages", apiKey: provider.apiKey, models: [{ id: "vendor/model" }] } } })}\n`);
+  });
+
+  it.each([undefined, "off"] as const)("keeps absent/off thinking metadata non-reasoning: %s", async thinkingLevel => {
+    const binding = await createPiProviderBinding({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel });
+    cleanups.push(binding.close);
+    expect(binding.provider.models).toEqual([{ id: "vendor/model" }]);
+    const direct = directPiProviderConfiguration({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel });
+    expect(direct.json).toBe(`${JSON.stringify({ providers: { paperclip: { baseUrl: "http://127.0.0.1:1", api: "anthropic-messages", apiKey: key, models: [{ id: "vendor/model" }] } } })}\n`);
+  });
+
+  it("refuses an invalid native thinking level before allocating a broker", async () => {
+    await expect(createPiProviderBinding({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel: "unsupported" as never }))
+      .rejects.toThrow("Pi managed model thinking level");
+  });
+
   it("writes only the session capability to models.json and routes a real Messages request", async () => {
     let received: { path?: string; key?: string; body: unknown } | undefined;
     const upstream = createServer(async (req, res) => {
