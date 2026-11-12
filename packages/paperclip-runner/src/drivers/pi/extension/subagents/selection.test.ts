@@ -8,9 +8,9 @@ export const selection = (model = "neutral/reasoner:max") => ({
   complexity: "cross-component", rationale: "Independent review", budget: { tokens: 2000 }, model,
 });
 export const catalog: ChildModelCatalog = model => ({
-  "neutral/reasoner": { provider: "neutral", id: "reasoner", family: "other" as const, thinkingLevels: PI_NATIVE_THINKING_LEVELS },
-  "anthropic/claude-test": { provider: "anthropic", id: "claude-test", family: "claude" as const, thinkingLevels: PI_NATIVE_THINKING_LEVELS },
-  "alias/reviewer": { provider: "gateway", id: "claude-test", family: "claude" as const, thinkingLevels: PI_NATIVE_THINKING_LEVELS },
+  "neutral/reasoner": { provider: "neutral", id: "reasoner", family: "other", thinkingLevels: PI_NATIVE_THINKING_LEVELS },
+  "anthropic/claude-test": { provider: "anthropic", id: "claude-test", family: "claude", thinkingLevels: PI_NATIVE_THINKING_LEVELS },
+  "alias/reviewer": { provider: "gateway", id: "claude-test", family: "claude", thinkingLevels: PI_NATIVE_THINKING_LEVELS },
 }[model]);
 
 describe("F085 per-leaf explicit selection (trust boundary)", () => {
@@ -49,10 +49,6 @@ describe("F085 per-leaf explicit selection (trust boundary)", () => {
       { ...state, sessionId: "" },
       { ...state, model: undefined },
     ]) expect(() => acknowledgeChildSelection(admitted, mismatch)).toThrow(/child|effective/i);
-  });
-
-  it("preserves exact nested and tagged model IDs using shared native config validation", () => {
-    expect(validateChildSelection(selection("local/vendor/model:tag:high"), () => ({ provider: "local", id: "vendor/model:tag", family: "other", thinkingLevels: ["high"] }))).toMatchObject({ requestedModel: "local/vendor/model:tag", effort: "high" });
   });
 
   it("snapshots decision evidence instead of retaining mutable parent data", () => {

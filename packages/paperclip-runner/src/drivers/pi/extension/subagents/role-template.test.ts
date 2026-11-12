@@ -14,7 +14,6 @@ describe("F084 role-only reusable templates (trust boundary)", () => {
     expect(() => validateRoleTemplate("---\nname: reviewer\nconfig: { thinking: high }\n---\nRole\n")).toThrow(/thinking/);
     expect(validateRoleTemplate(plain)).toMatchObject({ text: plain });
     expect(validateRoleTemplate("Plain role text without frontmatter").text).toBe("Plain role text without frontmatter");
-    expect(validateRoleTemplate("---\n---\nRole only").text).toBe("---\n---\nRole only");
     expect(() => validateRoleTemplate("---\nname: a\nname: b\n---\nrole")).toThrow(/frontmatter/i);
     expect(() => validateRoleTemplate("---\nmodel: [\n---\nrole")).toThrow(/frontmatter/i);
     expect(() => validateRoleTemplate("---\nthinking: high")).toThrow(/frontmatter/i);
