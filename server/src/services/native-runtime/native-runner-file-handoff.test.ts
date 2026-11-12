@@ -48,6 +48,7 @@ import { issueService } from "../issues.js";
 import { findHeartbeatRunCompletionComment, resolveHeartbeatRunResponse } from "../heartbeat-run-summary.js";
 import {
   renderNativeRunnerStagedAttachmentPrompt,
+  renderNativeRunnerStagedAttachmentInput,
   stageNativeRunnerAttachmentBytes,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
@@ -1012,6 +1013,31 @@ describe("native runner file handoff", () => {
     expect(unavailable.attachments[0]).toMatchObject({ workspaceRelativePath: null, unavailableReason: "attachment_staging_failed" });
     expect(stageRemoteAttachment).not.toHaveBeenCalled();
     await unavailable.cleanup();
+  });
+
+  // Keep reason: tenant/storage trust boundary. Native images must come from
+  // this run's staging result, while uploaded documents keep readable paths.
+  it.each(["local", "remote"] as const)("prepares one PNG and one PDF for native Pi without treating documents or unavailable files as images (%s)", async executionTargetKind => {
+    const storage = createStorageService(createLocalDiskStorageProvider(storageRoot));
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lRkAAAAASUVORK5CYII=", "base64");
+    const pdf = Buffer.from("%PDF-1.7\nfixture\n%%EOF\n");
+    const image = await createInboundAttachmentFixture({ storage, filename: "screenshot.png", body: png, contentType: "image/png", commentBody: "Inspect this screenshot" });
+    const document = await createInboundAttachmentFixture({ storage, filename: "document.pdf", body: pdf, contentType: "application/pdf", commentBody: "Read this document" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, paperclipWake: { comments: [image, document].map(({ attachment, comment }) => ({ id: comment.id, attachments: [{ id: attachment.id }] })) } } }).where(eq(heartbeatRuns.id, runId));
+    const stage = await stageNativeRunnerWakeAttachments({
+      db, storage, binding: { companyId, issueId, runId, agentId, workspaceRoot, executionTargetKind },
+      ...(executionTargetKind === "remote" ? { downloadRemoteAttachment: async source => `/runner/attachment-downloads/${source.attachmentId}` } : {}),
+    });
+    try {
+      const input = renderNativeRunnerStagedAttachmentInput(stage.attachments);
+      const [stagedImage, stagedDocument] = stage.attachments;
+      expect(input.localImagePaths).toEqual([stagedImage!.runnerLocalPath ?? stagedImage!.workspaceRelativePath]);
+      const documentPath = stagedDocument!.runnerLocalPath ?? stagedDocument!.workspaceRelativePath!;
+      expect(input.prompt).toContain(documentPath);
+      expect(input.localImagePaths).not.toContain(documentPath);
+      if (executionTargetKind === "local") expect(await readFile(path.join(workspaceRoot, documentPath))).toEqual(pdf);
+      expect(renderNativeRunnerStagedAttachmentInput([{ ...stagedImage!, unavailableReason: "attachment_staging_failed" }]).localImagePaths).toEqual([]);
+    } finally { await stage.cleanup(); }
   });
 
   it("excludes an older same-issue attachment when the current wake selects a newer file", async () => {

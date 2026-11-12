@@ -4164,6 +4164,22 @@ impl CodexCommandExecutor {
     fn start_turn(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
         // Validate before recovery or marking dispatch ambiguous: malformed
         // selections must not launch a provider or poison a durable session.
+        let local_image_paths: Vec<String> = serde_json::from_value(
+            payload
+                .get("localImagePaths")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|error| {
+            DurableRunnerError::invalid(format!("invalid turn.start localImagePaths: {error}"))
+        })?;
+        crate::codex_provider::pi_local_image_input(
+            self.state
+                .as_ref()
+                .map_or("", |state| state.config.provider.as_str()),
+            &local_image_paths,
+        )
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         let skills: Vec<CodexSkillInput> =
             serde_json::from_value(payload.get("skills").cloned().unwrap_or_else(|| json!([])))
                 .map_err(|error| {
@@ -4196,7 +4212,10 @@ impl CodexCommandExecutor {
             }
         };
         if compact
-            && (!skills.is_empty() || reasoning_mode.is_some() || payload.get("text").is_some())
+            && (!skills.is_empty()
+                || !local_image_paths.is_empty()
+                || reasoning_mode.is_some()
+                || payload.get("text").is_some())
         {
             return Err(DurableRunnerError::invalid(
                 "a compaction turn.start cannot carry text, skills, or a reasoning mode",
@@ -4322,6 +4341,7 @@ impl CodexCommandExecutor {
                     CodexTurnOptions {
                         skills: &skills,
                         reasoning_mode,
+                        local_image_paths: &local_image_paths,
                     },
                     payload.get("effort"),
                     run_id.as_deref(),
@@ -4556,9 +4576,27 @@ impl CodexCommandExecutor {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| DurableRunnerError::invalid("turn.steer payload.text is required"))?;
-        self.ensure_provider()?.steer_turn(text).map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
+        let local_image_paths: Vec<String> = serde_json::from_value(
+            payload
+                .get("localImagePaths")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(|error| {
+            DurableRunnerError::invalid(format!("invalid turn.steer localImagePaths: {error}"))
         })?;
+        crate::codex_provider::pi_local_image_input(
+            self.state
+                .as_ref()
+                .map_or("", |state| state.config.provider.as_str()),
+            &local_image_paths,
+        )
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        self.ensure_provider()?
+            .steer_turn_with_images(text, &local_image_paths)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
+            })?;
         Ok(CommandExecution::result(json!({"status": "steered"})))
     }
 

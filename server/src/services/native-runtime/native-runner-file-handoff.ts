@@ -1110,6 +1110,23 @@ export async function stageNativeRunnerWakeAttachments(input: {
   }
 }
 
+/** Native image inputs are selected from the authenticated staging result,
+ * never reconstructed from filenames or model-visible prompt text. PDF and
+ * other documents retain the upstream staged-path prompt contract. */
+export function renderNativeRunnerStagedAttachmentInput(
+  attachments: readonly NativeRunnerStagedAttachment[],
+) {
+  const imageTypes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+  return {
+    prompt: renderNativeRunnerStagedAttachmentPrompt(attachments),
+    localImagePaths: attachments.flatMap(attachment => {
+      if (attachment.unavailableReason !== null || !imageTypes.has(attachment.contentType)) return [];
+      const path = attachment.runnerLocalPath ?? attachment.workspaceRelativePath;
+      return path ? [path] : [];
+    }),
+  };
+}
+
 export function renderNativeRunnerStagedAttachmentPrompt(
   attachments: readonly NativeRunnerStagedAttachment[],
 ): string {

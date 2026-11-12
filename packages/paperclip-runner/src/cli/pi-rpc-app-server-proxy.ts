@@ -517,8 +517,12 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         const piRpcThinkingLevel = parsePiThinkingLevel(
           params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
         );
+        const localImagePaths = inputItems.filter(entry => entry.type === "localImage").map(entry => {
+          if (typeof entry.path !== "string" || !entry.path) throw new Error("Pi local image input requires a path");
+          return entry.path;
+        });
         const turnInput = {
-          message: { role: "user" as const, text: messageText },
+          message: { role: "user" as const, text: messageText, ...(localImagePaths.length ? { localImagePaths } : {}) },
           model: activeModel,
           ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
         } as Parameters<HarnessSession["startTurn"]>[0] & { piRpcThinkingLevel?: PiThinkingLevel };
@@ -561,7 +565,11 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (params.mode !== undefined && params.mode !== "steer") throw new Error("Pi RPC follow-up is unavailable");
         const inputItems = Array.isArray(params.input) ? params.input.map(record) : [];
         const messageText = inputItems.map((entry) => text(entry.text)).filter(Boolean).join("\n");
-        await session.steer({ turnId, message: { role: "user", text: messageText } });
+        const localImagePaths = inputItems.filter(entry => entry.type === "localImage").map(entry => {
+          if (typeof entry.path !== "string" || !entry.path) throw new Error("Pi local image input requires a path");
+          return entry.path;
+        });
+        await session.steer({ turnId, message: { role: "user", text: messageText, ...(localImagePaths.length ? { localImagePaths } : {}) } });
         result = { accepted: true };
         break;
       }

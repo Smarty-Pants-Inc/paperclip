@@ -272,6 +272,7 @@ import {
 import { claimFirstTurnQueuedInput } from "./first-turn-queued-input.js";
 import {
   renderNativeRunnerStagedAttachmentPrompt,
+  renderNativeRunnerStagedAttachmentInput,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
 import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
@@ -9902,7 +9903,7 @@ export async function executePaperclipNativeSession(input: {
   /** Internal, run-owned file inspection lifetime; never supplied by tool arguments. */
   chatAttachmentReadScope?: NativeChatAttachmentReadScope;
   bindAttachmentSession?: (session: NativeSession | null) => void;
-  prepareAttachmentPrompt?: () => Promise<string>;
+  prepareAttachmentPrompt?: () => Promise<string | ReturnType<typeof renderNativeRunnerStagedAttachmentInput>>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onPersistedNativeLog?: (cursor: number, chunk: string) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
@@ -10129,7 +10130,10 @@ export async function executePaperclipNativeSession(input: {
           },
         });
         wakeStages.push(wakeStage);
-        return renderNativeRunnerStagedAttachmentPrompt((await wakeStage).attachments);
+        const { attachments } = await wakeStage;
+        return input.execution.provider.kind === "pi_rpc"
+          ? renderNativeRunnerStagedAttachmentInput(attachments)
+          : renderNativeRunnerStagedAttachmentPrompt(attachments);
       };
       cleanupStagedAttachments = async () => {
         closed = true;
@@ -10143,7 +10147,7 @@ export async function executePaperclipNativeSession(input: {
         }
       };
       preparedInput = { ...input, chatAttachmentReadScope };
-      if (downloadRemoteAttachment) {
+      if (downloadRemoteAttachment || input.execution.provider.kind === "pi_rpc") {
         return {
           ...preparedInput,
           bindAttachmentSession: (session: NativeSession | null) => {

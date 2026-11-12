@@ -8,6 +8,7 @@ import { mapPiRpcRecord, PiRpcDriver } from "./pi-rpc-driver.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
 import { createPiRpcAppServerProxy } from "../../cli/pi-rpc-app-server-proxy.js";
+import * as piTurnImages from "./pi-turn-images.js";
 
 // Keep reason: recorded large-output incident439 and failure attribution across
 // resident runs. Drive the real session pump rather than a projector surrogate.
@@ -49,6 +50,31 @@ async function failureFixture(capture = true) {
 }
 
 describe("PiRpcDriver", () => {
+  it("does not send a late prompt when image preparation outlives close", async () => {
+    const fixture = await failureFixture();
+    let release!: (message: { message: string }) => void;
+    let began!: () => void;
+    const reading = new Promise<void>(resolve => { began = resolve; });
+    const held = new Promise<{ message: string }>(resolve => { release = resolve; });
+    const imageRead = vi.spyOn(piTurnImages, "piTurnImageInput").mockImplementationOnce(() => { began(); return held; });
+    const requests = vi.spyOn(fixture.transport, "request");
+    const started = fixture.session.startTurn({ message: { role: "user", text: "Inspect staged PNG", localImagePaths: ["/runner/image.png"] } })
+      .then(() => null, error => error);
+    try {
+      await reading;
+      await fixture.session.close();
+      release({ message: "Inspect staged PNG" });
+      expect(await started).toBeInstanceOf(Error);
+      expect(requests.mock.calls.some(([type]) => type === "prompt")).toBe(false);
+    } finally {
+      release({ message: "Inspect staged PNG" });
+      await started;
+      imageRead.mockRestore();
+      requests.mockRestore();
+      await fixture.close();
+    }
+  });
+
   it("does not inherit ambient AGENT_HOME when server omits it", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-home-ambient-"));
     vi.stubEnv("AGENT_HOME", root);

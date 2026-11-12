@@ -320,6 +320,7 @@ export class CodexHarnessSession
               ? `${turnSkills.map((skill) => `$${skill.name}`).join(" ")}\n\n${taskText}`
               : taskText,
           }),
+          ...(input.message.localImagePaths ?? []).map(path => ({ type: "localImage", path })),
           ...turnSkills,
         ],
         ...(this.conversationMode === "direct"
@@ -427,7 +428,7 @@ export class CodexHarnessSession
     try {
       await this.transport.request("turn/steer", {
         threadId: this.opened.threadId,
-        input: [userInput(input.message)],
+        input: [userInput(input.message), ...(input.message.localImagePaths ?? []).map(path => ({ type: "localImage", path }))],
         expectedTurnId: input.turnId,
         correlationId: input.correlationId,
         ...(input.mode === undefined ? {} : { mode: input.mode }),

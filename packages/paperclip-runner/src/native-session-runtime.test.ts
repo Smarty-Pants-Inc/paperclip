@@ -351,14 +351,17 @@ describe("executeNativeSession recovery", () => {
       async completeRun() {},
     };
     await executeNativeSession({ input: executionInput, backend, controlPlane: port,
+      prepareWakeAttachmentPrompt: async () => ({ prompt: "Read the document at /run/attachments/current.pdf.", localImagePaths: ["/run/attachments/current.png"] }),
       runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" });
+    expect(startTurn.mock.calls[0]![0].message.localImagePaths).toEqual(["/run/attachments/current.png"]);
+    expect(startTurn.mock.calls[0]![0].message.text).toContain("/run/attachments/current.pdf");
     expect(JSON.parse(startTurn.mock.calls[0]![0].message.text).workspace).toEqual({ cwd: cwd ?? originalWorkspace.cwd });
     // Fresh and ordinary resumed turns do not carry restart-continuation guidance.
     expect(startTurn.mock.calls[0]![0].message.text).not.toContain(RESTART_LOST_PROCESS_GUIDANCE);
     expect(executionInput.workspace).toEqual(originalWorkspace);
   });
 
-  it("settles a restart continuation that ended without a result through one disposition turn (Codex driver)", async () => {
+  it.each([false, true])("settles a restart continuation that ended without a result through one disposition turn (Codex driver, native images=%s)", async nativeImages => {
     const lost = { code: "provider_turn_lost_on_restore", recoverable: true };
     const originalTransport = new FakeCodexTransport();
     const recoveredTransport = new FakeCodexTransport();
@@ -388,7 +391,9 @@ describe("executeNativeSession recovery", () => {
       async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
       completeRun,
     };
-    const prepareWakeAttachmentPrompt = vi.fn(async () => "Read the fresh attachment at /run/attachments/restarted.png.");
+    const prepareWakeAttachmentPrompt = vi.fn(async () => nativeImages
+      ? { prompt: "Read the fresh document at /run/attachments/restarted.pdf.", localImagePaths: ["/run/attachments/restarted.png"] }
+      : "Read the fresh attachment at /run/attachments/restarted.png.");
     const execution = executeNativeSession({
       input: executionInput, backend, controlPlane: port, persistedSession: checkpoint, prepareWakeAttachmentPrompt,
       runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery", resumeInterruptedTurn: true,
@@ -397,6 +402,10 @@ describe("executeNativeSession recovery", () => {
     await vi.waitFor(() => expect(turnStarts()).toHaveLength(1));
     expect(prepareWakeAttachmentPrompt).toHaveBeenCalledOnce();
     expect(JSON.stringify(turnStarts()[0]!.params)).toContain("/run/attachments/restarted.png");
+    if (nativeImages) {
+      expect(turnStarts()[0]!.params.input).toContainEqual({ type: "localImage", path: "/run/attachments/restarted.png" });
+      expect(JSON.stringify(turnStarts()[0]!.params)).toContain("/run/attachments/restarted.pdf");
+    }
     // Like the RC-60 Claude turns: the continuation ends saying it will wait
     // for a background command, with no paperclip_finish.
     recoveredTransport.push("turn/completed", { threadId: "thread-1", turn: { id: "turn-2", status: "completed", items: [] } });

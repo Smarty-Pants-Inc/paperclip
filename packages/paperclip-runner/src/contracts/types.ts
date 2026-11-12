@@ -55,6 +55,15 @@ export interface NativeSessionCapabilities {
 export interface NativeUserMessage {
   role: "user";
   text: string;
+  /** Authenticated current-turn image paths on the provider host. Never
+   * extracted from user prompt text; documents remain referenced in text. */
+  localImagePaths?: readonly string[];
+}
+
+/** The existing staged-attachment prompt plus optional native image inputs. */
+export interface NativeWakeAttachmentInput {
+  prompt: string;
+  localImagePaths?: readonly string[];
 }
 import type { TypedEventFamilyCapability } from "../provider-events.js";
 

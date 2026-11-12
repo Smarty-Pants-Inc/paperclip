@@ -16,6 +16,7 @@ import { piHostInstructionSegment, verifiedPiChildBridgePath } from "./extension
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { piTurnImageInput } from "./pi-turn-images.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -583,7 +584,12 @@ export class PiRpcHarnessSession implements HarnessSession {
         // only by this host prompt, never attach/bind or callback arrival.
         if (binding) this.#callbacks?.activate(binding.origin);
         this.#pendingInput++;
-        const response = await this.#transport.request("prompt", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+        let response: PiRpcRecord;
+        try {
+          const message = await piTurnImageInput(input.message, this.#workingDirectory);
+          if (this.#closed || turn.settled || this.#activeTurn !== turn || !this.#admitted) throw new Error("Pi RPC session closed while preparing image input");
+          response = await this.#transport.request("prompt", message);
+        } finally { this.#pendingInput--; }
         const disposition = stringValue(record(response.data).disposition);
         if (disposition !== "started") throw new PiNativeAdmissionError("pi_prompt_rejected", `Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
       } catch (error) {
@@ -602,7 +608,12 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#closed || !turn || turn.settled) throw new HarnessOperationAlreadyTerminalError("steering");
     if (input.turnId !== turn.turnId) throw new HarnessStaleTurnError(input.turnId);
     this.#pendingInput++;
-    const response = await this.#transport.request("steer", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+    let response: PiRpcRecord;
+    try {
+      const message = await piTurnImageInput(input.message, this.#workingDirectory);
+      if (this.#closed || turn.settled || this.#activeTurn !== turn) throw new HarnessOperationAlreadyTerminalError("steering");
+      response = await this.#transport.request("steer", message);
+    } finally { this.#pendingInput--; }
     const disposition = stringValue(record(response.data).disposition);
     if (disposition !== "queued") {
       throw new Error(`Pi RPC steer did not queue input (disposition=${disposition ?? "missing"})`);

@@ -16,6 +16,16 @@ command-backed sandbox targets can also stage files through their bound
 transport when Runner download is unavailable. Image inputs must be opened
 with the provider's image-capable file reader.
 
+Native Pi RPC also sends current-wake PNG, JPEG, GIF, and WebP attachments
+through Pi 1.5.2's `prompt.images` input. The server selects authenticated staged
+paths separately from prompt text; Runner carries them as `localImage` inputs,
+and Pi's provider-host driver reads the bounded file bytes and constructs image
+blocks. Active-turn steering uses the same image mapping. PDFs and other
+documents remain files at their staged `workspaceRelativePath` or
+`runnerLocalPath`, referenced in prompt text for the agent to read. A new turn
+never implicitly reuses the previous turn's images. Unavailable staging does
+not grant an image read, and prompt text alone never grants a file read.
+
 The same paths support authorized historical external-chat reads. Their
 existing conversation and source-comment checks still apply. External-chat
 history tools grant access only within the authorized conversation.

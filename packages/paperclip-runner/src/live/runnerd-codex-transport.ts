@@ -854,6 +854,20 @@ async function awaitProviderDrainBarrier(input: {
   return false;
 }
 
+// Paths belong to the Runner filesystem, not the controller. Preserve them in
+// durable commands and let the admitted Pi facade read/encode them locally.
+export function runnerdPiLocalImagePaths(input: readonly Record<string, unknown>[], provider: string): string[] {
+  const images = input.filter(item => item.type === "localImage");
+  if (!images.length) return [];
+  if (provider !== "pi_rpc" || images.length > 128) throw new Error("local image inputs require Pi and at most 128 files");
+  return images.map(item => {
+    if (typeof item.path !== "string" || !item.path || item.path.length > 4096 || /[\x00-\x1f\x7f]/u.test(item.path)) {
+      throw new Error("local image input requires a valid Runner path");
+    }
+    return item.path;
+  });
+}
+
 export function committedEventWindowComplete(state: { committedEvents: readonly { sourceSeq: number }[]; ackedSourceSeq: number } | undefined): boolean {
   if (!state || state.committedEvents.length !== state.ackedSourceSeq) return false;
   const seen = new Set(state.committedEvents.map(event => event.sourceSeq));
@@ -4432,6 +4446,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const text = input
         .map((item) => (typeof item.text === "string" ? item.text : ""))
         .join("\n");
+      const localImagePaths = runnerdPiLocalImagePaths(input, this.options.provider ?? "codex");
       const expectedTurnId =
         typeof params.expectedTurnId === "string"
           ? params.expectedTurnId
@@ -4450,6 +4465,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           text,
           turnId: this.#durableTurnId,
           providerTurnId: expectedTurnId,
+          ...(localImagePaths.length ? { localImagePaths } : {}),
           ...(params.mode === "follow_up" ? { mode: "follow_up" } : {}),
           ...(correlationId ? { correlationId } : {}),
         },
@@ -7561,6 +7577,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       .filter((item) => item.type !== "skill")
       .map((item) => (typeof item.text === "string" ? item.text : ""))
       .join("\n");
+    const localImagePaths = runnerdPiLocalImagePaths(input, this.options.provider ?? "codex");
     const reasoningMode = params.reasoningMode;
     if (reasoningMode !== undefined && (
       !this.supportsTurnReasoning()
@@ -7602,7 +7619,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const startResult = await this.#commandResult(
         "turn.start",
         {
-          ...(compactionPayload ?? { text: message }),
+          ...(compactionPayload ?? { text: message, ...(localImagePaths.length ? { localImagePaths } : {}) }),
           ...(this.options.recordTimingReceipt ? {performance:true} : {}),
           ...((this.options.provider ?? "codex") === "codex" && params.effort !== undefined ? { effort: params.effort } : {}),
           ...(reasoningMode === undefined ? {} : { reasoningMode }),
