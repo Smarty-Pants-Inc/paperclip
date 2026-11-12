@@ -1,3 +1,5 @@
+import { resolveDefaultPiRpcThinkingLevel } from "@paperclipai/adapter-utils/pi-rpc-default-thinking";
+import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
 import { admitPiProbeSession, observePiNativeHello } from "../drivers/pi/pi-environment-probe.js";
 import { resolvePiNativeConfig } from "../drivers/pi/pi-native-config.js";
 import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
@@ -3754,6 +3756,7 @@ function withRunnerdProviderTrace(
   return result;
 }
 function createCapabilityRunnerdProviderEnvironmentBase(input: {
+  model?: unknown;
   provider: NonNullable<CapabilityRunnerdCodexTransportOptions["provider"]>;
   options: CapabilityRunnerdCodexTransportOptions;
   identity: DurableRecoveryIdentity;
@@ -3792,7 +3795,7 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
       // Server-selected registered instruction-copy executionRoot; Pi only.
       ...(input.options.environment?.AGENT_HOME ? { AGENT_HOME: input.options.environment.AGENT_HOME } : {}),
       PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
-      ...(input.options.piRpcThinkingLevel === undefined ? {} : { PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel }), ...commonIdentity };
+      PAPERCLIP_PI_THINKING_LEVEL: resolveDefaultPiRpcThinkingLevel(input.options.piRpcThinkingLevel ?? input.options.environment?.PAPERCLIP_PI_THINKING_LEVEL, input.model, undefined, PI_RPC_BUILTIN_THINKING_CATALOG), ...commonIdentity };
   }
   if (input.provider === "opencode") {
     return {
@@ -4228,7 +4231,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     resolveGrokEffort(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.grokEffort);
     resolveGrokDisableWebSearch(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.grokDisableWebSearch);
     if (options.provider === "pi_rpc") {
-      parsePiThinkingLevel(options.piRpcThinkingLevel ?? "low");
+      // Defaults are per transport/model, never written into a caller's shared config.
+      this.options = { ...options };
+      if (options.piRpcThinkingLevel !== undefined) parsePiThinkingLevel(options.piRpcThinkingLevel);
       parsePiRpcProfile(options.piProfile ?? QUALIFIED_PI_RPC_PROFILE);
     }
     resolvePiThinkingLevel(options.provider === "acpx" ? options.acpxAgent ?? "codex" : "", options.piThinkingLevel);
@@ -5910,10 +5915,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return this.options.measureOperation ? this.options.measureOperation("runner.transport.prepare", () => this.#prepareLaunchWork(params, identity, dynamicTools), {toolCount:dynamicTools.length, toolSchemaBytes:Buffer.byteLength(JSON.stringify(dynamicTools))}) : this.#prepareLaunchWork(params, identity, dynamicTools);
   }
 
+  #resolvePiThinkingLevel(params: Record<string, unknown>): void {
+    if (this.options.provider === "pi_rpc") {
+      this.options.piRpcThinkingLevel = resolveDefaultPiRpcThinkingLevel(
+        this.options.piRpcThinkingLevel ?? this.options.environment?.PAPERCLIP_PI_THINKING_LEVEL, params.model, undefined, PI_RPC_BUILTIN_THINKING_CATALOG,
+      );
+    }
+  }
+
   async #prepareLaunchWork(
     params: Record<string, unknown>, identity: DurableRecoveryIdentity,
     dynamicTools: Record<string, unknown>[],
   ) {
+    this.#resolvePiThinkingLevel(params);
     if (this.options.acpxCandidateAdmission) {
       const candidate = this.options.acpxCandidateAdmission;
       parseAcpxCandidateAdmission(candidate, { companyId: candidate.companyId, agent: this.options.acpxAgent ?? "", model: String(params.model ?? "") });
@@ -6114,6 +6128,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       environment: withRunnerdProviderTrace(
         createCapabilityRunnerdProviderEnvironment({
           provider,
+          model: params.model,
           options: {
             ...this.options,
             stateDirectory: this.#root,
@@ -6193,6 +6208,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async #startWork(
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    this.#resolvePiThinkingLevel(params);
     if (this.#core !== null)
       throw new Error("PRP provider thread is already started");
     if (this.options.adoptExistingRunner) {
@@ -6710,6 +6726,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#durableTurnId = identity.turnId;
     this.#eventIdentity = structuredClone(identity);
     const provider = this.options.provider ?? "codex";
+    if (provider === "pi_rpc") {
+      const savedProvider = record(record(controlPlaneState.runAttachTemplate).provider);
+      this.options.piRpcThinkingLevel = resolveDefaultPiRpcThinkingLevel(
+        this.options.piRpcThinkingLevel ?? savedProvider.piRpcThinkingLevel ?? this.options.environment?.PAPERCLIP_PI_THINKING_LEVEL,
+        savedProvider.model, undefined, PI_RPC_BUILTIN_THINKING_CATALOG,
+      );
+    }
     // Adoption authenticates the original artifact and process. Launch profiles
     // belong only to a new spawn and may reference a retired controller build.
     const preparesProviderLaunch = !this.options.prepareLaunch && !this.options.adoptExistingRunner;
@@ -7184,6 +7207,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           environment: this.options.prepareLaunch ? {} : withRunnerdProviderTrace(
             createCapabilityRunnerdProviderEnvironment({
               provider,
+              model: record(record(controlPlaneState.runAttachTemplate).provider).model,
               options: {
                 ...this.options,
                 stateDirectory: this.#root,

@@ -1001,6 +1001,20 @@ describe("agent routes adapter validation", () => {
     expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
+  // Keep reason: public hire -> runner selection -> persisted native effort contract.
+  it.each([[undefined, "max"], ["low", "low"]] as const)("uses the shared Pi default in public runner selection (%s)", async (configured, expected) => {
+    const selection = await import("../services/agent-runner-selection.js");
+    vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
+      selection.resolveNewAgentRunner({ ...input, target: { driver: "local", platform: "darwin", architecture: "arm64" } }));
+    const app = await createApp();
+    const response = await requestApp(app, base => request(base).post("/api/companies/company-1/agents").send({
+      name: "Pi catalog default", adapterType: "pi_local", runner: "paperclip",
+      adapterConfig: { model: "paperclip/claude-opus-5-5", ...(configured === undefined ? {} : { piRpcThinkingLevel: configured }) },
+    }));
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterConfig: { model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: expected } });
+  });
+
   it.each(["auto", "legacy"] as const)("creates Pi through the public route with %s selection and the experimental flag off", async runner => {
     const selection = await import("../services/agent-runner-selection.js");
     vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
@@ -1009,7 +1023,7 @@ describe("agent routes adapter validation", () => {
     const model = "openrouter/anthropic/claude-sonnet-4.6";
     const response = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents").send({ name: "Pi", adapterType: "pi_local", runner, adapterConfig: { model } }));
     expect(response.status, JSON.stringify(response.body)).toBe(201);
-    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: runner === "legacy" ? "pi_local" : "paperclip_runner", adapterConfig: runner === "legacy" ? { model } : { provider: "pi_rpc", model, piRpcThinkingLevel: "low" } });
+    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: runner === "legacy" ? "pi_local" : "paperclip_runner", adapterConfig: runner === "legacy" ? { model } : { provider: "pi_rpc", model, piRpcThinkingLevel: "max" } });
   });
 
   // Keep reason: new native Pi hires were stuck in verifying even though an
@@ -1095,7 +1109,7 @@ describe("agent routes adapter validation", () => {
     const draft = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents")
       .send({ ...input, setupId: "00000000-0000-4000-8000-000000000092" }));
     expect(draft.status, JSON.stringify(draft.body)).toBe(201);
-    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "", piRpcThinkingLevel: "low" } });
+    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "", piRpcThinkingLevel: "high" } });
     expect(mockAgentService.create.mock.calls.at(-1)?.[2]).toMatchObject({ setupOnly: true, runnerResolved: true });
     mockAgentService.create.mockClear();
     const active = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents")
@@ -1113,7 +1127,7 @@ describe("agent routes adapter validation", () => {
     const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111")
       .send({ adapterType: "pi_local", runner: "auto", adapterConfig: {} }));
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "", piRpcThinkingLevel: "low" } });
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "", piRpcThinkingLevel: "high" } });
   });
 
   it("keeps Kimi draft models unset through the public create route", async () => {

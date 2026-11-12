@@ -1,3 +1,5 @@
+import { resolveDefaultPiRpcThinkingLevel } from "@paperclipai/adapter-utils/pi-rpc-default-thinking";
+import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
 import { QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { createHash } from "node:crypto";
 import { parseNativeRuntimeContext, retargetNativeSystemInstructions } from "../contracts/runtime-context.js";
@@ -211,7 +213,7 @@ export function createRunnerProviderLaunch(
     return { kind: "pi_rpc", provider: "pi_rpc", driver: "pi_rpc", driverKind: "pi_rpc", providerVersion: "1.5.2",
       profile: settings.piProfile ?? QUALIFIED_PI_RPC_PROFILE,
       command: input.providerNodeCommand, args: [input.piProxyPath ?? ""], cwd: input.cwd,
-      model: requirements.model, piRpcThinkingLevel: settings.piRpcThinkingLevel ?? "low",
+      model: requirements.model, piRpcThinkingLevel: resolveDefaultPiRpcThinkingLevel(settings.piRpcThinkingLevel, requirements.model, undefined, PI_RPC_BUILTIN_THINKING_CATALOG),
       instructions: baseInstructions, runtimeContext,
       conversationMode: requirements.preparedConversation ? "prepared" : "task" };
   }
