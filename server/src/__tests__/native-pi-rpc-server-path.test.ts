@@ -206,8 +206,9 @@ async function providerPack() {
       sha256: sha256DirectoryTree(join(packRoot, "provider-assets/pi_rpc/linux-x64")) } },
   };
   payload.bridgeDigest = digest(`${artifacts.opencodeProxy.sha256}\n${artifacts.acpxSidecar.sha256}\n${payload.distDigest}`);
-  const { canonicalProviderPackJson } = await import("../services/native-runtime/remote-provider-pack-verification.js");
-  const manifest = { schema: "paperclip-runner/remote-provider-pack/v1", payload, digest: digest(canonicalProviderPackJson(payload)) };
+  // The digest exactly as build-provider-pack.mjs writes it (code-unit key order).
+  const { canonicalProviderPackDigestJson } = await import("../services/native-runtime/remote-provider-pack-verification.js");
+  const manifest = { schema: "paperclip-runner/remote-provider-pack/v1", payload, digest: digest(canonicalProviderPackDigestJson(payload)) };
   await writeFile(join(packRoot, "provider-pack.json"), JSON.stringify(manifest));
   return { packRoot, manifest };
 }
