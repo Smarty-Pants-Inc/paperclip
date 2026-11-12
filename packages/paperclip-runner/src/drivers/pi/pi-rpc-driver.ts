@@ -8,6 +8,7 @@ import { RunAuthority, sendPiBindRequest, validateBindReceipt, validateBindReque
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
+import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
@@ -124,6 +125,11 @@ export class PiRpcDriver implements HarnessDriver {
     const instructionFile = join(directory, `${safeSessionName(input.normalizedSessionId)}-${randomUUID()}.instructions.md`);
     const instructionBoundary = `paperclip-host-${randomUUID()}`;
     const initialContext = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
+    const agentHome = this.#options.model && usesPiProviderLoopback(this.#options.model, environment)
+      ? environment.PI_CODING_AGENT_DIR ?? join(directory, "agent")
+      : piCompanySkillsAgentHome(environment);
+    environment.PI_CODING_AGENT_DIR = agentHome;
+    await syncPiCompanySkills(agentHome, initialContext.runtimeContext);
     const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
     await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
     args.push("--append-system-prompt", instructionFile, "--extension", extension);
@@ -133,7 +139,6 @@ export class PiRpcDriver implements HarnessDriver {
     let resident: PiResidentState | undefined;
     let callbacks: PiHostCallbacks | undefined;
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
-      const agentHome = environment.PI_CODING_AGENT_DIR ?? join(directory, "agent");
       await mkdir(agentHome, { recursive: true, mode: 0o700 });
       environment.PI_CODING_AGENT_DIR = agentHome;
       if (credentialMode === "broker") {
@@ -201,6 +206,7 @@ export class PiRpcDriver implements HarnessDriver {
         config,
         systemInstructions: this.#options.systemInstructions,
         initialContext,
+        agentHome,
         instructionFile,
         instructionBoundary,
         admissionTimeoutMs: this.#options.startupTimeoutMs,
@@ -253,6 +259,7 @@ interface PiSessionState {
   config: PiNativeConfig;
   systemInstructions?: string;
   initialContext: PiRunContext;
+  agentHome: string;
   instructionFile: string;
   instructionBoundary: string;
   bindRequest: typeof sendPiBindRequest;
@@ -336,6 +343,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
   #initialContext: PiRunContext;
+  readonly #agentHome: string;
   readonly #instructionFile: string;
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
@@ -366,6 +374,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#bindRequest = state.bindRequest;
     this.#config = state.config;
     this.#initialContext = state.initialContext;
+    this.#agentHome = state.agentHome;
     this.#instructionFile = state.instructionFile;
     this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
@@ -408,6 +417,7 @@ export class PiRpcHarnessSession implements HarnessSession {
           input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
         if (JSON.stringify(context.tools) !== JSON.stringify(previous.tools)) throw new Error("Pi RPC tool refresh requires a provider bind receipt");
         await this.#admit(input.signal);
+        await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
         await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
         this.#initialContext = context;
       }
@@ -467,6 +477,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       await this.#sendBind(request, signal);
       resident.epoch = origin.epoch;
       await this.#admit(signal);
+      await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
       await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
       resident.context = context;
     } catch (error) {
