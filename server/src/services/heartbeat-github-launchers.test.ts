@@ -209,7 +209,7 @@ it("invalidates prior staging proof before a failing miss, including a later con
 
 it("does not alter a previously cached layout when durable invalidation fails", async () => {
   const lease = { id: "lease", companyId: "company", environmentId: "env", providerLeaseId: "box",
-    status: "active", metadata: { anonymousGitHubLaunchers: { key: "old", layout: {} } } } as unknown as EnvironmentLease;
+    status: "active", metadata: { anonymousGitHubLaunchers: { key: "old", leaseId: "lease", layout: {} } } } as unknown as EnvironmentLease;
   const prepare = vi.fn();
   const input = { native: true, githubConfigured: false, agentId: "agent", runId: "run", cwd: "/workspace",
     env: {}, target: { ...target, leaseId: lease.id }, brokerUrl: "", createBrokerToken: () => "",

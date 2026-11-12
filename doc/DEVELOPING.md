@@ -5342,3 +5342,8 @@ reacquisition). Their logical owner and cached realization owner are rebound to
 the successor; content/configuration keys still have to match at use time. A new
 allocation, unrelated row, agent/task/scope change, expired lease or missing receipt
 performs preparation normally. No bearer tokens are copied into lease metadata.
+
+On a preparation key miss, retire any older successful receipt durably before
+mutating guest files/layout. A partial failure followed by a configuration
+rollback must not resurrect an old proof. Failed invalidation stops preparation
+before guest mutation; unchanged hits still do no additional write or RPC.

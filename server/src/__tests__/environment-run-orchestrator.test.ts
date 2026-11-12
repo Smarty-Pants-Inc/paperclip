@@ -679,6 +679,40 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(5);
   });
 
+  it("retires a cached layout before a failed reconfiguration, even when config is reverted", async () => {
+    const environment = makeEnvironment("sandbox");
+    const originalConfig = environment.config;
+    const lease = makeLease({ provider: "daytona", providerLeaseId: "box", metadata: { agentId: "agent" } });
+    let durableMetadata = lease.metadata;
+    mockUpdateLeaseMetadata.mockImplementation(async (_id, metadata) => {
+      durableMetadata = metadata; return { ...lease, metadata };
+    });
+    const runtime = makeMockRuntime({ realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "/remote/workspace",
+      metadata: { workspaceRealization: { mode: "copy", authoritativeRoot: "/remote/workspace" } } }) });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+    const input = { ...makeRealizeInput({ environment, lease }), adapterType: "paperclip_runner" };
+    const first = await orchestrator.realizeForRun(input);
+    environment.config = { changed: true };
+    vi.mocked(runtime.realizeWorkspace).mockRejectedValueOnce(new Error("partial realization failure"));
+    await expect(orchestrator.realizeForRun({ ...input, lease: first.lease })).rejects.toThrow("partial realization failure");
+    expect(durableMetadata?.nativeWorkspaceRealizationPreparation).toBeNull();
+    environment.config = originalConfig;
+    await orchestrator.realizeForRun({ ...input, lease: { ...first.lease, metadata: durableMetadata } });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(3);
+  });
+
+  it("refuses realization mutation when prior-proof invalidation loses its lease", async () => {
+    const environment = makeEnvironment("sandbox");
+    const lease = makeLease({ providerLeaseId: "box", metadata: { agentId: "agent",
+      nativeWorkspaceRealizationPreparation: { key: "obsolete" } } });
+    mockUpdateLeaseMetadata.mockResolvedValueOnce(null);
+    const runtime = makeMockRuntime();
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+    await expect(orchestrator.realizeForRun({ ...makeRealizeInput({ environment, lease }), adapterType: "paperclip_runner" }))
+      .rejects.toThrow("lease disappeared before preparation");
+    expect(runtime.realizeWorkspace).not.toHaveBeenCalled();
+  });
+
   it("does not cache failed sandbox realization or reuse an expired lease", async () => {
     const environment = makeEnvironment("sandbox");
     const lease = makeLease({ provider: "daytona", providerLeaseId: "box", metadata: {} });

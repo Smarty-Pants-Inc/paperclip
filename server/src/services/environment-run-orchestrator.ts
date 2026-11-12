@@ -604,6 +604,15 @@ export function environmentRunOrchestrator(
       workspaceRealization = parseObject(priorPreparation.realization);
     }
     if (!reusePreparation && ENVIRONMENT_DRIVER_TRAITS[environment.driver].realizesWorkspace) {
+      // Realization may partially alter the guest before failing. Never let a
+      // reverted input key resurrect the earlier successful layout proof.
+      if (Object.keys(priorPreparation).length > 0) {
+        const invalidated = await environmentsSvc.updateLeaseMetadata(lease.id, {
+          ...lease.metadata, nativeWorkspaceRealizationPreparation: null,
+        });
+        if (!invalidated) throw new Error("Workspace realization lease disappeared before preparation");
+        lease = invalidated;
+      }
       try {
         const remoteCwd =
           typeof lease.metadata?.remoteCwd === "string" && lease.metadata.remoteCwd.trim().length > 0
