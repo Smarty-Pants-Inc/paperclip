@@ -186,3 +186,34 @@ it("does not publish a launcher reuse receipt after failed staging", async () =>
   await prepareHeartbeatGitHubLaunchers(input, prepare);
   expect(prepare).toHaveBeenCalledTimes(2);
 });
+
+it("invalidates prior staging proof before a failing miss, including a later config rollback", async () => {
+  const lease = { id: "lease", companyId: "company", environmentId: "env", providerLeaseId: "box",
+    status: "active", metadata: {} } as EnvironmentLease;
+  const prepare = vi.fn(async ({ env }) => ({ ...env, PATH: "/wrappers:/bin", ZDOTDIR: "/wrappers",
+    BASH_ENV: "/wrappers/.bashrc", GH_CONFIG_DIR: "/wrappers/config", PAPERCLIP_GITHUB_LAUNCHER_DIR: "/wrappers" }));
+  const save = vi.fn(async (receipt: unknown) => { lease.metadata = { anonymousGitHubLaunchers: receipt }; });
+  const input = { native: true, githubConfigured: false, agentId: "agent", cwd: "/workspace", env: { PATH: "/bin" },
+    target: { ...target, leaseId: lease.id }, brokerUrl: "", createBrokerToken: () => "",
+    preparation: { lease, configuration: { version: 1 }, save } };
+  await prepareHeartbeatGitHubLaunchers({ ...input, runId: "one" }, prepare);
+  input.preparation.configuration.version = 2;
+  prepare.mockRejectedValueOnce(new Error("partial staging failure"));
+  await expect(prepareHeartbeatGitHubLaunchers({ ...input, runId: "two" }, prepare)).rejects.toThrow("partial staging failure");
+  expect(save.mock.calls[1]).toEqual([null]);
+  expect(lease.metadata?.anonymousGitHubLaunchers).toBeNull();
+  input.preparation.configuration.version = 1;
+  await prepareHeartbeatGitHubLaunchers({ ...input, runId: "three" }, prepare);
+  expect(prepare).toHaveBeenCalledTimes(3);
+});
+
+it("does not alter a previously cached layout when durable invalidation fails", async () => {
+  const lease = { id: "lease", companyId: "company", environmentId: "env", providerLeaseId: "box",
+    status: "active", metadata: { anonymousGitHubLaunchers: { key: "old", layout: {} } } } as unknown as EnvironmentLease;
+  const prepare = vi.fn();
+  const input = { native: true, githubConfigured: false, agentId: "agent", runId: "run", cwd: "/workspace",
+    env: {}, target: { ...target, leaseId: lease.id }, brokerUrl: "", createBrokerToken: () => "",
+    preparation: { lease, configuration: {}, save: vi.fn().mockRejectedValue(new Error("lease lost")) } };
+  await expect(prepareHeartbeatGitHubLaunchers(input, prepare)).rejects.toThrow("lease lost");
+  expect(prepare).not.toHaveBeenCalled();
+});

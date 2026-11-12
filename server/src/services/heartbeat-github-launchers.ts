@@ -23,7 +23,7 @@ export async function prepareHeartbeatGitHubLaunchers(
     preparation?: {
       lease: EnvironmentLease;
       configuration: unknown;
-      save: (receipt: AnonymousGitHubLauncherReceipt) => Promise<void>;
+      save: (receipt: AnonymousGitHubLauncherReceipt | null) => Promise<void>;
     };
   },
   prepareLaunchers = prepareGitHubOperationLaunchers,
@@ -75,9 +75,17 @@ export async function prepareHeartbeatGitHubLaunchers(
     return { env: { ...env, ...Object.fromEntries(LAYOUT_KEYS.map(name => [name, saved.layout![name]!])) }, cleanupLocation: null };
   }
   try {
+    // A failed miss may have partially overwritten the old layout. Retire its
+    // proof before touching files, so a later config rollback cannot reuse it.
+    if (saved) {
+      await input.preparation!.save(null);
+      lease!.metadata = { ...lease!.metadata, anonymousGitHubLaunchers: null };
+    }
     const prepared = await prepareLaunchers({ ...location, cwd: input.cwd, env });
     if (key && LAYOUT_KEYS.every(name => typeof prepared[name] === "string")) {
-      await input.preparation!.save({ key, layout: Object.fromEntries(LAYOUT_KEYS.map(name => [name, prepared[name]!])) });
+      const receipt = { key, layout: Object.fromEntries(LAYOUT_KEYS.map(name => [name, prepared[name]!])) };
+      await input.preparation!.save(receipt);
+      lease!.metadata = { ...lease!.metadata, anonymousGitHubLaunchers: receipt };
     }
     return {
       env: prepared,

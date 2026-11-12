@@ -3127,12 +3127,13 @@ export function heartbeatService(
           ...(activeEnvironmentLease ? { preparation: {
             lease: activeEnvironmentLease.lease,
             configuration: { environment: selectedEnvironment?.config, adapter: agent.adapterConfig, runtime: agent.runtimeConfig },
-            save: async (receipt: import("./heartbeat-github-launchers.js").AnonymousGitHubLauncherReceipt) => {
-              await db.update(environmentLeases).set({
+            save: async (receipt: import("./heartbeat-github-launchers.js").AnonymousGitHubLauncherReceipt | null) => {
+              const saved = await db.update(environmentLeases).set({
                 metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ anonymousGitHubLaunchers: receipt })}::jsonb`,
               }).where(and(eq(environmentLeases.id, activeEnvironmentLease.lease.id),
                 eq(environmentLeases.companyId, agent.companyId), eq(environmentLeases.status, "active"),
-                eq(environmentLeases.heartbeatRunId, run.id)));
+                eq(environmentLeases.heartbeatRunId, run.id))).returning({ id: environmentLeases.id });
+              if (saved.length !== 1) throw new Error("native_launcher_preparation_lease_lost");
             },
           } } : {}),
           createBrokerToken: () => createRuntimeToolsToken({
