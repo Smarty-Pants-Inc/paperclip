@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import type { PiBindModel, PiThinkingLevel } from "./pi-bind-protocol.js";
 
 /** Only capability metadata crosses from an agent's provider into our broker. */
@@ -39,6 +40,29 @@ export function configuredPiManagedModel(snapshot: unknown, id: string): PiManag
     return metadata;
   }
   return { id };
+}
+
+/** The agent snapshot wins per capability (and thinking-map key). The original
+ * user's config is an optional, read-only fallback, never a routing/auth source.
+ * Keep the strict agent-snapshot validation; a bad user file cannot refuse a run.
+ */
+export async function configuredPiManagedModelSources(snapshot: unknown, id: string, originalModelsFile?: string): Promise<PiManagedModel> {
+  const primary = configuredPiManagedModel(snapshot, id);
+  if (!originalModelsFile) return primary;
+  let fallback: PiManagedModel;
+  try {
+    const text = await readFile(originalModelsFile, "utf8");
+    if (text.length > 60 * 1024) throw new Error("oversized user config");
+    const user: unknown = JSON.parse(text);
+    if (!user || typeof user !== "object" || Array.isArray(user)) throw new Error("invalid user config");
+    fallback = configuredPiManagedModel(user, id);
+  } catch {
+    // One fixed, bounded line; never expose paths, file contents, or credentials.
+    console.warn("Pi managed model metadata: original user models.json unavailable or invalid; skipping optional source");
+    return primary;
+  }
+  return { ...fallback, ...primary,
+    ...(fallback.thinkingLevelMap || primary.thinkingLevelMap ? { thinkingLevelMap: { ...fallback.thinkingLevelMap, ...primary.thinkingLevelMap } } : {}) };
 }
 
 /** Fill only missing fields using Pi's own exact-id catalog. A shared id is

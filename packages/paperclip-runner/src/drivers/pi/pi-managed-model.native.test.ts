@@ -162,3 +162,91 @@ it.skipIf(!binary || !output)("the real native driver retains the resolved snaps
     await writeFile(join(output!, "driver-proof.json"), JSON.stringify(proof, null, 2));
   }
 }, 60000);
+
+it.skipIf(!binary || !output).each(["user-cap", "no-user-file"] as const)("real driver uses -lf5d's original HOME layout: %s", async name => {
+  const root = await mkdtemp(join(tmpdir(), "pi-original-home-"));
+  const home = join(root, "home", "user"), runtime = join(root, "run"), agent = join(runtime, "agent"), workspace = join(root, "workspace");
+  const userFile = join(home, ".pi", "agent", "models.json");
+  await mkdir(agent, { recursive: true }); await mkdir(dirname(userFile), { recursive: true }); await mkdir(workspace); await mkdir(output!, { recursive: true });
+  await writeFile(join(agent, "models.json"), JSON.stringify({ providers: {} }));
+  const snapshot = JSON.stringify({ providers: { "cliproxyapi-anthropic": { baseUrl: "http://127.0.0.1:2", apiKey: "fixture-not-a-key", api: "anthropic-messages", models: [{ id: "claude-opus-5-5", thinkingLevelMap: { max: null } }] } } });
+  if (name === "user-cap") await writeFile(userFile, snapshot);
+  vi.stubEnv("HOME", home); vi.stubEnv("PI_CODING_AGENT_DIR", undefined);
+  const effective = name === "user-cap" ? "xhigh" : "max";
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const requests: unknown[] = [], records: unknown[] = [], states: unknown[] = [];
+  const peer = createServer((req, res) => {
+    let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      requests.push(JSON.parse(body)); res.writeHead(200, { "content-type": "text/event-stream" });
+      for (const chunk of [{ choices: [{ index: 0, delta: { content: "original HOME proof" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } }]) res.write(`data: ${JSON.stringify({ id: `home-${requests.length}`, object: "chat.completion.chunk", ...chunk })}\n\n`);
+      res.end("data: [DONE]\n\n");
+    });
+  });
+  await new Promise<void>(done => peer.listen(0, "127.0.0.1", done));
+  const address = peer.address(); if (!address || typeof address === "string") throw new Error("original HOME peer failed");
+  let native: PiRpcTransport | undefined, session: PiRpcHarnessSession | undefined;
+  const proof: Record<string, any> = { name, root, home, userFile, agent, binary, binarySha256: hash(binary!),
+    agentSnapshotBefore: JSON.parse(await readFile(join(agent, "models.json"), "utf8")), userSnapshotBefore: name === "user-cap" ? JSON.parse(snapshot) : null,
+    requestedCliThinking: "max", requestedAdmissionThinking: effective, expectedThinking: effective,
+    evidenceLevel: "real_dependency_with_controlled_loopback_peer", runnerHasPiAgentDir: Object.hasOwn(process.env, "PI_CODING_AGENT_DIR"), states, records, upstreamRequests: requests, status: "running" };
+  try {
+    expect(proof.runnerHasPiAgentDir).toBe(false);
+    expect(proof.agentSnapshotBefore.providers.paperclip).toBeUndefined();
+    const version = JSON.parse(await readFile(join(dirname(dirname(dirname(binary!))), "package.json"), "utf8")).version;
+    proof.version = version; expect(version).toBe("1.5.2");
+    session = await new PiRpcDriver({ command: binary!, model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: effective, runtimeDirectory: runtime, startupTimeoutMs: 15000,
+      environment: { PATH: process.env.PATH, HOME: home, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+      transportFactory: options => {
+        // Observe CLI normalization before admission can set the effective level.
+        // Exact-effort admission is another builder's scope, not changed here.
+        options.args = [...options.args!, "--thinking", "max"];
+        proof.launch = { args: options.args, HOME: options.env?.HOME, PI_CODING_AGENT_DIR: options.env?.PI_CODING_AGENT_DIR };
+        native = new PiRpcTransport(options); proof.pid = native.pid;
+        const request = native.request.bind(native);
+        native.request = async (type, params) => {
+          const result = await request(type, params);
+          records.push({ type, params, result });
+          if (type === "get_state") states.push(result.data);
+          return result;
+        };
+        return native;
+      },
+    }).openSession({ runId: "first", normalizedSessionId: `original-home-${name}`, workingDirectory: workspace }) as PiRpcHarnessSession;
+    proof.first = states[0];
+    expect(proof.first.model).toMatchObject({ provider: "paperclip", id: "claude-opus-5-5", contextWindow: 1000000, maxTokens: 128000, reasoning: true });
+    expect(proof.first.thinkingLevel).toBe(effective);
+    expect(proof.first.model.thinkingLevelMap.max).toBe(name === "user-cap" ? null : "max");
+    const events = session.events()[Symbol.asyncIterator](); proof.events = [];
+    for (const runId of ["first", "warm"]) {
+      if (runId === "warm") await session.attachRun({ runId });
+      const state = (await bounded(native!.request("get_state"))).data as any;
+      expect(state.model).toMatchObject({ provider: "paperclip", id: "claude-opus-5-5", contextWindow: 1000000, maxTokens: 128000, reasoning: true });
+      expect(state.thinkingLevel).toBe(effective); expect(native!.pid).toBe(proof.pid);
+      if (runId === "warm") { proof.warm = state; expect(state.model).toEqual({ ...proof.first.model, baseUrl: state.model.baseUrl }); expect(state.model.baseUrl).not.toBe(proof.first.model.baseUrl); }
+      await session.startTurn({ message: { role: "user", text: "Return the local fixture reply." } });
+      for (;;) {
+        const next = await bounded(events.next()); if (next.done) throw new Error("original HOME stream ended");
+        proof.events.push(next.value); if (next.value.eventType === "turn.failed") throw new Error(JSON.stringify(next.value));
+        if (next.value.eventType === "turn.completed") break;
+      }
+    }
+    expect(requests).toHaveLength(2);
+    if (name === "user-cap") expect(await readFile(userFile, "utf8")).toBe(snapshot);
+    else await expect(readFile(userFile)).rejects.toMatchObject({ code: "ENOENT" });
+    proof.userFileUnchanged = true;
+    proof.diagnostics = warn.mock.calls.map(call => String(call[0]));
+    expect(proof.diagnostics).toHaveLength(name === "user-cap" ? 0 : 1);
+    expect(proof.diagnostics.every((line: string) => line.length <= 256 && !line.includes("\n"))).toBe(true);
+    proof.status = "passed";
+  } catch (error) { proof.status = "failed"; proof.error = String(error); throw error; }
+  finally {
+    await session?.close();
+    if (!session) await native?.close();
+    peer.closeAllConnections(); await new Promise<void>(done => peer.close(() => done()));
+    proof.childExited = native?.exited;
+    warn.mockRestore(); vi.unstubAllEnvs();
+    await writeFile(join(output!, `original-home-${name}-proof.json`), JSON.stringify(proof, null, 2));
+    expect(native?.exited).toBe(true);
+  }
+}, 60000);
