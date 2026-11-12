@@ -132,6 +132,35 @@ describe("PiRpcDriver", () => {
       await vi.waitFor(() => expect(frames.map(frame => JSON.parse(frame)).some(frame => frame.method === "turn/completed" && frame.params.turnId === next.result.turn.id)).toBe(true));
     } finally { await proxy.close(); await first.close(); await second.close(); }
   });
+  // Keep: D2 real setup failure hid Pi 1.5.2 provider errors as empty answers.
+  it.each(["error", "aborted", "later-empty", "agent-end", "stream-error", "retry-exhausted"])("keeps Pi 1.5.2 %s records as provider errors without requiring errorMessage", async shape => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "provider failure" } });
+      f.transport.send({ type: "agent_start" });
+      const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+      const message = { role: "assistant", api: "openai-completions", provider: "neutral", model: "model", timestamp: 1,
+        content: [], usage, stopReason: shape === "aborted" ? "aborted" : "error" };
+      if (shape === "agent-end") f.transport.send({ type: "agent_end", messages: [message], willRetry: false });
+      else {
+        f.transport.send({ type: "message_start", message });
+        if (shape === "stream-error") f.transport.send({ type: "message_update", usage, assistantMessageEvent: { type: "error", reason: "error", error: message } });
+        else if (shape === "retry-exhausted") f.transport.send({ type: "auto_retry_end", success: false, attempt: 3, finalError: "529 overloaded" });
+        else f.transport.send({ type: "message_end", message });
+        if (["later-empty", "stream-error", "retry-exhausted"].includes(shape)) {
+          const empty = { ...message, timestamp: 2, stopReason: "stop" };
+          f.transport.send({ type: "message_start", message: empty });
+          f.transport.send({ type: "message_end", message: empty });
+        }
+      }
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await flushFailure();
+      const terminal = f.events.find(event => event.eventType === "turn.failed");
+      expect(terminal).toMatchObject({ turnId: turn.turnId, payload: { error: { code: "pi_provider_error", message: expect.any(String) } } });
+      if (shape === "retry-exhausted") expect(terminal?.payload).toMatchObject({ error: { message: "529 overloaded" } });
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
   it("forwards Pi provider error items and the last errorMessage on turn/failed", async () => {
     const f = await failureFixture(false); const frames: string[] = [];
     const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(frame); return true; }, once() {} },

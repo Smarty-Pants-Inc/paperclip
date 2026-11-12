@@ -1177,11 +1177,15 @@ export class PiRpcHarnessSession implements HarnessSession {
       // The final receipt supersedes streamed/earlier text. Mandatory usage is
       // accounting only, never proof of an answer or accepted completion.
       turn.lastText = text;
-      turn.lastErrorMessage = typeof message.errorMessage === "string" && message.errorMessage ? message.errorMessage : undefined;
       turn.lastAssistantStopReason = stringValue(message.stopReason);
-      // A successful retry supersedes the transient attempt's failure. An
-      // exhausted retry keeps the final failed receipt until settlement.
-      turn.failed = message.stopReason === "error" || message.stopReason === "aborted";
+      const failed = message.stopReason === "error" || message.stopReason === "aborted";
+      if (failed) capturePiProviderFailure(turn, message);
+      else if (text.trim() || (Array.isArray(message.content) && message.content.some(part => isRecord(part) && part.type === "toolCall")) || message.stopReason === "length") {
+        // A real successful retry supersedes a transient failure. An empty
+        // receipt is not proof of recovery and must not erase its diagnosis.
+        turn.failed = false;
+        turn.lastErrorMessage = undefined;
+      }
       if (this.#streamTurn === turn) this.#streamTurn = null;
       // Bind full native tool IDs before execution callbacks can arrive.
       for (const part of Array.isArray(message.content) ? message.content : []) {
@@ -1195,7 +1199,17 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (update.type === "toolcall_start") this.#remember(piToolIdentityKeys(update.id), turn);
       if (update.type === "toolcall_end") this.#remember(piToolIdentityKeys(record(update.toolCall).id), turn);
     }
+    if (event.type === "message_update" && update.type === "error") {
+      capturePiProviderFailure(turn, { ...record(update.error), stopReason: update.reason });
+    }
+    if (event.type === "error" || event.type === "auto_retry_start" || (event.type === "auto_retry_end" && event.success === false)) {
+      capturePiProviderFailure(turn, { ...event, errorMessage: event.finalError ?? event.errorMessage ?? event.message });
+    }
     if (event.type === "agent_end") {
+      // Pi 1.5.2 can carry the failed assistant receipt here, with optional
+      // errorMessage. Inspect only this low-level run's final assistant.
+      const final = Array.isArray(event.messages) ? event.messages.findLast(message => isRecord(message) && message.role === "assistant") : undefined;
+      if (isRecord(final) && (final.stopReason === "error" || final.stopReason === "aborted")) capturePiProviderFailure(turn, final);
       turn.agentEnded = true;
       if (this.#streamTurn === turn) this.#streamTurn = null;
     }
@@ -1213,7 +1227,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       const truncated = turn.lastAssistantStopReason === "length";
       const status = event.aborted === true ? "cancelled" : turn.failed || truncated || empty ? "failed" : "completed";
       const error = truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
-        : turn.failed && turn.lastErrorMessage ? { code: "pi_provider_error", message: turn.lastErrorMessage }
+        : turn.failed ? { code: "pi_provider_error", message: turn.lastErrorMessage ?? "Pi provider failed without an error message." }
         : empty ? { code: "opencode_empty_response", message: "Pi ended without a final answer or an accepted completion report.", recoverable: false } : undefined;
       await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
     }
@@ -1413,6 +1427,12 @@ async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPa
   await unlink(resident.socketPath).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
   await unlink(join(resident.directory, "initial.json")).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
   await rmdir(resident.directory).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+}
+
+function capturePiProviderFailure(turn: PiTurnState, message: Record<string, unknown>): void {
+  turn.failed = true;
+  turn.lastErrorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
+    ? message.errorMessage : turn.lastErrorMessage ?? `Pi provider ended with ${typeof message.stopReason === "string" ? message.stopReason : "an error"}.`;
 }
 
 function piNativeIdentity(value: unknown): string | null {
