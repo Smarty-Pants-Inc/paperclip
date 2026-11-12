@@ -77,17 +77,18 @@ describe("large native tool output projection (synthetic incident regression)", 
       expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
     }
   });
-  it("rejects oversized native inputs without silently truncating executable arguments", () => {
+  it("P0-1 bounds oversized argument records without mutating executable arguments", () => {
     const args = { command: "\"\\\n".repeat(300000), nested: { enabled: true, count: 3 } };
     const input = { type: "tool_execution_start", toolCallId: "typed", toolName: "bash", args };
     const serialized = JSON.stringify(input);
     const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
-    expect(() => projector.project(input)).toThrow(/pi_projection_record_limit/);
+    const events = projector.project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "bash", input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
     expect(JSON.stringify(input)).toBe(serialized);
-    projector.project({ ...input, args: { command: "echo ordinary" } });
-    expect(() => projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "other", result: {} })).toThrow(/name_changed/);
-    expect(() => projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))).toThrow(/pi_projection_record_limit/);
-    expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).toThrow(/pi_projection_record_limit/);
+    expect(projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "bash", result: {} })[0].eventType).toBe("item.completed");
+    expect(projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") } });
+    expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).not.toThrow();
   });
   it("projects an accumulated >4MiB tool update without copying full native output", () => {
     const input = { type: "tool_execution_update", toolCallId: "streamed", toolName: "bash", partialResult: { content: [{ type: "text", text: "x".repeat(4 * 1024 * 1024 + 1) }] } };
@@ -126,6 +127,38 @@ describe("large native tool output projection (synthetic incident regression)", 
     expect(events[1].payload).toMatchObject({ status: "completed", exitCode: 0, name: "find synthetic", output: result.content[0].text });
     expect(JSON.stringify(events)).not.toContain("fullOutput");
     expect(projector.project(input)).toEqual([]);
+  });
+});
+
+// Keep reason: reproduced audit A P0-1, including an ordinary completed run's summary.
+describe("P0-1 large records are display-only", () => {
+  const results = Array.from({ length: 6 }, (_, i) => ({ role: "toolResult", toolCallId: `read-${i}`, toolName: "read", content: [{ type: "text", text: "x".repeat(50_000) }] }));
+  it.each([
+    { type: "agent_end", messages: results, willRetry: false },
+    { type: "turn_end", message: final().message, toolResults: results },
+    { type: "message_start", message: { ...results[0], content: [{ type: "image", data: "A".repeat(300_000), mimeType: "image/png" }] } },
+    { type: "message_end", message: { role: "user", content: "x".repeat(300_000) } },
+    { type: "message_start", message: { role: "system", content: "x".repeat(300_000) } },
+  ])("ignores unneeded bodies in oversized $type without breaking the next projection", input => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const before = JSON.stringify(input);
+    expect(projector.project(input)).toEqual([]);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+    expect(JSON.stringify(input)).toBe(before);
+  });
+  it.each(["message_end", "tool_execution_end"])("omits a 300KB image in %s but keeps identity and completion", type => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const started = projector.project({ type: "tool_execution_start", toolCallId: "image", toolName: "read", args: { path: "shot.png" } });
+    const result = { role: "toolResult", toolCallId: "image", toolName: "read", content: [{ type: "text", text: "Read image file [image/png]" }, { type: "image", data: "A".repeat(300_000), mimeType: "image/png" }] };
+    const input = type === "message_end" ? { type, message: result } : { type, toolCallId: "image", toolName: "read", result, isError: false };
+    const before = JSON.stringify(input);
+    const events = projector.project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.completed", itemId: started[0].itemId, payload: { toolName: "read", output: expect.stringContaining("[Pi image omitted from projection]") }, debug: { piProjection: { truncated: true } } });
+    expect(events.at(-1)?.payload.status).toBe("completed");
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    expect(JSON.stringify(events)).not.toContain("A".repeat(1000));
+    expect(JSON.stringify(input)).toBe(before);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
   });
 });
 
@@ -292,12 +325,12 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
   it("rejects deep objects and non-numeric indexes rather than coercing identity", () => {
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(update("text_delta", { contentIndex: "0", delta: "wrong index" }))).toThrow(/index_invalid/);
     let deep: unknown = "leaf"; for (let index = 0; index < 40; index++) deep = { next: deep };
-    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "unknown", deep })).toThrow(/depth_limit/);
+    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "tool_execution_start", toolCallId: "deep", toolName: "read", args: deep })).toThrow(/depth_limit/);
   });
   it("rejects missing IDs, changed receipts and bounds instead of silently approving truncation", () => {
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "tool_execution_start", toolName: "bash" })).toThrow(/id_missing/);
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ responseId: undefined, timestamp: undefined }))).toThrow(/identity_missing/);
-    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "unknown", body: "x".repeat(262145) })).toThrow(/record_limit/);
+    expect(createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "unknown", body: "x".repeat(262145) })[0]).toMatchObject({ eventType: "harness.diagnostic", payload: { code: "pi_unknown_event" } });
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" }); projector.project(final());
     expect(() => projector.project(final({ content: [] }))).toThrow(/conflicting_receipt/);
   });
