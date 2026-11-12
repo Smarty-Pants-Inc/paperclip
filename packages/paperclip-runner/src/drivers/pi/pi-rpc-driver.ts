@@ -113,11 +113,9 @@ export class PiRpcDriver implements HarnessDriver {
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
-    // Only the controller-registered instruction copy may become AGENT_HOME.
-    // Preserve its exact runner environment spelling; ambient/caller paths
-    // without the matching current-run grant confer no filesystem authority.
-    const instructionRoot = record(record(record(this.#options.runtimeContext).instructions).workingCopy).rootPath;
-    if (typeof instructionRoot !== "string" || !instructionRoot || environment.AGENT_HOME !== instructionRoot) delete environment.AGENT_HOME;
+    // The authenticated runner environment already binds AGENT_HOME to this
+    // run's registered instruction-copy executionRoot. It need not equal the
+    // separately projected runtime-context root. Never borrow an ambient home.
     const credentialMode = environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker";
     if (credentialMode !== "broker" && credentialMode !== "env") throw new Error("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
     delete environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE;

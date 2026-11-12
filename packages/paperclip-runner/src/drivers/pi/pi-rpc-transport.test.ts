@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createPiEventProjector } from "./pi-event-projector.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 
 const spawnNode = process.execPath;
@@ -48,6 +49,19 @@ async function queuedRecords(child: PiRpcTransport): Promise<PiRpcRecord[]> {
 }
 
 describe("PiRpcTransport large tool output and lagging consumers", () => {
+  it("never coalesces away changed args or state before a lagging projector validates them", async () => {
+    const child = emittingTransport(`
+      await emit({ type: "tool_execution_update", toolCallId: "same", toolName: "paperclip", args: { input: "x".repeat(300000) }, state: "first", partialResult: { content: [{ type: "text", text: "old" }] } });
+      await emit({ type: "tool_execution_update", toolCallId: "same", toolName: "paperclip", args: { input: "small" }, state: "second", partialResult: { content: [{ type: "text", text: "new" }] } });
+    `);
+    try {
+      const records = await queuedRecords(child);
+      const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+      expect(() => projector.project(records[0])).toThrow("pi_projection_record_limit");
+      expect(records.slice(0, 2).map(record => record.state)).toEqual(["first", "second"]);
+      expect(records[1]).toMatchObject({ args: { input: "small" } });
+    } finally { await child.close(); }
+  });
   it("admits a real-shaped cumulative tool update larger than 4 MiB without altering its ID or final result", async () => {
     const child = emittingTransport(`${updateScript}
       await emit(update("original-call", "path\\n".repeat(1024 * 1024)));

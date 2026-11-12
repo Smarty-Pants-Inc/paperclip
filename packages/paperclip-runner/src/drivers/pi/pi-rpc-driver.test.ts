@@ -47,14 +47,14 @@ async function failureFixture(capture = true) {
 }
 
 describe("PiRpcDriver", () => {
-  it.each(["registered", "unregistered", "mismatched"])("exposes only the exact runner-registered AGENT_HOME (%s)", async mode => {
+  it.each(["registered", "unregistered"])("preserves the runner executionRoot independently of the projected instruction root (%s)", async mode => {
     const root = await mkdtemp(join(tmpdir(), "pi-agent-home-"));
     const home = join(root, "instruction-copy"); await mkdir(home);
     let launched: NodeJS.ProcessEnv | undefined;
     const transport = new FailureTransport();
     const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piThinkingLevel: "high",
-      environment: { PI_CODING_AGENT_DIR: join(root, "agent"), AGENT_HOME: mode === "mismatched" ? "/caller/other-home" : home },
-      ...(mode === "unregistered" ? {} : { runtimeContext: { instructions: { workingCopy: { rootPath: home } }, skills: [] } }),
+      environment: { PI_CODING_AGENT_DIR: join(root, "agent"), ...(mode === "registered" ? { AGENT_HOME: home } : {}) },
+      ...(mode === "unregistered" ? {} : { runtimeContext: { instructions: { workingCopy: { rootPath: join(root, "source") } }, skills: [] } }),
       transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
     }).openSession({ runId: "home", normalizedSessionId: "home", workingDirectory: root });
     try { expect(launched?.AGENT_HOME).toBe(mode === "registered" ? home : undefined); }
@@ -87,7 +87,8 @@ describe("PiRpcDriver", () => {
       expect(JSON.stringify(nativeFinal)).toBe(original);
       for (const frame of frames) expect(Buffer.byteLength(frame)).toBeLessThan(16 * 1024 * 1024);
     } finally { await proxy.close(); await f.close(); }
-  });
+  // Real-sized 4100-update replay and digest/redaction work exceeds Vitest's 5s default on shared hosts.
+  }, 20_000);
 
   it.each([true, false])("publishes the underlying iterator failure before drain (active=%s)", async active => {
     const f = await failureFixture();

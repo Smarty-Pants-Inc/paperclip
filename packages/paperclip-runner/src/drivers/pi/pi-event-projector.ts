@@ -219,12 +219,16 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     if (!serialized) throw new Error("pi_projection_record_limit");
     const recordBytes = Buffer.byteLength(serialized);
     const source = record(value);
-    const control = toolControlRecord(source);
+    // Custom session entries are extension display history, not executable
+    // inputs or final receipts. Digest an oversized body before redaction.
+    const customDisplay = source.type === "entry_appended" && record(source.entry).type === "custom"
+      && source.toolCallId === undefined && recordBytes > MAX_RECORD_BYTES;
+    const control = customDisplay ? { ...source, entry: { ...record(source.entry), data: undefined } } : toolControlRecord(source);
     if (recordBytes > MAX_RECORD_BYTES && (control === source || Buffer.byteLength(JSON.stringify(control)) > MAX_RECORD_BYTES)) throw new Error("pi_projection_record_limit");
     displayTruncated = recordBytes > MAX_RECORD_BYTES;
     originalToolOutput = undefined;
-    let observed: unknown = value;
-    if (control !== source) {
+    let observed: unknown = customDisplay ? control : value;
+    if (control !== source && !customDisplay) {
       const key = source.type === "message_end" ? "message" : source.type === "tool_execution_update" ? "partialResult" : "result";
       const nativeResult = record(source[key]);
       const fullBody = contentText(nativeResult.content);

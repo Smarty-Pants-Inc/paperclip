@@ -50,9 +50,20 @@ class AsyncRecordQueue implements AsyncIterable<PiRpcRecord> {
     else {
       const previous = this.#pendingUpdates.get(updateId);
       if (previous) {
-        this.#records[this.#records.indexOf(previous)] = record;
-        this.#pendingUpdates.set(updateId, record);
-        return true;
+        // Only display content can be replaced. Changed args, state, identity
+        // or receipt metadata must reach the consumer in their original order.
+        const control = (value: PiRpcRecord) => {
+          const result = value.partialResult;
+          if (!result || typeof result !== "object" || Array.isArray(result)) return JSON.stringify(value);
+          const { content: _content, ...rest } = result as PiRpcRecord;
+          return JSON.stringify({ ...value, partialResult: rest });
+        };
+        if (control(previous) === control(record)) {
+          this.#records[this.#records.indexOf(previous)] = record;
+          this.#pendingUpdates.set(updateId, record);
+          return true;
+        }
+        this.#pendingUpdates.clear();
       }
     }
     const waiter = this.#waiters.shift();

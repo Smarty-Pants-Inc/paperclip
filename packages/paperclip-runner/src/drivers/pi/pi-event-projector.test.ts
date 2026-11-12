@@ -54,6 +54,18 @@ describe("real Pi 1.5.2 RPC -> canonical events -> existing reducer/transcript",
 });
 
 describe("large native tool output projection (synthetic incident regression)", () => {
+  it("digests the real 403238-byte custom entry for display without losing the turn", () => {
+    const raw = fixture("tool-context-guard-full.json");
+    const input = JSON.parse(raw);
+    const before = JSON.stringify(input);
+    expect(Buffer.byteLength(before)).toBe(403238);
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const events = projector.project(input);
+    expect(events).toMatchObject([{ eventType: "harness.diagnostic", payload: { code: "pi_native_activity", providerMethod: "entry_appended" }, debug: { piProjection: { truncated: true, recordBytes: 403238, recordSha256: createHash("sha256").update(before).digest("hex") } } }]);
+    expect(Buffer.byteLength(JSON.stringify(events))).toBeLessThan(2048);
+    expect(JSON.stringify(input)).toBe(before);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
   it("preserves a safe small escaped record exactly instead of applying a blanket JSON text cap", () => {
     const body = "\\".repeat(50000);
     const input = { type: "tool_execution_end", toolCallId: "ordinary", toolName: "bash", isError: false, result: { content: [{ type: "text", text: body }] } };

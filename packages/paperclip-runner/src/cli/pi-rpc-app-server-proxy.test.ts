@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createPiEventProjector } from "../drivers/pi/pi-event-projector.js";
 import type { HarnessDriver, HarnessSession } from "../contracts/harness-driver.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import {
@@ -148,6 +149,29 @@ async function request(
 }
 
 describe("Pi RPC app-server facade proxy", () => {
+  it("adapts real Pi usage to Rust total/last without double counting warm turns", async () => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 101, "thread/start", { model: "neutral/model" });
+      for (const [index, runId] of ["run-1", "run-2"].entries()) {
+        if (index) await request(proxy, sink, 102, "run.attach", { runId });
+        const projector = createPiEventProjector({ runId, turnId: `usage-${index}` });
+        for (const receipt of [1, 2]) {
+          const native = { type: "message_end", message: { role: "assistant", responseId: `${index}-${receipt}`, provider: "neutral", model: "model", stopReason: "stop", content: [], usage: { input: 11, output: 3, cacheRead: 2, cacheWrite: 0, totalTokens: 16 } } };
+          const events = projector.project(native);
+          expect(projector.project(native)).toEqual([]);
+          for (const event of events.filter(e => e.eventType === "usage.reported")) session.push(event.eventType, event.payload, event.turnId, event.itemId, runId);
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      const usage = sink.decoded().filter(f => f.method === "thread/tokenUsage/updated");
+      expect(usage).toHaveLength(4);
+      for (const [index, frame] of usage.entries()) expect(frame).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 * (index + 1), outputTokens: 3 * (index + 1), cacheReadTokens: 2 * (index + 1) }, last: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 } } } });
+      expect(usage.reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
+    } finally { await proxy.close(); }
+  });
   // Keep reason: incident439 lost the actionable cause at the facade/Rust wire
   // boundary. A stale diagnostic must not poison a later current-run failure.
   it("forwards session failure cause to the receiver, rejects stale origin, then accepts a legitimate current failure", async () => {
