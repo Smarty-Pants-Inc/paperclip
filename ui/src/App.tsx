@@ -664,7 +664,7 @@ function CompanyRootRedirect() {
     return <NoCompaniesStartPage />;
   }
 
-  return <Navigate to={`/${targetCompany.issuePrefix}/dashboard`} replace />;
+  return <Navigate key={location.key} to={`/${targetCompany.issuePrefix}/dashboard`} replace />;
 }
 
 function StatusCardsLegacyRedirect() {
@@ -711,6 +711,7 @@ function UnprefixedBoardRedirect() {
 
   return (
     <Navigate
+      key={location.key}
       to={`/${targetCompany.issuePrefix}${location.pathname}${location.search}${location.hash}`}
       replace
     />
