@@ -237,15 +237,16 @@ struct ProviderCompletionContract {
 /// The completion contract is run-scoped and changes with each follow-up.
 /// Codex app-server never receives it (runnerd validates the claim), and the
 /// OpenCode proxy receives the current contract with each turn/start, so a
-/// replaced contract needs no cold resume for them. Other providers, a changed
-/// tool set, and adding or removing a contract keep the cold-resume boundary.
+/// replaced contract needs no cold resume for them. Pi can also receipt-bind a
+/// changed tool set after the live-work checks. Other providers and adding or
+/// removing a contract keep the cold-resume boundary.
 fn warm_attachment_keeps_provider(
     provider: &str,
     tools_unchanged: bool,
     current: Option<&ProviderCompletionContract>,
     next: Option<&ProviderCompletionContract>,
 ) -> bool {
-    if provider == "cursor_cloud" || !tools_unchanged {
+    if provider == "cursor_cloud" || (!tools_unchanged && provider != "pi_rpc") {
         return false;
     }
     current == next
@@ -271,6 +272,26 @@ fn opencode_turn_identity_params(
         ));
     }
     params
+}
+
+fn pi_run_context_params(
+    instructions: &str,
+    authorized_tools: &[AuthorizedTool],
+    runtime_context: &Value,
+    run_id: Option<&str>,
+) -> Result<(Value, BTreeSet<String>), LocalRunnerError> {
+    let (dynamic_tools, tool_ids) = codex_dynamic_tools(authorized_tools.iter().cloned())?;
+    let mut params = json!({
+        "baseInstructions": crate::task_memory::instructions_with_memory_note(
+            instructions, MAX_INSTRUCTIONS_BYTES,
+        ),
+        "dynamicTools": dynamic_tools,
+        "runtimeContext": runtime_context,
+    });
+    if let Some(run_id) = run_id {
+        params["paperclipRunId"] = json!(run_id);
+    }
+    Ok((params, tool_ids))
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -883,6 +904,7 @@ pub struct CodexProvider {
     _stdio_mcp: Option<crate::stdio_mcp::StdioMcpSession>,
     stderr_tail: BoundedLogBuffer,
     config: CodexProviderConfig,
+    pi_runtime_context: Value,
     authorized_tools: Vec<AuthorizedTool>,
     next_request_id: u64,
     thread_id: String,
@@ -1355,6 +1377,7 @@ impl CodexProvider {
                 MAX_PROVIDER_STDERR_BYTES,
             ),
             config: config.clone(),
+            pi_runtime_context: Value::Null,
             authorized_tools,
             next_request_id: 1,
             thread_id: String::new(),
@@ -1614,10 +1637,17 @@ impl CodexProvider {
         self.durable_tool_call_replays = true;
     }
 
+    pub(crate) fn set_pi_runtime_context(&mut self, runtime_context: Value) {
+        if self.config.provider == "pi_rpc" {
+            self.pi_runtime_context = runtime_context;
+        }
+    }
+
     pub(crate) fn attach_run_in_place(
         &mut self,
         authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
         completion_contract: Option<(&str, &[String])>,
+        pi_attachment: Option<(&str, &Value, &str)>,
         accounting: &mut Vec<(String, Value)>,
     ) -> Result<bool, LocalRunnerError> {
         let authorized_tools = authorized_tools.into_iter().collect::<Vec<_>>();
@@ -1651,11 +1681,27 @@ impl CodexProvider {
                 ),
             ));
         }
+        if self.config.provider == "pi_rpc" {
+            let (instructions, runtime_context, run_id) = pi_attachment.ok_or_else(|| {
+                LocalRunnerError::invalid("Pi warm attachment requires current run context")
+            })?;
+            let (params, tool_ids) = pi_run_context_params(
+                instructions, &authorized_tools, runtime_context, Some(run_id),
+            )?;
+            // Admit the refreshed native binding before publishing attachment,
+            // not just when the next prompt happens to reach the proxy.
+            if self.request("run.attach", params)? != json!(true) {
+                return Err(LocalRunnerError::invalid("Pi run attachment was not acknowledged"));
+            }
+            self.config.instructions = instructions.to_owned();
+            self.pi_runtime_context = runtime_context.clone();
+            self.authorized_tools = authorized_tools;
+            self.authorized_tool_ids = tool_ids;
+        }
         // The provider process and its thread remain authoritative. Exact
         // settled-turn identities stay in memory so delayed output from an
-        // earlier run cannot be accepted as the next turn. A changed semantic
-        // tool set (or a changed contract for other providers) returned false
-        // above so the caller preserves the cold-resume boundary.
+        // earlier run cannot be accepted as the next turn. Changed tools for
+        // other providers still preserve the cold-resume boundary above.
         self.completed_turn_authority = None;
         self.active_turn_result_authoritative = false;
         self.completion_reconciliation_pending = false;
@@ -1848,6 +1894,18 @@ impl CodexProvider {
             blockers.push("pending_runtime_requests");
         }
         Ok(blockers)
+    }
+
+    pub(crate) fn pi_host_park_ready(&mut self) -> Result<bool, LocalRunnerError> {
+        let proof = self.request("paperclip/host_park_ready", json!({}))?;
+        if proof.get("ready") != Some(&json!(true))
+            || !proof.get("reasons").and_then(Value::as_array).is_some_and(Vec::is_empty)
+        {
+            return Ok(false);
+        }
+        // A provider message buffered during the native readiness request can
+        // invalidate the local proof too. Never park over newly observed work.
+        Ok(self.warm_run_attachment_blockers()?.is_empty())
     }
 
     pub(crate) fn restore_completed_turn_authority(
@@ -2217,6 +2275,19 @@ impl CodexProvider {
         // local planning error never leaves an ambiguous turn start behind.
         let collaboration_mode =
             codex_plan_collaboration_mode(&self.config, self.observed_model.as_deref(), effort)?;
+        let pi_context = if self.config.provider == "pi_rpc" {
+            let (params, _) = pi_run_context_params(
+                &self.config.instructions, &self.authorized_tools, &self.pi_runtime_context, run_id,
+            )?;
+            // Attachment precedes the authority claim; this admission observes
+            // the claimed authority before any next-prompt bytes are sent.
+            if self.request("session.revalidate", json!({}))? != json!(true) {
+                return Err(LocalRunnerError::invalid("Pi post-claim admission was not acknowledged"));
+            }
+            Some(params)
+        } else {
+            None
+        };
         self.rollover_settled_turn_epoch_if_needed()?;
         // Preserve the prior durable result until a replacement turn identity
         // is accepted. A rejected, ambiguous, or transport-failed attempt does
@@ -2245,6 +2316,9 @@ impl CodexProvider {
             {
                 turn_params_object.insert(key.to_owned(), value);
             }
+        }
+        if let Some(pi_context) = pi_context {
+            turn_params_object.extend(pi_context.as_object().expect("Pi context is an object").clone());
         }
         if let Some(effort) = effort {
             turn_params_object.insert("effort".to_owned(), effort.clone());
@@ -5375,6 +5449,11 @@ mod tests {
 
     #[cfg(unix)]
     fn completion_tail_provider_with_stdout_flood(flood: bool) -> CodexProvider {
+        completion_tail_provider_with_pi_reply(flood, None)
+    }
+
+    #[cfg(unix)]
+    fn completion_tail_provider_with_pi_reply(flood: bool, pi_reply: Option<&str>) -> CodexProvider {
         // A real JSON-RPC child writes the terminal before exiting. The
         // per-instance receiver proxy below controls reader delivery only.
         let script = r#"
@@ -5383,11 +5462,18 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
     *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"reader-tail-thread"}}}' ;;
+    *'"method":"run.attach"'*|*'"method":"session.revalidate"'*|*'"method":"paperclip/host_park_ready"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '{"id":%s,__PI_REPLY__}\n' "$id" ;;
     *'"method":"turn/start"'*)
       turn=$((turn + 1))
       if [ "$turn" = 1 ]; then
         printf '%s\n' '{"id":3,"result":{"turn":{"id":"reader-tail-1"}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"reader-tail-1","status":"completed"}}}'
+      elif __PI_TURNS__; then
+        id=${line#*\"id\":}; id=${id%%,*}
+        printf '{"id":%s,"result":{"turn":{"id":"reader-tail-2"}}}\n' "$id"
+        printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"reader-tail-2","status":"completed"}}}'
       else
         printf '%s\n' '{"id":4,"error":{}}'
         printf '%s\n' '{"method":"turn/started","params":{"turn":{"id":"reader-tail-2"}}}'
@@ -5408,7 +5494,9 @@ done
             command: PathBuf::from("/bin/sh"),
             args: vec![
                 "-c".to_owned(),
-                script.replace("__FLOOD_STDOUT__", if flood { "true" } else { "false" }),
+                script.replace("__FLOOD_STDOUT__", if flood { "true" } else { "false" })
+                    .replace("__PI_TURNS__", if pi_reply.is_some() { "true" } else { "false" })
+                    .replace("__PI_REPLY__", pi_reply.unwrap_or("\"result\":true")),
             ],
             cwd: std::env::current_dir()
                 .unwrap()
@@ -5717,6 +5805,7 @@ done
                                 contract.criterion_ids.as_slice(),
                             )
                         }),
+                        None,
                         &mut accounting,
                     )
                     .map(|_| ());
@@ -6395,6 +6484,188 @@ done
             Some(&first),
             Some(&first)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_attachment_rebinds_tools_only_after_live_work_checks() {
+        let tool = AuthorizedTool {
+            operation_id: "fresh_operation".to_owned(),
+            version: 1,
+            description: "Fresh run tool".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        for busy in [false, true] {
+            let mut provider = completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
+            provider.config.provider = "pi_rpc".to_owned();
+            let process_id = provider.process_id();
+            let thread_id = provider.thread_id.clone();
+            if busy {
+                provider.active_provider_turn_id = Some("live-turn".to_owned());
+            }
+            let result = provider.attach_run_in_place(
+                [tool.clone()], None,
+                Some(("Fresh run instructions", &json!({"runId": "fresh-run"}), "fresh-run")),
+                &mut Vec::new(),
+            );
+            if busy {
+                assert!(result.is_err(), "changed Pi tools cannot bypass live-work fences");
+                assert!(provider.authorized_tools.is_empty());
+            } else {
+                assert!(result.unwrap(), "Pi can bind tools without replacing its process");
+                assert_eq!(provider.authorized_tools, [tool.clone()]);
+                assert_eq!(provider.authorized_tool_ids, BTreeSet::from([tool.operation_id.clone()]));
+                assert_eq!(provider.process_id(), process_id);
+                assert_eq!(provider.thread_id, thread_id);
+                assert_eq!(provider.config.instructions, "Fresh run instructions");
+                assert_eq!(provider.pi_runtime_context, json!({"runId": "fresh-run"}));
+            }
+            provider.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_attachment_turn_sends_fresh_context_before_prompt() {
+        let mut provider = completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
+        provider.config.provider = "pi_rpc".to_owned();
+        let tool = AuthorizedTool {
+            operation_id: "second_run_operation".to_owned(),
+            version: 1,
+            description: "Second run tool".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let context = json!({"runId": "second-run"});
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&frames);
+        provider.sent_frame_observer = Some(Box::new(move |frame| {
+            recorded.lock().unwrap().push(frame.clone());
+        }));
+        assert!(provider.attach_run_in_place(
+            [tool], None,
+            Some(("Fresh second run instructions", &context, "second-run")),
+            &mut Vec::new(),
+        ).unwrap());
+        let cwd = provider.config.cwd.clone();
+        let result = provider.start_turn_with_options_and_effort(
+            "Next prompt", &cwd, CodexTurnOptions::default(), None, Some("second-run")
+        ).unwrap();
+        assert_eq!(result["turn"]["id"], "reader-tail-2");
+        provider.shutdown().unwrap();
+        let frames = frames.lock().unwrap();
+        let start = frames.iter().find(|frame| frame["method"] == "turn/start").unwrap();
+        assert_eq!(start["params"]["paperclipRunId"], "second-run");
+        assert!(start["params"]["baseInstructions"].as_str().unwrap().contains("Fresh second run instructions"));
+        assert_eq!(start["params"]["dynamicTools"][0]["name"], "second_run_operation");
+        assert_eq!(start["params"]["runtimeContext"], context);
+        let attach = frames.iter().position(|frame| frame["method"] == "run.attach").unwrap();
+        let revalidate = frames.iter().position(|frame| frame["method"] == "session.revalidate").unwrap();
+        let prompt = frames.iter().position(|frame| frame["method"] == "turn/start").unwrap();
+        assert!(attach < revalidate && revalidate < prompt);
+        for key in ["baseInstructions", "dynamicTools", "runtimeContext", "paperclipRunId"] {
+            assert_eq!(frames[attach]["params"][key], start["params"][key], "{key}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_attachment_requires_native_acknowledgment_before_authority_or_prompt() {
+        for reply in ["\"result\":false", "\"error\":{\"code\":-32000,\"message\":\"admission denied\"}"] {
+            let mut provider = completion_tail_provider_with_pi_reply(false, Some(reply));
+            provider.config.provider = "pi_rpc".to_owned();
+            let instructions = provider.config.instructions.clone();
+            let authority = provider.completed_turn_authority.clone();
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone());
+            }));
+            assert!(provider.attach_run_in_place(
+                [], None, Some(("Unacknowledged instructions", &Value::Null, "denied-run")),
+                &mut Vec::new(),
+            ).is_err());
+            assert_eq!(provider.config.instructions, instructions);
+            assert_eq!(provider.completed_turn_authority, authority);
+            assert!(provider.authorized_tools.is_empty());
+            let cwd = provider.config.cwd.clone();
+            assert!(provider.start_turn_with_options_and_effort(
+                "Must not reach prompt", &cwd, CodexTurnOptions::default(), None, Some("denied-run")
+            ).is_err());
+            assert!(!provider.ambiguous_turn_start_pending);
+            assert!(!frames.lock().unwrap().iter().any(|frame| frame["method"] == "turn/start"));
+            provider.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_attachment_parking_requires_a_complete_idle_native_proof() {
+        for (reply, expected) in [
+            ("\"result\":{\"ready\":false,\"reasons\":[\"queued_work\"]}", Some(false)),
+            ("\"result\":{\"ready\":true,\"reasons\":[]}", Some(true)),
+            ("\"result\":{\"ready\":true,\"reasons\":[\"pending_dialog\"]}", Some(false)),
+            ("\"result\":{\"ready\":true}", Some(false)),
+            ("\"result\":{\"ready\":\"true\",\"reasons\":[]}", Some(false)),
+            ("\"result\":{\"ready\":true,\"reasons\":null}", Some(false)),
+            ("\"result\":true", Some(false)),
+            ("\"error\":{\"code\":-32601,\"message\":\"method unavailable\"}", None),
+        ] {
+            let mut provider = completion_tail_provider_with_pi_reply(false, Some(reply));
+            provider.config.provider = "pi_rpc".to_owned();
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone());
+            }));
+            let result = provider.pi_host_park_ready();
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected, "{reply}"),
+                None => assert!(result.is_err(), "unknown native readiness must fail closed"),
+            }
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames[0]["method"], "paperclip/host_park_ready");
+            assert_eq!(frames[0]["params"], json!({}));
+            drop(frames);
+            provider.shutdown().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_attachment_keeps_other_provider_tool_and_turn_paths_unchanged() {
+        for name in ["codex", "opencode"] {
+            let mut provider = completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
+            provider.config.provider = name.to_owned();
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone());
+            }));
+            let tool = AuthorizedTool {
+                operation_id: "changed_tool".to_owned(), version: 1,
+                description: "Changed tool".to_owned(),
+                input_schema: json!({"type": "object"}),
+                response_schema: json!({"type": "object"}),
+            };
+            assert!(!provider.attach_run_in_place([tool], None, None, &mut Vec::new()).unwrap());
+            assert!(provider.authorized_tools.is_empty());
+            let cwd = provider.config.cwd.clone();
+            provider.start_turn_with_options_and_effort(
+                "Unchanged provider prompt", &cwd, CodexTurnOptions::default(), None, Some("next-run")
+            ).unwrap();
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames.len(), 1, "{name} must issue no Pi attachment/admission RPC");
+            assert_eq!(frames[0]["method"], "turn/start");
+            for key in ["baseInstructions", "dynamicTools", "runtimeContext"] {
+                assert!(frames[0]["params"].get(key).is_none(), "{name}: {key}");
+            }
+            assert_eq!(frames[0]["params"].get("paperclipRunId"),
+                (name == "opencode").then_some(&json!("next-run")));
+            drop(frames);
+            provider.shutdown().unwrap();
+        }
     }
 
     #[test]
