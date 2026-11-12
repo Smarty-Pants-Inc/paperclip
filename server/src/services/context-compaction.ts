@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentTaskSessions, heartbeatRuns } from "@paperclipai/db";
 import type { IssueContextCompaction } from "@paperclipai/shared";
 
 /**
@@ -10,7 +10,7 @@ import type { IssueContextCompaction } from "@paperclipai/shared";
  * Agents run with a per-turn session lifecycle: the harness session exists
  * only during a run. A compaction therefore runs as its own short heartbeat
  * run that resumes the assignee's session, asks the harness to compact (Codex
- * `thread/compact/start`, Claude's ACP `/compact` command), and settles
+ * `thread/compact/start`, Pi's native RPC `compact`, Claude's ACP `/compact` command), and settles
  * without changing the task. The run is marked by
  * `contextSnapshot.contextCompactionRequestId`.
  */
@@ -51,21 +51,21 @@ export function isContextCompactionRun(context: unknown): boolean {
 /**
  * Harnesses that can compact on request. Compaction needs the Paperclip
  * runner, which resumes the provider session: Codex through its app-server,
- * Claude through ACP.
+ * native Pi through its resident RPC facade, Claude through ACP.
  */
 export function contextCompactionSupport(agent: AgentBinding): { supported: true } | { supported: false; reason: string } {
   const unsupported = { supported: false as const, reason: "This agent's harness can't compact on request." };
   if (agent.adapterType !== "paperclip_runner") return unsupported;
   const config = asRecord(agent.adapterConfig);
   const provider = typeof config.provider === "string" ? config.provider : "codex";
-  if (provider === "codex") return { supported: true };
+  if (provider === "codex" || provider === "pi_rpc") return { supported: true };
   if (provider === "acpx" && config.acpxAgent === "claude") return { supported: true };
   return unsupported;
 }
 
 export class ContextCompactionError extends Error {
   constructor(
-    readonly code: "no_assignee" | "task_closed" | "unsupported" | "agent_busy" | "already_pending" | "wake_skipped",
+    readonly code: "no_assignee" | "task_closed" | "unsupported" | "agent_busy" | "already_pending" | "wake_skipped" | "no_active_conversation",
     message: string,
   ) {
     super(message);
@@ -140,6 +140,18 @@ export function contextCompactionService(db: Db, deps: { wakeup?: WakeupFn } = {
         reasonCode: "agent_busy",
         reason: "Available when the agent finishes its current run.",
       };
+    }
+    if (asRecord(agent.adapterConfig).provider === "pi_rpc") {
+      // Never admit a compaction as a first conversation. The saved task session
+      // is the resume selector; do not reset it and compact a fresh transcript.
+      const [session] = await db.select({ sessionDisplayId: agentTaskSessions.sessionDisplayId })
+        .from(agentTaskSessions)
+        .where(and(eq(agentTaskSessions.companyId, companyId), eq(agentTaskSessions.agentId, issue.assigneeAgentId),
+          eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issue.id)))
+        .limit(1);
+      if (!nonEmptyString(session?.sessionDisplayId)) {
+        return { status: "unavailable", reasonCode: "no_active_conversation", reason: "No active conversation. Start a conversation before compacting its context." };
+      }
     }
     return { status: "available", reasonCode: null, reason: null };
   }

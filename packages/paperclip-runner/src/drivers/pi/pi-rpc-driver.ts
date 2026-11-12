@@ -16,7 +16,7 @@ import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { PiIdentityTombstones } from "./pi-identity-tombstones.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
-import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { PiRpcCommandError, PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
 import type {
   HarnessDriver,
@@ -406,6 +406,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   #activeIdentityCount = 0;
   #identityLimited = false;
   #operation: Promise<void> = Promise.resolve();
+  #manualCompaction: { runId: string; compactionId: string; failed?: boolean; ended(): void } | null = null;
   #activeTurn: PiTurnState | null = null;
   #agentTurn: PiTurnState | null = null;
   #streamTurn: PiTurnState | null = null;
@@ -648,6 +649,57 @@ export class PiRpcHarnessSession implements HarnessSession {
         throw error;
       }
       return { turnId: turn.turnId };
+    });
+  }
+
+  /** A native session control, never a prompt or a new conversation/turn. */
+  async compact(input: { customInstructions?: string } = {}): Promise<Record<string, unknown>> {
+    return this.#serialize(async () => {
+      if (input.customInstructions !== undefined && typeof input.customInstructions !== "string") throw new Error("Pi compaction instructions must be a string");
+      if (this.#failure) throw this.#failure;
+      await this.#admit(); // compact itself aborts active work: prove idle first.
+      if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
+      const binding = this.#resident?.binding;
+      let prepared = binding?.initial === true;
+      try {
+        if (binding && !binding.initial) {
+          await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
+          prepared = true;
+        }
+        // No host tool/callback authority is activated by a summary operation.
+        this.#promptAcceptance = null;
+        const ended = new Promise<void>(resolve => {
+          this.#manualCompaction = { runId: this.#runId, compactionId: `pi-compact-${randomUUID()}`, ended: resolve };
+        });
+        const owner = this.#manualCompaction!;
+        const response = await this.#transport.request("compact", input.customInstructions === undefined ? {} : { customInstructions: input.customInstructions }, { timeoutMs: 120_000 });
+        await withTimeout(ended, this.#admissionTimeoutMs ?? 5000, "Pi compaction end event missing");
+        if (owner.failed) throw new Error("Pi compaction ended unsuccessfully");
+        if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session closed during compaction");
+        const result = record(response.data);
+        if (typeof result.firstKeptEntryId !== "string" || !result.firstKeptEntryId || typeof result.summary !== "string") throw new Error("Pi compact returned no compaction receipt");
+        await this.#admit(); // Same native identity and idle state, not just a successful ACK.
+        const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+        // A summary can spend outside assistant receipts. Do not invent a turn
+        // or complete accounting when an extension omits its summary usage.
+        this.#emit("usage.reported", { runDeltaAvailable: false, accountingComplete: false }, owner);
+        this.#emit("context.compacted", { schema: "paperclip.context.compacted.v1", compactionId: owner.compactionId, reason: "manual", preTokens: count(result.tokensBefore), postTokens: count(result.estimatedTokensAfter), sameSession: true }, owner);
+        return result;
+      } catch (error) {
+        // Lost ACK/receipt or transport failure leaves execution uncertain.
+        // Native command refusals are surfaced without retrying or resetting.
+        if (!(error instanceof PiRpcCommandError)) await this.#fenceFailure(error);
+        throw error;
+      } finally {
+        this.#manualCompaction = null;
+        if (binding && !this.#closed) {
+          try {
+            if (prepared) await this.#sendBind({ schema: 1, type: "settle", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
+            await this.#revokeBinding();
+            this.#admitted = false;
+          } catch (error) { await this.#fenceFailure(error); throw error; }
+        }
+      }
     });
   }
 
@@ -899,6 +951,15 @@ export class PiRpcHarnessSession implements HarnessSession {
         if (turn) await this.#finishTurn(turn, "failed", { error: detail });
         else await this.#revokeBinding();
       } finally { await this.close(); }
+      return;
+    }
+    const compaction = this.#manualCompaction;
+    if (compaction && ["compaction_start", "compaction_end"].includes(String(event.type))) {
+      const completed = event.type === "compaction_end";
+      const failed = event.aborted === true || event.errorMessage !== undefined;
+      this.#emit("provider.notice.recorded", { schema: "paperclip.provider.notice.v1", noticeId: compaction.compactionId, severity: failed ? "warning" : "info", category: "context_compaction", scope: "session", recoverable: true, userActionable: false,
+        summary: completed ? failed ? "Context compaction failed" : "Context compaction finished" : "Compacting context", details: [{ name: "Phase", value: completed ? failed ? "failed" : "completed" : "started" }] }, compaction);
+      if (completed) { compaction.failed = failed; compaction.ended(); }
       return;
     }
     if (event.type === "agent_start") {

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, agentTaskSessions, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   ContextCompactionError,
   contextCompactionService,
@@ -11,7 +11,8 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 describe("context compaction support", () => {
-  it("supports Codex and Claude on the Paperclip runner only", () => {
+  it("supports Codex, native Pi and Claude on the Paperclip runner only", () => {
+    expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }).supported).toBe(true);
     expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: { provider: "codex" } }).supported).toBe(true);
     expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: {} }).supported).toBe(true);
     expect(contextCompactionSupport({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "claude" } }).supported).toBe(true);
@@ -66,6 +67,22 @@ suite("context compaction availability", () => {
         skipIssueComment: true,
       }),
     }));
+  });
+
+  it("makes native Pi available only for the same saved conversation, without a silent first-session compact", async () => {
+    const { companyId, agentId, issue } = await fixture({ provider: "pi_rpc" });
+    const wakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const service = contextCompactionService(db, { wakeup });
+    expect(await service.availability(companyId, issue)).toMatchObject({ status: "unavailable", reasonCode: "no_active_conversation" });
+    await expect(service.request({ companyId, issue, userId: "board-user" })).rejects.toMatchObject({ code: "no_active_conversation" });
+    expect(wakeup).not.toHaveBeenCalled();
+    // A different task's saved session is not authority to compact this one.
+    await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: randomUUID(), sessionDisplayId: "other-task-native-id" });
+    expect(await service.availability(companyId, issue)).toMatchObject({ status: "unavailable", reasonCode: "no_active_conversation" });
+    await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: issue.id, sessionDisplayId: "same-native-id", sessionParamsJson: { sessionId: randomUUID() } });
+    expect(await service.availability(companyId, issue)).toEqual({ status: "available", reasonCode: null, reason: null });
+    expect(await service.request({ companyId, issue, userId: "board-user" })).toHaveProperty("runId");
+    expect(wakeup).toHaveBeenCalledOnce();
   });
 
   it("waits for an active run and reports a compaction already underway", async () => {

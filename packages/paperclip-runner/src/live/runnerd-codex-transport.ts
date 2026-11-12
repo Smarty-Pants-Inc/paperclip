@@ -2021,7 +2021,7 @@ const COMPACTION_TURN = "paperclipCompactionTurn";
  * compacts when prompted with its `/compact` command.
  */
 export function runnerdCompactionTurnPayload(provider: string): Record<string, unknown> {
-  if (provider === "codex") return { compact: true };
+  if (provider === "codex" || provider === "pi_rpc") return { compact: true };
   if (provider === "acpx") return { text: "/compact" };
   throw new Error(`Context compaction is not supported by the ${provider} provider`);
 }

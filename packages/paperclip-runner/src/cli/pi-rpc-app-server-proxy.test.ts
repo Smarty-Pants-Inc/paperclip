@@ -149,6 +149,73 @@ async function request(
 }
 
 describe("Pi RPC app-server facade proxy", () => {
+  it("dispatches compact on the open session and settles the control envelope, not a prompt", async () => {
+    const sink = new FakeSink();
+    let finish!: (value: Record<string, unknown>) => void;
+    const calls: unknown[] = [];
+    const session = Object.assign(new FakeSession(), { compact(input: unknown) {
+      calls.push(input);
+      return new Promise<Record<string, unknown>>(resolve => { finish = resolve; });
+    } });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 90, "thread/start", { model: "neutral/model" });
+      const accepted = await request(proxy, sink, 91, "thread/compact/start", { threadId: session.id, customInstructions: "keep decisions" });
+      expect(accepted.error).toBeUndefined();
+      expect(calls).toEqual([{ customInstructions: "keep decisions" }]);
+      expect(session.turnInputs).toEqual([]);
+      const turnId = (accepted.result as any).turn.id;
+      expect(sink.decoded().filter(frame => frame.method === "turn/started")).toHaveLength(1);
+      finish({ tokensBefore: 100, estimatedTokensAfter: 25, firstKeptEntryId: "entry", summary: "private summary" });
+      // The event iterator is independent of the native command promise. A
+      // delayed success event must be durable before the control terminal.
+      setImmediate(() => session.push("context.compacted", { schema: "paperclip.context.compacted.v1", compactionId: "native-compact", reason: "manual", preTokens: 100, postTokens: 25, sameSession: true }));
+      await waitFor(() => sink.decoded().some(frame => frame.method === "turn/completed"));
+      const notifications = sink.decoded().filter(frame => frame.method);
+      const compactIndex = notifications.findIndex(frame => frame.method === "thread/compacted");
+      expect(compactIndex).toBeGreaterThanOrEqual(0);
+      expect(compactIndex).toBeLessThan(notifications.findIndex(frame => frame.method === "turn/completed"));
+      expect(notifications[compactIndex]).toMatchObject({ params: { threadId: session.id, turnId, preTokens: 100, postTokens: 25 } });
+      expect(sink.decoded().find(frame => frame.method === "turn/completed")).toMatchObject({ params: { turn: { id: turnId, status: "completed" } } });
+      expect(JSON.stringify(sink.decoded())).not.toContain("private summary");
+      expect(sink.decoded().some(frame => frame.method === "item/agentMessage/delta")).toBe(false);
+      expect((await request(proxy, sink, 92, "thread/read")).result).toMatchObject({ thread: { id: session.id, turns: [] } });
+    } finally { await proxy.close(); }
+  });
+
+  // Keep reason: a summary has no native turn id; forwarding its control id to
+  // ordinary interrupt silently leaves the native summarizer running.
+  it("physically closes a compact operation when its control envelope is interrupted", async () => {
+    const sink = new FakeSink();
+    let abort!: (error: Error) => void;
+    const session = Object.assign(new FakeSession(), { compact() {
+      return new Promise<Record<string, unknown>>((_resolve, reject) => { abort = reject; });
+    } });
+    const close = session.close.bind(session);
+    session.close = async input => { await close(input); abort(new Error("compaction interrupted")); };
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 96, "thread/start", { model: "neutral/model" });
+      const accepted = await request(proxy, sink, 97, "thread/compact/start", { threadId: session.id });
+      const turnId = (accepted.result as any).turn.id;
+      await request(proxy, sink, 98, "turn/interrupt", { turnId });
+      await waitFor(() => sink.decoded().some(frame => frame.method === "turn/failed"));
+      expect(session.closed).toContain("compaction_interrupt");
+      expect(session.turnInputs).toEqual([]);
+      expect(session.interrupted).toEqual([]);
+      expect(sink.decoded().some(frame => frame.method === "turn/completed")).toBe(false);
+    } finally { await proxy.close(); }
+  });
+
+  it("rejects compact without an active conversation and a mismatched thread", async () => {
+    const sink = new FakeSink(); const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      expect(await request(proxy, sink, 93, "thread/compact/start", { threadId: "unknown" })).toMatchObject({ error: { message: expect.stringMatching(/no active conversation/i) } });
+      await request(proxy, sink, 94, "thread/start", { model: "neutral/model" });
+      expect(await request(proxy, sink, 95, "thread/compact/start", { threadId: "another" })).toMatchObject({ error: { message: expect.stringMatching(/thread/i) } });
+    } finally { await proxy.close(); }
+  });
   it("adapts real Pi usage to Rust total/last without double counting warm turns", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });

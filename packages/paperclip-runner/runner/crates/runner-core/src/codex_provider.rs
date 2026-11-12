@@ -2481,9 +2481,9 @@ impl CodexProvider {
     /// identity is bound from the `turn/started` notification that follows.
     /// Messages read while waiting stay buffered for normal event delivery.
     pub fn start_compaction_turn(&mut self) -> Result<Value, LocalRunnerError> {
-        if self.config.provider != "codex" {
+        if !matches!(self.config.provider.as_str(), "codex" | "pi_rpc") {
             return Err(LocalRunnerError::invalid(
-                "on-demand context compaction requires Codex",
+                "on-demand context compaction requires Codex or native Pi",
             ));
         }
         if self.quarantined {
