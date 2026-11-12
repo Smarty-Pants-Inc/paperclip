@@ -1,10 +1,14 @@
+import { PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS } from "@paperclipai/adapter-utils";
 import { describe, expect, it } from "vitest";
-import { QUALIFIED_PI_RPC_PROFILE } from "../vendor/paperclip-runner/index.js";
+import { PI_THINKING_LEVELS, QUALIFIED_PI_RPC_PROFILE } from "../vendor/paperclip-runner/index.js";
 import { resolvePaperclipRunnerNativeProviderInput, resolvePaperclipRunnerProviderProfile } from "../services/native-runtime/provider-profile.js";
 import { agentHarnessType, paperclipRunnerProfileForHarness } from "@paperclipai/shared";
 
 const model = "cliproxyapi-anthropic/claude-opus-5-5";
 describe("native Pi server admission", () => {
+  it("binds browser-safe admission to the qualified runtime thinking catalog", () => {
+    expect(PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS).toEqual(PI_THINKING_LEVELS);
+  });
   it("selects the new harness without changing historical Pi", () => {
     expect(agentHarnessType("paperclip_runner", { provider: "pi_rpc" })).toBe("pi_rpc");
     expect(paperclipRunnerProfileForHarness("pi_rpc")).toEqual({ provider: "pi_rpc" });
@@ -34,5 +38,15 @@ describe("Pi RPC Claude effort cap", () => {
   it("leaves max exact for a non-Claude model and ACPX Pi", () => {
     expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { provider: "pi_rpc", model: "openai/gpt-6", piRpcThinkingLevel: "max" } })).toMatchObject({ piRpcThinkingLevel: "max" });
     expect(resolvePaperclipRunnerNativeProviderInput({ backend: "acpx_runtime", adapterConfig: { provider: "acpx", acpxAgent: "pi", model, piThinkingLevel: "max" } })).toMatchObject({ piThinkingLevel: "max" });
+  });
+});
+
+
+describe("native Pi field ownership", () => {
+  it.each(["piThinkingLevel", "thinking", "modelReasoningEffort", "reasoningEffort", "effort"])("does not accept the alias %s", key => {
+    expect(() => resolvePaperclipRunnerProviderProfile({ provider: "pi_rpc", model, [key]: "high" })).toThrow();
+  });
+  it.each(["codex", "opencode", "acpx"])("refuses the native key on %s", provider => {
+    expect(() => resolvePaperclipRunnerProviderProfile({ provider, model, piRpcThinkingLevel: "high" })).toThrow(/native Pi RPC/);
   });
 });

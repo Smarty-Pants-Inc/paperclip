@@ -50,6 +50,11 @@ describe("resolveNativeRuntimeMode", () => {
     }
   });
 
+  it("admits the graduated native Pi creation profile without an experimental flag", () => {
+    const adapterConfig = { provider: "pi_rpc", model: "paperclip/gateway/claude-opus-5-5", piRpcThinkingLevel: "xhigh" };
+    expect(resolveNativeRuntimeMode({ ...eligible, enabled: false, adapterConfig })).toMatchObject({ kind: "native", profile: { backend: "pi_rpc", protocolVersion: 1 } });
+    expect(resolveHeartbeatNativeRuntimeMode({ ...eligible, enabled: false, adapterConfig, persisted: { runtimeMode: "native", runtimeModeReason: "eligible_opt_in", runtimeModeResolvedAt: new Date(), driverKind: "pi_rpc" } })).toMatchObject({ kind: "native", profile: { backend: "pi_rpc" } });
+  });
   it("admits fresh native Codex when the experimental rollout is disabled", () => {
     expect(resolveNativeRuntimeMode({
       ...eligible,

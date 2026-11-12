@@ -9,6 +9,7 @@ export interface RunnerLifecycleDefaultContext {
   reusableLeaseSupported?: boolean;
   /** The run uses a managed AI account. */
   managedAiCredentialIdentity?: string;
+  managedAi?: NonNullable<Parameters<typeof defaultsRemoteSandboxRunToWarm>[0]["managedAi"]>;
 }
 
 function explicitLifecycleMode(
@@ -37,9 +38,7 @@ function sandboxRunDefaultsToWarm(
   return defaultsRemoteSandboxRunToWarm({
     profile,
     reusableLeaseSupported: context.reusableLeaseSupported === true,
-    // The attribution is not known here; a harness that needs it for a managed
-    // warm session (Copilot) is not a measured default, so this is exact.
-    managedAi: context.managedAiCredentialIdentity ? {} : null,
+    managedAi: context.managedAiCredentialIdentity ? context.managedAi ?? {} : null,
   });
 }
 
@@ -66,10 +65,11 @@ export function runnerLifecycleDefaultNeedsLeaseProbe(
   adapterConfig: Record<string, unknown> = {},
   admittedLifecycleMode?: "warm" | "per_turn",
   managedAiCredentialIdentity?: string,
+  managedAi?: RunnerLifecycleDefaultContext["managedAi"],
 ): boolean {
   if (adapterType !== "paperclip_runner" || environment.driver !== "sandbox") return false;
   if (explicitLifecycleMode(environment.config ?? {}, adapterConfig, admittedLifecycleMode)) return false;
-  return sandboxRunDefaultsToWarm(adapterConfig, { reusableLeaseSupported: true, managedAiCredentialIdentity });
+  return sandboxRunDefaultsToWarm(adapterConfig, { reusableLeaseSupported: true, managedAiCredentialIdentity, managedAi });
 }
 
 /** Resolve runner retention before acquiring a sandbox, not after it is ephemeral.
@@ -82,7 +82,7 @@ export function resolveRunnerEnvironmentForRun<T extends Pick<Environment, "driv
   adapterConfig: Record<string, unknown> = {},
   admittedLifecycleMode?: "warm" | "per_turn",
   managedAiCredentialIdentity?: string,
-  defaultContext: Pick<RunnerLifecycleDefaultContext, "reusableLeaseSupported"> = {},
+  defaultContext: Pick<RunnerLifecycleDefaultContext, "reusableLeaseSupported" | "managedAi"> = {},
 ): T {
   if (adapterType !== "paperclip_runner" || !["sandbox", "plugin"].includes(environment.driver)) return environment;
   const config = environment.config ?? {};

@@ -2900,6 +2900,7 @@ export function heartbeatService(
           configSnapshot,
           secretManifest,
           managedAiCredentialIdentity: managedAiRuntime?.identity,
+          managedAi: managedAiRuntime ? { attribution: managedAiRuntime.attribution, routing: parseObject(managedAiRuntime.config.managedAiRouting) } : undefined,
         },
         reuse: {
           requestedShouldReuseExisting,

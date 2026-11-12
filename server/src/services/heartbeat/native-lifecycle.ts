@@ -50,7 +50,7 @@ export function resolveHeartbeatNativeLifecyclePolicy(input: {
       : remoteDefault ? resolvePaperclipRunnerIdleTimeoutMs(input.remoteSandboxTarget?.idleTimeoutMs ?? input.agentIdleTimeoutMs)
         : PAPERCLIP_RUNNER_IDLE_TIMEOUT_DEFAULT_MS }
     : { mode: "per_turn", idleTimeoutMs: null };
-  const supportsManagedWarm = input.adapterType === "paperclip_runner" && (input.taskOwned ||
+  const supportsManagedWarm = input.adapterType === "paperclip_runner" && ((input.taskOwned && input.backend !== "pi_rpc") ||
     supportsManagedNativeWarmSession(profile, input.managedAiAttribution, input.managedAiRouting));
   return input.persistedPolicy ??
     (["openai_dot_mcp", "grok_bot_mcp", "muse_external", "cursor_cloud_api"].includes(input.backend) || input.managedAiSelected && !supportsManagedWarm

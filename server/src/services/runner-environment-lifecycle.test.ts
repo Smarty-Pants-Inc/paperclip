@@ -93,3 +93,22 @@ describe("remote-sandbox warm default", () => {
   });
 });
 
+
+
+// Trust boundary: a managed native Pi sandbox is reusable only on a broker-served route.
+describe("native Pi sandbox retention", () => {
+  const environment = { driver: "sandbox" as const, config: { provider: "daytona", reuseLease: false } };
+  const config = { provider: "pi_rpc", model: "paperclip/gateway/claude-sonnet-5-5", idleTimeoutMs: 600_000 };
+  const managedAi = { attribution: { provider: "anthropic", method: "api_key" }, routing: { kind: "gateway", protocol: "messages", auth: "bearer" } };
+  it("coordinates the environment lease and native idle window", () => {
+    expect(runnerLifecycleDefaultNeedsLeaseProbe(environment, "paperclip_runner", config, undefined, "account:generation", managedAi)).toBe(true);
+    const context = { reusableLeaseSupported: true, managedAi };
+    expect(resolveRunnerEnvironmentForRun(environment, "paperclip_runner", config, undefined, "account:generation", context).config.reuseLease).toBe(true);
+    expect(resolveWarmRunnerIdleTimeoutMsForRun(environment, "paperclip_runner", config, undefined, { ...context, managedAiCredentialIdentity: "account:generation" })).toBe(600_000);
+    expect(environment.config.reuseLease).toBe(false);
+  });
+  it.each([undefined, { ...managedAi, routing: { ...managedAi.routing, protocol: "chat" } }, { ...managedAi, attribution: { provider: "github", method: "api_key" } }])("keeps unserved managed routes ephemeral: %j", selected => {
+    expect(runnerLifecycleDefaultNeedsLeaseProbe(environment, "paperclip_runner", config, undefined, "account:generation", selected)).toBe(false);
+    expect(resolveRunnerEnvironmentForRun(environment, "paperclip_runner", config, undefined, "account:generation", { reusableLeaseSupported: true, managedAi: selected })).toBe(environment);
+  });
+});

@@ -553,6 +553,10 @@ describe("native Pi task thinking", () => {
     expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: config })).toMatchObject({ provider: "pi_rpc", model: base.model, piRpcThinkingLevel });
     expect(base.piRpcThinkingLevel).toBe("low");
   });
+  it("refuses an explicit task max after selecting a Claude model", () => {
+    const config = projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "paperclip/gateway/claude-sonnet-5-5", piRpcThinkingLevel: "max" });
+    expect(() => resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: config })).toThrow(/Claude.*xhigh/);
+  });
   it("does not reinterpret generic effort aliases as Pi thinking", () => {
     expect(projectPaperclipRunnerTaskConfig("pi_rpc", base, { effort: "max", modelReasoningEffort: "high", reasoningEffort: "medium" })).toEqual(base);
   });

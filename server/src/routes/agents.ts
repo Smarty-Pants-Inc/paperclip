@@ -1,4 +1,4 @@
-import { PI_THINKING_LEVELS } from "@paperclipai/paperclip-runner";
+import { PI_THINKING_LEVELS } from "../vendor/paperclip-runner/index.js";
 import { assertLoginEnvironmentTarget } from "../services/login-environment.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
@@ -3118,7 +3118,7 @@ export function agentRoutes(
         const modelAgent = await svc.getById(modelAgentId);
         if (!modelAgent || modelAgent.companyId !== companyId) throw notFound("Agent not found");
         await assertCanUpdateAgent(req, modelAgent);
-        savedBinding = modelAgent.aiConnection;
+        savedBinding = asRecord(modelAgent.runtimeConfig)?.aiConnection;
       } else await assertCanCreateAgentsForCompany(req, companyId);
       let binding: AiConnectionBinding;
       try {

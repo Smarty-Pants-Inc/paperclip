@@ -572,6 +572,14 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
   }
 
   async function testManagedEnvironment(adapterType: string, context: Parameters<ReturnType<typeof requireServerAdapter>["testEnvironment"]>[0], binding: AiConnectionBinding, managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>>, agentId?: string) {
+    // Native Pi must use the ordinary LocalFacade/proxy launch. Until that runner
+    // path supports a setup hello, never validate it with ACPX or a legacy CLI.
+    if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc") return {
+      adapterType, status: "fail" as const, testedAt: new Date().toISOString(), checks: [{
+        code: "pi_rpc_environment_test_unavailable", level: "error" as const,
+        message: "Native Pi connection testing is not available yet. No hello probe was run.",
+      }],
+    };
     const startedAt = new Date();
     if (adapterType === "paperclip_runner" && binding.provider === "google" && context.config.provider === "acpx"
       && context.config.acpxAgent === "antigravity" && managed.home) {

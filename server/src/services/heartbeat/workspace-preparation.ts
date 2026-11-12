@@ -145,6 +145,7 @@ export interface HeartbeatWorkspacePreparationInput {
     configSnapshot: WorkspaceMetadataInput["configSnapshot"];
     secretManifest: WorkspaceMetadataInput["secretManifest"];
     managedAiCredentialIdentity?: string;
+    managedAi?: import("../runner-environment-lifecycle.js").RunnerLifecycleDefaultContext["managedAi"];
   };
   reuse: {
     requestedShouldReuseExisting: boolean;
@@ -1340,6 +1341,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       adapterConfig: parseObject(agent.adapterConfig),
       admittedLifecycleMode: persistedNativeExecutionInput?.session.lifecyclePolicy.mode,
       managedAiCredentialIdentity: input.config.managedAiCredentialIdentity,
+      managedAi: input.config.managedAi,
       runnerTaskProjectIds:[...new Set([executionWorkspace.projectId,...resolvedWorkspace.runnerTaskProjectIds ?? [],
         ...(executionWorkspace.additionalWorkspaces ?? []).map(workspace=>workspace.projectId)]
         .filter((id):id is string=>Boolean(id)))],

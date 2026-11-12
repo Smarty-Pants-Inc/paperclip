@@ -83,10 +83,11 @@ describe("managed native Pi lifecycle", () => {
     managedAiRouting: { kind: "gateway", protocol: "messages", auth: "bearer" } };
   it("keeps a managed native Pi resident locally and on a reusable remote sandbox", () => {
     expect(resolveHeartbeatNativeLifecyclePolicy(input)).toEqual({ mode: "warm", idleTimeoutMs: 300_000 });
-    expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, localTarget: false, remoteSandboxTarget: { reusableLease: true } })).toEqual({ mode: "warm", idleTimeoutMs: 300_000 });
+    expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, localTarget: false, remoteSandboxTarget: { reusableLease: true } })).toEqual({ mode: "warm", idleTimeoutMs: 900_000 });
   });
   it("fails closed without a broker route and respects pinned per-turn", () => {
     expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, managedAiRouting: undefined })).toEqual(perTurn);
+    expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, taskOwned: true, managedAiRouting: undefined })).toEqual(perTurn);
     expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, persistedPolicy: perTurn })).toEqual(perTurn);
     expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, agentMode: "per_turn" })).toEqual(perTurn);
   });

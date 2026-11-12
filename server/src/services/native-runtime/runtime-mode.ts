@@ -45,16 +45,7 @@ export type NativeRuntimeResolution =
       reason: "eligible_opt_in";
       profile: {
         mode: "native";
-        backend:
-          | "codex_app_server"
-          | "opencode_server"
-          | "claude_managed_agents_api"
-          | "aws_agentcore_harness_api"
-          | "acpx_runtime"
-          | "openai_dot_mcp"
-          | "grok_bot_mcp"
-          | "muse_external"
-          | "cursor_cloud_api";
+        backend: PaperclipRunnerProviderProfile["backend"];
         protocolVersion: 1;
       };
       authorityDecision: NativeStatusDecision;
@@ -139,7 +130,7 @@ export function resolveNativeRuntimeMode(input: {
     if (input.dotEnabled !== true) throw ineligible("paperclip_runner_dot_disabled", "Enable OpenAI Dot and Assistant connections (MCP) in experimental settings before assigning new work.");
   } else if (runnerProfile.provider === "grok_bot" && (input.grokEnabled !== true || !input.enabled)) {
     throw ineligible("paperclip_runner_grok_disabled", "Enable Grok Bot, Paperclip Runner, and Assistant connections (MCP) before assigning new work.");
-  } else if (runnerProfile.provider !== "codex" && runnerProfile.provider !== "opencode"
+  } else if (runnerProfile.provider !== "codex" && runnerProfile.provider !== "opencode" && runnerProfile.provider !== "pi_rpc"
     && !(runnerProfile.provider === "acpx"
       && (["claude", "copilot", "pi", "antigravity"].includes(runnerProfile.acpxAgent ?? "")))
     && !input.enabled) {
@@ -320,7 +311,7 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
         );
       }
       const driverKind = input.persisted.driverKind;
-      const backend = driverKind === "opencode_server"
+      const backend = driverKind === "pi_rpc" ? "pi_rpc" : driverKind === "opencode_server"
         ? "opencode_server"
         : driverKind === "claude_managed_agents_api"
           ? "claude_managed_agents_api"

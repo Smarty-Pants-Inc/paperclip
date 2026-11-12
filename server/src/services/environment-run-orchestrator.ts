@@ -35,6 +35,7 @@ import type {
   IssueExecutionWorkspaceSettings,
 } from "@paperclipai/shared";
 import {
+  type RunnerLifecycleDefaultContext,
   resolveRunnerEnvironmentForRun,
   resolveRunnerReconnectGraceMsForRun,
   runnerLifecycleDefaultNeedsLeaseProbe,
@@ -296,6 +297,7 @@ export function environmentRunOrchestrator(
     adapterConfig?: Record<string, unknown>;
     admittedLifecycleMode?: "warm" | "per_turn";
     managedAiCredentialIdentity?: string;
+    managedAi?: RunnerLifecycleDefaultContext["managedAi"];
     issueId: string | null;
     heartbeatRunId: string;
     agentId: string;
@@ -319,10 +321,10 @@ export function environmentRunOrchestrator(
     // leases. Probe it only for a run the default can apply to; every other
     // run resolves without it, exactly as before.
     const reusableLeaseSupported = runnerLifecycleDefaultNeedsLeaseProbe(
-      selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode, input.managedAiCredentialIdentity,
+      selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode, input.managedAiCredentialIdentity, input.managedAi,
     ) && await Promise.resolve(environmentRuntime.providerSupportsReusableLeases?.(selectedEnvironment)).then(
       (supported) => supported === true, () => false);
-    const lifecycleDefaultContext = { reusableLeaseSupported, managedAiCredentialIdentity: input.managedAiCredentialIdentity };
+    const lifecycleDefaultContext = { reusableLeaseSupported, managedAiCredentialIdentity: input.managedAiCredentialIdentity, managedAi: input.managedAi };
     const environment = resolveRunnerEnvironmentForRun(
       selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode, input.managedAiCredentialIdentity,
       lifecycleDefaultContext,

@@ -107,24 +107,19 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
   if (config.command && config.command !== "pi") unsupported.push("command");
   if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
   if (config.stdoutLogMode !== undefined && config.stdoutLogMode !== "compact") unsupported.push("stdoutLogMode");
-  const nativePi = config.provider === "pi_rpc";
-  const thinking = nativePi ? config.piRpcThinkingLevel ?? config.thinking : config.piThinkingLevel ?? config.thinking;
-  if (nativePi) {
-    try { resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", thinking); } catch { unsupported.push("piRpcThinkingLevel"); }
-    for (const key of ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel"]) if (config[key] !== undefined) unsupported.push(key);
-    if (config.piRpcThinkingLevel !== undefined && config.thinking !== undefined && config.piRpcThinkingLevel !== config.thinking) unsupported.push("thinking");
-  } else if (thinking !== undefined && !["off", "low", "high", "max"].includes(String(thinking))) unsupported.push("thinking");
-  if (config.piThinkingLevel !== undefined && config.thinking !== undefined && config.piThinkingLevel !== config.thinking) unsupported.push("thinking", "piThinkingLevel");
+  const thinking = config.piRpcThinkingLevel ?? config.thinking;
+  try { resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", thinking); } catch { unsupported.push("piRpcThinkingLevel"); }
+  for (const key of ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel"]) if (config[key] !== undefined) unsupported.push(key);
+  if (config.piRpcThinkingLevel !== undefined && config.thinking !== undefined && config.piRpcThinkingLevel !== config.thinking) unsupported.push("thinking");
   if (unsupported.length) incompatible(unsupported);
   const translated = { ...config };
   for (const key of ["command", "extraArgs", "args", "thinking", "stdoutLogMode"]) delete translated[key];
   return {
     ...translated,
-    ...(nativePi ? { provider: "pi_rpc" } : { provider: "acpx", acpxAgent: "pi" }),
+    provider: "pi_rpc",
     model: typeof config.model === "string" ? config.model.trim() : "",
-    ...(nativePi ? { piRpcThinkingLevel: thinking ?? "low" } : { piThinkingLevel: thinking ?? "low" }),
-    ...(nativePi ? {} : { acpxPermissionMode: config.acpxPermissionMode ?? "approve-all" }),
-    ...(nativePi && config.lifecycleMode === undefined ? {} : { lifecycleMode: config.lifecycleMode ?? "per_turn" }),
+    piRpcThinkingLevel: thinking ?? "low",
+    ...(config.lifecycleMode === undefined ? {} : { lifecycleMode: config.lifecycleMode }),
   };
 }
 
@@ -229,9 +224,9 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
       for (const key of ["provider", "acpxAgent", "acpxPermissionMode", "lifecycleMode", "idleTimeoutMs", "modelReasoningEffort", "effort"]) delete config[key];
       return { adapterType: "grok_local", adapterConfig: { ...config, disableWebSearch: config.disableWebSearch ?? false, ...(effort === undefined ? {} : { reasoningEffort: effort }) } };
     }
-    if (harness === "pi_local") {
+    if (harness === "pi_local" || harness === "pi_rpc") {
       if (!native) return { adapterType, adapterConfig: config };
-      const thinking = config.thinking ?? config.piThinkingLevel ?? "low";
+      const thinking = config.thinking ?? (harness === "pi_rpc" ? config.piRpcThinkingLevel : config.piThinkingLevel) ?? "low";
       const unsupported = [
         ...(config.acpxPermissionMode !== undefined && config.acpxPermissionMode !== "approve-all" ? ["acpxPermissionMode"] : []),
         ...(config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn" ? ["lifecycleMode"] : []),
@@ -239,7 +234,7 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
         ...(!["off", "minimal", "low", "medium", "high", "xhigh"].includes(String(thinking)) ? [config.thinking !== undefined ? "thinking" : "piThinkingLevel"] : []),
       ];
       if (unsupported.length) throw unprocessable(`Legacy Pi cannot honor these settings: ${unsupported.join(", ")}. Keep Paperclip Runner or explicitly choose compatible settings.`, { code: "agent_runner_config_incompatible", fields: unsupported });
-      for (const key of ["provider", "acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "lifecycleMode", "idleTimeoutMs"]) delete config[key];
+      for (const key of ["provider", "acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "piRpcThinkingLevel", "lifecycleMode", "idleTimeoutMs"]) delete config[key];
       return { adapterType: "pi_local", adapterConfig: { ...config, thinking } };
     }
     if (harness === "opencode_local") {

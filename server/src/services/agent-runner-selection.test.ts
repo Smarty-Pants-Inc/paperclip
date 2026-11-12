@@ -211,13 +211,13 @@ describe("server-owned Codex runner selection", () => {
     const adapterConfig = { model: "openrouter/anthropic/claude-sonnet-4.6", thinking: "high", command: "pi", env: { OPENROUTER_API_KEY: { type: "secret_ref", secretId: "connection" } }, cwd: "/workspace" };
     const selected = resolveNewAgentRunner({ adapterType: "pi_local", adapterConfig, target });
     expect(agentRunnerAvailability("pi_local", target).defaultRunner).toBe("paperclip");
-    expect(selected).toEqual({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: adapterConfig.model, piThinkingLevel: "high", acpxPermissionMode: "approve-all", lifecycleMode: "per_turn", cwd: adapterConfig.cwd, env: adapterConfig.env } });
+    expect(selected).toEqual({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: adapterConfig.model, piRpcThinkingLevel: "high", cwd: adapterConfig.cwd, env: adapterConfig.env } });
     expect(resolveNewAgentRunner(selected)).toEqual(selected);
     expect(resolveNewAgentRunner({ ...selected, runner: "legacy" })).toEqual({ adapterType: "pi_local", adapterConfig: { model: adapterConfig.model, thinking: "high", cwd: adapterConfig.cwd, env: adapterConfig.env } });
   });
-  it.each(["minimal", "medium", "xhigh"])("keeps unsupported Pi thinking %s explicit", thinking => {
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"])("creates native Pi with exact thinking %s", thinking => {
     const input = { adapterType: "pi_local", target, adapterConfig: { model: "custom/model", thinking } };
-    expect(() => resolveNewAgentRunner(input)).toThrow("cannot honor");
+    expect(resolveNewAgentRunner(input)).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", piRpcThinkingLevel: thinking } });
     expect(resolveNewAgentRunner({ ...input, runner: "legacy" })).toEqual({ adapterType: input.adapterType, adapterConfig: input.adapterConfig });
   });
   it.each([{ command: "custom-pi" }, { args: ["--extension", "custom.ts"] }, { extraArgs: "--no-tools" }, { stdoutLogMode: "raw" }, { thinking: "low", piThinkingLevel: "high" }])("rejects unsupported Pi configuration %j", extra => {
@@ -227,7 +227,7 @@ describe("server-owned Codex runner selection", () => {
     expect(() => resolveNewAgentRunner({ adapterType: "pi_local", target, adapterConfig: { model } })).toThrow("provider/model");
   });
   it("allows an inactive Pi draft before model selection and preserves saved native policy", () => {
-    expect(resolveNewAgentRunner({ adapterType: "pi_local", target, setupOnly: true })).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "", piThinkingLevel: "low" } });
+    expect(resolveNewAgentRunner({ adapterType: "pi_local", target, setupOnly: true })).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "", piRpcThinkingLevel: "low" } });
     const saved = { adapterType: "paperclip_runner", target, adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "custom/model", piThinkingLevel: "max", acpxPermissionMode: "approve-reads", lifecycleMode: "warm", idleTimeoutMs: 1234 } };
     expect(resolveNewAgentRunner(saved)).toEqual({ adapterType: saved.adapterType, adapterConfig: saved.adapterConfig });
     expect(() => resolveNewAgentRunner({ ...saved, runner: "legacy" })).toThrow("Legacy Pi cannot honor");
@@ -704,7 +704,7 @@ describe("Codex creation runner contract", () => {
     expect(paperclipRunnerProfileForHarness("codex_local")).toEqual({ provider: "codex" });
     expect(paperclipRunnerProfileForHarness("claude_local")).toEqual({ provider: "acpx", acpxAgent: "claude" });
     expect(paperclipRunnerProfileForHarness("opencode_local")).toEqual({ provider: "opencode" });
-    expect(paperclipRunnerProfileForHarness("pi_local")).toEqual({ provider: "acpx", acpxAgent: "pi" });
+    expect(paperclipRunnerProfileForHarness("pi_local")).toEqual({ provider: "pi_rpc" });
     for (const harness of ["cursor", "process"]) expect(paperclipRunnerProfileForHarness(harness)).toBeUndefined();
     expect(agentHarnessType("paperclip_runner", { provider: "codex" })).toBe("codex_local");
     expect(agentHarnessType("paperclip_runner", { provider: "acpx", acpxAgent: "claude" })).toBe("claude_local");

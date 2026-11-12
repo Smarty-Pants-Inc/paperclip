@@ -473,10 +473,10 @@ export function resolvePaperclipRunnerProviderProfile(
 
   if (candidate === "pi_rpc") {
     const model = optionalString(config.model);
-    if (!model || !model.includes("/") || model.endsWith("/") || model.length > 240 || /[\x00-\x1f\x7f]/.test(model)) {
+    if (!model || !/^[^/\s]+\/\S+$/.test(model) || model.endsWith("/") || model.length > 240 || /[\x00-\x1f\x7f]/.test(model)) {
       throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_model_invalid", "Native Pi RPC requires an explicit provider/model selection.");
     }
-    const unsupported = ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "codexPermissionMode", "opencodePermissionMode"]
+    const unsupported = ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "thinking", "modelReasoningEffort", "reasoningEffort", "effort", "codexPermissionMode", "opencodePermissionMode"]
       .filter(key => config[key] !== undefined);
     if (unsupported.length) throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_config_invalid", `Native Pi RPC cannot honor ACPX or other-provider selectors: ${unsupported.join(", ")}.`);
     try {
@@ -544,7 +544,7 @@ export function resolvePaperclipRunnerProviderProfile(
   }
 
   if (candidate === "opencode") {
-    if (!model || !model.includes("/") || model.endsWith("/")) {
+    if (!model || !/^[^/\s]+\/\S+$/.test(model) || model.endsWith("/")) {
       throw new PaperclipRunnerProviderProfileError(
         "paperclip_runner_opencode_model_invalid",
         "Paperclip Runner OpenCode requires model in provider/model form.",

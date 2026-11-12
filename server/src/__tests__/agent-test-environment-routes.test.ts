@@ -507,10 +507,20 @@ describe("agent test-environment route", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it("fails native Pi Setup Test closed instead of claiming the old ACPX hello passed", async () => {
+    const { agentEnvironmentTestService } = await import("../services/agent-environment-test.js");
+    const result = await agentEnvironmentTestService({} as never).testManagedEnvironment("paperclip_runner", {
+      companyId: "company-1", adapterType: "paperclip_runner", config: { provider: "pi_rpc", model: "paperclip/gateway/claude-opus-5-5" },
+    } as never, { provider: "anthropic", method: "api_key", mode: "responsible_user" }, {} as never);
+    expect(result.status).toBe("fail");
+    expect(result.checks).toContainEqual(expect.objectContaining({ code: "pi_rpc_environment_test_unavailable", level: "error" }));
+    expect(testEnvironmentSpy).not.toHaveBeenCalled();
+  });
+
   // Trust boundary: the scoped model endpoint must not fall back to another provider's catalog.
   it.each([false, true])("lists only the selected Pi RPC connection catalog (refresh=%s)", async refresh => {
     const binding = { provider: "anthropic", method: "api_key", mode: "responsible_user" };
-    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1", aiConnection: binding });
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1", runtimeConfig: { aiConnection: binding } });
     mockSelectAiConnection.mockResolvedValueOnce({ connection: { config: { ai: { provider: "anthropic", method: "api_key", routing: {
       kind: "gateway", protocol: "messages", baseUrl: "https://gateway.example", auth: "bearer", models: [
         { id: "nested/claude-opus-5-5", label: "Gateway Opus" }, { id: "tenant/custom-model" },
