@@ -5,8 +5,8 @@ const claudeModel = "cliproxyapi-anthropic/claude-opus-5-5";
 const config = (mode: string) => [{ id: "thought_level", type: "select", currentValue: mode, options: ["off", "low", "high", "xhigh", "max"].map(value => ({ value, name: value })) }];
 const session = (mode: string) => ({ sessionId: "native", modes: { currentModeId: mode }, configOptions: config(mode) });
 const prompt = { id: 9, method: "session/prompt", params: { sessionId: "native" } };
-function opened(expected: "off" | "low" | "high" | "max", initial: string = expected === "max" ? "xhigh" : expected) {
-  const native = expected === "max" ? "xhigh" : expected;
+function opened(expected: "off" | "low" | "high" | "max", initial: string = expected) {
+  const native = expected;
   const admission = createPiThinkingAdmission(expected, { modelId: claudeModel }); const guard = admission.createGuard();
   guard("outbound", { id: 0, method: "session/new", params: {} });
   guard("inbound", { id: 0, result: session(initial) });
@@ -19,26 +19,11 @@ function opened(expected: "off" | "low" | "high" | "max", initial: string = expe
 
 describe("Pi thinking native mode admission", () => {
   it.each([
-    ["cliproxyapi-anthropic/claude-opus-5-5", "xhigh"],
-    ["cliproxyapi/Claude-opus-5-5", "xhigh"],
-    ["custom/CLAUDE-sonnet", "xhigh"],
-    ["custom-ANTHROPIC/model", "xhigh"],
-    ["cliproxyapi-anthropic/claude-fable-5-2", "xhigh"],
-    ["cliproxyapi/gpt-6.1-sol", "max"],
-    ["cliproxyapi/gpt-6-luna", "max"],
-    ["cliproxyapi/gpt-6-astra", "max"],
-    ["custom/GPT-6-astra", "max"],
-    ["custom-ANTHROPIC/gpt-6-astra", "xhigh"],
-    ["cliproxyapi/gpt-6-claude", "xhigh"],
-    ["custom/gemini", "xhigh"],
-    ["claude-provider/not-claude", "xhigh"],
-    [undefined, "xhigh"],
-    ["", "xhigh"],
-    ["cliproxyapi/some-new-model", "xhigh"],
-    ["gemini-3", "xhigh"],
-  ] as const)("maps and admits levels for model %s (max=%s)", (modelId, maxNative) => {
+    "cliproxyapi-anthropic/claude-opus-5-5", "cliproxyapi/Claude-opus-5-5", "custom/CLAUDE-sonnet",
+    "custom-ANTHROPIC/model", "cliproxyapi/gpt-6-astra", "custom/gemini", undefined, "",
+  ] as const)("passes through all levels for model %s", modelId => {
     for (const level of ["off", "low", "high", "max"] as const) {
-      const native = level === "max" ? maxNative : level;
+      const native = level;
       expect(piNativeThinkingValue(level, modelId)).toBe(native);
       const admission = createPiThinkingAdmission(level, { modelId });
       const guard = admission.createGuard();
@@ -47,13 +32,6 @@ describe("Pi thinking native mode admission", () => {
       guard("outbound", { id: 1, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: native } });
       guard("inbound", { id: 1, result: { configOptions: config(native) } });
       admission.assertReady(); guard("outbound", prompt);
-      if (level === "max") {
-        const wrong = native === "xhigh" ? "max" : "xhigh";
-        const rejected = createPiThinkingAdmission(level, { modelId, restoring: true });
-        const reload = rejected.createGuard();
-        reload("outbound", { id: 2, method: "session/load", params: { sessionId: "native" } });
-        expect(() => reload("inbound", { id: 2, result: session(wrong) })).toThrow(/drifted/);
-      }
     }
   });
   it("requires explicit Pi thinking and rejects unadmitted aliases and other providers", () => {
@@ -69,23 +47,19 @@ describe("Pi thinking native mode admission", () => {
     expect(admission.assertReady).toThrow();
     expect(() => guard("outbound", prompt)).toThrow(/replaced/);
     reloaded("outbound", { id: 1, method: "session/load", params: { sessionId: "native" } });
-    reloaded("inbound", { id: 1, result: session(expected === "max" ? "xhigh" : expected) });
+    reloaded("inbound", { id: 1, result: session(expected) });
     admission.assertReady(); reloaded("outbound", prompt);
   });
-  it("rejects max as a native setter or acknowledgement for Paperclip max", () => {
+  it("passes max through native setters and restored-mode admission without vendor policy", () => {
     const setter = opened("max", "high");
-    expect(() => setter.guard("outbound", { id: 2, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: "max" } })).toThrow(/selected mode/);
-    const echo = opened("max", "high");
-    echo.guard("outbound", { id: 2, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: "xhigh" } });
-    expect(() => echo.guard("inbound", { id: 2, result: { configOptions: config("max") } })).toThrow(/did not apply/);
-    expect(echo.admission.assertReady).toThrow();
-  });
-  it("rejects a restored native max when Paperclip max requires xhigh", () => {
+    setter.guard("outbound", { id: 2, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: "max" } });
+    setter.guard("inbound", { id: 2, result: { configOptions: config("max") } });
+    setter.admission.assertReady();
     const admission = createPiThinkingAdmission("max", { restoring: true, modelId: claudeModel });
     const guard = admission.createGuard();
     guard("outbound", { id: 0, method: "session/load", params: { sessionId: "native" } });
-    expect(() => guard("inbound", { id: 0, result: session("max") })).toThrow(/drifted/);
-    expect(admission.assertReady).toThrow();
+    guard("inbound", { id: 0, result: session("max") });
+    admission.assertReady();
   });
   it.each(["medium", "high"])("allows initial %s/model-selection updates but requires a correlated low setter before prompting", initial => {
     const { admission, guard } = opened("low", initial);

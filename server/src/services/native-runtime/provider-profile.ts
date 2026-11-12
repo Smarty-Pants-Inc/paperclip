@@ -480,10 +480,7 @@ export function resolvePaperclipRunnerProviderProfile(
       .filter(key => config[key] !== undefined);
     if (unsupported.length) throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_config_invalid", `Native Pi RPC cannot honor ACPX or other-provider selectors: ${unsupported.join(", ")}.`);
     try {
-      const thinking = resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel);
-      if (thinking === "max" && /(?:^|[/.-])claude(?:[/.-]|$)/i.test(model)) {
-        throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_claude_thinking_cap", "Claude models support Pi RPC thinking at most xhigh; max is not admitted.");
-      }
+      resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel);
       if (config.profile !== undefined) parsePiRpcProfile(config.profile);
     } catch (error) {
       throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_profile_invalid", error instanceof Error ? error.message : "Native Pi profile is invalid");

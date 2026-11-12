@@ -1162,7 +1162,7 @@ describe("agent routes adapter validation", () => {
     expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject(input);
   });
 
-  it.each([{ thinking: "high", status: 200 }, { thinking: "medium", status: 200 }, { thinking: "max", status: 422 }, { command: "custom-pi", status: 422 }]
+  it.each([{ thinking: "high", status: 200 }, { thinking: "medium", status: 200 }, { thinking: "max", status: 200 }, { command: "custom-pi", status: 422 }]
     .flatMap(settings => [undefined, "pi_rpc"].map(provider => ({ ...settings, provider }))))("validates saved Pi settings during direct adapter conversion: %j", async ({ status, provider, ...settings }) => {
     const selection = await import("../services/agent-runner-selection.js");
     vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>

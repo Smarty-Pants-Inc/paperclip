@@ -28,11 +28,11 @@ describe("native Pi server admission", () => {
 });
 
 
-// Trust boundary: the native provider never silently clamps model-unsupported thinking.
-describe("Pi RPC Claude effort cap", () => {
-  it.each(["anthropic/claude-opus-5-5", "paperclip/gateway/claude-sonnet-5-5", "anthropic/claude-opus-4-6", "gateway/Claude-Haiku"])("rejects max for %s", model => {
-    expect(() => resolvePaperclipRunnerProviderProfile({ provider: "pi_rpc", model, piRpcThinkingLevel: "max" })).toThrow(/Claude.*xhigh/i);
-    expect(() => resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { provider: "pi_rpc", model, piRpcThinkingLevel: "max" } })).toThrow(/Claude.*xhigh/i);
+// Trust boundary: server passes explicit effort; native catalog/config owns admission.
+describe("Pi RPC effort passthrough", () => {
+  it.each(["anthropic/claude-opus-5-5", "paperclip/gateway/claude-sonnet-5-5", "anthropic/claude-opus-4-6", "gateway/Claude-Haiku"])("preserves explicit max for %s without vendor policy", model => {
+    expect(resolvePaperclipRunnerProviderProfile({ provider: "pi_rpc", model, piRpcThinkingLevel: "max" })).toMatchObject({ model });
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { provider: "pi_rpc", model, piRpcThinkingLevel: "max" } })).toMatchObject({ model, piRpcThinkingLevel: "max" });
     expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: { provider: "pi_rpc", model, piRpcThinkingLevel: "xhigh" } })).toMatchObject({ model, piRpcThinkingLevel: "xhigh" });
   });
   it("leaves max exact for a non-Claude model and ACPX Pi", () => {

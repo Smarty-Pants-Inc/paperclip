@@ -32,8 +32,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
   const checks: AdapterEnvironmentTestResult["checks"] = [];
   let stage = "metadata";
   try {
-    // Reuse the existing server admission rule, including Claude <= xhigh.
-    // provider-profile.ts:474-489 is the sole Claude cap; no second regex here.
+    // Reuse exact model/profile/config admission; capability caps belong to config.
     const profile = resolvePaperclipRunnerProviderProfile(context.config, { companyId: context.companyId });
     const model = profile.model;
     if (profile.provider !== "pi_rpc" || !model || model !== context.config.model) throw new Error("Pi needs an unchanged explicit model ID");
