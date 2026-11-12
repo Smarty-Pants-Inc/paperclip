@@ -205,9 +205,23 @@ describe("owned Pi bind extension", () => {
     expect(JSON.stringify(await raw(f.socketPath, park))).not.toContain("SECRET");
     expect(await raw(f.socketPath, { ...park, type: "unknown", payload: "SECRET" })).toEqual({ error: "Pi private request rejected" });
   });
-  it("applies model/effort with real API shapes and rejects clamped effort before ACK", async () => {
+  it("accepts Pi's config-lowered effort on initial and warm turns without changing the requested bind receipt", async () => {
+    const f = await fixture({ initial: { ...initial, thinkingLevel: "max" } });
+    f.pi.setThinkingLevel!("xhigh");
+    f.pi.setThinkingLevel = () => {}; // Pi config keeps the effective cap.
+    await f.emit("input", { source: "rpc" });
+    expect(await f.emit("before_agent_start", { systemPrompt: "native" })).toBeDefined();
+    await f.emit("agent_settled");
+    await expect(sendPiBindRequest(f.socketPath, { ...bind, thinkingLevel: "max" })).resolves.toMatchObject({ thinkingLevel: "max" });
+    await sendPiBindRequest(f.socketPath, command("begin_turn", next));
+    await f.emit("input", { source: "rpc" });
+    expect(await f.emit("before_agent_start", { systemPrompt: "native" })).toBeDefined();
+    expect(f.ctx.abort).not.toHaveBeenCalled();
+  });
+  it.each([undefined, "ultra", "max"])("refuses missing/invalid/escalated effective effort before bind ACK (%s)", async effective => {
     const f = await fixture(); await f.emit("agent_settled");
     f.pi.setThinkingLevel = () => {};
+    f.pi.getThinkingLevel = () => effective as never;
     await expect(sendPiBindRequest(f.socketPath, { ...bind, thinkingLevel: "high" })).rejects.toThrow("rejected");
     expect(f.pi.setModel).toHaveBeenCalledWith(expect.objectContaining({ provider: "paperclip", id: "m" }));
     expect(captureOrigin()).toBeNull();

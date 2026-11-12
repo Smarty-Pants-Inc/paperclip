@@ -14,7 +14,7 @@ import type { PiManagedModel } from "./pi-managed-model.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
-import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
+import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type {
   HarnessDriver,
@@ -218,6 +218,7 @@ export class PiRpcDriver implements HarnessDriver {
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
         providerSessionId: identity.providerSessionId,
+        identity,
         sessionFile,
         config,
         systemInstructions: this.#options.systemInstructions,
@@ -274,6 +275,7 @@ interface PiSessionState {
   resident?: PiResidentState;
   callbacks?: PiHostCallbacks;
   config: PiNativeConfig;
+  identity: PiNativeAdmittedIdentity;
   systemInstructions?: string;
   initialContext: PiRunContext;
   agentHome: string;
@@ -366,6 +368,8 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #events = new EventQueue();
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
+  #identity: PiNativeAdmittedIdentity;
+  #thinkingLoweringReported = false;
   #initialContext: PiRunContext;
   readonly #agentHome: string;
   readonly #instructionFile: string;
@@ -397,11 +401,14 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#callbacks?.setNativeSessionId(state.providerSessionId);
     this.#bindRequest = state.bindRequest;
     this.#config = state.config;
+    this.#identity = state.identity;
     this.#initialContext = state.initialContext;
     this.#agentHome = state.agentHome;
     this.#instructionFile = state.instructionFile;
     this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
+    this.#emit("session.started", { context: this.#effectiveContext() });
+    this.#recordAdmission(state.identity);
     void this.#pump();
   }
 
@@ -465,6 +472,19 @@ export class PiRpcHarnessSession implements HarnessSession {
     return result;
   }
 
+  #effectiveContext(): Record<string, unknown> {
+    return { model: this.#identity.model, piRpcThinkingLevel: this.#identity.piRpcThinkingLevel };
+  }
+
+  #recordAdmission(identity: PiNativeAdmittedIdentity): void {
+    this.#identity = identity;
+    if (identity.diagnostic && !this.#thinkingLoweringReported) {
+      this.#thinkingLoweringReported = true;
+      const { requested, effective } = identity.diagnostic;
+      this.#emit("harness.diagnostic", { ...identity.diagnostic, message: `pi_thinking_lowered_by_config ${JSON.stringify({ requested, effective })}` });
+    }
+  }
+
   async #admit(signal?: AbortSignal): Promise<void> {
     if (this.#closed) throw new Error("Pi RPC session is closed");
     if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
@@ -473,6 +493,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
       if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
       if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
+      this.#recordAdmission(identity);
       this.#admitted = true;
     } catch (error) {
       if (this.#resident) await this.#fenceFailure(error);
@@ -549,7 +570,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, failed: false, settled: false };
       this.#activeTurn = turn;
       this.#streamTurn = null;
-      this.#emit("turn.started", { status: "inProgress" }, turn);
+      this.#emit("turn.started", { status: "inProgress", context: this.#effectiveContext() }, turn);
       try {
         // Host authority is independent from extension authority and activated
         // only by this host prompt, never attach/bind or callback arrival.
@@ -684,7 +705,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     return this.#transport.exited;
   }
 
-  async snapshot(): Promise<PersistedHarnessSession & { sessionFile: string; binding?: { epoch: number; socketPath: string; preparedTurnId: string | null } }> {
+  async snapshot(): Promise<PersistedHarnessSession & { sessionFile: string; piRpcThinkingLevel?: PiNativeThinkingLevel; binding?: { epoch: number; socketPath: string; preparedTurnId: string | null } }> {
     return {
       driverKind: "pi_rpc",
       driverSessionId: this.#providerSessionId,
@@ -695,6 +716,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       lastSourceSequence: this.#sourceSequence,
       workingDirectory: this.#workingDirectory,
       sessionFile: this.#sessionFile,
+      piRpcThinkingLevel: this.#identity.piRpcThinkingLevel,
       ...(this.#resident ? { binding: { epoch: this.#resident.epoch, socketPath: this.#resident.socketPath, preparedTurnId: this.#resident.binding?.origin.turnId ?? null } } : {}),
     };
   }

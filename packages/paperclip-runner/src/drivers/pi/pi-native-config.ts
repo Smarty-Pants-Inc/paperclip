@@ -4,6 +4,16 @@ import type { HarnessDriverConfigValidation } from "../../contracts/harness-driv
 export const PI_NATIVE_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export const PI_RPC_THINKING_KEY = "piRpcThinkingLevel" as const;
 export type PiNativeThinkingLevel = typeof PI_NATIVE_THINKING_LEVELS[number];
+/** Pi owns capability/config lowering; the host only forbids an escalation. */
+export function isPiThinkingLevelAtMost(effective: unknown, requested: PiNativeThinkingLevel): effective is PiNativeThinkingLevel {
+  const index = PI_NATIVE_THINKING_LEVELS.indexOf(effective as PiNativeThinkingLevel);
+  return index >= 0 && index <= PI_NATIVE_THINKING_LEVELS.indexOf(requested);
+}
+export interface PiThinkingLoweredDiagnostic {
+  code: "pi_thinking_lowered_by_config";
+  requested: PiNativeThinkingLevel;
+  effective: PiNativeThinkingLevel;
+}
 export interface PiNativeConfig {
   provider: "pi_rpc";
   model: string;
@@ -43,7 +53,10 @@ export interface PiRpcAdmissionPort {
 export interface PiNativeAdmittedIdentity {
   model: string;
   providerSessionId: string;
+  /** Authoritative effective effort, not the configured request. */
   piRpcThinkingLevel?: PiNativeThinkingLevel;
+  /** At most one bounded diagnostic, emitted once by the session owner. */
+  diagnostic?: PiThinkingLoweredDiagnostic;
 }
 /**
  * Invoke on create/load/reconnect AND run.attach AND after claim, before prompt.
@@ -64,14 +77,21 @@ export async function admitPiRpcSession(port: PiRpcAdmissionPort, input: PiNativ
   const provider = config.model.slice(0, slash), modelId = config.model.slice(slash + 1);
   const matchingModel = (value: unknown) => record(value).provider === provider && record(value).id === modelId;
   if (!matchingModel(await request({ type: "set_model", provider, modelId }))) throw new PiNativeAdmissionError("pi_model_mismatch", "Pi did not acknowledge the exact selected model; no prompt was sent.");
+  let available: PiNativeThinkingLevel[] | undefined;
   if (config.piRpcThinkingLevel !== undefined) {
-    const available = record(await request({ type: "get_available_thinking_levels" })).levels;
-    if (!Array.isArray(available) || available.length > 7 || !available.every(level => PI_NATIVE_THINKING_LEVELS.includes(level)) || !available.includes(config.piRpcThinkingLevel)) throw new PiNativeAdmissionError("pi_thinking_unsupported", "Pi selected model does not support the requested thinking level; no prompt was sent.");
+    const levels = record(await request({ type: "get_available_thinking_levels" })).levels;
+    if (!Array.isArray(levels) || !levels.length || levels.length > PI_NATIVE_THINKING_LEVELS.length || !levels.every(level => PI_NATIVE_THINKING_LEVELS.includes(level))) throw new PiNativeAdmissionError("pi_thinking_unsupported", "Pi selected model did not report valid available thinking levels; no prompt was sent.");
+    available = levels;
+    // A valid request need not itself be available: Pi applies its own config.
     await request({ type: "set_thinking_level", level: config.piRpcThinkingLevel });
   }
   const state = record(await request({ type: "get_state" })); idle(state);
   if (!matchingModel(state.model)) throw new PiNativeAdmissionError("pi_model_mismatch", "Pi effective model differs from the selection; no prompt was sent.");
-  if (config.piRpcThinkingLevel !== undefined && state.thinkingLevel !== config.piRpcThinkingLevel) throw new PiNativeAdmissionError("pi_thinking_mismatch", "Pi cannot honor the selected thinking level; no prompt was sent.");
+  const effective = state.thinkingLevel;
+  if (config.piRpcThinkingLevel !== undefined && (!isPiThinkingLevelAtMost(effective, config.piRpcThinkingLevel) || !available!.includes(effective))) throw new PiNativeAdmissionError("pi_thinking_mismatch", "Pi effective thinking level is missing, unavailable, or higher than requested; no prompt was sent.");
   if (typeof state.sessionId !== "string" || !state.sessionId.trim() || state.sessionId.length > 1024 || (before.sessionId !== undefined && before.sessionId !== state.sessionId)) throw new PiNativeAdmissionError("pi_session_identity_missing", "Pi native session identity is missing or changed during admission; no prompt was sent.");
-  return { model: config.model, providerSessionId: state.sessionId, ...(config.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: config.piRpcThinkingLevel }) };
+  return { model: config.model, providerSessionId: state.sessionId, ...(config.piRpcThinkingLevel === undefined ? {} : {
+    piRpcThinkingLevel: effective as PiNativeThinkingLevel,
+    ...(effective === config.piRpcThinkingLevel ? {} : { diagnostic: { code: "pi_thinking_lowered_by_config" as const, requested: config.piRpcThinkingLevel, effective: effective as PiNativeThinkingLevel } }),
+  }) };
 }

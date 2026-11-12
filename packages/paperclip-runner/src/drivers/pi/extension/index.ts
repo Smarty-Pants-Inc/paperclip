@@ -4,6 +4,7 @@ import { chmod, lstat, realpath, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, resolve } from "node:path";
 import { piManagedModelRegistration } from "../pi-managed-model.js";
+import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -221,7 +222,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
       if (!model || !await deadline(() => pi.setModel!(model))) throw new Error(PI_BIND_ERROR);
     } else if (ctx?.model?.provider !== provider.name || ctx.model.id !== id) throw new Error(PI_BIND_ERROR);
     pi.setThinkingLevel?.(candidate.thinkingLevel);
-    if (pi.getThinkingLevel && pi.getThinkingLevel() !== candidate.thinkingLevel) throw new Error(PI_BIND_ERROR);
+    if (pi.getThinkingLevel && !isPiThinkingLevelAtMost(pi.getThinkingLevel(), candidate.thinkingLevel)) throw new Error(PI_BIND_ERROR);
   }
   async function parkReady(): Promise<ParkReadyResult> {
     const reasons: string[] = [];
@@ -366,7 +367,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     // Do NOT acquire current authority here. Consume only the immutable input-admitted snapshot.
     if (!admitted || !authority.accept(admitted) || running || closed || failed
       || `${context.model?.provider}/${context.model?.id}` !== config.model
-      || (pi.getThinkingLevel && pi.getThinkingLevel() !== config.thinkingLevel)) {
+      || (pi.getThinkingLevel && !isPiThinkingLevelAtMost(pi.getThinkingLevel(), config.thinkingLevel))) {
       fence(); context.abort(); throw new Error("Pi turn authority refused");
     }
     running = admitted; admitted = null;
