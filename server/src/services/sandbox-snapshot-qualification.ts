@@ -12,7 +12,7 @@ export function usesManagedCloudSandboxImage(environment: Environment, template:
 }
 
 export type SandboxSnapshotIdentity = {
-  provider: "daytona";
+  provider: string;
   requestedRef: string;
   id: string;
   name: string;
@@ -20,11 +20,13 @@ export type SandboxSnapshotIdentity = {
   createdAt: string;
 };
 
-export function readSnapshotIdentity(value: unknown, reference: unknown): SandboxSnapshotIdentity | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+export function readSnapshotIdentity(value: unknown, reference: unknown, provider: string): SandboxSnapshotIdentity | null {
+  if (!provider.trim() || !value || typeof value !== "object" || Array.isArray(value)) return null;
   const identity = value as Record<string, unknown>;
-  if (identity.provider !== "daytona" || identity.requestedRef !== reference
-    || typeof identity.id !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(identity.id)
+  if (identity.provider !== provider || identity.requestedRef !== reference
+    || typeof identity.id !== "string" || (provider === "daytona"
+      ? !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(identity.id)
+      : !identity.id.length || identity.id.length > 256 || /\s/.test(identity.id))
     || typeof identity.name !== "string" || !identity.name.trim()
     || (reference !== identity.id && reference !== identity.name)
     || typeof identity.organizationId !== "string" || !identity.organizationId.trim()
@@ -32,14 +34,18 @@ export function readSnapshotIdentity(value: unknown, reference: unknown): Sandbo
   return identity as SandboxSnapshotIdentity;
 }
 
-export function isQualifiableDaytonaSnapshot(
+export function isQualifiableSandboxSnapshot(
   input: SandboxEnvironmentConfig, template: SandboxTemplateIdentity,
 ): input is SandboxEnvironmentConfig & Record<string, unknown> & { snapshot: string } {
   const config = input as unknown as Record<string, unknown>;
-  return config.provider === "daytona" && typeof config.snapshot === "string" && !!config.snapshot.trim()
+  return typeof config.provider === "string" && !!config.provider.trim()
+    && typeof config.snapshot === "string" && !!config.snapshot.trim()
     && !config.image && !config.template && !config.templateRef
     && (!template || (template.templateKind === "snapshot" && template.bindingField === "snapshot"));
 }
+
+/** @deprecated Use isQualifiableSandboxSnapshot. */
+export const isQualifiableDaytonaSnapshot = isQualifiableSandboxSnapshot;
 
 /** Keep an invalidated snapshot binding distinct from an environment that has
  * never required an immutable qualification. A failed probe cannot unpin a run.
@@ -59,7 +65,7 @@ export function hasSandboxSnapshotQualification(environment: Environment, compan
 export function qualifiedSandboxSnapshotId(
   environment: Environment, companyId: string, config: SandboxEnvironmentConfig, template: SandboxTemplateIdentity,
 ): string | null {
-  if (!isQualifiableDaytonaSnapshot(config, template)) return null;
+  if (!isQualifiableSandboxSnapshot(config, template)) return null;
   const proofs = environment.metadata?.[SANDBOX_PLATFORM_PROBE_METADATA_KEY];
   if (!proofs || typeof proofs !== "object" || Array.isArray(proofs)) return null;
   const proof = (proofs as Record<string, unknown>)[companyId];
@@ -69,5 +75,5 @@ export function qualifiedSandboxSnapshotId(
     || value.baseConfigFingerprint !== fingerprintEnvironmentSandboxProviderConfig(environment.config as SandboxEnvironmentConfig)
     || value.runtimeConfigFingerprint !== fingerprintEnvironmentSandboxProviderConfig(config)
     || value.snapshot !== config.snapshot || JSON.stringify(value.template) !== JSON.stringify(template)) return null;
-  return readSnapshotIdentity(value.snapshotIdentity, config.snapshot)?.id ?? null;
+  return readSnapshotIdentity(value.snapshotIdentity, config.snapshot, config.provider)?.id ?? null;
 }

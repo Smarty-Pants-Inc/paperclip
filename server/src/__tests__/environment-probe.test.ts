@@ -52,6 +52,85 @@ describe("probeEnvironment", () => {
     mockEnvironmentRuntimeService.mockClear();
   });
 
+  it("qualifies a Boat plugin snapshot through acquisition metadata, measurement and owned cleanup", async () => {
+    const environment = { id: "env", driver: "sandbox", status: "active", config: { provider: "boat", snapshot: "daily-work-snapshot", reuseLease: false }, metadata: null } as any;
+    const identity = { provider: "boat", requestedRef: environment.config.snapshot, id: "snap_01JBOAT-immutable:42", name: environment.config.snapshot, organizationId: "boat-account/project", createdAt: "2026-11-12T05:00:00.000Z" };
+    const now = new Date();
+    const lease = { id: "lease", companyId: "company", environmentId: environment.id,
+      executionWorkspaceId: null, issueId: null, heartbeatRunId: null,
+      status: "active", leasePolicy: "ephemeral", provider: "boat", providerLeaseId: "boat-allocation-42",
+      acquiredAt: now, lastUsedAt: now, expiresAt: null, releasedAt: null,
+      failureReason: null, cleanupStatus: "pending", createdAt: now, updatedAt: now,
+      metadata: { provider: "boat", sandboxProviderPlugin: true, pluginId: "boat-plugin", pluginKey: "boat.sandbox-provider",
+        snapshot: environment.config.snapshot, snapshotIdentity: identity, sandboxName: "boat-probe", remoteCwd: "/workspace", reuseLease: false } };
+    const workerManager = {} as any;
+    vi.spyOn(configRuntime, "resolveEnvironmentDriverConfigForRuntime").mockResolvedValue({ driver: "sandbox", config: environment.config });
+    mockRuntimeAcquireRunLease.mockResolvedValue({ environment, leaseContext: { executionWorkspaceId: null, executionWorkspaceMode: null }, lease });
+    mockRuntimeExecute.mockResolvedValue({ exitCode: 0, stdout: "Linux\nx86_64\nglibc\nglibc 2.39\n" });
+    const result = await probeEnvironment({} as any, environment, { companyId: "company", pluginWorkerManager: workerManager, acquireSandboxRuntimeLease: true, assertCompanyBinding: true });
+    expect(result).toMatchObject({ ok: true, details: { provider: "boat", platformQualificationRecorded: true } });
+    expect(mockEnvironmentRuntimeService).toHaveBeenCalledWith(expect.anything(), { pluginWorkerManager: workerManager });
+    expect(mockRuntimeAcquireRunLease).toHaveBeenCalledWith(expect.objectContaining({ resolveSnapshotIdentity: true, assertCompanyBinding: true,
+      environment: expect.objectContaining({ config: { ...environment.config, reuseLease: false, archiveOnRelease: true } }) }));
+    expect(mockRuntimeExecute).toHaveBeenCalledWith(expect.objectContaining({ lease, command: "sh", args: ["-c", SANDBOX_PLATFORM_PROBE_COMMAND], bypassSession: true }));
+    expect(mockRuntimeReleaseRunLease).toHaveBeenCalledWith(expect.objectContaining({ lease, status: "released" }));
+    const proof = mockRecordPlatformProbe.mock.calls[1]![0].proof;
+    expect(proof).toMatchObject({ v: 2, companyId: "company", snapshot: environment.config.snapshot, snapshotIdentity: identity,
+      facts: { platform: "linux", architecture: "x64", libc: "glibc", glibcVersion: "glibc 2.39" } });
+    expect(proof).not.toHaveProperty("qualifiedSnapshotId");
+    environment.metadata = { [SANDBOX_PLATFORM_PROBE_METADATA_KEY]: { company: proof } };
+    expect(await readSandboxPlatformQualification({} as any, environment, "company")).toEqual(proof.facts);
+    expect(await readSandboxPlatformQualification({} as any, environment, "foreign-company")).toBeNull();
+    expect(await readSandboxPlatformQualification({} as any, { ...environment, config: { ...environment.config, target: "another-cluster" } }, "company")).toBeNull();
+    expect(mockRuntimeAcquireRunLease).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["boat", "other-provider"], ["boat", "Boat"], ["boat", undefined], ["boat", null], ["daytona", "boat"], ["daytona", undefined],
+  ])("does not qualify selected provider %s with lease provider %s", async (provider, leaseProvider) => {
+    const environment = { id: "env", driver: "sandbox", status: "active", config: { provider, snapshot: "managed-snapshot" } } as any;
+    const identity = { provider, requestedRef: "managed-snapshot", id: provider === "daytona" ? "a6b9e7d0-f886-471a-b461-640dd03e8d0f" : "snap_boat-42",
+      name: "managed-snapshot", organizationId: "provider-account", createdAt: "2026-10-07T23:19:57.133Z" };
+    vi.spyOn(configRuntime, "resolveEnvironmentDriverConfigForRuntime").mockResolvedValue({ driver: "sandbox", config: environment.config });
+    mockRuntimeAcquireRunLease.mockResolvedValue({ lease: { id: "lease", provider: leaseProvider, metadata: { snapshot: "managed-snapshot", snapshotIdentity: identity } } });
+    mockRuntimeExecute.mockResolvedValue({ exitCode: 0, stdout: "Linux\nx86_64\nglibc\nglibc 2.39\n" });
+    const result = await probeEnvironment({} as any, environment, { companyId: "company", acquireSandboxRuntimeLease: true });
+    expect(result.ok).toBe(true);
+    expect(result.details?.platformQualificationRecorded).toBe(false);
+    expect(mockRuntimeExecute).not.toHaveBeenCalled();
+    expect(mockRecordPlatformProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["identity-provider", "reference", "owner", "date", "id", "competing-image", "measurement", "cleanup", "config-race"])("does not qualify a Boat snapshot after %s failure", async failure => {
+    const environment = { id: "env", driver: "sandbox", status: "active", config: { provider: "boat", snapshot: "daily-work-snapshot",
+      ...(failure === "competing-image" ? { image: `registry.example.test/runtime@sha256:${"a".repeat(64)}` } : {}) } } as any;
+    const identity = { provider: failure === "identity-provider" ? "other-provider" : "boat",
+      requestedRef: failure === "reference" ? "other-snapshot" : environment.config.snapshot,
+      id: failure === "id" ? "snap with-space" : "snap_boat-42", name: environment.config.snapshot,
+      organizationId: failure === "owner" ? "" : "boat-account", createdAt: failure === "date" ? "bad-date" : "2026-11-12T05:00:00.000Z" };
+    vi.spyOn(configRuntime, "resolveEnvironmentDriverConfigForRuntime").mockResolvedValue({ driver: "sandbox", config: environment.config });
+    mockRuntimeAcquireRunLease.mockResolvedValue({ lease: { id: "lease", provider: "boat", metadata: { snapshot: environment.config.snapshot, snapshotIdentity: identity } } });
+    mockRuntimeExecute.mockResolvedValue({ exitCode: failure === "measurement" ? 1 : 0, stdout: "Linux\nx86_64\nglibc\nglibc 2.39\n" });
+    if (failure === "cleanup") mockRuntimeReleaseRunLease.mockResolvedValue({ id: "lease", companyId: "company", environmentId: "env", status: "released", cleanupStatus: "failed" });
+    if (failure === "config-race") mockRecordPlatformProbe.mockResolvedValue(false);
+    const result = await probeEnvironment({} as any, environment, { companyId: "company", acquireSandboxRuntimeLease: true });
+    expect(result.ok).toBe(true);
+    expect(result.details?.platformQualificationRecorded).toBe(false);
+    expect(mockRecordPlatformProbe.mock.calls[0]![0].proof).toBeNull();
+    if (failure !== "config-race") expect(mockRecordPlatformProbe).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the non-Daytona immutable OCI image qualification route", async () => {
+    const image = `registry.example.test/runtime@sha256:${"a".repeat(64)}`;
+    const environment = { id: "env", driver: "sandbox", status: "active", config: { provider: "boat", image }, metadata: null } as any;
+    vi.spyOn(configRuntime, "resolveEnvironmentDriverConfigForRuntime").mockResolvedValue({ driver: "sandbox", config: environment.config });
+    mockRuntimeAcquireRunLease.mockResolvedValue({ lease: { id: "lease", provider: "boat", metadata: { image } } });
+    mockRuntimeExecute.mockResolvedValue({ exitCode: 0, stdout: "Linux\nx86_64\nglibc\nglibc 2.39\n" });
+    const result = await probeEnvironment({} as any, environment, { companyId: "company", acquireSandboxRuntimeLease: true });
+    expect(result.details?.platformQualificationRecorded).toBe(true);
+    expect(mockRecordPlatformProbe.mock.calls[1]![0].proof).toMatchObject({ v: 1, image });
+  });
+
   it("qualifies a named Daytona snapshot only after an ID-pinned lease and owned cleanup", async () => {
     const environment = { id: "env", driver: "sandbox", status: "active", config: { provider: "daytona", snapshot: "managed-snapshot" }, metadata: null } as any;
     const identity = { provider: "daytona", requestedRef: "managed-snapshot", id: "a6b9e7d0-f886-471a-b461-640dd03e8d0f", name: "managed-snapshot", organizationId: "provider-account", createdAt: "2026-10-07T23:19:57.133Z" };

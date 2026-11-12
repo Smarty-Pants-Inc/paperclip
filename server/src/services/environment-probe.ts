@@ -14,7 +14,7 @@ import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentService } from "./environments.js";
 import { fingerprintEnvironmentSandboxProviderConfig, SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "./environment-custom-image-runtime.js";
 import type { SandboxEnvironmentConfig } from "@paperclipai/shared";
-import { isQualifiableDaytonaSnapshot, qualifiedSandboxSnapshotId, readSnapshotIdentity, type SandboxTemplateIdentity } from "./sandbox-snapshot-qualification.js";
+import { isQualifiableSandboxSnapshot, qualifiedSandboxSnapshotId, readSnapshotIdentity, type SandboxTemplateIdentity } from "./sandbox-snapshot-qualification.js";
 
 export const SANDBOX_PLATFORM_PROBE_COMMAND = "uname -s; uname -m; if version=$(getconf GNU_LIBC_VERSION 2>/dev/null) && [ -n \"$version\" ]; then printf 'glibc\\n%s\\n' \"$version\"; else case \"$(ldd --version 2>&1)\" in *musl*) printf 'musl\\n' ;; *) printf 'unknown\\n' ;; esac; fi";
 type PlatformFacts = { platform: string; architecture: string; libc: "glibc" | "musl" | "unknown"; glibcVersion?: string };
@@ -44,7 +44,7 @@ export async function sandboxBinding(db: Db, environment: Environment, companyId
   if (parsed.driver !== "sandbox") return null;
   const image = parsed.config.image;
   const template = selectedTemplate.value;
-  if (isQualifiableDaytonaSnapshot(parsed.config, template)) {
+  if (isQualifiableSandboxSnapshot(parsed.config, template)) {
     return { baseConfigFingerprint: fingerprint(environment.config), runtimeConfigFingerprint: fingerprint(parsed.config),
       snapshot: parsed.config.snapshot, template, qualifiedSnapshotId: qualifiedSandboxSnapshotId(environment, companyId, parsed.config, template) };
   }
@@ -160,13 +160,13 @@ export async function probeEnvironment(
           : null;
         details = { provider, providerLeaseId: leaseRecord.lease.providerLeaseId, leaseId: leaseRecord.lease.id,
           leasePolicy: leaseRecord.lease.leasePolicy, metadata, platformQualificationRecorded: false,
-          platformQualificationDiagnostic: "Platform qualification requires an immutable OCI image or a Daytona snapshot with a verified provider ID. Update the provider plugin and probe again, or select Legacy runner." };
+          platformQualificationDiagnostic: "Platform qualification requires an immutable OCI image or a snapshot with a verified provider ID. Update the provider plugin and probe again, or select Legacy runner." };
         if ((isImmutableImage(metadata.image) && !metadata.snapshot) || metadata.snapshotIdentity) {
           try {
             const binding = await sandboxBinding(db, environment, resolvedCompanyId);
-            const snapshotIdentity = binding && "snapshot" in binding ? readSnapshotIdentity(metadata.snapshotIdentity, binding.snapshot) : null;
+            const snapshotIdentity = binding && "snapshot" in binding ? readSnapshotIdentity(metadata.snapshotIdentity, binding.snapshot, parsed.config.provider) : null;
             if (binding && (("image" in binding && metadata.image === binding.image && !metadata.snapshot)
-              || (snapshotIdentity && metadata.snapshot === binding.snapshot && provider === "daytona"))) {
+              || (snapshotIdentity && metadata.snapshot === binding.snapshot && leaseRecord.lease.provider === parsed.config.provider))) {
               const platform = await runtime.execute({ environment: probeEnvironmentConfig, lease: leaseRecord.lease,
                 command: "sh", args: ["-c", SANDBOX_PLATFORM_PROBE_COMMAND],
                 bypassSession: true, timeoutMs: 10_000, commandTimeoutMs: 10_000 });

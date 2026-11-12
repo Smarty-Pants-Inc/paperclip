@@ -47,6 +47,42 @@ lifecycle calls. Providers must still enforce their operation timeouts and
 report uncertain allocations for cleanup. A bundled plugin must bump its
 manifest version when adding the field so existing installations receive it.
 
+## Snapshot identity for qualification
+
+An explicit platform probe requests `resolveSnapshotIdentity: true` during lease
+acquisition. A provider that boots from `config.snapshot` returns the resolved
+identity in `lease.metadata.snapshotIdentity`:
+
+```ts
+snapshotIdentity: {
+  provider: "my-provider",              // exactly config.provider
+  requestedRef: "runner-snapshot",       // exactly config.snapshot
+  id: "snap_01JEXAMPLE",                 // immutable provider snapshot ID
+  name: "runner-snapshot",
+  organizationId: "provider-account",    // provider account or namespace
+  createdAt: "2026-11-12T00:00:00.000Z",
+}
+```
+
+The lease provider and identity provider must both exactly match the selected
+provider. `requestedRef` must equal either `id` or `name`. The ID must be nonempty,
+contain no whitespace, and be at most 256 characters. Daytona retains its existing
+UUID ID requirement. `name` and `organizationId` must be nonempty, and `createdAt`
+must be a valid ISO date. The lease metadata also returns `snapshot` equal to the
+requested snapshot reference.
+
+Resolve the reference and boot from that immutable ID, not a later name lookup.
+After qualification, the host supplies the saved ID as `config.snapshot` for
+native execution. A missing ID must fail rather than fall back to a replacement
+with the same name.
+
+Snapshot qualification requires a nonempty provider and snapshot, no competing
+`image`, `template` or `templateRef`, and either no captured template or a snapshot
+template bound to `snapshot`. The host records company- and configuration-bound
+platform proof only after measurement and verified owned lease cleanup. This
+handshake does not grant other sandbox capabilities or replace the separate
+immutable OCI image qualification path.
+
 ## How the host resolves an effective capability
 
 The host never trusts a declaration alone. For every run it resolves each
