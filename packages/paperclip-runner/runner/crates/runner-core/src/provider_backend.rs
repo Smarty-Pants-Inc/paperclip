@@ -56,6 +56,9 @@ const MAX_QUEUED_PROVIDER_EVENTS: usize =
 const MAX_RECEIPT_LIMIT_INTERRUPT_ATTEMPTS: u8 = 3;
 const RECEIPT_LIMIT_INTERRUPT_TERMINAL_DEADLINE_MS: u64 = 2_000;
 const RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS: u64 = 30_000;
+// The same bounded settlement window used after an accepted interruption.
+// A Pi provider terminal is already observed; only controller results remain.
+const PI_DEFERRED_TERMINAL_DEADLINE_MS: u64 = RECEIPT_LIMIT_ACCEPTED_TERMINAL_DEADLINE_MS;
 const GENERIC_INVALID_TOOL_CALL_MESSAGE: &str = "Paperclip rejected this semantic tool call";
 
 fn invalid_tool_call_result(
@@ -702,6 +705,25 @@ fn normalize_provider_notification(
     method: &str,
     params: &Value,
 ) -> Result<Vec<NormalizedProviderEvent>, DurableRunnerError> {
+    if state.config.provider == "pi_rpc"
+        && method == "warning"
+        && params.get("code").and_then(Value::as_str) == Some("pi_stdout_frame_rejected")
+    {
+        return Ok(vec![NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "pi_rpc",
+                "code": "pi_stdout_frame_rejected",
+                "severity": "warning",
+                "message": params.get("message").and_then(Value::as_str)
+                    .unwrap_or("Dropped an unattributable Pi stdout frame")
+                    .chars().take(4_000).collect::<String>(),
+                "attribution": "unknown",
+                "dropped": true,
+            }),
+        }]);
+    }
     if state.config.provider == "codex" && method == "account/rateLimits/updated" {
         // Account-scoped and sparse: merge into the last snapshot and report
         // only a changed one, so repeated identical updates stay out of the log.
@@ -1361,10 +1383,14 @@ struct CodexProviderState {
     active_terminal_tool_rejected: bool,
     // A Pi client waiter can expire before the dispatched operation settles.
     // Retain its provider terminal fact across runner restarts, but do not
-    // finalize the run or invent a fallback result while an effect is pending.
+    // finalize the run as success or invent an operation result while an effect is pending.
     // Older journals have no deferred outcome and deserialize unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pi_deferred_terminal: Option<String>,
+    // Older journals without this field receive one bounded window on first
+    // maintenance, persisted before returning. Restart never renews that window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_deferred_terminal_deadline_unix_ms: Option<u64>,
     last_agent_message: Option<String>,
     #[serde(default)]
     goal_capability: Option<SessionGoalCapability>,
@@ -1459,6 +1485,7 @@ impl CodexProviderState {
             active_provider_result_disposition: None,
             active_terminal_tool_rejected: false,
             pi_deferred_terminal: None,
+            pi_deferred_terminal_deadline_unix_ms: None,
             last_agent_message: None,
             goal_capability: None,
             goal: None,
@@ -1755,6 +1782,9 @@ impl CodexProviderState {
                         || self.tool_bridge.pending_calls().next().is_none()
                         || self.active_provider_turn_id.is_some()
                 })
+            || self
+                .pi_deferred_terminal_deadline_unix_ms
+                .is_some_and(|deadline| deadline == 0 || self.pi_deferred_terminal.is_none())
             || (matches!(
                 self.lifecycle.as_str(),
                 "prepared" | "session_open" | "closed"
@@ -1922,23 +1952,30 @@ impl CodexProviderState {
         &mut self,
         event_type: &str,
         outcome: Vec<NormalizedProviderEvent>,
-    ) -> Vec<NormalizedProviderEvent> {
+    ) -> Result<Vec<NormalizedProviderEvent>, DurableRunnerError> {
         if self.config.provider == "pi_rpc"
             && self.tool_bridge.turn_closed()
             && self.tool_bridge.pending_calls().next().is_some()
         {
             // The provider terminal closes delivery, not the operation's
-            // authority. Only its correlated controller result settles that.
+            // authority. Wait for the correlated controller result, but bound
+            // that wait independently of a healthy, now-idle Pi process.
+            if self.pi_deferred_terminal_deadline_unix_ms.is_none() {
+                self.pi_deferred_terminal_deadline_unix_ms = Some(receipt_limit_deadline_after(
+                    PI_DEFERRED_TERMINAL_DEADLINE_MS,
+                )?);
+            }
             self.pi_deferred_terminal = Some(event_type.to_owned());
-            Vec::new()
+            Ok(Vec::new())
         } else {
-            outcome
+            Ok(outcome)
         }
     }
 
     fn settle_deferred_pi_terminal(&mut self) -> Result<(), DurableRunnerError> {
         if self.tool_bridge.pending_calls().next().is_none() {
             if let Some(event_type) = self.pi_deferred_terminal.take() {
+                self.pi_deferred_terminal_deadline_unix_ms = None;
                 let outcome = terminal_events(self, &event_type, None);
                 self.extend_terminal_events(outcome)?;
             }
@@ -3114,7 +3151,7 @@ impl CodexCommandExecutor {
                             "turn.completed",
                             state.goal.as_ref().map(|goal| goal.status.as_str()),
                         );
-                        let outcome = state.defer_pi_terminal_outcome("turn.completed", outcome);
+                        let outcome = state.defer_pi_terminal_outcome("turn.completed", outcome)?;
                         state.extend_terminal_events(outcome)?;
                     } else {
                         // A turn that disappeared while runnerd was offline has no
@@ -3149,7 +3186,7 @@ impl CodexCommandExecutor {
                             // No provider result was observed. Preserve the lost
                             // turn as a fact, but leave the run open for the
                             // controller's bounded same-conversation recovery.
-                            state.defer_pi_terminal_outcome("turn.failed", Vec::new());
+                            state.defer_pi_terminal_outcome("turn.failed", Vec::new())?;
                             state.push_terminal_event(provider_terminal)?;
                         } else {
                             let outcome = terminal_events(
@@ -3157,7 +3194,8 @@ impl CodexCommandExecutor {
                                 "turn.failed",
                                 state.goal.as_ref().map(|goal| goal.status.as_str()),
                             );
-                            let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome);
+                            let outcome =
+                                state.defer_pi_terminal_outcome("turn.failed", outcome)?;
                             state.extend_terminal_events(with_terminal_outcome(
                                 vec![provider_terminal],
                                 outcome,
@@ -5037,7 +5075,7 @@ impl CodexCommandExecutor {
             }),
         };
         let terminal = terminal_events(state, terminal_event_type, None);
-        let terminal = state.defer_pi_terminal_outcome(terminal_event_type, terminal);
+        let terminal = state.defer_pi_terminal_outcome(terminal_event_type, terminal)?;
         state.extend_terminal_events(with_terminal_outcome(vec![provider_terminal], terminal))?;
         self.save_state()
     }
@@ -5450,6 +5488,82 @@ impl CodexCommandExecutor {
         })))
     }
 
+    fn maintain_deferred_pi_terminal(&mut self) -> Result<Option<u64>, DurableRunnerError> {
+        let Some(state) = self.state.as_ref().filter(|state| {
+            state.config.provider == "pi_rpc" && state.pi_deferred_terminal.is_some()
+        }) else {
+            return Ok(None);
+        };
+        let now = current_unix_ms()?;
+        let legacy = state.pi_deferred_terminal_deadline_unix_ms.is_none();
+        let deadline = match state.pi_deferred_terminal_deadline_unix_ms {
+            Some(deadline) => deadline,
+            None => now
+                .checked_add(PI_DEFERRED_TERMINAL_DEADLINE_MS)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("Pi deferred terminal deadline overflowed")
+                })?,
+        };
+        if now < deadline && !legacy {
+            return Ok(Some(deadline));
+        }
+        let mut next = state.clone();
+        next.pi_deferred_terminal_deadline_unix_ms = Some(deadline);
+        if now < deadline {
+            if legacy {
+                self.persist_state(&next)?;
+                self.state = Some(next);
+            }
+            return Ok(Some(deadline));
+        }
+        let abandoned = next
+            .tool_bridge
+            .abandon_closed_turn_pending_calls()
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to release expired Pi tool waiters: {error}"
+                ))
+            })?;
+        next.pi_deferred_terminal = None;
+        next.pi_deferred_terminal_deadline_unix_ms = None;
+        // Never synthesize semantic_tool.result or a completion claim: a timed
+        // out dispatcher may still commit its effect. The run requires review.
+        for call in abandoned {
+            next.push_terminal_event(NormalizedProviderEvent {
+                event_type: "harness.diagnostic".to_owned(),
+                priority: EventPriority::P0,
+                payload: json!({
+                    "provider": "pi_rpc", "code": "pi_deferred_terminal_timeout",
+                    "callId": call.call_id, "operationId": call.operation_id,
+                    "operationOutcome": "unknown", "retryable": false,
+                    "message": "Stopped waiting for a controller result after the Pi turn ended; the operation may have executed",
+                }),
+            })?;
+        }
+        next.push_terminal_event(NormalizedProviderEvent {
+            event_type: "session.failed".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "pi_rpc", "code": "pi_deferred_terminal_timeout",
+                "message": "Pi terminal settlement exceeded its bounded controller-result deadline",
+                "recoverable": true,
+            }),
+        })?;
+        next.push_terminal_event(NormalizedProviderEvent {
+            event_type: "run.terminal".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "schema": "paperclip.prp.terminal.v1", "provider": "pi_rpc",
+                "code": "pi_deferred_terminal_timeout",
+                "turnTerminalState": "failed", "runTerminalState": "failed",
+                "reportedWorkDisposition": "needs_review",
+            }),
+        })?;
+        self.persist_state(&next)?;
+        self.state = Some(next);
+        Ok(None)
+    }
+
     fn poll_provider(&mut self) -> Result<(), DurableRunnerError> {
         self.restore()?;
         // `restore_checked` records that the durable file was loaded even when
@@ -5468,6 +5582,7 @@ impl CodexCommandExecutor {
         &mut self,
         allow_control: bool,
     ) -> Result<(), DurableRunnerError> {
+        self.maintain_deferred_pi_terminal()?;
         // Receipt-limit interruption is autonomous recovery. It must advance
         // even while older durable events await acknowledgement, otherwise a
         // slow or disconnected controller can keep an exhausted provider turn
@@ -5581,7 +5696,7 @@ impl CodexCommandExecutor {
                             "message": diagnostic["message"], "error": diagnostic }),
                     };
                     let outcome = terminal_events(state, "turn.failed", None);
-                    let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome);
+                    let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome)?;
                     state.extend_terminal_events(with_terminal_outcome(
                         vec![provider_terminal],
                         outcome,
@@ -5878,7 +5993,7 @@ impl CodexCommandExecutor {
                     if let Some(ref event_type) = terminal_event_type {
                         let goal_status = state.goal.as_ref().map(|goal| goal.status.as_str());
                         let outcome = terminal_events(state, event_type, goal_status);
-                        let outcome = state.defer_pi_terminal_outcome(event_type, outcome);
+                        let outcome = state.defer_pi_terminal_outcome(event_type, outcome)?;
                         terminal_goal_events.extend(normalized);
                         state.extend_terminal_events(with_terminal_outcome(
                             terminal_goal_events,
@@ -6123,6 +6238,7 @@ impl CommandExecutor for CodexCommandExecutor {
         let outcome = (|| {
             self.save_before_provider_writes(false)?;
             self.restore()?;
+            self.maintain_deferred_pi_terminal()?;
             if self
                 .state
                 .as_ref()
@@ -6208,6 +6324,7 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn poll_disconnected_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        self.maintain_deferred_pi_terminal()?;
         // Only an already-admitted local Codex process can supply passive
         // output. Recovery, facades and cleanup retain their connected path.
         if self.provider.is_some()
@@ -6239,6 +6356,15 @@ impl CommandExecutor for CodexCommandExecutor {
     fn maintain_disconnected_provider(
         &mut self,
     ) -> Result<Option<std::time::Instant>, DurableRunnerError> {
+        if let Some(deadline) = self.maintain_deferred_pi_terminal()? {
+            let remaining = deadline.saturating_sub(current_unix_ms()?);
+            return std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(remaining))
+                .map(Some)
+                .ok_or_else(|| {
+                    DurableRunnerError::invalid("Pi terminal deadline is outside the local clock")
+                });
+        }
         // Local Codex ownership cannot prove termination of a remote facade.
         // Never restore a provider merely to service its cleanup deadline.
         if self.provider.is_none()
@@ -6284,6 +6410,7 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        self.maintain_deferred_pi_terminal()?;
         if self.state.as_ref().is_some_and(|state| {
             state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
         }) {
@@ -8277,6 +8404,165 @@ done
         }
     }
 
+    // Keep reason: B5's durable effect/terminal boundary. Advance the persisted
+    // deadline instead of sleeping; the provider has already ended this turn.
+    #[test]
+    fn pi_rpc_deferred_terminal_deadline_fails_and_unblocks_the_next_turn() {
+        for path in [
+            "connected",
+            "disconnected",
+            "backpressured",
+            "deadline-wake",
+        ] {
+            let directory = std::env::temp_dir().join(format!(
+                "paperclip-pi-terminal-deadline-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut state = tool_result_authority_state("pi_rpc", "paperclip_finish");
+            state
+                .admit_tool_call(
+                    "missing-result",
+                    "paperclip_finish",
+                    &valid_opencode_result(),
+                )
+                .unwrap();
+            state
+                .tool_bridge
+                .settle_turn("provider_turn_terminated")
+                .unwrap();
+            state.active_provider_turn_id = None;
+            state.lifecycle = "session_open".to_owned();
+            let mut saved = serde_json::to_value(&state).unwrap();
+            saved["piDeferredTerminal"] = json!("turn.completed");
+            // Test clock: this durable absolute deadline is already elapsed.
+            saved["piDeferredTerminalDeadlineUnixMs"] = json!(1);
+            let mut state: CodexProviderState = serde_json::from_value(saved).unwrap();
+            state.tool_bridge.attach_existing_run().unwrap();
+            state.validate().unwrap();
+            let mut executor = CodexCommandExecutor::new(&directory);
+            executor.state = Some(state);
+            match path {
+                "connected" => executor.poll_current_provider().unwrap(),
+                "disconnected" => {
+                    executor.poll_disconnected_events().unwrap();
+                }
+                "backpressured" => executor.maintain_backpressured_provider().unwrap(),
+                "deadline-wake" => {
+                    assert!(executor.maintain_disconnected_provider().unwrap().is_none());
+                }
+                _ => unreachable!(),
+            }
+            let state = executor.state.as_mut().unwrap();
+            let events: Vec<_> = state
+                .pending_events
+                .iter()
+                .chain(state.queued_events.iter())
+                .collect();
+            let terminal = events.iter().find(|event| event.event_type == "run.terminal")
+                .expect("an elapsed deferred Pi deadline must produce a terminal, even with no provider handle");
+            assert_eq!(terminal.payload["runTerminalState"], "failed");
+            assert_eq!(terminal.payload["turnTerminalState"], "failed");
+            assert_eq!(terminal.payload["code"], "pi_deferred_terminal_timeout");
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "session.failed"
+                    && event.payload["code"] == "pi_deferred_terminal_timeout"));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.event_type == "semantic_tool.result"),
+                "a deadline must not invent the outcome of a possibly executed effect"
+            );
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
+            let diagnostic = events
+                .iter()
+                .find(|event| {
+                    event.event_type == "harness.diagnostic"
+                        && event.payload["callId"] == "missing-result"
+                })
+                .unwrap();
+            assert_eq!(diagnostic.payload["operationOutcome"], "unknown");
+            state.validate().unwrap();
+            state
+                .tool_bridge
+                .prepare_turn()
+                .expect("the next turn must no longer be blocked");
+            assert!(
+                state
+                    .admit_tool_call(
+                        "missing-result",
+                        "paperclip_finish",
+                        &valid_opencode_result()
+                    )
+                    .is_err(),
+                "an expired call id remains tombstoned; timeout never authorizes duplicate effects"
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_rpc_deferred_terminal_deadline_is_bounded_for_legacy_journals() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-pi-terminal-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut state = tool_result_authority_state("pi_rpc", "get_task_context");
+        state
+            .admit_tool_call("missing-result", "get_task_context", &json!({}))
+            .unwrap();
+        state
+            .tool_bridge
+            .settle_turn("provider_turn_terminated")
+            .unwrap();
+        state.active_provider_turn_id = None;
+        state.lifecycle = "session_open".to_owned();
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved["piDeferredTerminal"] = json!("turn.failed");
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("piDeferredTerminalDeadlineUnixMs");
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(serde_json::from_value(saved).unwrap());
+        let before = current_unix_ms().unwrap();
+        executor.poll_current_provider_with_control(false).unwrap();
+        let saved: Value =
+            serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        let deadline = saved["piDeferredTerminalDeadlineUnixMs"]
+            .as_u64()
+            .expect("old deferred journals acquire a durable bounded deadline");
+        assert!(deadline >= before && deadline <= current_unix_ms().unwrap() + 30_000);
+        assert!(
+            executor.maintain_disconnected_provider().unwrap().is_some(),
+            "the existing host lifecycle receives the actual pending deadline"
+        );
+        executor.poll_current_provider_with_control(false).unwrap();
+        assert_eq!(
+            serde_json::to_value(executor.state.as_ref().unwrap()).unwrap()
+                ["piDeferredTerminalDeadlineUnixMs"],
+            deadline
+        );
+        assert!(executor
+            .state
+            .as_ref()
+            .unwrap()
+            .tool_bridge
+            .pending_calls()
+            .next()
+            .is_some());
+        assert!(!executor
+            .state
+            .as_ref()
+            .unwrap()
+            .pending_events
+            .iter()
+            .any(|event| event.event_type == "run.terminal"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn pi_rpc_deferred_terminal_waits_for_every_authoritative_result() {
         for provider in ["pi_rpc", "codex"] {
@@ -8296,7 +8582,9 @@ done
                     state.active_provider_turn_id = None;
                     state.lifecycle = "session_open".to_owned();
                     let outcome = terminal_events(&state, "turn.failed", None);
-                    let outcome = state.defer_pi_terminal_outcome("turn.failed", outcome);
+                    let outcome = state
+                        .defer_pi_terminal_outcome("turn.failed", outcome)
+                        .unwrap();
                     state.extend_terminal_events(outcome).unwrap();
                     let saved = serde_json::to_value(&state).unwrap();
                     let mut state: CodexProviderState = serde_json::from_value(saved).unwrap();
@@ -8959,6 +9247,7 @@ done
             active_provider_result_disposition: None,
             active_terminal_tool_rejected: false,
             pi_deferred_terminal: None,
+            pi_deferred_terminal_deadline_unix_ms: None,
             last_agent_message: None,
             goal_capability: None,
             goal: None,
