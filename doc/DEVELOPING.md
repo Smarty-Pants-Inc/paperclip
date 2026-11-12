@@ -5176,6 +5176,15 @@ uploaded over the retained execution. Remote collection and cleanup serialize
 through Postgres across controller homes. A missing remote collector retains a
 pending save instead of treating an empty local cache as the agent's files.
 
+Agent configuration writes refuse external instructions on a volume-free
+server. An agent's managed instruction paths are saved as absolute paths under
+the home of the server that wrote them, and each replacement server can have a
+new home. When a configuration change keeps the saved `instructionsFilePath`
+of a managed bundle, the bundle stays managed and its paths are rewritten under
+the current server's managed root. A change that sets a different
+`instructionsFilePath` is classified from that path and is still refused when
+it points outside the managed root.
+
 ## Cloud startup configuration
 
 Cloud stores nonsecret startup choices in a private PostgreSQL singleton.
