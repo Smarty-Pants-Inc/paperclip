@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
+import { piPerformanceEntrySpans } from "./pi-performance-diagnostics.js";
+import { PROVIDER_PERFORMANCE_DIAGNOSTIC } from "../../contracts/provider-performance.js";
 
 /** Driver-admitted ownership, captured once for the lifetime of a Runner turn. */
 export interface PiEventOrigin {
@@ -313,6 +315,16 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   return { project(value: unknown): PiProjectedEvent[] {
     pendingDiagnostics = [];
     const source = record(value);
+    // Custom entries may contain arbitrary opaque/private extension data. Never
+    // stringify them (even for a size/hash) or feed them to recursive redaction.
+    // Each request batch bypasses the generic 16-notice activity cap; equal
+    // milliseconds are distinct hook observations, not dedupe identities.
+    if (source.type === "entry_appended") {
+      const spans = piPerformanceEntrySpans(source.entry, Date.now());
+      return spans.length ? [{ ...origin, eventType: "harness.diagnostic",
+        payload: { code: PROVIDER_PERFORMANCE_DIAGNOSTIC, spans } }]
+        : diagnostic("entry_appended", "pi_native_activity");
+    }
     // These records carry redundant history, system prompts or binary results
     // which this projector never displays. In particular, agent_end is NOT
     // settlement; its full message list is already persisted by Pi.

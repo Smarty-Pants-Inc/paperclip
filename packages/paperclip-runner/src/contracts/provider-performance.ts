@@ -8,6 +8,7 @@ export const PROVIDER_PERFORMANCE_PHASES = [
   "provider.workspace.snapshot.track", "provider.workspace.snapshot.patch", "provider.workspace.snapshot.diff",
   "provider.workspace.git.discover", "provider.workspace.git.default_branch",
   "provider.dependencies.install", "provider.plugins.initialize",
+  "pi.request.sent",
 ] as const;
 export type ProviderPerformancePhase = typeof PROVIDER_PERFORMANCE_PHASES[number];
 export interface ProviderPerformanceSpan {
@@ -33,7 +34,8 @@ export function parseProviderPerformanceSpans(payload: unknown, observedAtMs: nu
     if (typeof name !== "string" || !names.has(name) || typeof startedAtMs !== "number" || typeof endedAtMs !== "number"
       || !Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs)
       || startedAtMs < observedAtMs - maxDurationMs || endedAtMs > observedAtMs + 1000
-      || endedAtMs < startedAtMs || endedAtMs - startedAtMs > maxDurationMs) return [];
+      || endedAtMs < startedAtMs || endedAtMs - startedAtMs > maxDurationMs
+      || (name === "pi.request.sent" && endedAtMs !== startedAtMs)) return [];
     const count = counts.get(name) ?? 0;
     if (count >= 16) return [];
     counts.set(name, count + 1);

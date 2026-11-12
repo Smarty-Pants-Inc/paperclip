@@ -12,6 +12,7 @@ import type {
   PersistedHarnessSession,
 } from "../contracts/harness-driver.js";
 import { HarnessStaleTurnError } from "../contracts/harness-driver.js";
+import { parseProviderPerformanceSpans, PROVIDER_PERFORMANCE_DIAGNOSTIC } from "../contracts/provider-performance.js";
 import { parsePiUserInput } from "../drivers/pi/pi-user-input.js";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
@@ -444,6 +445,13 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (event.turnId) turnFailures.delete(event.turnId);
         if (event.runId === activeRunId && event.turnId === activeTurnId) activeTurnId = null;
       } else if (event.eventType === "harness.diagnostic") {
+        if (payload.code === PROVIDER_PERFORMANCE_DIAGNOSTIC) {
+          const spans = parseProviderPerformanceSpans(payload, Date.now());
+          if (spans.length) send({ method: "paperclip/providerPerformance", params: {
+            threadId: opened.ids().driverSessionId, turnId: event.turnId, spans,
+          } });
+          continue;
+        }
         send({
           method: "warning",
           params: {

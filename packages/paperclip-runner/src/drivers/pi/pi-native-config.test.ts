@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { admitPiRpcSession, PI_NATIVE_THINKING_LEVELS, resolvePiNativeConfig, validatePiNativeConfig } from "./pi-native-config.js";
+import { admitPiRpcSession, validatePiRpcSession, PI_NATIVE_THINKING_LEVELS, resolvePiNativeConfig, validatePiNativeConfig } from "./pi-native-config.js";
 
 const config = { provider: "pi_rpc", model: "neutral/vendor/model-not-in-catalog", piRpcThinkingLevel: "high" };
 const model = { provider: "neutral", id: "vendor/model-not-in-catalog" };
@@ -59,5 +59,49 @@ describe("native Pi configuration and admission (playbook 6.1/6.2)", () => {
     await admitPiRpcSession(port, resolvePiNativeConfig(config));
     await expect(admitPiRpcSession(port, resolvePiNativeConfig(config))).rejects.toThrow("reconnect refused");
     expect(calls).toBe(6);
+  });
+});
+
+describe("read-only native Pi prepared admission", () => {
+  const selected = resolvePiNativeConfig({ ...config, piRpcThinkingLevel: "max" });
+  const admitted = { model: config.model, providerSessionId: state.sessionId, piRpcThinkingLevel: "xhigh" as const };
+  it("preserves the acknowledged effective lowering using only a fresh state read", async () => {
+    const commands: string[] = [];
+    await validatePiRpcSession({ request: async command => {
+      commands.push(command.type);
+      return { ...state, thinkingLevel: "xhigh" };
+    } }, selected, admitted);
+    expect(commands).toEqual(["get_state"]);
+    expect(admitted.piRpcThinkingLevel).toBe("xhigh");
+  });
+  it.each([
+    { ...state, sessionId: "another-native-session", thinkingLevel: "xhigh" },
+    { ...state, model: { ...model, id: "another-model" }, thinkingLevel: "xhigh" },
+    { ...state, thinkingLevel: "high" },
+    { ...state, thinkingLevel: "max" },
+  ])("refuses changed native identity or selection without repairing it", async changed => {
+    const commands: string[] = [];
+    await expect(validatePiRpcSession({ request: async command => { commands.push(command.type); return changed; } }, selected, admitted)).rejects.toThrow(/Pi.*(identity|model|thinking)/);
+    expect(commands).toEqual(["get_state"]);
+  });
+  it.each([
+    { isStreaming: true, isCompacting: false, pendingMessageCount: 0 },
+    { isStreaming: false, isCompacting: true, pendingMessageCount: 0 },
+    { isStreaming: false, isCompacting: false, pendingMessageCount: 1 },
+    { isStreaming: false, isCompacting: false, pendingMessageCount: undefined },
+  ])("requires authoritative idle state even with unchanged selection", async idle => {
+    const commands: string[] = [];
+    await expect(validatePiRpcSession({ request: async command => { commands.push(command.type); return { ...state, thinkingLevel: "xhigh", ...idle }; } }, selected, admitted)).rejects.toThrow(/state|busy/);
+    expect(commands).toEqual(["get_state"]);
+  });
+  it("cannot spend a prior acknowledgement for a different configured model", async () => {
+    const commands: string[] = [];
+    await expect(validatePiRpcSession({ request: async command => { commands.push(command.type); return state; } }, { ...selected, model: "neutral/changed" }, admitted)).rejects.toThrow(/model/);
+    expect(commands).toEqual([]);
+  });
+  it("propagates a failed state read rather than admitting or rewriting configuration", async () => {
+    const commands: string[] = [];
+    await expect(validatePiRpcSession({ request: async command => { commands.push(command.type); throw new Error("state unavailable"); } }, selected, admitted)).rejects.toThrow("state unavailable");
+    expect(commands).toEqual(["get_state"]);
   });
 });

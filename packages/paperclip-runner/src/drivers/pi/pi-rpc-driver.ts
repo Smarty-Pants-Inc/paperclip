@@ -18,7 +18,7 @@ import { piRpcUserInput } from "./pi-user-input.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { piTurnImageInput } from "./pi-turn-images.js";
 import { PiIdentityTombstones } from "./pi-identity-tombstones.js";
-import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
+import { admitPiRpcSession, validatePiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
 import type {
@@ -501,7 +501,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // same-run post-claim admission. Do not consume INITIAL or rotate twice.
         if (this.#resident.binding) {
           if (input.runId !== this.#runId || JSON.stringify(context) !== JSON.stringify(previous)) throw new Error("Pi prepared binding context cannot change before its turn");
-          await this.#admit(input.signal);
+          await this.#reusePreparedAdmission(input.signal);
         } else await this.#prepareBinding(input.runId, context, input.signal);
       } else {
         // Direct env/native providers retain their existing behavior. They do
@@ -523,7 +523,7 @@ export class PiRpcHarnessSession implements HarnessSession {
 
   /** Runner's post-claim hook; shared HarnessSession has no claim contract. */
   async revalidateAfterClaim(input: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.#serialize(() => this.#admit(input.signal));
+    return this.#serialize(() => this.#validatePreparedAdmission(input.signal));
   }
 
   /** Reconnected authority cannot spend a previous native acknowledgment. */
@@ -547,6 +547,42 @@ export class PiRpcHarnessSession implements HarnessSession {
       this.#thinkingLoweringReported = true;
       const { requested, effective } = identity.diagnostic;
       this.#emit("harness.diagnostic", { ...identity.diagnostic, message: `pi_thinking_lowered_by_config ${JSON.stringify({ requested, effective })}` });
+    }
+  }
+
+  /** The existing binding owns this proof; it cannot survive terminal revocation. */
+  async #reusePreparedAdmission(signal?: AbortSignal): Promise<void> {
+    if (this.#closed) throw new Error("Pi RPC session is closed");
+    if (this.#failure) throw this.#failure;
+    if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
+    try {
+      signal?.throwIfAborted();
+      const resident = this.#resident;
+      const binding = resident?.binding;
+      // The transport and native config are fixed for this process. Context is
+      // checked by attachRun; a new epoch always binds and fully admits first.
+      if (!this.#admitted || this.#transport.exited || !resident || !binding
+        || binding.origin.epoch !== resident.epoch || binding.origin.runId !== this.#runId
+        || this.#identity.providerSessionId !== this.#providerSessionId || this.#identity.model !== this.#config.model
+        || this.#identity.piRpcThinkingLevel === undefined) throw new Error("Pi RPC prepared binding requires fresh admission before input");
+    } catch (error) {
+      await this.#fenceFailure(error);
+      throw error;
+    }
+  }
+
+  async #validatePreparedAdmission(signal?: AbortSignal): Promise<void> {
+    if (!this.#resident?.binding) return this.#admit(signal);
+    await this.#reusePreparedAdmission(signal);
+    this.#admitted = false;
+    try {
+      await validatePiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, this.#identity, signal);
+      if (this.#closed || this.#failure || this.#transport.exited) throw this.#failure ?? new Error("Pi RPC session is closed");
+      this.#admitted = true;
+    } catch (error) {
+      // Drift is refusal/retirement, never a silent model or effort repair.
+      await this.#fenceFailure(error);
+      throw error;
     }
   }
 
@@ -640,12 +676,13 @@ export class PiRpcHarnessSession implements HarnessSession {
       // Every prompt, including direct-env and first hello, re-proves selection.
       // A failed attach/claim must still be recovered by an explicit admission;
       // startTurn may not silently revive a cancelled or rejected authority.
-      // The re-admission below also proves idle after handled input before
-      // replacing its discard gate with a new prompt owner.
+      // A prepared epoch needs a fresh read-only state proof, not another
+      // configuration write. A new binding still performs full admission.
+      // Both paths prove idle before replacing a handled input's discard gate.
       if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
       else {
         if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
-        await this.#admit();
+        await this.#validatePreparedAdmission();
       }
       const binding = this.#resident?.binding;
       const origin = binding?.origin ?? { runId: this.#runId, turnId: `pi-turn-${randomUUID()}` };

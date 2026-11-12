@@ -921,10 +921,12 @@ fn provider_performance_spans(params: &Value) -> Vec<Value> {
             | "provider.tools.resolve" | "provider.model.resolve" | "provider.model.stream"
             | "provider.workspace.snapshot.track" | "provider.workspace.snapshot.patch" | "provider.workspace.snapshot.diff"
             | "provider.workspace.git.discover" | "provider.workspace.git.default_branch"
-            | "provider.dependencies.install" | "provider.plugins.initialize") { return None; }
+            | "provider.dependencies.install" | "provider.plugins.initialize"
+            | "pi.request.sent") { return None; }
         let start = span.get("startedAtMs")?.as_f64()?;
         let end = span.get("endedAtMs")?.as_f64()?;
-        if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start || end - start > 86_400_000.0 { return None; }
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start || end - start > 86_400_000.0
+            || (name == "pi.request.sent" && end != start) { return None; }
         let count = counts.entry(name).or_default();
         if *count >= 16 { return None; }
         *count += 1;
@@ -2578,6 +2580,55 @@ mod tests {
                 {"name":"provider.model.stream","startedAtMs":10,"endedAtMs":1},
                 {"name":"provider.model.stream","startedAtMs":0,"endedAtMs":86400001}
             ]})
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn pi_request_sent_instant_is_closed_bounded_and_content_free() {
+        let instant = json!({"name":"pi.request.sent","startedAtMs":1234,"endedAtMs":1234,
+            "outcome":"ok","attributes":{"prompt":"private"},"runId":"forged"});
+        let events = normalize_pi_notification_in(
+            "paperclip/providerPerformance",
+            &json!({"threadId":"thread","turnId":"turn","spans":[instant.clone()]}),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "harness.diagnostic");
+        assert_eq!(events[0].priority, EventPriority::P1);
+        assert_eq!(
+            events[0].payload,
+            json!({"code":"provider_performance_spans","spans":[
+            {"name":"pi.request.sent","startedAtMs":1234.0,"endedAtMs":1234.0,"outcome":"ok"}]})
+        );
+        let bounded = normalize_pi_notification_in(
+            "paperclip/providerPerformance",
+            &json!({"spans":vec![instant.clone(); 200]}),
+            None,
+        );
+        assert_eq!(bounded[0].payload["spans"].as_array().unwrap().len(), 16);
+        // Per-batch caps do not merge distinct invocations in the same millisecond.
+        for _ in 0..24 {
+            assert_eq!(
+                normalize_pi_notification_in(
+                    "paperclip/providerPerformance",
+                    &json!({"spans":[instant.clone()]}),
+                    None
+                )
+                .len(),
+                1
+            );
+        }
+        assert!(normalize_pi_notification_in(
+            "paperclip/providerPerformance",
+            &json!({"spans":[
+                {"name":"pi.request.sent.extra","startedAtMs":1,"endedAtMs":1},
+                {"name":"pi.request.sent","startedAtMs":1,"endedAtMs":2},
+                {"name":"pi.request.sent","startedAtMs":2,"endedAtMs":1},
+                {"name":"pi.request.sent","startedAtMs":-1,"endedAtMs":-1},
+                {"name":"pi.request.sent","startedAtMs":"1","endedAtMs":1}
+            ]}),
+            None
         )
         .is_empty());
     }

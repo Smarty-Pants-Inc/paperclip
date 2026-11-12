@@ -11092,6 +11092,9 @@ async function executePaperclipNativeSessionAttempt(
     configDigest: nativeSessionConfigDigest(input.execution, input.runnerExecutionTarget?.kind ?? "local"),
     processConfigDigest: nativeProcessReuseKey(input) ?? null,
   };
+  // Snapshot provider admission with this observer, never a mutable reused
+  // execution holder or a provider/origin claim inside diagnostic payloads.
+  const observesPiRequests = input.execution.provider.kind === "pi_rpc";
   const controlPlane = new PaperclipControlPlanePort(
     input.db,
     {
@@ -11135,7 +11138,9 @@ async function executePaperclipNativeSessionAttempt(
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});
         }
         if (event.eventType === "harness.diagnostic") {
-          await recordNativeProviderPerformanceSpans(trace, parseProviderPerformanceSpans(event.payload, Date.now()));
+          const spans = parseProviderPerformanceSpans(event.payload, Date.now()).filter(span =>
+            span.name !== "pi.request.sent" || (event.sourceKind === "runner" && observesPiRequests));
+          await recordNativeProviderPerformanceSpans(trace, spans);
         }
         const textKind = !firstTokenRecorded ? observeDeliverableText(event) : null;
         if (textKind) {

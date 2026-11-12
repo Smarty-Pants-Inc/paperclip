@@ -779,7 +779,12 @@ export async function recordNativeProviderPerformanceSpans(trace: NativeRunTrace
       startedAtMs: Math.min(...spans.map(span => span.startedAtMs)), persistRunLog: false });
     try {
       for (const span of spans) await trace.record({ name: span.name, parentName: "provider.runtime",
-        startedAtMs: span.startedAtMs, endedAtMs: span.endedAtMs, outcome: span.outcome }, { persistRunLog: false });
+        startedAtMs: span.startedAtMs, endedAtMs: span.endedAtMs, outcome: span.outcome }, {
+          // Existing duration batches already have a durable diagnostic row.
+          // The Pi hook instant additionally belongs in the run waterfall;
+          // defer its sink write so committed-event progress is never blocked.
+          persistRunLog: span.name === "pi.request.sent", deferRunLog: true,
+        });
     } finally {
       await trace.end(scope, { endedAtMs: Math.max(...spans.map(span => span.endedAtMs)),
         outcome: spans.some(span => span.outcome === "failed") ? "failed" : "ok" });
