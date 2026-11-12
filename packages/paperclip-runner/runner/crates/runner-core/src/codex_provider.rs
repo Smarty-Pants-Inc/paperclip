@@ -3286,107 +3286,130 @@ impl CodexProvider {
                 ) {
                     return self.reject_post_terminal_request(rpc_id, method);
                 }
-                let active_turn_id = self.active_provider_turn_id.as_deref().ok_or_else(|| {
-                    LocalRunnerError::invalid("Codex tool call arrived outside an active turn")
-                })?;
-                if params.get("turnId").and_then(Value::as_str) != Some(active_turn_id) {
-                    return Ok(Some(self.identity_failure(
-                        method,
-                        &params,
-                        "turn_binding_mismatch",
-                    )));
-                }
-                let call_id = bounded_identifier(
-                    params.get("callId").and_then(Value::as_str),
-                    "Codex tool callId",
-                )?;
-                let operation_id = bounded_identifier(
-                    params.get("tool").and_then(Value::as_str),
-                    "Codex tool name",
-                )?;
-                if !self.authorized_tool_ids.contains(&operation_id) {
-                    self.send_courtesy_response(&json!({
-                        "id": rpc_id,
-                        "result": codex_tool_failure("Paperclip did not authorize this tool for the run"),
-                    }))?;
-                    return Err(LocalRunnerError::invalid(format!(
-                        "Codex requested unauthorized tool {}",
-                        bounded_method(&operation_id)
-                    )));
-                }
-                let input = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let input_bytes = serde_json::to_vec(&input)
-                    .map_err(|error| {
-                        LocalRunnerError::invalid(format!(
-                            "Codex tool arguments are not serializable: {error}"
-                        ))
-                    })?
-                    .len();
-                let rpc_id_bytes = serde_json::to_vec(&rpc_id)
-                    .map_err(|error| {
-                        LocalRunnerError::invalid(format!(
-                            "Codex JSON-RPC id is not serializable: {error}"
-                        ))
-                    })?
-                    .len();
-                let retained_bytes = pending_tool_request_size([
-                    input_bytes,
-                    rpc_id_bytes,
-                    call_id.len(),
-                    operation_id.len(),
-                ])?;
-                let pending = PendingToolRequest {
-                    rpc_id: rpc_id.clone(),
-                    operation_id: operation_id.clone(),
-                    input: input.clone(),
-                    retained_bytes,
-                };
-                let completed_replay = self.completed_tool_call_ids.contains(&call_id);
-                if completed_replay && !self.durable_tool_call_replays {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex reused a completed tool call id",
-                    ));
-                }
-                if let Some(existing) = self.pending_tool_requests.get(&call_id) {
-                    if existing != &pending {
+                // Provider request validation is call-local: a malformed call must
+                // not escape poll() and terminate the shared runner daemon.
+                let accepted = (|| {
+                    let active_turn_id =
+                        self.active_provider_turn_id.as_deref().ok_or_else(|| {
+                            LocalRunnerError::invalid(
+                                "Codex tool call arrived outside an active turn",
+                            )
+                        })?;
+                    if params.get("turnId").and_then(Value::as_str) != Some(active_turn_id) {
+                        return Ok(Some(self.identity_failure(
+                            method,
+                            &params,
+                            "turn_binding_mismatch",
+                        )));
+                    }
+                    let call_id = bounded_identifier(
+                        params.get("callId").and_then(Value::as_str),
+                        "Codex tool callId",
+                    )?;
+                    let operation_id = bounded_identifier(
+                        params.get("tool").and_then(Value::as_str),
+                        "Codex tool name",
+                    )?;
+                    if !self.authorized_tool_ids.contains(&operation_id) {
+                        return Err(LocalRunnerError::invalid(format!(
+                            "Codex requested unauthorized tool {}",
+                            bounded_method(&operation_id)
+                        )));
+                    }
+                    let input = params.get("arguments").cloned().unwrap_or(Value::Null);
+                    let input_bytes = serde_json::to_vec(&input)
+                        .map_err(|error| {
+                            LocalRunnerError::invalid(format!(
+                                "Codex tool arguments are not serializable: {error}"
+                            ))
+                        })?
+                        .len();
+                    let rpc_id_bytes = serde_json::to_vec(&rpc_id)
+                        .map_err(|error| {
+                            LocalRunnerError::invalid(format!(
+                                "Codex JSON-RPC id is not serializable: {error}"
+                            ))
+                        })?
+                        .len();
+                    let retained_bytes = pending_tool_request_size([
+                        input_bytes,
+                        rpc_id_bytes,
+                        call_id.len(),
+                        operation_id.len(),
+                    ])?;
+                    let pending = PendingToolRequest {
+                        rpc_id: rpc_id.clone(),
+                        operation_id: operation_id.clone(),
+                        input: input.clone(),
+                        retained_bytes,
+                    };
+                    let completed_replay = self.completed_tool_call_ids.contains(&call_id);
+                    if completed_replay && !self.durable_tool_call_replays {
                         return Err(LocalRunnerError::invalid(
-                            "Codex reused a tool call id with different input",
+                            "Codex reused a completed tool call id",
                         ));
                     }
-                    return Ok(None);
-                }
-                if self
-                    .pending_tool_requests
-                    .values()
-                    .any(|existing| existing.rpc_id == rpc_id)
-                {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex reused a pending JSON-RPC id for another tool call",
-                    ));
-                }
-                if self.pending_tool_requests.len() >= MAX_PENDING_TOOL_REQUESTS {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex emitted too many pending tool calls",
-                    ));
-                }
-                if !completed_replay
-                    && self.completed_tool_call_ids.len() >= MAX_COMPLETED_TOOL_CALL_IDS
-                {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex emitted too many completed tool calls in one turn",
-                    ));
-                }
-                let retained_request_bytes = retain_pending_tool_request_bytes(
-                    self.pending_tool_request_bytes,
-                    retained_bytes,
-                )?;
-                self.pending_tool_requests.insert(call_id.clone(), pending);
-                self.pending_tool_request_bytes = retained_request_bytes;
-                return Ok(Some(CodexProviderEvent::ToolCall {
-                    call_id,
-                    operation_id,
-                    input,
-                }));
+                    if let Some(existing) = self.pending_tool_requests.get(&call_id) {
+                        if existing != &pending {
+                            return Err(LocalRunnerError::invalid(
+                                "Codex reused a tool call id with different input",
+                            ));
+                        }
+                        return Ok(None);
+                    }
+                    if self
+                        .pending_tool_requests
+                        .values()
+                        .any(|existing| existing.rpc_id == rpc_id)
+                    {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex reused a pending JSON-RPC id for another tool call",
+                        ));
+                    }
+                    if self.pending_tool_requests.len() >= MAX_PENDING_TOOL_REQUESTS {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex emitted too many pending tool calls",
+                        ));
+                    }
+                    if !completed_replay
+                        && self.completed_tool_call_ids.len() >= MAX_COMPLETED_TOOL_CALL_IDS
+                    {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex emitted too many completed tool calls in one turn",
+                        ));
+                    }
+                    let retained_request_bytes = retain_pending_tool_request_bytes(
+                        self.pending_tool_request_bytes,
+                        retained_bytes,
+                    )?;
+                    self.pending_tool_requests.insert(call_id.clone(), pending);
+                    self.pending_tool_request_bytes = retained_request_bytes;
+                    Ok(Some(CodexProviderEvent::ToolCall {
+                        call_id,
+                        operation_id,
+                        input,
+                    }))
+                })();
+                return match accepted {
+                    Ok(event) => Ok(event),
+                    Err(error) => {
+                        let message = error.to_string();
+                        // Like post-terminal refusals, a courtesy write failure
+                        // must not promote invalid input into a fatal poll error.
+                        let _ = self.send_courtesy_response(&json!({
+                            "id": rpc_id,
+                            "result": codex_tool_failure(&message),
+                        }));
+                        Ok(Some(CodexProviderEvent::Notification {
+                            method: "warning".to_owned(),
+                            params: json!({
+                                "code": "provider_tool_call_refused",
+                                "message": message,
+                                "providerMethod": method,
+                            }),
+                        }))
+                    }
+                };
             }
             if matches!(
                 method,
@@ -5535,6 +5558,103 @@ done
         provider
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn malformed_tool_call_refusals_preserve_pending_calls_and_capacity() {
+        for (case, expected) in [
+            (
+                "conflicting-call",
+                "reused a tool call id with different input",
+            ),
+            ("conflicting-rpc", "reused a pending JSON-RPC id"),
+            ("pending-capacity", "too many pending tool calls"),
+            ("completed-capacity", "too many completed tool calls"),
+            ("retained-bytes", "16 MiB aggregate limit"),
+            ("outside-turn", "outside an active turn"),
+        ] {
+            let mut provider = completion_tail_provider();
+            provider.active_provider_turn_id = Some("active-turn".to_owned());
+            provider.completed_turn_authority = None;
+            provider
+                .authorized_tool_ids
+                .insert("get_task_context".to_owned());
+            let existing = PendingToolRequest {
+                rpc_id: json!(91),
+                operation_id: "get_task_context".to_owned(),
+                input: json!({"existing": true}),
+                retained_bytes: 32,
+            };
+            match case {
+                "conflicting-call" => {
+                    provider
+                        .pending_tool_requests
+                        .insert("new-call".to_owned(), existing);
+                }
+                "conflicting-rpc" => {
+                    provider
+                        .pending_tool_requests
+                        .insert("other-call".to_owned(), existing);
+                }
+                "pending-capacity" => {
+                    for index in 0..MAX_PENDING_TOOL_REQUESTS {
+                        let mut request = existing.clone();
+                        request.rpc_id = json!(format!("existing-{index}"));
+                        provider
+                            .pending_tool_requests
+                            .insert(format!("existing-{index}"), request);
+                    }
+                }
+                "completed-capacity" => {
+                    provider.completed_tool_call_ids = (0..MAX_COMPLETED_TOOL_CALL_IDS)
+                        .map(|index| format!("completed-{index}"))
+                        .collect();
+                }
+                "retained-bytes" => {
+                    provider.pending_tool_request_bytes = MAX_PENDING_TOOL_REQUEST_BYTES;
+                }
+                "outside-turn" => {
+                    provider.active_provider_turn_id = None;
+                }
+                _ => unreachable!(),
+            }
+            let pending = provider.pending_tool_requests.clone();
+            let bytes = provider.pending_tool_request_bytes;
+            let completed = provider.completed_tool_call_ids.clone();
+            let active_turn = provider.active_provider_turn_id.clone();
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| {
+                recorded.lock().unwrap().push(frame.clone());
+            }));
+            let request = json!({"id":91,"method":"item/tool/call","params":{
+                "threadId":provider.thread_id,"turnId":active_turn,
+                "callId":"new-call","tool":"get_task_context","arguments":{}}});
+            provider.pending_message_bytes = json_size(&request, "fixture").unwrap();
+            provider
+                .pending_messages
+                .push_back(BufferedProviderMessage {
+                    value: request,
+                    trace_frame_id: None,
+                });
+            assert!(
+                matches!(provider.poll().expect("call refusal must keep polling healthy"),
+                Some(CodexProviderEvent::Notification { method, params })
+                    if method == "warning" && params["message"].as_str().unwrap().contains(expected)),
+                "{case}"
+            );
+            assert_eq!(provider.pending_tool_requests, pending, "{case}");
+            assert_eq!(provider.pending_tool_request_bytes, bytes, "{case}");
+            assert_eq!(provider.completed_tool_call_ids, completed, "{case}");
+            assert_eq!(provider.active_provider_turn_id, active_turn, "{case}");
+            assert!(!provider.quarantined, "{case}");
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames.len(), 1, "{case}");
+            assert_eq!(frames[0]["id"], 91, "{case}");
+            assert_eq!(frames[0]["result"]["success"], false, "{case}");
+            drop(frames);
+            provider.shutdown().unwrap();
+        }
+    }
     #[cfg(unix)]
     #[test]
     fn fenced_tool_rejection_keeps_identity_and_real_delivery_strict() {

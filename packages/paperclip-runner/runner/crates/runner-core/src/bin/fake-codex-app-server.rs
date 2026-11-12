@@ -758,6 +758,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let expected_canonical_task_context_file =
         argument(&args, "--expected-canonical-task-context-file");
     let emit_tool_call = args.iter().any(|value| value == "--emit-tool-call");
+    let malformed_tool_params = argument(&args, "--malformed-tool-params-file")
+        .map(|path| -> Result<Value, Box<dyn std::error::Error>> {
+            Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+        })
+        .transpose()?;
     let terminal_result = argument(&args, "--terminal-result-file")
         .map(|path| -> Result<Value, Box<dyn std::error::Error>> {
             Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
@@ -1173,6 +1178,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "failed"
                 },
             )?;
+            continue;
+        }
+        if message.get("method").is_none()
+            && message.get("id") == Some(&json!("malformed-tool-request"))
+        {
+            // Continue only after the runner has refused the malformed request.
+            if message.pointer("/result/success") != Some(&json!(false))
+                || message.pointer("/result/contentItems/0/type") != Some(&json!("inputText"))
+                || message
+                    .pointer("/result/contentItems/0/text")
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err("malformed tool call did not receive a typed tool failure".into());
+            }
+            log_call(
+                call_log.as_deref(),
+                &format!("malformed-tool-refusal:{message}"),
+            )?;
+            send(json!({
+                "id": "tool-request-1", "method": "item/tool/call",
+                "params": {"threadId": state.thread_id, "turnId": state.active_turn_id,
+                    "callId": "semantic-call-1", "tool": "get_task_context", "arguments": {}}
+            }))?;
             continue;
         }
         if message.get("method").is_none() && message.get("id") == Some(&json!("tool-request-1")) {
@@ -2222,6 +2251,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "params": { "threadId": state.thread_id, "turnId": provider_turn_id,
                             "callId": "terminal-result-call", "tool": "paperclip_finish", "arguments": result }
                     }))?;
+                } else if let Some(overrides) = &malformed_tool_params {
+                    let mut params = json!({
+                        "threadId": state.thread_id, "turnId": provider_turn_id,
+                        "callId": "toolu_X/1", "tool": "get_task_context", "arguments": {}
+                    });
+                    for (key, value) in overrides
+                        .as_object()
+                        .ok_or("malformed params must be an object")?
+                    {
+                        params[key] = value.clone();
+                    }
+                    send(
+                        json!({"id": "malformed-tool-request", "method": "item/tool/call", "params": params}),
+                    )?;
                 } else if emit_tool_call {
                     send(json!({
                         "id": "tool-request-1",
