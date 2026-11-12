@@ -47,6 +47,7 @@ type TranscriptBlock =
   | {
       type: "message";
       role: "assistant" | "user";
+      itemId?: string;
       ts: string;
       // Timestamp of the first entry that opened this block. `ts` tracks the
       // latest merged delta and mutates every chunk; `startTs` stays fixed so
@@ -58,6 +59,7 @@ type TranscriptBlock =
     }
   | {
       type: "thinking";
+      itemId?: string;
       ts: string;
       startTs: string;
       text: string;
@@ -549,17 +551,30 @@ function groupToolBlocks(blocks: TranscriptBlock[]): TranscriptBlock[] {
   return grouped;
 }
 
+function usageDetail(entry: Extract<TranscriptEntry, { kind: "result" }>): string {
+  const tokens = (value: number) => Number.isFinite(value) ? formatTokens(value) : "unknown";
+  const cost = Number.isFinite(entry.costUsd) ? `$${entry.costUsd.toFixed(6)}` : "cost unknown";
+  return `${tokens(entry.inputTokens)} / ${tokens(entry.outputTokens)} / ${cost}`;
+}
+
 export function normalizeTranscript(entries: TranscriptEntry[], streaming: boolean): TranscriptBlock[] {
   const blocks: TranscriptBlock[] = [];
   const pendingToolBlocks = new Map<string, Extract<TranscriptBlock, { type: "tool" }>>();
   const pendingActivityBlocks = new Map<string, Extract<TranscriptBlock, { type: "activity" }>>();
+  const textBlocks = new Map<string, Extract<TranscriptBlock, { type: "message" | "thinking" }>>();
 
   for (const entry of entries) {
     const previous = blocks[blocks.length - 1];
 
     if (entry.kind === "assistant" || entry.kind === "user") {
       const isStreaming = streaming && entry.kind === "assistant" && entry.delta === true;
-      if (previous?.type === "message" && previous.role === entry.kind) {
+      const id = entry.kind === "assistant" ? entry.itemId : undefined;
+      const existing = id ? textBlocks.get(`assistant:${id}`) : undefined;
+      if (existing?.type === "message") {
+        existing.text = entry.kind === "assistant" && entry.delta ? existing.text + entry.text : entry.text;
+        existing.ts = entry.ts;
+        existing.streaming = isStreaming;
+      } else if (!id && previous?.type === "message" && !previous.itemId && previous.role === entry.kind) {
         previous.text += previous.text.endsWith("\n") || entry.text.startsWith("\n") ? entry.text : `\n${entry.text}`;
         previous.ts = entry.ts;
         previous.streaming = previous.streaming || isStreaming;
@@ -567,29 +582,38 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
         blocks.push({
           type: "message",
           role: entry.kind,
+          itemId: id,
           ts: entry.ts,
           startTs: entry.ts,
           text: entry.text,
           streaming: isStreaming,
         });
+        if (id) textBlocks.set(`assistant:${id}`, blocks.at(-1) as Extract<TranscriptBlock, { type: "message" }>);
       }
       continue;
     }
 
     if (entry.kind === "thinking") {
       const isStreaming = streaming && entry.delta === true;
-      if (previous?.type === "thinking") {
+      const existing = entry.itemId ? textBlocks.get(`thinking:${entry.itemId}`) : undefined;
+      if (existing?.type === "thinking") {
+        if (entry.text) existing.text = entry.delta ? existing.text + entry.text : entry.text;
+        existing.ts = entry.ts;
+        existing.streaming = isStreaming;
+      } else if (!entry.itemId && previous?.type === "thinking" && !previous.itemId) {
         previous.text += previous.text.endsWith("\n") || entry.text.startsWith("\n") ? entry.text : `\n${entry.text}`;
         previous.ts = entry.ts;
         previous.streaming = previous.streaming || isStreaming;
       } else {
         blocks.push({
           type: "thinking",
+          itemId: entry.itemId,
           ts: entry.ts,
           startTs: entry.ts,
           text: entry.text,
           streaming: isStreaming,
         });
+        if (entry.itemId) textBlocks.set(`thinking:${entry.itemId}`, blocks.at(-1) as Extract<TranscriptBlock, { type: "thinking" }>);
       }
       continue;
     }
@@ -705,7 +729,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
         text: entry.text.trim() || entry.errors[0] || (entry.isError ? "Run failed" : "Completed"),
         detail:
           !entry.isError && entry.text.trim().length > 0
-            ? `${formatTokens(entry.inputTokens)} / ${formatTokens(entry.outputTokens)} / $${entry.costUsd.toFixed(6)}`
+            ? usageDetail(entry)
             : undefined,
       });
       continue;
@@ -1748,7 +1772,7 @@ function rawEntryContent(entry: TranscriptEntry): string {
     return formatToolPayload(entry.content);
   }
   if (entry.kind === "result") {
-    return `${entry.text}\n${formatTokens(entry.inputTokens)} / ${formatTokens(entry.outputTokens)} / $${entry.costUsd.toFixed(6)}`;
+    return `${entry.text}\n${usageDetail(entry)}`;
   }
   if (entry.kind === "init") {
     return `model=${entry.model}${entry.sessionId ? ` session=${entry.sessionId}` : ""}`;

@@ -7,8 +7,10 @@ import { isRunLogOnlyProviderEvent } from "@/components/transcript/run-log-only-
 type JsonRecord = Record<string, unknown>;
 
 interface PaperclipRunnerParserState {
-  assistantDeltaItemIds: Set<string>;
-  reasoningDeltaItemIds: Set<string>;
+  assistantTextById: Map<string, string>;
+  reasoningTextById: Map<string, string>;
+  usageReceiptItemIds: Set<string>;
+  completedTextItemIds: Set<string>;
   resultSummaries: Set<string>;
   toolOutputItemIds: Set<string>;
   itemChannels: Map<string, "progress" | "final" | "summary" | "detail" | "unknown">;
@@ -223,7 +225,10 @@ function parseItemEvent(
   if (type === "agentmessage") {
     const value = itemText(item, payload);
     if (phase === "completed") state.itemChannels.delete(id);
-    if (!value || state.assistantDeltaItemIds.has(id)) return [];
+    if (!value || (phase === "started" && state.assistantTextById.has(id))) return [];
+    if (phase === "completed" && state.completedTextItemIds.has(id)) return [];
+    if (phase === "completed") state.completedTextItemIds.add(id);
+    state.assistantTextById.set(id, value);
     if (resolvedChannel === "final") {
       const summary = structuredResultSummary(value);
       if (summary) {
@@ -231,15 +236,21 @@ function parseItemEvent(
         return [{ kind: "assistant", ts, text: summary, channel: "final", itemId: id }];
       }
     }
+    // A completion is an authoritative replacement, not another chunk. Keep
+    // it even when text matches: it can upgrade an unknown channel to final.
     return [{ kind: "assistant", ts, text: value, channel: resolvedChannel === "final" ? "final" : resolvedChannel === "progress" ? "progress" : "unknown", itemId: id }];
   }
   if (type === "reasoning") {
     const value = itemText(item, payload);
     if (phase === "completed") state.itemChannels.delete(id);
+    const previous = state.reasoningTextById.get(id);
+    if (value) state.reasoningTextById.set(id, value);
+    const suffix = previous && value.startsWith(previous) ? value.slice(previous.length) : null;
     return [{
       kind: "thinking",
       ts,
-      text: value && !state.reasoningDeltaItemIds.has(id) ? value : "",
+      text: suffix ?? value,
+      ...(suffix !== null ? { delta: true } : {}),
       lifecycle: phase,
       channel: resolvedChannel === "detail" ? "detail" : resolvedChannel === "summary" ? "summary" : "unknown",
       itemId: id,
@@ -256,7 +267,12 @@ function parseItemEvent(
   if (type === "filechange") return fileChangeEntries(event, item, phase, ts);
   if (type === "dynamictoolcall") return dynamicToolEntries(event, item, phase, ts);
   if (type === "tooluse" || type === "toolresult" || type === "mcptoolcall") {
-    return genericToolEntries(event, item, phase, ts);
+    const normalized = { ...item, output: payload.output ?? item.output, isError: payload.isError === true || item.isError === true };
+    // Some providers learn structured arguments only at completion. Re-emit
+    // the same call identity as an update before its correlated result.
+    return phase === "completed" && (item.input !== undefined || item.arguments !== undefined)
+      ? [...genericToolEntries(event, normalized, "started", ts), ...genericToolEntries(event, normalized, phase, ts)]
+      : genericToolEntries(event, normalized, phase, ts);
   }
   if (type === "usage") return [];
   if (type === "usermessage") return [];
@@ -277,7 +293,7 @@ function parseDeltaEvent(
   const channel = explicitChannel === "unknown" ? state.itemChannels.get(id) ?? "unknown" : explicitChannel;
   if (!value) return [];
   if (kind === "agentmessage") {
-    state.assistantDeltaItemIds.add(id);
+    state.assistantTextById.set(id, (state.assistantTextById.get(id) ?? "") + value);
     if (channel === "final" && (state.structuredFinalItemIds.has(id) || value.trimStart().startsWith("{"))) {
       state.structuredFinalItemIds.add(id);
       return [];
@@ -285,7 +301,7 @@ function parseDeltaEvent(
     return [{ kind: "assistant", ts, text: value, delta: true, channel: channel === "final" ? "final" : channel === "progress" ? "progress" : "unknown", itemId: id }];
   }
   if (kind === "reasoning") {
-    state.reasoningDeltaItemIds.add(id);
+    state.reasoningTextById.set(id, (state.reasoningTextById.get(id) ?? "") + value);
     return [{ kind: "thinking", ts, text: value, delta: true, channel: channel === "detail" ? "detail" : channel === "summary" ? "summary" : "unknown", itemId: id }];
   }
   if (kind === "commandexecution") {
@@ -314,19 +330,20 @@ function parseDeltaEvent(
 
 function usageEntry(payload: JsonRecord, ts: string): TranscriptEntry {
   const usage = Object.keys(record(payload.usage)).length > 0 ? record(payload.usage) : payload;
-  const reported = Object.keys(record(usage.total)).length > 0
-    ? record(usage.total)
-    : Object.keys(record(usage.runDelta)).length > 0
-      ? record(usage.runDelta)
-      : usage;
+  const reported = usage.runDeltaAvailable === true
+    ? record(usage.runDelta)
+    : Object.keys(record(usage.total)).length > 0 ? record(usage.total) : Object.keys(record(usage.runDelta)).length > 0 ? record(usage.runDelta) : usage;
+  // TranscriptEntry's numeric contract uses NaN for an unknown measurement;
+  // renderers must label it unknown, not claim free/zero usage.
+  const measurement = (value: unknown) => nullableNumber(value) ?? Number.NaN;
   return {
     kind: "result",
     ts,
-    text: "",
-    inputTokens: number(reported.inputTokens ?? reported.input_tokens),
-    outputTokens: number(reported.outputTokens ?? reported.output_tokens),
-    cachedTokens: number(reported.cachedInputTokens ?? reported.cached_input_tokens ?? reported.cacheReadTokens),
-    costUsd: number(usage.costUsd ?? usage.cost_usd),
+    text: ["Provider usage", ...(nullableNumber(reported.providerCostUsd ?? usage.costUsd ?? usage.cost_usd) === null ? ["Provider cost unknown."] : []), ...(usage.accountingComplete === false ? ["Total accounting incomplete. Child usage unknown."] : [])].join(" · "),
+    inputTokens: measurement(reported.inputTokens ?? reported.input_tokens),
+    outputTokens: measurement(reported.outputTokens ?? reported.output_tokens),
+    cachedTokens: measurement(reported.cachedInputTokens ?? reported.cached_input_tokens ?? reported.cacheReadTokens),
+    costUsd: measurement(reported.providerCostUsd ?? usage.costUsd ?? usage.cost_usd),
     subtype: "paperclip.usage",
     isError: false,
     errors: [],
@@ -755,16 +772,34 @@ function parsePrpEvent(
   if (eventType === "turn.completed") return [{ kind: "system", ts, text: "Turn completed" }];
   if (eventType === "turn.failed") return [{ kind: "stderr", ts, text: text(record(payload.error).message, "Turn failed") }];
   if (eventType === "item.started" || eventType === "item.completed") {
-    if (payload.kind === "usage") return [usageEntry(payload, ts)];
+    if (payload.kind === "usage") {
+      // Modern run deltas and compatibility usage items describe the SAME
+      // receipt. Do not add the cumulative item again (or bill a compactor
+      // whose usage was explicitly marked unaccounted).
+      if (text(event.itemId) && state.usageReceiptItemIds.has(text(event.itemId))) return [];
+      if (record(payload.usage).runDeltaComplete === false) {
+        return [{ kind: "system", ts, text: "Usage accounting incomplete; additional usage unknown." }];
+      }
+      return [usageEntry(payload, ts)];
+    }
     return parseItemEvent(event, payload, eventType === "item.started" ? "started" : "completed", ts, state);
   }
   if (eventType === "item.failed") {
     const item = record(payload.item);
     const error = record(payload.error);
-    return [{ kind: "stderr", ts, text: text(error.message, text(item.error, "Runner item failed")) }];
+    const message = text(payload.message, text(error.message, text(item.error, "Runner item failed")));
+    if (["tooluse", "toolresult", "mcptoolcall"].includes(normalizedItemType(item, payload))) {
+      return parseItemEvent(event, { ...payload, output: payload.output ?? message, isError: true, item: { ...item, isError: true } }, "completed", ts, state);
+    }
+    return [{ kind: "stderr", ts, text: message }];
   }
   if (eventType === "item.delta") return parseDeltaEvent(event, payload, ts, state);
-  if (eventType === "usage.reported") return [usageEntry(payload, ts)];
+  if (eventType === "usage.reported") {
+    const id = text(event.itemId);
+    if (id && state.usageReceiptItemIds.has(id)) return [];
+    if (id) state.usageReceiptItemIds.add(id);
+    return [usageEntry(payload, ts)];
+  }
   if (eventType === "run.result.proposed" || eventType === "run.result.accepted") {
     const result = eventType === "run.result.accepted" ? record(payload.result) : payload;
     const summary = text(result.summary);
@@ -785,8 +820,10 @@ function parsePrpEvent(
 
 function createParserState(): PaperclipRunnerParserState {
   return {
-    assistantDeltaItemIds: new Set(),
-    reasoningDeltaItemIds: new Set(),
+    assistantTextById: new Map(),
+    reasoningTextById: new Map(),
+    usageReceiptItemIds: new Set(),
+    completedTextItemIds: new Set(),
     resultSummaries: new Set(),
     toolOutputItemIds: new Set(),
     itemChannels: new Map(),

@@ -17,7 +17,7 @@ function text(value: unknown): string | null {
 }
 
 function finiteNumber(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : Number.NaN;
 }
 
 function normalizedItem(payload: Record<string, unknown>): Record<string, unknown> {
@@ -828,6 +828,8 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
   const startedToolIds = new Set<string>();
   const toolSignatures = new Map<string, string>();
   const completedToolIds = new Set<string>();
+  let accountingIncomplete = false;
+  let additionalUsageUnknown = false;
   let usageSummary: {
     ts: string;
     inputTokens: number;
@@ -1001,6 +1003,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     const itemKind = itemIdentity.kind;
 
     if (event.eventType === "item.completed" && payload.kind === "usage") {
+      additionalUsageUnknown ||= record(payload.usage)?.runDeltaComplete === false;
       const context = contextUsageFromUsagePayload(payload.usage);
       if (context) {
         usageSinceLastCompaction = true;
@@ -1362,6 +1365,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     }
 
     if (event.eventType === "usage.reported") {
+      accountingIncomplete ||= payload.accountingComplete === false;
       // A provider may report only session-cumulative usage. Preserve the
       // latest snapshot as explicitly session-scoped usage instead of either
       // summing cumulative values or relabelling them as a per-run delta.
@@ -1516,7 +1520,11 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
     entries.push({
       kind: "result",
       ...usageSummary,
-      text: "",
+      text: [
+        ...(!Number.isFinite(usageSummary.costUsd) ? ["Provider cost unknown."] : []),
+        ...(accountingIncomplete ? ["Total accounting incomplete. Child usage unknown."] : []),
+        ...(additionalUsageUnknown ? ["Additional usage unknown."] : []),
+      ].join(" · "),
       subtype: "paperclip_runner_usage",
       isError: false,
       errors: [],

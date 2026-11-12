@@ -751,6 +751,7 @@ export function transcriptToTaskChatItems(
 ): TaskChatItem[] {
   const items: TaskChatItem[] = [];
   const toolIndexById = new Map<string, number>();
+  const messageIndexById = new Map<string, number>();
   const protocolIndexByKey = new Map<string, number>();
   const thinkingStartTs = new Map<number, string>();
   let lastToolIndex = -1;
@@ -847,17 +848,18 @@ export function transcriptToTaskChatItems(
         if (!entry.text) break;
         finishThinking();
         const channel = entry.channel;
-        const sameMessage =
-          messageIndex >= 0 &&
-          messageChannel === channel &&
-          ((entry.itemId !== undefined && entry.itemId === messageItemId) ||
-            (entry.itemId === undefined &&
-              messageItemId === undefined &&
-              entry.delta === true));
+        const addressedIndex = entry.itemId ? messageIndexById.get(entry.itemId) : undefined;
+        if (addressedIndex !== undefined) messageIndex = addressedIndex;
+        const sameMessage = addressedIndex !== undefined || (
+          messageIndex >= 0 && messageChannel === channel &&
+          entry.itemId === undefined && messageItemId === undefined && entry.delta === true
+        );
         if (sameMessage) {
           const it = items[messageIndex];
           if (it.kind === "message") {
-            it.text += entry.text;
+            it.text = entry.delta ? it.text + entry.text : entry.text;
+            it.channel = channel;
+            it.interstitial = channel !== "final";
             it.transcriptIndex = i;
           }
         } else {
@@ -879,6 +881,7 @@ export function transcriptToTaskChatItems(
             transcriptIndex: i,
           });
           messageIndex = items.length - 1;
+          if (entry.itemId) messageIndexById.set(entry.itemId, messageIndex);
           messageChannel = channel;
           messageItemId = entry.itemId;
         }
@@ -907,6 +910,8 @@ export function transcriptToTaskChatItems(
               existing.target = clip(entry.name!, TARGET_MAX);
             }
           }
+          const target = summarizeToolInput(entry.input);
+          if (target) existing.target = target;
           if (entry.detail) applyToolDetail(existing, entry.detail);
           lastToolIndex = existingIndex!;
         } else {
@@ -1209,11 +1214,13 @@ export function transcriptToTaskChatItems(
       case "result": {
         if (
           entry.subtype !== "paperclip_runner_usage" &&
-          entry.subtype !== "paperclip_runner_session_usage"
+          entry.subtype !== "paperclip_runner_session_usage" &&
+          entry.subtype !== "paperclip.usage"
         )
           break;
-        const inputTokens = entry.inputTokens || 0;
-        const outputTokens = entry.outputTokens || 0;
+        const knownTokens = Number.isFinite(entry.inputTokens) && Number.isFinite(entry.outputTokens);
+        const inputTokens = entry.inputTokens;
+        const outputTokens = entry.outputTokens;
         items.push({
           id: `${runId}:usage:${i}`,
           kind: "usage",
@@ -1225,12 +1232,14 @@ export function transcriptToTaskChatItems(
                   "This cumulative usage can include earlier runs in the resumed provider session.",
               }
             : {}),
+          ...(!knownTokens ? { label: "Usage unknown" } : {}),
+          ...(entry.text ? { detail: entry.text } : {}),
           usage: {
-            used: inputTokens + outputTokens + (entry.cachedTokens || 0),
+            // Without a context size the readout does not display occupancy.
+            used: knownTokens ? inputTokens + outputTokens + (Number.isFinite(entry.cachedTokens) ? entry.cachedTokens : 0) : Number.NaN,
             size: 0,
-            inputTokens,
-            outputTokens,
-            ...(entry.costUsd > 0 ? { costUsd: entry.costUsd } : {}),
+            ...(knownTokens ? { inputTokens, outputTokens } : {}),
+            ...(Number.isFinite(entry.costUsd) && entry.costUsd >= 0 ? { costUsd: entry.costUsd } : {}),
           },
         });
         resetInline();
