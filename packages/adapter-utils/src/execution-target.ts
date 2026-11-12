@@ -188,6 +188,15 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
   /** Host-bound plugin task RPC. expectedTaskId pins an owner to its physical task after startup. */
   runnerTask?: (operation: unknown, context?: { executionContext?: unknown; expectedTaskId?: string }) => Promise<unknown>;
   runnerTaskProjectIds?: readonly string[];
+  /** Host-only exact-allocation callbacks. Never serialized into the VM. A
+   * successful release confirms reusable retention; uncertainty must throw. */
+  runnerLeaseLifecycle?: {
+    releaseLease(): Promise<void>;
+    resumeLease(): Promise<"resumed" | "unavailable">;
+  };
+  /** Explicit resident-guardian opt-in, not inferred from duplex/reuse support.
+   * Core additionally qualifies the guardian and selected daemon at runtime. */
+  readonly runnerGuardian?: { version: 1 };
   /** Private Core-issued identity for a bounded, tool-free setup probe. */
   runnerTaskProbe?: { runId: string; sessionId: string };
   /**
