@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { createPiSteerRecordingPeer } from "../../test-support/pi-rpc-steer-peer.js";
+import { PiRpcTransport } from "../drivers/pi/pi-rpc-transport.js";
 import type { HarnessDriver, HarnessSession } from "../contracts/harness-driver.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import { createPiEventProjector } from "../drivers/pi/pi-event-projector.js";
@@ -386,6 +387,42 @@ describe("Pi RPC app-server facade proxy", () => {
       await proxy.close();
       await peer.transport.close();
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns native startup stderr, redacted, in the runner-facing bootstrap error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-startup-stderr-"));
+    const sink = new FakeSink();
+    const proxy = createPiRpcAppServerProxy({
+      stdout: sink,
+      environment: { PI_CODING_AGENT_DIR: join(root, "agent") },
+      createDriver: (config) => new PiRpcDriver({
+        ...config,
+        runtimeDirectory: join(root, "runtime"),
+        transportFactory: (options) => new PiRpcTransport({
+          ...options,
+          command: process.execPath,
+          args: ["-e", `
+            process.stdin.once("data", () => {
+              process.stderr.write("Error: Failed to load extension: Cannot find module yaml\\nAuthorization: Bearer proxy-startup-secret\\n", () => process.exit(1));
+            });
+          `],
+        }),
+      }),
+    });
+    try {
+      const response = await request(proxy, sink, 10, "thread/start", {
+        cwd: root, model: "startup/model", piRpcThinkingLevel: "high",
+      });
+      expect(response).toMatchObject({ id: 10, error: { code: -32000 } });
+      const message = (response.error as { message: string }).message;
+      expect(message).toContain("Pi RPC process exited (code=1, signal=none)");
+      expect(message).toContain("Error: Failed to load extension: Cannot find module yaml");
+      expect(message).toContain("Bearer [REDACTED]");
+      expect(JSON.stringify(sink.decoded())).not.toContain("proxy-startup-secret");
+      expect(sink.decoded().some((frame) => frame.method === "thread/started")).toBe(false);
+    } finally {
+      await proxy.close();
     }
   });
 

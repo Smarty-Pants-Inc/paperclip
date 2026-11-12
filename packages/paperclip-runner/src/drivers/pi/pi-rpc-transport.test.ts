@@ -341,6 +341,87 @@ describe("PiRpcTransport", () => {
     } finally { await child.close(); }
   });
 
+  it("keeps native startup stderr in pending rejections without draining events", async () => {
+    const child = transport(`
+      process.stdin.once("data", () => {
+        process.stderr.write("Error: Failed to load extension: Cannot find module yaml\\n", () => process.exit(1));
+      });
+    `);
+    try {
+      const failures = await Promise.allSettled([child.request("get_state"), child.request("get_available_models")]);
+      for (const failure of failures) {
+        expect(failure.status).toBe("rejected");
+        if (failure.status !== "rejected") throw new Error("Pi startup unexpectedly succeeded");
+        expect(failure.reason.message).toContain("Pi RPC process exited (code=1, signal=none)");
+        expect(failure.reason.message).toContain("Error: Failed to load extension: Cannot find module yaml");
+      }
+    } finally {
+      await child.close();
+    }
+  });
+
+  it("redacts credential-shaped stderr before bounding the startup diagnostic tail", async () => {
+    const child = transport(`
+      process.stdin.once("data", () => {
+        process.stderr.write("discarded-prefix" + "x".repeat(9000)
+          + "\\nAuthorization: Bearer startup-bearer-canary\\napi_key=startup-key-canary\\n"
+          + "https://startup-user:startup-password@example.test/\\n"
+          + "Error: Cannot find module yaml\\n", () => process.exit(1));
+      });
+    `);
+    try {
+      const failure = await child.request("get_state").catch((error: Error) => error);
+      expect(failure).toBeInstanceOf(Error);
+      const message = (failure as Error).message;
+      expect(message).toContain("Error: Cannot find module yaml");
+      expect(message).toContain("[REDACTED]");
+      expect(message).not.toContain("startup-bearer-canary");
+      expect(message).not.toContain("startup-key-canary");
+      expect(message).not.toContain("startup-password");
+      expect(message).not.toContain("discarded-prefix");
+      const prefix = "Pi RPC process exited (code=1, signal=none)\nPi stderr (tail):\n";
+      expect(message.startsWith(prefix)).toBe(true);
+      expect(Buffer.byteLength(message.slice(prefix.length))).toBeLessThanOrEqual(4096);
+    } finally {
+      await child.close();
+    }
+  });
+
+  it.each([
+    ["final tail bound", "token=" + "boundary-secret-canary".repeat(100) + "\n" + "x".repeat(3000)],
+    ["raw capture bound", "token=" + "boundary-secret-canary".repeat(500)],
+    ["UTF-8 byte bound", "😀".repeat(1500)],
+  ])("keeps the %s safe and bounded", async (_label, stderr) => {
+    const diagnostic = "\nError: Cannot find module yaml\n";
+    const child = transport(`
+      process.stdin.once("data", () => {
+        process.stderr.write(${JSON.stringify(stderr + diagnostic)}, () => process.exit(1));
+      });
+    `);
+    try {
+      const failure = await child.request("get_state").catch((error: Error) => error);
+      expect(failure).toBeInstanceOf(Error);
+      const message = (failure as Error).message;
+      expect(message).toContain("Error: Cannot find module yaml");
+      expect(message).not.toContain("boundary-secret-canary");
+      expect(message).not.toContain("�");
+      const prefix = "Pi RPC process exited (code=1, signal=none)\nPi stderr (tail):\n";
+      expect(message.startsWith(prefix)).toBe(true);
+      expect(Buffer.byteLength(message.slice(prefix.length))).toBeLessThanOrEqual(4096);
+    } finally {
+      await child.close();
+    }
+  });
+
+  it("preserves the generic exit error when native stderr is empty", async () => {
+    const child = transport(`process.stdin.once("data", () => process.exit(1));`);
+    try {
+      await expect(child.request("get_state")).rejects.toThrow(/^Pi RPC process exited \(code=1, signal=none\)$/);
+    } finally {
+      await child.close();
+    }
+  });
+
   it("rejects outstanding commands and emits a terminal event when the child exits", async () => {
     const child = transport(`process.stdin.resume(); setTimeout(() => process.exit(17), 15);`);
     const pending = child.request("never");

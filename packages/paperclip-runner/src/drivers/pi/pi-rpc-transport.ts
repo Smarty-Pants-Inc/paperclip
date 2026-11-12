@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
+import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
 
 export type PiRpcRecord = Record<string, unknown>;
 
@@ -120,6 +121,7 @@ export class PiRpcTransport {
   #exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   #stderr = "";
   #failure: Error | null = null;
+  #stderrTruncated = false;
 
   constructor(options: PiRpcTransportOptions) {
     this.#maxRecordBytes = options.maxRecordBytes ?? 64 * 1024 * 1024;
@@ -156,7 +158,15 @@ export class PiRpcTransport {
       if (this.#stderr) terminal.stderr = this.#stderr.slice(-8192);
       this.#records.push(terminal);
       this.#records.close();
-      const failure = new Error(`Pi RPC process exited (code=${info.code ?? "null"}, signal=${info.signal ?? "none"})`);
+      // Startup can reject before anyone drains process_exit. A truncated first
+      // line may have lost the credential key needed for redaction; omit it.
+      const newline = this.#stderr.indexOf("\n");
+      const diagnostic = this.#stderrTruncated ? (newline < 0 ? "" : this.#stderr.slice(newline + 1)) : this.#stderr;
+      // Redact before the final byte bound can cut another credential.
+      const stderr = Buffer.from(redactProviderDiagnostic(diagnostic));
+      const stderrTail = stderr.subarray(-4096).toString("utf8").replace(/^\uFFFD+/u, "");
+      const message = `Pi RPC process exited (code=${info.code ?? "null"}, signal=${info.signal ?? "none"})`;
+      const failure = new Error(stderrTail ? `${message}\nPi stderr (tail):\n${stderrTail}` : message);
       for (const pending of this.#pending.values()) pending.reject(failure);
       this.#pending.clear();
       resolveExit(info);
@@ -181,7 +191,9 @@ export class PiRpcTransport {
       if (this.#buffer.length > 0) this.#fail(new Error("Pi RPC stdout ended with an unterminated JSONL record"));
     });
     this.#child.stderr.on("data", (chunk: Buffer | string) => {
-      this.#stderr = (this.#stderr + chunk.toString()).slice(-8192);
+      const stderr = this.#stderr + chunk.toString();
+      this.#stderrTruncated ||= stderr.length > 8192;
+      this.#stderr = stderr.slice(-8192);
     });
   }
 
