@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 
-import { act as reactAct } from "react";
+import { act as reactAct, useEffect } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "../lib/queryKeys";
 import { AuthPage } from "./Auth";
@@ -16,6 +16,13 @@ const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
 const healthMock = vi.hoisted(() => vi.fn());
 const beginCloudSignInMock = vi.hoisted(() => vi.fn());
+
+const locationChanges: string[] = [];
+function LocationProbe() {
+  const location = useLocation();
+  useEffect(() => { locationChanges.push(`${location.pathname}:${location.key}`); }, [location]);
+  return null;
+}
 
 vi.mock("../api/health", () => ({ healthApi: { get: () => healthMock() } }));
 vi.mock("@/lib/cloud-sign-in", () => ({
@@ -112,11 +119,14 @@ describe("AuthPage", () => {
   async function mount(path = "/auth") {
     const { root, queryClient } = renderAuthPage(container);
     await act(async () => {
+      locationChanges.length = 0;
       root.render(
         <MemoryRouter initialEntries={[path]}>
+          <LocationProbe />
           <QueryClientProvider client={queryClient}>
             <Routes>
               <Route path="/auth" element={<AuthPage />} />
+              <Route path="*" element={null} />
             </Routes>
           </QueryClientProvider>
         </MemoryRouter>,
@@ -272,6 +282,29 @@ describe("AuthPage", () => {
     await act(async () => {
       root.unmount();
     });
+  });
+
+  it("navigates once after a successful sign-in when the refreshed session arrives", async () => {
+    getSessionMock.mockResolvedValueOnce(null).mockResolvedValue({
+      session: { id: "session-1", userId: "user-1" },
+      user: { id: "user-1", email: "jane@example.com", name: "Jane", image: null },
+    });
+    const { root } = await mount("/auth?next=%2FPAP%2Fdashboard");
+    const inputValueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    const emailInput = container.querySelector('input[name="email"]') as HTMLInputElement;
+    const passwordInput = container.querySelector('input[name="password"]') as HTMLInputElement;
+    await act(async () => {
+      inputValueSetter!.call(emailInput, "jane@example.com");
+      emailInput.dispatchEvent(new Event("input", { bubbles: true }));
+      inputValueSetter!.call(passwordInput, "supersecret");
+      passwordInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+    await vi.waitFor(() => expect(locationChanges.some((change) => change.startsWith("/PAP/dashboard:"))).toBe(true));
+    expect(locationChanges.filter((change) => change.startsWith("/PAP/dashboard:"))).toHaveLength(1);
+    await act(async () => { root.unmount(); });
   });
 
   it("invalidates anonymous health metadata after sign-in", async () => {
