@@ -57,12 +57,12 @@ export async function admitPiProbeSession(options: PiProbeObservation) {
 
 /** The L4b hello body shared by direct native and LocalFacade setup probes. */
 export async function observePiNativeHello(options: PiProbeObservation): Promise<string> {
-  const active = options.session, config = resolvePiNativeConfig(options.config), signal = options.signal;
+  const active = options.session, signal = options.signal;
   const { providerSessionId, events } = await admitPiProbeSession(options);
     // Subscribe before startTurn: the native peer may complete synchronously.
     let next = events.next();
     void next.catch(() => undefined);
-    const started = await untilAbort(active.startTurn({ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." }, model: config.model, ...(config.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: config.piRpcThinkingLevel }) }), signal);
+    const started = await untilAbort(active.startTurn({ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." } }), signal);
     let responseObserved = false;
     while (true) {
       const received = await untilAbort(next, signal);
@@ -70,9 +70,8 @@ export async function observePiNativeHello(options: PiProbeObservation): Promise
       const current = received.value;
       if (current.runId !== options.runId || current.normalizedSessionId !== options.normalizedSessionId) throw new PiNativeAdmissionError("pi_probe_session_mismatch", "Pi hello probe received a mismatched run/session.");
       if (current.eventType === "session.failed") throw probeFailure(current.payload, "Pi hello probe session failed.");
-      // Facade diagnostics may retain the pending command ID rather than the
-      // provider-assigned turn ID. They cannot prove a reply or settlement.
-      if (current.eventType !== "harness.diagnostic" && current.turnId && current.turnId !== started.turnId) throw new PiNativeAdmissionError("pi_probe_turn_mismatch", "Pi hello probe received a stale or mismatched turn.");
+      // LocalFacade may replay the opening turn before the hello turn. It
+      // cannot satisfy this probe; only the started turn's own events count.
       if (current.turnId === started.turnId) {
         if (current.eventType.startsWith("tool.execution.") || (current.eventType.startsWith("item.") && ["tool", "commandExecution", "mcpToolCall"].includes(String(current.payload.kind)))) {
           throw new PiNativeAdmissionError("pi_probe_tool_used", "Pi hello probe unexpectedly used a tool.");

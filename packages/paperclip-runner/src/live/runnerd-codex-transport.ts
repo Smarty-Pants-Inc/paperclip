@@ -1,6 +1,6 @@
 import { resolveDefaultPiRpcThinkingLevel } from "@paperclipai/adapter-utils/pi-rpc-default-thinking";
 import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
-import { admitPiProbeSession, observePiNativeHello } from "../drivers/pi/pi-environment-probe.js";
+import { admitPiProbeSession, probePiNativeEnvironment, PiEnvironmentProbeCleanupError } from "../drivers/pi/pi-environment-probe.js";
 import { resolvePiNativeConfig } from "../drivers/pi/pi-native-config.js";
 import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import type { RunnerAttachmentDownloadGrant } from "../contracts/harness-driver.js";
@@ -9346,6 +9346,22 @@ export async function probeNativeRunnerEnvironment(options: {
   let piMetadata: Record<string, unknown> | undefined;
   let failure: unknown;
   const operation = (async () => {
+    if (options.provider === "pi_rpc" && !options.admissionOnly) {
+      const receipt = await probePiNativeEnvironment({
+        driver: { openSession: async input => { session = await driver.openSession(input); return session; } },
+        // LocalFacade does not expose provider-specific effort in session.started.
+        // The selected level is admitted by PiRpcDriver on the target; do not
+        // invent an effective level in this facade context.
+        config: { provider: "pi_rpc", model: options.model ?? "" },
+        runId: options.transportOptions?.prpIdentity?.runId ?? "environment-probe",
+        normalizedSessionId: options.transportOptions?.prpIdentity?.normalizedSessionId ?? "environment-probe",
+        workingDirectory, signal: controller.signal, timeoutMs: options.timeoutMs, cleanupTimeoutMs: cleanupBudget,
+      });
+      if (bundle.evidence().providerDriver !== "pi_rpc") throw new Error("Pi setup returned an incompatible native provider driver.");
+      effectiveModel = receipt.effectiveModel;
+      completed = true;
+      return;
+    }
     session = await driver.openSession({ runId: options.transportOptions?.prpIdentity?.runId ?? "environment-probe", normalizedSessionId: options.transportOptions?.prpIdentity?.normalizedSessionId ?? "environment-probe",
       workingDirectory, signal: controller.signal });
     controller.signal.throwIfAborted();
@@ -9363,7 +9379,7 @@ export async function probeNativeRunnerEnvironment(options: {
         piMetadata = record(admitted.context.piMetadata);
         if (piMetadata.version !== "1.5.2" || piMetadata.promptSent !== false || !Array.isArray(piMetadata.providers)
           || !["broker", "env"].includes(String(piMetadata.credentialMode))) throw new Error("Native Pi metadata admission was incomplete");
-      } else await observePiNativeHello(observation);
+      }
       effectiveModel = config.model;
       completed = true;
       return;
@@ -9430,6 +9446,10 @@ export async function probeNativeRunnerEnvironment(options: {
     } catch (error) { teardownErrors.push(error); }
     try { await awaitTeardown(operation.catch(() => undefined), "draining native setup"); }
     catch (error) { teardownErrors.push(error); }
+    if (failure instanceof PiEnvironmentProbeCleanupError) {
+      try { await awaitTeardown(failure.retired, "joining native Pi retirement"); }
+      catch (error) { teardownErrors.push(error); }
+    }
     if (registrationOperation) {
       try { await awaitTeardown(registrationOperation.catch(() => undefined), "draining authority registration"); }
       catch (error) { teardownErrors.push(error); }
@@ -9454,6 +9474,7 @@ export async function probeNativeRunnerEnvironment(options: {
     if (teardownErrors.length) {
       const retained = retainNativeProbeCleanup(async retry => {
         const deadline = Date.now() + cleanupBudget;
+        if (failure instanceof PiEnvironmentProbeCleanupError) await awaitProbeCleanup(failure.retryCleanup(), deadline, "joining native Pi retirement");
         await awaitProbeCleanup(Promise.allSettled([operation, closingOperation, registrationOperation]), deadline, "joining original probe operations");
         if (!bundle.retireProbeResources) throw new Error("Native probe physical retirement proof is unavailable");
         await awaitProbeCleanup(bundle.retireProbeResources(Math.max(1, deadline - Date.now())), deadline, "confirming physical retirement");
