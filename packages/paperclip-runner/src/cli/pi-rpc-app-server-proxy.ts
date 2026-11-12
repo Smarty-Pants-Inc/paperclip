@@ -115,8 +115,8 @@ function parseRpcMessage(line: string): RpcMessage | null {
 }
 
 function runtimeDirectory(environment: NodeJS.ProcessEnv): string {
-  const configured = environment.PAPERCLIP_PI_RPC_RUNTIME_DIR?.trim();
-  if (!configured) throw new Error("PAPERCLIP_PI_RPC_RUNTIME_DIR is required");
+  const configured = environment.PAPERCLIP_PI_RUNTIME_DIR?.trim();
+  if (!configured) throw new Error("PAPERCLIP_PI_RUNTIME_DIR is required");
   return resolve(configured);
 }
 
@@ -267,7 +267,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       command: launchBinding?.command ?? "",
       ...(launchBinding?.commandFd === undefined ? {} : { commandFd: launchBinding.commandFd }),
       ...(launchBinding?.commandLifecycle === undefined ? {} : { commandLifecycle: launchBinding.commandLifecycle }),
-      runtimeDirectory: options.createDriver && !environment.PAPERCLIP_PI_RPC_RUNTIME_DIR?.trim()
+      runtimeDirectory: options.createDriver && !environment.PAPERCLIP_PI_RUNTIME_DIR?.trim()
         ? cwd
         : runtimeDirectory(environment),
       environment: withoutAmbientPiCommand(environment),
