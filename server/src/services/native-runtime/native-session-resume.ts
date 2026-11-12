@@ -601,7 +601,10 @@ export function buildNativeExecutionWithCheckpoint(input: {
     };
   // Rebuild both task context and wake instructions. Merely rotating the ID
   // leaves a fresh provider with a compact delta and missing task context.
-  const normalizedSessionId = randomUUID();
+  const normalizedSessionId = execution.provider.kind === "pi_rpc" ? input.normalizedSessionId : randomUUID();
+  if (execution.provider.kind === "pi_rpc" && !isNativeSessionId(normalizedSessionId)) {
+    throw new Error("pi_conversation_identity_missing");
+  }
   return {
     execution: input.buildExecution({
       normalizedSessionId,

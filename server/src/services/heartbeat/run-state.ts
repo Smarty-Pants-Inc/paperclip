@@ -1,4 +1,5 @@
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
+import { preservePiConversation } from "../native-runtime/pi-conversation-record.js";
 import { preservedAccountRuntimeState } from "../agent-provider-rate-limits.js";
 import { readRuntimeAccountingTotals } from "../runtime-accounting-totals.js";
 import { conversationEventCondition, conversationEventColumns } from "./conversation-events.js";
@@ -1660,7 +1661,7 @@ export function createHeartbeatRunState(db: Db) {
       return tx
         .update(agentTaskSessions)
         .set({
-          sessionParamsJson: input.sessionParamsJson,
+          sessionParamsJson: preservePiConversation(existing.sessionParamsJson, input.sessionParamsJson),
           sessionDisplayId: input.sessionDisplayId,
           lastRunId: input.lastRunId,
           lastError: input.lastError,
@@ -1671,6 +1672,14 @@ export function createHeartbeatRunState(db: Db) {
         .then((rows) => rows[0] ?? null);
     }
 
+    if (input.adapterType === "paperclip_runner" && input.lastRunId) {
+      const [owner] = await tx.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.lastRunId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+      )).limit(1);
+      // Pi admission always creates its record first. Absence now is an
+      // explicit reset; a late failure/completion cannot resurrect old C.
+      if (owner?.profile?.piConversation != null) return null;
+    }
     return tx
       .insert(agentTaskSessions)
       .values({
