@@ -356,7 +356,8 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #callbacks?: PiHostCallbacks;
   readonly #dialogs = new Map<string, { id: string | number; method: string; origin: Readonly<Origin>; turn: PiTurnState; diagnosticOrigin: Record<string, unknown>; resolving: boolean }>();
   readonly #dialogIds = new Set<string>();
-  readonly #pendingNativeTools = new Map<string, PiTurnState>();
+  // Park blockers outlive settlement, but need no retained projector/display.
+  readonly #pendingNativeTools = new Map<string, { runId: string; turnId: string; toolName: string | undefined }>();
   #pendingInput = 0;
   #cleanupFailure: Error | null = null;
   readonly #bindRequest: typeof sendPiBindRequest;
@@ -370,9 +371,12 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #instructionFile: string;
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
-  // Values retain the originating turn/projector after settlement and attach.
-  // Ambiguous reused native identities are tombstoned, never rebound.
+  // Active identities alone own a turn/projector. Settlement replaces values
+  // with compact hash-key tombstones: late/reused IDs still cannot authorize
+  // new work, but completed projectors and their display bodies are released.
   readonly #owners = new Map<string, PiTurnState | null>();
+  #activeIdentityCount = 0;
+  #identityLimited = false;
   #operation: Promise<void> = Promise.resolve();
   #activeTurn: PiTurnState | null = null;
   #agentTurn: PiTurnState | null = null;
@@ -730,6 +734,8 @@ export class PiRpcHarnessSession implements HarnessSession {
           : { status: "cancelled", reason: "session_closed" }, turn);
       }
       this.#activeTurn = this.#agentTurn = this.#streamTurn = null;
+      this.#owners.clear(); this.#pendingNativeTools.clear();
+      this.#activeIdentityCount = 0;
       this.#events.close();
       if (failures.length) throw this.#cleanupFailure ?? new AggregateError(failures, "Pi cleanup failed");
     })();
@@ -802,6 +808,18 @@ export class PiRpcHarnessSession implements HarnessSession {
       return;
     }
     const keys = piRecordIdentityKeys(event);
+    // A delayed terminal can clear its captured park blocker without reviving
+    // a settled projector. Conflicting/unknown extra identities cannot clear
+    // it: retain the same fail-closed provenance rule as event projection.
+    if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
+      const pending = this.#pendingNativeTools.get(event.toolCallId);
+      const toolKeys = piToolIdentityKeys(event.toolCallId);
+      const unambiguous = pending && keys.every(key => {
+        const owner = this.#owners.get(key);
+        return toolKeys.includes(key) || (owner?.runId === pending.runId && owner.turnId === pending.turnId);
+      });
+      if (unambiguous && (event.toolName === undefined || pending.toolName === event.toolName)) this.#pendingNativeTools.delete(event.toolCallId);
+    }
     let turn: PiTurnState | null = null;
     if (event.type === "extension_ui_request") {
       await this.#captureUi(event, keys);
@@ -833,13 +851,12 @@ export class PiRpcHarnessSession implements HarnessSession {
       else if (!["tool_execution_start", "tool_execution_update", "tool_execution_end", "message_end"].includes(String(event.type))) turn = this.#agentTurn;
     }
     if (!turn) return;
-    this.#remember(keys, turn);
+    if (!this.#remember(keys, turn)) return;
     if (event.type === "tool_execution_start" && !turn.settled) {
-      if (typeof event.toolCallId === "string") this.#pendingNativeTools.set(event.toolCallId, turn);
+      if (typeof event.toolCallId === "string") this.#pendingNativeTools.set(event.toolCallId, { runId: turn.runId, turnId: turn.turnId, toolName: typeof event.toolName === "string" ? event.toolName : undefined });
       const captured = this.#callbacks?.authority.capture();
       if (captured && captured.runId === turn.runId && captured.turnId === turn.turnId) this.#callbacks?.announce(event, captured);
     }
-    if (event.type === "tool_execution_end" && typeof event.toolCallId === "string" && this.#pendingNativeTools.get(event.toolCallId) === turn) this.#pendingNativeTools.delete(event.toolCallId);
     const update = record(event.assistantMessageEvent);
     if (event.type === "message_update" && update.type === "text_delta" && typeof update.delta === "string") turn.lastText += update.delta;
     const message = record(event.message);
@@ -874,13 +891,22 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  #remember(keys: string[], turn: PiTurnState): void {
+  #remember(keys: string[], turn: PiTurnState): boolean {
     for (const key of keys) {
       if (!this.#owners.has(key)) {
-        if (this.#owners.size >= 4096) throw new Error("Pi RPC native identity limit exceeded");
+        // This is a per-prompt display budget, NOT a warm-session fuse. All
+        // provenance/session/effect gates remain unchanged. Budget exhaustion
+        // drops only the unrouteable display record with an explicit marker.
+        if (this.#activeIdentityCount >= 65_536) {
+          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "[Pi projection truncated]: turn identity budget reached." }, turn);
+          this.#identityLimited = true;
+          return false;
+        }
         this.#owners.set(key, turn);
+        this.#activeIdentityCount++;
       } else if (this.#owners.get(key) !== turn) this.#owners.set(key, null);
     }
+    return true;
   }
 
   async #finishTurn(turn: PiTurnState, status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): Promise<void> {
@@ -891,6 +917,8 @@ export class PiRpcHarnessSession implements HarnessSession {
     const captured = this.#callbacks?.authority.capture();
     if (captured?.runId === turn.runId && captured.turnId === turn.turnId) this.#callbacks?.fence();
     for (const [id, dialog] of this.#dialogs) if (dialog.turn === turn) this.#dialogs.delete(id);
+    for (const [key, owner] of this.#owners) if (owner === turn) this.#owners.set(key, null);
+    this.#activeIdentityCount = 0; this.#identityLimited = false;
     if (this.#resident) this.#admitted = false;
     if (this.#agentTurn === turn) this.#agentTurn = null;
     if (this.#streamTurn === turn) this.#streamTurn = null;
@@ -1039,7 +1067,7 @@ async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPa
 }
 
 function piNativeIdentity(value: unknown): string | null {
-  if (typeof value === "string" && value.length > 0 && value.length <= 4096) return `s:${value}`;
+  if (typeof value === "string" && value.length > 0 && value.length <= 4096) return `s:${createHash("sha256").update(value).digest("hex")}`;
   if (typeof value === "number" && Number.isSafeInteger(value)) return `n:${value}`;
   return null;
 }
@@ -1057,7 +1085,7 @@ function piRecordIdentityKeys(event: PiRpcRecord): string[] {
     if (key !== null) keys.push(`message:${key}`);
   }
   if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
-    keys.push(`stamp:${JSON.stringify([message.role, message.provider, message.model, message.timestamp])}`);
+    keys.push(`stamp:${createHash("sha256").update(JSON.stringify([message.role, message.provider, message.model, message.timestamp])).digest("hex")}`);
   }
   keys.push(...piToolIdentityKeys(event.toolCallId ?? message.toolCallId));
   return [...new Set(keys)];

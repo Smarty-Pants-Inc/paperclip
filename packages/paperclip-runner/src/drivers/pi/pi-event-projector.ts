@@ -17,7 +17,9 @@ interface Block { id: string; kind: string; text: string; terminal: boolean; tru
 interface Tool { id: string; name: string; args?: unknown; input: string; terminal: boolean; started: boolean }
 const MAX_RECORD_BYTES = 256 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
-const MAX_IDENTITIES = 1024;
+const MAX_IDENTITIES = 1024; // Per native message's content indexes, not lifetime work.
+const MAX_ACTIVE_TOOLS = 1024;
+const MAX_RECEIPTS = 65_536; // Compact, turn-local hashes; overflow is display-only.
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const text = (value: unknown): string => typeof value === "string" ? value : "";
 const nativeId = (value: unknown): string | undefined => typeof value === "string" && value.length > 0 ? `s:${value}` : typeof value === "number" && Number.isSafeInteger(value) ? `n:${value}` : undefined;
@@ -93,10 +95,10 @@ function toolControlRecord(event: Record<string, unknown>): Record<string, unkno
  * cursors and terminal authority. In particular, agent_end is NOT settlement.
  * No display event authorizes completion, artifact registration or delegation.
  *
- * The driver supplies the admitted origin and retains this projector for any
- * delayed callbacks from that turn, even after settlement/next admission. Every
- * output carries that captured origin; an envelope must not overwrite it with
- * the driver's current run/turn. Native event payloads cannot select ownership.
+ * The driver supplies the admitted origin and releases this projector at turn
+ * settlement. Delayed callbacks are refused by compact ownership tombstones,
+ * never by borrowing the next turn's projector. Every output carries its
+ * captured origin; native event payloads cannot select ownership.
  */
 export function createPiEventProjector(options: PiEventOrigin & { includeThinking?: boolean }): { project(value: unknown): PiProjectedEvent[] } {
   if (typeof options.runId !== "string" || !options.runId || options.runId.length > 240) throw new Error("pi_projection_run_id_invalid");
@@ -109,13 +111,14 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   let messageId: string | undefined;
   let blocks = new Map<number, Block>();
   const tools = new Map<string, Tool>();
+  const completedTools = new Map<string, Tool>();
   const receipts = new Map<string, string>();
+  let pendingDiagnostics: PiProjectedEvent[] = [];
   const totals: Record<string, number> = {};
   let usageComplete = true;
   let estimatedCostUsd: number | undefined;
   let providerReportedCostUsd: number | undefined;
   let costComplete = true;
-  let identityCount = 0;
   let diagnosticCount = 0;
   let compactionCount = 0;
   let childUsageUnknown = false;
@@ -133,26 +136,49 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     return [{ ...origin, eventType: "harness.diagnostic", payload: { code: suppressed ? "pi_diagnostics_suppressed" : code, providerMethod: suppressed ? "suppressed" : type.slice(0, 160) } }];
   };
   const emit = (eventType: PiProjectedEvent["eventType"], itemId: string, payload: Record<string, unknown>): PiProjectedEvent => ({ ...origin, eventType, itemId, payload });
-  const identity = () => { if (++identityCount > MAX_IDENTITIES) throw new Error("pi_projection_identity_limit"); };
+  // Shared receipt-budget predicate also kept for the native user-receipt
+  // consumer on the descendant image2 candidate. It never fences the session.
+  const identity = () => receipts.size < MAX_RECEIPTS;
   const ensureMessage = () => messageId ??= `${prefix}:pi-message:${++ordinal}`;
   const blockFor = (index: number, kind: string): Block => {
     if (!Number.isSafeInteger(index) || index < 0 || index >= MAX_IDENTITIES) throw new Error("pi_projection_content_index_invalid");
     let block = blocks.get(index);
-    if (!block) { identity(); block = { id: `${ensureMessage()}:block:${index}`, kind, text: "", terminal: false }; blocks.set(index, block); }
+    if (!block) { block = { id: `${ensureMessage()}:block:${index}`, kind, text: "", terminal: false }; blocks.set(index, block); }
     if (block.kind !== kind) throw new Error("pi_projection_content_kind_changed");
     return block;
   };
   const toolFor = (idValue: unknown, name: unknown): Tool => {
     const key = nativeId(idValue);
     if (key === undefined) throw new Error("pi_projection_tool_id_missing");
-    let tool = tools.get(key);
-    if (!tool) { identity(); tool = { id: `${prefix}:pi-tool:${digest(key)}`, name: text(name), input: "", terminal: false, started: false }; tools.set(key, tool); }
+    const toolKey = digest(key);
+    let tool = tools.get(toolKey) ?? completedTools.get(toolKey);
+    if (!tool) {
+      tool = { id: `${prefix}:pi-tool:${toolKey}`, name: text(name), input: "", terminal: false, started: false };
+      if (tools.size < MAX_ACTIVE_TOOLS) tools.set(toolKey, tool);
+      else pendingDiagnostics.push(...diagnostic("tool", "pi_active_tool_projection_limit"));
+    }
     if (typeof name === "string" && name) {
       if (name.length > 240) throw new Error("pi_projection_tool_name_limit");
       if (tool.name && tool.name !== name) throw new Error("pi_projection_tool_name_changed");
       tool.name = name;
     }
     return tool;
+  };
+  const receiptFor = (key: string, fingerprint: string, output: PiProjectedEvent[]): "new" | "seen" | "limited" => {
+    const receiptKey = digest(key);
+    const previous = receipts.get(receiptKey);
+    if (previous !== undefined) {
+      if (previous !== fingerprint) throw new Error("pi_projection_conflicting_receipt");
+      return "seen";
+    }
+    if (!identity()) {
+      usageComplete = false; costComplete = false;
+      output.push(...diagnostic("receipt", "pi_receipt_projection_limit"));
+      output.push(emit("item.completed", `${prefix}:pi-usage:projection-limit`, { kind: "usage", usage: { source: "pi_receipt_projection_limit", total: { ...totals }, runDeltaComplete: false, costComplete: false, childUsage: "unknown" } }));
+      return "limited";
+    }
+    receipts.set(receiptKey, fingerprint);
+    return "new";
   };
   const toolPayload = (tool: Tool): Record<string, unknown> => ({ kind: tool.name === "bash" ? "commandExecution" : "tool", toolName: tool.name, ...(tool.input ? { input: tool.input } : {}), item: { type: "tool_use", id: tool.id, name: tool.name, ...(tool.args === undefined ? {} : { input: tool.args, arguments: tool.args }) } });
   const startTool = (tool: Tool, output: PiProjectedEvent[]) => {
@@ -234,21 +260,29 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       target: null, namespace: null, readOnly: null, status: end ? failed ? "failed" : "completed" : "running", durationMs: duration, exitCode: Number.isSafeInteger(record(result.structuredContent).exit_code) ? record(result.structuredContent).exit_code : null,
       progress: null, output: body || null, outputBytes: Buffer.byteLength(originalToolOutput?.body ?? fullBody), outputTruncated: outputWasTruncated || record(result.structuredContent).truncated === true, outputDigest: (originalToolOutput?.body ?? fullBody) ? `sha256:${digest(originalToolOutput?.body ?? fullBody)}` : null,
     }));
+    if (end) {
+      const key = tool.id.slice(`${prefix}:pi-tool:`.length);
+      tools.delete(key);
+      // Only duplicate/name-conflict metadata survives completion, not the
+      // potentially 64KB input or structured argument preview.
+      completedTools.set(key, { id: tool.id, name: tool.name, input: "", terminal: true, started: true });
+    }
   };
   return { project(value: unknown): PiProjectedEvent[] {
+    pendingDiagnostics = [];
     const source = record(value);
-    // These records carry redundant history, user prompts or binary results
+    // These records carry redundant history, system prompts or binary results
     // which this projector never displays. In particular, agent_end is NOT
     // settlement; its full message list is already persisted by Pi.
     if (["response", "session", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "extension_ui_response"].includes(text(source.type))
-      || (source.type === "message_start" && record(source.message).role !== "assistant")
-      || (source.type === "message_end" && !["assistant", "toolResult"].includes(text(record(source.message).role)))) return [];
+      || (source.type === "message_start" && !["assistant", "user"].includes(text(record(source.message).role)))
+      || (source.type === "message_end" && !["assistant", "toolResult", "user"].includes(text(record(source.message).role)))) return [];
     const serialized = JSON.stringify(value) ?? "null";
     const recordBytes = Buffer.byteLength(serialized);
     displayTruncated = recordBytes > MAX_RECORD_BYTES;
     originalToolOutput = undefined;
     const control = toolControlRecord(source);
-    let observed: unknown = source.type === "message_start" ? { type: source.type, message: { role: "assistant" } }
+    let observed: unknown = source.type === "message_start" && record(source.message).role === "assistant" ? { type: source.type, message: { role: "assistant" } }
       : source.type === "message_end" && record(source.message).role === "assistant" ? { ...source, message: { ...record(source.message), usage: projectionUsage(record(source.message).usage) } }
       : source;
     // Diagnostics consume only method/type; don't walk unknown or extension
@@ -306,8 +340,10 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         if (type === "toolcall_start") startTool(toolFor(update.id, update.toolName), output);
         else if (type === "toolcall_end") {
           const call = record(update.toolCall); const tool = toolFor(call.id, call.name);
-          argumentsFor(tool, call.arguments); startTool(tool, output);
-          output.push(emit("item.delta", tool.id, toolPayload(tool)));
+          if (!tool.terminal) {
+            argumentsFor(tool, call.arguments); startTool(tool, output);
+            output.push(emit("item.delta", tool.id, toolPayload(tool)));
+          }
         }
         // Argument fragments are not executable arguments. The terminal native
         // toolCall and tool_execution_start carry exact complete input.
@@ -320,17 +356,19 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         if (nativeId(message.responseId) === undefined && (typeof message.timestamp !== "number" || !Number.isFinite(message.timestamp) || !text(message.provider) || !text(message.model))) throw new Error("pi_projection_receipt_identity_missing");
         const receiptKey = `assistant:${JSON.stringify([message.provider, message.model, nativeId(message.responseId) ?? message.timestamp])}`;
         const fingerprint = digest(JSON.stringify(message));
-        const previous = receipts.get(receiptKey);
-        if (previous !== undefined) { if (previous !== fingerprint) throw new Error("pi_projection_conflicting_receipt"); return []; }
-        identity(); receipts.set(receiptKey, fingerprint);
+        const receiptState = receiptFor(receiptKey, fingerprint, output);
+        if (receiptState === "seen") return [];
         const failed = message.stopReason === "error" || message.stopReason === "aborted";
         if (failed) { usageComplete = false; costComplete = false; }
         const content = Array.isArray(message.content) ? message.content : [];
         for (const [index, entry] of content.entries()) {
           const part = record(entry);
           if (part.type === "toolCall") {
-            const tool = toolFor(part.id, part.name); argumentsFor(tool, part.arguments); startTool(tool, output);
-            if (!tool.terminal) output.push(emit("item.delta", tool.id, toolPayload(tool)));
+            const tool = toolFor(part.id, part.name);
+            if (!tool.terminal) {
+              argumentsFor(tool, part.arguments); startTool(tool, output);
+              output.push(emit("item.delta", tool.id, toolPayload(tool)));
+            }
           } else if (part.type === "text" || (part.type === "thinking" && includeThinking && part.redacted !== true)) {
             const kind = part.type === "thinking" ? "reasoning" : "agentMessage";
             const block = blockFor(index, kind);
@@ -349,7 +387,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         if (failed && !omittedBlock && !content.some(part => record(part).type === "text")) {
           output.push(emit("item.failed", `${ensureMessage()}:failure`, { kind: "agentMessage", message: projectText(text(message.errorMessage) || `Pi ${message.stopReason}`) }));
         }
-        usageFor(message, receiptKey, output);
+        if (receiptState === "new") usageFor(message, receiptKey, output);
         messageId = undefined; blocks = new Map();
       } else if (message.role === "toolResult") {
         projectTool({ type: "tool_execution_end", toolCallId: message.toolCallId, toolName: message.toolName, result: message, isError: message.isError, durationMs: message.durationMs }, output);
@@ -358,8 +396,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
           if (id === undefined) throw new Error("pi_projection_tool_id_missing");
           const key = `tool:${id}`;
           const fingerprint = digest(JSON.stringify(message.usage));
-          if (!receipts.has(key)) { identity(); receipts.set(key, fingerprint); usageFor(message, key, output); }
-          else if (receipts.get(key) !== fingerprint) throw new Error("pi_projection_conflicting_receipt");
+          if (receiptFor(key, fingerprint, output) === "new") usageFor(message, key, output);
         }
       }
     } else if (["compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"].includes(text(event.type))) {
@@ -384,6 +421,8 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     } else if (!["response", "session", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "extension_ui_response"].includes(text(event.type))) {
       output.push(...diagnostic(text(event.type)));
     }
+    output.push(...pendingDiagnostics);
+    pendingDiagnostics = [];
     // Bound the actual wire payload, including duplicate text fields and JSON
     // escapes. Inputs/arguments here are display copies, never execution authority.
     for (const projected of output) {

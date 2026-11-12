@@ -184,13 +184,13 @@ describe("Pi RPC live-session L4 wiring", () => {
     expect(f.transport.commands.some(command => command.type === "prompt")).toBe(false);
   });
 
-  it.each([false, true])("retains originating projectors for late text/tool/usage after next turn (new run=%s)", async nextRun => {
+  it.each([false, true])("P0-4 releases settled projectors and refuses late text/tool/usage (new run=%s)", async nextRun => {
     const f = await fixture(); const { session, events } = await f.open();
     const first = await begin(session, f.transport, "old");
     f.transport.send(delta("old", "old partial"));
     f.transport.send({ type: "tool_execution_start", messageId: "old", toolCallId: 0, toolName: "read", args: {} });
-    // Settlement may precede a delayed final receipt. Both text and usage must
-    // retain the old projector even after another run is attached.
+    // Settlement releases the old display projector. Delayed records must be
+    // refused, never rebound to the next run or counted against its usage.
     f.transport.send({ type: "agent_settled", aborted: false }); await flush();
     if (nextRun) await session.attachRun!({ runId: "run-b" });
     const second = await begin(session, f.transport, "new");
@@ -200,10 +200,7 @@ describe("Pi RPC live-session L4 wiring", () => {
     f.transport.send({ type: "message_end", message: message("old", { usage: usage(11) }) });
     f.transport.send(delta("new", "new text")); await flush();
     const late = events.slice(boundary).filter(event => event.turnId === first.turnId);
-    expect(late.some(event => event.payload.text === "late old text")).toBe(true);
-    expect(late.some(event => event.eventType === "tool.execution.completed")).toBe(true);
-    expect(late.filter(event => event.eventType === "usage.reported")).toHaveLength(2);
-    for (const event of late) expect(event.runId).toBe("run-a");
+    expect(late).toEqual([]);
     const current = events.slice(boundary).filter(event => event.turnId === second.turnId);
     expect(current.some(event => event.payload.text === "new text")).toBe(true);
     expect(current.some(event => event.eventType === "usage.reported")).toBe(false);
@@ -222,7 +219,8 @@ describe("Pi RPC live-session L4 wiring", () => {
     f.transport.send({ type: "tool_execution_end", toolCallId: "unknown", toolName: "read", result: { content: [{ type: "text", text: "unknown old tool" }] } });
     f.transport.send({ ...delta("old", "captured old text"), runId: "run-b", turnId: second.turnId }); await flush();
     expect(events.slice(boundary).some(event => JSON.stringify(event).includes("unknown old"))).toBe(false);
-    expect(events.find(event => event.payload.text === "captured old text")).toMatchObject({ runId: "run-a", turnId: first.turnId });
+    expect(events.some(event => event.payload.text === "captured old text")).toBe(false);
+    expect(events.slice(boundary).some(event => event.turnId === first.turnId)).toBe(false);
   });
 
   it("uses the captured native stream scope for unlabelled Pi deltas, not a current run fallback", async () => {

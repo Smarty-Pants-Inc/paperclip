@@ -146,6 +146,51 @@ describe("PiRpcDriver P0 regressions", () => {
       expect(f.transport.closed).toBe(true);
     } finally { await f.close(); }
   });
+  it("P0-4 admits 1400 assistant receipts inside one long prompt", async () => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "one long real prompt" } });
+      f.transport.send({ type: "agent_start" });
+      for (let i = 0; i < 1400; i++) {
+        const message = { role: "assistant", provider: "neutral", model: "model", id: `native-id-${i}`, responseId: `response-${i}`, timestamp: i + 1, content: [], stopReason: "stop", usage: {} };
+        f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message });
+      }
+      f.transport.send({ type: "agent_end", messages: [], willRetry: false }); f.transport.send({ type: "agent_settled", aborted: false });
+      await flushFailure();
+      expect(f.events.filter(event => /^(turn\.(completed|failed)|session\.failed)$/.test(event.eventType))).toMatchObject([{ eventType: "turn.completed", turnId: turn.turnId }]);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  }, 30_000);
+  it("P0-4 releases identities across 2100 settled turns on the same warm Pi", async () => {
+    const f = await failureFixture();
+    try {
+      for (let i = 0; i < 2100; i++) {
+        const turn = await f.session.startTurn({ message: { role: "user", text: `prompt ${i}` } });
+        f.transport.send({ type: "agent_start" }); auditFinal(f.transport, i + 1); await flushFailure();
+        expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed", turnId: turn.turnId });
+        expect(f.transport.closed).toBe(false);
+      }
+      expect(f.events.filter(event => event.eventType === "turn.completed")).toHaveLength(2100);
+    } finally { await f.close(); }
+  }, 30_000);
+  it("P0-4 retains an unfinished tool's park blocker and rejects mixed-owner completion", async () => {
+    const f = await failureFixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "old" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-pending", toolName: "read", args: { path: "a" } });
+      auditFinal(f.transport, 1); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).toContain("pending tools");
+      await f.session.startTurn({ message: { role: "user", text: "new" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "message_start", message: { role: "assistant", id: "new-message" } }); await flushFailure();
+      f.transport.send({ type: "tool_execution_end", toolCallId: "old-pending", messageId: "new-message", toolName: "read", result: {} }); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).toContain("pending tools");
+      f.transport.send({ type: "tool_execution_end", toolCallId: "old-pending", toolName: "read", result: {} }); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).not.toContain("pending tools");
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
 });
 
 describe("PiRpcDriver", () => {
@@ -235,7 +280,7 @@ describe("PiRpcDriver", () => {
     } finally { await f.close(); }
   });
 
-  it.each([true, false])("keeps a projector failure's captured origin (old continuation fails=%s)", async oldFails => {
+  it.each([true, false])("P0-4 refuses stale callbacks after releasing the completed projector (stale=%s)", async oldFails => {
     const f = await failureFixture();
     try {
       const old = await f.session.startTurn({ message: { role: "user", text: "old" } });
@@ -253,8 +298,14 @@ describe("PiRpcDriver", () => {
       f.transport.send({ type: "tool_execution_end", toolCallId: oldFails ? "old-tool" : "current-tool", toolName: "read", result: { content: [{ type: "text", text: "conflicting native tool name" }] } });
       await flushFailure();
       const failure = f.events.find(event => event.eventType === "session.failed");
-      expect(failure).toMatchObject({ runId: oldFails ? "run-old" : "run-new", turnId: oldFails ? old.turnId : current.turnId, payload: { code: "pi_rpc_transport_failed", message: "pi_projection_tool_name_changed" } });
-      if (oldFails) expect(f.events.some(event => event.eventType === "turn.failed" && event.turnId === current.turnId)).toBe(false);
+      if (oldFails) {
+        expect(failure).toBeUndefined();
+        expect(f.events.some(event => event.turnId === current.turnId && event.payload.output === "late old")).toBe(false);
+        auditFinal(f.transport, 777); await flushFailure();
+        expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed", runId: "run-new", turnId: current.turnId });
+        expect(f.transport.closed).toBe(false);
+      } else expect(failure).toMatchObject({ runId: "run-new", turnId: current.turnId, payload: { code: "pi_rpc_transport_failed", message: "pi_projection_tool_name_changed" } });
+      expect(f.events.some(event => event.turnId === old.turnId && event.eventType === "turn.completed")).toBe(true);
     } finally { await f.close(); }
   });
 
