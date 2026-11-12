@@ -23,6 +23,15 @@ describe("mergedPiModelsJson", () => {
     expect(merged.providers.paperclip.apiKey).toBe("t");
     expect(merged.providers.paperclip.old).toBeUndefined();
   });
+  it.each(["paperclip", "cliproxyapi-anthropic"])("keeps same-id capability metadata from %s but not its routing or credentials", async provider => {
+    dir = await mkdtemp(join(tmpdir(), "pi-merge-"));
+    const file = join(dir, "models.json");
+    const metadata = { id: "m", contextWindow: 777777, maxTokens: 4321, reasoning: true, thinkingLevelMap: { max: null } };
+    await writeFile(file, JSON.stringify({ providers: { [provider]: { api: "wrong-api", apiKey: "not-the-broker", baseUrl: "https://wrong.invalid", models: [metadata] } } }));
+    const merged = JSON.parse(await mergedPiModelsJson(file, ours));
+    expect(merged.providers.paperclip).toEqual({ baseUrl: "http://127.0.0.1:1", api: "openai-completions", apiKey: "t", models: [metadata] });
+    if (provider !== "paperclip") expect(merged.providers[provider].apiKey).toBe("not-the-broker");
+  });
   it("refuses to overwrite an unparsable models.json", async () => {
     dir = await mkdtemp(join(tmpdir(), "pi-merge-"));
     const file = join(dir, "models.json");

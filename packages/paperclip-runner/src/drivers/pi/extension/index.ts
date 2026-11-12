@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { chmod, lstat, realpath, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, resolve } from "node:path";
+import { piManagedModelRegistration } from "../pi-managed-model.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -211,12 +212,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     if (registeredProvider) pi.unregisterProvider(registeredProvider);
     pi.registerProvider(provider.name, {
       api: provider.api, apiKey: provider.apiKey, baseUrl: provider.baseUrl, authHeader: true,
-      models: provider.models.map(model => ({
-        id: model.id, name: model.name ?? model.id, reasoning: model.reasoning ?? false, input: model.input ?? ["text"],
-        cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: model.contextWindow ?? 128000, maxTokens: model.maxTokens ?? 8192,
-        ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
-      })),
+      models: provider.models.map(piManagedModelRegistration),
     });
     registeredProvider = provider.name;
     const id = candidate.model.slice(provider.name.length + 1);
