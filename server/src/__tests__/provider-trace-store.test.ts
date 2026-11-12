@@ -269,45 +269,50 @@ describe("provider trace retention", () => {
     { name: "download", read: (store) => store.download("run-1", "company-1") },
   ];
 
-  it.each(rawReaders)("denies and expires raw trace access through $name", async ({ name, read }) => {
+  it.each(rawReaders)("keeps a trace past its legacy 24 h deadline readable and undeleted through $name (R-keep-all-traces)", async ({ name, read }) => {
     mockUnlink.mockReset();
     mockUnlink.mockResolvedValue(undefined);
     const { db, returning } = expiredTraceDb();
     const store = providerTraceStore(db as never);
 
-    const result = await read(store);
+    const result = await read(store).catch((error: unknown) => ({ error }));
 
-    expect(result).toEqual(name === "inspect" ? { trace: null, entries: [] } : null);
-    expect(returning).toHaveBeenCalledOnce();
+    if (name === "inspect") expect(result).toMatchObject({ trace: { runId: "run-1" } });
+    if (name === "download") expect(result).not.toBeNull();
+    expect(returning).not.toHaveBeenCalled();
+    expect(mockUnlink).not.toHaveBeenCalled();
   });
 
-  it("keeps an expired row denied but never deletes its raw files or pointer (R-keep-all-traces)", async () => {
+  it("keeps a trace past its legacy deadline readable, with its raw files and pointer (R-keep-all-traces)", async () => {
     mockUnlink.mockReset();
     mockUnlink.mockResolvedValue(undefined);
     const { db, row } = statefulExpiredTraceDb();
     const originalRef = row().traceRef;
     const store = providerTraceStore(db as never);
 
-    await expect(store.inspect("run-1", "company-1")).resolves.toEqual({ trace: null, entries: [] });
-    expect(row()).toMatchObject({ status: "expired", deletedAt: expect.any(Date), traceRef: originalRef });
+    await expect(store.inspect("run-1", "company-1")).resolves.toMatchObject({ trace: { runId: "run-1" } });
+    expect(row()).toMatchObject({ status: "complete", deletedAt: null, traceRef: originalRef });
     expect(originalRef).not.toBe("00000000-0000-0000-0000-000000000000.ndjson");
     await expect(store.cleanupExpired(new Date(Date.now() + 365 * 24 * 60 * 60 * 1000))).resolves.toEqual([]);
     await expect(store.nextRetentionDeadline()).resolves.toBeNull();
     expect(mockUnlink).not.toHaveBeenCalled();
   });
 
-  it("never returns a writable capture path for an expired existing trace", async () => {
+  it("never expires or deletes an existing trace when its run prepares again (R-keep-all-traces)", async () => {
     mockUnlink.mockReset();
     mockUnlink.mockResolvedValue(undefined);
-    const { db } = statefulExpiredTraceDb();
+    const { db, row } = statefulExpiredTraceDb();
+    const before = row();
     const store = providerTraceStore(db as never);
 
-    await expect(store.prepare({
+    await store.prepare({
       runId: "run-1",
       companyId: "company-1",
       provider: "codex",
       requestedBy: "user-1",
-    })).rejects.toThrow("provider_trace_unavailable");
+    }).catch(() => undefined);
+    expect(row()).toMatchObject({ status: before.status, deletedAt: before.deletedAt ?? null, traceRef: before.traceRef });
+    expect(mockUnlink).not.toHaveBeenCalled();
   });
 
   it("does not let concurrent finalization overwrite expiry, and keeps the raw files (R-keep-all-traces)", async () => {

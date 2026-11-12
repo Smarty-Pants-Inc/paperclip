@@ -20,6 +20,11 @@ export const PROVIDER_TRACE_MAX_BYTES = 64 * 1024 * 1024;
 export const PROVIDER_TRACE_RETENTION_MS = 24 * 60 * 60 * 1_000;
 /** R-keep-all-traces: the retention sweep never runs, so raw traces are kept forever. */
 export const PROVIDER_TRACE_KEEP_FOREVER = true;
+/** With keep-forever, new traces never reach an expiry deadline and stay readable. */
+export const PROVIDER_TRACE_KEEP_FOREVER_EXPIRES_AT = new Date("9999-12-31T00:00:00.000Z");
+function providerTraceExpired(expiresAt: Date, now: Date): boolean {
+  return !PROVIDER_TRACE_KEEP_FOREVER && expiresAt.getTime() <= now.getTime();
+}
 const EXPIRED_PROVIDER_TRACE_REF = "00000000-0000-0000-0000-000000000000.ndjson";
 
 export function providerTraceRequiredChannels(provider: string): string[] {
@@ -402,7 +407,7 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
     if (existing) {
       if (importingProviderTraceRef(existing.traceRef)) throw new Error("provider_trace_import_in_progress");
       const now = new Date();
-      const expired = existing.expiresAt.getTime() <= now.getTime();
+      const expired = providerTraceExpired(existing.expiresAt, now);
       if (expired) await expireRow(existing, now);
       if (existing.deletedAt || expired) {
         throw new Error("provider_trace_unavailable");
@@ -427,7 +432,8 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
     const handle = await fs.open(filePath, "wx", 0o600);
     await handle.close();
     await fs.chmod(filePath, 0o600);
-    const expiresAt = new Date(Date.now() + PROVIDER_TRACE_RETENTION_MS);
+    const expiresAt = PROVIDER_TRACE_KEEP_FOREVER ? PROVIDER_TRACE_KEEP_FOREVER_EXPIRES_AT
+      : new Date(Date.now() + PROVIDER_TRACE_RETENTION_MS);
     const values = {
       runId: input.runId, companyId: input.companyId, status: "capturing", provider: input.provider,
       traceRef, requestedBy: input.requestedBy, expiresAt,
@@ -465,14 +471,14 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
     const now = new Date();
     if (row.deletedAt) {
       if (
-        row.expiresAt.getTime() <= now.getTime()
+        providerTraceExpired(row.expiresAt, now)
         && row.traceRef !== EXPIRED_PROVIDER_TRACE_REF
       ) {
         await expireRow(row, now);
       }
       return null;
     }
-    if (row.expiresAt.getTime() <= now.getTime()) {
+    if (providerTraceExpired(row.expiresAt, now)) {
       await expireRow(row, now);
       return null;
     }
