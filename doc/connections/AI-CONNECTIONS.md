@@ -706,7 +706,8 @@ credentials belong to the connection; the model belongs to the agent.
 | Codex legacy and Codex New Runner (app-server) | OpenRouter; custom/local OpenAI Responses endpoints |
 | Claude legacy and Claude New Runner (ACPX) | OpenRouter; custom/local Anthropic Messages; Bedrock API key |
 | OpenCode legacy and New Runner | OpenRouter; custom/local Chat Completions |
-| Pi legacy and New Runner | OpenRouter; native OpenAI, Anthropic, and Google API keys with a matching `provider/model` |
+| Pi legacy | OpenRouter; native OpenAI, Anthropic, and Google API keys with a matching `provider/model` |
+| Pi New Runner (ACPX) | OpenRouter; native OpenAI, Anthropic, and Google API keys with a matching `provider/model`; custom/local Anthropic Messages; custom/local OpenAI Responses |
 | Hermes local | OpenRouter; custom/local Chat Completions |
 | Gemini CLI, Grok | Their native API connections; custom routes are not advertised |
 
@@ -716,7 +717,7 @@ environment probes and task execution. The settings file contains no credential.
 
 OpenClaw Gateway, Hermes Gateway, Claude Managed, AWS AgentCore, Process, HTTP,
 and legacy `acpx_local` are excluded: external agents retain their own model
-configuration, and `acpx_local` is retired. Cursor/Copilot custom routing, Pi custom gateways and Bedrock,
+configuration, and `acpx_local` is retired. Cursor/Copilot custom routing, Pi legacy custom gateways, Pi Bedrock,
 Vertex, ambient AWS identity, arbitrary authentication headers, and automatic
 catalog discovery for custom gateways are not part of this implementation.
 
@@ -746,6 +747,16 @@ ALL_PROXY fallback, NO_PROXY bypasses, and SSL_CERT_FILE/SSL_CERT_DIR trust. The
 harness bypasses outgoing proxies for loopback broker/MCP calls. This bounds key exposure
 from shell tools reading the configuration; it is not an OS isolation boundary
 against a process debugger running as the runner user.
+
+Pi New Runner custom gateways use the same runner broker. The runner keeps the
+reusable key and writes only a session-scoped loopback capability into Pi's private
+`models.json`: the broker URL, a per-session token, and the agent's model, under the
+`paperclip` provider (model `paperclip/<id>`). Messages connections are served at the
+broker root (`/v1/messages`, token in `x-api-key` or `Authorization`), and Responses
+connections at `/v1/responses`. The same streaming, error-status, redirect, revocation,
+proxy and trust rules apply, and the same limit: the broker bounds key exposure from
+shell tools reading configuration or environment, but it is not an OS isolation
+boundary against a debugger running as the runner user.
 
 Only fixed official provider endpoints receive control-plane key checks. Custom
 endpoints and Bedrock are exercised by the selected harness in the selected

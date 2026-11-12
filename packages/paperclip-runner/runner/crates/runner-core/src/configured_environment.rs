@@ -63,7 +63,10 @@ const RESERVED: &[&str] = &[
     "PAPERCLIP_AGENT_MESSAGE_KEY",
     "PAPERCLIP_AGENT_PRIVATE_KEY",
     "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AI_PROVIDER_AUTH",
     "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+    "PAPERCLIP_AI_PROVIDER_URL",
     "PAPERCLIP_API_BRIDGE_MODE",
     "PAPERCLIP_API_KEY",
     "PAPERCLIP_API_URL",
@@ -196,6 +199,35 @@ pub(crate) fn apply_configured_environment(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn managed_provider_route_cannot_be_projected_into_task_environment() {
+        for name in [
+            "PAPERCLIP_AI_PROVIDER_KEY",
+            "PAPERCLIP_AI_PROVIDER_URL",
+            "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+            "PAPERCLIP_AI_PROVIDER_AUTH",
+        ] {
+            for key in [name.to_owned(), name.to_ascii_lowercase()] {
+                let raw = serde_json::to_string(&[&key]).unwrap();
+                let mut command = Command::new("unused");
+                assert!(
+                    apply_configured_environment(&mut command, |lookup| {
+                        if lookup == MARKER {
+                            Some(raw.clone())
+                        } else if lookup == key {
+                            Some("route-fixture".to_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .is_err(),
+                    "managed route name {key} must not cross the task projection"
+                );
+                assert_eq!(command.get_envs().count(), 0);
+            }
+        }
+    }
 
     #[test]
     fn rejects_reserved_malformed_missing_and_oversized_environment() {

@@ -42,8 +42,15 @@ export function managedProviderRouting(
       env.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
       env.CLAUDE_CODE_SUBAGENT_MODEL = model;
     }
-  } else if (harness === "pi_local" && route.kind === "openrouter") {
+  } else if ((harness === "pi_local" || harness === "pi_runtime") && route.kind === "openrouter") {
     env.OPENROUTER_API_KEY = credential;
+    config.model = aiRoutingModel(route, harness, model);
+  } else if (harness === "pi_runtime" && (route.kind === "gateway" || route.kind === "local")
+    && (route.protocol === "messages" || route.protocol === "responses")) {
+    env.PAPERCLIP_AI_PROVIDER_URL = baseUrl;
+    env.PAPERCLIP_AI_PROVIDER_KEY = credential;
+    env.PAPERCLIP_AI_PROVIDER_PROTOCOL = route.protocol;
+    env.PAPERCLIP_AI_PROVIDER_AUTH = route.auth;
     config.model = aiRoutingModel(route, harness, model);
   } else if (harness === "opencode_local") {
     const provider = route.kind === "openrouter" ? "openrouter" : "paperclip";

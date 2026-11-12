@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createAcpxSidecarHostEnvironment, createSanitizedAcpxSpawnInput } from "./environment.js";
 import { assertPiInstallationProfile } from "./pi-installation.js";
 import { requireVerifiedAcpxModel } from "./model-verification.js";
-import { piProviderConfiguration } from "./pi-provider-config.js";
+import { PI_CREDENTIAL_NAMES, PI_SIDECAR_PROVIDER_ROUTE_NAMES, piCredentialNames, piProviderConfiguration } from "./pi-provider-config.js";
 import { resolveQualifiedAcpxProfile } from "./qualified-profiles.js";
 import { createAcpxRecoveryBinding } from "./recovery-identity.js";
 
@@ -38,7 +38,7 @@ describe("Pi caller-selected providers and models", () => {
     finally { vi.unstubAllEnvs(); }
   });
 
-  it.each(["!cat /private/key", "PAPERCLIP_API_KEY", "NODE_OPTIONS", "PATH", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"])("rejects unsafe custom-provider credential reference %s", apiKey => {
+  it.each(["!cat /private/key", "PAPERCLIP_API_KEY", "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH", "NODE_OPTIONS", "PATH", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"])("rejects unsafe custom-provider credential reference %s", apiKey => {
     expect(() => piProviderConfiguration({ PAPERCLIP_PI_PROVIDERS: JSON.stringify({ custom: { apiKey } }) })).toThrow();
   });
 
@@ -49,6 +49,18 @@ describe("Pi caller-selected providers and models", () => {
     }
     for (const apiKey of ["LD_API_KEY", "DYLD_API_KEY", "MY_PI_SERVICE_KEY"]) {
       expect(piProviderConfiguration({ PAPERCLIP_PI_PROVIDERS: JSON.stringify({ custom: { apiKey } }) })?.credentialNames).toEqual([apiKey]);
+    }
+  });
+
+  it("keeps managed route names out of Pi's child credential catalog", () => {
+    expect(PI_SIDECAR_PROVIDER_ROUTE_NAMES).toEqual([
+      "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL",
+      "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
+    ]);
+    expect(Object.isFrozen(PI_SIDECAR_PROVIDER_ROUTE_NAMES)).toBe(true);
+    for (const name of PI_SIDECAR_PROVIDER_ROUTE_NAMES) {
+      expect(PI_CREDENTIAL_NAMES).not.toContain(name);
+      expect(piCredentialNames({ [name]: "route-fixture" })).not.toContain(name);
     }
   });
 

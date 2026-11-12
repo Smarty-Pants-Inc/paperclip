@@ -72,6 +72,19 @@ describe("configured environment authority", () => {
     expect(projected.PAPERCLIP_API_KEY).toBeUndefined();
   });
 
+  it.each([
+    "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL",
+    "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
+  ])("reserves managed route value %s for the runner instead of task children", name => {
+    for (const key of [name, name.toLowerCase()]) {
+      const projected = configuredEnvironmentProjection({ [key]: "route-fixture", CUSTOM_FLAG: "allowed" });
+      expect(projected).not.toHaveProperty(key);
+      expect(JSON.parse(projected[CONFIGURED_ENVIRONMENT_KEYS]!)).toEqual(["CUSTOM_FLAG"]);
+      expect(() => configuredEnvironment({ [key]: "route-fixture", [CONFIGURED_ENVIRONMENT_KEYS]: JSON.stringify([key]) }))
+        .toThrow("Invalid configured environment projection");
+    }
+  });
+
   it("reserves Kimi credentials for the selected provider instead of the generic task projection", async () => {
     const { createSanitizedAcpxSpawnInput } = await import("./drivers/acpx/environment.js");
     const projected = configuredEnvironmentProjection({ KIMI_API_KEY: "selected-kimi-secret", CUSTOM_FLAG: "allowed" });

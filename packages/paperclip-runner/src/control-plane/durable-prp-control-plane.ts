@@ -34,7 +34,7 @@ import { verifyPrivateRegularFile } from "./private-state-file.js";
 
 import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES, CLAUDE_ROUTING_ENV_KEYS, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
-import { piCredentialNames } from "../drivers/acpx/pi-provider-config.js";
+import { PI_SIDECAR_PROVIDER_ROUTE_NAMES, piCredentialNames } from "../drivers/acpx/pi-provider-config.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
 import {
   validatePrpEvent,
@@ -4588,8 +4588,7 @@ const runnerPlatformEnvironmentKeys = [
 const runnerExplicitProviderEnvironmentKeys = [
   ...ACPX_CREDENTIAL_NAMES.claude.filter(name => !name.startsWith("AWS_")),
   ...CLAUDE_ROUTING_ENV_KEYS,
-  "PAPERCLIP_AI_PROVIDER_KEY",
-  "PAPERCLIP_AI_PROVIDER_URL",
+  ...PI_SIDECAR_PROVIDER_ROUTE_NAMES,
   "PAPERCLIP_AGENT_KEY_ID",
   "PAPERCLIP_AGENT_PUBLIC_KEY",
   "PAPERCLIP_AGENT_PRIVATE_KEY",

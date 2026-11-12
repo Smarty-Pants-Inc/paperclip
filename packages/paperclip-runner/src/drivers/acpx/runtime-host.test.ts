@@ -35,6 +35,7 @@ import {
 } from "./runtime-sandbox.js";
 import {
   AcpxRuntimeHost,
+  providerConfigurationDigest,
   type AcpxRuntimeHostDependencies,
   type AcpxRuntimePort,
   type AcpxRuntimePortOpenOptions,
@@ -204,6 +205,34 @@ afterEach(async () => {
 });
 
 describe("ACPX runtime host", () => {
+  it("hashes the actual managed Pi route without requiring child provider JSON", () => {
+    const environment = {
+      PAPERCLIP_AI_PROVIDER_URL: "https://gateway.example/v1",
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "responses",
+      PAPERCLIP_AI_PROVIDER_AUTH: "bearer",
+      PAPERCLIP_AI_PROVIDER_KEY: "provider-key-canary",
+    };
+    const digest = providerConfigurationDigest(environment, "paperclip/model-x");
+    expect(digest).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(providerConfigurationDigest({ ...environment, PAPERCLIP_AI_PROVIDER_KEY: "replacement-key-canary" }, "paperclip/model-x")).toBe(digest);
+    for (const change of [
+      { PAPERCLIP_AI_PROVIDER_URL: "https://other.example/v1" },
+      { PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages" },
+      { PAPERCLIP_AI_PROVIDER_AUTH: "api_key" },
+    ]) expect(providerConfigurationDigest({ ...environment, ...change }, "paperclip/model-x")).not.toBe(digest);
+    expect(providerConfigurationDigest(environment, "paperclip/model-y")).not.toBe(digest);
+  });
+  it("keeps managed Pi provider identity stable across broker ports and tokens", () => {
+    const config = (port: number, token: string, url = "https://gateway.example/v1") => ({
+      PAPERCLIP_AI_PROVIDER_URL: url,
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "responses",
+      PAPERCLIP_AI_PROVIDER_AUTH: "bearer",
+      PAPERCLIP_PI_PROVIDERS: JSON.stringify({ paperclip: { baseUrl: `http://127.0.0.1:${port}/v1`, apiKey: token, models: [{ id: "model-x" }] } }),
+    });
+    const original = providerConfigurationDigest(config(41001, "session-one"), "paperclip/model-x");
+    expect(providerConfigurationDigest(config(53022, "session-two"), "paperclip/model-x")).toBe(original);
+    expect(providerConfigurationDigest(config(53022, "session-two", "https://other.example/v1"), "paperclip/model-x")).not.toBe(original);
+  });
   it.each(["copilot", "cursor"] as const)("reports missing %s credentials as credential admission", async agent => {
     const fixture = await hostFixture();
     const openRuntime = vi.fn(async () => runtimePort());

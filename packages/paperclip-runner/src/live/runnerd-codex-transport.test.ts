@@ -26,6 +26,7 @@ import {
   ACPX_CREDENTIAL_BINDING_ENV,
   createAcpxCredentialBinding,
   createAcpxSidecarHostEnvironment,
+  createSanitizedAcpxSpawnInput,
 } from "../drivers/acpx/environment.js";
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
 import * as durableControlPlane from "../control-plane/durable-prp-control-plane.js";
@@ -3220,6 +3221,45 @@ it.each([
     expect(environment.DATABASE_URL).toBeUndefined();
   },
 );
+
+it.each(["pi", "cursor", "copilot", "claude"] as const)(
+  "passes the managed Pi route only to the %s sidecar",
+  agent => {
+    const route = {
+      PAPERCLIP_AI_PROVIDER_KEY: "managed-key-fixture", PAPERCLIP_AI_PROVIDER_URL: "https://models.example",
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key",
+    };
+    const environment = createCapabilityRunnerdProviderEnvironment({
+      provider: "acpx", options: { acpxAgent: agent, environment: { ...route, PAPERCLIP_AI_PROVIDER_OTHER: "must-not-cross" } },
+      identity: { runnerInstanceId: "runner-1", environmentLeaseId: "lease-1", runId: "run-1", normalizedSessionId: "session-1", turnId: "turn-1", itemId: "item-1" },
+      codexHome: "/isolated/home", runtimeContextPath: "/isolated/context.json", hasRuntimeContext: false,
+    });
+    for (const [name, value] of Object.entries(route)) expect(environment[name]).toBe(agent === "pi" ? value : undefined);
+    expect(environment.PAPERCLIP_AI_PROVIDER_OTHER).toBeUndefined();
+    if (agent === "pi") {
+      expect(JSON.parse(environment[ACPX_CREDENTIAL_BINDING_ENV]!)).toMatchObject({ names: [] });
+      const sidecar = createAcpxSidecarHostEnvironment(environment, "pi", "session-1");
+      expect(sidecar).toMatchObject(route);
+      const child = createSanitizedAcpxSpawnInput(sidecar, "pi").env;
+      for (const name of Object.keys(route)) expect(child).not.toHaveProperty(name);
+    }
+  },
+);
+
+it("never inherits an ambient managed Pi route into runnerd", () => {
+  const names = ["PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH"];
+  for (const name of names) vi.stubEnv(name, "ambient-must-not-cross");
+  try {
+    for (const environment of [undefined, {}]) {
+      const result = createCapabilityRunnerdProviderEnvironment({
+        provider: "acpx", options: { acpxAgent: "pi", environment },
+        identity: { runnerInstanceId: "runner-1", environmentLeaseId: "lease-1", runId: "run-1", normalizedSessionId: "session-1", turnId: "turn-1", itemId: "item-1" },
+        codexHome: "/isolated/home", runtimeContextPath: "/isolated/context.json", hasRuntimeContext: false,
+      });
+      for (const name of names) expect(result).not.toHaveProperty(name);
+    }
+  } finally { vi.unstubAllEnvs(); }
+});
 
 it("does not bind ambient candidate credentials from an inherited or caller-supplied marker", () => {
   const forged = createAcpxCredentialBinding({ CURSOR_API_KEY: "ambient-secret" }, "cursor", "session-1")!;

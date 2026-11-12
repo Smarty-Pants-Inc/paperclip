@@ -25,7 +25,7 @@ import { describe, expect, it, vi } from "vitest";
 import { configuredEnvironmentProjection } from "../configured-environment.js";
 import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
 import { createCapabilityRunnerdCodexTransport, createCapabilityRunnerdProviderEnvironment } from "../live/runnerd-codex-transport.js";
-import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
+import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxSidecarHostEnvironment, createSanitizedAcpxSpawnInput } from "../drivers/acpx/environment.js";
 import { validatePrpEvent } from "../protocol/replay-contract.js";
 import { digestPaperclipSemanticContent } from "../semantic-tools/receipts.js";
 import {
@@ -2210,6 +2210,49 @@ it.each([undefined, {}, {
     expect(launches).toHaveLength(1);
     for (const name of names) expect(launches[0]!.environment[name]).toBe(environment?.[name]);
     expect(launches[0]!.environment.PAPERCLIP_CURSOR_CLOUD_UNRELATED).toBeUndefined();
+  } finally { vi.unstubAllEnvs(); }
+});
+
+it("preserves only an explicit managed Pi route at runner spawn and restart boundaries", () => {
+  const route = {
+    PAPERCLIP_AI_PROVIDER_KEY: "managed-key-fixture", PAPERCLIP_AI_PROVIDER_URL: "https://models.example",
+    PAPERCLIP_AI_PROVIDER_PROTOCOL: "responses", PAPERCLIP_AI_PROVIDER_AUTH: "bearer",
+  };
+  for (const name of Object.keys(route)) vi.stubEnv(name, "ambient-must-not-cross");
+  try {
+    const prepared = createCapabilityRunnerdProviderEnvironment({
+      provider: "acpx", options: { acpxAgent: "pi", environment: route }, identity,
+      codexHome: "/isolated/home", runtimeContextPath: "/isolated/context.json", hasRuntimeContext: false,
+    });
+    for (const mode of ["absent", "empty", "explicit", "prepared"] as const) {
+      const environment = mode === "absent" ? undefined : mode === "empty" ? {}
+        : mode === "explicit" ? { ...route, PAPERCLIP_AI_PROVIDER_OTHER: "must-not-cross" } : prepared;
+      const launches: RunnerProcessLaunchSpec[] = [];
+      const handle = spawnRunner({
+        connection: { mode: "connect", connectUrl: "ws://127.0.0.1:43127" },
+        stateDirectory: "/tmp/paperclip-runner-test", identity, ticket: "bootstrap-ticket",
+        maxOutboxBytes: 256 * 1024, p0ReserveBytes: 64 * 1024,
+        runnerVersion: expectedRunnerVersion, runnerDigest: expectedRunnerDigest, environment,
+        processLauncher: spec => {
+          launches.push(spec);
+          return { child: { pid: 42, exitCode: null, signalCode: null, kill: () => true },
+            completion: Promise.resolve({ code: 0, signal: null, stdout: "", stderr: "" }) };
+        },
+      });
+      restartRunner(handle, "replacement-ticket");
+      expect(launches).toHaveLength(2);
+      for (const launch of launches) {
+        const sidecar = createAcpxSidecarHostEnvironment(launch.environment, "pi", identity.normalizedSessionId);
+        const child = createSanitizedAcpxSpawnInput(sidecar, "pi").env;
+        for (const [name, value] of Object.entries(route)) {
+          expect(launch.environment[name], `${mode}: ${name}`).toBe(mode === "explicit" || mode === "prepared" ? value : undefined);
+          expect(sidecar[name]).toBe(launch.environment[name]);
+          expect(child).not.toHaveProperty(name);
+          expect(launch.args.join("\n")).not.toContain(value);
+        }
+        expect(launch.environment.PAPERCLIP_AI_PROVIDER_OTHER).toBeUndefined();
+      }
+    }
   } finally { vi.unstubAllEnvs(); }
 });
 

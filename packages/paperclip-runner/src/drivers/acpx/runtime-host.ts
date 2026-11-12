@@ -7,6 +7,7 @@ import { composeCopilotSystemInstructions } from "./copilot-profile.js";
 import { resolveClaudeEffort } from "./claude-effort.js";
 import { resolveGrokEffort } from "./grok-effort.js";
 import { piProviderConfiguration } from "./pi-provider-config.js";
+import { createHash } from "node:crypto";
 import { withAcpxTurnCancellation } from "./turn-cancellation.js";
 import type { AcpxTerminalSessionFailure } from "./provider-failure.js";
 import { resolveAcpxProviderMode } from "./provider-mode.js";
@@ -78,6 +79,23 @@ import type { AcpxExpectedSessionIdentity } from "./sidecar-protocol.js";
 
 export const ACPX_TURN_CANCELLATION_SHUTDOWN_BOUND_MS = 2_000;
 const RUNTIME_ADMISSION_VERIFICATION_TIMEOUT_MS = 8_000;
+
+/** Stable recovery identity for managed Pi routes; never includes a credential or loopback broker address. */
+export function providerConfigurationDigest(environment: NodeJS.ProcessEnv | undefined, model: string): string | undefined {
+  const configuration = piProviderConfiguration(environment);
+  if (!configuration) return undefined;
+  const parsed = JSON.parse(configuration.json) as { providers?: Record<string, unknown> };
+  const usingPaperclip = Boolean(environment?.PAPERCLIP_AI_PROVIDER_URL)
+    || Boolean(parsed.providers && Object.hasOwn(parsed.providers, "paperclip"));
+  if (!usingPaperclip) return configuration.digest;
+  const stableRoute = {
+    url: environment?.PAPERCLIP_AI_PROVIDER_URL ?? "",
+    protocol: environment?.PAPERCLIP_AI_PROVIDER_PROTOCOL ?? "",
+    auth: environment?.PAPERCLIP_AI_PROVIDER_AUTH ?? "",
+    model,
+  };
+  return `sha256:${createHash("sha256").update(JSON.stringify(stableRoute)).digest("hex")}`;
+}
 const activeRuntimeHostCleanupOwners = new Set<Promise<unknown>>();
 
 class AcpxRuntimeAdmissionTimeoutError extends Error {
@@ -286,6 +304,8 @@ export interface OpenAcpxRuntimeHostOptions {
   semanticTools?: AcpxSemanticToolSession;
   assignedMcpTransport?: "prp";
   onGoalUpdate?: (goal: AcpxRuntimeGoalSnapshot | null) => void;
+  /** Register runner-owned capabilities with the embedding diagnostic redactor. */
+  onSensitiveValues?(values: readonly string[]): void;
 }
 
 const RETAINED_CLEANUP_RETRY_INITIAL_DELAY_MS = 10;
@@ -403,7 +423,7 @@ export class AcpxRuntimeHost {
           workingDirectory: options.workingDirectory,
           profile,
           requestedModel: options.model,
-          ...(options.agent === "pi" ? { providerConfigurationDigest: piProviderConfiguration(options.environment)?.digest } : {}),
+          ...(options.agent === "pi" ? { providerConfigurationDigest: providerConfigurationDigest(options.environment, options.model) } : {}),
           permissionMode: options.permissionMode,
           mode: resolveAcpxProviderMode(options.agent, options.mode),
           piThinkingLevel: resolvePiThinkingLevel(options.agent, options.piThinkingLevel),
@@ -491,6 +511,7 @@ export class AcpxRuntimeHost {
             binding,
             agent: options.agent,
             environment: options.environment,
+            onSensitiveValues: options.onSensitiveValues,
             tools: options.semanticTools?.tools,
             ...(options.providerPolicy === undefined ? {} : { providerPolicy: {
               ...options.providerPolicy,
@@ -553,6 +574,18 @@ export class AcpxRuntimeHost {
           reportFailure: (failure) =>
             dependencies.reportRetainedCleanupFailure(failure),
         });
+      }
+      if (sandbox.closeOwnedConfiguration) {
+        const providerLifetime = credential;
+        credential = {
+          lifetimeFenceCandidates: providerLifetime.lifetimeFenceCandidates,
+          lifetimeFenceFds: providerLifetime.lifetimeFenceFds,
+          activateLifetimeOwner: pid => providerLifetime.activateLifetimeOwner(pid),
+          async close() {
+            await providerLifetime.close();
+            await sandbox.closeOwnedConfiguration!();
+          },
+        };
       }
       options.signal?.throwIfAborted();
       admissionStage = "configuration";

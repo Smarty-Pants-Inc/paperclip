@@ -94,7 +94,7 @@ export function aiRoutingHarness(
         codex: "codex_local",
         opencode: "opencode_local",
         grok: "grok_local",
-        pi: "pi_local",
+        pi: "pi_runtime",
       } as Record<string, string>
     )[String(runner)] ?? "unsupported"
   );
@@ -110,11 +110,17 @@ export function isAiRoutingCompatible(
       "codex_local",
       "opencode_local",
       "pi_local",
+      "pi_runtime",
       "hermes_local",
     ].includes(harness);
-  if (route.protocol === "responses") return harness === "codex_local";
-  if (route.protocol === "messages") return harness === "claude_local";
-  return ["opencode_local", "hermes_local"].includes(harness);
+  const customProtocolCapabilities: Readonly<Record<string, readonly AiProviderRouting["protocol"][]>> = {
+    codex_local: ["responses"],
+    claude_local: ["messages"],
+    opencode_local: ["chat"],
+    hermes_local: ["chat"],
+    pi_runtime: ["messages", "responses"],
+  };
+  return customProtocolCapabilities[harness]?.includes(route.protocol) ?? false;
 }
 export function aiRoutingBaseUrl(
   route: AiProviderRouting,
@@ -130,7 +136,10 @@ export function aiRoutingModel(
   harness: string,
   model: string,
 ): string {
-  if (!model || (harness !== "opencode_local" && !(harness === "pi_local" && route.kind === "openrouter"))) return model;
+  const prefixesModel = harness === "opencode_local"
+    || (harness === "pi_local" && route.kind === "openrouter")
+    || (harness === "pi_runtime" && ["openrouter", "gateway", "local"].includes(route.kind));
+  if (!model || !prefixesModel) return model;
   const prefix = route.kind === "openrouter" ? "openrouter" : "paperclip";
   return model.startsWith(`${prefix}/`) ? model : `${prefix}/${model}`;
 }

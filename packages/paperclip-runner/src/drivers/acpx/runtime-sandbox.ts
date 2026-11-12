@@ -2,6 +2,7 @@ import { kimiManagedConfiguration } from "./kimi-config.js";
 import { kimiInstructionBinding } from "./kimi-instructions.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS, codexObservabilityToml } from "../agent-observability.js";
 import { piProviderConfiguration } from "./pi-provider-config.js";
+import { startPiProviderLoopback, usesPiProviderLoopback } from "./pi-provider-loopback.js";
 import { configuredPiNativeExtensions } from "./pi-extension-snapshot.js";
 import { configuredEnvironmentKeys } from "../../configured-environment.js";
 import { COPILOT_SYSTEM_INSTRUCTIONS_FILE } from "./copilot-profile.js";
@@ -59,6 +60,8 @@ export interface AcpxRuntimeSandbox {
   agentHomeDirectory: string;
   workspaceRecordPath: string;
   initializeOwnedConfiguration?: () => Promise<void>;
+  /** Release session capabilities after the provider lifetime has ended. */
+  closeOwnedConfiguration?: () => Promise<void>;
   launchEnvironment: Readonly<NodeJS.ProcessEnv>;
   persistedEnvironment: Readonly<NodeJS.ProcessEnv>;
   /** The host sandbox must protect these runtime/config paths from tools. */
@@ -349,6 +352,7 @@ export async function prepareAcpxRuntimeSandbox(input: {
   /** Public operations on the runner-owned Paperclip MCP bridge only. */
   tools?: readonly Readonly<Record<string, unknown>>[];
   providerPolicy?: AcpxProviderRuntimePolicy;
+  onSensitiveValues?(values: readonly string[]): void;
 }): Promise<AcpxRuntimeSandbox> {
   if (input.agent === "pi" && (input.providerPolicy === undefined || typeof input.providerPolicy.readOnly !== "boolean")) {
     throw new Error("Pi admission requires an explicit task execution policy");
@@ -427,7 +431,9 @@ export async function prepareAcpxRuntimeSandbox(input: {
   if (input.agent === "kimi") {
     await writePrivateFile(join(agentHomeDirectory, "config.toml"), kimiManagedConfiguration(input.binding.requestedModel));
   }
-  if (input.agent === "pi") {
+  const managedPiProvider = input.agent === "pi" && usesPiProviderLoopback(input.binding.requestedModel, input.environment);
+  let piProviderLoopback: Awaited<ReturnType<typeof startPiProviderLoopback>> | undefined;
+  if (input.agent === "pi" && !managedPiProvider) {
     const configuration = piProviderConfiguration(input.environment);
     if (configuration) await writePrivateFile(join(agentHomeDirectory, "models.json"), configuration.json);
   }
@@ -446,6 +452,16 @@ export async function prepareAcpxRuntimeSandbox(input: {
           : {}),
       })}\n`,
     );
+  } : managedPiProvider ? async () => {
+    if (piProviderLoopback) return;
+    const provider = await startPiProviderLoopback({ model: input.binding.requestedModel, environment: input.environment ?? {}, onSensitiveValues: input.onSensitiveValues });
+    try {
+      await writePrivateFile(join(agentHomeDirectory, "models.json"), provider.json);
+      piProviderLoopback = provider;
+    } catch (error) {
+      await provider.close();
+      throw error;
+    }
   } : input.agent === "antigravity" ? async () => {
     const profile = await ensurePrivateDirectory(join(agentHomeDirectory, "antigravity-acp"), agentHomeDirectory);
     const method = input.environment?.PAPERCLIP_ACPX_ANTIGRAVITY_AUTH_JSON_SECRET ? "oauth-personal" : "gemini-api-key";
@@ -617,6 +633,7 @@ export async function prepareAcpxRuntimeSandbox(input: {
     agentHomeDirectory,
     workspaceRecordPath,
     ...(initializeOwnedConfiguration ? { initializeOwnedConfiguration } : {}),
+    ...(managedPiProvider ? { closeOwnedConfiguration: async () => { await piProviderLoopback?.close(); piProviderLoopback = undefined; } } : {}),
     protectedPaths,
     launchEnvironment: Object.freeze({ ...launchEnvironment }),
     persistedEnvironment: Object.freeze(persistedEnvironment),

@@ -242,6 +242,44 @@ fn pi_credential_environment_keys(binding: Option<&str>) -> Result<Vec<String>, 
     Ok(value.names)
 }
 
+fn sidecar_credential_keys(agent: &str) -> Result<&'static [&'static str], LocalRunnerError> {
+    let keys: &[&str] = match agent {
+        "claude" => &[
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+        ],
+        "codex" => &[
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "PAPERCLIP_AI_PROVIDER_KEY",
+        ],
+        "grok" => &["XAI_API_KEY", "PAPERCLIP_ACPX_GROK_AUTH_JSON_SECRET"],
+        // Managed routing belongs to the sidecar's loopback broker, not Pi's
+        // native provider credential binding or child-process environment.
+        "pi" => &[
+            "PAPERCLIP_AI_PROVIDER_KEY",
+            "PAPERCLIP_AI_PROVIDER_URL",
+            "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+            "PAPERCLIP_AI_PROVIDER_AUTH",
+        ],
+        "cursor" => &["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
+        "copilot" => &["COPILOT_GITHUB_TOKEN"],
+        "kimi" => &["KIMI_API_KEY"],
+        "antigravity" => &[
+            "GEMINI_API_KEY",
+            "PAPERCLIP_ACPX_ANTIGRAVITY_AUTH_JSON_SECRET",
+        ],
+        _ => {
+            return Err(LocalRunnerError::invalid(
+                "ACPX sidecar credentials require a known agent profile",
+            ))
+        }
+    };
+    Ok(keys)
+}
+
 impl AcpxSidecarTransport {
     pub fn start(config: &AcpxSidecarTransportConfig) -> Result<Self, LocalRunnerError> {
         Self::start_with_environment_keys(config, &[])
@@ -251,33 +289,7 @@ impl AcpxSidecarTransport {
         config: &AcpxSidecarTransportConfig,
         agent: &str,
     ) -> Result<Self, LocalRunnerError> {
-        let credential_keys: &[&str] = match agent {
-            "claude" => &[
-                "ANTHROPIC_API_KEY",
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "ANTHROPIC_AUTH_TOKEN",
-                "AWS_BEARER_TOKEN_BEDROCK",
-            ],
-            "codex" => &[
-                "OPENAI_API_KEY",
-                "CODEX_API_KEY",
-                "PAPERCLIP_AI_PROVIDER_KEY",
-            ],
-            "grok" => &["XAI_API_KEY", "PAPERCLIP_ACPX_GROK_AUTH_JSON_SECRET"],
-            "pi" => &[],
-            "cursor" => &["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
-            "copilot" => &["COPILOT_GITHUB_TOKEN"],
-            "kimi" => &["KIMI_API_KEY"],
-            "antigravity" => &[
-                "GEMINI_API_KEY",
-                "PAPERCLIP_ACPX_ANTIGRAVITY_AUTH_JSON_SECRET",
-            ],
-            _ => {
-                return Err(LocalRunnerError::invalid(
-                    "ACPX sidecar credentials require a known agent profile",
-                ))
-            }
-        };
+        let credential_keys = sidecar_credential_keys(agent)?;
         let mut keys = vec![
             "PAPERCLIP_AGENT_KEY_ID",
             "PAPERCLIP_AGENT_PUBLIC_KEY",
@@ -1423,6 +1435,26 @@ mod tests {
     }
 
     #[test]
+    fn pi_sidecar_receives_only_the_managed_provider_route_keys() {
+        assert_eq!(
+            sidecar_credential_keys("pi").unwrap(),
+            &[
+                "PAPERCLIP_AI_PROVIDER_KEY",
+                "PAPERCLIP_AI_PROVIDER_URL",
+                "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+                "PAPERCLIP_AI_PROVIDER_AUTH",
+            ]
+        );
+        for agent in ["claude", "grok", "cursor", "copilot", "kimi", "antigravity"] {
+            assert!(!sidecar_credential_keys(agent)
+                .unwrap()
+                .iter()
+                .any(|name| name.starts_with("PAPERCLIP_AI_PROVIDER_")));
+        }
+        assert!(sidecar_credential_keys("unknown").is_err());
+    }
+
+    #[test]
     fn pi_credentials_require_a_bounded_binding_without_process_control_variables() {
         assert!(pi_credential_environment_keys(None).unwrap().is_empty());
         for name in [
@@ -1432,6 +1464,12 @@ mod tests {
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
             "PAPERCLIP_NATIVE_MCP_TOKEN",
+            "PAPERCLIP_API_KEY",
+            "PAPERCLIP_AI_PROVIDER_KEY",
+            "PAPERCLIP_AI_PROVIDER_URL",
+            "PAPERCLIP_AI_PROVIDER_PROTOCOL",
+            "PAPERCLIP_AI_PROVIDER_AUTH",
+            "PAPERCLIP_AI_PROVIDER_OTHER",
             "INVALID-NAME",
         ] {
             let binding = json!({"schema":"paperclip.acpx_credential_binding.v1", "agent":"pi", "sessionId":"session-1", "names":[name]});

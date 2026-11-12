@@ -180,6 +180,7 @@ let host: AcpxRuntimeHost | null = null;
 let activeHostCleanup: Promise<void> | null = null;
 let failedAdmissionCleanup: Promise<void> | null = null;
 let openParams: AcpxSidecarOpenParams | null = null;
+let sessionSensitiveValues: readonly string[] = [];
 /** Claude compaction banners seen by this sidecar; pairs start and end notices. */
 let claudeCompactionCount = 0;
 let runId: string | null = null;
@@ -338,8 +339,10 @@ async function dispatch(
     ) {
       throw new Error("ACPX session profile differs from its initialization");
     }
+    sessionSensitiveValues = [];
     const openedHost = await AcpxRuntimeHost.open(
       {
+        onSensitiveValues: values => { sessionSensitiveValues = [...sessionSensitiveValues, ...values]; },
         candidateAdmission: params.candidateAdmission,
         runtimeDirectory: params.runtimeDirectory,
         normalizedSessionId: params.normalizedSessionId,
@@ -1801,6 +1804,9 @@ function safeText(value: unknown, maxBytes = 8_192): string {
 }
 
 function redactSecrets(value: string): string {
+  for (const sensitive of sessionSensitiveValues) {
+    if (sensitive) value = value.replaceAll(sensitive, "[REDACTED]");
+  }
   return redactObservabilityDiagnostic(value, process.env).replace(
     /(key|token|secret|password|authorization)\s*[:=]\s*[^\s,}\]]+/gi,
     "$1=[REDACTED]",

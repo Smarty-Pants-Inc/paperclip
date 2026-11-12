@@ -90,6 +90,36 @@ describe("ACPX launch environment", () => {
       expect(() => createAcpxSidecarHostEnvironment({ ...source, [ACPX_CREDENTIAL_BINDING_ENV]: JSON.stringify({ ...JSON.parse(binding), names: [name] }) }, "pi", "session-1")).toThrow("explicit matching session binding");
     }
   });
+  it("keeps the managed Pi route in the sidecar but never in the native child", () => {
+    const route = {
+      PAPERCLIP_AI_PROVIDER_KEY: "managed-key-fixture",
+      PAPERCLIP_AI_PROVIDER_URL: "https://models.example",
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages",
+      PAPERCLIP_AI_PROVIDER_AUTH: "api_key",
+    };
+    // The generic task projection must not bypass the native child's
+    // allowlist for these runner-owned route values.
+    const source = { ...route, ...configuredEnvironmentProjection({ ...route, CUSTOM_SETTING: "allowed" }), PATH: "/bin" };
+    const binding = createAcpxCredentialBinding(source, "pi", "session-1")!;
+    expect(JSON.parse(binding).names).toEqual([]);
+    const sidecar = createAcpxSidecarHostEnvironment({ ...source, [ACPX_CREDENTIAL_BINDING_ENV]: binding }, "pi", "session-1");
+    expect(sidecar).toMatchObject(route);
+    expect(sidecar).not.toHaveProperty(ACPX_CREDENTIAL_BINDING_ENV);
+    for (const environment of [route, source, sidecar]) {
+      const child = createSanitizedAcpxSpawnInput(environment, "pi").env;
+      for (const name of Object.keys(route)) expect(child).not.toHaveProperty(name);
+      if (child[CONFIGURED_ENVIRONMENT_KEYS]) {
+        expect(JSON.parse(child[CONFIGURED_ENVIRONMENT_KEYS])).toEqual(["CUSTOM_SETTING"]);
+        expect(child.CUSTOM_SETTING).toBe("allowed");
+      }
+    }
+    // Sanitizing the child must not mutate the sidecar's broker input.
+    expect(sidecar).toMatchObject(route);
+    for (const [name, value] of Object.entries(route)) vi.stubEnv(name, value);
+    const ambientChild = createSanitizedAcpxSpawnInput(undefined, "pi").env;
+    for (const name of Object.keys(route)) expect(ambientChild).not.toHaveProperty(name);
+  });
+
   it("keeps gateway and Bedrock settings confined to the selected harness", () => {
     const source = {
       ANTHROPIC_BASE_URL: "https://gateway.example",

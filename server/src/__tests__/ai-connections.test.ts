@@ -126,6 +126,38 @@ describe("managed AI connections", () => {
     } finally { native.mockRestore(); legacy.mockRestore(); request.mockRestore(); await runtime.cleanup(); }
   });
 
+  it.each(["gateway", "local"] as const)("probes managed Runner Pi %s with a real Runner hello transport", async kind => {
+    const baseUrl = kind === "gateway" ? "https://gateway.example" : "http://localhost:4318";
+    const saved = await service.save(companyId, "alice", { provider: "anthropic", method: "api_key", name: `Pi ${kind} route`, ownership: "personal",
+      allAgents: true, agentIds: [], routing: { kind, protocol: "messages", auth: "api_key", baseUrl, models: [] } }, `fixture-pi-${kind}-key`);
+    const selected = { provider: "anthropic", method: "api_key", mode: "delegated", ...saved } as const;
+    const runtime = await prepareManagedAiRuntime(db, { companyId, agentId, responsibleUserId: "alice", adapterType: "paperclip_runner", binding: selected,
+      config: { provider: "acpx", acpxAgent: "pi", model: "anthropic/model-x" } });
+    const { requireServerAdapter } = await import("../adapters/index.js");
+    const { agentEnvironmentTestService } = await import("../services/agent-environment-test.js");
+    const readiness = vi.spyOn(requireServerAdapter("paperclip_runner"), "testEnvironment").mockResolvedValue({ adapterType: "paperclip_runner", status: "pass",
+      testedAt: new Date().toISOString(), checks: [{ code: "acpx_runtime_ready", level: "info", message: "Runner is ready" }] });
+    const transport = vi.spyOn(runnerProbe, "probeNativeRunnerEnvironment").mockResolvedValue({ provider: "acpx", providerDriver: "acpx_runtime",
+      effectiveModel: "paperclip/anthropic/model-x", helloProbePassed: true });
+    const legacy = vi.spyOn(requireServerAdapter("pi_local"), "testEnvironment").mockRejectedValue(new Error("Legacy Pi CLI must not run"));
+    try {
+      expect(runtime.config.model).toBe("paperclip/anthropic/model-x");
+      expect(runtime.config.env).toMatchObject({ PAPERCLIP_AI_PROVIDER_URL: baseUrl, PAPERCLIP_AI_PROVIDER_KEY: `fixture-pi-${kind}-key`,
+        PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key" });
+      expect(runtime.config.env.PAPERCLIP_PI_PROVIDERS).toBe("");
+      const result = await agentEnvironmentTestService(db).testManagedEnvironment("paperclip_runner", { companyId, adapterType: "paperclip_runner", config: runtime.config }, selected, runtime, agentId);
+      expect(result.status, JSON.stringify(result)).toBe("pass");
+      expect(result.checks).toContainEqual(expect.objectContaining({ code: "pi_hello_probe_passed" }));
+      expect(result.checks).not.toContainEqual(expect.objectContaining({ code: "ai_connection_api_key_reverified" }));
+      expect(transport).toHaveBeenCalledOnce();
+      expect(transport.mock.calls[0][0]).toMatchObject({ provider: "acpx", model: "paperclip/anthropic/model-x", environment: {
+        PAPERCLIP_AI_PROVIDER_URL: baseUrl, PAPERCLIP_AI_PROVIDER_KEY: `fixture-pi-${kind}-key`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key",
+      } });
+      expect(readiness).toHaveBeenCalledOnce();
+      expect(legacy).not.toHaveBeenCalled();
+    } finally { readiness.mockRestore(); transport.mockRestore(); legacy.mockRestore(); await runtime.cleanup(); }
+  });
+
   it("defers a new plugin agent's Copilot check until its saved-agent lifecycle can acquire the computer", async () => {
     const { errorHandler } = await import("../middleware/index.js");
     const owner = "copilot-plugin-bootstrap", pluginId = randomUUID();

@@ -467,6 +467,13 @@ describe("qualified ACPX runtime sidecar", () => {
     }
   });
 
+  it("redacts a registered loopback capability even outside credential-shaped text", () => {
+    const token = "loopback-capability-canary-123456789";
+    const commands = loadActualToolCommands(new Map(), [token]);
+    expect(commands.redact(`Provider echoed ${token} in an error`)).toBe("Provider echoed [REDACTED] in an error");
+    expect(commands.redact("Ordinary provider failure")).toBe("Ordinary provider failure");
+  });
+
   it("keeps a restored provider's restarted call ids distinct from earlier calls in the run", async () => {
     // A restored session starts a new provider process whose MCP request ids
     // restart. The controller keys calls by run and call id, so a reused id
@@ -2071,22 +2078,24 @@ function loadActualSidecarWriter(mode: "normal" | "backpressure" | "throws" = "n
 }
 
 /** Actual parsed command dispatcher; only the owned pending map/turn are supplied. */
-function loadActualToolCommands(tools: Map<string, unknown>): {
+function loadActualToolCommands(tools: Map<string, unknown>, sensitiveValues: readonly string[] = []): {
   resolve: (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
   setTurn: (turnId: string | null) => void;
+  redact: (value: string) => string;
 } {
   const source = readFileSync(new URL("./acpx-runtime-sidecar.ts", import.meta.url), "utf8");
   const start = source.indexOf("async function dispatch("), end = source.indexOf("\nasync function pumpTurn(", start);
   const safeStart = source.indexOf("function safeText("), safeEnd = source.indexOf("\nfunction safeMessage(", safeStart);
   if (start < 0 || end < 0 || safeStart < 0 || safeEnd < 0) throw new Error("Actual sidecar command dispatcher not found");
-  const dispatcher = new Function("tools", "boundedIdentity", "record", "text", "parseAcpxSidecarRequest", "ACPX_SIDECAR_PROTOCOL_VERSION", "redactObservabilityDiagnostic", `
+  const dispatcher = new Function("tools", "boundedIdentity", "record", "text", "parseAcpxSidecarRequest", "ACPX_SIDECAR_PROTOCOL_VERSION", "redactObservabilityDiagnostic", "sessionSensitiveValues", `
     let turnId="test-turn", requestId=0;
     ${stripTypeScriptTypes(source.slice(safeStart, safeEnd))}
     ${stripTypeScriptTypes(source.slice(start, end))}
     return {
       resolve: params => dispatch(parseAcpxSidecarRequest({ protocolVersion: ACPX_SIDECAR_PROTOCOL_VERSION, id: ++requestId, command: "tool.resolve", params })),
-      setTurn: value => { turnId=value; }
+      setTurn: value => { turnId=value; },
+      redact: safeText
     };
-  `)(tools, boundedIdentity, record, text, parseAcpxSidecarRequest, ACPX_SIDECAR_PROTOCOL_VERSION, redactObservabilityDiagnostic);
+  `)(tools, boundedIdentity, record, text, parseAcpxSidecarRequest, ACPX_SIDECAR_PROTOCOL_VERSION, redactObservabilityDiagnostic, sensitiveValues);
   return dispatcher;
 }

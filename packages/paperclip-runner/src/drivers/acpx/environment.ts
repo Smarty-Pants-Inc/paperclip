@@ -30,6 +30,16 @@ function removePiIamCredentials(environment: NodeJS.ProcessEnv): void {
   }
 }
 
+/** Managed provider credentials belong to the sidecar broker, not Pi or its tools. */
+function removePiProviderRouting(environment: NodeJS.ProcessEnv): void {
+  const isRouting = (name: string) => name.toUpperCase().startsWith("PAPERCLIP_AI_PROVIDER_");
+  const names = configuredEnvironmentKeys(environment);
+  for (const name of Object.keys(environment)) if (isRouting(name)) delete environment[name];
+  if (environment[CONFIGURED_ENVIRONMENT_KEYS] !== undefined) {
+    environment[CONFIGURED_ENVIRONMENT_KEYS] = JSON.stringify(names.filter(name => !isRouting(name)));
+  }
+}
+
 function removeKimiRuntimeOverrides(environment: NodeJS.ProcessEnv): void {
   const isOverride = (name: string) => /^KIMI_MODEL_/.test(name.toUpperCase())
     || ["KIMI_SECONDARY_MODEL", "KIMI_CODE_HOME"].includes(name.toUpperCase());
@@ -178,7 +188,10 @@ export function createSanitizedAcpxSpawnInput(
     retainedBytes += entryBytes;
     result[key] = value;
   }
-  if (agent === "pi") removePiIamCredentials(result);
+  if (agent === "pi") {
+    removePiIamCredentials(result);
+    removePiProviderRouting(result);
+  }
   if (agent === "kimi") removeKimiRuntimeOverrides(result);
   if (agent === "antigravity") sanitizeAntigravityEnvironment(result);
   // The controller-to-sidecar document is staged under a lifetime fence. The

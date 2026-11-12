@@ -17,6 +17,13 @@ export const PI_CREDENTIAL_NAMES = Object.freeze([
   "PAPERCLIP_PI_PROVIDERS",
 ]);
 
+// The runner-side loopback broker consumes these values. Never add them to
+// PI_CREDENTIAL_NAMES: that catalog is also the native Pi child's allowlist.
+export const PI_SIDECAR_PROVIDER_ROUTE_NAMES = Object.freeze([
+  "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL",
+  "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
+]);
+
 // General IAM credentials authorize services beyond the model provider. Bedrock
 // uses its provider-scoped bearer credential instead.
 export const PI_GENERAL_IAM_CREDENTIAL_NAMES = Object.freeze([

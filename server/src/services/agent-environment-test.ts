@@ -1,8 +1,11 @@
 import { join } from "node:path";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { probePluginRunnerEnvironment } from "./native-runtime/plugin-runner-probe.js";
 import { pluginRunnerAiConnectionRequiredTestResult } from "./plugin-runner-ai-connection.js";
 import { registerPluginTaskCredentialHandoff } from "./plugin-task-credential-writeback.js";
 import { randomUUID } from "node:crypto";
+import { NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment } from "../vendor/paperclip-runner/index.js";
 import { agents, companies, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
@@ -25,6 +28,41 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { pluginEnvironmentRequiresAgent } from "./plugin-environment-driver.js";
 const asRecord = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+async function probeManagedPiRunnerHello(context: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult> {
+  const testedAt = new Date().toISOString();
+  if (context.executionTarget?.kind === "remote") return { adapterType: "paperclip_runner", status: "fail", testedAt,
+    checks: [{ code: "pi_hello_probe_failed", level: "error", message: "The selected Runner transport could not run the managed Pi hello probe." }] };
+  const configEnv = context.config.env && typeof context.config.env === "object" && !Array.isArray(context.config.env)
+    ? context.config.env as Record<string, unknown> : {};
+  const environment = Object.fromEntries(Object.entries(configEnv).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  const model = typeof context.config.model === "string" ? context.config.model : null;
+  if (!model) return { adapterType: "paperclip_runner", status: "fail", testedAt,
+    checks: [{ code: "pi_hello_probe_failed", level: "error", message: "Select a Pi model before testing this connection." }] };
+  const runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-managed-pi-probe-")));
+  let cleanupConfirmed = false;
+  let cleanupTransferred = false;
+  try {
+    const result = await probeNativeRunnerEnvironment({ runtimeDirectory, provider: "acpx", model, timeoutMs: 45_000,
+      environment, transportOptions: { externallySandboxed: false,
+        acpxAgent: "pi", acpxPermissionMode: "deny-all", acpxPermissionModePinned: true,
+        prpIdentity: { runnerInstanceId: `setup-runner-${randomUUID()}`, runId: `setup-${randomUUID()}`,
+          normalizedSessionId: `setup-${randomUUID()}`, environmentLeaseId: `setup-${randomUUID()}`,
+          turnId: `setup-turn-${randomUUID()}`, itemId: `setup-item-${randomUUID()}` } },
+      onCleanupConfirmed: async () => { await rm(runtimeDirectory, { recursive: true, force: true }); cleanupConfirmed = true; },
+    });
+    return { adapterType: "paperclip_runner", status: result.helloProbePassed ? "pass" : "fail", testedAt,
+      checks: [{ code: result.helloProbePassed ? "pi_hello_probe_passed" : "pi_hello_probe_failed",
+        level: result.helloProbePassed ? "info" : "error",
+        message: result.helloProbePassed ? "Runner Pi completed a hello turn using the selected managed connection." : "Runner Pi did not complete the managed connection hello turn." }] };
+  } catch (error) {
+    if (error instanceof NativeEnvironmentProbeCleanupError) { cleanupTransferred = true; throw error; }
+    return { adapterType: "paperclip_runner", status: "fail", testedAt,
+      checks: [{ code: "pi_hello_probe_failed", level: "error", message: "Runner Pi did not complete the managed connection hello turn." }] };
+  } finally {
+    if (!cleanupConfirmed && !cleanupTransferred) await rm(runtimeDirectory, { recursive: true, force: true });
+  }
+}
+
 function finishManagedConnectionTest(adapterType: string, context: AdapterEnvironmentTestContext, result: AdapterEnvironmentTestResult): AdapterEnvironmentTestResult {
   const target = context.executionTarget;
   if (result.status === "fail" || adapterType !== "paperclip_runner" || context.config.provider !== "acpx"
@@ -618,9 +656,19 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
     // requirement stays for subscriptions: a stored login is a file layout
     // only a provider CLI reads, so proving the runtime lane can consume it
     // takes a real hello turn.
+    const managedPiCustomRoute = adapterType === "paperclip_runner" && context.config.provider === "acpx"
+      && context.config.acpxAgent === "pi"
+      && ["gateway", "local"].includes(String(asRecord(context.config.managedAiRouting)?.kind))
+      && ["messages", "responses"].includes(String(asRecord(context.config.managedAiRouting)?.protocol));
     const nativePiOpenRouter = adapterType === "paperclip_runner" && context.config.provider === "acpx"
       && context.config.acpxAgent === "pi" && binding.provider === "openrouter"
       && asRecord(context.config.managedAiRouting)?.kind === "openrouter";
+    if (managedPiCustomRoute) {
+      const probe = await probeManagedPiRunnerHello(context);
+      result.checks.push(...probe.checks);
+      result.status = probe.status;
+      return finishManagedConnectionTest(adapterType, context, result);
+    }
     if (resolvedMethod === "api_key" && (!context.config.managedAiRouting || nativePiOpenRouter)) {
       const envKey = AI_CONNECTION_CAPABILITIES[binding.provider].methods.api_key?.envKey;
       const key = envKey ? parseObject(context.config.env)[envKey] : undefined;

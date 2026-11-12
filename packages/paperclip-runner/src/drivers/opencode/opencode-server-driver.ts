@@ -17,10 +17,8 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:net";
 import { constants as osConstants } from "node:os";
-import { Agent as HttpAgent, createServer as createHttpServer, request as requestHttp, type IncomingMessage } from "node:http";
-import { Agent as HttpsAgent, request as requestHttps } from "node:https";
-import { getCACertificates } from "node:tls";
-import { pipeline } from "node:stream/promises";
+import { startProviderLoopbackBroker } from "../provider-loopback/broker.js";
+import { chatLoopbackAdapter } from "../provider-loopback/chat.js";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseOpenCodeReasoningMode, type OpenCodeReasoningMode } from "./reasoning-mode.js";
@@ -2367,114 +2365,6 @@ class OpenCodeHarnessSession implements HarnessSession {
   }
 }
 
-/** Retain the reusable gateway key in the runner; the harness gets a session-scoped capability. */
-async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv) {
-  const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
-  const token = randomBytes(32).toString("base64url");
-  // Agent-local settings keep one runtime's transport configuration out of other sessions.
-  const proxyEnv = {
-    HTTP_PROXY: environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
-    HTTPS_PROXY: environment.https_proxy ?? environment.HTTPS_PROXY ?? environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
-    NO_PROXY: environment.no_proxy ?? environment.NO_PROXY,
-  };
-  const ca = [...getCACertificates("default")];
-  if (environment.SSL_CERT_FILE) ca.push(await readFile(environment.SSL_CERT_FILE, "utf8"));
-  if (environment.SSL_CERT_DIR) {
-    for (const entry of await readdir(environment.SSL_CERT_DIR, { withFileTypes: true })) {
-      if (!entry.isDirectory()) {
-        const certificate = await readFile(join(environment.SSL_CERT_DIR, entry.name), "utf8");
-        if (certificate.includes("-----BEGIN CERTIFICATE-----")) ca.push(certificate);
-      }
-    }
-  }
-  const agent = upstreamUrl.protocol === "https:" ? new HttpsAgent({ proxyEnv, ca }) : new HttpAgent({ proxyEnv });
-  const controllers = new Set<AbortController>();
-  const server = createHttpServer((request, response) => {
-    const controller = new AbortController();
-    controllers.add(controller);
-    response.once("close", () => controller.abort());
-    void (async () => {
-      if (request.headers.authorization !== `Bearer ${token}`) {
-        response.writeHead(401).end();
-        return;
-      }
-      if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
-        response.writeHead(404).end();
-        return;
-      }
-      const chunks: Buffer[] = [];
-      let bytes = 0;
-      for await (const chunk of request) {
-        bytes += chunk.length;
-        if (bytes > 16 * 1024 * 1024) {
-          response.writeHead(413).end();
-          return;
-        }
-        chunks.push(Buffer.from(chunk));
-      }
-      let body = Buffer.concat(chunks);
-      let payload: Record<string, unknown>;
-      try { payload = JSON.parse(body.toString("utf8")); }
-      catch { response.writeHead(400).end(); return; }
-      if (!payload || typeof payload !== "object" || payload.model !== model ||
-        ["models", "route", "plugins", "transforms"].some(field => Object.hasOwn(payload, field))) {
-        response.writeHead(400).end();
-        return;
-      }
-      // Keep OpenCode's unreadable-media notice attributed to the tool result
-      // instead of a synthetic user message the model mistakes for the person.
-      if (attributeUnsupportedToolMedia(payload)) body = Buffer.from(JSON.stringify(payload), "utf8");
-      const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
-        const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
-          method: "POST",
-          agent,
-          headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
-        }, resolve);
-        outgoing.once("error", reject);
-        outgoing.end(body);
-      });
-      // Never forward authentication to a redirect destination.
-      const status = upstream.statusCode ?? 502;
-      if (status >= 300 && status < 400) {
-        upstream.destroy();
-        throw new Error("Provider redirects are not supported");
-      }
-      const headers: Record<string, string> = {};
-      for (const name of ["content-type", "content-encoding", "cache-control", "retry-after"]) {
-        const value = upstream.headers[name];
-        if (typeof value === "string") headers[name] = value;
-      }
-      response.writeHead(status, headers);
-      await pipeline(upstream, response);
-    })().catch(() => {
-      if (!response.headersSent) response.writeHead(502).end("Provider request failed");
-      else response.destroy();
-    }).finally(() => controllers.delete(controller));
-  });
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
-    });
-  } catch (error) { agent.destroy(); throw error; }
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    server.close();
-    agent.destroy();
-    throw new Error("Could not bind OpenCode provider proxy");
-  }
-  return {
-    baseURL: `http://127.0.0.1:${address.port}/v1`,
-    token,
-    close: async () => {
-      for (const controller of controllers) controller.abort();
-      agent.destroy();
-      await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); });
-    },
-  };
-}
-
 async function startRuntime(input: {
   options: OpenCodeServerDriverOptions;
   root: string;
@@ -2565,7 +2455,17 @@ async function startRuntime(input: {
       ? { baseUrl: input.options.environment.PAPERCLIP_AI_PROVIDER_URL, key: input.options.environment.PAPERCLIP_AI_PROVIDER_KEY ?? "" }
       : null;
   const providerProxy = providerRoute
-    ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, providerEnvironment).catch(async error => {
+    ? await startProviderLoopbackBroker({
+      adapter: chatLoopbackAdapter,
+      baseUrl: providerRoute.baseUrl,
+      key: providerRoute.key,
+      auth: "bearer",
+      model: providerModelId,
+      rejectFields: ["models", "route", "plugins", "transforms"],
+      transformPayload: attributeUnsupportedToolMedia,
+      ...(isOpenRouterUrl(providerRoute.baseUrl) ? { extraUpstreamHeaders: OPENROUTER_ATTRIBUTION_HEADERS } : {}),
+      environment: providerEnvironment,
+    }).catch(async error => {
         await bridge.close().catch(() => {});
         await removeIsolatedHome(isolatedHome).catch(() => {});
         throw error;

@@ -88,6 +88,7 @@ import {
   type QualifiedAcpxAgent,
 } from "../drivers/acpx/qualified-profiles.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createSanitizedAcpxSpawnInput } from "../drivers/acpx/environment.js";
+import { PI_SIDECAR_PROVIDER_ROUTE_NAMES } from "../drivers/acpx/pi-provider-config.js";
 import {
   createSanitizedAwsAgentCoreEnvironment,
   createSanitizedClaudeManagedEnvironment,
@@ -3770,6 +3771,14 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
         input.options.acpxAgent ?? "codex",
       ).env,
       ...(credentialBinding === undefined ? {} : { [ACPX_CREDENTIAL_BINDING_ENV]: credentialBinding }),
+      // The managed route belongs to the sidecar broker, never the native
+      // child's sanitizer above. Copy only explicit task values, not ambient env.
+      ...(input.options.acpxAgent === "pi" ? Object.fromEntries(
+        PI_SIDECAR_PROVIDER_ROUTE_NAMES.flatMap(name => {
+          const value = input.options.environment?.[name];
+          return value === undefined ? [] : [[name, value]];
+        }),
+      ) : {}),
       ...(input.options.acpxAgent === "grok" && input.options.environment?.PAPERCLIP_ACPX_GROK_AUTH_JSON_SECRET
         ? { PAPERCLIP_ACPX_GROK_AUTH_JSON_SECRET: input.options.environment.PAPERCLIP_ACPX_GROK_AUTH_JSON_SECRET } : {}),
       ...(input.options.acpxAgent === "antigravity" && input.options.environment?.PAPERCLIP_ACPX_ANTIGRAVITY_AUTH_JSON_SECRET
