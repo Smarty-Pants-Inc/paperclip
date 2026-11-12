@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { admitNativeHome, assertClaudeClamp, checkNativeHomeEnvironment } from "./admission.js";
-import { computeNativeHomeManifest } from "./manifest.js";
+import { canonicalJson, computeNativeHomeManifest, sha256 } from "./manifest.js";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
@@ -15,32 +15,30 @@ async function fixture() {
   await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { managed: { models: [{ id: "claude-fable-5-2", thinkingLevelMap: { max: null } }], modelOverrides: { "claude-sonnet-5": { thinkingLevelMap: { max: null } } } } } }));
   for (const [path, name, version] of [[guard, "@smarty-pants-inc/tool-context-guard", "1.0.0"], [subagents, "pi-subagents", "0.88.0"]]) { await writeFile(join(path, "package.json"), JSON.stringify({ name, version, pi: { extensions: ["./index.js"] } })); await writeFile(join(path, "index.js"), "export default function() {}\n"); }
   const environment = { PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" };
-  const manifest = await computeNativeHomeManifest({ agentDir, packages: [{ source: guard, root: guard }, { source: subagents, root: subagents }], resources: [], allowedExternalRoots: [root], environment, runtime: { distributionDigest: "a".repeat(64), cwd: root, argv: [], projectTrust: "denied", approvedProjectRoots: [] }, effectiveMetadata: {} });
+  const manifest = await computeNativeHomeManifest({ agentDir, packages: [{ source: guard, root: guard }, { source: subagents, root: subagents }], resources: [], allowedExternalRoots: [root], environment, runtime: { distributionDigest: "a".repeat(64), cwd: root, argv: [], projectTrust: "denied", approvedProjectRoots: [] }, effectiveMetadata: {}, effectivePackages: [guard, subagents], effectiveExtensions: [] });
   const required = [{ role: "tool-context-guard" as const, root: guard, version: "1.0.0" }, { role: "pi-subagents" as const, root: subagents, version: "0.88.0" }];
-  const loadReceipt = { schema: "pi-native-load/v1" as const, sessionId: "native-session", manifestDigest: manifest.digest, packages: manifest.packages.map(pkg => ({ root: pkg.root, name: pkg.name, version: pkg.version, extensions: [{ path: join(pkg.root, "index.js"), loaded: true }], failed: false, shadowed: false })) };
+  const loadReceipt = { schema: "pi-native-load/v1" as const, sessionId: "native-session", manifestDigest: manifest.digest, startup: { rule: "startup-fatal" as const, piVersion: "1.5.2" }, effectiveSettingsDigest: sha256(canonicalJson({ effectivePackages: manifest.effectivePackages, effectiveExtensions: manifest.effectiveExtensions })), subagentTool: { name: "subagent" as const, root: subagents, path: join(subagents, "index.js") }, extensionErrors: { observability: "not observable in-process" as const } };
   return { agentDir, manifest, required, environment, sessionId: "native-session", loadReceipt };
 }
 
 describe("native required-load admission (trust boundary)", () => {
-  it("fails closed when public Pi RPC supplies no real loader receipt", async () => {
+  it("fails closed without the resident's in-process load facts", async () => {
     const input = await fixture();
     await expect(admitNativeHome({ ...input, loadReceipt: undefined })).rejects.toMatchObject({ code: "pi_home_load_receipt_missing" });
   });
   it("admits exact loaded roots and versions, returning only the opaque digest contribution", async () => {
     const input = await fixture();
-    expect(await admitNativeHome(input)).toEqual({ schema: "pi-native-home/v1", digest: input.manifest.digest });
+    expect(await admitNativeHome(input)).toEqual({ digest: input.manifest.digest });
   });
-  it.each(["failed", "shadowed", "missing-extension", "not-loaded", "wrong-version", "wrong-root", "duplicate", "stale-session", "stale-digest"])("rejects %s actual load diagnostics", async defect => {
-    const input = await fixture(), receipt = input.loadReceipt, pkg = receipt.packages[0];
-    if (defect === "failed") pkg.failed = true;
-    if (defect === "shadowed") pkg.shadowed = true;
-    if (defect === "missing-extension") pkg.extensions = [];
-    if (defect === "not-loaded") pkg.extensions[0].loaded = false;
-    if (defect === "wrong-version") pkg.version = "999.0.0";
-    if (defect === "wrong-root") pkg.root += "-other";
-    if (defect === "duplicate") receipt.packages.push(pkg);
+  it.each(["wrong-version", "wrong-root", "missing-root", "duplicate", "stale-session", "stale-digest", "missing-tool"])("rejects %s admission facts", async defect => {
+    const input = await fixture(), receipt = input.loadReceipt;
+    if (defect === "wrong-version") input.required[0].version = "999.0.0";
+    if (defect === "wrong-root") input.required[0].root = input.required[1].root;
+    if (defect === "missing-root") await rm(input.required[0].root, { recursive: true });
+    if (defect === "duplicate") input.required.push(input.required[0]);
     if (defect === "stale-session") receipt.sessionId = "another-session";
     if (defect === "stale-digest") receipt.manifestDigest = "b".repeat(64);
+    if (defect === "missing-tool") Object.assign(receipt, { subagentTool: undefined });
     await expect(admitNativeHome(input)).rejects.toBeInstanceOf(Error);
   });
   it("cannot silently omit either required package role", async () => {

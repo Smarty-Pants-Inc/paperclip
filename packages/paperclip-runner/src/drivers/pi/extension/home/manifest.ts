@@ -43,6 +43,15 @@ export interface NativeHomePackage {
   version: string;
   extensionSelectors: string[];
 }
+export interface NativeHomePackageSelection {
+  source: string;
+  extensions?: string[];
+  autoload?: boolean;
+}
+export interface NativeHomeSettings {
+  packages?: readonly (string | NativeHomePackageSelection)[];
+  extensions?: readonly string[];
+}
 export interface NativeHomeInput {
   /** Pass Pi's resolved getAgentDir() from the sandbox itself; never a Runner mirror. */
   agentDir: string;
@@ -56,6 +65,9 @@ export interface NativeHomeInput {
   runtime: { distributionDigest: string; cwd: string; argv: readonly string[]; projectTrust: "denied" | "approved"; approvedProjectRoots: readonly string[] };
   /** Sanitized effective settings/model/MCP metadata from native readback; no credentials. */
   effectiveMetadata: unknown;
+  /** Pi's effective package/resource settings, after trust/overrides; never guessed from installs. */
+  effectivePackages?: readonly (string | NativeHomePackageSelection)[];
+  effectiveExtensions?: readonly string[];
   signal?: AbortSignal;
 }
 export interface NativeHomeManifest {
@@ -67,6 +79,8 @@ export interface NativeHomeManifest {
   environment: ReturnType<typeof nativeHomeEnvironment>;
   runtime: NativeHomeInput["runtime"];
   effectiveMetadataDigest: string;
+  effectivePackages?: NativeHomePackageSelection[];
+  effectiveExtensions?: string[];
   digest: string;
 }
 const hostPackages = new Set(["@earendil-works/pi-ai", "@earendil-works/pi-agent-core", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox", "@mariozechner/pi-ai", "@mariozechner/pi-agent-core", "@mariozechner/pi-coding-agent", "@mariozechner/pi-tui", "@sinclair/typebox"]);
@@ -74,10 +88,21 @@ const hostPackages = new Set(["@earendil-works/pi-ai", "@earendil-works/pi-agent
 // Package node_modules are traversed through declared runtime dependencies, never by directory size.
 const ignoredDirectories = new Set(["node_modules", ".git"]);
 const ignoredFiles = new Set(["auth.json", "mcp-auth.json", "models-store.json"]);
+export const isNativeHomeIgnoredName = (name: string) => ignoredDirectories.has(name) || ignoredFiles.has(name);
 const stamp = (s: Awaited<ReturnType<typeof lstat>>) => [s.dev, s.ino, s.mode, s.size, s.mtimeMs, s.ctimeMs].join(":");
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new PiNativeAdmissionError("pi_home_config_invalid", "Native home configuration must be an object.");
   return value as Record<string, unknown>;
+}
+/** Sanitized selection identity shared by the manifest and actual pi.getSettings() receipt. */
+export function nativeHomeEffectiveSettings(settings: NativeHomeSettings) {
+  if (!Array.isArray(settings.packages ?? []) || !Array.isArray(settings.extensions ?? []) || settings.extensions?.some(value => typeof value !== "string")) throw new PiNativeAdmissionError("pi_home_config_invalid", "Effective native resource settings are invalid.");
+  const effectivePackages = (settings.packages ?? []).map(value => {
+    const pkg = typeof value === "string" ? { source: value } : object(value);
+    if (typeof pkg.source !== "string" || (pkg.extensions !== undefined && (!Array.isArray(pkg.extensions) || pkg.extensions.some(value => typeof value !== "string"))) || (pkg.autoload !== undefined && typeof pkg.autoload !== "boolean")) throw new PiNativeAdmissionError("pi_home_config_invalid", "Effective package settings are invalid.");
+    return { source: pkg.source as string, ...(pkg.extensions === undefined ? {} : { extensions: [...pkg.extensions as string[]] }), ...(pkg.autoload === undefined ? {} : { autoload: pkg.autoload as boolean }) };
+  });
+  return { effectivePackages, effectiveExtensions: [...settings.extensions ?? []] };
 }
 
 /**
@@ -114,7 +139,7 @@ export async function computeNativeHomeManifest(input: NativeHomeInput): Promise
       entries.push({ logicalPath, resolvedPath, kind: "directory" });
       const next = new Set(ancestors).add(resolvedPath);
       for (const name of (await readdir(path)).sort(bytewise)) {
-        if (ignoredDirectories.has(name) || ignoredFiles.has(name)) continue;
+        if (isNativeHomeIgnoredName(name)) continue;
         await walk(join(path, name), `${logicalPath}/${name}`, next);
       }
       return;
@@ -193,6 +218,7 @@ export async function computeNativeHomeManifest(input: NativeHomeInput): Promise
     if (after !== before) fail("pi_home_collection_race", "Native home changed during manifest collection.");
   }
   entries.sort((a, b) => bytewise(a.logicalPath, b.logicalPath));
-  const body = { schema: NATIVE_HOME_SCHEMA, agentDir, entries, packages, resources, environment: nativeHomeEnvironment(input.environment), runtime: { distributionDigest: input.runtime.distributionDigest, cwd: await realpath(input.runtime.cwd), argv: [...input.runtime.argv], projectTrust: input.runtime.projectTrust, approvedProjectRoots: [...input.runtime.approvedProjectRoots].sort(bytewise) }, effectiveMetadataDigest: sha256(canonicalJson(input.effectiveMetadata)) };
+  const effective = nativeHomeEffectiveSettings({ packages: input.effectivePackages, extensions: input.effectiveExtensions });
+  const body = { schema: NATIVE_HOME_SCHEMA, agentDir, entries, packages, resources, environment: nativeHomeEnvironment(input.environment), runtime: { distributionDigest: input.runtime.distributionDigest, cwd: await realpath(input.runtime.cwd), argv: [...input.runtime.argv], projectTrust: input.runtime.projectTrust, approvedProjectRoots: [...input.runtime.approvedProjectRoots].sort(bytewise) }, effectiveMetadataDigest: sha256(canonicalJson(input.effectiveMetadata)), ...(input.effectivePackages === undefined ? {} : { effectivePackages: effective.effectivePackages }), ...(input.effectiveExtensions === undefined ? {} : { effectiveExtensions: effective.effectiveExtensions }) };
   return { ...body, digest: sha256(canonicalJson(body)) };
 }

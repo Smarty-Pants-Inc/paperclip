@@ -2,6 +2,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { PiNativeAdmissionError } from "../../pi-native-config.js";
 import { canonicalJson, isWithin, nativeHomeEnvironment, NATIVE_HOME_SCHEMA, sha256, type NativeHomeEnvironment, type NativeHomeManifest } from "./manifest.js";
+import { checkRequiredNativePackages } from "./required-packages.js";
 
 function fail(code: string, message: string): never { throw new PiNativeAdmissionError(code, message); }
 function object(value: unknown): Record<string, unknown> {
@@ -31,16 +32,16 @@ export interface RequiredNativePackage {
   root: string;
   version: string;
 }
-/**
- * TEMP integration port: actual Pi loader diagnostics, not disk/get_commands/import probes.
- * Stock Pi 1.5.2 RPC/ExtensionContext exposes no complete startup receipt. Caller MUST omit
- * this until the approved loader hook exists; absence fails closed. Never synthesize it.
- */
+/** In-process facts, not a fictional upstream loaded-extension inventory. */
 export interface NativeHomeLoadReceipt {
   schema: "pi-native-load/v1";
   sessionId: string;
   manifestDigest: string;
-  packages: { root: string; name: string; version: string; failed: boolean; shadowed: boolean; extensions: { path: string; loaded: boolean }[] }[];
+  startup: { rule: "startup-fatal"; piVersion: string };
+  effectiveSettingsDigest: string;
+  subagentTool: { name: "subagent"; root: string; path?: string };
+  /** Pi 1.5.2's public ExtensionAPI has no extension_error subscription; the driver owns it. */
+  extensionErrors: { observability: "not observable in-process" };
 }
 export interface NativeHomeAdmissionInput {
   manifest: NativeHomeManifest;
@@ -48,43 +49,33 @@ export interface NativeHomeAdmissionInput {
   required: readonly RequiredNativePackage[];
   environment: NativeHomeEnvironment;
   loadReceipt?: NativeHomeLoadReceipt;
+  signal?: AbortSignal;
 }
-/** Contributes to BindReceipt.digest only; does not commit a bind or allow a prompt. */
-export async function admitNativeHome(input: NativeHomeAdmissionInput): Promise<{ schema: typeof NATIVE_HOME_SCHEMA; digest: string }> {
+/** Contributes to BindReceipt.homeDigest only; does not commit a bind or allow a prompt. */
+export async function admitNativeHome(input: NativeHomeAdmissionInput): Promise<{ digest: string }> {
+  input.signal?.throwIfAborted();
   checkNativeHomeEnvironment(input.environment);
   const { digest, ...body } = input.manifest;
   if (body.schema !== NATIVE_HOME_SCHEMA || sha256(canonicalJson(body)) !== digest || canonicalJson(body.environment) !== canonicalJson(nativeHomeEnvironment(input.environment))) fail("pi_home_manifest_invalid", "Native home manifest/environment identity does not match.");
   const receipt = input.loadReceipt;
-  if (!receipt) fail("pi_home_load_receipt_missing", "Pi must expose actual required-resource load receipts before native-home admission can succeed.");
-  if (receipt.schema !== "pi-native-load/v1" || receipt.sessionId !== input.sessionId || receipt.manifestDigest !== digest) fail("pi_home_load_receipt_stale", "Native loader receipt belongs to another session or home identity.");
-  if (input.required.length !== 2 || input.required.filter(pkg => pkg.role === "tool-context-guard" || pkg.role === "tool-cap").length !== 1 || input.required.filter(pkg => pkg.role === "pi-subagents").length !== 1) fail("pi_home_required_packages", "Exactly one declared guard and pi-subagents are required.");
-  for (const required of input.required) {
-    const root = await realpath(required.root);
-    const selected = body.packages.filter(pkg => pkg.root === root);
-    const loaded = receipt.packages.filter(pkg => pkg.root === root);
-    if (selected.length !== 1 || loaded.length !== 1) fail("pi_home_required_load_failed", "A required native package is missing, duplicated or unresolved.");
-    const pkg = selected[0], proof = loaded[0];
-    const expectedName = required.role === "pi-subagents" ? "pi-subagents" : required.role;
-    if (pkg.name.split("/").at(-1) !== expectedName || !required.version || pkg.version !== required.version || proof.name !== pkg.name || proof.version !== required.version || proof.failed !== false || proof.shadowed !== false || !proof.extensions.length) fail("pi_home_required_load_failed", "Required native package did not load at the exact admitted identity.");
-    for (const extension of proof.extensions) {
-      if (extension.loaded !== true || !isWithin(root, extension.path) || !body.entries.some(entry => entry.kind === "file" && entry.resolvedPath === extension.path)) fail("pi_home_required_load_failed", "Required extension load is not backed by the admitted file closure.");
-    }
-    // Canonical path packages use explicit pi.extensions. Wildcards/selection need native
-    // resolved-selector diagnostics, not a second resource-discovery implementation here.
-    for (const selector of pkg.extensionSelectors) {
-      if (/[!*?\[\]]/.test(selector) || selector.startsWith("+") || selector.startsWith("-")) fail("pi_home_selector_receipt_required", "Filtered required extensions need native resolved-selector diagnostics.");
-      const expected = await realpath(resolve(root, selector));
-      if (!proof.extensions.some(extension => extension.path === expected && extension.loaded)) fail("pi_home_required_load_failed", "A declared required extension has no native successful-load receipt.");
-    }
-  }
+  if (!receipt) fail("pi_home_load_receipt_missing", "Native home requires the resident's in-process startup load facts.");
+  if (!input.sessionId.trim() || receipt.schema !== "pi-native-load/v1" || receipt.sessionId !== input.sessionId || receipt.manifestDigest !== digest) fail("pi_home_load_receipt_stale", "Native loader receipt belongs to another session or home identity.");
+  if (receipt.startup?.rule !== "startup-fatal" || receipt.startup.piVersion !== "1.5.2") fail("pi_home_startup_rule_invalid", "The startup-fatal load rule is established only for Pi 1.5.2.");
+  if (receipt.extensionErrors?.observability !== "not observable in-process") fail("pi_home_error_observation_invalid", "Native error observability must be explicit; the RPC driver must fence required extension errors.");
+  if (receipt.effectiveSettingsDigest !== sha256(canonicalJson({ effectivePackages: body.effectivePackages, effectiveExtensions: body.effectiveExtensions }))) fail("pi_home_effective_settings_mismatch", "The manifest does not describe the resident's actual effective package/extension settings.");
+  const subagentsRoot = await checkRequiredNativePackages(input.manifest, input.required, input.signal);
+  const tool = receipt.subagentTool;
+  if (tool?.name !== "subagent" || tool.root !== subagentsRoot || await realpath(tool.root) !== subagentsRoot) fail("pi_home_subagent_provenance", "The subagent tool is not owned by the admitted pi-subagents root.");
+  if (tool.path && (await realpath(tool.path) !== tool.path || !isWithin(subagentsRoot, tool.path) || !body.entries.some(entry => entry.kind === "file" && entry.resolvedPath === tool.path))) fail("pi_home_subagent_provenance", "The subagent tool entry is not backed by admitted package bytes.");
   const modelFile = await realpath(resolve(body.agentDir, "models.json"));
   const modelEntry = body.entries.find(entry => entry.kind === "file" && entry.resolvedPath === modelFile);
   if (!modelEntry) fail("pi_home_claude_clamp_missing", "Native models.json is required to verify the Claude clamp.");
-  const bytes = await readFile(modelFile);
+  const bytes = await readFile(modelFile, { signal: input.signal });
   if (sha256(bytes) !== modelEntry.sha256) fail("pi_home_models_drift", "Native model bytes changed after manifest collection.");
   let config: unknown;
   try { config = JSON.parse(bytes.toString("utf8")); }
   catch { return fail("pi_home_models_invalid", "Native models configuration is not valid JSON."); }
   assertClaudeClamp(config);
-  return { schema: NATIVE_HOME_SCHEMA, digest };
+  input.signal?.throwIfAborted();
+  return { digest };
 }
