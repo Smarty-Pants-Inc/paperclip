@@ -150,6 +150,36 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+// Keep: a finish-only Pi answer must reach the same final channel as native
+// text, without promoting rejected reports, duplicate text, or failed turns.
+describe("Pi RPC finish answer presentation", () => {
+  it.each([
+    { accepted: true, nativeFinal: false, status: "turn.completed", expected: ["accepted answer"] },
+    { accepted: true, nativeFinal: true, status: "turn.completed", expected: ["native answer"] },
+    { accepted: false, nativeFinal: false, status: "turn.completed", expected: [] },
+    { accepted: true, nativeFinal: false, status: "turn.failed", expected: [] },
+    { accepted: true, nativeFinal: false, status: "turn.cancelled", expected: [] },
+    { accepted: true, nativeFinal: false, status: "turn.interrupted", expected: [] },
+  ])("publishes only the settled accepted answer: %j", async ({ accepted, nativeFinal, status, expected }) => {
+    const h = await setup();
+    await h.request("turn/start", { input: [{ type: "text", text: "Answer" }] });
+    h.session.emit("run-1", "turn-1", "item.completed", { kind: "agentMessage", channel: "progress", text: "working" });
+    const pending = h.invoke({ ...call(), tool: "paperclip_finish", arguments: { summary: "accepted answer" } });
+    h.respond(await h.nextController("item/tool/call"), { success: accepted });
+    await pending;
+    if (nativeFinal) h.session.emit("run-1", "turn-1", "item.completed", { kind: "agentMessage", channel: "final", text: "native answer" });
+    h.session.emit("run-1", "turn-1", status);
+    await h.nextController(status.replace(".", "/"));
+    const completed = h.controllerFrames("item/completed").map(f => f.params!);
+    expect(completed.filter(p => p.channel === "final").map(p => p.text)).toEqual(expected);
+    expect(completed.find(p => p.text === "working")?.channel).toBe("progress");
+    // A duplicate terminal must not publish the accepted summary again.
+    h.session.emit("run-1", "turn-1", status);
+    await h.nextController(status.replace(".", "/"), 1);
+    expect(h.controllerFrames("item/completed").filter(f => f.params?.channel === "final")).toHaveLength(expected.length);
+  });
+});
+
 // Keep reason: native Responses composite IDs cross a bounded-ID trust boundary.
 // This replaces the frozen draft's per-RPC/opencode allocator contract: durable
 // replay requires SAME run/native session/original ID => SAME full-SHA256 alias,

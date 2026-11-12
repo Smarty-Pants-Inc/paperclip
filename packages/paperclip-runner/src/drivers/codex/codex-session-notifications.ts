@@ -631,9 +631,16 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
     if (notification.method === "item/completed") {
       if (!state.notificationNamesActiveTurn(turnId, "item completion")) return;
       if (!captureResultFromItem(state, item, turnId)) return;
-      const channel = itemId
-        ? (state.itemChannels.get(itemId) ?? channelForStartedItem(state, item))
-        : channelForStartedItem(state, item);
+      // Pi cannot classify streamed text until message_end supplies stopReason.
+      // Its canonical completion (rehydrated as phase) supersedes the provisional
+      // start; retaining that start made final answers depend on stream timing.
+      const piCompletionChannel = state.driverKind === "pi_rpc" && item.type === "agentMessage" &&
+        (item.phase === "final_answer" || item.phase === "commentary");
+      const channel = piCompletionChannel
+        ? channelForStartedItem(state, item)
+        : itemId
+          ? (state.itemChannels.get(itemId) ?? channelForStartedItem(state, item))
+          : channelForStartedItem(state, item);
       state.emit(
         "item.completed",
         boundedPayload({

@@ -210,6 +210,11 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let activeRunId = environment.PAPERCLIP_RUN_ID ?? "runnerd-run";
   let inputEnded = false;
   const announcedTurnIds = new Set<string>();
+  // A successful finish may be the last model action, with no subsequent text.
+  // Keep the accepted summary only until this captured run/turn settles; a
+  // native final answer wins, and failed/cancelled turns never get a fallback.
+  const turnAnswers = new Map<string, { summary?: string; nativeFinal?: boolean }>();
+  const answerKey = (runId: string, turnId: string) => JSON.stringify([runId, turnId]);
   const usageTotals: Record<string, number> = {};
   const usageByTurn = new Map<string, {
     receipts: Map<string, string>;
@@ -351,6 +356,11 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (payload.kind === "usage" && record(payload.usage).runDeltaComplete === false) {
           reportUsage(opened, { runId: event.runId, turnId: event.turnId }, { runDeltaAvailable: false, accountingComplete: false });
         }
+        if (event.eventType === "item.completed" && payload.kind === "agentMessage" &&
+            payload.channel === "final" && text(payload.text).trim()) {
+          const key = answerKey(event.runId, event.turnId);
+          turnAnswers.set(key, { ...turnAnswers.get(key), nativeFinal: true });
+        }
         send(openCodeProxyItemNotification({
           eventType: event.eventType,
           threadId: opened.ids().driverSessionId,
@@ -408,6 +418,18 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         event.eventType === "turn.completed" || event.eventType === "turn.failed" ||
         event.eventType === "turn.interrupted" || event.eventType === "turn.cancelled"
       ) {
+        const key = typeof event.turnId === "string" ? answerKey(event.runId, event.turnId) : "";
+        const answer = turnAnswers.get(key);
+        turnAnswers.delete(key);
+        if (event.eventType === "turn.completed" && answer?.summary && !answer.nativeFinal) {
+          send(openCodeProxyItemNotification({
+            eventType: "item.completed",
+            threadId: opened.ids().driverSessionId,
+            turnId: event.turnId,
+            itemId: `${event.turnId}:pi-finish-answer`,
+            payload: { kind: "agentMessage", channel: "final", text: answer.summary },
+          }));
+        }
         send(openCodeProxyTerminalNotification({
           eventType: event.eventType,
           threadId: opened.ids().driverSessionId,
@@ -476,6 +498,13 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         // The controller may answer after another run has attached to this
         // resident Pi. Never deliver that old result into the current run.
         assertCallbackAuthority(opened, runId, turnId);
+        if (tool === "paperclip_finish" && record(response).success === true) {
+          const summary = text(record(arguments_).summary).trim();
+          if (summary) {
+            const key = answerKey(runId, turnId);
+            turnAnswers.set(key, { ...turnAnswers.get(key), summary });
+          }
+        }
         return response;
       },
       isolateProcessGroup: false,
