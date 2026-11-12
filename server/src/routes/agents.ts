@@ -3087,6 +3087,9 @@ export function agentRoutes(
     if (pendingAcpxProfile && req.query.acpxAgent !== "antigravity") throw unprocessable(`${pendingAcpxProfile.label} is awaiting native Runner acceptance. Its profile is not enabled for production runs.`,
       { code: "paperclip_runner_acpx_agent_unavailable" });
     const poolId = asNonEmptyString(req.query.poolId);
+    if (poolId && type === "paperclip_runner" && req.query.provider === "pi_rpc") {
+      throw unprocessable("Pi model discovery requires the selected AI connection, not a pool-wide provider catalog.");
+    }
     if (poolId) {
       const pool = (await aiConnectionRouterService(db).selectable(companyId, responsibleUserForAiRequest(req) ?? "")).find(pool => pool.id === poolId);
       if (!pool) throw unprocessable("Enable an accessible AI connection pool");

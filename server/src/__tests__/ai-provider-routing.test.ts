@@ -50,7 +50,7 @@ describe("provider routing", () => {
   it.each(["messages", "responses"] as const)("keeps legacy Pi incompatible with %s routes", protocol => {
     const route = aiProviderRoutingSchema.parse({ kind: "gateway", protocol, baseUrl: protocol === "messages" ? "https://gateway.example" : "https://gateway.example/v1" });
     expect(aiRoutingHarness("paperclip_runner", "acpx", "pi")).toBe("pi_runtime");
-    const requirement = { provider: protocol === "messages" ? "anthropic" : "openai", method: "api_key" as const, routing: route };
+    const requirement: Parameters<typeof isAiConnectionCompatible>[0] = { provider: protocol === "messages" ? "anthropic" : "openai", method: "api_key", routing: route };
     expect(isAiConnectionCompatible(requirement, "paperclip_runner", `${requirement.provider}/model`, "acpx", "pi")).toBe(true);
     expect(isAiConnectionCompatible(requirement, "pi_local", `${requirement.provider}/model`)).toBe(false);
   });

@@ -141,7 +141,7 @@ describe("managed AI connections", () => {
       effectiveModel: "paperclip/anthropic/model-x", helloProbePassed: true });
     const legacy = vi.spyOn(requireServerAdapter("pi_local"), "testEnvironment").mockRejectedValue(new Error("Legacy Pi CLI must not run"));
     try {
-      expect(runtime.config.model).toBe("paperclip/anthropic/model-x");
+      expect((runtime.config as Record<string, unknown>).model).toBe("paperclip/anthropic/model-x");
       expect(runtime.config.env).toMatchObject({ PAPERCLIP_AI_PROVIDER_URL: baseUrl, PAPERCLIP_AI_PROVIDER_KEY: `fixture-pi-${kind}-key`,
         PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key" });
       expect(runtime.config.env.PAPERCLIP_PI_PROVIDERS).toBe("");

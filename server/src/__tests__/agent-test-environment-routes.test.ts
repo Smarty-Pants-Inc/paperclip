@@ -535,6 +535,12 @@ describe("agent test-environment route", () => {
     expect(mockSelectAiConnection).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ companyId: "company-1", agentId: "agent-1", runnerProvider: "pi_rpc", binding }));
     expect(mockAiCredential).not.toHaveBeenCalled();
   });
+  it("does not replace Pi connection scope with a pool-wide provider catalog", async () => {
+    const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models").query({ provider: "pi_rpc", poolId: "pool-1" });
+    expect(response.status).toBe(422);
+    expect(response.body.error).toContain("selected AI connection");
+    expect(mockSelectAiConnection).not.toHaveBeenCalled();
+  });
   it("carries only exact, source-declared Pi thinking capabilities", async () => {
     mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
     mockSelectAiConnection.mockResolvedValueOnce({ connection: { config: { ai: { provider: "anthropic", method: "api_key", routing: {
