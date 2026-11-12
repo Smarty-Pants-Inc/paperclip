@@ -13,10 +13,8 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 import { prepareNativePiHomeProof, readNativePiHomeProof, assertNativePiHomeProof } from "./helpers/native-pi-home-load-proof.js";
 
 // Explicit-only real process/user flow; faux model, real HTTP route/DB/runner/Pi.
-// Keep reason: reproduces stack-lead's residentAlive=false after Stop, before
-// harness teardown. The contract on 2868978c is physical retirement, not warm
-// interrupt: pi-rpc-driver.ts interrupt + pi-rpc-c2-live.test.ts, and the executor
-// only retains successful runs. A NEW wake must still work and then stay warm.
+// Desired contract: real Stop cancels bash, not the resident; the next run
+// recalls assistant-only history on the same Pi PID and native session ID.
 // This is not a sandbox/remote-target qualification and uses no paid model.
 const enabled = process.env.PAPERCLIP_PI_FULL_SERVER_E2E === "1";
 const thinking = process.env.PAPERCLIP_PI_E2E_THINKING_LEVEL ?? "xhigh";
@@ -47,7 +45,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeeds and stays warm (thinking=${thinking})`, async () => {
+it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant history (thinking=${thinking})`, async () => {
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -62,7 +60,8 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
     stages.push(row); console.log(`[pi-full-server] ${name} ${JSON.stringify(detail)}`);
   };
   const bundles: Bundle[] = [];
-  const requests: Array<{ path: string; model: unknown; lastMessage: unknown; tools: string[] }> = [];
+  const assistantFact = `ASSISTANT_ONLY_STOP_FACT_${randomUUID()}`;
+  const requests: Array<{ path: string; model: unknown; lastMessage: unknown; tools: string[]; recalledAssistantFact: boolean }> = [];
   const packVerificationCommands: Array<Record<string, unknown>> = [];
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
   let replyCount = 0;
@@ -144,21 +143,25 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
         if (new URL(req.url ?? "", "http://127.0.0.1").pathname !== "/v1/messages") { res.writeHead(404).end(); return; }
         const parsed = JSON.parse(body), useTool = requests.length === 0;
         requests.push({ path: req.url!, model: parsed.model, lastMessage: parsed.messages?.at(-1),
-          tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? "") });
+          tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? ""),
+          recalledAssistantFact: (parsed.messages ?? []).some((message: { role: string; content: unknown }) => message.role === "assistant" && JSON.stringify(message.content).includes(assistantFact)) });
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
         const emit = (type: string, value: Record<string, unknown>) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
         emit("message_start", { message: { id: `msg-${requests.length}`, type: "message", role: "assistant", model: "faux", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 7, output_tokens: 0 } } });
         if (useTool) {
+          emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+          emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: assistantFact } });
+          emit("content_block_stop", { index: 0 });
           const input = { command: `echo $$ > ${join(root, "bash.pid")}; sleep 60; echo SHOULD_NOT_RUN > ${join(root, "after-stop.txt")}` };
-          emit("content_block_start", { index: 0, content_block: { type: "tool_use", id: "call-stop-sleep", name: "bash", input: {} } });
-          emit("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
+          emit("content_block_start", { index: 1, content_block: { type: "tool_use", id: "call-stop-sleep", name: "bash", input: {} } });
+          emit("content_block_delta", { index: 1, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
           stage("faux model called bash sleep 60", input);
         } else {
-          const reply = `LOCAL_PI_FULL_SERVER_REPLY_${++replyCount}`;
+          const reply = `LOCAL_PI_FULL_SERVER_REPLY_${++replyCount} ${requests.at(-1)!.recalledAssistantFact ? assistantFact : "HISTORY_LOST"}`;
           emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
           emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: reply } });
         }
-        emit("content_block_stop", { index: 0 });
+        emit("content_block_stop", { index: useTool ? 1 : 0 });
         emit("message_delta", { delta: { stop_reason: useTool ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } });
         emit("message_stop", {}); res.end();
       });
@@ -290,6 +293,7 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
     expect(requests[0]!.tools).toContain("subagent");
     expect(requests[0]!.tools).toContain("paperclip_finish");
     stage("native Pi fixture load proof before Stop", await assertNativePiHomeProof(nativeHomeProof!, pid.piPid));
+    const nativeSessionIdBeforeStop = readNativePiHomeProof(nativeHomeProof!.receiptPath)!.sessionId;
     await writeFile(join(root, "native-home-before-stop.json"), JSON.stringify(readNativePiHomeProof(nativeHomeProof!.receiptPath), null, 2));
     const alive = (value: number) => {
       try { return readFileSync(`/proc/${value}/stat`, "utf8").split(") ")[1]!.split(" ")[0] !== "Z"; }
@@ -312,8 +316,8 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
     const { heartbeatService } = await import("../services/heartbeat.js");
     await heartbeatService(db).waitForRunExecutionDrain(admitted.id, { timeoutMs: 15_000 });
     stage("Stop drained before NEW wake", { residentAlive: alive(pid.piPid), runnerAlive: alive(pid.runnerPid), bashAlive: alive(bashPid), bundles: bundles.length });
-    expect(alive(pid.piPid), "Pi interrupt contract physically retires resident").toBe(false);
-    expect(alive(pid.runnerPid), "run drain retires original runnerd before any harness teardown").toBe(false);
+    expect(alive(pid.piPid), "Stop must keep Pi alive after server run drain, before harness teardown").toBe(true);
+    expect(alive(pid.runnerPid), "Stop must keep the original runnerd warm").toBe(true);
     expect(existsSync(join(root, "after-stop.txt")), "cancelled command cannot run its trailing effect").toBe(false);
     await api("POST", `/issues/${issueId}/comments`, { body: "New turn after Stop: reply with the next local faux token. No tool needed." }, 201);
     const reply = await waitFor("NEW turn after Stop completes", async () => {
@@ -329,14 +333,14 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
     stage("NEW turn completed after Stop", { runId: final.id, status: final.status, old: pid, newPids, reply: reply.body });
     expect(final.status).toBe("succeeded");
     const replacement = newPids.find(value => value.piPid !== null)!;
-    expect(replacement, "new wake creates a healthy resident").toBeDefined();
-    expect(replacement.piPid).not.toBe(pid.piPid);
-    expect(replacement.runnerPid).not.toBe(pid.runnerPid);
-    // Stop keeps Pi's conversation: a fresh process cold-opens the SAME session file
-    // (org 11-12 18:58Z; native-pi-rpc-stop-continue.e2e.test.ts proves the history recall).
+    expect(replacement, "next run uses the same healthy resident").toBeDefined();
+    expect(replacement.piPid).toBe(pid.piPid);
+    expect(replacement.runnerPid).toBe(pid.runnerPid);
+    expect(readNativePiHomeProof(nativeHomeProof!.receiptPath)!.sessionId).toBe(nativeSessionIdBeforeStop);
+    expect(requests[1]!.recalledAssistantFact, "private assistant history, not echoed in user input").toBe(true);
+    expect(reply.body).toContain(assistantFact);
     expect(final.nativeSessionId, "Stop keeps the same Pi session").toBe(stopped.nativeSessionId);
-    // After replacement succeeds, ordinary warm policy still works. This catches
-    // a poisoned session/agent after Stop without claiming Stop itself is warm.
+    // A further ordinary run must also retain the same resident.
     await api("POST", `/issues/${issueId}/comments`, { body: "Another normal turn: reply with the next local faux token, no tool." }, 201);
     const warmReply = await waitFor("warm turn after replacement", async () => {
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -355,7 +359,7 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
     expect(requests.every(request => request.model === "faux")).toBe(true);
     stage("replacement stays warm", { ...replacement, runId: settledWarm.id, nativeSessionId: settledWarm.nativeSessionId, reply: warmReply.body });
     stage("native Pi fixture load proof on replacement", await assertNativePiHomeProof(nativeHomeProof!, replacement.piPid!));
-    stage("GREEN", { companyId, agentId, issueId, requests: requests.length, cancelMs, retired: pid, replacement, bashPid, sleepPid });
+    stage("GREEN", { companyId, agentId, issueId, requests: requests.length, cancelMs, original: pid, resident: replacement, nativeSessionId: nativeSessionIdBeforeStop, assistantHistoryRecalled: true, bashPid, sleepPid });
   } catch (error) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;

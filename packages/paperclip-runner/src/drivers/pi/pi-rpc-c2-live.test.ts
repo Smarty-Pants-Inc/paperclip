@@ -22,7 +22,7 @@ class FakeTransport {
   pid = 42; exited = false; closed = false; ready = Promise.resolve();
   writes: PiRpcRecord[] = []; order: string[] = []; state: PiRpcRecord = {}; uiGate = Promise.resolve();
   #queue: PiRpcRecord[] = []; #wake?: (value: IteratorResult<PiRpcRecord>) => void;
-  async request(type: string) { await this.ready; this.order.push(type); return { success: true, data: type === "get_state" ? { sessionId: "native", model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0, ...this.state } : type === "set_model" ? { provider: "paperclip", id: "faux" } : type === "get_available_thinking_levels" ? { levels: ["off"] } : type === "prompt" ? { disposition: "started" } : undefined }; }
+  async request(type: string) { await this.ready; this.order.push(type); if (type === "abort") { this.send({ type: "agent_end", messages: [] }); this.send({ type: "agent_settled", aborted: true }); } return { success: true, data: type === "get_state" ? { sessionId: "native", model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0, ...this.state } : type === "set_model" ? { provider: "paperclip", id: "faux" } : type === "get_available_thinking_levels" ? { levels: ["off"] } : type === "prompt" ? { disposition: "started" } : undefined }; }
   async sendExtensionUiResponse(value: PiRpcRecord) { this.writes.push(structuredClone(value)); await this.uiGate; }
   send(value: PiRpcRecord) { if (this.#wake) { const wake = this.#wake; this.#wake = undefined; wake({ value, done: false }); } else this.#queue.push(value); }
   events(): AsyncIterable<PiRpcRecord> { return { [Symbol.asyncIterator]: () => ({ next: async () => { const value = this.#queue.shift(); if (value) return { value, done: false }; if (this.closed) return { value: undefined, done: true }; return new Promise<IteratorResult<PiRpcRecord>>(r => { this.#wake = r; }); } }) }; }
@@ -134,19 +134,20 @@ describe("live host Pi C2 authority", () => {
     const count = f.transport.writes.length; await expect(f.session.resolveRuntimeRequest!({ ...resolution, requestId: "old", origin: oldRequest.origin } as never)).rejects.toThrow(); expect(f.transport.writes).toHaveLength(count);
     f.transport.send({ type: "extension_ui_request", id: "late", method: "input", title: "Value?", origin }); await tick(); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(2);
   });
-  it("fences immediately while child cleanup is still pending, then physically closes on interrupt", async () => {
+  it("fences immediately while child cleanup is pending, then aborts and keeps Pi warm", async () => {
     const f = await fixture(); const turn = await f.start(); const request = f.call(); await f.announce(request);
     const gate = deferred<void>(); f.setStopGate(gate.promise);
     const stopping = f.session.interrupt({ turnId: turn.turnId });
     await vi.waitFor(() => expect(f.ipc.some(command => command.type === "stop_children")).toBe(true));
     expect(f.transport.closed).toBe(false);
     await expect(sendPiToolRequest(f.initial.toolSocketPath, request)).rejects.toThrow(); expect(f.effects).toEqual([]);
-    gate.resolve(); await stopping; expect(f.transport.closed).toBe(true);
+    gate.resolve(); await stopping; expect(f.transport.closed).toBe(false);
+    expect(f.transport.order.indexOf("clear_queue")).toBeLessThan(f.transport.order.indexOf("abort"));
     await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.cancelled" && event.turnId === turn.turnId)).toBe(true));
   });
-  it("retires idle sessions on interrupt but ignores a stale turn-specific stop", async () => {
+  it("keeps idle sessions warm on interrupt and ignores a stale turn-specific stop", async () => {
     const f = await fixture(); const turn = await f.start(); await f.session.interrupt({ turnId: "old-turn" }); expect(f.transport.closed).toBe(false); await f.settle();
-    await f.session.interrupt(); expect(f.transport.closed).toBe(true); expect(f.ipc.some(command => command.type === "stop_children")).toBe(true); expect(turn.turnId).toBe(f.initial.turnId);
+    await f.session.interrupt(); expect(f.transport.closed).toBe(false); expect(f.ipc.some(command => command.type === "stop_children")).toBe(false); expect(turn.turnId).toBe(f.initial.turnId);
   });
   it("accepts a UI request attributed by a previously captured native message owner", async () => {
     const f = await fixture(); await f.start(); const message = { role: "assistant", id: "native-message", provider: "paperclip", model: "faux", timestamp: 1, content: [] };
