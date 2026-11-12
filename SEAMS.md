@@ -61,11 +61,37 @@ Until upstream's next stable release, the seam branches are based on upstream
 | S4 | Sandbox callback bridge admits the run-scoped tool gateway: 4 exact routes plus the gateway session-token header (no allow-all) | parked (agents use Paperclip's staged runtime MCP) | `seam/sandbox-tool-gateway` (fixes: `hotfix/2026-11-11` @ f31f080: UUID-anchored revoke, token log redaction, queue_v1 60 s budget; challenger re-check PASS) | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | not offered (upstream [#18748](https://github.com/paperclipai/paperclip/issues/18748); the broader [#18949](https://github.com/paperclipai/paperclip/pull/18949) is not used) |
 | S5 | Runner Pi extensions: operator-named extension list (`PAPERCLIP_PI_EXTENSIONS`) and native mode (`PAPERCLIP_PI_EXTENSIONS_MODE=native`: Pi's own settings, packages, project .pi and -e, owned extension first, private session dir) | built, in review | `hq/2026-11-11c` @ 877b6be5 + e2104449 | [smarty-dev#20045](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20045) | draft for the owner's approval |
 | S6 | Runner Pi thinking: a Claude model's top level runs as Pi xhigh, never max; only an identified GPT model keeps max (fail closed) | in tonight's hq image (build in progress) | `hq/2026-11-11c` @ e4e01bb7 + d892d229 | independent review PASS | not offered |
+| S7 | Managed custom gateways for Runner Pi: a protocol-generic runner loopback broker (Chat, Messages, Responses) plus a per-harness custom-protocol declaration | building | `seam/runner-provider-broker` | [smarty-dev#20018](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/20018), review `doc/seams/runner-provider-broker.md` | not offered |
 
 S1's scope and whether it splits into separate seams are being settled by its design
 review. This table is updated when the review result is recorded.
 
 S4 follow-ups (all under 5, only if S4 is un-parked): N1 the issue-update helper's 30 s curl timeout can double-apply a PATCH behind a long queue_v1 call; N2 the long budget also slows dead-exec detection; N3 a caller forwardTimeoutMs under 70 s gives a retryable 502; N4 slow test; N5 stale comments.
+
+### S7 Runner provider broker
+
+- **Problem**: a Runner Pi agent cannot use an organization's managed Messages or Responses gateway connection. AI-CONNECTIONS.md L703 and L719 say "Pi custom gateways ... are not part of this implementation."
+- **No existing way**:
+  - The only AI-connection plugin hook is `onRouteAiConnection` (plugin-sdk `define-plugin.ts:379-380`). It selects a pool member from host-resolved candidates. It cannot change harness compatibility, hold a key in the runner, or change the sidecar environment.
+  - Environment hooks are per environment, and could only write a key into the sandbox, which is forbidden.
+  - The Rust sidecar environment allowlist is core.
+  - Skills are prompt text.
+  - No upstream issue or pull request covers it (design pair's step-0 search, 2026-11-12).
+- **Design**: OpenCode's session-scoped loopback broker is extracted into `packages/paperclip-runner/src/drivers/provider-loopback/`, with per-protocol adapters.
+  - Each harness declares the custom protocols it consumes. Runner Pi declares Messages and Responses; legacy Pi declares none.
+  - The environment contract is `PAPERCLIP_AI_PROVIDER_{URL,KEY,PROTOCOL,AUTH}` (OpenCode's names plus two), and the model is `paperclip/<id>`.
+  - The key stays in runner memory, and Pi gets a loopback URL and a session token.
+  - The configuration digest covers only the stable route, and the hello probe goes through the broker.
+- **Extensions built on it**: Paul's Smarty (Runner Pi) on our CLIProxyAPI Messages and Responses gateway.
+- **Tests**:
+  - the broker: Chat, Messages and Responses; auth headers; 3xx rejected; 413; revoke on close;
+  - the OpenCode driver, for regressions;
+  - the Pi consumer: no key in files or the environment;
+  - the gate: Runner yes, legacy no;
+  - the projection and the digest;
+  - the hello outcome;
+  - the Rust allowlist.
+- **Upstream**: not offered. The PR text is drafted, and offering it needs the product owner's yes.
 
 ## Upstream-pending carries
 
