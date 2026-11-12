@@ -87,6 +87,7 @@ export interface CodexAppServerTransport {
     turnId: string;
     itemId: string;
     currentRunGrant?: NativeRunRuntimeGrant;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     /** The attaching run's own completion contract. */
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }): Promise<void>;

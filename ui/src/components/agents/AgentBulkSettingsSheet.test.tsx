@@ -96,6 +96,28 @@ describe("bulk model editing", () => {
     expect(button("Update 1 agent").disabled).toBe(false);
   });
 
+  it.each(["messages", "responses", "chat"] as const)("validates native Pi bulk edits against %s gateway metadata", async protocol => {
+    const binding = { provider: "anthropic", method: "api_key", mode: "shared", connectionId: "11111111-1111-4111-8111-111111111111", grantId: "22222222-2222-4222-8222-222222222222" } as const;
+    const model = "paperclip/claude-opus-5-5";
+    const pi = { ...agent("Paul's Smarty", "paperclip_runner"), adapterConfig: { provider: "pi_rpc", model: "paperclip/old-model" }, runtimeConfig: { aiConnection: binding } } as Agent;
+    api.accounts.mockResolvedValue({ currentUserId: "board", canManageConnections: true, pools: [], connections: [{
+      id: binding.connectionId, grantId: binding.grantId, provider: "anthropic", method: "api_key", status: "connected", companyId: "company-1",
+      name: "Paul's Smarty gateway (per-agent key)", ownership: "shared", isDefault: false,
+      routing: { kind: "gateway", protocol, baseUrl: "https://gateway.example/v1", auth: "bearer", models: [{ id: model }] },
+    }] });
+    api.models.mockResolvedValue([{ id: model, label: model }]);
+    api.update.mockResolvedValue({ ...pi, adapterConfig: { ...pi.adapterConfig, model } });
+    await render([pi]);
+    await chooseModel(model);
+    await vi.waitFor(() => expect(button("Update 1 agent").disabled).toBe(protocol === "chat"));
+    expect(document.body.textContent?.includes("Choose a model compatible with this connection")).toBe(protocol === "chat");
+    if (protocol !== "chat") {
+      await act(async () => button("Update 1 agent").click());
+      await vi.waitFor(() => expect(onClose).toHaveBeenCalledWith([pi.id], true));
+      expect(api.update).toHaveBeenCalledWith(pi.id, expect.objectContaining({ harness: "pi_rpc", model, expected: { model: "paperclip/old-model", aiConnection: binding } }), "company-1");
+    }
+  });
+
   it("refreshes an Antigravity catalog when its saved binding or environment changes", async () => {
     const first = { provider: "google", method: "subscription", mode: "shared", connectionId: "11111111-1111-4111-8111-111111111111", grantId: "33333333-3333-4333-8333-333333333333" } as const;
     const second = { ...first, connectionId: "22222222-2222-4222-8222-222222222222", grantId: "44444444-4444-4444-8444-444444444444" };

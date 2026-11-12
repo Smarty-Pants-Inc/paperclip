@@ -4,12 +4,15 @@ import {
   readSync, realpathSync, rmdirSync, unlinkSync, writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute } from "node:path";
+import { pathToFileURL } from "node:url";
 
 export const TRUSTED_PI_EXECUTABLE_ARG = "--paperclip-trusted-pi-executable";
 
 export interface TrustedPiLaunchBinding {
   command: string;
   commandFd?: number;
+  /** Original proxy path attested against the currently compiled proxy FD. */
+  trustedProxyEntrypointUrl?: string;
   commandLifecycle?: {
     beforeSpawn(): void;
     afterSpawn(): void;
@@ -30,11 +33,13 @@ export function withoutAmbientPiCommand(environment: NodeJS.ProcessEnv): NodeJS.
  * fallback; the macOS lifecycle keeps the verified inode bound across spawn.
  */
 export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunchBinding {
-  const command = (args.length === 2 || (args.length === 4 && args[2] === "--paperclip-pi-executable-path"))
+  const resourceBinding = process.platform === "linux" && args.length === 6 && args[2] === "--paperclip-pi-executable-path"
+    && args[4] === "--paperclip-pi-proxy-path";
+  const command = (args.length === 2 || (args.length === 4 && args[2] === "--paperclip-pi-executable-path") || resourceBinding)
     && args[0] === TRUSTED_PI_EXECUTABLE_ARG ? args[1]! : "";
   const matched = process.platform === "linux" ? command.match(/^\/proc\/self\/fd\/(\d+)$/) : null;
   const commandFd = Number(matched?.[1]);
-  const executablePath = args.length === 4 && args[2] === "--paperclip-pi-executable-path" ? args[3]! : "";
+  const executablePath = (args.length === 4 || resourceBinding) && args[2] === "--paperclip-pi-executable-path" ? args[3]! : "";
   if (matched && Number.isInteger(commandFd) && commandFd >= 3 && commandFd <= 255
     && isAbsolute(executablePath)) {
     const unavailable = () => new Error(
@@ -50,6 +55,23 @@ export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunch
         || realpathSync(executablePath) !== executablePath) throw unavailable();
       if (createHash("sha256").update(bytes).digest("hex") !== createHash("sha256").update(verifiedBytes).digest("hex")) {
         throw unavailable();
+      }
+      if (resourceBinding) {
+        // Attest resources against the CURRENT compiled CommonJS artifact, not
+        // the separate SDK executable descriptor and never raw argv/env/cwd.
+        const proxyDescriptor = process.argv[1] ?? "";
+        const proxyMatch = proxyDescriptor.match(/^\/proc\/self\/fd\/([1-9]\d*)$/);
+        const proxyFd = Number(proxyMatch?.[1]);
+        const proxyPath = args[5]!;
+        if (!proxyMatch || !Number.isInteger(proxyFd) || proxyFd < 3 || proxyFd > 255
+          || proxyFd === commandFd || !isAbsolute(proxyPath)) throw unavailable();
+        const proxyMetadata = lstatSync(proxyPath);
+        if (!proxyMetadata.isFile() || proxyMetadata.isSymbolicLink() || proxyMetadata.nlink !== 1
+          || (proxyMetadata.mode & 0o022) !== 0 || proxyMetadata.uid !== uid
+          || realpathSync(proxyPath) !== proxyPath) throw unavailable();
+        if (createHash("sha256").update(readFileSync(proxyPath)).digest("hex")
+          !== createHash("sha256").update(readFileSync(proxyDescriptor)).digest("hex")) throw unavailable();
+        return { command: executablePath, trustedProxyEntrypointUrl: pathToFileURL(proxyPath).href };
       }
       return { command: executablePath };
     } catch {

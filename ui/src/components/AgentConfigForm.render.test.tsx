@@ -1248,6 +1248,23 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.container.querySelector('input[aria-label="Variable name"]')).toBeNull();
   });
 
+  it.each(["pi_rpc", "acpx"])("preserves %s Pi identity for the routed gateway warning", async provider => {
+    const binding = { provider: "anthropic", method: "api_key", mode: "shared", connectionId: "11111111-1111-4111-8111-111111111111", grantId: "22222222-2222-4222-8222-222222222222" } as const;
+    const model = "paperclip/claude-opus-5-5";
+    const list = vi.spyOn(aiConnectionsApi, "list").mockResolvedValue({ currentUserId: "you", canManageConnections: true, connections: [{
+      id: binding.connectionId, grantId: binding.grantId, provider: "anthropic", method: "api_key", companyId: "company-1", status: "connected", isDefault: false,
+      name: "Paul's Smarty gateway (per-agent key)", ownership: "shared",
+      routing: { kind: "gateway", protocol: "messages", baseUrl: "https://gateway.example/v1", auth: "bearer", models: [{ id: model }] },
+    }] });
+    try {
+      mockAgentsApi.adapterModels.mockResolvedValue([{ id: model, label: model }]);
+      const result = await renderForm([], { adapterType: "paperclip_runner", adapterConfig: { provider, ...(provider === "acpx" ? { acpxAgent: "pi" } : {}), model }, runtimeConfig: { aiConnection: binding } });
+      roots.push(result.root);
+      await flushReact();
+      expect(result.container.textContent?.includes("does not support the current harness")).toBe(provider === "acpx");
+    } finally { list.mockRestore(); }
+  });
+
   it.each(["pi_rpc", "acpx"])("reopens and saves %s Pi without changing its execution profile or duplicating effort", async provider => {
     const native = provider === "pi_rpc";
     const key = native ? "piRpcThinkingLevel" : "piThinkingLevel";

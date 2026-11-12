@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { copyFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -57,7 +57,7 @@ describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
       await expect(driver.openSession({ runId: "mode-test", normalizedSessionId: "mode-test", workingDirectory: workspace }))
         .rejects.toThrow("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      // Retain the private proof root and any raw native JSONL traces.
     }
   });
 
@@ -73,6 +73,7 @@ describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
     const driver = new PiRpcDriver({
       command: binary!,
       model: "paperclip/faux",
+      piRpcThinkingLevel: "off",
       runtimeDirectory: join(root, "sessions"),
       environment: {
         PI_CODING_AGENT_DIR: agentDirectory,
@@ -172,7 +173,7 @@ describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
         }).then(response => response.status === 401, () => true);
         expect(refused).toBe(true);
       }
-      await rm(root, { recursive: true, force: true });
+      // Retain the private proof root and any raw native JSONL traces.
     }
   }, 30_000);
 });

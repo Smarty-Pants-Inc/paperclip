@@ -20,6 +20,20 @@ export async function startPiProviderLoopback(input: {
   environment: NodeJS.ProcessEnv;
   onSensitiveValues?(values: readonly string[]): void;
 }): Promise<{ json: string; close(): Promise<void> }> {
+  const binding = await createPiProviderBinding(input);
+  const { baseUrl, api, apiKey, models } = binding.provider;
+  return {
+    json: piProviderJson({ baseUrl, api, apiKey, model: models[0].id }),
+    close: binding.close,
+  };
+}
+
+/** Bind Pi in memory using only a revocable broker capability, never the upstream credential. */
+export async function createPiProviderBinding(input: {
+  model: string;
+  environment: NodeJS.ProcessEnv;
+  onSensitiveValues?(values: readonly string[]): void;
+}): Promise<{ provider: { name: "paperclip"; api: string; baseUrl: string; apiKey: string; models: [{ id: string }] }; close(): Promise<void> }> {
   const protocol = input.environment.PAPERCLIP_AI_PROVIDER_PROTOCOL ?? "";
   const route = Object.hasOwn(PI_MANAGED_PROVIDER_PROTOCOLS, protocol) ? PI_MANAGED_PROVIDER_PROTOCOLS[protocol] : undefined;
   if (!route) throw new Error("Pi managed provider protocol is unsupported");
@@ -28,7 +42,7 @@ export async function startPiProviderLoopback(input: {
   try {
     input.onSensitiveValues?.([broker.token, ...(connection.key ? [connection.key] : [])]);
     return {
-      json: piProviderJson({ baseUrl: broker.baseURL, api: route.api, apiKey: broker.token, model: connection.model }),
+      provider: { name: "paperclip", api: route.api, baseUrl: broker.baseURL, apiKey: broker.token, models: [{ id: connection.model }] },
       close: broker.close,
     };
   } catch (error) {

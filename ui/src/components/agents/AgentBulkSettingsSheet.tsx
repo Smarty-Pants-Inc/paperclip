@@ -89,7 +89,11 @@ export function AgentBulkSettingsSheet({ companyId, agents, totalSelected, onClo
     let problem: string | null = null;
     if (row.binding) {
       problem = bindingProblem(row.binding, { companyId, provider: row.binding.provider }, row.accounts.connections, row.accounts.currentUserId, agent.id);
-      if (!problem && !isAiConnectionCompatible(row.binding, harness, nextModel)) problem = "Choose a model compatible with this connection.";
+      const connection = harness === "pi_rpc" && row.binding.mode !== "responsible_user" ? resolveBulkConnection(row.binding, row.accounts) : undefined;
+      const requirement = connection?.routing
+        ? { provider: connection.provider, method: connection.method, routing: connection.routing }
+        : row.binding;
+      if (!problem && !isAiConnectionCompatible(requirement, harness === "pi_rpc" ? "pi_runtime" : harness, nextModel)) problem = "Choose a model compatible with this connection.";
     }
     if (!problem && row.restricted && !row.models.some(m => m.id === nextModel)) problem = `${nextModel ?? "Harness default"} isn’t available on this connection. Choose a different connection or change the default model.`;
     return problem ? [{ agent, message: problem }] : [];

@@ -127,6 +127,17 @@ export function AiConnectionField({
     ?? accounts.data?.connections.find((account) => account.provider === provider && account.isDefault)?.method
     ?? (provider === "openrouter" || provider === "google" || provider === "github" ? "api_key" : "subscription");
   const compatiblePools = agentId ? accounts.data?.pools?.filter(pool => pool.enabled && pool.members.some(member => isAiConnectionCompatible(member.binding, routerAdapterType ?? adapterType, member.profile.model, member.profile.provider, member.profile.acpxAgent))) ?? [] : [];
+  const selectedConnection = value && value.mode !== "router" && value.mode !== "responsible_user"
+    ? accounts.data?.connections.find(account => account.id === value.connectionId && account.grantId === value.grantId)
+    : undefined;
+  const incompatible = value && value.mode !== "router" && !isAiConnectionCompatible(
+    adapterType === "pi_rpc" && selectedConnection?.routing
+      ? { provider: selectedConnection.provider, method: selectedConnection.method, routing: selectedConnection.routing }
+      : value,
+    // Preserve binding-only UI feedback until the selected metadata is loaded.
+    adapterType === "pi_rpc" ? "pi_runtime" : adapterType,
+    model,
+  );
   if (!provider) return null;
   if (legacy && !value && !adopting)
     return (
@@ -137,7 +148,7 @@ export function AiConnectionField({
     );
   return (
     <div className="space-y-4">
-      {value && value.mode !== "router" && (!["opencode_local", "pi_local", "pi_rpc", "pi_runtime"].includes(adapterType) || Boolean(model)) && !isAiConnectionCompatible(value, adapterType, model) && (
+      {incompatible && (!["opencode_local", "pi_local", "pi_rpc", "pi_runtime"].includes(adapterType) || Boolean(model)) && (
         <p role="alert" className="text-sm text-destructive">
           This connection does not support the current harness and model. Choose
           a compatible connection before saving.

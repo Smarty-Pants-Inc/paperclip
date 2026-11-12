@@ -2,6 +2,13 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 export type PiRpcRecord = Record<string, unknown>;
 
+export interface PiRpcExtensionUiResponseInput {
+  id: string | number;
+  value?: string;
+  confirmed?: boolean;
+  cancelled?: true;
+}
+
 export interface PiRpcTransportOptions {
   command: string;
   args?: readonly string[];
@@ -181,6 +188,37 @@ export class PiRpcTransport {
     return response;
   }
 
+  async sendExtensionUiResponse(input: PiRpcExtensionUiResponseInput): Promise<void> {
+    if (this.#closed || this.#exited) throw new Error("Pi RPC transport is closed");
+    const line = `${JSON.stringify(extensionUiResponseRecord(input))}\n`;
+    if (this.#child.stdin.write(line)) return;
+
+    await new Promise<void>((resolve, reject) => {
+      const stdin = this.#child.stdin;
+      const cleanup = () => {
+        stdin.removeListener("drain", onDrain);
+        stdin.removeListener("error", onError);
+        stdin.removeListener("close", onClose);
+        this.#child.removeListener("exit", onExit);
+      };
+      const succeed = () => { cleanup(); resolve(); };
+      const fail = (error: Error) => { cleanup(); reject(error); };
+      const onDrain = () => succeed();
+      const onError = (error: Error) => fail(error);
+      const onClose = () => fail(new Error("Pi RPC stdin closed before extension UI response drained"));
+      const onExit = () => fail(new Error("Pi RPC process exited before extension UI response drained"));
+
+      if (this.#closed || this.#exited || stdin.destroyed || stdin.writableEnded) {
+        onClose();
+        return;
+      }
+      stdin.once("drain", onDrain);
+      stdin.once("error", onError);
+      stdin.once("close", onClose);
+      this.#child.once("exit", onExit);
+    });
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return this.#exit.then(() => undefined);
     this.#closed = true;
@@ -252,6 +290,34 @@ export class PiRpcTransport {
 
 function isRecord(value: unknown): value is PiRpcRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function extensionUiResponseRecord(input: PiRpcExtensionUiResponseInput): PiRpcRecord {
+  if (!isRecord(input)) throw new Error("Pi RPC extension UI response must be an object");
+  const id = input.id;
+  if ((typeof id === "string" && (id.length === 0 || id.length > 1024))
+    || (typeof id === "number" && !Number.isSafeInteger(id))
+    || (typeof id !== "string" && typeof id !== "number")) {
+    throw new Error("Pi RPC extension UI response has an invalid id");
+  }
+
+  const hasValue = input.value !== undefined;
+  const hasConfirmed = input.confirmed !== undefined;
+  const hasCancelled = input.cancelled !== undefined;
+  if (Number(hasValue) + Number(hasConfirmed) + Number(hasCancelled) !== 1
+    || (hasValue && typeof input.value !== "string")
+    || (hasConfirmed && typeof input.confirmed !== "boolean")
+    || (hasCancelled && input.cancelled !== true)) {
+    throw new Error("Pi RPC extension UI response must contain exactly one valid response value");
+  }
+
+  return {
+    type: "extension_ui_response",
+    id,
+    ...(hasValue ? { value: input.value } : {}),
+    ...(hasConfirmed ? { confirmed: input.confirmed } : {}),
+    ...(hasCancelled ? { cancelled: true } : {}),
+  };
 }
 
 function boundedTimeout(value: number | undefined, fallback: number): number {
