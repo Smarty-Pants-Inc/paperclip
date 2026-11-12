@@ -6783,6 +6783,7 @@ describe("runnerd compaction turn payload", () => {
   it("asks Codex for its own compaction and Claude for its /compact command", async () => {
     const { runnerdCompactionTurnPayload } = await import("./runnerd-codex-transport.js");
     expect(runnerdCompactionTurnPayload("codex")).toEqual({ compact: true });
+    expect(runnerdCompactionTurnPayload("pi_rpc")).toEqual({ compact: true });
     expect(runnerdCompactionTurnPayload("acpx")).toEqual({ text: "/compact" });
     expect(() => runnerdCompactionTurnPayload("opencode")).toThrow("not supported");
   });

@@ -9553,7 +9553,7 @@ export function issueRoutes(
       res.status(202).json(accepted);
     } catch (error) {
       if (error instanceof ContextCompactionError) {
-        const status = error.code === "agent_busy" || error.code === "already_pending" ? 409 : 422;
+        const status = error.code === "agent_busy" || error.code === "already_pending" || error.code === "no_active_conversation" ? 409 : 422;
         res.status(status).json({ error: error.message, code: error.code });
         return;
       }

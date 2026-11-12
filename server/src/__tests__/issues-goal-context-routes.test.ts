@@ -1,8 +1,16 @@
 import express from "express";
+import { agents, agentTaskSessions } from "@paperclipai/db";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { activityRoutes } from "../routes/activity.js";
+
+const mockContextReading = vi.hoisted(() => vi.fn(async () => ({
+  runId: "run-previous", agentId: "33333333-3333-4333-8333-333333333333", sessionId: "native-session",
+  usedTokens: 100, windowTokens: 200_000, observedAt: new Date().toISOString(), totals: null, costUsd: null, compactions: 0,
+})));
+vi.mock("../services/issue-context-usage.js", () => ({ issueContextUsage: mockContextReading }));
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -164,6 +172,7 @@ function createApp() {
     };
     next();
   });
+  app.use("/api", activityRoutes(mockDb as any));
   app.use("/api", issueRoutes(mockDb as any, {} as any));
   app.use(errorHandler);
   return app;
@@ -278,6 +287,38 @@ describe("issue goal context routes", () => {
       id === projectGoal.id ? projectGoal : null,
     );
     mockGoalService.getDefaultCompanyGoal.mockResolvedValue(null);
+  });
+
+  // Keep reason: authorized HTTP control boundary (#20303). Real service below
+  // decides capability; neither it nor route behavior is replaced by a mock.
+  it.each([true, false])("native Pi compaction route and UI capability (saved conversation=%s)", async hasConversation => {
+    mockHeartbeatService.wakeup.mockResolvedValue({ id: "compact-run" } as never);
+    mockDb.select.mockImplementation(() => {
+      let rows: unknown[] = [];
+      const query: any = {
+        from(table: unknown) {
+          rows = table === agents ? [{ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } }]
+            : table === agentTaskSessions && hasConversation ? [{ sessionDisplayId: "same-native-session" }] : [];
+          return query;
+        },
+        where() { return query; }, orderBy() { return query; }, limit() { return Promise.resolve(rows); },
+        then(resolve: (value: unknown[]) => unknown) { return Promise.resolve(rows).then(resolve); },
+      };
+      return query;
+    });
+    const app = createApp();
+    const usage = await request(app).get(`/api/issues/${legacyProjectLinkedIssue.id}/context-usage`);
+    expect(usage.status).toBe(200);
+    const compact = await request(app).post(`/api/issues/${legacyProjectLinkedIssue.id}/context/compact`);
+    expect(compact.status).toBe(hasConversation ? 202 : 409);
+    expect(usage.body.compaction).toMatchObject(hasConversation ? { status: "available", reasonCode: null } : { status: "unavailable", reasonCode: "no_active_conversation" });
+    if (hasConversation) {
+      expect(compact.body).toMatchObject({ runId: "compact-run", requestId: expect.any(String) });
+      expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "issue.context_compaction_requested" }));
+    } else {
+      expect(compact.body).toMatchObject({ code: "no_active_conversation", error: expect.stringMatching(/no active conversation/i) });
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    }
   });
 
   it.each(["", "/heartbeat-context"])("reads historical review tasks without computed productivity fields: %s", async (suffix) => {

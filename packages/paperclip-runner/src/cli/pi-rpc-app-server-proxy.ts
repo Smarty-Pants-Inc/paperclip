@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -93,6 +93,7 @@ type PiRpcProxySession = Omit<HarnessSession, "attachRun" | "resolveRuntimeReque
   revalidateAfterClaim?(): Promise<void> | void;
   reconnect?(): Promise<void> | void;
   parkReady?(): Promise<{ ready: boolean; reasons: string[] }>;
+  compact?(input?: { customInstructions?: string }): Promise<Record<string, unknown>>;
 };
 
 export interface PiRpcAppServerProxyOptions {
@@ -213,6 +214,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   // An idle-abort retirement replaces the process, not the conversation. Keep
   // its actual normalized ID even without the runner's usual environment grant.
   let idleTimeoutSessionId: string | undefined;
+  let compactionOperation: Promise<void> | null = null;
+  let compactionProgress: { runId: string; turnId: string; observed(): void } | null = null;
   let activeRunId = environment.PAPERCLIP_RUN_ID ?? "runnerd-run";
   let inputEnded = false;
   const announcedTurnIds = new Set<string>();
@@ -262,6 +265,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       throw new Error("Invalid Paperclip run identity");
     }
     const opened = session;
+    if (compactionOperation) throw new Error("Pi RPC session is compacting");
     if (!opened?.attachRun) throw new Error("Pi RPC run attachment unavailable");
     const input: PiRpcRunAttachment = { runId };
     if (params.baseInstructions !== undefined) {
@@ -397,13 +401,18 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       } else if (event.eventType === "context.compacted") {
         // Use the existing Codex-facade compaction notification. Keep Pi's
         // typed measurements/identity: one Runner turn can compact repeatedly.
-        if (typeof event.turnId !== "string" || !event.turnId) continue;
+        // Manual compaction has no native turn; only its captured run may use
+        // the administrative envelope and release the progress-before-terminal gate.
+        const progress = compactionProgress?.runId === event.runId ? compactionProgress : null;
+        const turnId = event.turnId ?? progress?.turnId;
+        if (typeof turnId !== "string" || !turnId) continue;
         send({ method: "thread/compacted", params: {
           ...payload, threadId: opened.ids().driverSessionId,
-          turnId: event.turnId, itemId: event.itemId,
+          turnId, itemId: event.itemId,
         } });
+        progress?.observed();
       } else if (event.eventType === "usage.reported") {
-        reportUsage(opened, event, payload);
+        reportUsage(opened, compactionOperation && !event.turnId && activeTurnId ? { ...event, turnId: activeTurnId } : event, payload);
       } else if (event.eventType === "run.result.proposed") {
         send({
           method: "paperclip/runResult",
@@ -478,6 +487,10 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         }));
         if (event.turnId) turnFailures.delete(event.turnId);
         if (event.runId === activeRunId && event.turnId === activeTurnId) activeTurnId = null;
+      } else if (event.eventType === "provider.notice.recorded") {
+        send({ method: "warning", params: { threadId: opened.ids().driverSessionId,
+          ...(event.turnId ?? activeTurnId ? { turnId: event.turnId ?? activeTurnId } : {}),
+          message: payload.summary, severity: payload.severity, category: payload.category, noticeKey: payload.noticeId, details: payload.details } });
       } else if (event.eventType === "harness.diagnostic") {
         send({
           method: "warning",
@@ -645,8 +658,41 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       case "thread/resume":
         result = await open(params, true);
         break;
+      case "thread/compact/start": {
+        const opened = session;
+        if (!opened) throw new Error("No active conversation to compact");
+        if (params.threadId !== opened.ids().driverSessionId) throw new Error("Pi compaction thread does not match the active conversation");
+        if (!opened.compact) throw new Error("Pi RPC compaction is unavailable");
+        if (activeTurnId || compactionOperation) throw new Error("Pi RPC session already has an active turn or compaction");
+        if (params.customInstructions !== undefined && typeof params.customInstructions !== "string") throw new Error("Pi compaction instructions must be a string");
+        const turnId = `pi-compact-${randomUUID()}`;
+        let resolveObserved!: () => void;
+        let rejectObserved!: (error: Error) => void;
+        const observed = new Promise<void>((resolve, reject) => { resolveObserved = resolve; rejectObserved = reject; });
+        compactionProgress = { runId: activeRunId, turnId, observed: resolveObserved };
+        activeTurnId = turnId;
+        // Runner's existing compact protocol needs an administrative execution
+        // envelope. Native compaction events remain progress, never prompt/turn events.
+        announceTurnStarted(opened, turnId);
+        compactionOperation = Promise.resolve().then(() => opened.compact!(params.customInstructions === undefined ? {} : { customInstructions: params.customInstructions as string }))
+          .then(async receipt => {
+            // Command completion and event delivery are independent. Do not let
+            // the durable control terminal overtake its compaction notification.
+            const timeout = setTimeout(() => rejectObserved(new Error("Pi compaction progress receipt missing")), 5000);
+            try { await observed; } finally { clearTimeout(timeout); }
+            send({ method: "turn/completed", params: { threadId: opened.ids().driverSessionId, turnId,
+              turn: { id: turnId, status: "completed" }, compaction: { tokensBefore: receipt.tokensBefore,
+                estimatedTokensAfter: receipt.estimatedTokensAfter, firstKeptEntryId: receipt.firstKeptEntryId } } });
+          }).catch(error => {
+            send({ method: "turn/failed", params: { threadId: opened.ids().driverSessionId, turnId,
+              turn: { id: turnId, status: "failed", error: { message: error instanceof Error ? error.message : String(error) } } } });
+          }).finally(() => { if (activeTurnId === turnId) activeTurnId = null; compactionProgress = null; compactionOperation = null; });
+        result = { turn: { id: turnId, status: "inProgress" } };
+        break;
+      }
       case "turn/start": {
         if (!session) throw new Error("Pi RPC thread is not open");
+        if (compactionOperation) throw new Error("Pi RPC session is compacting");
         assertPiCollaborationMode(params);
         const userMessage = parsePiUserInput(params.input);
         if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
@@ -701,11 +747,22 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         result = { accepted: true };
         break;
       }
-      case "turn/interrupt":
-        if (!session?.interrupt) throw new Error("Pi RPC interruption is unavailable");
-        await session.interrupt({ turnId: text(params.turnId, activeTurnId ?? "") });
+      case "turn/interrupt": {
+        if (!session) throw new Error("Pi RPC interruption is unavailable");
+        const turnId = text(params.turnId, activeTurnId ?? "");
+        const compacting = compactionOperation;
+        if (compacting && turnId === activeTurnId) {
+          // The administrative id is not a native Pi turn id. A physical close
+          // cancels the summary instead of silently ignoring that unmatched id.
+          await session.close({ reason: "compaction_interrupt", force: true });
+          await compacting;
+        } else {
+          if (!session.interrupt) throw new Error("Pi RPC interruption is unavailable");
+          await session.interrupt({ turnId });
+        }
         result = true;
         break;
+      }
       case "thread/read":
         if (!session) throw new Error("Pi RPC thread is not open");
         result = {
@@ -721,6 +778,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           const closing = session;
           session = null;
           await closing.close({ reason: "thread_close" });
+          await compactionOperation;
           await eventPump?.catch(() => {});
           eventPump = null;
           activeTurnId = null;
@@ -780,6 +838,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     session = null;
     try { await closing?.close({ reason: "proxy_shutdown", force: true }); }
     finally {
+      await compactionOperation;
       await eventPump?.catch(() => {});
       output.flush();
       stdoutFrames.drain();

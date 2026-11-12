@@ -4382,10 +4382,10 @@ impl CodexCommandExecutor {
             && self
                 .state
                 .as_ref()
-                .is_some_and(|state| state.config.provider != "codex")
+                .is_some_and(|state| !matches!(state.config.provider.as_str(), "codex" | "pi_rpc"))
         {
             return Err(DurableRunnerError::invalid(
-                "on-demand context compaction requires Codex",
+                "on-demand context compaction requires Codex or native Pi",
             ));
         }
         let cwd = self
