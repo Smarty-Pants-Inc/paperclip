@@ -62,6 +62,35 @@ describe("remote provider verification", () => {
 });
 
 describe("remote provider pack reuse", () => {
+  // Keep: trust-boundary ordering. A cold controller must not hash a staged
+  // alias before it tries the matching sealed image; failed seals grant nothing.
+  it.each(["sealed", "memo", "full"] as const)("selects seal, staged memo, then full fallback: %s", async hit => {
+    const order: string[] = [];
+    const source = await prepareVerifiedRemoteProviderPack({
+      useSealedPreinstalled: async () => { order.push("sealed"); return hit === "sealed"; },
+      verifyStaged: async () => { order.push("memo"); if (hit !== "memo") throw new Error("no staged proof"); },
+      usePreinstalled: async () => { order.push("full"); return true; },
+      stageAndVerify: async () => { throw new Error("unexpected upload"); },
+    });
+    expect(source).toBe(hit === "memo" ? "staged" : "preinstalled");
+    expect(order).toEqual(hit === "sealed" ? ["sealed"] : hit === "memo" ? ["sealed", "memo"] : ["sealed", "memo", "full"]);
+  });
+
+  it("keeps normal staged verification after an unavailable seal and never admits from that failed read", async () => {
+    const verifyStaged = vi.fn(async () => {});
+    const usePreinstalled = vi.fn(async () => false);
+    const stageAndVerify = vi.fn(async () => { throw new Error("upload verification failed"); });
+    const input = {
+      useSealedPreinstalled: async () => { throw new Error("snapshot discovery unavailable"); },
+      verifyStaged, usePreinstalled, stageAndVerify,
+    };
+    await expect(prepareVerifiedRemoteProviderPack(input)).resolves.toBe("staged");
+    expect(verifyStaged).toHaveBeenCalledOnce();
+    expect(stageAndVerify).not.toHaveBeenCalled();
+    verifyStaged.mockRejectedValue(new Error("staged verification failed"));
+    await expect(prepareVerifiedRemoteProviderPack(input)).rejects.toThrow("upload verification failed");
+  });
+
   it("keeps a verified staged pack without consulting the image or uploading again", async () => {
     const usePreinstalled = vi.fn();
     const stageAndVerify = vi.fn();
