@@ -394,7 +394,8 @@ impl RunnerState {
                     ));
                 }
                 Ok(ProcessOutput::Stderr(line)) => self.logs.push(format!("stderr: {line}")),
-                Ok(ProcessOutput::StdoutError(message)) => {
+                Ok(ProcessOutput::StdoutError(message))
+                | Ok(ProcessOutput::StdoutFrameRejected(message)) => {
                     return Err(LocalRunnerError::invalid(message));
                 }
                 Ok(ProcessOutput::StdoutClosed) => {
@@ -518,7 +519,8 @@ impl RunnerState {
             match output {
                 ProcessOutput::Stdout(line) => self.handle_harness_line(&line)?,
                 ProcessOutput::Stderr(line) => self.logs.push(format!("stderr: {line}")),
-                ProcessOutput::StdoutError(message) => {
+                ProcessOutput::StdoutError(message)
+                | ProcessOutput::StdoutFrameRejected(message) => {
                     self.logs.push(format!("stdout: [{message}]"));
                     self.terminal_intent = TerminalIntent::ProtocolViolation;
                     self.terminate_harness()?;

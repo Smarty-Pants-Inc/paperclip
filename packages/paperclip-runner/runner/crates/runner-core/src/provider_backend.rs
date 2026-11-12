@@ -702,6 +702,25 @@ fn normalize_provider_notification(
     method: &str,
     params: &Value,
 ) -> Result<Vec<NormalizedProviderEvent>, DurableRunnerError> {
+    if state.config.provider == "pi_rpc"
+        && method == "warning"
+        && params.get("code").and_then(Value::as_str) == Some("pi_stdout_frame_rejected")
+    {
+        return Ok(vec![NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: json!({
+                "provider": "pi_rpc",
+                "code": "pi_stdout_frame_rejected",
+                "severity": "warning",
+                "message": params.get("message").and_then(Value::as_str)
+                    .unwrap_or("Dropped an unattributable Pi stdout frame")
+                    .chars().take(4_000).collect::<String>(),
+                "attribution": "unknown",
+                "dropped": true,
+            }),
+        }]);
+    }
     if state.config.provider == "codex" && method == "account/rateLimits/updated" {
         // Account-scoped and sparse: merge into the last snapshot and report
         // only a changed one, so repeated identical updates stay out of the log.

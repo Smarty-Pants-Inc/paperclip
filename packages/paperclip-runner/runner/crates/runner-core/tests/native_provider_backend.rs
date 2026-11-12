@@ -3841,3 +3841,103 @@ fn pi_rpc_replays_first_held_finish_result_despite_different_evidence() {
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
+
+// Keep reason: B3's subprocess trust boundary. A bad proxy line must not
+// escape poll_events (runnerd treats that error as process-fatal).
+#[test]
+#[cfg(unix)]
+fn pi_rpc_oversized_stdout_line_does_not_stop_polling() {
+    pi_rpc_bad_stdout_line_does_not_stop_polling("oversized");
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_non_json_stdout_line_does_not_stop_polling() {
+    pi_rpc_bad_stdout_line_does_not_stop_polling("non-json");
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_non_object_stdout_line_does_not_stop_polling() {
+    pi_rpc_bad_stdout_line_does_not_stop_polling("non-object");
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_non_utf8_stdout_line_does_not_stop_polling() {
+    pi_rpc_bad_stdout_line_does_not_stop_polling("non-utf8");
+}
+
+#[cfg(unix)]
+fn pi_rpc_bad_stdout_line_does_not_stop_polling(kind: &str) {
+    let directory = temporary_directory("pi-rpc-bad-stdout");
+    let mut config = opencode_config(&directory);
+    let proxy = directory.join("qualified-opencode-proxy-script");
+    let script = fs::read_to_string(&proxy).unwrap();
+    fs::set_permissions(&proxy, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        &proxy,
+        script.replace(
+            "--require-completion-contract\n",
+            &format!("--require-completion-contract --stdout-bad-line {kind}\n"),
+        ),
+    )
+    .unwrap();
+    config
+        .opencode_launch_profile
+        .as_mut()
+        .unwrap()
+        .proxy_script = qualified_artifact(proxy);
+    config.pi_launch_profile = config.opencode_launch_profile.take();
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    executor
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(&directory),
+        ))
+        .unwrap();
+    let opened = executor
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    let pid = opened.result["processId"].clone();
+    acknowledge_delivered_events(&mut executor);
+    for seq in [3, 4] {
+        executor
+            .execute(&command(
+                seq,
+                "turn.start",
+                json!({"text":"Complete this turn."}),
+            ))
+            .unwrap();
+        let events = poll_opencode_until(&mut executor, "turn.completed");
+        let diagnostics: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "harness.diagnostic")
+            .collect();
+        assert!(
+            diagnostics.iter().any(|event| event
+                .payload
+                .to_string()
+                .contains("pi_stdout_frame_rejected")),
+            "{events:?}"
+        );
+        assert!(!serde_json::to_string(&diagnostics)
+            .unwrap()
+            .contains("private-content"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "turn.completed"),
+            "the next valid frame must be processed"
+        );
+    }
+    let still_open = executor
+        .execute(&command(5, "session.open", json!({})))
+        .unwrap();
+    assert_eq!(still_open.result["processId"], pid);
+    assert_eq!(opencode_call_count(&directory, "turn/start"), 2);
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+

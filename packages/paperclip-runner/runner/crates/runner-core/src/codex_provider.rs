@@ -1333,7 +1333,7 @@ impl CodexProvider {
                     true,
                 )?;
                 observe(ProviderStartupObservation::SpawnStarting)?;
-                SupervisedProcess::spawn_verified_with_environment_keys(
+                SupervisedProcess::spawn_verified_with_recoverable_stdout(
                     &launch,
                     Duration::from_secs(2),
                     CODEX_APP_SERVER_MAX_FRAME_BYTES,
@@ -3136,7 +3136,12 @@ impl CodexProvider {
         let (message, trace_frame_id) = if let Some(buffered) = buffered {
             (buffered.value, buffered.trace_frame_id)
         } else {
-            let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
+            let line = if self.config.provider == "pi_rpc" {
+                self.receive_provider_stdout_line(Duration::from_millis(1))?
+            } else {
+                self.process.receive_stdout_line(Duration::from_millis(1))?
+            };
+            let Some(line) = line else {
                 let exit = self.process.try_wait()?;
                 if !self.process.stdout_drained() {
                     return Ok(None);
@@ -3148,7 +3153,7 @@ impl CodexProvider {
                 };
             };
             let trace_frame_id = self.trace_inbound(&line);
-            let message = parse_provider_message(&line).map_err(|error| {
+            let message = self.parse_stdout_message(&line).map_err(|error| {
                 if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), trace_frame_id) {
                     trace.interpretation(
                         frame_id,
@@ -4231,7 +4236,7 @@ impl CodexProvider {
                 )));
             };
             let trace_frame_id = self.trace_inbound(&line);
-            let message = parse_provider_message(&line).map_err(|error| {
+            let message = self.parse_stdout_message(&line).map_err(|error| {
                 if let (Some(trace), Some(frame_id)) = (self.trace.as_mut(), trace_frame_id) {
                     trace.interpretation(
                         frame_id,
@@ -4310,6 +4315,27 @@ impl CodexProvider {
         }
     }
 
+    fn rejected_pi_stdout_frame(message: &str) -> Value {
+        json!({
+            "method": "warning",
+            "params": {
+                "code": "pi_stdout_frame_rejected",
+                "message": message,
+                "attribution": "unknown",
+                "dropped": true,
+            },
+        })
+    }
+
+    fn parse_stdout_message(&self, line: &str) -> Result<Value, LocalRunnerError> {
+        match parse_provider_message(line) {
+            Err(_) if self.config.provider == "pi_rpc" => Ok(Self::rejected_pi_stdout_frame(
+                "Dropped an unattributable Pi stdout line that was not a JSON-RPC object",
+            )),
+            result => result,
+        }
+    }
+
     fn receive_provider_stdout_line(
         &mut self,
         timeout: Duration,
@@ -4327,7 +4353,13 @@ impl CodexProvider {
                 Ok(ProcessOutput::Stderr(line)) => {
                     self.stderr_tail.push(redact_text(&line));
                 }
-                Ok(ProcessOutput::StdoutError(message)) => {
+                Ok(ProcessOutput::StdoutFrameRejected(message))
+                    if self.config.provider == "pi_rpc" =>
+                {
+                    return Ok(Some(Self::rejected_pi_stdout_frame(&message).to_string()));
+                }
+                Ok(ProcessOutput::StdoutError(message))
+                | Ok(ProcessOutput::StdoutFrameRejected(message)) => {
                     return Err(LocalRunnerError::invalid(message));
                 }
                 Ok(ProcessOutput::StdoutClosed) => return Ok(None),
@@ -4357,6 +4389,7 @@ impl CodexProvider {
                 | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(ProcessOutput::Stdout(_))
                 | Ok(ProcessOutput::StdoutError(_))
+                | Ok(ProcessOutput::StdoutFrameRejected(_))
                 | Ok(ProcessOutput::StdoutClosed) => {}
             }
         }
