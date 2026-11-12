@@ -8,6 +8,7 @@ import { createSubagentLifecycle, registerSubagentBridge, type SubagentEventBus 
 import { installSubagentSeam, installUnboundChildParent } from "./subagents/seam.js";
 import { piManagedModelRegistration } from "../pi-managed-model.js";
 import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
+import { installPiPerformanceDiagnostics } from "../pi-performance-diagnostics.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -41,6 +42,9 @@ export interface PiBindApi {
   on(event: "session_shutdown", handler: LifecycleHandler): () => void;
   on(event: "input", handler: LifecycleHandler): () => void;
   on(event: "before_agent_start", handler: LifecycleHandler): () => void;
+  on(event: "before_provider_request", handler: () => void): () => void;
+  /** Present in Pi 1.5.2; optional for older structural host fixtures. */
+  appendEntry?(customType: string, data: unknown): void;
   on(event: "cache_warming_decision", handler: LifecycleHandler): () => void;
   on(event: "tool_execution_start", handler: LifecycleHandler): () => void;
   on(event: "tool_execution_end", handler: LifecycleHandler): () => void;
@@ -494,6 +498,7 @@ export function readPiBindInitial(environment: NodeJS.ProcessEnv): PiBindInitial
 }
 
 export default function paperclipPiBindExtension(pi: PiBindApi): void {
+  installPiPerformanceDiagnostics(pi);
   const socketPath = process.env.PAPERCLIP_PI_BIND_SOCKET;
   const initial = readPiBindInitial(process.env);
   if (!socketPath && initial === undefined) {

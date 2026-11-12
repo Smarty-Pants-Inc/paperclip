@@ -9201,6 +9201,86 @@ describe("native terminal-turn accounting", () => {
 });
 
 describe("native resumed preparation timing", () => {
+  // Keep reason: actual committed-event observer authorization; payload claims
+  // and mutation of a reused execution holder must not authorize Pi instants.
+  it.each([
+    { provider: "pi_rpc", sourceKind: "runner", accepted: true },
+    { provider: "pi_rpc", sourceKind: "control_plane", accepted: false },
+    { provider: "codex", sourceKind: "runner", accepted: false },
+  ] as const)("authorizes Pi request instants only for captured $provider / $sourceKind admission", async ({ provider, sourceKind, accepted }) => {
+    const at = Date.now() - 100;
+    const events: AdapterRuntimeEvent[] = [];
+    const current = { ...execution, provider: provider === "pi_rpc"
+      ? { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE }
+      : execution.provider } as unknown as NativeExecutionInput;
+    const admittedProvider = current.provider;
+    const normalizedSessionId = current.session.normalizedSessionId;
+    if (!normalizedSessionId) throw new Error("Pi request fixture requires a native session ID");
+    state.execute.mockReset().mockImplementationOnce(async () => {
+      // Simulate a caller reusing its holder while this captured observer lives.
+      current.provider = (provider === "pi_rpc" ? execution.provider
+        : { kind: "pi_rpc", model: "paperclip/forged", profile: QUALIFIED_PI_RPC_PROFILE }) as NativeExecutionInput["provider"];
+      try {
+        const candidate: PrpEvent = {
+          schema: "paperclip.prp.event.v1", sourceEventId: "request-1", sourceSeq: 1,
+          sourceKind, sourceInstanceId: "runner", runId: current.binding.runId,
+          normalizedSessionId, turnId: "captured-turn",
+          eventType: "harness.diagnostic", schemaVersion: 1, priority: 1, emittedAt: new Date().toISOString(),
+          payload: { code: "provider_performance_spans", provider: "pi_rpc", sourceKind: "runner", origin: "runner",
+            spans: [{ name: "pi.request.sent", startedAtMs: at, endedAtMs: at, outcome: "ok", attributes: { prompt: "PRIVATE" } }] },
+        };
+        await accountingEvents.committed!(candidate);
+        await accountingEvents.duplicate!(candidate);
+      } finally { current.provider = admittedProvider; }
+      return { result: { summary: "cancelled" }, terminal: { runTerminalState: "cancelled" },
+        turnId: "captured-turn", normalizedSessionId: current.session.normalizedSessionId, providerSessionId: null,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    });
+    await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: "runner",
+      onEvent: async event => { events.push(event); } });
+    const rows = events.filter(event => event.payload?.span === "pi.request.sent");
+    expect(rows).toHaveLength(accepted ? 1 : 0);
+    if (accepted) expect(rows[0]?.payload).toMatchObject({ wallStartedAtMs: at, durationMs: 0, parentSpan: "provider.runtime" });
+    expect(JSON.stringify(rows)).not.toContain("PRIVATE");
+    expect(events.some(event => event.payload?.span === "task.time_to_first_token")).toBe(false);
+  });
+
+  it("does not adopt the next run's trace when an old committed-event observer is called after reuse", async () => {
+    const firstEvents: AdapterRuntimeEvent[] = [], secondEvents: AdapterRuntimeEvent[] = [];
+    let oldObserver: (event: PrpEvent) => Promise<void>;
+    const current = { ...execution, provider: { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE } } as unknown as NativeExecutionInput;
+    const normalizedSessionId = current.session.normalizedSessionId;
+    if (!normalizedSessionId) throw new Error("Pi request fixture requires a native session ID");
+    const next = { ...current, binding: { ...current.binding, runId: "pi-next-request-run" } };
+    const event = (runId: string, turnId: string): PrpEvent => {
+      const at = Date.now();
+      return { schema: "paperclip.prp.event.v1", sourceEventId: `${runId}:${turnId}:request`, sourceSeq: 1,
+        sourceInstanceId: "runner", sourceKind: "runner", runId,
+        normalizedSessionId, turnId,
+        eventType: "harness.diagnostic", schemaVersion: 1, priority: 1, emittedAt: new Date().toISOString(),
+        payload: { code: "provider_performance_spans",
+          spans: [{ name: "pi.request.sent", startedAtMs: at, endedAtMs: at, outcome: "ok" }] } };
+    };
+    const result = { result: { summary: "cancelled" }, terminal: { runTerminalState: "cancelled" },
+      turnId: "turn", normalizedSessionId: current.session.normalizedSessionId, providerSessionId: null,
+      driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    state.execute.mockReset().mockImplementationOnce(async () => {
+      oldObserver = accountingEvents.committed!;
+      await oldObserver(event(current.binding.runId, "old-turn"));
+      return result;
+    }).mockImplementationOnce(async () => {
+      const activeObserver = accountingEvents.committed!;
+      await oldObserver!(event(current.binding.runId, "old-turn"));
+      expect(secondEvents.filter(event => event.payload?.span === "pi.request.sent")).toEqual([]);
+      await activeObserver(event(next.binding.runId, "new-turn"));
+      return result;
+    });
+    await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: "runner", onEvent: async event => { firstEvents.push(event); } });
+    await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner", onEvent: async event => { secondEvents.push(event); } });
+    expect(firstEvents.filter(event => event.payload?.span === "pi.request.sent")).toHaveLength(1);
+    expect(secondEvents.filter(event => event.payload?.span === "pi.request.sent")).toHaveLength(1);
+  });
+
   it.each(["comment.to_run_created", "question_response.to_run_created", "heartbeat.queue", "native_dispatch"])(
     "records first assistant text once from %s through Core preparation and event receipt",
     async (ingress) => {

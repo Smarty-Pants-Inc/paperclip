@@ -58,8 +58,14 @@ export interface PiNativeAdmittedIdentity {
   /** At most one bounded diagnostic, emitted once by the session owner. */
   diagnostic?: PiThinkingLoweredDiagnostic;
 }
+function assertPiRpcIdle(state: Record<string, unknown>): void {
+  if (typeof state.isStreaming !== "boolean" || typeof state.isCompacting !== "boolean" || typeof state.pendingMessageCount !== "number" || !Number.isSafeInteger(state.pendingMessageCount) || state.pendingMessageCount < 0) throw new PiNativeAdmissionError("pi_session_state_invalid", "Pi session did not report authoritative idle/queue state; refusing admission.");
+  if (state.isStreaming || state.isCompacting || state.pendingMessageCount > 0) throw new PiNativeAdmissionError("pi_session_busy", "Pi session is busy; refusing attach/claim without changing live work.");
+}
 /**
- * Invoke on create/load/reconnect AND run.attach AND after claim, before prompt.
+ * Full admission on create/load/reconnect and each new resident binding epoch;
+ * direct providers also retain full attach/claim/input admission. Prepared-epoch
+ * claim/input fences use validatePiRpcSession without rewriting selection.
  * Read live state first; apply supported live changes or refuse. Native Codex
  * attach precedent: provider_backend.rs:3436-3541. Pi rpc-commands.md:150-184,
  * 274-327: set success has no effective-level data; only get_state acknowledges.
@@ -68,11 +74,7 @@ export interface PiNativeAdmittedIdentity {
 export async function admitPiRpcSession(port: PiRpcAdmissionPort, input: PiNativeConfig, signal?: AbortSignal): Promise<PiNativeAdmittedIdentity> {
   const config = resolvePiNativeConfig(input);
   const request = async (command: { type: string; [key: string]: unknown }) => { signal?.throwIfAborted(); const result = await port.request(command, signal); signal?.throwIfAborted(); return result; };
-  const idle = (state: Record<string, unknown>) => {
-    if (typeof state.isStreaming !== "boolean" || typeof state.isCompacting !== "boolean" || typeof state.pendingMessageCount !== "number" || !Number.isSafeInteger(state.pendingMessageCount) || state.pendingMessageCount < 0) throw new PiNativeAdmissionError("pi_session_state_invalid", "Pi session did not report authoritative idle/queue state; refusing admission.");
-    if (state.isStreaming || state.isCompacting || state.pendingMessageCount > 0) throw new PiNativeAdmissionError("pi_session_busy", "Pi session is busy; refusing attach/claim without changing live work.");
-  };
-  const before = record(await request({ type: "get_state" })); idle(before);
+  const before = record(await request({ type: "get_state" })); assertPiRpcIdle(before);
   const slash = config.model.indexOf("/");
   const provider = config.model.slice(0, slash), modelId = config.model.slice(slash + 1);
   const matchingModel = (value: unknown) => record(value).provider === provider && record(value).id === modelId;
@@ -85,7 +87,7 @@ export async function admitPiRpcSession(port: PiRpcAdmissionPort, input: PiNativ
     // A valid request need not itself be available: Pi applies its own config.
     await request({ type: "set_thinking_level", level: config.piRpcThinkingLevel });
   }
-  const state = record(await request({ type: "get_state" })); idle(state);
+  const state = record(await request({ type: "get_state" })); assertPiRpcIdle(state);
   if (!matchingModel(state.model)) throw new PiNativeAdmissionError("pi_model_mismatch", "Pi effective model differs from the selection; no prompt was sent.");
   const effective = state.thinkingLevel;
   if (config.piRpcThinkingLevel !== undefined && (!isPiThinkingLevelAtMost(effective, config.piRpcThinkingLevel) || !available!.includes(effective))) throw new PiNativeAdmissionError("pi_thinking_mismatch", "Pi effective thinking level is missing, unavailable, or higher than requested; no prompt was sent.");
@@ -94,4 +96,20 @@ export async function admitPiRpcSession(port: PiRpcAdmissionPort, input: PiNativ
     piRpcThinkingLevel: effective as PiNativeThinkingLevel,
     ...(effective === config.piRpcThinkingLevel ? {} : { diagnostic: { code: "pi_thinking_lowered_by_config" as const, requested: config.piRpcThinkingLevel, effective: effective as PiNativeThinkingLevel } }),
   }) };
+}
+
+/** Fresh read-only fence against an already acknowledged prepared selection. */
+export async function validatePiRpcSession(port: PiRpcAdmissionPort, input: PiNativeConfig, admitted: PiNativeAdmittedIdentity, signal?: AbortSignal): Promise<void> {
+  const config = resolvePiNativeConfig(input);
+  if (admitted.model !== config.model) throw new PiNativeAdmissionError("pi_model_mismatch", "Pi prepared admission does not match the selected model; no prompt was sent.");
+  signal?.throwIfAborted();
+  const state = record(await port.request({ type: "get_state" }, signal));
+  signal?.throwIfAborted();
+  assertPiRpcIdle(state);
+  if (state.sessionId !== admitted.providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed after admission; no prompt was sent.");
+  const slash = config.model.indexOf("/");
+  if (record(state.model).provider !== config.model.slice(0, slash) || record(state.model).id !== config.model.slice(slash + 1)) throw new PiNativeAdmissionError("pi_model_mismatch", "Pi effective model changed after admission; no prompt was sent.");
+  // Lowering is admitted once by Pi (e.g. max -> xhigh). A later lower level
+  // is drift, not a new acknowledgement of the same prepared selection.
+  if (config.piRpcThinkingLevel !== undefined && (!isPiThinkingLevelAtMost(admitted.piRpcThinkingLevel, config.piRpcThinkingLevel) || state.thinkingLevel !== admitted.piRpcThinkingLevel)) throw new PiNativeAdmissionError("pi_thinking_mismatch", "Pi effective thinking level changed after admission; no prompt was sent.");
 }
