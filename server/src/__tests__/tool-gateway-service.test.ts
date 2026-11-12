@@ -2981,7 +2981,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(failed).toMatchObject({ status: reasonCode === "tool_timeout" ? "timed_out" : "failed" });
   });
 
-  it.each([401, 403])("keeps the connection blocked after an HTTP %s authentication failure", async (status) => {
+  it.each([401, 403])("keeps tools discoverable after a tools/call HTTP %s denial", async (status) => {
     const { company, agent, run } = await createRunFixture(db);
     const { connection } = await createRemoteMcpToolFixture(db, company.id);
     await db.insert(toolPolicies).values(readPolicyRow(company, "Allow read tools"));
@@ -2993,8 +2993,8 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
       .rejects.toMatchObject({ reasonCode: "mcp_remote_status", details: { status } });
     const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
-    expect(updated.healthStatus).toBe("error");
-    expect((await gateway.listToolsForSession(session.token)).filter((entry) => entry.connectionId === connection.id)).toEqual([]);
+    expect(updated.healthStatus).toBe("ok");
+    expect((await gateway.listToolsForSession(session.token)).filter((entry) => entry.connectionId === connection.id)).toEqual([tool]);
     expect(provider).toHaveBeenCalledTimes(1);
   });
 

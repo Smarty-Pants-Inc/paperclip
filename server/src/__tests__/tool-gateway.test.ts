@@ -2942,7 +2942,8 @@ rl.on("line", (line) => {
       .rejects.toMatchObject({ status: 403, reasonCode: "oauth_insufficient_scope", message: expect.stringContaining("Reconnect") });
     expect(JSON.stringify(await db.select().from(toolAccessAuditEvents))).not.toContain("provider-secret-canary");
     const [updated] = await db.select().from(toolConnections).where(eq(toolConnections.id, connection.id));
-    expect(updated!.healthStatus).toBe("degraded");
+    expect(updated!.healthStatus).toBe("ok");
+    expect(await gateway.listToolsForSession(session.token)).toEqual(expect.arrayContaining([tool]));
   });
 
   it("uses the responsible user's identity directly and requires delegation only without one", async () => {
@@ -4889,6 +4890,18 @@ rl.on("line", (line) => {
 
   const perCallResponseFailures = [
     {
+      name: "an HTTP 401 tools/call denial",
+      reasonCode: "mcp_remote_status",
+      expectedSessionId: "session-1",
+      response: () => ({ status: 401, rawBody: "Action denied" }),
+    },
+    {
+      name: "an HTTP 403 tools/call denial",
+      reasonCode: "mcp_remote_status",
+      expectedSessionId: "session-1",
+      response: () => ({ status: 403, rawBody: "Action denied" }),
+    },
+    {
       name: "a tool call timeout",
       reasonCode: "tool_timeout",
       status: 504,
@@ -4924,7 +4937,7 @@ rl.on("line", (line) => {
   ];
 
   for (const scenario of perCallResponseFailures) {
-    it(`keeps a remote MCP connection healthy and starts a fresh MCP session after ${scenario.name}`, async () => {
+    it(`keeps a remote MCP connection healthy and permits an explicit call after ${scenario.name}`, async () => {
       const company = await createCompany(db);
       const agent = await createAgent(db, company.id);
       const { run } = await createIssueAndRun(db, company.id, agent.id);
@@ -4993,7 +5006,7 @@ rl.on("line", (line) => {
         const toolCallSessionIds = fake.requests
           .filter((request) => request.body?.method === "tools/call")
           .map((request) => request.headers["mcp-session-id"]);
-        expect(toolCallSessionIds).toEqual(["session-1", "session-2"]);
+        expect(toolCallSessionIds).toEqual(["session-1", scenario.expectedSessionId ?? "session-2"]);
       } finally {
         await fake.close();
       }
