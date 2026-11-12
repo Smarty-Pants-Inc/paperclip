@@ -68,7 +68,12 @@ export async function startProviderLoopbackBroker(input: {
         response.writeHead(401).end();
         return;
       }
-      if (request.method !== "POST" || request.url !== input.adapter.localPath) {
+      // Match the origin-form pathname without normalizing a different route
+      // into it. Keep the raw query (including encoding/order) for the upstream.
+      const target = request.url ?? "";
+      const queryOffset = target.indexOf("?");
+      const pathname = queryOffset < 0 ? target : target.slice(0, queryOffset);
+      if (request.method !== "POST" || pathname !== input.adapter.localPath) {
         response.writeHead(404).end();
         return;
       }
@@ -96,6 +101,7 @@ export async function startProviderLoopbackBroker(input: {
       const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
         const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
           method: "POST",
+          ...(queryOffset < 0 ? {} : { path: `${upstreamUrl.pathname}${target.slice(queryOffset)}` }),
           agent,
           headers: {
             ...input.extraUpstreamHeaders,

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { startProviderLoopbackBroker } from "./broker.js";
 import { chatLoopbackAdapter } from "./chat.js";
 import { messagesLoopbackAdapter } from "./messages.js";
+import { responsesLoopbackAdapter } from "./responses.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
@@ -36,6 +37,38 @@ function post(base: string, token: string, headers: Record<string, string> = {},
 }
 
 describe("provider loopback broker", () => {
+  // Incident: installed Pi's Anthropic SDK uses /v1/messages?beta=true.
+  // Preserve query bytes without relaxing the fixed route or credential boundary.
+  it.each([messagesLoopbackAdapter, chatLoopbackAdapter, responsesLoopbackAdapter])(
+    "preserves $protocol paths and query strings without changing authentication", async adapter => {
+      const received: Array<{ path?: string; headers: IncomingHttpHeaders }> = [];
+      const baseUrl = await listen(createServer((req, res) => {
+        req.resume(); received.push({ path: req.url, headers: req.headers }); res.end("ok");
+      }));
+      const broker = await startProviderLoopbackBroker({ adapter,
+        baseUrl: `${baseUrl}${adapter.protocol === "messages" ? "" : "/v1"}`,
+        key: "upstream-query-key", auth: "api_key", environment: {} });
+      cleanups.push(broker.close);
+      const origin = new URL(broker.baseURL).origin;
+      const call = (path: string, token = broker.token) => fetch(`${origin}${path}`, {
+        method: "POST", headers: { "x-api-key": token, authorization: `Bearer ${token}`, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "faux", messages: [] }),
+      });
+      expect((await call(`${adapter.localPath}?beta=true`)).status).toBe(200);
+      expect((await call(`${adapter.localPath}?beta=true&encoded=%2f+%20&repeat=1&repeat=2`)).status).toBe(200);
+      expect((await call(adapter.localPath)).status).toBe(200);
+      expect((await call("/v1/other?beta=true")).status).toBe(404);
+      expect((await call(`${adapter.localPath}?beta=true`, "wrong")).status).toBe(401);
+      expect(received.map(row => row.path)).toEqual([
+        `${adapter.localPath}?beta=true`, `${adapter.localPath}?beta=true&encoded=%2f+%20&repeat=1&repeat=2`, adapter.localPath,
+      ]);
+      expect(JSON.stringify(received)).not.toContain(broker.token);
+      for (const row of received) {
+        expect(row.headers[adapter.protocol === "messages" ? "x-api-key" : "authorization"])
+          .toBe(adapter.protocol === "messages" ? "upstream-query-key" : "Bearer upstream-query-key");
+      }
+    },
+  );
   it.each(["x-api-key", "authorization"])('accepts Messages %s without forwarding the session token', async header => {
     const { broker, received } = await fixture();
     const response = await post(broker.baseURL, header === "authorization" ? "invalid" : broker.token, {
