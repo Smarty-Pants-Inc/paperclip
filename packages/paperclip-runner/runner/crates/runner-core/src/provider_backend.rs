@@ -465,12 +465,14 @@ fn semantic_result_event(
     }
 }
 
-/// Local Codex, OpenCode and Pi RPC restart their own process and
+/// Local Codex app-server and OpenCode server restart their own process and
 /// restore the same conversation after runner loss, so a turn that vanished
 /// meanwhile is a restart interruption the controller may continue once. A
 /// Cursor Cloud agent runs remotely; its lost turn is not a process restart.
+/// Pi RPC is excluded until its restore (thread_open after a runner loss) is
+/// proven on the real path (hq-test e8b1d929 failed it 3x).
 fn restart_lost_turn_is_continuable(provider: &str) -> bool {
-    matches!(provider, "codex" | "opencode" | "pi_rpc")
+    matches!(provider, "codex" | "opencode")
 }
 
 /// True only when signal 0 reports that no such process (or process group)
@@ -6220,8 +6222,7 @@ mod tests {
     fn restart_lost_turns_continue_only_for_locally_restored_providers() {
         assert!(super::restart_lost_turn_is_continuable("codex"));
         assert!(super::restart_lost_turn_is_continuable("opencode"));
-        assert!(super::restart_lost_turn_is_continuable("pi_rpc"));
-        for provider in ["acpx", "claude_managed", "unknown"] {
+        for provider in ["pi_rpc", "acpx", "claude_managed", "unknown"] {
             assert!(!super::restart_lost_turn_is_continuable(provider));
         }
         assert!(!super::restart_lost_turn_is_continuable("cursor_cloud"));

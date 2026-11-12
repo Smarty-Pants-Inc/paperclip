@@ -1926,6 +1926,119 @@ fn codex_dynamic_tool_round_trips_through_the_provider_boundary() {
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
 
+// Regression: real Pi nested IDs such as toolu_X/1 used to escape poll() as
+// validation errors, terminating runnerd and every other session it owned.
+#[test]
+fn codex_malformed_tool_call_is_refused_without_ending_the_session() {
+    for (label, overrides, expected_error) in [
+        (
+            "nested-pi-call-id",
+            json!({}),
+            "Codex tool callId is invalid",
+        ),
+        (
+            "missing-call-id",
+            json!({"callId": null}),
+            "Codex tool callId is required",
+        ),
+        (
+            "invalid-tool-name",
+            json!({"callId": "valid-call", "tool": "bad/tool"}),
+            "Codex tool name is invalid",
+        ),
+        (
+            "missing-tool-name",
+            json!({"callId": "valid-call", "tool": null}),
+            "Codex tool name is required",
+        ),
+        (
+            "unauthorized-tool",
+            json!({"callId": "valid-call", "tool": "not_authorized"}),
+            "unauthorized tool",
+        ),
+    ] {
+        let directory = temporary_directory(label);
+        let params_path = directory.join("malformed-tool-params.json");
+        fs::write(&params_path, serde_json::to_vec(&overrides).unwrap()).unwrap();
+        let config = provider_config(
+            &directory,
+            &[
+                "--malformed-tool-params-file",
+                params_path.to_str().unwrap(),
+            ],
+        );
+        let mut provider = CodexProvider::start_with_tools(&config, [task_context_tool()], None)
+            .expect("start provider with an authorized tool");
+        let thread_id = provider.thread_id().to_owned();
+        provider
+            .start_turn("Refuse one call and continue.", &config.cwd)
+            .unwrap();
+        let turn_id = provider.active_provider_turn_id().unwrap().to_owned();
+        let mut delivered = false;
+        let mut completed = false;
+        let deadline = event_deadline();
+        while std::time::Instant::now() < deadline {
+            match provider
+                .poll()
+                .expect("malformed tool call must not escape poll")
+            {
+                Some(CodexProviderEvent::ToolCall {
+                    call_id,
+                    operation_id,
+                    input,
+                }) => {
+                    assert!(
+                        !delivered,
+                        "only the following valid call may be dispatched"
+                    );
+                    assert_eq!(call_id, "semantic-call-1");
+                    assert_eq!(operation_id, "get_task_context");
+                    assert_eq!(input, json!({}));
+                    assert_eq!(provider.thread_id(), thread_id);
+                    assert_eq!(provider.active_provider_turn_id(), Some(turn_id.as_str()));
+                    provider
+                        .deliver_tool_result(&ToolResult {
+                            call_id,
+                            operation_id,
+                            result: json!({"ok": true, "task": {"id": "task-1"}}),
+                            is_error: false,
+                        })
+                        .unwrap();
+                    delivered = true;
+                }
+                Some(CodexProviderEvent::Notification { method, .. })
+                    if method == "turn/completed" =>
+                {
+                    completed = true;
+                    break;
+                }
+                Some(
+                    CodexProviderEvent::Exited { .. } | CodexProviderEvent::ProtocolFailure { .. },
+                ) => {
+                    panic!("malformed call must not terminate or quarantine the provider");
+                }
+                _ => {}
+            }
+        }
+        assert!(delivered, "valid call after refusal must work: {label}");
+        assert!(completed, "the same turn must complete: {label}");
+        let log = fs::read_to_string(directory.join("calls.log")).unwrap();
+        let refusal = log
+            .lines()
+            .find_map(|line| line.strip_prefix("malformed-tool-refusal:"))
+            .expect("provider received the refusal before sending the valid call");
+        let refusal: Value = serde_json::from_str(refusal).unwrap();
+        assert_eq!(refusal["id"], "malformed-tool-request");
+        assert_eq!(refusal["result"]["success"], false);
+        assert_eq!(refusal["result"]["contentItems"][0]["type"], "inputText");
+        assert!(refusal["result"]["contentItems"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(expected_error));
+        provider.shutdown().unwrap();
+    }
+}
+
 #[test]
 fn codex_rejects_replay_of_a_completed_tool_call_id_in_the_same_turn() {
     let directory = temporary_directory("completed-tool-call-replay");
@@ -1967,23 +2080,13 @@ fn codex_rejects_replay_of_a_completed_tool_call_id_in_the_same_turn() {
         })
         .expect("deliver the first semantic result");
 
-    let replay_deadline = event_deadline();
-    let replay_error =
-        std::iter::from_fn(|| (std::time::Instant::now() < replay_deadline).then_some(()))
-            .find_map(|_| {
-                let error = provider.poll().err();
-                if error.is_none() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                error
-            })
-            .expect("same-turn replay of the completed call id is rejected");
-    assert!(
-        replay_error
-            .to_string()
-            .contains("reused a completed tool call id"),
-        "unexpected replay error: {replay_error}"
-    );
+    let refusal = wait_for_notification(&mut provider, "warning");
+    assert_eq!(refusal["code"], "provider_tool_call_refused");
+    assert!(refusal["message"]
+        .as_str()
+        .unwrap()
+        .contains("reused a completed tool call id"));
+    assert!(provider.active_provider_turn_id().is_some());
 
     let _ = provider.shutdown();
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
@@ -3714,10 +3817,12 @@ fn codex_rejects_a_tool_call_that_was_not_advertised() {
     provider
         .start_turn("Attempt an unavailable tool.", &config.cwd)
         .expect("start provider turn");
-    let error = (0..32)
-        .find_map(|_| provider.poll().err())
-        .expect("unauthorized provider tool call is rejected");
-    assert!(error.to_string().contains("unauthorized tool"));
+    let refusal = wait_for_notification(&mut provider, "warning");
+    assert_eq!(refusal["code"], "provider_tool_call_refused");
+    assert!(refusal["message"]
+        .as_str()
+        .unwrap()
+        .contains("unauthorized tool"));
     let _ = provider.shutdown();
     fs::remove_dir_all(directory).expect("remove Codex integration-test directory");
 }
@@ -5287,31 +5392,36 @@ fn durable_backend_rotates_tool_authority_for_fresh_run_attach() {
         ))
         .expect("start the second provider turn");
     let deadline = event_deadline();
-    let rejection = loop {
+    let refusal = loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "the prior run's operation must be rejected before the deadline"
+            "the prior run's operation must be refused before the deadline"
         );
-        match executor.poll_events() {
-            Ok(events) => {
-                assert!(
-                    events
-                        .iter()
-                        .all(|event| event.event_type != "semantic_tool.input"),
-                    "the prior run's operation must not be dispatched under new authority"
-                );
-                executor
-                    .acknowledge_events(events.len())
-                    .expect("acknowledge events before the rejected replay");
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(error) => break error,
+        let events = executor
+            .poll_events()
+            .expect("refusal must not fail backend polling");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != "semantic_tool.input"),
+            "the prior run's operation must not be dispatched under new authority"
+        );
+        let refusal = events
+            .iter()
+            .find(|event| {
+                event.event_type == "provider.notice.recorded"
+                    && event.payload["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("unauthorized tool"))
+            })
+            .cloned();
+        executor.acknowledge_events(events.len()).unwrap();
+        if let Some(refusal) = refusal {
+            break refusal;
         }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     };
-    assert!(
-        rejection.to_string().contains("unauthorized tool"),
-        "unexpected replay rejection: {rejection}"
-    );
+    assert_eq!(refusal.payload["recoverable"], true);
 
     executor
         .shutdown()
