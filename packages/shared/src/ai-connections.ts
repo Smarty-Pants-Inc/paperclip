@@ -140,10 +140,8 @@ export function isAiConnectionCompatible(
     && ["openrouter", "openai", "anthropic", "google"].includes(requirement.provider)
     // Native Pi fixed bindings carry no routing; custom provider/model IDs
     // are checked against authoritative metadata by the service, not identity.
-    // Native Pi RPC also sends gateway models through the broker loopback as paperclip/<id>.
     && ((nativePi && "mode" in requirement && requirement.mode !== "responsible_user" && requirement.method === "api_key")
-      || (typeof model === "string" && (model.startsWith(`${requirement.provider}/`)
-        || (adapterType === "pi_runtime" && runnerProvider === "pi_rpc" && model.startsWith("paperclip/")))));
+      || (typeof model === "string" && model.startsWith(`${requirement.provider}/`)));
   if ("mode" in requirement && requirement.mode !== "responsible_user" && requirement.method === "api_key")
     return ["claude_local", "codex_local", "opencode_local", "hermes_local", "gemini_local", "grok_local", "copilot_runtime"].includes(adapterType);
   const methods = AI_CONNECTION_CAPABILITIES[requirement.provider].methods;
