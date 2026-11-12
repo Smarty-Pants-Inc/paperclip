@@ -4,6 +4,7 @@ import { validatePrpStructuredRunResult, type PersistedNativeSession } from "../
 import { nativeSha256 } from "./canonical.js";
 import type { PaperclipControlPlaneBinding } from "./paperclip-control-plane-port.js";
 import { readRunCancellation } from "../run-cancellation.js";
+import { preservePiConversation } from "./pi-conversation-record.js";
 
 /** Prepared once by heartbeat; never copied into recovery metadata or receipts. */
 export interface NativeTaskSessionPublicationContext {
@@ -138,7 +139,7 @@ async function publishTaskSessionPointer(tx: Transaction, input: PointerPublicat
       && run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return "suppressed_reset";
   if (issue.executionRunId && issue.executionRunId !== binding.runId) return "suppressed_newer";
   const [session] = await tx.select({ id: agentTaskSessions.id, goalSourceId: agentTaskSessions.goalSourceId,
-    lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(
+    lastRunId: agentTaskSessions.lastRunId, sessionParamsJson: agentTaskSessions.sessionParamsJson }).from(agentTaskSessions).where(and(
     eq(agentTaskSessions.companyId, binding.companyId), eq(agentTaskSessions.agentId, binding.agentId),
     eq(agentTaskSessions.adapterType, context.adapterType), eq(agentTaskSessions.taskKey, context.taskKey),
   )).for("update").limit(1);
@@ -158,7 +159,7 @@ async function publishTaskSessionPointer(tx: Transaction, input: PointerPublicat
         || prior.finishedAt > run.startedAt) return "suppressed_newer";
   }
   await tx.update(agentTaskSessions).set({
-    sessionParamsJson: { ...context.sessionParamsJson, sessionId: snapshot.identity.sessionId },
+    sessionParamsJson: preservePiConversation(session.sessionParamsJson, { ...context.sessionParamsJson, sessionId: snapshot.identity.sessionId }),
     sessionDisplayId: snapshot.providerSessionId ?? snapshot.sessionId, lastRunId: binding.runId,
     lastError: null, updatedAt: new Date(),
   }).where(eq(agentTaskSessions.id, session.id));

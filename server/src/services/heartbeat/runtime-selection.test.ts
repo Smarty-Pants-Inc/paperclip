@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agentTaskSessions, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -144,6 +144,58 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(await coordinators(f.run.id)).toHaveLength(1);
   });
 
+  // Data safety: real row/transaction boundary for the first mint and two turns.
+  async function piFixture() {
+    const f = await fixture();
+    f.input.agent.adapterConfig = { provider: "pi_rpc", model: "anthropic/model-a", piRpcThinkingLevel: "low" };
+    f.input.config.runtimeConfig = f.input.agent.adapterConfig;
+    await db.update(agents).set({ adapterConfig: f.input.agent.adapterConfig }).where(eq(agents.id, f.agent.id));
+    f.input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: f.run, enabled: true,
+      runtimeConfig: {}, adapterConfig: f.input.agent.adapterConfig, agent: f.input.agent, issue: f.issue, target: null, workspaceId: null });
+    return f;
+  }
+  async function nextPiTurn(f: Awaited<ReturnType<typeof piFixture>>) {
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.input.run.id));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+      issueId: f.issue.id, status: "running", scopeKind: "issue" }).returning();
+    f.input.run = run;
+    f.input.session.persistedNativeExecutionInput = null;
+    f.input.session.persistedRunnerProfile = {};
+    // Deliberately no usable checkpoint/lastRunId: the record, not those hints, owns C.
+    f.input.session.taskSessionForRun = null;
+    f.input.session.taskSessionDecodedParams = null;
+  }
+  it("mints one Pi conversation at first selection and reuses it without checkpoint/lastRunId", async () => {
+    const f = await piFixture();
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected selection");
+    const id = first.nativeExecution.session.normalizedSessionId;
+    const [stored] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, f.issue.id));
+    expect(stored?.sessionParamsJson).toMatchObject({ sessionId: id, __paperclipPiConversation: { id, reason: "first_message" } });
+    await nextPiTurn(f);
+    const next = await selectHeartbeatRuntime(db, f.input);
+    expect(next).toMatchObject({ nativeExecution: { session: { normalizedSessionId: id } } });
+    expect((await read(f.input.run.id)).nativeSessionId).toBe(id);
+  });
+  it("adopts a verified legacy Pi pointer without ending the existing conversation", async () => {
+    const f = await piFixture();
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected selection");
+    const id = first.nativeExecution.session.normalizedSessionId;
+    await db.update(agentTaskSessions).set({ sessionParamsJson: { sessionId: id }, lastRunId: f.run.id })
+      .where(eq(agentTaskSessions.taskKey, f.issue.id));
+    await nextPiTurn(f);
+    const next = await selectHeartbeatRuntime(db, f.input);
+    expect(next).toMatchObject({ nativeExecution: { session: { normalizedSessionId: id } } });
+    expect((await read(f.input.run.id)).runnerProfileJson).toMatchObject({ piConversation: { id, reason: "adopted_existing_conversation" } });
+  });
+  it("refuses an unverified legacy pointer instead of guessing ownership or silently replacing it", async () => {
+    const f = await piFixture();
+    await db.insert(agentTaskSessions).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+      adapterType: "paperclip_runner", taskKey: f.issue.id, sessionParamsJson: { sessionId: randomUUID() } });
+    await expect(selectHeartbeatRuntime(db, f.input)).rejects.toThrow("pi_conversation_legacy_binding_unverified");
+    expect((await read(f.input.run.id)).nativeSessionId).toBeNull();
+  });
   async function connectorFixture(durable = true) {
     const f = await fixture(), { input } = f;
     const home = await mkdtemp(join(tmpdir(), "selection-connector-assets-"));
