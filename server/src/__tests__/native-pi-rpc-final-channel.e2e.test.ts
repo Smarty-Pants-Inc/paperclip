@@ -7,7 +7,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, agentWakeupRequests } from "@paperclipai/db";
+import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, agentWakeupRequests, issueComments, issues as issueRows } from "@paperclipai/db";
 import { expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -132,8 +132,8 @@ it.skipIf(!enabled)(`labels every final answer through the real Pi server path (
       let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; });
       req.on("end", () => {
         const parsed = JSON.parse(body);
-        const shape = ["plain", "finish-text", "text-finish"][Math.floor(activeCase / 3)]!;
-        const answer = `FINAL_CHANNEL_${activeCase}_${shape}`;
+        const shape = activeCase === 9 ? "plain" : activeCase === 10 ? "finish-text" : ["plain", "finish-text", "text-finish"][Math.floor(activeCase / 3)]!;
+        const answer = activeCase === 9 ? "PUBLISHED_CHAT_REPLY_9" : activeCase === 10 ? "PUBLISHED_DONE_CHAT_REPLY_10" : `FINAL_CHANNEL_${activeCase}_${shape}`;
         const latest = parsed.messages?.at(-1);
         const isToolResult = latest?.role === "user" && Array.isArray(latest.content) && latest.content.some((p: any) => p.type === "tool_result");
         requests.push({ path: req.url ?? "", model: parsed.model, lastMessage: latest, tools: (parsed.tools ?? []).map((t: any) => t.name) });
@@ -159,7 +159,7 @@ it.skipIf(!enabled)(`labels every final answer through the real Pi server path (
         if (finish) {
           if (shape === "text-finish") textBlock(answer);
           else textBlock(`WORKING_${activeCase}`);
-          const input = {reportedWorkDisposition:"done",summary:answer,evidence:[{ref:"provider:pi_rpc:agent-message"}],verification:[],attentionRequests:[],artifacts:[],completionClaim:{contractRevision:contract.revision,objectiveSatisfied:true,criteria:contract.criteria.map((c:any)=>({criterionId:c.id,status:"satisfied",evidenceRefs:["provider:pi_rpc:agent-message"]})),remainingWork:[]}};
+          const input = {reportedWorkDisposition:"done",summary:activeCase===10?"DONE_RESULT_SUMMARY_10":answer,evidence:[{ref:"provider:pi_rpc:agent-message"}],verification:[],attentionRequests:[],artifacts:[],completionClaim:{contractRevision:contract.revision,objectiveSatisfied:true,criteria:contract.criteria.map((c:any)=>({criterionId:c.id,status:"satisfied",evidenceRefs:["provider:pi_rpc:agent-message"]})),remainingWork:[]}};
           emit("content_block_start", {index,content_block:{type:"tool_use",id:`finish-${activeCase}`,name:"paperclip_finish",input:{}}});
           emit("content_block_delta", {index,delta:{type:"input_json_delta",partial_json:JSON.stringify(input)}});
           emit("content_block_stop", {index});
@@ -293,8 +293,114 @@ it.skipIf(!enabled)(`labels every final answer through the real Pi server path (
       stage("case result",{case:activeCase,shape,status:run?.status,channel:final?.channel,text:final?.text});
       await writeFile(join(root,"channel-proof.json"),JSON.stringify({proofs,failures},null,2));
     }
+    // This is the incident's user path: a board user comments on an already
+    // assigned Pi issue; the faux provider ends its turn with plain final text.
+    // Backlog suppresses the create-time assignment wake, leaving the comment
+    // as the event that admits the run.
+    activeCase = 9;
+    const answer = "PUBLISHED_CHAT_REPLY_9";
+    const issue = await api("POST", `/companies/${companyId}/chats/${agentId}`);
+    issueId = issue.id;
+    expect(issue).toMatchObject({ assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: "local-board" });
+    const inbound = await api("POST", `/issues/${issueId}/comments`, {
+      body: "Please tell me the result.", clientRequestId: randomUUID(),
+    }, 201);
+    stage("board chat comment posted", { issueId, commentId: inbound.id, assigneeAgentId: issue.assigneeAgentId, conversationAgentId: issue.conversationAgentId });
+    const admitted = await waitFor("chat run admitted", async () =>
+      (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .find(run => run.nativeIssueId === issueId) ?? null);
+    const processes = await waitFor("chat run real Pi descendant", async () => {
+      for (const bundle of bundles) {
+        const info = bundle.transport.processInfo?.();
+        if (typeof info?.pid !== "number") continue;
+        const piPid = piDescendant(info.pid);
+        if (piPid) return { runnerPid: info.pid, piPid };
+      }
+      return null;
+    });
+    await waitFor("chat run terminal", async () => {
+      const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
+      return ["succeeded", "failed", "cancelled", "timed_out"].includes(run!.status) ? run : null;
+    });
+    await heartbeatService(db!).waitForRunExecutionDrain(admitted.id, { timeoutMs: 15_000 });
+    const publicationDeadline = Date.now() + 120_000;
+    let replyComments: typeof issueComments.$inferSelect[] = [];
+    while (Date.now() < publicationDeadline && replyComments.length === 0) {
+      const comments = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      replyComments = comments.filter(comment => comment.authorAgentId === agentId &&
+        comment.createdByRunId === admitted.id && comment.body === answer && comment.deletedAt === null);
+      if (replyComments.length === 0) await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
+    const events = (await db!.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, admitted.id)))
+      .sort((a, b) => a.seq - b.seq);
+    const refusalEvents = events.filter(event => event.eventType === "run.response_publication.retrying" ||
+      JSON.stringify(event.payload).includes("publication_refused"));
+    expect(run.status).toBe("succeeded");
+    expect(replyComments, "exactly one final agent reply is published on the issue").toHaveLength(1);
+    expect(replyComments[0]).toMatchObject({ body: answer, authorAgentId: agentId, createdByRunId: admitted.id });
+    expect(refusalEvents).toEqual([]);
+    stage("chat reply published", {
+      issueId, runId: admitted.id, status: run.status, piProcess: processes.piPid,
+      replyCount: replyComments.length, replyCommentId: replyComments[0]!.id,
+      responsePublicationEvents: events.filter(event => String(event.eventType).startsWith("run.response_publication.")),
+    });
+    await writeFile(join(root, "publication-proof.json"), JSON.stringify({
+      issueId, inboundCommentId: inbound.id, runId: admitted.id, status: run.status,
+      piProcess: processes, replyComments, refusalEvents,
+      responsePublicationEvents: events.filter(event => String(event.eventType).startsWith("run.response_publication.")),
+    }, null, 2) + "\n");
+
+    // The faux harness can also finish the issue in this same turn. This second
+    // board-comment run returns a done paperclip_finish result, then asserts the
+    // completed issue still receives its single final reply publication.
+    activeCase = 10;
+    const doneIssue = await api("POST", `/companies/${companyId}/issues`, {
+      title: "Close and publish a Pi chat reply", description: "Complete this issue and answer the board comment.",
+      status: "backlog", assigneeAgentId: agentId,
+    }, 201);
+    issueId = doneIssue.id;
+    const doneInbound = await api("POST", `/issues/${issueId}/comments`, {
+      body: "Please complete the issue and tell me the result.", clientRequestId: randomUUID(),
+    }, 201);
+    const doneRun = await waitFor("done chat run admitted", async () =>
+      (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .find(run => run.nativeIssueId === issueId) ?? null);
+    await waitFor("done chat run terminal", async () => {
+      const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, doneRun.id));
+      return ["succeeded", "failed", "cancelled", "timed_out"].includes(run!.status) ? run : null;
+    });
+    await heartbeatService(db!).waitForRunExecutionDrain(doneRun.id, { timeoutMs: 15_000 });
+    const doneDeadline = Date.now() + 120_000;
+    let doneReplies: typeof issueComments.$inferSelect[] = [];
+    while (Date.now() < doneDeadline && doneReplies.length === 0) {
+      const comments = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      doneReplies = comments.filter(comment => comment.authorAgentId === agentId &&
+        comment.createdByRunId === doneRun.id && comment.body === "PUBLISHED_DONE_CHAT_REPLY_10" && comment.deletedAt === null);
+      if (doneReplies.length === 0) await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    const [doneRunRow] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, doneRun.id));
+    const [closedIssue] = await db!.select().from(issueRows).where(eq(issueRows.id, issueId));
+    const doneEvents = (await db!.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, doneRun.id)))
+      .sort((a, b) => a.seq - b.seq);
+    const doneRefusals = doneEvents.filter(event => event.eventType === "run.response_publication.retrying" ||
+      JSON.stringify(event.payload).includes("publication_refused"));
+    expect(doneRunRow.status).toBe("succeeded");
+    expect(closedIssue.status).toBe("done");
+    expect(doneReplies, "exactly one final reply is published when the turn closes the issue").toHaveLength(1);
+    expect(doneRefusals).toEqual([]);
+    stage("done chat reply published", {
+      issueId, runId: doneRun.id, runStatus: doneRunRow.status, issueStatus: closedIssue.status,
+      inboundCommentId: doneInbound.id, replyCount: doneReplies.length, replyCommentId: doneReplies[0]!.id,
+      responsePublicationEvents: doneEvents.filter(event => String(event.eventType).startsWith("run.response_publication.")),
+    });
+    await writeFile(join(root, "done-publication-proof.json"), JSON.stringify({
+      issueId, inboundCommentId: doneInbound.id, runId: doneRun.id, runStatus: doneRunRow.status,
+      issueStatus: closedIssue.status, replyComments: doneReplies, refusalEvents: doneRefusals,
+      responsePublicationEvents: doneEvents.filter(event => String(event.eventType).startsWith("run.response_publication.")),
+    }, null, 2) + "\n");
     expect(failures).toEqual([]);
-    stage("GREEN",{cases:9});
+    stage("GREEN", { channelCases: 9, publishedChatReplies: replyComments.length, doneChatReplies: doneReplies.length });
   } catch (error) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;
