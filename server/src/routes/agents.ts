@@ -1911,7 +1911,7 @@ export function agentRoutes(
         throw unprocessable("Enable Grok Bot, Assistant connections (MCP), and Paperclip Runner before connecting this agent.", { code: "paperclip_runner_grok_disabled" });
       } else if (!([undefined, "codex", "opencode"].includes(asRecord(config)?.provider as string | undefined)) &&
         !(asRecord(config)?.provider === "acpx" && asRecord(config)?.acpxAgent === "copilot") &&
-        !["claude_local", "pi_local", "grok_local"].includes(agentHarnessType("paperclip_runner", asRecord(config) ?? {})) &&
+        !["claude_local", "pi_local", "pi_rpc", "grok_local"].includes(agentHarnessType("paperclip_runner", asRecord(config) ?? {})) &&
         experimental.enableNativeRunner !== true && !antigravityCandidate && !kimiCandidate) {
         throw unprocessable(
           "Paperclip Runner is experimental and disabled on this instance.",
@@ -2212,6 +2212,18 @@ export function agentRoutes(
     return normalized;
   }
 
+  function isIncompleteModelSetup(input: {
+    adapterType: string | null | undefined;
+    adapterConfig: Record<string, unknown>;
+    setupOnly?: boolean;
+  }): boolean {
+    const config = input.adapterConfig;
+    return input.setupOnly === true && input.adapterType === "paperclip_runner"
+      && (config.provider === "opencode" || config.provider === "cursor_cloud" || config.provider === "pi_rpc"
+        || (config.provider === "acpx" && ["pi", "kimi"].includes(String(config.acpxAgent))))
+      && (config.model === undefined || config.model === "");
+  }
+
   async function normalizeMediatedAdapterConfigForPersistence(input: {
     companyId: string;
     adapterType: string | null | undefined;
@@ -2227,11 +2239,7 @@ export function agentRoutes(
         adapterType: input.adapterType ?? null,
       },
     );
-    const incompleteModelSetup = input.setupOnly && input.adapterType === "paperclip_runner"
-      && (normalizedAdapterConfig.provider === "opencode"
-        || normalizedAdapterConfig.provider === "cursor_cloud"
-        || (normalizedAdapterConfig.provider === "acpx" && ["pi", "kimi"].includes(String(normalizedAdapterConfig.acpxAgent))))
-      && (normalizedAdapterConfig.model === undefined || normalizedAdapterConfig.model === "");
+    const incompleteModelSetup = isIncompleteModelSetup({ ...input, adapterConfig: normalizedAdapterConfig });
     // Inactive drafts can precede model selection. Test/hire always validate the complete profile.
     if (!incompleteModelSetup) await assertAdapterConfigConstraints(
       input.companyId,
@@ -5757,11 +5765,16 @@ export function agentRoutes(
           (requestedAdapterConfig !== null ||
             rawEffectiveAdapterConfig.provider !== existingRunnerProvider))
       )) {
-        await assertFreshPaperclipRunnerProvider(
-          existing.companyId,
-          requestedAdapterType,
-          rawEffectiveAdapterConfig,
-        );
+        // A held setup draft is not a runnable hire. Keep its native Pi model
+        // unset; environment verification and active hires still require it.
+        if (!isIncompleteModelSetup({ adapterType: requestedAdapterType, adapterConfig: rawEffectiveAdapterConfig,
+          setupOnly: existing.lifecycleHolds?.includes("setup") })) {
+          await assertFreshPaperclipRunnerProvider(
+            existing.companyId,
+            requestedAdapterType,
+            rawEffectiveAdapterConfig,
+          );
+        }
       }
       const effectiveAdapterConfig = applyCodexLocalKeyIsolation(
         existing.companyId,

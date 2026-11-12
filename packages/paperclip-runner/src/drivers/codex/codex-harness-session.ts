@@ -187,6 +187,9 @@ export class CodexHarnessSession
 
   async startTurn(input: {
     message: NativeUserMessage;
+    /** Native Pi selection is repeated unchanged at the facade boundary. */
+    model?: string;
+    piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
     /** Set by orchestration only after successful provider-session recovery. */
     continuation?: true;
     requestedCollaborationMode?: "default" | "plan";
@@ -201,6 +204,11 @@ export class CodexHarnessSession
     effectiveCollaborationMode: "default" | "plan";
   }> {
     this.assertProtocolIntegrity();
+    const piRpcThinkingLevel = record(this.opened.context).piRpcThinkingLevel;
+    if (piRpcThinkingLevel !== undefined && ((input.model !== undefined && input.model !== this.opened.context.model)
+      || (input.piRpcThinkingLevel !== undefined && input.piRpcThinkingLevel !== piRpcThinkingLevel))) {
+      throw new Error("Native Pi turn selection differs from the admitted model/thinking identity");
+    }
     if (input.compact === true && (input.reasoningMode !== undefined || this.dispositionOnlyRecoveryAvailable)) {
       throw this.unsupported("context compaction", "compaction cannot combine with reasoning or disposition recovery");
     }
@@ -285,6 +293,7 @@ export class CodexHarnessSession
         ? await this.transport.request("thread/compact/start", { threadId: this.opened.threadId })
         : await this.transport.request("turn/start", {
         threadId: this.opened.threadId,
+        ...(piRpcThinkingLevel === undefined ? {} : { model: this.opened.context.model, piRpcThinkingLevel }),
         ...(input.reasoningMode === undefined ? {} : { reasoningMode: input.reasoningMode }),
         ...(this.reasoningEffort ? { effort: this.reasoningEffort } : {}),
         // Codex resolves an unset summary from the model, and current models

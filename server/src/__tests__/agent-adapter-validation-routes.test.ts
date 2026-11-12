@@ -1008,7 +1008,7 @@ describe("agent routes adapter validation", () => {
     const model = "openrouter/anthropic/claude-sonnet-4.6";
     const response = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents").send({ name: "Pi", adapterType: "pi_local", runner, adapterConfig: { model } }));
     expect(response.status, JSON.stringify(response.body)).toBe(201);
-    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: runner === "legacy" ? "pi_local" : "paperclip_runner", adapterConfig: runner === "legacy" ? { model } : { provider: "acpx", acpxAgent: "pi", model, piThinkingLevel: "low", acpxPermissionMode: "approve-all" } });
+    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: runner === "legacy" ? "pi_local" : "paperclip_runner", adapterConfig: runner === "legacy" ? { model } : { provider: "pi_rpc", model, piRpcThinkingLevel: "low" } });
   });
 
   // Keep reason: new native Pi hires were stuck in verifying even though an
@@ -1016,7 +1016,6 @@ describe("agent routes adapter validation", () => {
   // the HTTP route, environment service, facade driver, hello observer, readiness
   // assertion and lifecycle worker are real. No provider/network inference occurs.
   it.each(["hello", "empty"] as const)("fresh native Pi create becomes ready only after a retired nonempty hello (%s)", async mode => {
-    mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: true });
     const { FakeCodexTransport, WORKSPACE } = await import("../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.js");
     const { CodexAppServerDriver } = await import("../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.js");
     const { probePiNativeEnvironment } = await import("../../../packages/paperclip-runner/src/drivers/pi/pi-environment-probe.js");
@@ -1080,7 +1079,7 @@ describe("agent routes adapter validation", () => {
       expect(ready).toHaveBeenCalledTimes(mode === "hello" ? 1 : 0);
       expect(probe).toHaveBeenCalledOnce();
       expect(transport!.calls.find(c => c.method === "thread/start")?.params.model, JSON.stringify(verdict)).toBe(model);
-      expect(transport!.calls.some(c => c.method === "turn/start")).toBe(true);
+      expect(transport!.calls.find(c => c.method === "turn/start")?.params).toMatchObject({ model, piRpcThinkingLevel: "xhigh" });
     } finally { probeSpy.mockRestore(); }
   }, 60000);
 
@@ -1095,7 +1094,7 @@ describe("agent routes adapter validation", () => {
     const draft = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents")
       .send({ ...input, setupId: "00000000-0000-4000-8000-000000000092" }));
     expect(draft.status, JSON.stringify(draft.body)).toBe(201);
-    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "" } });
+    expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "", piRpcThinkingLevel: "low" } });
     expect(mockAgentService.create.mock.calls.at(-1)?.[2]).toMatchObject({ setupOnly: true, runnerResolved: true });
     mockAgentService.create.mockClear();
     const active = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents")
@@ -1113,7 +1112,7 @@ describe("agent routes adapter validation", () => {
     const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111")
       .send({ adapterType: "pi_local", runner: "auto", adapterConfig: {} }));
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "" } });
+    expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "", piRpcThinkingLevel: "low" } });
   });
 
   it("keeps Kimi draft models unset through the public create route", async () => {
@@ -1162,7 +1161,7 @@ describe("agent routes adapter validation", () => {
     expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject(input);
   });
 
-  it.each([{ thinking: "high", status: 200 }, { thinking: "medium", status: 422 }, { command: "custom-pi", status: 422 }])("validates saved Pi settings during direct adapter conversion: %j", async ({ status, ...settings }) => {
+  it.each([{ thinking: "high", status: 200 }, { thinking: "medium", status: 200 }, { thinking: "max", status: 422 }, { command: "custom-pi", status: 422 }])("validates saved Pi settings during direct adapter conversion: %j", async ({ status, ...settings }) => {
     const selection = await import("../services/agent-runner-selection.js");
     vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
       selection.resolveNewAgentRunner({ ...input, target: { driver: "local", platform: "darwin", architecture: "arm64" } }));
@@ -1171,7 +1170,7 @@ describe("agent routes adapter validation", () => {
     const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111")
       .send({ adapterType: "paperclip_runner", adapterConfig: {} }));
     expect(response.status, JSON.stringify(response.body)).toBe(status);
-    if (status === 200) expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { acpxAgent: "pi", model: "openrouter/anthropic/claude-sonnet-4.5", piThinkingLevel: "high" } });
+    if (status === 200) expect(mockAgentService.update.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "openrouter/anthropic/claude-sonnet-4.5", piRpcThinkingLevel: (settings as { thinking?: string }).thinking } });
     else expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 

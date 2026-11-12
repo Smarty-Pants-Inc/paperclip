@@ -1,6 +1,6 @@
 import { posix } from "node:path";
 import { QUALIFIED_PI_RPC_PROFILE } from "../../vendor/paperclip-runner/index.js";
-import type { CapabilityRunnerdCodexTransportOptions } from "../../vendor/paperclip-runner/index.js";
+import type { probeNativeRunnerEnvironment } from "../../vendor/paperclip-runner/index.js";
 
 type Artifact = { path: string; sha256: string };
 export interface NativePiPack {
@@ -12,7 +12,7 @@ export interface NativePiPack {
 }
 
 /** The exact same verified native distribution/launch binding for Setup and Run. */
-export function nativePiRemoteLaunchOptions(root: string, manifest: NativePiPack, runtimeRoot: string): Pick<CapabilityRunnerdCodexTransportOptions,
+export function nativePiRemoteLaunchOptions(root: string, manifest: NativePiPack, runtimeRoot: string): Pick<NonNullable<Parameters<typeof probeNativeRunnerEnvironment>[0]["transportOptions"]>,
   "providerNodeCommand" | "providerNodeCommandSha256" | "providerPackAuthorityDigest" | "piCommand" | "piCommandSha256" | "piProxyPath" | "piProxySha256" | "piRuntimeDirectory"> {
   const native = manifest.payload.nativeProviders?.pi_rpc;
   const proxy = manifest.payload.artifacts.piRpcProxy, executable = manifest.payload.artifacts.piRpcExecutable;

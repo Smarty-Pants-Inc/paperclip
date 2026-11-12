@@ -55,7 +55,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     const requireSuccess = (result: { timedOut: boolean; exitCode: number | null }) => {
       if (result.timedOut || result.exitCode !== 0) throw new Error("Pi setup could not prepare or clean its private factory runtime");
     };
-    async function probe(admissionOnly: boolean) {
+    const probe = async (admissionOnly: boolean) => {
       const id = `setup-${randomUUID()}`, runnerInstanceId = `runner-${id}`;
       const runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-native-pi-setup-")));
       const remoteRoot = posix.join(target!.remoteCwd, ".paperclip-runtime", id);
@@ -107,7 +107,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
         // cleanup keeps the lease/root with its retained owner, never local success.
         if (!cleanupTransferred) await cleanup();
       }
-    }
+    };
     const metadata = await probe(true);
     if (!metadata.sessionAdmissionPassed || metadata.helloProbePassed || metadata.providerDriver !== "pi_rpc" || metadata.effectiveModel !== model || !metadata.piMetadata) {
       throw new Error("Pi metadata admission was incomplete; hello was not sent");
