@@ -112,8 +112,12 @@ unset PAPERCLIP_PI_E2E_EXCLUDE_SUBAGENTS
 (cd "$PAPERCLIP_PI_E2E_HOME_FIXTURE" && sha256sum --check --quiet SHA256SUMS)
 export PAPERCLIP_PI_E2E_FIXTURE_MANIFEST_SHA256=$(sha256sum "$PAPERCLIP_PI_E2E_HOME_FIXTURE/SHA256SUMS" | cut -d' ' -f1)
 export L3_RUN="$run" L3_SHA="$sha"
-python3 - <<'PY'
-import hashlib,json,os,pathlib
+# Select once: the receipt hashes exactly the test files passed to Vitest below.
+# Stop/continue is mandatory; the older warm test defaults on but can be omitted.
+tests=(src/__tests__/native-pi-rpc-full-server.e2e.test.ts src/__tests__/native-pi-rpc-stop-continue.e2e.test.ts)
+if [ "${PAPERCLIP_PI_GATE_INCLUDE_STOP:-1}" = 1 ]; then tests+=(src/__tests__/native-pi-rpc-stop-warm.e2e.test.ts); fi
+python3 - "${tests[@]}" <<'PY'
+import hashlib,json,os,pathlib,sys
 run=pathlib.Path(os.environ['L3_RUN']);pack=pathlib.Path(os.environ['PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH']);binary=pathlib.Path(os.environ['PAPERCLIP_RUNNER_BINARY'])
 wt=pathlib.Path(os.environ['L3_WT'])
 def tree_digest(root):
@@ -126,6 +130,11 @@ assert manifest['payload']['runnerSourceRevision']==os.environ['L3_SHA']
 d={'head':os.environ['L3_SHA'],'runnerBinary':str(binary),'runnerBinarySha256':hashlib.file_digest(binary.open('rb'),'sha256').hexdigest(),'providerPack':str(pack),'providerPackDigest':manifest['digest'],'providerPackManifestSha256':hashlib.sha256((pack/'provider-pack.json').read_bytes()).hexdigest(),'providerPackArtifacts':manifest['payload']['artifacts']}
 d['serverDist']=str(run/'server-dist')
 d['serverDistTreeSha256']=tree_digest(run/'server-dist')
+# Retain legacy scalar hashes for existing receipt readers. New consumers should
+# use the exact selected list and complete per-file map, not infer membership.
+d['gateTestArguments']=sys.argv[1:]
+d['gateTests']=[str(pathlib.PurePosixPath('server')/test) for test in d['gateTestArguments']]
+d['gateTestSha256ByPath']={test:hashlib.sha256((wt/test).read_bytes()).hexdigest() for test in d['gateTests']}
 d['gateTestSha256']=hashlib.sha256((wt/'server/src/__tests__/native-pi-rpc-full-server.e2e.test.ts').read_bytes()).hexdigest()
 d['stopTestSha256']=hashlib.sha256((wt/'server/src/__tests__/native-pi-rpc-stop-warm.e2e.test.ts').read_bytes()).hexdigest()
 d['gateScriptSha256']=hashlib.sha256((wt/'scripts/pi-rpc-full-server-gate.sh').read_bytes()).hexdigest()
@@ -133,8 +142,6 @@ d['nativeObserverSha256']=hashlib.sha256((wt/'server/src/__tests__/helpers/nativ
 d['fixtureManifestSha256']=os.environ['PAPERCLIP_PI_E2E_FIXTURE_MANIFEST_SHA256']
 (run/'artifacts.json').write_text(json.dumps(d,indent=2)+'\n')
 PY
-tests=(src/__tests__/native-pi-rpc-full-server.e2e.test.ts)
-if [ "${PAPERCLIP_PI_GATE_INCLUDE_STOP:-0}" = 1 ]; then tests+=(src/__tests__/native-pi-rpc-stop-warm.e2e.test.ts); fi
 phase "GATE_START"
 set +e
 (cd "$wt/server" && timeout 600 ../node_modules/.bin/vitest run --config vitest.config.ts "${tests[@]}") > "$run/gate.log" 2>&1
