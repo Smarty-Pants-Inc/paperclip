@@ -1,13 +1,13 @@
 import { createServer, request, type IncomingHttpHeaders, type Server } from "node:http";
 import { once } from "node:events";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { startProviderLoopbackBroker } from "./broker.js";
 import { chatLoopbackAdapter } from "./chat.js";
 import { messagesLoopbackAdapter } from "./messages.js";
 import { responsesLoopbackAdapter } from "./responses.js";
 
 const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
+afterEach(async () => { vi.useRealTimers(); vi.restoreAllMocks(); for (const close of cleanups.splice(0).reverse()) await close(); });
 
 async function listen(server: Server): Promise<string> {
   server.listen(0, "127.0.0.1");
@@ -37,6 +37,41 @@ function post(base: string, token: string, headers: Record<string, string> = {},
 }
 
 describe("provider loopback broker", () => {
+  // Keep reason: real streaming HTTP boundary; simulate wall time rather than
+  // spending ten minutes to reproduce a total-vs-idle provider cutoff.
+  it("keeps a stream alive past ten minutes when bytes arrive within the default 120-second idle deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController(); setTimeout(() => controller.abort(), ms).unref(); return controller.signal;
+    });
+    let write!: (text: string) => void, finish!: () => void;
+    const baseUrl = await listen(createServer((req, res) => {
+      req.resume(); res.writeHead(200, { "content-type": "text/event-stream" }); res.write("start\n");
+      write = text => { res.write(text); }; finish = () => { res.end("done\n"); };
+    }));
+    const broker = await startProviderLoopbackBroker({ adapter: messagesLoopbackAdapter, baseUrl, key: "local-only", auth: "api_key", environment: {} }); cleanups.push(broker.close);
+    const response = await post(broker.baseURL, broker.token); const reader = response.body!.getReader();
+    expect(Buffer.from((await reader.read()).value!).toString()).toBe("start\n");
+    for (let i = 0; i < 6; i++) {
+      await vi.advanceTimersByTimeAsync(119_000);
+      write(`chunk-${i}\n`);
+      expect(Buffer.from((await reader.read()).value!).toString()).toBe(`chunk-${i}\n`);
+    }
+    finish(); let output = "";
+    for (;;) { const chunk = await reader.read(); if (chunk.done) break; output += Buffer.from(chunk.value).toString(); }
+    expect(output).toBe("done\n");
+  });
+  it("aborts a byte-idle streaming upstream at its configured deadline and leaves the broker reusable", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let count = 0;
+    const baseUrl = await listen(createServer((req, res) => { req.resume(); if (++count === 1) { res.writeHead(200, { "content-type": "text/event-stream" }); res.write("start\n"); } else res.end("next succeeds"); }));
+    const broker = await startProviderLoopbackBroker({ adapter: messagesLoopbackAdapter, baseUrl, key: "local-only", auth: "api_key", environment: { PAPERCLIP_PROVIDER_IDLE_TIMEOUT_MS: "2000" } }); cleanups.push(broker.close);
+    const response = await post(broker.baseURL, broker.token); const reader = response.body!.getReader(); await reader.read();
+    const next = reader.read(); const rejected = expect(next).rejects.toThrow();
+    await vi.advanceTimersByTimeAsync(2001);
+    await rejected;
+    expect(await (await post(broker.baseURL, broker.token)).text()).toBe("next succeeds");
+  });
   // Incident: installed Pi's Anthropic SDK uses /v1/messages?beta=true.
   // Preserve query bytes without relaxing the fixed route or credential boundary.
   it.each([messagesLoopbackAdapter, chatLoopbackAdapter, responsesLoopbackAdapter])(

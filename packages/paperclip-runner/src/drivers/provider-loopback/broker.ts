@@ -38,10 +38,14 @@ export async function startProviderLoopbackBroker(input: {
   transformPayload?(payload: Record<string, unknown>): boolean;
   extraUpstreamHeaders?: Record<string, string>;
   environment: NodeJS.ProcessEnv;
+  /** Byte-idle upstream limit; active streams have no total-duration cutoff. */
+  idleTimeoutMs?: number;
 }): Promise<{ baseURL: string; token: string; close(): Promise<void> }> {
   const upstreamUrl = input.adapter.upstreamUrl(input.baseUrl);
   const token = randomBytes(32).toString("base64url");
   const environment = input.environment;
+  const idleTimeoutMs = input.idleTimeoutMs ?? Number(environment.PAPERCLIP_PROVIDER_IDLE_TIMEOUT_MS ?? 120_000);
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0 || idleTimeoutMs > 2_147_483_647) throw new Error("Invalid provider idle timeout");
   const proxyEnv = {
     HTTP_PROXY: environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
     HTTPS_PROXY: environment.https_proxy ?? environment.HTTPS_PROXY ?? environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
@@ -62,6 +66,12 @@ export async function startProviderLoopbackBroker(input: {
   const server = createServer((request, response) => {
     const controller = new AbortController();
     controllers.add(controller);
+    let idleTimer: NodeJS.Timeout | undefined;
+    const refreshIdleDeadline = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs);
+      idleTimer.unref();
+    };
     response.once("close", () => controller.abort());
     void (async () => {
       if (!input.adapter.authorize(request.headers, token)) {
@@ -98,6 +108,7 @@ export async function startProviderLoopbackBroker(input: {
         return;
       }
       if (input.transformPayload?.(payload)) body = Buffer.from(JSON.stringify(payload), "utf8");
+      refreshIdleDeadline();
       const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
         const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
           method: "POST",
@@ -109,11 +120,13 @@ export async function startProviderLoopbackBroker(input: {
             "Content-Length": body.length,
             ...input.adapter.upstreamHeaders({ key: input.key, auth: input.auth, incoming: request.headers }),
           },
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
+          signal: controller.signal,
         }, resolve);
         outgoing.once("error", reject);
         outgoing.end(body);
       });
+      refreshIdleDeadline();
+      upstream.on("data", refreshIdleDeadline);
       const status = upstream.statusCode ?? 502;
       if (status >= 300 && status < 400) {
         upstream.destroy();
@@ -130,7 +143,7 @@ export async function startProviderLoopbackBroker(input: {
     })().catch(() => {
       if (!response.headersSent) response.writeHead(502).end("Provider request failed");
       else response.destroy();
-    }).finally(() => controllers.delete(controller));
+    }).finally(() => { if (idleTimer) clearTimeout(idleTimer); controllers.delete(controller); });
   });
   try {
     await new Promise<void>((resolve, reject) => {
