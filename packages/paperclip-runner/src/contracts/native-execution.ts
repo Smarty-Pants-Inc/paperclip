@@ -1,3 +1,4 @@
+import { parsePiRpcProfile, type NativePiRpcProfileSnapshot } from "../drivers/pi/qualified-profile.js";
 import { parseNativeCursorCloudConfig, type NativeCursorCloudConfig } from "./cursor-cloud.js";
 import { resolveGrokDisableWebSearch } from "../drivers/acpx/grok-web-search.js";
 import { resolveGrokEffort } from "../drivers/acpx/grok-effort.js";
@@ -120,7 +121,10 @@ export interface NativeAcpxProfileSnapshot {
   commandDigest: string;
 }
 
+export type NativePiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
 export type NativeProviderConfig =
+  | { kind: "pi"; model: string; profile: NativePiRpcProfileSnapshot; piThinkingLevel?: NativePiThinkingLevel }
   | { kind: "cursor_cloud"; model: string; cursorCloud: NativeCursorCloudConfig }
   | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
@@ -156,7 +160,7 @@ export type NativeProviderConfig =
 export type NativeProviderConfigV4 =
   | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode: NativeOpenCodePermissionMode }
-  | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" | "cursor_cloud" }>
+  | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" | "cursor_cloud" | "pi" }>
   | {
       kind: "acpx";
       agent: NativeAcpxAgent;
@@ -197,7 +201,7 @@ export interface NativeExecutionInputV1 {
   };
   session: {
     normalizedSessionId: string | null;
-    driverKind: "cursor_cloud_api" | "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
+    driverKind: "pi_rpc" | "cursor_cloud_api" | "codex_app_server" | "opencode_server" | "claude_managed_agents_api" | "aws_agentcore_harness_api" | "acpx_runtime";
     protocolVersion: 1;
     lifecyclePolicy: NativeSessionLifecyclePolicy;
   };
@@ -535,6 +539,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       session.driverKind !== "cursor_cloud_api"
       && session.driverKind !== "codex_app_server"
       && session.driverKind !== "opencode_server"
+      && session.driverKind !== "pi_rpc"
       && session.driverKind !== "claude_managed_agents_api"
       && session.driverKind !== "aws_agentcore_harness_api"
       && session.driverKind !== "acpx_runtime"
@@ -575,15 +580,18 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     provider.kind !== "cursor_cloud"
     && provider.kind !== "codex"
     && provider.kind !== "opencode"
+    && provider.kind !== "pi"
     && provider.kind !== "claude_managed"
     && provider.kind !== "aws_agentcore"
     && provider.kind !== "acpx"
   ) {
-    throw new NativeExecutionInputError("input.provider.kind must be cursor_cloud, codex, opencode, claude_managed, aws_agentcore, or acpx");
+    throw new NativeExecutionInputError("input.provider.kind must be cursor_cloud, codex, opencode, pi, claude_managed, aws_agentcore, or acpx");
   }
   exactKeys(
     provider,
-    provider.kind === "cursor_cloud"
+    provider.kind === "pi"
+      ? ["kind", "model", "profile", "piThinkingLevel"]
+      : provider.kind === "cursor_cloud"
       ? ["kind", "model", "cursorCloud"]
       : provider.kind === "claude_managed"
       ? ["kind", "model", "managedProfile", "maxSessionListCostUsd"]
@@ -602,6 +610,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     (provider.kind === "cursor_cloud" && session.driverKind !== "cursor_cloud_api")
     || (provider.kind === "codex" && session.driverKind !== "codex_app_server")
     || (provider.kind === "opencode" && session.driverKind !== "opencode_server")
+    || (provider.kind === "pi" && session.driverKind !== "pi_rpc")
     || (provider.kind === "claude_managed" && session.driverKind !== "claude_managed_agents_api")
     || (provider.kind === "aws_agentcore" && session.driverKind !== "aws_agentcore_harness_api")
     || (provider.kind === "acpx" && session.driverKind !== "acpx_runtime")
@@ -611,11 +620,17 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   const providerModel = provider.model === null || provider.model === undefined
     ? null
     : text(provider.model, "input.provider.model");
-  if (provider.kind === "opencode" && (providerModel === null || !providerModel.includes("/"))) {
+  if ((provider.kind === "opencode" || provider.kind === "pi") && (providerModel === null || !providerModel.includes("/") || providerModel.length > 240 || /[\x00-\x1f\x7f]/.test(providerModel))) {
     throw new NativeExecutionInputError("input.provider.model is required for opencode in provider/model form");
   }
   let parsedProvider: NativeProviderConfigV9 | NativeProviderConfig | NativeProviderConfigV5;
-  if (provider.kind === "cursor_cloud") {
+  if (provider.kind === "pi") {
+    if (provider.piThinkingLevel !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(provider.piThinkingLevel))) {
+      throw new NativeExecutionInputError("Native Pi thinking level is unsupported");
+    }
+    parsedProvider = { kind: "pi", model: providerModel!, profile: parsePiRpcProfile(provider.profile),
+      ...(provider.piThinkingLevel === undefined ? {} : { piThinkingLevel: provider.piThinkingLevel as NativePiThinkingLevel }) };
+  } else if (provider.kind === "cursor_cloud") {
     if (!isV5 || !providerModel || providerModel.length > 240 || /[\x00-\x1f\x7f]/.test(providerModel) || lifecyclePolicy.mode !== "per_turn") {
       throw new NativeExecutionInputError("Cursor Cloud requires a model and per-turn lifecycle in a v5 or later input");
     }

@@ -109,6 +109,22 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_NORMALIZED_SESSION_ID",
     "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
 ];
+const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
+    "PAPERCLIP_AI_PROVIDER_KEY",
+    "PAPERCLIP_AI_PROVIDER_URL",
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
+    "PAPERCLIP_PI_RUNTIME_DIR",
+    "PAPERCLIP_PI_THINKING_LEVEL",
+    "PAPERCLIP_RUNNER_INSTANCE_ID",
+    "PAPERCLIP_RUN_ID",
+    "PAPERCLIP_NORMALIZED_SESSION_ID",
+    "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
+    "PI_CODING_AGENT_DIR",
+    "LANGFUSE_TRACING_ENABLED",
+];
 const CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "CURSOR_API_KEY",
     "PAPERCLIP_CURSOR_CLOUD_CONFIG_PATH",
@@ -231,7 +247,7 @@ fn warm_attachment_keeps_provider(
         return false;
     }
     current == next
-        || (current.is_some() && next.is_some() && matches!(provider, "codex" | "opencode"))
+        || (current.is_some() && next.is_some() && matches!(provider, "codex" | "opencode" | "pi"))
 }
 
 /// Run-scoped identity a retained OpenCode proxy needs on each turn/start: its
@@ -469,6 +485,8 @@ fn default_approval_policy() -> String {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexProviderConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Value>,
     pub provider: String,
     pub driver: String,
     pub provider_version: String,
@@ -590,15 +608,37 @@ impl CodexProviderConfig {
             (self.provider.as_str(), self.driver.as_str()),
             ("codex", "codex_app_server")
                 | ("opencode", "opencode_server")
+                | ("pi", "pi_rpc")
                 | ("cursor_cloud", "cursor_cloud_api")
         ) {
             return Err(LocalRunnerError::invalid(
-                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, or cursor_cloud/cursor_cloud_api",
+                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, pi/pi_rpc, or cursor_cloud/cursor_cloud_api",
             ));
         }
         if self.provider_version.trim().is_empty() || self.provider_version.len() > 120 {
             return Err(LocalRunnerError::invalid(
                 "Codex providerVersion is empty or oversized",
+            ));
+        }
+        if self.provider == "pi" {
+            let expected: Value =
+                serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON)
+                    .map_err(|_| LocalRunnerError::invalid("invalid compiled Pi profile"))?;
+            if self.provider_version != crate::generated_pi_rpc_profile::PI_RPC_VERSION
+                || self.profile.as_ref() != Some(&expected)
+                || self.model.as_ref().is_none_or(|model| {
+                    model.trim().is_empty()
+                        || !model.contains('/')
+                        || model.chars().any(char::is_control)
+                })
+            {
+                return Err(LocalRunnerError::invalid(
+                    "Pi native profile, version, or model differs from its registered release",
+                ));
+            }
+        } else if self.profile.is_some() {
+            return Err(LocalRunnerError::invalid(
+                "native Pi profile is only supported by pi/pi_rpc",
             ));
         }
         if self.provider == "opencode" && self.provider_version != QUALIFIED_OPENCODE_VERSION {
@@ -877,7 +917,7 @@ pub struct CodexProvider {
     pub(crate) sent_frame_observer: Option<Box<dyn FnMut(&Value) + Send>>,
     #[cfg(test)]
     pub(crate) interpretation_observer: Option<Box<dyn FnMut(&[String]) + Send>>,
-    opencode_launch_profile: Option<OpenCodeLaunchProfile>,
+    local_launch_profile: Option<OpenCodeLaunchProfile>,
     cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
     provider_termination_receipt: Option<Value>,
     completion_contract: Option<ProviderCompletionContract>,
@@ -1078,7 +1118,7 @@ impl CodexProvider {
         authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
         resume_thread_id: Option<&str>,
         process_generation: u64,
-        opencode_launch_profile: Option<&OpenCodeLaunchProfile>,
+        local_launch_profile: Option<&OpenCodeLaunchProfile>,
         cursor_cloud_launch_profile: Option<&CursorCloudLaunchProfile>,
         completion_contract: Option<(&str, &[String])>,
     ) -> Result<Self, LocalRunnerError> {
@@ -1087,7 +1127,7 @@ impl CodexProvider {
             authorized_tools,
             resume_thread_id,
             process_generation,
-            opencode_launch_profile,
+            local_launch_profile,
             cursor_cloud_launch_profile,
             completion_contract,
             &mut |_| Ok(()),
@@ -1099,7 +1139,7 @@ impl CodexProvider {
         authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
         resume_thread_id: Option<&str>,
         process_generation: u64,
-        opencode_launch_profile: Option<&OpenCodeLaunchProfile>,
+        local_launch_profile: Option<&OpenCodeLaunchProfile>,
         cursor_cloud_launch_profile: Option<&CursorCloudLaunchProfile>,
         completion_contract: Option<(&str, &[String])>,
         observe: &mut dyn FnMut(ProviderStartupObservation) -> Result<(), LocalRunnerError>,
@@ -1149,6 +1189,7 @@ impl CodexProvider {
         ];
         let provider_environment_keys = match config.provider.as_str() {
             "opencode" => OPENCODE_PROVIDER_ENVIRONMENT_KEYS,
+            "pi" => PI_RPC_PROVIDER_ENVIRONMENT_KEYS,
             "cursor_cloud" => CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS,
             _ => CODEX_PROVIDER_ENVIRONMENT_KEYS,
         };
@@ -1219,7 +1260,7 @@ impl CodexProvider {
                     &environment_keys,
                 )
             } else if config.provider == "opencode" {
-                let profile = opencode_launch_profile.ok_or_else(|| {
+                let profile = local_launch_profile.ok_or_else(|| {
                     LocalRunnerError::invalid(
                         "OpenCode runner startup omitted its qualified launch profile",
                     )
@@ -1233,6 +1274,32 @@ impl CodexProvider {
                     ));
                 }
                 let launch = verified_opencode_launch(profile)?;
+                observe(ProviderStartupObservation::SpawnStarting)?;
+                SupervisedProcess::spawn_verified_with_environment_keys(
+                    &launch,
+                    Duration::from_secs(2),
+                    CODEX_APP_SERVER_MAX_FRAME_BYTES,
+                    &environment_keys,
+                )
+            } else if config.provider == "pi" {
+                let profile = local_launch_profile.ok_or_else(|| {
+                    LocalRunnerError::invalid(
+                        "Pi runner startup omitted its qualified launch profile",
+                    )
+                })?;
+                let proxy_script = profile.proxy_script.path.to_string_lossy();
+                if config.command != profile.command.path
+                    || config.args.as_slice() != [proxy_script.as_ref()]
+                {
+                    return Err(LocalRunnerError::invalid(
+                        "Pi launch does not match the runner-owned qualified profile",
+                    ));
+                }
+                let launch = verified_native_facade_launch(
+                    profile,
+                    "Pi",
+                    "--paperclip-trusted-pi-executable",
+                )?;
                 observe(ProviderStartupObservation::SpawnStarting)?;
                 SupervisedProcess::spawn_verified_with_environment_keys(
                     &launch,
@@ -1321,7 +1388,7 @@ impl CodexProvider {
             sent_frame_observer: None,
             #[cfg(test)]
             interpretation_observer: None,
-            opencode_launch_profile: opencode_launch_profile.cloned(),
+            local_launch_profile: local_launch_profile.cloned(),
             cursor_cloud_launch_profile: cursor_cloud_launch_profile.cloned(),
             provider_termination_receipt: None,
             completion_contract: completion_contract.map(|(revision, criterion_ids)| {
@@ -1385,7 +1452,7 @@ impl CodexProvider {
             } else {
                 params_object.insert("permissions".to_owned(), json!(provider.permission_profile));
             }
-            if matches!(config.provider.as_str(), "opencode" | "cursor_cloud") {
+            if matches!(config.provider.as_str(), "opencode" | "pi" | "cursor_cloud") {
                 if let Some(mode) = &config.conversation_mode {
                     params_object.insert("conversationMode".to_owned(), json!(mode));
                 }
@@ -1900,7 +1967,7 @@ impl CodexProvider {
             authorized_tools,
             Some(&thread_id),
             next_generation,
-            self.opencode_launch_profile.as_ref(),
+            self.local_launch_profile.as_ref(),
             self.cursor_cloud_launch_profile.as_ref(),
             completion_contract.as_ref().map(|contract| {
                 (
@@ -2164,7 +2231,7 @@ impl CodexProvider {
             .expect("Codex turn parameters are an object");
         // The retained proxy's launch environment belongs to its first run.
         // Only runnerd's rotated authority supplies the current run identity.
-        if self.config.provider == "opencode" {
+        if matches!(self.config.provider.as_str(), "opencode" | "pi") {
             for (key, value) in
                 opencode_turn_identity_params(run_id, self.completion_contract.as_ref())
             {
@@ -4164,12 +4231,23 @@ impl CodexProvider {
 fn verified_opencode_launch(
     profile: &OpenCodeLaunchProfile,
 ) -> Result<VerifiedProcessLaunch, LocalRunnerError> {
-    let command = verify_launch_artifact(&profile.command, "OpenCode proxy command")
+    verified_native_facade_launch(profile, "OpenCode", TRUSTED_OPENCODE_EXECUTABLE_ARG)
+}
+
+fn verified_native_facade_launch(
+    profile: &OpenCodeLaunchProfile,
+    provider: &str,
+    executable_arg: &str,
+) -> Result<VerifiedProcessLaunch, LocalRunnerError> {
+    let command = verify_launch_artifact(&profile.command, &format!("{provider} proxy command"))
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
-    let proxy = verify_launch_artifact(&profile.proxy_script, "OpenCode proxy script")
+    let proxy = verify_launch_artifact(&profile.proxy_script, &format!("{provider} proxy script"))
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
-    let executable = verify_launch_artifact(&profile.executable, "OpenCode provider executable")
-        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    let executable = verify_launch_artifact(
+        &profile.executable,
+        &format!("{provider} provider executable"),
+    )
+    .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
     let proxy = if is_node_interpreter(&profile.command.path) {
         VerifiedProcessArgument::CommonJsArtifact(proxy)
     } else {
@@ -4180,7 +4258,7 @@ fn verified_opencode_launch(
     };
     let args = vec![
         proxy,
-        VerifiedProcessArgument::Literal(TRUSTED_OPENCODE_EXECUTABLE_ARG.to_owned()),
+        VerifiedProcessArgument::Literal(executable_arg.to_owned()),
         VerifiedProcessArgument::ExecutableArtifact(executable),
     ];
     Ok(VerifiedProcessLaunch::new(command, args))
@@ -5116,6 +5194,7 @@ mod tests {
     #[test]
     fn read_only_codex_turns_use_native_plan_collaboration_mode() {
         let mut config = CodexProviderConfig {
+            profile: None,
             provider: "codex".to_owned(),
             driver: "codex_app_server".to_owned(),
             provider_version: "fixture".to_owned(),
@@ -5305,6 +5384,7 @@ while IFS= read -r line; do
 done
 "#;
         let config = CodexProviderConfig {
+            profile: None,
             provider: "codex".to_owned(),
             driver: "codex_app_server".to_owned(),
             provider_version: "reader-tail-fixture".to_owned(),
@@ -5970,6 +6050,7 @@ done
     #[cfg(unix)]
     fn startup_observer_failure_reaps_the_exact_child_before_any_initialization_rpc() {
         let config = CodexProviderConfig {
+            profile: None,
             provider: "codex".to_owned(),
             driver: "codex_app_server".to_owned(),
             provider_version: "fixture".to_owned(),
@@ -6205,6 +6286,7 @@ done
     #[test]
     fn admits_only_exact_local_facade_provider_driver_pairs() {
         let mut config = CodexProviderConfig {
+            profile: None,
             provider: "opencode".to_owned(),
             driver: "opencode_server".to_owned(),
             provider_version: QUALIFIED_OPENCODE_VERSION.to_owned(),

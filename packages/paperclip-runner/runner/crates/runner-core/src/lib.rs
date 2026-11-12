@@ -386,3 +386,5 @@ mod tests {
 
 #[cfg(unix)]
 pub mod runtime_notifications;
+
+pub mod generated_pi_rpc_profile;

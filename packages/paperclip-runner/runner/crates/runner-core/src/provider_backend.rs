@@ -497,6 +497,7 @@ fn local_process_definitely_gone(_id: u32, _group: bool) -> bool {
 fn facade_provider_name(provider: &str) -> &'static str {
     match provider {
         "opencode" => "OpenCode",
+        "pi" => "Pi",
         "cursor_cloud" => "Cursor Cloud",
         _ => "Codex",
     }
@@ -1282,6 +1283,8 @@ struct CodexProviderState {
     lifecycle: String,
     config: CodexProviderConfig,
     #[serde(default)]
+    pi_launch_profile_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     opencode_launch_profile_digest: Option<String>,
     /// SHA-256 of the qualified OpenCode executable: the upstream release that
     /// owns the saved conversation. The launch-profile digest also covers the
@@ -1411,6 +1414,7 @@ impl CodexProviderState {
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "prepared".to_owned(),
             config,
+            pi_launch_profile_digest: None,
             opencode_launch_profile_digest: None,
             opencode_release_digest: None,
             cursor_cloud_launch_profile_digest: None,
@@ -2019,6 +2023,7 @@ pub struct CodexCommandExecutor {
     event_identity: Option<ProviderEventIdentity>,
     restore_checked: bool,
     restore_error: Option<DurableRunnerError>,
+    pi_launch_profile: Option<OpenCodeLaunchProfile>,
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
     cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
     startup_command: Option<ProviderStartupCommand>,
@@ -2039,6 +2044,7 @@ impl CodexCommandExecutor {
             event_identity: None,
             restore_checked: false,
             restore_error: None,
+            pi_launch_profile: None,
             opencode_launch_profile: None,
             cursor_cloud_launch_profile: None,
             startup_command: None,
@@ -2054,6 +2060,7 @@ impl CodexCommandExecutor {
     pub fn with_runner_config(state_dir: impl Into<PathBuf>, config: &DurableRunnerConfig) -> Self {
         let mut executor = Self::new(state_dir);
         executor.event_identity = Some(ProviderEventIdentity::from_config(config));
+        executor.pi_launch_profile = config.pi_launch_profile.clone();
         executor.opencode_launch_profile = config.opencode_launch_profile.clone();
         executor.cursor_cloud_launch_profile = config.cursor_cloud_launch_profile.clone();
         executor
@@ -2085,6 +2092,35 @@ impl CodexCommandExecutor {
         }
         let mut digest = Sha256::new();
         digest.update(b"paperclip.runner.opencode-launch-profile.v1\0");
+        for artifact in [&profile.command, &profile.proxy_script, &profile.executable] {
+            digest.update(artifact.path.to_string_lossy().as_bytes());
+            digest.update(b"\0");
+            digest.update(artifact.sha256.as_bytes());
+            digest.update(b"\0");
+        }
+        Ok(Some(format!("sha256:{:x}", digest.finalize())))
+    }
+
+    fn bind_pi_launch_profile(
+        &self,
+        config: &CodexProviderConfig,
+    ) -> Result<Option<String>, DurableRunnerError> {
+        if config.provider != "pi" {
+            return Ok(None);
+        }
+        let profile = self.pi_launch_profile.as_ref().ok_or_else(|| {
+            DurableRunnerError::invalid("Pi runner startup omitted its qualified launch profile")
+        })?;
+        let proxy_script = profile.proxy_script.path.to_string_lossy();
+        if config.command != profile.command.path
+            || config.args.as_slice() != [proxy_script.as_ref()]
+        {
+            return Err(DurableRunnerError::invalid(
+                "Pi run.prepare launch does not match the runner-owned qualified profile",
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"paperclip.runner.pi-rpc-launch-profile.v1\0");
         for artifact in [&profile.command, &profile.proxy_script, &profile.executable] {
             digest.update(artifact.path.to_string_lossy().as_bytes());
             digest.update(b"\0");
@@ -2311,7 +2347,11 @@ impl CodexCommandExecutor {
             .state
             .clone()
             .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
-        let profile = self.opencode_launch_profile.clone();
+        let profile = if state.config.provider == "pi" {
+            self.pi_launch_profile.clone()
+        } else {
+            self.opencode_launch_profile.clone()
+        };
         let cursor_cloud_profile = self.cursor_cloud_launch_profile.clone();
         self.begin_startup(trigger, generation)?;
         CodexProvider::start_with_tools_observed(
@@ -2527,6 +2567,13 @@ impl CodexCommandExecutor {
             ))
         })?;
         state.validate()?;
+        let expected_pi_profile_digest = self.bind_pi_launch_profile(&state.config)?;
+        if state.pi_launch_profile_digest != expected_pi_profile_digest {
+            return Err(DurableRunnerError::invalid(
+                "Pi runner launch profile changed across durable recovery",
+            )
+            .with_classification(PROVIDER_STATE_INCOMPATIBLE));
+        }
         let expected_launch_profile_digest = self.bind_opencode_launch_profile(&state.config)?;
         if state.opencode_launch_profile_digest != expected_launch_profile_digest
             && self.rebinds_settled_opencode_session(&state)
@@ -3186,6 +3233,7 @@ impl CodexCommandExecutor {
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         let provider_name = config.provider.clone();
         let driver = config.driver.clone();
+        let pi_launch_profile_digest = self.bind_pi_launch_profile(&config)?;
         let opencode_launch_profile_digest = self.bind_opencode_launch_profile(&config)?;
         let cursor_cloud_launch_profile_digest = self.bind_cursor_cloud_launch_profile(&config)?;
         let completion_contract = completion_contract(payload)?;
@@ -3194,6 +3242,11 @@ impl CodexCommandExecutor {
             if state.config != config || state.completion_contract != completion_contract {
                 return Err(DurableRunnerError::invalid(
                     "Codex provider or completion contract changed across the durable run",
+                ));
+            }
+            if state.pi_launch_profile_digest != pi_launch_profile_digest {
+                return Err(DurableRunnerError::invalid(
+                    "Pi runner launch profile changed across the durable run",
                 ));
             }
             if state.opencode_launch_profile_digest != opencode_launch_profile_digest {
@@ -3234,6 +3287,7 @@ impl CodexCommandExecutor {
                 DurableRunnerError::invalid(format!("run.prepare tool contract rejected: {error}"))
             })?;
             let mut state = CodexProviderState::new(config, completion_contract, tool_bridge);
+            state.pi_launch_profile_digest = pi_launch_profile_digest;
             state.opencode_launch_profile_digest = opencode_launch_profile_digest;
             state.opencode_release_digest = self.opencode_release_digest(&state.config);
             state.cursor_cloud_launch_profile_digest = cursor_cloud_launch_profile_digest;
@@ -5738,7 +5792,7 @@ impl CodexCommandExecutor {
                                 "prompt": prompt,
                                 "input": question_set,
                                 "origin": {
-                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
+                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
                                     "provider": state.config.provider,
                                     "method": "item/tool/requestUserInput",
                                 },
@@ -7027,6 +7081,7 @@ done
     fn opencode_result_state() -> CodexProviderState {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
                 provider_version: "1.18.34".to_owned(),
@@ -8099,6 +8154,7 @@ done
     fn opencode_terminal_fallback_uses_its_actual_provider_identity() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
                 provider_version: "1.18.34".to_owned(),
@@ -8203,6 +8259,7 @@ done
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "turn_active".to_owned(),
             config: CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8221,6 +8278,7 @@ done
                 include_skill_instructions: None,
                 conversation_mode: None,
             },
+            pi_launch_profile_digest: None,
             opencode_launch_profile_digest: None,
             opencode_release_digest: None,
             cursor_cloud_launch_profile_digest: None,
@@ -8266,6 +8324,7 @@ done
     fn recovered_active_turn_revokes_prior_completion_authority() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8310,6 +8369,7 @@ done
     fn emits_a_structured_result_before_the_terminal_event() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8403,6 +8463,7 @@ done
     fn receipt_limit_diagnostic_is_durable_and_turn_idempotent() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8471,6 +8532,7 @@ done
     fn settled_receipt_limit_interrupt_cannot_be_marked_accepted() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8522,6 +8584,7 @@ done
     fn regular_backlog_preserves_receipt_limit_and_terminal_settlement_capacity() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8647,6 +8710,7 @@ done
 
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8760,6 +8824,7 @@ done
 
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8818,6 +8883,7 @@ done
     fn exact_regular_backlog_capacity_rejects_turn_admission() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -8961,6 +9027,7 @@ done
 
         let state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -9003,6 +9070,7 @@ done
     fn durable_provider_turn_ledger_backfills_legacy_completion_authority() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -9042,6 +9110,7 @@ done
     fn durable_provider_turn_ledger_never_evicts_within_an_epoch() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -9565,6 +9634,7 @@ done
         fs::create_dir_all(&directory).unwrap();
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                profile: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),

@@ -3,6 +3,7 @@ use super::*;
 fn frame_test_state() -> CodexProviderState {
     let mut state = CodexProviderState::new(
         CodexProviderConfig {
+            profile: None,
             provider: "opencode".to_owned(),
             driver: "opencode_server".to_owned(),
             provider_version: "1.18.34".to_owned(),

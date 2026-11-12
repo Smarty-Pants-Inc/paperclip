@@ -17,6 +17,7 @@ import {
   createAcpxNativeSessionBackend,
   type CodexAcpxNativeSessionBackendOptions,
 } from "./codex-acpx-native-backend.js";
+import { createPiNativeSessionBackend } from "./pi-native-backend.js";
 import { createOpenCodeNativeSessionBackend } from "./opencode-native-backend.js";
 
 export interface NativeBackendFactoryOptions extends Omit<
@@ -40,6 +41,9 @@ export interface NativeBackendFactoryOptions extends Omit<
   acpxEnvironment?: NodeJS.ProcessEnv;
   acpxManagedCodexCredentialSourcePath?: string;
   acpxDynamicToolHandler?: CodexAcpxNativeSessionBackendOptions["dynamicToolHandler"];
+  piRuntimeDirectory?: string;
+  piEnvironment?: NodeJS.ProcessEnv;
+  piCommand?: string;
   opencodeRuntimeDirectory?: string;
   opencodeEnvironment?: NodeJS.ProcessEnv;
   opencodeCommand?: string;
@@ -91,6 +95,23 @@ export function createNativeSessionBackend(
       runtimeDirectory: options.opencodeRuntimeDirectory,
       environment: options.opencodeEnvironment,
       command: options.opencodeCommand,
+      runnerInstanceId: options.runnerInstanceId,
+      onSpawn: options.onSpawn,
+      dynamicTools: options.dynamicTools,
+      dynamicToolHandler: options.dynamicToolHandler,
+    });
+  }
+  if (input.provider.kind === "pi") {
+    if (!options.piRuntimeDirectory?.trim()) {
+      throw new Error(
+        "Pi native backend requires an instance runtime directory",
+      );
+    }
+    return createPiNativeSessionBackend(input, {
+      completionFeedback: options.completionFeedback,
+      runtimeDirectory: options.piRuntimeDirectory,
+      environment: options.piEnvironment,
+      command: options.piCommand,
       runnerInstanceId: options.runnerInstanceId,
       onSpawn: options.onSpawn,
       dynamicTools: options.dynamicTools,

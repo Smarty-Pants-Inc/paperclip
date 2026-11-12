@@ -1,0 +1,8 @@
+{
+  "schema": "paperclip.pi-rpc-profile.v1",
+  "driverKind": "pi_rpc",
+  "protocolVersion": 1,
+  "profileVersion": 1,
+  "runtimePackage": "@earendil-works/pi-coding-agent",
+  "runtimeVersion": "1.5.2"
+}

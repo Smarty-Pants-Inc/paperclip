@@ -905,3 +905,27 @@ describe("Grok effort input v10", () => {
     expect(() => parseNativeExecutionInput({ ...current, provider: { ...current.provider, agent: "codex", profile: QUALIFIED_ACPX_PROFILES.codex, grokEffort: "high" } })).toThrow("Grok effort");
   });
 });
+
+
+describe("native Pi RPC registration", () => {
+  it("preserves the actual registered native profile through the execution parser", async () => {
+    const { QUALIFIED_PI_RPC_PROFILE } = await import("../drivers/pi/qualified-profile.js");
+    const parsed = parseNativeExecutionInput({ ...input,
+      session: { ...input.session, driverKind: "pi_rpc" },
+      provider: { kind: "pi", model: "openai/gpt-5", profile: QUALIFIED_PI_RPC_PROFILE },
+    });
+    expect(parsed.provider).toEqual({ kind: "pi", model: "openai/gpt-5", profile: QUALIFIED_PI_RPC_PROFILE });
+  });
+  it("rejects ACPX substitution and release-profile drift", async () => {
+    const { QUALIFIED_PI_RPC_PROFILE } = await import("../drivers/pi/qualified-profile.js");
+    for (const profile of [{ ...QUALIFIED_PI_RPC_PROFILE, driverKind: "acpx_runtime" },
+      { ...QUALIFIED_PI_RPC_PROFILE, commandDigest: `sha256:${"0".repeat(64)}` },
+      { ...QUALIFIED_PI_RPC_PROFILE, runtimeVersion: "1.2.0" },
+      { ...QUALIFIED_PI_RPC_PROFILE, unexpected: true }]) {
+      expect(() => parseNativeExecutionInput({ ...input,
+        session: { ...input.session, driverKind: "pi_rpc" },
+        provider: { kind: "pi", model: "openai/gpt-5", profile },
+      })).toThrow();
+    }
+  });
+});

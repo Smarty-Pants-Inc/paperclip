@@ -226,6 +226,9 @@ pub struct OpenCodeLaunchProfile {
     pub executable: QualifiedLaunchArtifact,
 }
 
+// Native Pi uses the same three protected launch artifacts as the resident OpenCode facade.
+pub type PiRpcLaunchProfile = OpenCodeLaunchProfile;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorCloudLaunchProfile {
     pub command: QualifiedLaunchArtifact,
@@ -246,6 +249,7 @@ pub struct DurableRunnerConfig {
     pub runner_version: String,
     pub runner_digest: String,
     pub acpx_launch_profile: Option<AcpxLaunchProfile>,
+    pub pi_launch_profile: Option<PiRpcLaunchProfile>,
     pub opencode_launch_profile: Option<OpenCodeLaunchProfile>,
     pub cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
     pub max_outbox_bytes: usize,
@@ -390,6 +394,25 @@ impl DurableRunnerConfig {
                 ));
             }
         }
+        if let Some(profile) = self.pi_launch_profile.as_ref() {
+            let artifacts = [&profile.command, &profile.proxy_script, &profile.executable];
+            if artifacts.iter().any(|artifact| {
+                !artifact.path.is_absolute()
+                    || artifact.path.to_str().is_none()
+                    || artifact.sha256.len() != 71
+                    || !artifact.sha256.starts_with("sha256:")
+                    || !artifact.sha256[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            }) || profile.command.path == profile.proxy_script.path
+                || profile.command.path == profile.executable.path
+                || profile.proxy_script.path == profile.executable.path
+            {
+                return Err(DurableRunnerError::invalid(
+                    "Pi runner launch profile is malformed",
+                ));
+            }
+        }
         if let Some(profile) = self.cursor_cloud_launch_profile.as_ref() {
             if [&profile.command, &profile.proxy_script]
                 .iter()
@@ -431,6 +454,7 @@ mod tests {
             runner_version: "1.0.0".to_owned(),
             runner_digest: "sha256:digest".to_owned(),
             acpx_launch_profile: None,
+            pi_launch_profile: None,
             opencode_launch_profile: None,
             cursor_cloud_launch_profile: None,
             max_outbox_bytes: 1024 * 1024,

@@ -150,6 +150,7 @@ fn eligible_key(key: &str) -> bool {
             "PAPERCLIP_CURSOR_CLOUD_",
             "PAPERCLIP_GITHUB_",
             "PAPERCLIP_ACPX_",
+            "PAPERCLIP_PI_",
             "PAPERCLIP_VERIFIED_",
         ]
         .iter()

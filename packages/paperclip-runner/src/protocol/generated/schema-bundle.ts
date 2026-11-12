@@ -1227,7 +1227,8 @@ export const providerDescriptorSchema = {
         "openai_dot",
         "grok_bot",
         "muse",
-        "cursor_cloud"
+        "cursor_cloud",
+        "pi"
       ]
     },
     "driver": {
@@ -1240,7 +1241,8 @@ export const providerDescriptorSchema = {
         "openai_dot_mcp",
         "grok_bot_mcp",
         "muse_external",
-        "cursor_cloud_api"
+        "cursor_cloud_api",
+        "pi_rpc"
       ]
     },
     "model": {
@@ -1363,8 +1365,11 @@ export const providerDescriptorSchema = {
     "piThinkingLevel": {
       "enum": [
         "off",
+        "minimal",
         "low",
+        "medium",
         "high",
+        "xhigh",
         "max"
       ]
     },
@@ -1398,16 +1403,38 @@ export const providerDescriptorSchema = {
         ]
       },
       "then": {
-        "properties": {
-          "provider": {
-            "const": "acpx"
+        "oneOf": [
+          {
+            "properties": {
+              "provider": {
+                "const": "pi"
+              },
+              "driver": {
+                "const": "pi_rpc"
+              }
+            }
           },
-          "agent": {
-            "const": "pi"
+          {
+            "properties": {
+              "provider": {
+                "const": "acpx"
+              },
+              "agent": {
+                "const": "pi"
+              },
+              "piThinkingLevel": {
+                "enum": [
+                  "off",
+                  "low",
+                  "high",
+                  "max"
+                ]
+              }
+            },
+            "required": [
+              "agent"
+            ]
           }
-        },
-        "required": [
-          "agent"
         ]
       }
     },
@@ -1547,6 +1574,22 @@ export const providerDescriptorSchema = {
             },
             "executionKind": {
               "const": "local_process"
+            }
+          }
+        },
+        {
+          "properties": {
+            "provider": {
+              "const": "pi"
+            },
+            "driver": {
+              "const": "pi_rpc"
+            },
+            "executionKind": {
+              "const": "local_process"
+            },
+            "providerVersion": {
+              "const": "1.5.2"
             }
           }
         }

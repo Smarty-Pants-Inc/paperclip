@@ -146,3 +146,7 @@ export { archiveCursorCloudSessionCheckpoint } from "./drivers/cursor-cloud/chec
 export { readProviderFailure, type ProviderFailure } from "./contracts/provider-failure.generated.js";
 export { providerFailureFromError } from "./drivers/provider-failure.js";
 export { SAFE_ERROR_CAUSE_PATTERN, safeErrorCauseCode } from "./control-plane/safe-error-cause.js";
+
+export { PiRpcDriver, type PiRpcDriverOptions } from "./drivers/pi/pi-rpc-driver.js";
+export { createPiNativeSessionBackend } from "./backends/pi-native-backend.js";
+export { QUALIFIED_PI_RPC_PROFILE, parsePiRpcProfile, type NativePiRpcProfileSnapshot } from "./drivers/pi/qualified-profile.js";
