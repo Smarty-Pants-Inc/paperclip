@@ -4878,6 +4878,8 @@ export function spawnRunner(options: {
 
   const command = options.runnerBinaryPath ?? runnerBinary;
   const environment = runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment);
+  // Only the explicitly prepared native Pi launch may carry this run's executionRoot.
+  if (options.piLaunchProfile && options.environment?.AGENT_HOME !== undefined) environment.AGENT_HOME = options.environment.AGENT_HOME;
   const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => handle.restart === null ? handle : ({
     ...handle,
     // Remote owners publish this identity after dispatch; keep it live through the wrapper.
