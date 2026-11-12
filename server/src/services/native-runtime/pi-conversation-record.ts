@@ -64,8 +64,9 @@ export async function selectPiConversation(db: Db, input: {
     // The issue lock serializes first creation too, before a task row exists.
     const [session] = await tx.select().from(agentTaskSessions).where(scope).for("update");
     let previous = readPiConversation(session?.sessionParamsJson);
-    const legacyId = session?.sessionParamsJson?.sessionId;
+    let legacyId = session?.sessionParamsJson?.sessionId;
     if (legacyId != null && !uuid(legacyId)) throw new Error("pi_conversation_record_invalid");
+    let legacyUnverified = false;
     if (previous && legacyId && legacyId !== previous.id) throw new Error("pi_conversation_identity_conflict");
     if (!previous && uuid(legacyId)) {
       const [owner] = session?.lastRunId ? await tx.select().from(heartbeatRuns).where(and(
@@ -77,9 +78,13 @@ export async function selectPiConversation(db: Db, input: {
       } | undefined;
       if (!owner || owner.nativeSessionId !== legacyId || execution?.binding?.issueId !== input.issueId
         || execution.binding.runId !== owner.id || execution.session?.normalizedSessionId !== legacyId || typeof execution.provider?.kind !== "string") {
-        throw new Error("pi_conversation_legacy_binding_unverified");
+        // A pre-record row whose owner can't be verified (existing prod rows)
+        // must not fail every turn on its issue: don't adopt the unverified
+        // id; start a recorded conversation, as today's selection would.
+        legacyUnverified = true;
+        legacyId = undefined;
       }
-      previous = { schema: "paperclip.pi-conversation.v1", id: legacyId, generation: 1,
+      if (!legacyUnverified && owner && execution?.provider?.kind && execution.binding) previous = { schema: "paperclip.pi-conversation.v1", id: legacyId, generation: 1,
         boundary: { ...input.boundary, provider: execution.provider.kind === "codex" ? "codex_app_server" : execution.provider.kind,
           cwd: execution.workspace?.cwd ?? null,
           workspaceId: execution.binding.executionWorkspaceId === owner.id ? null : execution.binding.executionWorkspaceId ?? null },
@@ -95,7 +100,7 @@ export async function selectPiConversation(db: Db, input: {
     const record: PiConversationRecord = previous && !reason ? previous : {
       schema: "paperclip.pi-conversation.v1", id, generation: (previous?.generation ?? 0) + 1,
       boundary: input.boundary, previousId: previous?.id ?? null,
-      reason: reason ?? (legacyId || run.nativeSessionId ? "adopted_existing_conversation" : "first_message"), runId: input.runId,
+      reason: reason ?? (legacyUnverified ? "legacy_binding_unverified" : legacyId || run.nativeSessionId ? "adopted_existing_conversation" : "first_message"), runId: input.runId,
     };
     const sessionParamsJson = { ...session?.sessionParamsJson, sessionId: id, [PI_CONVERSATION_KEY]: record };
     if (session) await tx.update(agentTaskSessions).set({ sessionParamsJson, updatedAt: new Date() }).where(eq(agentTaskSessions.id, session.id));
