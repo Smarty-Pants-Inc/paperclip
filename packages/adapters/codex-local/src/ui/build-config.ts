@@ -8,8 +8,10 @@ import {
   resolvePaperclipRunnerCursorMode,
   resolvePaperclipRunnerPiThinkingLevel,
   PAPERCLIP_RUNNER_ACPX_PROFILES,
+  PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS,
   type CreateConfigValues,
 } from "@paperclipai/adapter-utils";
+import { PI_RPC_PROVIDER, PI_RPC_THINKING_LEVEL_KEY } from "@paperclipai/shared";
 import { DEFAULT_CODEX_LOCAL_BYPASS_APPROVALS_AND_SANDBOX } from "../index.js";
 
 function parseCommaArgs(value: string): string[] {
@@ -100,6 +102,17 @@ export function buildPaperclipRunnerConfig(v: CreateConfigValues, context?: {
     delete schemaValues[unsupportedKey];
   }
   const providerCandidate = schemaValues.provider;
+  if (providerCandidate === PI_RPC_PROVIDER) {
+    const model = String(config.model || schemaValues.model || "").trim();
+    if (!model) throw new Error("Pi RPC requires an explicit model before saving.");
+    const thinking = v.thinkingEffort?.trim() || schemaValues[PI_RPC_THINKING_LEVEL_KEY];
+    if (thinking !== undefined && thinking !== "" && (typeof thinking !== "string" || !PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS.some(level => level === thinking))) {
+      throw new Error("Unsupported Pi RPC thinking level for this model.");
+    }
+    for (const key of ["acpxAgent", "piThinkingLevel", "thinking", "reasoningEffort", "effort", PI_RPC_THINKING_LEVEL_KEY]) delete schemaValues[key];
+    return { ...config, ...schemaValues, provider: PI_RPC_PROVIDER, model,
+      ...(thinking ? { [PI_RPC_THINKING_LEVEL_KEY]: thinking } : {}) };
+  }
   const provider = isPaperclipRunnerProvider(providerCandidate)
     ? providerCandidate
     : "codex";

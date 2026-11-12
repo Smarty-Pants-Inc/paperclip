@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, ChevronDown, Plus, RotateCcw, Search, X, Zap } from "lucide-react";
-import { aiRuntimeConnectionBindingSchema, agentHarnessType, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
+import { aiRuntimeConnectionBindingSchema, agentHarnessType, PI_RPC_PROVIDER, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
 import { queryKeys } from "@/lib/queryKeys";
 import { ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS, nativeTaskModelCatalogOptions } from "@/lib/native-model-catalog";
@@ -45,7 +45,7 @@ interface Props {
 
 const HARNESS_LABELS: Record<string, string> = {
   claude_local: "Claude Code", codex_local: "Codex", opencode_local: "OpenCode",
-  pi_local: "Pi", kimi_local: "Kimi Code", gemini_local: "Gemini CLI",
+  pi_local: "Pi", pi_rpc: "Pi", kimi_local: "Kimi Code", gemini_local: "Gemini CLI",
   cursor: "Cursor", cursor_cloud: "Cursor Cloud", grok_local: "Grok CLI",
   hermes_local: "Hermes CLI", paperclip_runner: "Paperclip Runner",
   process: "Process", http: "HTTP", openclaw_gateway: "OpenClaw Gateway",
@@ -121,7 +121,7 @@ export function ComposerRunSettingsPicker({
   const acpxAgent = agent?.adapterType === "paperclip_runner" && provider === "acpx" && typeof agent.adapterConfig.acpxAgent === "string" ? agent.adapterConfig.acpxAgent : undefined;
   const nativeCatalogScope = JSON.stringify(nativeCatalog ?? null);
   const requestNativeModels = Boolean(nativeCatalog && open && view !== "agents" && !modelOptionsOverride);
-  const { data: fetchedModels = [], isPending: modelsPending, refetch: refreshModels } = useQuery({
+  const { data: fetchedModels = [], isPending: modelsPending, error: modelsError, refetch: refreshModels } = useQuery({
     queryKey: agent && modelSupported
       ? [...queryKeys.agents.adapterModels(companyId, agent.adapterType, agent.defaultEnvironmentId ?? null, provider), poolId ?? null, nativeCatalog ?? null, acpxAgent ?? null]
       : ["agents", "composer-models", "none"],
@@ -140,13 +140,13 @@ export function ComposerRunSettingsPicker({
     ?? fetchedModels;
   const catalogPending = modelsPending && !modelOptionsOverride;
   const base = assigneeValue === currentAssigneeValue
-    ? readComposerRunSettings(overrides, agent?.adapterType)
+    ? readComposerRunSettings(overrides, agent)
     : DEFAULT_COMPOSER_RUN_SETTINGS;
   const selected = settings ?? base;
   const configuredModel = composerDefaultModel(agent);
   const model = selected.model ?? configuredModel;
   const modelName = models.find((item) => item.id === model)?.label ?? model ?? "";
-  const choices = composerEfforts(agent, model, models.map((item) => item.id));
+  const choices = composerEfforts(agent, model, models);
   const effort = selected.effort && choices.includes(selected.effort) ? selected.effort : null;
   const effortIndex = effort ? choices.indexOf(effort) + 1 : 0;
   const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : "Default";
@@ -172,7 +172,7 @@ export function ComposerRunSettingsPicker({
     `${item.label} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   const exactMatch = models.some((item) => item.id.toLowerCase() === query.toLowerCase());
   const needsProvider = agent && (["opencode_local", "pi_local", "kimi_local"].includes(agent.adapterType)
-    || (agent.adapterType === "paperclip_runner" && provider === "opencode"));
+    || (agent.adapterType === "paperclip_runner" && (provider === "opencode" || provider === PI_RPC_PROVIDER)));
   const manualValid = query.length > 0 && !/\s/.test(query)
     && (!needsProvider || /^[^/]+\/.+[^/]$/.test(query))
     && (provider !== "openrouter" || /^openrouter\/[^/]+\/.+[^/]$/.test(query));
@@ -195,7 +195,7 @@ export function ComposerRunSettingsPicker({
     setAssigneeSearch("");
   };
   const chooseModel = (value: string | null) => {
-    const nextChoices = composerEfforts(agent, value ?? configuredModel, models.map((item) => item.id));
+    const nextChoices = composerEfforts(agent, value ?? configuredModel, models);
     const preferred = selected.effort ?? getLastComposerEffort(companyId);
     onSettingsChange({ model: value, effort: preferred && nextChoices.includes(preferred) ? preferred : null, fast: false });
     setView("settings");
@@ -227,6 +227,8 @@ export function ComposerRunSettingsPicker({
     </> : null}
   </div>;
 
+  const catalogError = modelsError && !modelOptionsOverride
+    ? <p role="alert" className="px-2.5 py-2 text-xs text-destructive">Could not load models. Retry or enter a model ID manually. <button type="button" onClick={() => void refreshModels()} className="underline">Retry models</button></p> : null;
   const body = view === "settings" ? <div className="min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-3" data-testid="composer-run-settings-view">
     <div className="flex items-center gap-2">
       <AssigneeHeader type={allowAssigneeChange ? "button" : undefined} aria-label={allowAssigneeChange ? "Choose assignee" : undefined} onClick={allowAssigneeChange ? () => setView("agents") : undefined}
@@ -239,16 +241,18 @@ export function ComposerRunSettingsPicker({
       {closeButton}
     </div>
     {modelSupported ? <>
+      {catalogError}
       <button type="button" aria-label="Choose exact model" onClick={() => setView("models")} className="mt-3 flex w-full items-center gap-2 rounded-md px-1 py-1 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <span className="min-w-0 flex-1"><span className="block text-xs text-muted-foreground">Model</span><span className="block truncate text-sm font-medium">{modelName || "Default"}</span></span><ChevronDown className="size-4 shrink-0 text-muted-foreground" aria-hidden />
       </button>
       {choices.length ? <div className="mt-3">
+        {provider === PI_RPC_PROVIDER ? <span className="block text-xs text-muted-foreground">Thinking</span> : null}
         <div className="flex items-center gap-2">
           {fastAvailable ? <button type="button" aria-label="Fast mode" aria-pressed={selected.fast} title="Fast mode" onClick={() => onSettingsChange({ ...selected, fast: !selected.fast })} className={cn("grid size-8 shrink-0 place-items-center rounded-md hover:bg-accent", selected.fast ? "composer-run-settings-accent bg-accent" : "text-muted-foreground")}><Zap className="size-4" /></button> : <span className="size-8 shrink-0" aria-hidden />}
           <label htmlFor="composer-run-effort" data-testid="selected-effort" className="composer-run-settings-accent min-w-0 flex-1 text-center text-sm font-medium">{effortLabel}</label>
           <button type="button" aria-label="Reset to agent default" title="Reset to agent default" disabled={!changed} onClick={reset} className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button>
         </div>
-        <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={agent?.adapterType === "pi_local" ? "Thinking" : "Effort"} aria-valuetext={effortLabel}
+        <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={agent?.adapterType === "pi_local" || provider === PI_RPC_PROVIDER ? "Thinking" : "Effort"} aria-valuetext={effortLabel}
           onChange={(event) => {
             const nextEffort = Number(event.target.value) === 0 ? null : choices[Number(event.target.value) - 1]!;
             rememberComposerEffort(companyId, nextEffort);
@@ -273,8 +277,9 @@ export function ComposerRunSettingsPicker({
     <div className="mt-2 min-h-0 max-h-60 overflow-y-auto overscroll-contain touch-pan-y" role="listbox" aria-label="Models">
       {!query ? <button type="button" role="option" aria-selected={selected.model === null} onClick={() => chooseModel(null)} className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left hover:bg-accent"><span className="min-w-0 flex-1"><span className="block text-sm font-medium">Use agent default</span><span className="block truncate text-xs text-muted-foreground">{models.find((item) => item.id === configuredModel)?.label || configuredModel || "Default"}</span></span>{selected.model === null ? <Check className="composer-run-settings-accent size-4" /> : null}</button> : null}
       {filteredModels.map((item) => <button type="button" role="option" aria-selected={selected.model === item.id} key={item.id} onClick={() => chooseModel(item.id)} className="flex w-full items-center gap-3 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent focus-visible:bg-accent focus-visible:outline-none"><span className="min-w-0 flex-1"><span className="block truncate font-medium">{item.label}</span><span className="block truncate font-mono text-xs text-muted-foreground">{item.id}</span></span>{item.detail || item.id === configuredModel ? <span className="shrink-0 text-xs text-muted-foreground">{item.detail ?? "Agent default"}</span> : null}{selected.model === item.id ? <Check className="composer-run-settings-accent size-4 shrink-0" /> : null}</button>)}
+      {catalogError}
       {catalogPending ? <p className="px-2.5 py-2 text-xs text-muted-foreground">Loading models…</p> : null}
-      {!catalogPending && !filteredModels.length && query ? <p className="px-2.5 py-2 text-xs text-muted-foreground">No catalog match.</p> : null}
+      {!catalogPending && !modelsError && !filteredModels.length && query ? <p className="px-2.5 py-2 text-xs text-muted-foreground">No catalog match.</p> : null}
     </div>
     {query && !exactMatch ? <div className="mt-2 border-t border-border pt-2"><button type="button" disabled={!manualValid} onClick={() => chooseModel(query)} className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm hover:bg-accent disabled:opacity-40"><Plus className="size-4 shrink-0" aria-hidden /><span className="min-w-0 flex-1 truncate">Use exact ID <span className="font-mono font-semibold">{query}</span></span></button>{!manualValid ? <p className="px-2.5 text-xs text-destructive">{provider === "openrouter" ? "Use openrouter/provider/model with no spaces." : "Model IDs cannot contain spaces."}</p> : null}</div> : null}
     <p className="px-2.5 pb-1 pt-2 text-xs text-muted-foreground">{provider === "openrouter" ? "Custom IDs: openrouter/provider/model. Provider access is checked when the run starts." : "Custom model IDs can be pasted here. Provider access is checked when the run starts."}</p>

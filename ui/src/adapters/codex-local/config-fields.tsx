@@ -5,6 +5,8 @@ import { GrokBotConnection } from "../../components/GrokBotConnection";
 import { DotRunnerConnection } from "../../components/DotRunnerConnection";
 import { configFieldsForSection } from "../config-sections";
 import type { AdapterConfigFieldsProps } from "../types";
+import { PI_RPC_PROVIDER, PI_RPC_THINKING_LEVEL_KEY } from "@paperclipai/shared";
+import { piRpcThinkingLevelsForModel } from "@/lib/pi-rpc-thinking";
 import type { CreateConfigValues } from "@paperclipai/adapter-utils";
 import { buildCodexLocalConfig } from "@paperclipai/adapter-codex-local/ui";
 import {
@@ -45,6 +47,7 @@ const defaultClaudeManagedModel = "claude-sonnet-5";
 const defaultAwsAgentCoreModel = "global.anthropic.claude-sonnet-4-6";
 const runnerHarnessOptions = [
   { value: "codex", label: "Codex", adapter: "codex_local" },
+  { value: PI_RPC_PROVIDER, label: "Pi", adapter: "pi_local" },
   { value: "opencode", label: "OpenCode 1.18.34", adapter: "opencode_local" },
   { value: "claude_managed", label: "Claude Managed", adapter: "claude_local" },
   { value: "aws_agentcore", label: "AWS AgentCore", adapter: "aws_agentcore" },
@@ -240,7 +243,7 @@ export function CodexLocalConfigFields({
             value={runnerProvider === "acpx" && runnerSchemaValue("acpxAgent", "claude") === "grok" ? "grok" : runnerProvider}
             onValueChange={(value) => {
               const grok = value === "grok";
-              const provider = grok ? "acpx" : isPaperclipRunnerProvider(value)
+              const provider = grok ? "acpx" : value === PI_RPC_PROVIDER ? PI_RPC_PROVIDER : isPaperclipRunnerProvider(value)
                 ? value
                 : "codex";
               const cloudResetKeys = ["codexPermissionMode", "opencodePermissionMode", "acpxPermissionMode", "acpxAgent", "command", "extraArgs", "idleTimeoutMs", "modelReasoningEffort", "reasoningEffort", "effort", "modelParams", "homeMode"];
@@ -255,17 +258,18 @@ export function CodexLocalConfigFields({
                       ? defaultAwsAgentCoreModel
                       : provider === "acpx"
                         ? grok ? "grok-4.7" : defaultAcpxClaudeModel
-                        : provider === "cursor_cloud" ? ""
+                        : provider === "cursor_cloud" || provider === PI_RPC_PROVIDER ? ""
                         : DEFAULT_CODEX_LOCAL_MODEL;
               if (isCreate) {
                 set!({
                   model,
-                  ...(provider === "cursor_cloud" ? { thinkingEffort: "" } : {}),
+                  thinkingEffort: "",
                   adapterSchemaValues: {
                     ...values!.adapterSchemaValues,
                     provider,
                     acpxSessionMode: undefined,
                     piThinkingLevel: undefined,
+                    [PI_RPC_THINKING_LEVEL_KEY]: undefined,
                     ...(provider === "cursor_cloud" ? { ...Object.fromEntries(cloudResetKeys.map(key => [key, undefined])), lifecycleMode: "per_turn" } : {}),
                     ...(provider === "acpx" ? { acpxAgent: grok ? "grok" : "claude" } : {}),
                   },
@@ -274,6 +278,7 @@ export function CodexLocalConfigFields({
                 mark("adapterConfig", "provider", provider);
                 mark("adapterConfig", "acpxSessionMode", undefined);
                 mark("adapterConfig", "piThinkingLevel", undefined);
+                mark("adapterConfig", PI_RPC_THINKING_LEVEL_KEY, undefined);
                 mark("adapterConfig", "model", model);
                 if (provider === "openai_dot") {
                   mark("adapterConfig", "lifecycleMode", "per_turn");
@@ -291,7 +296,7 @@ export function CodexLocalConfigFields({
           >
             <SelectTrigger className="w-full" aria-label="Harness"><SelectValue /></SelectTrigger>
             <SelectContent>
-              {!isPaperclipRunnerProvider(runnerProvider) && <SelectItem value={runnerProvider} disabled>{runnerProvider} (unknown provider)</SelectItem>}
+              {!isPaperclipRunnerProvider(runnerProvider) && runnerProvider !== PI_RPC_PROVIDER && <SelectItem value={runnerProvider} disabled>{runnerProvider} (unknown provider)</SelectItem>}
               {runnerHarnessOptions.map((option) => (
                 <SelectItem key={option.value} value={option.value}>
                   <AdapterMark type={option.adapter} className="size-4" />
@@ -390,6 +395,22 @@ export function CodexLocalConfigFields({
           </select>
         </Field>
       )}
+      {runnerManaged && runnerProvider === PI_RPC_PROVIDER && (() => {
+        const model = String(isCreate ? values!.model : eff("adapterConfig", "model", config.model ?? ""));
+        const levels = piRpcThinkingLevelsForModel(model, models.find(row => row.id === model));
+        const thinking = String(runnerSchemaValue(PI_RPC_THINKING_LEVEL_KEY, isCreate ? values!.thinkingEffort : ""));
+        return <Field configSection="adapter" label="Pi thinking level" hint="Choose a native thinking level. Provider access and the exact effective level are verified when the run starts.">
+          <select className={inputClass} aria-label="Pi thinking level" value={thinking}
+            onChange={event => {
+              if (isCreate) set!({ thinkingEffort: "", adapterSchemaValues: { ...values!.adapterSchemaValues, [PI_RPC_THINKING_LEVEL_KEY]: event.target.value || undefined } });
+              else updateRunnerSchemaValue(PI_RPC_THINKING_LEVEL_KEY, event.target.value || undefined);
+            }}>
+            <option value="">Auto</option>
+            {thinking && !levels.includes(thinking) && <option value={thinking} disabled>Unsupported saved thinking level ({thinking})</option>}
+            {levels.map(level => <option key={level} value={level}>{level === "xhigh" ? "Extra High" : level[0].toUpperCase() + level.slice(1)}</option>)}
+          </select>
+        </Field>;
+      })()}
       {runnerManaged && runnerProvider === "claude_managed" && (
         <>
           <Field

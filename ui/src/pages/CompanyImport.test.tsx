@@ -1227,7 +1227,7 @@ describe("CompanyImport", () => {
     expect(lastImportMeta().adapterOverrides?.coder).toBeUndefined();
   });
 
-  it("keeps native Pi identity and saved policies with the experimental flag off", async () => {
+  it.each(["acpx", "pi_rpc"])("keeps %s Pi identity and saved policies with the experimental flag off", async provider => {
     mockAdaptersApi.list.mockResolvedValue([
       { type: "claude_local", disabled: false },
       { type: "pi_local", disabled: false, supportedRunners: ["paperclip", "legacy"], defaultRunner: "paperclip" },
@@ -1235,16 +1235,49 @@ describe("CompanyImport", () => {
     ]);
     const preview = buildMixedAdapterPreviewResult();
     preview.manifest.agents[0]!.adapterType = "paperclip_runner";
-    preview.manifest.agents[0]!.adapterConfig = { provider: "acpx", acpxAgent: "pi", model: "provider/model", piThinkingLevel: "max", acpxPermissionMode: "approve-reads", lifecycleMode: "warm" };
+    preview.manifest.agents[0]!.adapterConfig = provider === "pi_rpc"
+      ? { provider, model: "paperclip/custom/nested", piRpcThinkingLevel: "max", lifecycleMode: "warm" }
+      : { provider: "acpx", acpxAgent: "pi", model: "provider/model", piThinkingLevel: "max", acpxPermissionMode: "approve-reads", lifecycleMode: "warm" };
     mockCompaniesApi.importPreview.mockResolvedValue(preview);
     await renderPage();
     await enterGithubUrl();
     await clickButton(text => text === "Preview import");
-    expect(findAdapterSelects()[0]!.value).toBe("pi_local");
+    expect(findAdapterSelects()[0]!.value).toBe(provider === "pi_rpc" ? "pi_rpc" : "pi_local");
     expect(container.textContent).not.toContain("requires its experimental feature to be enabled");
     await clickButton(text => text.startsWith("Import 3 file"));
     await settle();
     expect(lastImportMeta().adapterOverrides?.coder).toBeUndefined();
+  });
+
+  it.each(["high", ""])("edits native Pi thinking to '%s' while retaining its Runner profile", async thinking => {
+    mockOptionalCompany.mockReturnValue({ selectedCompanyId: "company-1" });
+    mockAdaptersApi.list.mockResolvedValue([{ type: "paperclip_runner", disabled: false }]);
+    const preview = buildPreviewResult();
+    const sourceConfig = { provider: "pi_rpc", model: "paperclip/custom/nested", piRpcThinkingLevel: "max", lifecycleMode: "warm", idleTimeoutMs: 45000 };
+    preview.manifest.agents[0]!.adapterType = "paperclip_runner";
+    preview.manifest.agents[0]!.runner = "paperclip";
+    preview.manifest.agents[0]!.adapterConfig = sourceConfig;
+    mockCompaniesApi.importPreview.mockResolvedValue(preview);
+    await renderPage();
+    await enterGithubUrl();
+    await clickButton(text => text === "Preview import");
+    expect(findAdapterSelects()[0]!.value).toBe("pi_rpc");
+    await clickButton(text => text.includes("configure adapter"));
+    const field = container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]');
+    expect(field?.value).toBe("max");
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(field, thinking);
+      field!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await clickButton(text => text.startsWith("Import 3 file"));
+    await settle();
+    const expected: Record<string, unknown> = { ...sourceConfig };
+    if (thinking) expected.piRpcThinkingLevel = thinking;
+    else delete expected.piRpcThinkingLevel;
+    expect(lastImportMeta().adapterOverrides?.coder).toEqual({
+      adapterType: "paperclip_runner", runner: "paperclip", adapterConfig: expected,
+    });
+    expect(preview.manifest.agents[0]!.adapterConfig).toEqual(sourceConfig);
   });
 
   it.each([

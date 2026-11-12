@@ -51,7 +51,7 @@ export function AiConnectionSelect({
       : connections.find(
           (c) => c.id === value?.connectionId && c.grantId === value?.grantId,
         );
-  const compatibilityModel = (provider: string) => adapterType === "pi_local"
+  const compatibilityModel = (provider: string) => ["pi_local", "pi_rpc", "pi_runtime"].includes(adapterType)
     ? model || `${provider}/` : provider === "openrouter" ? "openrouter/" : undefined;
   const compatible = connections
     .filter(

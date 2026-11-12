@@ -5076,7 +5076,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         const updated = await issuesApi.update(writableIssueId, {
           assigneeAdapterOverrides: mergeComposerRunSettings(
             freshIssue.assigneeAdapterOverrides,
-            (conversation?.agent ?? agentMap.get(issue.conversationAgentId))?.adapterType,
+            conversation?.agent ?? agentMap.get(issue.conversationAgentId),
             runSettings,
           ),
         });
@@ -5503,7 +5503,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           assigneeAdapterOverrides: runSettings
             ? mergeComposerRunSettings(
                 freshIssue?.assigneeAdapterOverrides,
-                agentMap.get(reassignment?.assigneeAgentId ?? freshIssue?.assigneeAgentId ?? "")?.adapterType,
+                agentMap.get(reassignment?.assigneeAgentId ?? freshIssue?.assigneeAgentId ?? ""),
                 runSettings,
                 Boolean(reassignment),
               )

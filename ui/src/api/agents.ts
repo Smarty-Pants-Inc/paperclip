@@ -52,6 +52,18 @@ export interface AgentKey {
 export interface AdapterModel {
   id: string;
   label: string;
+  thinkingLevels?: string[];
+  family?: string;
+}
+
+export interface AdapterModelOptions {
+  refresh?: boolean;
+  environmentId?: string | null;
+  provider?: string;
+  acpxAgent?: string;
+  aiConnection?: import("@paperclipai/shared").AiRuntimeConnectionBinding;
+  agentId?: string;
+  poolId?: string;
 }
 
 export interface DetectedAdapterModel {
@@ -241,7 +253,7 @@ export const agentsApi = {
   adapterModels: (
     companyId: string,
     type: string,
-    options?: { refresh?: boolean; environmentId?: string | null; provider?: string; acpxAgent?: string; aiConnection?: import("@paperclipai/shared").AiConnectionBinding; agentId?: string; poolId?: string },
+    options?: AdapterModelOptions,
   ) => {
     const params = new URLSearchParams();
     if (options?.refresh) params.set("refresh", "1");

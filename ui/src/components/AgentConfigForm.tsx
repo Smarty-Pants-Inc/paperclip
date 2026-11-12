@@ -3,7 +3,7 @@ import { environmentSupportsLoginPty } from "@paperclipai/shared";
 import { useAdapterLoginCancellation } from "./useAdapterLoginCancellation";
 import { ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS, isAccountBoundAcpxAgent } from "@/lib/native-model-catalog";
 import { useConnectionModels } from "./ai-connections/useConnectionModels";
-import { agentHarnessType, agentRunner, paperclipRunnerProfileForHarness, normalizeClaudeRunnerOptions, type AgentRunnerChoice } from "@paperclipai/shared";
+import { PI_RPC_PROVIDER, PI_RPC_THINKING_LEVEL_KEY, agentHarnessType, agentRunner, paperclipRunnerProfileForHarness, normalizeClaudeRunnerOptions, type AgentRunnerChoice } from "@paperclipai/shared";
 import { adaptersApi } from "../api/adapters";
 import { canQualifyRunnerEnvironment, qualifyRunnerEnvironment } from "../lib/qualify-claude-setup";
 import { aiRoutingHarness } from "@paperclipai/shared";
@@ -681,11 +681,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     else setOverlay(prev => ({ ...prev, runner: "paperclip" }));
   }, [legacyRunnerUnavailable, props.mode, props.mode === "create" ? props.onChange : undefined]);
   const getCapabilities = useAdapterCapabilities();
-  const adapterCaps = getCapabilities(isRunnerHarness ? harnessType : adapterType);
+  const adapterCaps = getCapabilities(fieldsAdapterType === "paperclip_runner" && ["pi_local", PI_RPC_PROVIDER].includes(harnessType)
+    ? "paperclip_runner" : isRunnerHarness ? harnessType : adapterType);
   const runnerProvider = adapterType === "paperclip_runner"
     ? String(isCreate ? props.values.adapterSchemaValues?.provider ?? "codex"
       : eff("adapterConfig", "provider", config.provider === "acpx" && config.acpxAgent === "codex" ? "codex" : config.provider ?? "codex"))
     : undefined;
+  const isNativePiRunner = fieldsAdapterType === "paperclip_runner"
+    && (runnerProvider === PI_RPC_PROVIDER || (adapterType !== "paperclip_runner" && runnerProfile?.provider === PI_RPC_PROVIDER));
   const isDotRunner = runnerProvider === "openai_dot";
   const isGrokBotRunner = runnerProvider === "grok_bot";
   const isMuseRunner = runnerProvider === "muse";
@@ -1033,15 +1036,15 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       ? "Paperclip Sandbox"
       : "Local";
 
-  const modelProvider = adapterType === "opencode_local" && aiConnectionBindingSchema.safeParse(
+  const modelProvider = isNativePiRunner ? PI_RPC_PROVIDER : adapterType === "opencode_local" && aiConnectionBindingSchema.safeParse(
     (overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection,
   ).data?.provider === "openrouter" ? "openrouter" : runnerProvider;
   const runnerAcpxAgent = adapterType === "paperclip_runner" && runnerProvider === "acpx"
     ? String(isCreate ? props.values.adapterSchemaValues?.acpxAgent ?? "claude" : eff("adapterConfig", "acpxAgent", config.acpxAgent ?? "claude")) : undefined;
   const modelAiBinding = aiConnectionBindingSchema.safeParse((overlay.runtime.runtimeConfig as Record<string, unknown> | undefined)?.aiConnection ?? runtimeConfig.aiConnection).data;
-  const accountBoundCatalog = isAccountBoundAcpxAgent(runnerAcpxAgent);
+  const accountBoundCatalog = isNativePiRunner || isAccountBoundAcpxAgent(runnerAcpxAgent);
   const modelCacheIdentity = accountBoundCatalog ? `${modelProvider}:${runnerAcpxAgent}:${isCreate ? "new" : props.agent.id}:${JSON.stringify(modelAiBinding ?? null)}` : runnerAcpxAgent ? `${modelProvider}:${runnerAcpxAgent}` : modelProvider;
-  const connectionModels = useConnectionModels(isExternalRunner ? null : selectedCompanyId, isCreate ? undefined : modelAiBinding, aiRoutingHarness(adapterType, runnerProvider, runnerAcpxAgent));
+  const connectionModels = useConnectionModels(isExternalRunner || isNativePiRunner ? null : selectedCompanyId, isCreate || isNativePiRunner ? undefined : modelAiBinding, aiRoutingHarness(adapterType, runnerProvider, runnerAcpxAgent));
   // Fetch adapter models for the effective provider, including unsaved changes.
   const modelAdapterType = accountBoundCatalog ? "paperclip_runner" : isRunnerHarness ? harnessType : adapterType;
   const modelQueryKey = selectedCompanyId
@@ -1105,9 +1108,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     isCreate,
     adapterType: fieldsAdapterType,
     hideRunnerHarness: isRunnerHarness,
-    values: isCreate ? { ...props.values, ...(runnerProfile && fieldsAdapterType === "paperclip_runner" ? { adapterSchemaValues: { ...props.values.adapterSchemaValues, ...runnerProfile } } : {}) } : null,
+    values: isCreate ? { ...props.values, ...(runnerProfile && fieldsAdapterType === "paperclip_runner" ? { adapterSchemaValues: { ...runnerProfile, ...props.values.adapterSchemaValues } } : {}) } : null,
     set: isCreate ? (patch: Partial<CreateConfigValues>) => props.onChange(patch) : null,
-    config: runnerProfile && fieldsAdapterType === "paperclip_runner" ? { ...config, ...runnerProfile } : config,
+    config: runnerProfile && fieldsAdapterType === "paperclip_runner" ? { ...runnerProfile, ...config } : config,
     eff: eff as <T>(group: "adapterConfig", field: string, original: T) => T,
     // Harness transitions supply the new harness's default model. Resolve
     // user-selected model IDs in ModelDropdown, not through the previous
@@ -1483,7 +1486,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         : adapterType === "opencode_local"
           ? eff("adapterConfig", "variant", String(config.variant ?? ""))
           : eff("adapterConfig", thinkingEffortKey, String(config[thinkingEffortKey] ?? ""));
-  const showThinkingEffort = !(harnessType === "pi_local" && fieldsAdapterType === "paperclip_runner")
+  const showThinkingEffort = !(["pi_local", PI_RPC_PROVIDER].includes(harnessType) && fieldsAdapterType === "paperclip_runner")
     && adapterType !== "gemini_local"
     && harnessType !== "cursor_cloud"
     && (adapterType !== "paperclip_runner" || isRunnerHarness);
@@ -1966,11 +1969,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   if (isCreate) {
                     set!({
                       model: v,
-                      ...(clearUnsupportedEffort ? { thinkingEffort: "" } : {}),
+                      ...(clearUnsupportedEffort || isNativePiRunner ? { thinkingEffort: "" } : {}),
+                      ...(isNativePiRunner ? { adapterSchemaValues: { ...val!.adapterSchemaValues, [PI_RPC_THINKING_LEVEL_KEY]: undefined } } : {}),
                     });
                     return;
                   }
                   mark("adapterConfig", "model", connectionModels?.resolveModel(v) || v || undefined);
+                  if (isNativePiRunner) mark("adapterConfig", PI_RPC_THINKING_LEVEL_KEY, undefined);
                   if (clearUnsupportedEffort) {
                     for (const key of ["modelReasoningEffort", "reasoningEffort", "effort"]) mark("adapterConfig", key, undefined);
                   }

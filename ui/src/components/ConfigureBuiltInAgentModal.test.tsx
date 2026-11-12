@@ -170,6 +170,26 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("preserves saved native Pi configuration and allows an exact manual model", async () => {
+    const savedConfig = { provider: "pi_rpc", model: "paperclip/manual/nested", piRpcThinkingLevel: "max" };
+    const agent = makeSavedAgent("paperclip_runner", savedConfig);
+    agent.defaultEnvironmentId = "pi-env";
+    adapterModelsMock.mockResolvedValue([{ id: "paperclip/catalog-model", label: "Catalog model" }]);
+    const state = makeState({ status: "needs_setup", agentId: agent.id, agent });
+    provisionMock.mockResolvedValue({ ...state, status: "ready" });
+    await renderModal(state);
+    expect(adapterModelsMock).toHaveBeenCalledWith("c1", "paperclip_runner", {
+      provider: "pi_rpc", agentId: "a1", environmentId: "pi-env", aiConnection: undefined,
+    });
+    const submit = findButton("Configure")!;
+    expect(submit.disabled).toBe(false);
+    flushSync(() => submit.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    await flushReact();
+    expect(provisionMock).toHaveBeenCalledWith("c1", "briefs", {
+      adapterType: "paperclip_runner", adapterConfig: savedConfig,
+    });
+  });
+
   it("prefills a built-in's default adapter and model", async () => {
     provisionMock.mockResolvedValue({ ...makeState(), status: "ready", agentId: "a1" });
     await renderModal(makeState({

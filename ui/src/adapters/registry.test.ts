@@ -8,6 +8,8 @@ import {
   syncExternalAdapters,
   unregisterUIAdapter,
 } from "./registry";
+import { agentDisplayAdapterType } from "./adapter-display-registry";
+import { paperclipRunnerUIAdapter } from "./paperclip-runner";
 import { processUIAdapter } from "./process";
 import { SchemaConfigFields } from "./schema-config-fields";
 
@@ -20,6 +22,15 @@ const externalUIAdapter: UIAdapterModule = {
 };
 
 describe("ui adapter registry", () => {
+  it("uses Pi branding but the Runner parser/configuration for a saved Pi RPC agent", () => {
+    const agent = { adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } };
+    expect(agentDisplayAdapterType(agent)).toBe("pi_rpc");
+    const adapter = getUIAdapter(agent.adapterType);
+    expect(adapter).toBe(paperclipRunnerUIAdapter);
+    expect(adapter.parseStdoutLine).not.toBe(getUIAdapter("pi_local").parseStdoutLine);
+    expect(adapter.createStdoutParser).toBe(paperclipRunnerUIAdapter.createStdoutParser);
+    expect(listUIAdapters().filter(item => item.type === "paperclip_runner")).toHaveLength(1);
+  });
   beforeEach(() => {
     unregisterUIAdapter("external_test");
     syncExternalAdapters([]);

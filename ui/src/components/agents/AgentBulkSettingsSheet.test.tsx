@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { storybookAgents } from "../../../storybook/fixtures/paperclipData";
 import { TooltipProvider } from "../ui/tooltip";
 import { AgentBulkSettingsSheet } from "./AgentBulkSettingsSheet";
+import { bulkAgentDisabledReason, bulkAgentHarness } from "@/lib/bulk-agent-settings";
 
 const api = vi.hoisted(() => ({ models: vi.fn(), accounts: vi.fn(), update: vi.fn(), get: vi.fn() }));
 vi.mock("@/api/agents", () => ({ agentsApi: { adapterModels: api.models, updateRuntimeSettings: api.update, get: api.get } }));
@@ -72,6 +73,29 @@ afterEach(async () => {
 });
 
 describe("bulk model editing", () => {
+  it("discovers native Pi with pi_rpc rather than ACPX and keeps model capabilities", async () => {
+    const pi = { ...agent("Pi", "paperclip_runner"), defaultEnvironmentId: "pi-env", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt" }, runtimeConfig: {} } as Agent;
+    expect(bulkAgentHarness(pi)).toBe("pi_rpc");
+    expect(bulkAgentDisabledReason(pi)).toBeUndefined();
+    api.models.mockResolvedValue([{ id: "paperclip/gpt", label: "Pi GPT", thinkingLevels: ["off", "max"] }]);
+    await render([pi]);
+    expect(api.models).toHaveBeenCalledWith("company-1", "paperclip_runner", { provider: "pi_rpc", agentId: pi.id, environmentId: "pi-env" });
+    const data = client.getQueryCache().getAll().find(query => query.queryKey[0] === "bulk-agent-models")?.state.data;
+    expect(JSON.stringify(data)).toContain('"thinkingLevels":["off","max"]');
+  });
+  it("keeps native Pi OpenRouter prefixes and permits exact IDs absent from saved model lists", async () => {
+    const binding = { provider: "openrouter", method: "api_key", mode: "shared", connectionId: "11111111-1111-4111-8111-111111111111", grantId: "22222222-2222-4222-8222-222222222222" } as const;
+    const pi = { ...agent("Pi", "paperclip_runner"), adapterConfig: { provider: "pi_rpc", model: "openrouter/vendor/gpt" }, runtimeConfig: { aiConnection: binding } } as Agent;
+    api.accounts.mockResolvedValue({ currentUserId: "board", canManageConnections: true, pools: [], connections: [{ id: binding.connectionId, grantId: binding.grantId, provider: "openrouter", method: "api_key", status: "connected", companyId: "company-1", name: "Pi gateway", ownership: "shared", routing: { kind: "openrouter", protocol: "chat", auth: "bearer", models: [{ id: "vendor/gpt" }] } }] });
+    api.models.mockResolvedValue([{ id: "openrouter/vendor/gpt", label: "Pi GPT", thinkingLevels: ["off", "max"] }]);
+    await render([pi]);
+    expect(api.models).toHaveBeenCalledWith("company-1", "paperclip_runner", expect.objectContaining({ provider: "pi_rpc", aiConnection: binding, agentId: pi.id }));
+    const data = client.getQueryCache().getAll().find(query => query.queryKey[0] === "bulk-agent-models")?.state.data;
+    expect(JSON.stringify(data)).toContain('"id":"openrouter/vendor/gpt"');
+    await chooseModel("openrouter/vendor/manual", true);
+    expect(button("Update 1 agent").disabled).toBe(false);
+  });
+
   it("refreshes an Antigravity catalog when its saved binding or environment changes", async () => {
     const first = { provider: "google", method: "subscription", mode: "shared", connectionId: "11111111-1111-4111-8111-111111111111", grantId: "33333333-3333-4333-8333-333333333333" } as const;
     const second = { ...first, connectionId: "22222222-2222-4222-8222-222222222222", grantId: "44444444-4444-4444-8444-444444444444" };

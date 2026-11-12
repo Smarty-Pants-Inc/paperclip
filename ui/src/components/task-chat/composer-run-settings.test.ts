@@ -10,6 +10,43 @@ const agent = (adapterType: Agent["adapterType"], provider?: string) => ({
 }) as Agent;
 
 describe("composer run settings", () => {
+  const nativePi = agent("paperclip_runner", "pi_rpc");
+  const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+  it("uses exact native Pi levels before router/Codex heuristics, including manual IDs", () => {
+    for (const model of ["gateway/custom/nested", "paperclip/gpt-6-astra", "hand-typed-model"]) {
+      expect(composerEfforts(nativePi, model, [])).toEqual(levels);
+    }
+    expect(composerDefaultModel(nativePi)).toBe("");
+    expect(composerCatalogProvider(nativePi)).toBe("pi_rpc");
+    expect(composerEfforts({ ...nativePi, runtimeConfig: { aiConnection: { mode: "router", connectionId: "00000000-0000-4000-8000-000000000001" } } }, "gpt-6-astra", [])).toEqual(levels);
+  });
+  it("filters Pi capability rows in native order and caps Claude without aliasing GPT max", () => {
+    expect(composerEfforts(nativePi, "paperclip/custom", [{ id: "paperclip/custom", thinkingLevels: ["max", "low", "off", "medium"] }])).toEqual(["off", "low", "medium", "max"]);
+    expect(composerEfforts(nativePi, "paperclip/nonreasoning", [{ id: "paperclip/nonreasoning", thinkingLevels: ["off"] }])).toEqual(["off"]);
+    expect(composerEfforts(nativePi, "paperclip/empty", [{ id: "paperclip/empty", thinkingLevels: [] }])).toEqual([]);
+    expect(composerEfforts(nativePi, "paperclip/ClAuDe-opus", [])).toEqual(levels.slice(0, -1));
+    expect(composerEfforts(nativePi, "gateway/alias", [{ id: "gateway/alias", family: "Claude" }])).toEqual(levels.slice(0, -1));
+    expect(composerEfforts(nativePi, "claude-gateway/gpt-custom", [])).toEqual(levels);
+    expect(composerEfforts(nativePi, "openrouter/anthropic/claude-exact", [])).toEqual(levels.slice(0, -1));
+    expect(composerEfforts(nativePi, "paperclip/claude-exact", [{ id: "paperclip/claude-exact", thinkingLevels: ["max", "medium", "off"] }])).toEqual(["off", "medium"]);
+    expect(composerEfforts(nativePi, "paperclip/gpt-custom", [{ id: "other-model", thinkingLevels: ["off"] }])).toContain("max");
+  });
+  it("reads/writes the native Pi key only and clears it on reset, reassignment and model change", () => {
+    const previous = { adapterConfig: { chrome: true, model: "old", piRpcThinkingLevel: "max", modelReasoningEffort: "low" }, useProjectWorkspace: true };
+    const saved = mergeComposerRunSettings(previous, nativePi, { model: "gateway/gpt", effort: "max", fast: false });
+    expect(saved).toEqual({ adapterConfig: { chrome: true, model: "gateway/gpt", piRpcThinkingLevel: "max" }, useProjectWorkspace: true });
+    expect(readComposerRunSettings(saved, nativePi).effort).toBe("max");
+    expect(readComposerRunSettings({ adapterConfig: { modelReasoningEffort: "high" } }, nativePi).effort).toBeNull();
+    expect(mergeComposerRunSettings(previous, nativePi, { model: null, effort: null, fast: false })).toEqual({ adapterConfig: { chrome: true }, useProjectWorkspace: true });
+    expect(mergeComposerRunSettings(previous, nativePi, { model: "new", effort: null, fast: false })).toEqual({ adapterConfig: { chrome: true, model: "new" }, useProjectWorkspace: true });
+    expect(mergeComposerRunSettings(previous, "codex_local", { model: null, effort: null, fast: false }, true)).toBeNull();
+  });
+  it("leaves legacy Pi and saved ACPX Pi semantics unchanged", () => {
+    const oldPi = { ...agent("paperclip_runner", "acpx"), adapterConfig: { provider: "acpx", acpxAgent: "pi" } };
+    expect(composerEfforts(oldPi, "openrouter/gpt", ["openrouter/gpt"])).toEqual([]);
+    expect(composerEfforts(agent("pi_local"), "openrouter/gpt", ["openrouter/gpt"])).toEqual(levels.slice(0, -1));
+    expect(mergeComposerRunSettings(null, "pi_local", { model: null, effort: "xhigh", fast: false })).toEqual({ adapterConfig: { thinking: "xhigh" } });
+  });
   it("resolves known adapter defaults without guessing local CLI settings", () => {
     expect(composerDefaultModel(agent("claude_local"))).toBe("");
     expect(composerDefaultModel({ ...agent("claude_local"), adapterConfig: { model: "claude-opus-5" } })).toBe("claude-opus-5");

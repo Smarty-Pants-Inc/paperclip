@@ -61,6 +61,61 @@ afterEach(() => {
 });
 
 describe("composer assignee picker", () => {
+  it.each([false, true])("keeps native Pi capabilities, validates remembered effort and accepts manual models (mobile: %s)", async mobile => {
+    const pi = { ...agent, adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/claude-exact" } } as Agent;
+    rememberComposerEffort("company-1", "max");
+    const changed = vi.fn();
+    render(vi.fn(), changed, false, { mobile, settings: null, agents: new Map([[agent.id, pi]]),
+      modelOptionsOverride: [{ id: "paperclip/claude-exact", label: "Claude gateway", thinkingLevels: ["off", "high", "xhigh", "max"] }] });
+    expect(changed).not.toHaveBeenCalled();
+    await click("Select model and effort");
+    expect(document.querySelector<HTMLInputElement>('[aria-label="Thinking"]')?.max).toBe("3");
+    expect(document.querySelector('[aria-label="Effort"]')).toBeNull();
+    await click("Choose exact model");
+    await click("Claude gateway");
+    expect(changed).toHaveBeenLastCalledWith({ model: "paperclip/claude-exact", effort: null, fast: false });
+    await click("Choose exact model");
+    const search = document.querySelector<HTMLInputElement>('[aria-label="Search or paste a model ID"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!.call(search, "paperclip/manual/nested");
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const manual = [...document.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.includes("Use exact ID"))!;
+    expect(manual.disabled).toBe(false);
+    await act(async () => manual.click());
+    expect(changed).toHaveBeenLastCalledWith({ model: "paperclip/manual/nested", effort: "max", fast: false });
+  });
+
+  it("scopes native Pi requests and cached rows to each agent, connection and environment", async () => {
+    const binding = { provider: "openrouter", method: "api_key", mode: "shared", connectionId: "11111111-1111-4111-8111-111111111111", grantId: "33333333-3333-4333-8333-333333333333" } as const;
+    const pi = { ...agent, adapterType: "paperclip_runner", defaultEnvironmentId: "pi-env", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt" }, runtimeConfig: { aiConnection: binding } } as Agent;
+    const load = vi.spyOn(agentsApi, "adapterModels").mockResolvedValue([{ id: "paperclip/gpt", label: "Pi GPT", thinkingLevels: ["off", "max"] }]);
+    const client = render(vi.fn(), vi.fn(), true, { agents: new Map([[agent.id, pi]]), settings: null });
+    expect(load).not.toHaveBeenCalled();
+    await click("Select model and effort");
+    expect(load).toHaveBeenCalledWith("company-1", "paperclip_runner", { provider: "pi_rpc", agentId: agent.id, aiConnection: binding, environmentId: "pi-env", poolId: undefined, acpxAgent: undefined });
+    expect(document.querySelector<HTMLInputElement>('[aria-label="Thinking"]')?.max).toBe("2");
+    const key = client.getQueryCache().getAll().find(query => query.state.data)?.queryKey;
+    expect(JSON.stringify(key)).toContain(agent.id);
+    expect(JSON.stringify(key)).toContain(binding.connectionId);
+    expect(JSON.stringify(key)).toContain("pi-env");
+    expect(client.getQueryData(key!)).toEqual([{ id: "paperclip/gpt", label: "Pi GPT", thinkingLevels: ["off", "max"] }]);
+    const other = { ...pi, id: "a2", defaultEnvironmentId: "other-env", runtimeConfig: { aiConnection: { ...binding, connectionId: "22222222-2222-4222-8222-222222222222" } } };
+    await act(async () => root!.render(<QueryClientProvider client={client}><ComposerRunSettingsPicker companyId="company-1" assigneeValue="agent:a2" currentAssigneeValue="agent:a2" agents={new Map([[other.id, other]])} options={[]} settings={null} onSettingsChange={vi.fn()} onAssigneeChange={vi.fn()} initialOpen /></QueryClientProvider>));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+    expect(load).toHaveBeenLastCalledWith("company-1", "paperclip_runner", expect.objectContaining({ agentId: "a2", environmentId: "other-env", aiConnection: other.runtimeConfig.aiConnection }));
+    expect(client.getQueryCache().getAll().filter(query => query.state.data)).toHaveLength(2);
+  });
+
+  it("shows native Pi catalog failures with retry while leaving exact IDs available", async () => {
+    vi.spyOn(agentsApi, "adapterModels").mockRejectedValue(new Error("Gateway unavailable"));
+    const pi = { ...agent, adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } } as Agent;
+    render(vi.fn(), vi.fn(), true, { agents: new Map([[agent.id, pi]]), settings: null, initialOpen: true, initialView: "models" });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("Could not load models");
+    expect(document.querySelector('[aria-label="Search or paste a model ID"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("Retry models");
+  });
   it.each([false, true])("allows model and effort changes with a fixed conversation agent (mobile: %s)", async (mobile) => {
     const onAssigneeChange = vi.fn();
     const onSettingsChange = vi.fn();

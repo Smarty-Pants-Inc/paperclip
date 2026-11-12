@@ -577,13 +577,13 @@ function importAdapterValues(
   sourceAdapterType?: string,
   runner?: AgentRunnerChoice,
 ): CreateConfigValues {
-  const nativeHarness = sourceAdapterType === "paperclip_runner" && ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(choice);
+  const nativeHarness = sourceAdapterType === "paperclip_runner" && ["codex_local", "claude_local", "opencode_local", "pi_local", "pi_rpc"].includes(choice);
   const nativeCodex = nativeHarness && choice === "codex_local";
   const savedBypass = sourceConfig?.dangerouslyBypassApprovalsAndSandbox
     ?? (nativeCodex ? undefined : sourceConfig?.dangerouslyBypassSandbox);
   return {
     ...defaultCreateValues,
-    adapterType: (choice === "openai_dot" || choice === "muse") ? "paperclip_runner" : choice,
+    adapterType: (choice === "openai_dot" || choice === "muse" || choice === "pi_rpc") ? "paperclip_runner" : choice,
     ...(runner !== undefined ? { runner } : nativeHarness ? { runner: agentRunner("paperclip_runner") } : {}),
     ...(sourceConfig && choice === "codex_local" ? {
       model: typeof sourceConfig.model === "string" ? sourceConfig.model : "",
@@ -596,6 +596,7 @@ function importAdapterValues(
     } : {}),
     ...(sourceConfig && choice === "opencode_local" ? { model: typeof sourceConfig.model === "string" ? sourceConfig.model : "" } : {}),
     ...(sourceConfig && choice === "pi_local" ? { model: typeof sourceConfig.model === "string" ? sourceConfig.model : "", thinkingEffort: String(sourceConfig.piThinkingLevel ?? sourceConfig.thinking ?? "") } : {}),
+    ...(sourceConfig && choice === "pi_rpc" ? { model: typeof sourceConfig.model === "string" ? sourceConfig.model : "", thinkingEffort: String(sourceConfig.piRpcThinkingLevel ?? "") } : {}),
     ...(sourceConfig && choice === "claude_local" ? { model: typeof sourceConfig.model === "string" ? sourceConfig.model : "", thinkingEffort: String(sourceConfig.modelReasoningEffort ?? sourceConfig.reasoningEffort ?? sourceConfig.effort ?? "") } : {}),
     ...(nativeHarness && sourceConfig ? {
       cwd: typeof sourceConfig.cwd === "string" ? sourceConfig.cwd : "",
@@ -1684,7 +1685,7 @@ export function CompanyImport() {
       const nativeCodex = a.adapterType === "paperclip_runner"
         && (a.adapterConfig?.provider === "codex" || a.adapterConfig?.provider === undefined);
       const nativeHarness = nativeCodex || (a.adapterType === "paperclip_runner"
-        && ["claude_local", "opencode_local", "pi_local"].includes(agentHarnessType(a.adapterType, a.adapterConfig)));
+        && ["claude_local", "opencode_local", "pi_local", "pi_rpc"].includes(agentHarnessType(a.adapterType, a.adapterConfig)));
       const adapterChoice = a.adapterType === "paperclip_runner" && a.adapterConfig?.provider === "openai_dot"
         ? "openai_dot" : a.adapterType === "paperclip_runner" && a.adapterConfig?.provider === "muse" ? "muse" : nativeHarness ? agentHarnessType(a.adapterType, a.adapterConfig) : a.adapterType;
       let fallbackAdapterType: string | null = null;
@@ -1738,7 +1739,7 @@ export function CompanyImport() {
       if (selectedType === agent.adapterChoice && !adapterConfigEditedSlugs.has(agent.slug)
         && (!configVals || configVals.runner === importAdapterValues(selectedType, agent.adapterConfig, agent.adapterType, agent.runner).runner)) continue;
       const retainsNativeHarness = agent.adapterType === "paperclip_runner"
-        && selectedType === agent.adapterChoice && ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(selectedType);
+        && selectedType === agent.adapterChoice && ["codex_local", "claude_local", "opencode_local", "pi_local", "pi_rpc"].includes(selectedType);
       const apiType = selectedType === "openai_dot" || selectedType === "muse" || retainsNativeHarness ? "paperclip_runner" : selectedType;
       const override: CompanyPortabilityAdapterOverride = { adapterType: apiType };
       if (configVals?.runner !== undefined) override.runner = configVals.runner;
@@ -1759,7 +1760,7 @@ export function CompanyImport() {
         const build = getUIAdapter(nativeClaudeForm ? "paperclip_runner" : configVals.adapterType).buildAdapterConfig;
         const edited = build(configVals);
         if (agent.adapterType === "paperclip_runner" && selectedType === agent.adapterChoice
-          && ["codex_local", "claude_local", "opencode_local", "pi_local"].includes(selectedType) && configVals.adapterType === selectedType
+          && ["codex_local", "claude_local", "opencode_local", "pi_local", "pi_rpc"].includes(selectedType) && configVals.adapterType === (selectedType === "pi_rpc" ? "paperclip_runner" : selectedType)
           && agentHarnessType("paperclip_runner", configVals.adapterSchemaValues) === selectedType) {
           const original = importAdapterValues(selectedType, agent.adapterConfig, agent.adapterType, configVals.runner);
           const baseline = build(original);

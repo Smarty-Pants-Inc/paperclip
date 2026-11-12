@@ -25,6 +25,7 @@ import {
   type BuiltInAgentState,
 } from "@/api/builtInAgents";
 import { adapterCuratesModelOrder } from "../lib/model-utils";
+import { nativeTaskModelCatalogOptions } from "@/lib/native-model-catalog";
 
 /** Adapters whose config completeness is keyed on a non-empty `model`. */
 function isModelBasedAdapter(adapterType: string): boolean {
@@ -98,10 +99,12 @@ export function ConfigureBuiltInAgentModal({
   }, [definition.allowedAdapterTypes]);
 
   const setupSupportedInModal = isModelBasedAdapter(adapterType);
+  const nativePiCatalog = adapterType === "paperclip_runner" && state.agent?.adapterConfig.provider === "pi_rpc"
+    ? nativeTaskModelCatalogOptions(state.agent) : undefined;
 
   const { data: fetchedModels } = useQuery({
-    queryKey: queryKeys.agents.adapterModels(companyId, adapterType, null),
-    queryFn: () => agentsApi.adapterModels(companyId, adapterType, {}),
+    queryKey: queryKeys.agents.adapterModels(companyId, adapterType, nativePiCatalog?.environmentId ?? null, nativePiCatalog ? JSON.stringify(nativePiCatalog) : undefined),
+    queryFn: () => agentsApi.adapterModels(companyId, adapterType, nativePiCatalog ?? {}),
     enabled: open && Boolean(companyId) && setupSupportedInModal,
   });
   const models = fetchedModels ?? [];
@@ -109,7 +112,7 @@ export function ConfigureBuiltInAgentModal({
   const modelRequired = setupSupportedInModal;
   const normalizedModel = model.trim();
   const modelKnown =
-    !normalizedModel ||
+    Boolean(nativePiCatalog) || !normalizedModel ||
     models.length === 0 ||
     models.some((candidate) => candidate.id === normalizedModel);
   const modelError = modelKnown
@@ -130,7 +133,8 @@ export function ConfigureBuiltInAgentModal({
       const adapterConfig: Record<string, unknown> = {};
       if (model.trim()) adapterConfig.model = model.trim();
       const existing = state.agent;
-      const sameHarness = existing && agentHarnessType(existing.adapterType, existing.adapterConfig) === adapterType;
+      const sameHarness = existing && (agentHarnessType(existing.adapterType, existing.adapterConfig) === adapterType
+        || (nativePiCatalog && existing.adapterType === adapterType));
       const savedModel = typeof existing?.adapterConfig.model === "string" ? existing.adapterConfig.model.trim() : "";
       const alreadyConfigured = state.status === "ready" || state.status === "paused";
       const adapterInput = alreadyConfigured && sameHarness && normalizedModel === savedModel ? {}

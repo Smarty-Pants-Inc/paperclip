@@ -5,6 +5,12 @@ import { isNewAgentAdapterAllowed } from "./new-agent-adapters";
 
 const agent = { id: "google-agent", adapterType: "paperclip_runner", adapterConfig: { provider: "acpx", acpxAgent: "antigravity" } } as unknown as Agent;
 describe("Antigravity model catalog scope", () => {
+  it("scopes native Pi to its execution provider, agent, connection and environment, never ACPX", () => {
+    const binding = { provider: "openrouter", method: "api_key", mode: "responsible_user" } as const;
+    const pi = { ...agent, id: "pi-agent", defaultEnvironmentId: "remote", adapterConfig: { provider: "pi_rpc" }, runtimeConfig: { aiConnection: binding } };
+    expect(nativeTaskModelCatalogOptions(pi)).toEqual({ provider: "pi_rpc", agentId: "pi-agent", aiConnection: binding, environmentId: "remote" });
+    expect(nativeTaskModelCatalogOptions({ ...pi, adapterConfig: { provider: "acpx", acpxAgent: "pi" } })).toBeUndefined();
+  });
   it("binds discovery to the assignee and selected Google account", () => {
     const binding = { provider: "google", method: "subscription", mode: "responsible_user" } as const;
     expect(nativeTaskModelCatalogOptions({ ...agent, runtimeConfig: { aiConnection: binding } })).toEqual({

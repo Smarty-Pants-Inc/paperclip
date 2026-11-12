@@ -1248,6 +1248,34 @@ describe("AgentConfigForm environment selector", () => {
     expect(result.container.querySelector('input[aria-label="Variable name"]')).toBeNull();
   });
 
+  it.each(["pi_rpc", "acpx"])("reopens and saves %s Pi without changing its execution profile or duplicating effort", async provider => {
+    const native = provider === "pi_rpc";
+    const key = native ? "piRpcThinkingLevel" : "piThinkingLevel";
+    const adapterConfig = { provider, ...(native ? {} : { acpxAgent: "pi" }), model: "paperclip/gpt-custom", [key]: "max" };
+    const binding = { provider: "openrouter", method: "api_key", mode: "responsible_user" } as const;
+    mockAgentsApi.adapterModels.mockResolvedValue([{ id: adapterConfig.model, label: "Pi custom GPT", thinkingLevels: ["off", "medium", "xhigh", "max"] }]);
+    const result = await renderForm([], { adapterType: "paperclip_runner", adapterConfig, runtimeConfig: { aiConnection: binding } });
+    roots.push(result.root);
+    const fields = result.container.querySelectorAll<HTMLSelectElement>('[aria-label="Pi thinking level"]');
+    expect(fields).toHaveLength(1);
+    expect(result.container.querySelector('[aria-label="Thinking effort"]')).toBeNull();
+    expect(fields[0].value).toBe("max");
+    if (native) {
+      expect(mockAgentsApi.adapterModels).toHaveBeenCalledWith("company-1", "paperclip_runner", expect.objectContaining({ provider: "pi_rpc", agentId: "agent-1", aiConnection: binding }));
+      expect([...fields[0].options].map(option => option.value)).toEqual(["", "off", "medium", "xhigh", "max"]);
+    } else expect([...fields[0].options].map(option => option.value)).toEqual(["off", "low", "high", "max"]);
+    await act(async () => { fields[0].value = native ? "medium" : "low"; fields[0].dispatchEvent(new Event("change", { bubbles: true })); });
+    await clickByText(result.container, "Save");
+    const patch = result.onSave.mock.calls[0][0];
+    expect(patch).toMatchObject({ adapterConfig: { ...adapterConfig, [key]: native ? "medium" : "low" } });
+    expect(patch.adapterConfig).not.toHaveProperty(native ? "piThinkingLevel" : "piRpcThinkingLevel");
+    expect(patch.adapterConfig).not.toHaveProperty("modelReasoningEffort");
+    const reopened = await renderForm([], { adapterType: "paperclip_runner", adapterConfig: patch.adapterConfig, runtimeConfig: { aiConnection: binding } });
+    roots.push(reopened.root);
+    expect(reopened.container.querySelectorAll('[aria-label="Pi thinking level"]')).toHaveLength(1);
+    expect(reopened.container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]')?.value).toBe(native ? "medium" : "low");
+  });
+
   it("reads and saves Pi thinking effort using the Pi runtime key", async () => {
     const result = await renderForm([], { adapterType: "pi_local", adapterConfig: { model: "openrouter/anthropic/claude-sonnet-4.6", thinking: "high" } });
     roots.push(result.root);

@@ -58,6 +58,13 @@ it.each(["opencode_local", "pi_local", "codex_local", "claude_local", "hermes_lo
   expect(result?.resolveModel("anthropic/custom-model")).toBe(["opencode_local", "pi_local"].includes(harness) ? "openrouter/anthropic/custom-model" : "anthropic/custom-model");
 });
 
+it.each(["pi_local", "pi_rpc", "pi_runtime"])("preserves thinking capabilities and family when rebuilding %s catalog rows", async harness => {
+  vi.mocked(agentsApi.adapterModels).mockResolvedValue([{ id: "openrouter/vendor/custom", label: "Custom", thinkingLevels: ["off", "medium", "xhigh"], family: "Claude" }]);
+  await mount([account], harness);
+  await vi.waitFor(() => expect(result?.models).toHaveLength(1));
+  expect(result?.models[0]).toEqual({ id: "openrouter/vendor/custom", label: "Custom", thinkingLevels: ["off", "medium", "xhigh"], family: "Claude" });
+});
+
 it("also discovers models for legacy OpenRouter connections without routing metadata", async () => {
   await mount([{ ...account, routing: undefined }]);
   await vi.waitFor(() => expect(result?.models).toEqual(catalog));

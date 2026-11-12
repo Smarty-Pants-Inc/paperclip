@@ -2437,6 +2437,17 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
+  it("keeps Runner Pi disabled in the legacy properties override editor", async () => {
+    mockAgentsApi.list.mockResolvedValue([{ id: "agent-1", name: "Pi", role: "engineer", status: "active", adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt" }, runtimeConfig: {} }]);
+    const root = renderProperties(container, { issue: createIssue({ assigneeAgentId: "agent-1", assigneeAdapterOverrides: { adapterConfig: { model: "paperclip/gpt", piRpcThinkingLevel: "max" } } }), childIssues: [], onUpdate: vi.fn() });
+    await waitForAssertion(() => expect(container.textContent).toContain("Pi"));
+    await act(async () => findRowTrigger(container, "Model")!.click());
+    expect(document.body.textContent).toContain("This assignee's adapter does not expose editable task overrides.");
+    expect(document.querySelector('[role="radiogroup"][aria-label="Model lane"]')).toBeNull();
+    expect(mockAgentsApi.adapterModels).not.toHaveBeenCalled();
+    act(() => root.unmount());
+  });
+
   it("hides model options when the issue uses the responsible default", async () => {
     mockAgentsApi.list.mockResolvedValue([
       seniorProductEngineer(),

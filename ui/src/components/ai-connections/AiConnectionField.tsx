@@ -37,6 +37,8 @@ export function aiProviderForAdapter(
       codex_local: "openai",
       opencode_local: "openrouter",
       pi_local: "openrouter",
+      pi_rpc: "openrouter",
+      pi_runtime: "openrouter",
       grok_local: "xai",
       copilot_runtime: "github",
       antigravity_runtime: "google",
@@ -135,7 +137,7 @@ export function AiConnectionField({
     );
   return (
     <div className="space-y-4">
-      {value && value.mode !== "router" && (!["opencode_local", "pi_local"].includes(adapterType) || Boolean(model)) && !isAiConnectionCompatible(value, adapterType, model) && (
+      {value && value.mode !== "router" && (!["opencode_local", "pi_local", "pi_rpc", "pi_runtime"].includes(adapterType) || Boolean(model)) && !isAiConnectionCompatible(value, adapterType, model) && (
         <p role="alert" className="text-sm text-destructive">
           This connection does not support the current harness and model. Choose
           a compatible connection before saving.

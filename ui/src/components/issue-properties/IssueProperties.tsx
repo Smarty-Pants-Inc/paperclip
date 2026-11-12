@@ -14,6 +14,7 @@ import { issueStatusText } from "@/lib/status-colors";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { Link } from "@/lib/router";
 import {
+  agentHarnessType,
   deriveOriginatingActor,
   readProviderRateLimits,
   summarizeProviderRateLimits,
@@ -753,7 +754,9 @@ export function IssueProperties({
   const assignee = issue.assigneeAgentId
     ? agents?.find((a) => a.id === issue.assigneeAgentId)
     : null;
-  const nativeCatalog = nativeTaskModelCatalogOptions(assignee);
+  // Runner Pi overrides belong to the composer; this older editor has legacy effort semantics.
+  const nativeCatalog = assignee?.adapterType === "paperclip_runner" && ["pi_local", "pi_rpc"].includes(agentHarnessType(assignee.adapterType, assignee.adapterConfig))
+    ? undefined : nativeTaskModelCatalogOptions(assignee);
   const assigneeAdapterType = assignee?.adapterType ?? null;
   const assigneeAdapterOverrides = issue.assigneeAdapterOverrides ?? null;
   const showAssigneeAdapterOptions = assigneeAdapterOverrides !== null;

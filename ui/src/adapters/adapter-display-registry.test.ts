@@ -1,8 +1,20 @@
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { AdapterMark } from "@/components/AdapterMark";
 
 import { agentDisplayAdapterType, getAdapterDisplay, getAdapterLabel, getAdapterLabels } from "./adapter-display-registry";
 
 describe("adapter display registry", () => {
+  it("brands saved native Pi RPC using the existing Pi label and icon", () => {
+    const type = agentDisplayAdapterType({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } });
+    expect(type).toBe("pi_rpc");
+    expect(getAdapterDisplay(type)).toMatchObject({ label: "Pi", icon: getAdapterDisplay("pi_local").icon });
+    expect(getAdapterLabel(type)).toBe("Pi");
+    const mark = renderToStaticMarkup(createElement(AdapterMark, { type }));
+    expect(mark).toContain('/brands/adapters/pi.svg');
+    expect(mark).toContain('/brands/adapters/pi-dark.svg');
+  });
   it("shows a pending setup choice without changing the saved execution adapter", () => {
     const agent = { adapterType: "process", adapterConfig: {}, pauseReason: "setup", metadata: {
       setupAdapterPending: true,

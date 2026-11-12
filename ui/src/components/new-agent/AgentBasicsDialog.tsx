@@ -4,7 +4,7 @@ import { useAgentAppearanceDraft } from "@/hooks/useAgentAppearanceDraft";
 import { AdapterMark } from "../AdapterMark";
 import { AgentCharacter } from "../AgentCharacter";
 import { useEffect, useId, useRef, useState } from "react";
-import type { Agent } from "@paperclipai/shared";
+import { PI_RPC_PROVIDER, type Agent } from "@paperclipai/shared";
 import { agentsApi } from "@/api/agents";
 import { buildNewAgentRuntimeConfig } from "@/lib/new-agent-runtime-config";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -327,6 +327,7 @@ export function AgentBasicsDialog({
                       options={[
                         { value: "grok", label: "Grok Build (Paperclip Runner)" },
                         { value: "opencode", label: "OpenCode (Paperclip Runner)" },
+                        { value: PI_RPC_PROVIDER, label: "Pi (Paperclip Runner)" },
                       ]} />
                   </div>
                 </details>}

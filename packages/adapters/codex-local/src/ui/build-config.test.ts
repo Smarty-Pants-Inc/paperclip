@@ -36,6 +36,20 @@ function makeValues(overrides: Partial<CreateConfigValues> = {}): CreateConfigVa
 }
 
 describe("buildCodexLocalConfig", () => {
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"])("round-trips native Pi %s with the exact model, without falling back to Codex", level => {
+    const first = buildPaperclipRunnerConfig(makeValues({ model: "paperclip/custom/nested", thinkingEffort: level,
+      adapterSchemaValues: { provider: "pi_rpc", piRpcThinkingLevel: level } }));
+    expect(first).toMatchObject({ provider: "pi_rpc", model: "paperclip/custom/nested", piRpcThinkingLevel: level });
+    expect(first).not.toHaveProperty("acpxAgent");
+    expect(first).not.toHaveProperty("modelReasoningEffort");
+    expect(first).not.toHaveProperty("thinking");
+    const reopened = buildPaperclipRunnerConfig(makeValues({ model: "", adapterSchemaValues: JSON.parse(JSON.stringify(first)) }));
+    expect(reopened).toEqual(first);
+  });
+  it("requires an explicit native Pi model and exact native effort", () => {
+    expect(() => buildPaperclipRunnerConfig(makeValues({ model: "", adapterSchemaValues: { provider: "pi_rpc" } }))).toThrow("explicit model");
+    expect(() => buildPaperclipRunnerConfig(makeValues({ adapterSchemaValues: { provider: "pi_rpc", piRpcThinkingLevel: "ultra" } }))).toThrow("thinking");
+  });
   it("round-trips native Cursor Cloud fields and credentials without adding local command permission defaults", () => {
     const cloud = { provider: "cursor_cloud", repoUrl: "https://github.com/acme/repo", repoRef: "feature", cloudEnvType: "cloud", autoCreatePR: true };
     const env = { CURSOR_API_KEY: { type: "secret_ref" as const, secretId: "company-key", version: "latest" as const } };

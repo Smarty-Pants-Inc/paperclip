@@ -175,11 +175,11 @@ it("uses the server's connection-manager permission for company-wide access", as
   expect(credentialProps).toMatchObject({ allAgents: true });
 });
 
-it("offers Pi account selection before choosing its required model", async () => {
+it.each(["pi_local", "pi_rpc", "pi_runtime"])("offers %s account selection before choosing its required model", async adapterType => {
   mocks.list.mockResolvedValue({ currentUserId: "owner", connections: [], canManageConnections: true });
-  expect(aiProviderForAdapter("pi_local")).toBe("openrouter");
+  expect(aiProviderForAdapter(adapterType)).toBe("openrouter");
   flushSync(() => root.render(<QueryClientProvider client={client}>
-    <AiConnectionField companyId="company" agentId="agent" agentName="Pi" adapterType="pi_local" model=""
+    <AiConnectionField companyId="company" agentId="agent" agentName="Pi" adapterType={adapterType} model=""
       value={{ provider: "openrouter", method: "api_key", mode: "responsible_user" }} onChange={onChange} />
   </QueryClientProvider>));
   await settle();
@@ -189,11 +189,12 @@ it("offers Pi account selection before choosing its required model", async () =>
   expect(document.body.textContent).toContain("Advanced provider setup");
 });
 
-it.each(["openai", "anthropic", "google", "openrouter"] as const)("keeps a matching saved Pi %s API-key account selectable", async provider => {
+it.each(["pi_local", "pi_rpc", "pi_runtime"].flatMap(adapterType =>
+  (["openai", "anthropic", "google", "openrouter"] as const).map(provider => ({ adapterType, provider }))))("keeps a matching saved $adapterType $provider API-key account selectable", async ({ adapterType, provider }) => {
   const saved = account({ provider, method: "api_key", name: "Pi provider account", accountLabel: "avery@example.test", status: "connected" });
   mocks.list.mockResolvedValue({ currentUserId: "owner", connections: [saved], canManageConnections: true });
   flushSync(() => root.render(<QueryClientProvider client={client}>
-    <AiConnectionField companyId="company" agentId="agent" agentName="Pi" adapterType="pi_local" model={`${provider}/provider-model`}
+    <AiConnectionField companyId="company" agentId="agent" agentName="Pi" adapterType={adapterType} model={`${provider}/provider-model`}
       value={{ provider, method: "api_key", mode: "delegated", connectionId: saved.id, grantId: saved.grantId }} onChange={onChange} />
   </QueryClientProvider>));
   await settle();

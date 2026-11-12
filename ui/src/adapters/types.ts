@@ -39,7 +39,7 @@ export interface AdapterConfigFieldsProps {
   /** Edit mode: mark field dirty */
   mark: (group: "adapterConfig", field: string, value: unknown) => void;
   /** Available models for dropdowns */
-  models: { id: string; label: string }[];
+  models: import("@paperclipai/adapter-utils").AdapterModel[];
   /** When true, hides the instructions file path field (e.g. during import where it's set automatically) */
   hideInstructionsFile?: boolean;
   /**

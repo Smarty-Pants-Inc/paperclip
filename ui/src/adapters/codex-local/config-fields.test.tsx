@@ -25,11 +25,13 @@ async function renderMarkup(node: ReactNode, expand?: string, inspect?: (contain
   if (expand) await act(async () => {
     container.querySelector(`[aria-label="${expand}"]`)?.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
   });
-  inspect?.(container);
-  const html = container.innerHTML + Array.from(document.body.children).filter(child => child !== container).map(child => child.outerHTML).join("");
-  await act(async () => root.unmount());
-  container.remove();
-  return html;
+  try {
+    inspect?.(container);
+    return container.innerHTML + Array.from(document.body.children).filter(child => child !== container).map(child => child.outerHTML).join("");
+  } finally {
+    await act(async () => root.unmount());
+    container.remove();
+  }
 }
 
 async function renderRunner(config: Record<string, unknown>, expand?: string, inspectOrDot?: ((container: HTMLElement) => void) | boolean): Promise<string> {
@@ -121,6 +123,27 @@ async function editFields(
 }
 
 describe("Paperclip Runner Codex configuration", () => {
+  it("offers all seven native Pi levels without widening saved ACPX Pi", async () => {
+    await renderRunner({ provider: "pi_rpc", model: "paperclip/gpt-custom", piRpcThinkingLevel: "max" }, undefined, container => {
+      const fields = container.querySelectorAll<HTMLSelectElement>('[aria-label="Pi thinking level"]');
+      expect(fields).toHaveLength(1);
+      expect(fields[0].value).toBe("max");
+      expect([...fields[0].options].map(option => option.value)).toEqual(["", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+    });
+    await renderRunner({ provider: "acpx", acpxAgent: "pi", model: "openrouter/gpt", piThinkingLevel: "max" }, undefined, container => {
+      const field = container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]')!;
+      expect([...field.options].map(option => option.value)).toEqual(["off", "low", "high", "max"]);
+    });
+  });
+  it("narrows native Pi choices to the selected row and Claude cap", async () => {
+    await renderMarkup(<TooltipProvider><CodexLocalConfigFields mode="edit" isCreate={false} adapterType="paperclip_runner" values={null} set={null}
+      config={{ provider: "pi_rpc", model: "paperclip/claude-custom", piRpcThinkingLevel: "xhigh" }}
+      eff={(_group, _field, original) => original} mark={() => undefined}
+      models={[{ id: "paperclip/claude-custom", label: "Claude", thinkingLevels: ["off", "medium", "xhigh", "max"] }]} hideInstructionsFile /></TooltipProvider>, undefined, container => {
+      const field = container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]')!;
+      expect([...field.options].map(option => option.value)).toEqual(["", "off", "medium", "xhigh"]);
+    });
+  });
   it.each(["", "--sandbox,read-only"])("shows actual automatic Legacy policy and preserves the explicit toggle (%s)", async (extraArgs) => {
     const container = document.createElement("div");
     document.body.appendChild(container);

@@ -29,7 +29,8 @@ import type {
   Agent,
   EnvBinding,
 } from "@paperclipai/shared";
-import { ADAPTER_AUTH_MISSING_CHECK_CODE, isAgentStatusInvokable, paperclipRunnerCreationLifecycle, paperclipRunnerProfileForHarness } from "@paperclipai/shared";
+import { piRpcThinkingLevelsForModel } from "@/lib/pi-rpc-thinking";
+import { PI_RPC_PROVIDER, PI_RPC_THINKING_LEVEL_KEY, ADAPTER_AUTH_MISSING_CHECK_CODE, isAgentStatusInvokable, paperclipRunnerCreationLifecycle, paperclipRunnerProfileForHarness } from "@paperclipai/shared";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { agentsApi } from "@/api/agents";
 import { ApiError } from "@/api/client";
@@ -80,7 +81,7 @@ import { adapterCuratesModelOrder } from "../../lib/model-utils";
 
 const controlClass = nativeSelectClassName;
 const nativeSetupHarnesses: Record<string, string> = {
-  codex: "codex_local", claude: "claude_local", opencode: "opencode_local", pi: "pi_local", cursor_cloud: "cursor_cloud",
+  codex: "codex_local", claude: "claude_local", opencode: "opencode_local", [PI_RPC_PROVIDER]: "pi_local", cursor_cloud: "cursor_cloud",
 };
 const blocking = (result: AdapterEnvironmentTestResult) =>
   result.status === "fail" ||
@@ -150,7 +151,7 @@ function Setup({
       ? "claude_local"
       : runnerProvider === "opencode"
         ? "opencode_local"
-        : runnerProvider === "pi" ? "pi_local" : runnerProvider === "codex" ? "codex_local" : runnerProvider
+        : runnerProvider === PI_RPC_PROVIDER ? "pi_local" : runnerProvider === "codex" ? "codex_local" : runnerProvider
     : adapterType;
   const connectionAdapter =
     brandType === "claude_local" || brandType === "codex_local" || brandType === "grok_local" || brandType === "antigravity_runtime"
@@ -193,7 +194,6 @@ function Setup({
   const [connection, setConnection] = useState<ProviderConnection | null>(null);
   const [choosingAdapter, setChoosingAdapter] = useState(false);
   const aiBinding = runtimeAiBinding ?? connection?.aiConnection;
-  const connectionModels = useConnectionModels(companyId, aiBinding, brandType);
   const [repository, setRepository] = useState("");
   const [branch, setBranch] = useState("");
   const [createdInSession, setCreated] = useState<Agent | null>(null);
@@ -333,19 +333,31 @@ function Setup({
     environmentError =
       describeError(cause).body;
   }
-  const accountBoundCatalog = brandType === "copilot_runtime" || brandType === "antigravity_runtime";
-  const accountCatalogAvailable = brandType === "copilot_runtime" || (brandType === "antigravity_runtime" && aiBinding?.method === "subscription");
+  const adapters = useQuery({
+    queryKey: queryKeys.adapters.availability(companyId, environmentId),
+    queryFn: () => adaptersApi.list({ companyId, environmentId }),
+  });
+  const defaultRunner = adapters.data?.find(adapter => adapter.type === adapterType)?.defaultRunner;
+  const savedAcpxPi = brandType === "pi_local" && created?.adapterType === "paperclip_runner"
+    && created.adapterConfig.provider === "acpx" && created.adapterConfig.acpxAgent === "pi";
+  const nativePi = brandType === "pi_local" && !savedAcpxPi
+    && (runner === "paperclip" || (runner === "auto" && defaultRunner === "paperclip"));
+  const connectionModels = useConnectionModels(nativePi ? null : companyId, nativePi ? undefined : aiBinding,
+    brandType === "pi_local" && created?.adapterType === "paperclip_runner" ? "pi_runtime" : brandType);
+  const accountBoundCatalog = nativePi || brandType === "copilot_runtime" || brandType === "antigravity_runtime";
+  const accountCatalogAvailable = nativePi || brandType === "copilot_runtime" || (brandType === "antigravity_runtime" && aiBinding?.method === "subscription");
   const requestAccountModels = accountCatalogAvailable && showModel && !connectionModels && Boolean(aiBinding)
     && envs.isSuccess && settings.isSuccess && experimental.isSuccess && general.isSuccess && !environmentError;
   const accountModelScope = JSON.stringify([companyId, environmentId, aiBinding]);
   const models = useQuery({
-    queryKey: queryKeys.agents.adapterModels(companyId, brandType, environmentId, accountBoundCatalog ? JSON.stringify(aiBinding ?? null) : aiBinding?.provider),
-    queryFn: () => agentsApi.adapterModels(companyId, isKimi || accountBoundCatalog ? "paperclip_runner" : brandType, isKimi
+    queryKey: queryKeys.agents.adapterModels(companyId, nativePi ? "paperclip_runner" : brandType, environmentId, accountBoundCatalog ? JSON.stringify([nativePi ? PI_RPC_PROVIDER : runnerProvider, created?.id, aiBinding ?? null]) : aiBinding?.provider),
+    queryFn: () => agentsApi.adapterModels(companyId, isKimi || accountBoundCatalog ? "paperclip_runner" : brandType, nativePi
+      ? { provider: PI_RPC_PROVIDER, aiConnection: aiBinding, agentId: created?.id, environmentId } : isKimi
       ? { provider: "acpx", acpxAgent: "kimi", environmentId } : accountBoundCatalog
       ? { provider: "acpx", acpxAgent: runnerProvider, aiConnection: aiBinding, environmentId }
       : { provider: aiBinding?.provider, environmentId }),
     ...(accountBoundCatalog ? ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
-    enabled: Boolean(brandType) && showModel && !connectionModels && (!accountBoundCatalog || requestAccountModels),
+    enabled: Boolean(brandType) && showModel && !connectionModels && (!accountBoundCatalog || nativePi || requestAccountModels),
     });
   const refreshAccountModels = models.refetch;
   useEffect(() => {
@@ -356,17 +368,12 @@ function Setup({
   const setupEnvironmentRef = useRef("");
   setupEnvironmentRef.current = setupEnvironmentKey;
   useEffect(() => { resetTest(); }, [setupEnvironmentKey]);
-  const adapters = useQuery({
-    queryKey: queryKeys.adapters.availability(companyId, environmentId),
-    queryFn: () => adaptersApi.list({ companyId, environmentId }),
-  });
   const candidateHarnesses = adapters.data?.find(adapter => adapter.type === "paperclip_runner" && adapter.loaded && !adapter.disabled)?.candidateHarnesses;
   const antigravityCandidate = brandType === "antigravity_runtime" ? candidateHarnesses?.find(candidate => candidate.agent === "antigravity") : undefined;
   const pendingAntigravity = unreleasedAntigravity && !antigravityCandidate;
   useEffect(() => { if (antigravityCandidate) setModel(current => current || antigravityCandidate.model); }, [antigravityCandidate?.model]);
-  const defaultRunner = adapters.data?.find(adapter => adapter.type === adapterType)?.defaultRunner;
-  const efforts = brandType === "pi_local" && (runner === "paperclip" || (runner === "auto" && defaultRunner === "paperclip"))
-    ? ["off", "low", "high", "max"] : isRunner ? [] : setupEfforts(adapterType, model);
+  const efforts = nativePi ? piRpcThinkingLevelsForModel(model, (connectionModels?.models ?? models.data ?? []).find(row => row.id === model))
+    : savedAcpxPi ? ["off", "low", "high", "max"] : isRunner ? [] : setupEfforts(adapterType, model);
   useEffect(() => {
     const transition = qualificationTransition.current;
     if (transition?.run === generation.current && transition.companyId === companyId
@@ -478,28 +485,28 @@ function Setup({
       ...(isRunner
         ? {
             adapterSchemaValues: {
-              provider: ["claude", "grok", "copilot", "pi", "antigravity", "kimi"].includes(runnerProvider) ? "acpx" : runnerProvider,
+              provider: ["claude", "grok", "copilot", "antigravity", "kimi"].includes(runnerProvider) ? "acpx" : runnerProvider,
               ...(isDot ? { allowUnmeteredProvider } : {}),
-              ...(["claude", "grok", "copilot", "pi", "antigravity", "kimi"].includes(runnerProvider) ? { acpxAgent: runnerProvider } : {}),
+              ...(["claude", "grok", "copilot", "antigravity", "kimi"].includes(runnerProvider) ? { acpxAgent: runnerProvider } : {}),
             },
           }
         : {}),
     };
-    const profile = paperclipRunnerProfileForHarness(brandType);
+    const profile = savedAcpxPi ? { provider: "acpx" as const, acpxAgent: "pi" as const } : paperclipRunnerProfileForHarness(brandType);
     const nativeSchema = profile ? {
       ...profile,
       ...(profile.provider === "acpx" ? { acpxPermissionMode: "approve-all" } : {}),
-      ...(brandType === "pi_local" && effort ? { piThinkingLevel: effort } : {}),
+      ...(brandType === "pi_local" && effort ? { [savedAcpxPi ? "piThinkingLevel" : PI_RPC_THINKING_LEVEL_KEY]: effort } : {}),
     } : {};
-    const config = getUIAdapter(preserveNativeHarness && runner === "paperclip" && brandType !== "pi_local" ? "paperclip_runner" : adapterType).buildAdapterConfig(preserveNativeHarness && runner === "paperclip" ? { ...values, adapterSchemaValues: nativeSchema } : values,
+    const config = getUIAdapter((preserveNativeHarness && runner === "paperclip") || nativePi || savedAcpxPi ? "paperclip_runner" : adapterType).buildAdapterConfig((preserveNativeHarness && runner === "paperclip") || nativePi || savedAcpxPi ? { ...values, adapterSchemaValues: nativeSchema } : values,
       antigravityCandidate ? { candidateHarnesses: [antigravityCandidate] } : undefined);
     if (preserveNativeHarness && runner === "paperclip" && profile) {
       Object.assign(config, nativeSchema, profile.provider === "opencode" ? { opencodePermissionMode: "allow" } : profile.provider === "codex" ? { codexPermissionMode: "never" } : {}, paperclipRunnerCreationLifecycle(profile));
     }
     if (isRunner)
       Object.assign(config, {
-        provider: ["claude", "grok", "copilot", "pi", "antigravity", "kimi"].includes(runnerProvider) ? "acpx" : runnerProvider,
-        ...(["claude", "grok", "copilot", "pi", "antigravity", "kimi"].includes(runnerProvider) ? { acpxAgent: runnerProvider } : {}),
+        provider: ["claude", "grok", "copilot", "antigravity", "kimi"].includes(runnerProvider) ? "acpx" : runnerProvider,
+        ...(["claude", "grok", "copilot", "antigravity", "kimi"].includes(runnerProvider) ? { acpxAgent: runnerProvider } : {}),
         ...(model ? { model } : {}),
       });
     if (multiProvider && created) {
@@ -512,7 +519,7 @@ function Setup({
         if (saved[key] !== undefined) config[key] = saved[key];
       }
       if (brandType === "pi_local" && created.adapterType === "paperclip_runner" && runner !== "legacy" && effort) {
-        config.piThinkingLevel = effort;
+        config[savedAcpxPi ? "piThinkingLevel" : PI_RPC_THINKING_LEVEL_KEY] = effort;
         delete config.thinking;
       }
       config.model = model;
@@ -609,8 +616,10 @@ function Setup({
       role: existing.length ? "general" : "ceo", ...(leader ? { reportsTo: leader.id } : {}),
       adapterType: requestAdapterType, runner,
       adapterConfig: requestAdapterType === "paperclip_runner" ? {
-        provider: ["claude", "grok", "copilot", "pi", "antigravity", "kimi"].includes(runnerProvider) ? "acpx" : runnerProvider,
-        ...(["claude", "grok", "copilot", "pi", "antigravity", "kimi"].includes(runnerProvider) ? { acpxAgent: runnerProvider } : {}),
+        ...(nativePi ? { provider: PI_RPC_PROVIDER } : {
+          provider: ["claude", "grok", "copilot", "antigravity", "kimi"].includes(runnerProvider) ? "acpx" : runnerProvider,
+          ...(["claude", "grok", "copilot", "antigravity", "kimi"].includes(runnerProvider) ? { acpxAgent: runnerProvider } : {}),
+        }),
         ...(antigravityCandidate ? { model: antigravityCandidate.model } : {}),
       } : {}, defaultEnvironmentId: nativeCursorCloud ? null : environmentOverride || (forced.forced || managedOnly ? environmentId : null),
       runtimeConfig: buildNewAgentRuntimeConfig({ heartbeatEnabled: false }),
@@ -631,7 +640,7 @@ function Setup({
     const config = agent.adapterConfig;
     if (multiProvider || adapterType === "cursor_cloud") setRunner(agent.adapterType === "paperclip_runner" ? "paperclip" : "legacy");
     setModel(typeof config.model === "string" && config.model ? config.model : antigravityCandidate?.model ?? "");
-    setEffort(String(config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort ?? config.thinkingEffort ?? config.piThinkingLevel ?? config.thinking ?? ""));
+    setEffort(String(config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort ?? config.thinkingEffort ?? config[PI_RPC_THINKING_LEVEL_KEY] ?? config.piThinkingLevel ?? config.thinking ?? ""));
     setEnvironmentOverride(agent.defaultEnvironmentId ?? "");
     setRepository(typeof config.repoUrl === "string" ? config.repoUrl : "");
     setBranch(typeof config.repoRef === "string" ? config.repoRef : typeof config.repoStartingRef === "string" ? config.repoStartingRef : "");
@@ -1209,7 +1218,8 @@ function Setup({
                                 value={model}
                                 onChange={(value) => {
                                   setModel(connectionModels?.resolveModel(value) ?? value);
-                                  if (
+                                  if (nativePi) setEffort("");
+                                  else if (
                                     effort &&
                                     !setupEfforts(adapterType, value).includes(
                                       effort,

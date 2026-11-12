@@ -1446,6 +1446,36 @@ describe("New agent setup", () => {
       expect(secrets.create).toHaveBeenCalledTimes(1);
     },
   );
+  it("creates, tests, saves and reopens native Pi RPC with exact model and thinking", async () => {
+    settings.getExperimental.mockResolvedValue({ enableNativeRunner: true });
+    managedApi.list.mockResolvedValue({ currentUserId: "user-1", canManageConnections: true, connections: [{
+      id: "11111111-1111-4111-8111-111111111111", grantId: "22222222-2222-4222-8222-222222222222", companyId: "company-1", provider: "openrouter", method: "api_key", name: "Saved Pi gateway", ownership: "personal", ownerUserId: "user-1", isDefault: true, status: "connected",
+    }] } as any);
+    api.adapterModels.mockResolvedValue([{ id: "paperclip/gpt-private/nested", label: "Private GPT", thinkingLevels: ["off", "minimal", "medium", "xhigh", "max"] }]);
+    await render("paperclip_runner", "pi_rpc");
+    expect(api.create.mock.calls[0][1]).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } });
+    expect(api.create.mock.calls[0][1].adapterConfig).not.toHaveProperty("acpxAgent");
+    await fill("Model", "paperclip/gpt-private/nested");
+    await settle();
+    const fields = container.querySelectorAll<HTMLSelectElement>('[aria-label="Thinking effort"]');
+    expect(fields).toHaveLength(1);
+    expect([...fields[0].options].map(option => option.value)).toEqual(["", "off", "minimal", "medium", "xhigh", "max"]);
+    await act(async () => { fields[0].value = "max"; fields[0].dispatchEvent(new Event("change", { bubbles: true })); });
+    await click("Run test");
+    expect(api.testEnvironment).toHaveBeenLastCalledWith("company-1", "paperclip_runner", expect.objectContaining({ adapterConfig: expect.objectContaining({ provider: "pi_rpc", model: "paperclip/gpt-private/nested", piRpcThinkingLevel: "max" }) }));
+    await click("Finish setup");
+    const hire = api.hire.mock.calls[0][1];
+    expect(hire).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-private/nested", piRpcThinkingLevel: "max" } });
+    for (const key of ["acpxAgent", "thinking", "piThinkingLevel", "modelReasoningEffort"]) expect(hire.adapterConfig).not.toHaveProperty(key);
+    const id = hire.setupAgentId;
+    api.get.mockResolvedValue({ ...hire, id, companyId: "company-1", name: "Atlas", pauseReason: "setup", status: "paused", runtimeConfig: {} });
+    state.params = new URLSearchParams({ name: "Atlas", adapterType: "paperclip_runner", runnerProvider: "pi_rpc", setupAgentId: id });
+    await renderCurrentParams();
+    expect((container.querySelector('[aria-label="Model"]') as HTMLInputElement).value).toBe("paperclip/gpt-private/nested");
+    expect(container.querySelector<HTMLSelectElement>('[aria-label="Thinking effort"]')?.value).toBe("max");
+    expect(api.adapterModels).toHaveBeenCalledWith("company-1", "paperclip_runner", expect.objectContaining({ provider: "pi_rpc" }));
+  });
+
   it("resumes an empty native Pi draft with account selection and exact thinking controls", async () => {
     const id = "00000000-0000-4000-8000-000000000093";
     settings.getExperimental.mockResolvedValue({ enableNativeRunner: false });

@@ -2,7 +2,7 @@ import { describeError } from "@/api/errors";
 import { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight, Loader2 } from "lucide-react";
-import { aiRoutingModel, isAiConnectionCompatible, type Agent, type AiConnectionBinding, type AiConnectionList } from "@paperclipai/shared";
+import { PI_RPC_PROVIDER, aiRoutingModel, isAiConnectionCompatible, type Agent, type AiConnectionBinding, type AiConnectionList } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { getAdapterLabel } from "@/adapters/adapter-display-registry";
@@ -49,9 +49,10 @@ export function AgentBulkSettingsSheet({ companyId, agents, totalSelected, onClo
         const routing = connection?.routing;
         const openRouter = routing?.kind === "openrouter" || (!routing && effective?.provider === "openrouter");
         const nativeCatalog = nativeTaskModelCatalogOptions(agent);
+        const nativePi = nativeCatalog?.provider === PI_RPC_PROVIDER;
         let models: AdapterModel[];
-        if (routing?.models.length) {
-          models = routing.models.map(m => ({ id: aiRoutingModel(routing, harness, m.id), label: m.label ?? m.id }));
+        if (routing?.models.length && !nativePi) {
+          models = routing.models.map(m => ({ ...m, id: aiRoutingModel(routing, harness, m.id), label: m.label ?? m.id }));
         } else if (nativeCatalog?.acpxAgent === "antigravity" && (connection?.method ?? effective?.method) === "api_key") {
           // Native discovery uses a saved subscription. API-key users retain
           // the existing unrestricted manual-model configuration path.
@@ -59,16 +60,16 @@ export function AgentBulkSettingsSheet({ companyId, agents, totalSelected, onClo
         } else {
           const type = nativeCatalog ? "paperclip_runner" : openRouter ? "opencode_local" : harness;
           const options = nativeCatalog
-            ? { provider: "acpx", ...nativeCatalog, aiConnection: effective, environmentId: agent.defaultEnvironmentId }
+            ? { provider: String(agent.adapterConfig.provider ?? "codex"), ...nativeCatalog, aiConnection: changeConnection ? binding : nativeCatalog.aiConnection ?? effective, environmentId: agent.defaultEnvironmentId }
             : openRouter ? { provider: "openrouter" }
             : { environmentId: agent.defaultEnvironmentId };
           const key = JSON.stringify([type, options]);
           let request = modelRequests.get(key);
           if (!request) { request = agentsApi.adapterModels(companyId, type, options); modelRequests.set(key, request); }
           models = await request;
-          if (openRouter && !["opencode_local", "pi_local"].includes(harness)) models = models.map(m => ({ ...m, id: m.id.replace(/^openrouter\//, "") }));
+          if (openRouter && !nativePi && !["opencode_local", "pi_local"].includes(harness)) models = models.map(m => ({ ...m, id: m.id.replace(/^openrouter\//, "") }));
         }
-        const restricted = Boolean(routing?.models.length || openRouter || harness === "copilot_runtime");
+        const restricted = !nativePi && Boolean(routing?.models.length || openRouter || harness === "copilot_runtime");
         return { agent, accounts, binding: effective, models, restricted } satisfies Catalog;
       });
       return results.map((result, index) => result.status === "fulfilled" ? result.value : { agent: targets[index], error: result.reason instanceof Error ? result.reason.message : "Couldn’t load connections or models" });

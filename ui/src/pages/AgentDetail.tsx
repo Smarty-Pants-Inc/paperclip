@@ -1,3 +1,4 @@
+import { ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS, nativeTaskModelCatalogOptions } from "@/lib/native-model-catalog";
 import { companyProjectsQuery } from "@/lib/company-projects-query";
 import { describeError } from "../api/errors";
 import { useSelectedHeartbeatRun } from "../hooks/useSelectedHeartbeatRun";
@@ -1647,12 +1648,14 @@ export function ConfigurationTab({
   const lastAgentRef = useRef(agent);
 
   const catalogProvider = agent.adapterType === "paperclip_runner" ? String(agent.adapterConfig.provider ?? "codex") : undefined;
+  const nativeCatalog = nativeTaskModelCatalogOptions(agent);
   const { data: adapterModels } = useQuery({
     queryKey:
       companyId
-        ? queryKeys.agents.adapterModels(companyId, agent.adapterType, null, catalogProvider)
+        ? [...queryKeys.agents.adapterModels(companyId, agent.adapterType, agent.defaultEnvironmentId ?? null, catalogProvider), nativeCatalog ?? null]
         : ["agents", "none", "adapter-models", agent.adapterType],
-    queryFn: () => agentsApi.adapterModels(companyId!, agent.adapterType, { provider: catalogProvider }),
+    queryFn: () => agentsApi.adapterModels(companyId!, agent.adapterType, { provider: catalogProvider, environmentId: agent.defaultEnvironmentId ?? null, ...nativeCatalog }),
+    ...(nativeCatalog ? ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS : {}),
     enabled: Boolean(companyId) && content === "runtime" && !["openai_dot", "grok_bot", "muse"].includes(catalogProvider ?? ""),
   });
 

@@ -127,6 +127,12 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Pi harness",
     icon: Terminal,
   },
+  pi_rpc: {
+    label: "Pi",
+    description: "Pi harness",
+    icon: Terminal,
+    hideFromVisualSelection: true,
+  },
   cursor: {
     label: "Cursor",
     description: "Cursor CLI harness",
@@ -227,7 +233,7 @@ export function agentDisplayAdapterType(agent: { adapterType: string; adapterCon
     return agent.adapterConfig.provider;
   }
   const harness = agentHarnessType(agent.adapterType, agent.adapterConfig);
-  return ["codex_local", "claude_local", "opencode_local", "pi_local", "antigravity_runtime"].includes(harness) ? harness : agent.adapterType;
+  return ["codex_local", "claude_local", "opencode_local", "pi_local", "pi_rpc", "antigravity_runtime"].includes(harness) ? harness : agent.adapterType;
 }
 
 export function isKnownAdapterType(type: string): boolean {
