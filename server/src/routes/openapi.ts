@@ -4222,7 +4222,7 @@ registry.registerPath({
     params: z.object({ companyId: z.string(), type: z.string() }),
     query: z.object({
       provider: z
-        .enum(["codex", "acpx", "opencode", "claude_managed", "aws_agentcore", "openrouter"])
+        .enum(["codex", "acpx", "opencode", "pi_rpc", "claude_managed", "aws_agentcore", "openrouter"])
         .optional(),
       environmentId: z.string().optional(),
       refresh: z.string().optional(),
