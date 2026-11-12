@@ -1347,7 +1347,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "initialized" => {}
             "session.revalidate" | "run.attach" => {
-                if !message.pointer("/params/baseInstructions").is_some_and(Value::is_string) {
+                if !message
+                    .pointer("/params/baseInstructions")
+                    .is_some_and(Value::is_string)
+                {
                     return Err("Pi facade admission omitted baseInstructions".into());
                 }
                 send(json!({"id":id,"result":true}))?;

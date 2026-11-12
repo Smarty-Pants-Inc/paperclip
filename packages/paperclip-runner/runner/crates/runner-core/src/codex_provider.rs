@@ -1699,12 +1699,17 @@ impl CodexProvider {
                 LocalRunnerError::invalid("Pi warm attachment requires current run context")
             })?;
             let (params, tool_ids) = pi_run_context_params(
-                instructions, &authorized_tools, runtime_context, Some(run_id),
+                instructions,
+                &authorized_tools,
+                runtime_context,
+                Some(run_id),
             )?;
             // Admit the refreshed native binding before publishing attachment,
             // not just when the next prompt happens to reach the proxy.
             if self.request("run.attach", params)? != json!(true) {
-                return Err(LocalRunnerError::invalid("Pi run attachment was not acknowledged"));
+                return Err(LocalRunnerError::invalid(
+                    "Pi run attachment was not acknowledged",
+                ));
             }
             self.config.instructions = instructions.to_owned();
             self.pi_runtime_context = runtime_context.clone();
@@ -1912,7 +1917,10 @@ impl CodexProvider {
     pub(crate) fn pi_host_park_ready(&mut self) -> Result<bool, LocalRunnerError> {
         let proof = self.request("paperclip/host_park_ready", json!({}))?;
         if proof.get("ready") != Some(&json!(true))
-            || !proof.get("reasons").and_then(Value::as_array).is_some_and(Vec::is_empty)
+            || !proof
+                .get("reasons")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
         {
             return Ok(false);
         }
@@ -2290,16 +2298,25 @@ impl CodexProvider {
             codex_plan_collaboration_mode(&self.config, self.observed_model.as_deref(), effort)?;
         let pi_context = if self.config.provider == "pi_rpc" {
             let (params, _) = pi_run_context_params(
-                &self.config.instructions, &self.authorized_tools, &self.pi_runtime_context, run_id,
+                &self.config.instructions,
+                &self.authorized_tools,
+                &self.pi_runtime_context,
+                run_id,
             )?;
             // Attachment precedes the authority claim; this admission observes
             // the claimed authority before any next-prompt bytes are sent.
             // Revalidation runs the managed-session refresher after authority
             // rotates. Supply the newly admitted grant, not its launch-time base.
-            if self.request("session.revalidate", json!({
-                "baseInstructions": params["baseInstructions"],
-            }))? != json!(true) {
-                return Err(LocalRunnerError::invalid("Pi post-claim admission was not acknowledged"));
+            if self.request(
+                "session.revalidate",
+                json!({
+                    "baseInstructions": params["baseInstructions"],
+                }),
+            )? != json!(true)
+            {
+                return Err(LocalRunnerError::invalid(
+                    "Pi post-claim admission was not acknowledged",
+                ));
             }
             Some(params)
         } else {
@@ -2335,7 +2352,12 @@ impl CodexProvider {
             }
         }
         if let Some(pi_context) = pi_context {
-            turn_params_object.extend(pi_context.as_object().expect("Pi context is an object").clone());
+            turn_params_object.extend(
+                pi_context
+                    .as_object()
+                    .expect("Pi context is an object")
+                    .clone(),
+            );
         }
         if let Some(effort) = effort {
             turn_params_object.insert("effort".to_owned(), effort.clone());
@@ -5499,7 +5521,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn completion_tail_provider_with_pi_reply(flood: bool, pi_reply: Option<&str>) -> CodexProvider {
+    fn completion_tail_provider_with_pi_reply(
+        flood: bool,
+        pi_reply: Option<&str>,
+    ) -> CodexProvider {
         // A real JSON-RPC child writes the terminal before exiting. The
         // per-instance receiver proxy below controls reader delivery only.
         let script = r#"
@@ -5540,8 +5565,12 @@ done
             command: PathBuf::from("/bin/sh"),
             args: vec![
                 "-c".to_owned(),
-                script.replace("__FLOOD_STDOUT__", if flood { "true" } else { "false" })
-                    .replace("__PI_TURNS__", if pi_reply.is_some() { "true" } else { "false" })
+                script
+                    .replace("__FLOOD_STDOUT__", if flood { "true" } else { "false" })
+                    .replace(
+                        "__PI_TURNS__",
+                        if pi_reply.is_some() { "true" } else { "false" },
+                    )
                     .replace("__PI_REPLY__", pi_reply.unwrap_or("\"result\":true")),
             ],
             cwd: std::env::current_dir()
@@ -6437,7 +6466,11 @@ done
         };
 
         let launch = verified_opencode_launch(&profile).unwrap();
-        assert_eq!(launch.arguments().len(), 3, "Pi resource metadata is Pi-only");
+        assert_eq!(
+            launch.arguments().len(),
+            3,
+            "Pi resource metadata is Pi-only"
+        );
         assert!(matches!(
             launch.arguments().first(),
             Some(VerifiedProcessArgument::CommonJsArtifact(_))
@@ -6689,7 +6722,8 @@ done
             response_schema: json!({"type": "object"}),
         };
         for busy in [false, true] {
-            let mut provider = completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
+            let mut provider =
+                completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
             provider.config.provider = "pi_rpc".to_owned();
             let process_id = provider.process_id();
             let thread_id = provider.thread_id.clone();
@@ -6697,17 +6731,31 @@ done
                 provider.active_provider_turn_id = Some("live-turn".to_owned());
             }
             let result = provider.attach_run_in_place(
-                [tool.clone()], None,
-                Some(("Fresh run instructions", &json!({"runId": "fresh-run"}), "fresh-run")),
+                [tool.clone()],
+                None,
+                Some((
+                    "Fresh run instructions",
+                    &json!({"runId": "fresh-run"}),
+                    "fresh-run",
+                )),
                 &mut Vec::new(),
             );
             if busy {
-                assert!(result.is_err(), "changed Pi tools cannot bypass live-work fences");
+                assert!(
+                    result.is_err(),
+                    "changed Pi tools cannot bypass live-work fences"
+                );
                 assert!(provider.authorized_tools.is_empty());
             } else {
-                assert!(result.unwrap(), "Pi can bind tools without replacing its process");
+                assert!(
+                    result.unwrap(),
+                    "Pi can bind tools without replacing its process"
+                );
                 assert_eq!(provider.authorized_tools, [tool.clone()]);
-                assert_eq!(provider.authorized_tool_ids, BTreeSet::from([tool.operation_id.clone()]));
+                assert_eq!(
+                    provider.authorized_tool_ids,
+                    BTreeSet::from([tool.operation_id.clone()])
+                );
                 assert_eq!(provider.process_id(), process_id);
                 assert_eq!(provider.thread_id, thread_id);
                 assert_eq!(provider.config.instructions, "Fresh run instructions");
@@ -6736,32 +6784,70 @@ done
         provider.sent_frame_observer = Some(Box::new(move |frame| {
             recorded.lock().unwrap().push(frame.clone());
         }));
-        assert!(provider.attach_run_in_place(
-            [tool], None,
-            Some(("Fresh second run instructions", &context, "second-run")),
-            &mut Vec::new(),
-        ).unwrap());
+        assert!(provider
+            .attach_run_in_place(
+                [tool],
+                None,
+                Some(("Fresh second run instructions", &context, "second-run")),
+                &mut Vec::new(),
+            )
+            .unwrap());
         let cwd = provider.config.cwd.clone();
-        let result = provider.start_turn_with_options_and_effort(
-            "Next prompt", &cwd, CodexTurnOptions::default(), None, Some("second-run")
-        ).unwrap();
+        let result = provider
+            .start_turn_with_options_and_effort(
+                "Next prompt",
+                &cwd,
+                CodexTurnOptions::default(),
+                None,
+                Some("second-run"),
+            )
+            .unwrap();
         assert_eq!(result["turn"]["id"], "reader-tail-2");
         provider.shutdown().unwrap();
         let frames = frames.lock().unwrap();
-        let start = frames.iter().find(|frame| frame["method"] == "turn/start").unwrap();
+        let start = frames
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
         assert_eq!(start["params"]["paperclipRunId"], "second-run");
-        assert!(start["params"]["baseInstructions"].as_str().unwrap().contains("Fresh second run instructions"));
-        assert_eq!(start["params"]["dynamicTools"][0]["name"], "second_run_operation");
+        assert!(start["params"]["baseInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("Fresh second run instructions"));
+        assert_eq!(
+            start["params"]["dynamicTools"][0]["name"],
+            "second_run_operation"
+        );
         assert_eq!(start["params"]["runtimeContext"], context);
-        let attach = frames.iter().position(|frame| frame["method"] == "run.attach").unwrap();
-        let revalidate = frames.iter().position(|frame| frame["method"] == "session.revalidate").unwrap();
-        let prompt = frames.iter().position(|frame| frame["method"] == "turn/start").unwrap();
+        let attach = frames
+            .iter()
+            .position(|frame| frame["method"] == "run.attach")
+            .unwrap();
+        let revalidate = frames
+            .iter()
+            .position(|frame| frame["method"] == "session.revalidate")
+            .unwrap();
+        let prompt = frames
+            .iter()
+            .position(|frame| frame["method"] == "turn/start")
+            .unwrap();
         assert!(attach < revalidate && revalidate < prompt);
         // The post-claim refresher must use the admitted attachment's grant,
         // not the retained proxy's launch-time FIRST instructions.
-        assert_eq!(frames[revalidate]["params"]["baseInstructions"], start["params"]["baseInstructions"]);
-        assert!(!frames[revalidate]["params"]["baseInstructions"].as_str().unwrap().contains("FIRST"));
-        for key in ["baseInstructions", "dynamicTools", "runtimeContext", "paperclipRunId"] {
+        assert_eq!(
+            frames[revalidate]["params"]["baseInstructions"],
+            start["params"]["baseInstructions"]
+        );
+        assert!(!frames[revalidate]["params"]["baseInstructions"]
+            .as_str()
+            .unwrap()
+            .contains("FIRST"));
+        for key in [
+            "baseInstructions",
+            "dynamicTools",
+            "runtimeContext",
+            "paperclipRunId",
+        ] {
             assert_eq!(frames[attach]["params"][key], start["params"][key], "{key}");
         }
     }
@@ -6769,7 +6855,10 @@ done
     #[cfg(unix)]
     #[test]
     fn pi_attachment_requires_native_acknowledgment_before_authority_or_prompt() {
-        for reply in ["\"result\":false", "\"error\":{\"code\":-32000,\"message\":\"admission denied\"}"] {
+        for reply in [
+            "\"result\":false",
+            "\"error\":{\"code\":-32000,\"message\":\"admission denied\"}",
+        ] {
             let mut provider = completion_tail_provider_with_pi_reply(false, Some(reply));
             provider.config.provider = "pi_rpc".to_owned();
             let instructions = provider.config.instructions.clone();
@@ -6779,19 +6868,33 @@ done
             provider.sent_frame_observer = Some(Box::new(move |frame| {
                 recorded.lock().unwrap().push(frame.clone());
             }));
-            assert!(provider.attach_run_in_place(
-                [], None, Some(("Unacknowledged instructions", &Value::Null, "denied-run")),
-                &mut Vec::new(),
-            ).is_err());
+            assert!(provider
+                .attach_run_in_place(
+                    [],
+                    None,
+                    Some(("Unacknowledged instructions", &Value::Null, "denied-run")),
+                    &mut Vec::new(),
+                )
+                .is_err());
             assert_eq!(provider.config.instructions, instructions);
             assert_eq!(provider.completed_turn_authority, authority);
             assert!(provider.authorized_tools.is_empty());
             let cwd = provider.config.cwd.clone();
-            assert!(provider.start_turn_with_options_and_effort(
-                "Must not reach prompt", &cwd, CodexTurnOptions::default(), None, Some("denied-run")
-            ).is_err());
+            assert!(provider
+                .start_turn_with_options_and_effort(
+                    "Must not reach prompt",
+                    &cwd,
+                    CodexTurnOptions::default(),
+                    None,
+                    Some("denied-run")
+                )
+                .is_err());
             assert!(!provider.ambiguous_turn_start_pending);
-            assert!(!frames.lock().unwrap().iter().any(|frame| frame["method"] == "turn/start"));
+            assert!(!frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame["method"] == "turn/start"));
             provider.shutdown().unwrap();
         }
     }
@@ -6800,14 +6903,26 @@ done
     #[test]
     fn pi_attachment_parking_requires_a_complete_idle_native_proof() {
         for (reply, expected) in [
-            ("\"result\":{\"ready\":false,\"reasons\":[\"queued_work\"]}", Some(false)),
+            (
+                "\"result\":{\"ready\":false,\"reasons\":[\"queued_work\"]}",
+                Some(false),
+            ),
             ("\"result\":{\"ready\":true,\"reasons\":[]}", Some(true)),
-            ("\"result\":{\"ready\":true,\"reasons\":[\"pending_dialog\"]}", Some(false)),
+            (
+                "\"result\":{\"ready\":true,\"reasons\":[\"pending_dialog\"]}",
+                Some(false),
+            ),
             ("\"result\":{\"ready\":true}", Some(false)),
-            ("\"result\":{\"ready\":\"true\",\"reasons\":[]}", Some(false)),
+            (
+                "\"result\":{\"ready\":\"true\",\"reasons\":[]}",
+                Some(false),
+            ),
             ("\"result\":{\"ready\":true,\"reasons\":null}", Some(false)),
             ("\"result\":true", Some(false)),
-            ("\"error\":{\"code\":-32601,\"message\":\"method unavailable\"}", None),
+            (
+                "\"error\":{\"code\":-32601,\"message\":\"method unavailable\"}",
+                None,
+            ),
         ] {
             let mut provider = completion_tail_provider_with_pi_reply(false, Some(reply));
             provider.config.provider = "pi_rpc".to_owned();
@@ -6833,7 +6948,8 @@ done
     #[test]
     fn pi_attachment_keeps_other_provider_tool_and_turn_paths_unchanged() {
         for name in ["codex", "opencode"] {
-            let mut provider = completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
+            let mut provider =
+                completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
             provider.config.provider = name.to_owned();
             let frames = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&frames);
@@ -6841,25 +6957,40 @@ done
                 recorded.lock().unwrap().push(frame.clone());
             }));
             let tool = AuthorizedTool {
-                operation_id: "changed_tool".to_owned(), version: 1,
+                operation_id: "changed_tool".to_owned(),
+                version: 1,
                 description: "Changed tool".to_owned(),
                 input_schema: json!({"type": "object"}),
                 response_schema: json!({"type": "object"}),
             };
-            assert!(!provider.attach_run_in_place([tool], None, None, &mut Vec::new()).unwrap());
+            assert!(!provider
+                .attach_run_in_place([tool], None, None, &mut Vec::new())
+                .unwrap());
             assert!(provider.authorized_tools.is_empty());
             let cwd = provider.config.cwd.clone();
-            provider.start_turn_with_options_and_effort(
-                "Unchanged provider prompt", &cwd, CodexTurnOptions::default(), None, Some("next-run")
-            ).unwrap();
+            provider
+                .start_turn_with_options_and_effort(
+                    "Unchanged provider prompt",
+                    &cwd,
+                    CodexTurnOptions::default(),
+                    None,
+                    Some("next-run"),
+                )
+                .unwrap();
             let frames = frames.lock().unwrap();
-            assert_eq!(frames.len(), 1, "{name} must issue no Pi attachment/admission RPC");
+            assert_eq!(
+                frames.len(),
+                1,
+                "{name} must issue no Pi attachment/admission RPC"
+            );
             assert_eq!(frames[0]["method"], "turn/start");
             for key in ["baseInstructions", "dynamicTools", "runtimeContext"] {
                 assert!(frames[0]["params"].get(key).is_none(), "{name}: {key}");
             }
-            assert_eq!(frames[0]["params"].get("paperclipRunId"),
-                (name == "opencode").then_some(&json!("next-run")));
+            assert_eq!(
+                frames[0]["params"].get("paperclipRunId"),
+                (name == "opencode").then_some(&json!("next-run"))
+            );
             drop(frames);
             provider.shutdown().unwrap();
         }
@@ -6892,13 +7023,33 @@ done
         for key in keys {
             assert!(PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
             assert!(OPENCODE_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
-            assert_eq!(PI_RPC_PROVIDER_ENVIRONMENT_KEYS.iter().filter(|candidate| **candidate == key).count(), 1);
-            assert!(!CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
+            assert_eq!(
+                PI_RPC_PROVIDER_ENVIRONMENT_KEYS
+                    .iter()
+                    .filter(|candidate| **candidate == key)
+                    .count(),
+                1
+            );
+            assert!(
+                !CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS.contains(&key),
+                "{key}"
+            );
             assert!(!CODEX_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
         }
-        let first = PI_RPC_PROVIDER_ENVIRONMENT_KEYS.iter().position(|key| *key == keys[0]).unwrap();
-        assert_eq!(&PI_RPC_PROVIDER_ENVIRONMENT_KEYS[first..first + keys.len()], &keys);
-        for key in ["NODE_OPTIONS", "NODE_PATH", "PAPERCLIP_PI_COMMAND", "PAPERCLIP_NATIVE_MCP_SECRET"] {
+        let first = PI_RPC_PROVIDER_ENVIRONMENT_KEYS
+            .iter()
+            .position(|key| *key == keys[0])
+            .unwrap();
+        assert_eq!(
+            &PI_RPC_PROVIDER_ENVIRONMENT_KEYS[first..first + keys.len()],
+            &keys
+        );
+        for key in [
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PAPERCLIP_PI_COMMAND",
+            "PAPERCLIP_NATIVE_MCP_SECRET",
+        ] {
             assert!(!PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
         }
     }
