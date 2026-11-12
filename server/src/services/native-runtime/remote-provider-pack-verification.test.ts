@@ -173,3 +173,181 @@ describe("installed provider pack compatibility", () => {
   });
 
 });
+
+
+// Trust-boundary regressions: execute the verifier's remote command against real
+// pack files. No provider, network, credentials or live sandbox is needed.
+type NativePiPack = ProviderPackIdentity & {
+  payload: {
+    distDigest: string;
+    nativeProviders?: Record<string, { version: string; profileDigest: string; closureDigest: string; path: string; sha256: string }>;
+  };
+};
+
+function fixtureTreeDigest(files: Record<string, string>): string {
+  const records: string[] = [];
+  const visit = (prefix: string) => {
+    const children = [...new Set(Object.keys(files).filter(path => path.startsWith(prefix))
+      .map(path => path.slice(prefix.length).split("/")[0]))].sort((a, b) => a.localeCompare(b));
+    for (const child of children) {
+      const path = `${prefix}${child}`;
+      if (path in files) records.push(`file\0${path}\0${sha(files[path])}\n`);
+      else { records.push(`directory\0${path}\n`); visit(`${path}/`); }
+    }
+  };
+  visit("");
+  return sha(records.join(""));
+}
+
+async function nativePiFixture() {
+  const root = await mkdtemp(join(tmpdir(), "native-pi-pack-verification-"));
+  const pack = manifest("a") as NativePiPack;
+  Object.assign(pack.payload.pins, { acpx: "0.22.0", claudeAcp: "0.73.0", codexAcp: "1.6.2" });
+  const nativePath = "provider-assets/pi_rpc/linux-x64";
+  const executablePath = `${nativePath}/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`;
+  const proxyPath = "dist/cli/pi-rpc-app-server-proxy.cjs";
+  const files: Record<string, string> = {
+    [pack.payload.artifacts.nodeCommand.path]: `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+    [pack.payload.artifacts.opencodeCommand.path]: `#!/bin/sh\nprintf '%s\n' '${pack.payload.pins.opencode}'\n`,
+    [proxyPath]: "// native Pi RPC proxy\n",
+    [executablePath]: "// independently pinned native Pi CLI\n",
+    [`${nativePath}/runtime/node_modules/@earendil-works/pi-ai/package.json`]: '{"version":"1.5.2"}\n',
+  };
+  for (const [pkg, version] of Object.entries({ acpx: pack.payload.pins.acpx,
+    "@agentclientprotocol/claude-agent-acp": pack.payload.pins.claudeAcp,
+    "@agentclientprotocol/codex-acp": pack.payload.pins.codexAcp, "opencode-ai": pack.payload.pins.opencode })) {
+    files[`node_modules/${pkg}/package.json`] = JSON.stringify({ version });
+  }
+  pack.payload.artifacts.piRpcProxy = { path: proxyPath, sha256: sha(files[proxyPath]) };
+  pack.payload.artifacts.piRpcExecutable = { path: executablePath, sha256: sha(files[executablePath]) };
+  for (const [name, artifact] of Object.entries(pack.payload.artifacts)) {
+    files[artifact.path] ??= `fixture ${name}\n`;
+    artifact.sha256 = sha(files[artifact.path]);
+  }
+  for (const [path, content] of Object.entries(files)) {
+    await mkdir(dirname(join(root, path)), { recursive: true });
+    await writeFile(join(root, path), content, { mode: 0o755 });
+  }
+  const subtree = (prefix: string) => Object.fromEntries(Object.entries(files)
+    .filter(([path]) => path.startsWith(`${prefix}/`)).map(([path, content]) => [path.slice(prefix.length + 1), content]));
+  pack.payload.distDigest = fixtureTreeDigest(subtree("dist"));
+  pack.payload.nativeProviders = { pi_rpc: { version: "1.5.2", profileDigest: sha("native-pi-profile"),
+    closureDigest: sha("native-pi-closure"), path: nativePath, sha256: fixtureTreeDigest(subtree(nativePath)) } };
+  const seal = async () => {
+    pack.digest = sha(canonicalProviderPackJson(pack.payload));
+    await writeFile(join(root, "provider-pack.json"), JSON.stringify(pack));
+  };
+  await seal();
+  const execute = vi.fn(async (request: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) => {
+    try {
+      const result = await promisify(execFile)(request.command, request.args ?? [], { cwd: request.cwd, timeout: request.timeoutMs });
+      return { ...result, exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString() };
+    } catch (error) {
+      const failed = error as Error & { code: number; stdout: string; stderr: string };
+      if (typeof failed.code !== "number") throw error;
+      return { stdout: failed.stdout, stderr: failed.stderr, exitCode: failed.code, signal: null,
+        timedOut: false, pid: null, startedAt: new Date().toISOString() };
+    }
+  });
+  const input = { runner: { execute }, cwd: root, packRoot: root, manifest: pack, provider: { kind: "pi_rpc" as const } };
+  return { root, pack, input, execute, seal, cleanup: () => rm(root, { recursive: true, force: true }) };
+}
+
+describe("native Pi remote provider pack verification", () => {
+  it("verifies the declared native Pi proxy, executable and closure over the remote runner", async () => {
+    const fixture = await nativePiFixture();
+    try {
+      const verified = await verifyRemoteProviderPack(fixture.input);
+      expect(verified).toEqual(fixture.pack);
+      expect(verified).not.toBe(fixture.pack);
+      expect(fixture.execute).toHaveBeenCalledWith(expect.objectContaining({ bypassSession: true, timeoutMs: 30_000 }));
+    } finally { await fixture.cleanup(); }
+  });
+
+  it.each(["piRpcProxy", "piRpcExecutable"])("refuses a missing %s manifest entry", async name => {
+    const fixture = await nativePiFixture();
+    try {
+      delete fixture.pack.payload.artifacts[name];
+      await fixture.seal();
+      await expect(verifyRemoteProviderPack(fixture.input)).rejects.toThrow(/runner_remote_provider_artifact_incompatible/);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it.each(["piRpcProxy", "piRpcExecutable"])("refuses a missing %s file", async name => {
+    const fixture = await nativePiFixture();
+    try {
+      await rm(join(fixture.root, fixture.pack.payload.artifacts[name].path));
+      await expect(verifyRemoteProviderPack(fixture.input)).rejects.toThrow(/runner_remote_provider_artifact_incompatible/);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it.each(["piRpcProxy", "piRpcExecutable"])("refuses a %s digest mismatch", async name => {
+    const fixture = await nativePiFixture();
+    try {
+      fixture.pack.payload.artifacts[name].sha256 = sha("not the file's bytes");
+      await fixture.seal();
+      await expect(verifyRemoteProviderPack(fixture.input)).rejects.toThrow(new RegExp(`runner_remote_provider_artifact_incompatible:.*${name} digest mismatch`, "s"));
+    } finally { await fixture.cleanup(); }
+  });
+
+  it.each(["pi_rpc", "nativeProviders"])("refuses native Pi selection without %s, even with an ACPX Pi entry", async field => {
+    const fixture = await nativePiFixture();
+    try {
+      // The legacy ACPX lane cannot authorize native Pi.
+      fixture.pack.payload.candidateProviders = { pi: fixture.pack.payload.nativeProviders!.pi_rpc };
+      if (field === "pi_rpc") delete fixture.pack.payload.nativeProviders!.pi_rpc;
+      else delete fixture.pack.payload.nativeProviders;
+      await fixture.seal();
+      await expect(verifyRemoteProviderPack(fixture.input)).rejects.toThrow(/runner_remote_provider_artifact_incompatible:.*pi_rpc/s);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("refuses changed files elsewhere in the independent native Pi closure", async () => {
+    const fixture = await nativePiFixture();
+    try {
+      await writeFile(join(fixture.root, "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-ai/package.json"), "corrupted dependency");
+      await expect(verifyRemoteProviderPack(fixture.input)).rejects.toThrow(/runner_remote_provider_artifact_incompatible:.*native Pi asset tree digest mismatch/s);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("also verifies declared native Pi bytes when the caller omits provider", async () => {
+    const fixture = await nativePiFixture();
+    try {
+      fixture.pack.payload.artifacts.piRpcExecutable.sha256 = sha("wrong executable");
+      await fixture.seal();
+      await expect(verifyRemoteProviderPack({ ...fixture.input, provider: undefined })).rejects.toThrow(/runner_remote_provider_artifact_incompatible:.*piRpcExecutable digest mismatch/s);
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("admits an exact protected native Pi installation without running commands", async () => {
+    const fixture = await nativePiFixture();
+    try {
+      await expect(verifyRemoteProviderPack({ ...fixture.input,
+        installation: { root: fixture.root, manifest: structuredClone(fixture.pack), immutable: true } })).resolves.toEqual(fixture.pack);
+      expect(fixture.execute).not.toHaveBeenCalled();
+    } finally { await fixture.cleanup(); }
+  });
+
+  it("refuses a protected installation without native Pi", async () => {
+    const fixture = await nativePiFixture();
+    try {
+      const installed = structuredClone(fixture.pack);
+      delete installed.payload.nativeProviders;
+      installed.digest = sha(canonicalProviderPackJson(installed.payload));
+      await expect(verifyRemoteProviderPack({ ...fixture.input,
+        installation: { root: fixture.root, manifest: installed, immutable: true } })).rejects.toThrow("runner_remote_provider_artifact_incompatible");
+    } finally { await fixture.cleanup(); }
+  });
+
+  it.each(["opencode", "acpx"] as const)("keeps legacy %s content verification valid without a native Pi declaration", async kind => {
+    const fixture = await nativePiFixture();
+    try {
+      delete fixture.pack.payload.nativeProviders;
+      delete fixture.pack.payload.artifacts.piRpcProxy;
+      delete fixture.pack.payload.artifacts.piRpcExecutable;
+      await fixture.seal();
+      const provider = kind === "acpx" ? { kind, agent: "claude" } : { kind };
+      await expect(verifyRemoteProviderPack({ ...fixture.input, provider })).resolves.toEqual(fixture.pack);
+    } finally { await fixture.cleanup(); }
+  });
+});

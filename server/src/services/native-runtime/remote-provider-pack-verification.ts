@@ -19,6 +19,7 @@ export type ProviderPackIdentity = {
     acpxProfileDigests?: Record<string, string>;
     providers?: Record<string, unknown>;
     candidateProviders?: Record<string, unknown>;
+    nativeProviders?: Record<string, { path: string; sha256: string }>;
     pins: { opencode: string; [key: string]: string | null };
     target: { platform: string; architecture: string };
     runnerSourceRevision: string;
@@ -27,7 +28,7 @@ export type ProviderPackIdentity = {
 };
 
 export type ProviderPackInstallation = { root: string; manifest: unknown; immutable: boolean };
-export type PackProvider = { kind: "opencode" } | { kind: "acpx"; agent: string };
+export type PackProvider = { kind: "opencode" } | { kind: "acpx"; agent: string } | { kind: "pi_rpc" };
 
 /** Admission of a build-qualified, OS-protected installation. Source revisions,
  * dependency pins and unrelated provider changes are provenance, not an interface.
@@ -42,12 +43,14 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
 ): T {
   const actual = installation.manifest as T | null;
   const payload = actual?.payload;
-  const contract = expected.payload.compatibility?.[provider.kind];
+  const contract = provider.kind === "pi_rpc" ? undefined : expected.payload.compatibility?.[provider.kind];
+  // Native Pi has no published compatibility revision; reuse only exact packs.
+  const exactIdentity = requireExactIdentity || provider.kind === "pi_rpc";
   if (!installation.immutable || installation.root !== packRoot || !payload
     || actual.schema !== expected.schema
     || actual.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackJson(payload)).digest("hex")}`
     || canonicalProviderPackJson(payload.target) !== canonicalProviderPackJson(expected.payload.target)
-    || (requireExactIdentity ? actual.digest !== expected.digest
+    || (exactIdentity ? actual.digest !== expected.digest
       : !Number.isSafeInteger(contract) || contract! < 1 || payload.compatibility?.[provider.kind] !== contract
         || !/^sha256:[a-f0-9]{64}$/.test(expected.payload.contractDigest ?? "")
         || payload.contractDigest !== expected.payload.contractDigest)
@@ -92,6 +95,13 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   requireExactIdentity?: boolean;
   requireCurrentOpenCodeProxy?: boolean;
 }): Promise<T> {
+  const nativePi = manifest.payload.nativeProviders?.pi_rpc;
+  if (provider?.kind === "pi_rpc" && !nativePi) {
+    throw new Error("runner_remote_provider_artifact_incompatible: native provider pi_rpc is missing");
+  }
+  if (nativePi && (!manifest.payload.artifacts.piRpcProxy || !manifest.payload.artifacts.piRpcExecutable)) {
+    throw new Error("runner_remote_provider_artifact_incompatible: native Pi proxy or executable artifact is missing");
+  }
   if (installation) {
     if (!provider) throw new Error("runner_remote_provider_artifact_incompatible: provider interface is required");
     return compatibleInstallation(installation, manifest, packRoot, provider, requireExactIdentity, requireCurrentOpenCodeProxy);
@@ -117,6 +127,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "const hash=(p)=>'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(path.join(root,p))).digest('hex')",
     "const tree=(treeRoot)=>{const digest=crypto.createHash('sha256');const visit=(directory,prefix='')=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))){const relative=prefix?prefix+'/'+entry.name:entry.name;const absolute=path.join(directory,entry.name);if(entry.isDirectory()){digest.update('directory\\0'+relative+'\\n');visit(absolute,relative)}else if(entry.isFile()){digest.update('file\\0'+relative+'\\0'+'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex')+'\\n')}else if(entry.isSymbolicLink()){digest.update('symlink\\0'+relative+'\\0'+fs.readlinkSync(absolute)+'\\n')}else throw new Error('unsupported dist entry '+relative)}};visit(treeRoot);return 'sha256:'+digest.digest('hex')}",
     "for(const name of ['nodeCommand','productionLock','opencodeCommand','opencodeExecutable','opencodeProxy','acpxSidecar','grokLauncher']){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)throw new Error(name+' digest mismatch')}",
+    "if(manifest.payload.nativeProviders?.pi_rpc){for(const name of ['piRpcProxy','piRpcExecutable']){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)throw new Error(name+' digest mismatch')}const native=manifest.payload.nativeProviders.pi_rpc;if(tree(path.join(root,native.path))!==native.sha256)throw new Error('native Pi asset tree digest mismatch')}",
     "if(tree(path.join(root,'dist'))!==manifest.payload.distDigest)throw new Error('dist tree digest mismatch')",
     "for(const candidate of Object.values({...manifest.payload.providers,...manifest.payload.candidateProviders})){if(tree(path.join(root,candidate.path))!==candidate.sha256)throw new Error('candidate asset tree digest mismatch')}",
     "const version=process.versions.node.split('.').map(Number)",
