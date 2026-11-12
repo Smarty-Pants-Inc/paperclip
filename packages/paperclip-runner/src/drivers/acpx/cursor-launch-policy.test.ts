@@ -8,7 +8,7 @@ afterEach(async () => { await Promise.all(roots.splice(0).map(root => rm(root, {
 async function fixture() { const root = await mkdtemp(join(tmpdir(), "cursor-policy-")); roots.push(root); await mkdir(join(root, "project")); await mkdir(join(root, ".git")); return root; }
 it("uses fixed update/project config flags and memory-only credential storage", () => {
   expect(CURSOR_FIXED_ARGUMENTS).toEqual(["--disable-project-configs", "--disable-auto-update", "acp"]);
-  expect(cursorPrivateEnvironment({ agentHomeDirectory: "/private/home", dataDirectory: "/private/data", cacheDirectory: "/private/cache" })).toEqual({ CURSOR_CONFIG_DIR: "/private/home", CURSOR_DATA_DIR: "/private/data", NODE_COMPILE_CACHE: "/private/cache/cursor-compile-cache", AGENT_CLI_CREDENTIAL_STORE: "memory", NO_OPEN_BROWSER: "1" });
+  expect(cursorPrivateEnvironment({ agentHomeDirectory: "/private/home", dataDirectory: "/private/data", cacheDirectory: "/private/cache" })).toEqual({ CURSOR_CONFIG_DIR: "/private/home", CURSOR_DATA_DIR: "/private/data", NODE_COMPILE_CACHE: "/private/cache/node-compile-cache", NODE_DISABLE_COMPILE_CACHE: "1", AGENT_CLI_CREDENTIAL_STORE: "memory", NO_OPEN_BROWSER: "1" });
 });
 it("rejects parent-root MCP/hooks and symlinked config, while leaving ordinary Claude settings alone", async () => {
   const root = await fixture(); const project = join(root, "project");

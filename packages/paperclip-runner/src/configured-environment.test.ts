@@ -75,7 +75,8 @@ describe("configured environment authority", () => {
   it.each([
     "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL",
     "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
-  ])("reserves managed route value %s for the runner instead of task children", name => {
+    "NODE_COMPILE_CACHE", "NODE_DISABLE_COMPILE_CACHE",
+  ])("reserves launch policy value %s for the runner instead of task children", name => {
     for (const key of [name, name.toLowerCase()]) {
       const projected = configuredEnvironmentProjection({ [key]: "route-fixture", CUSTOM_FLAG: "allowed" });
       expect(projected).not.toHaveProperty(key);

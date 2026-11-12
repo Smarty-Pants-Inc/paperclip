@@ -5,6 +5,7 @@ import { piProviderConfiguration } from "./pi-provider-config.js";
 import { startPiProviderLoopback, usesPiProviderLoopback } from "./pi-provider-loopback.js";
 import { configuredPiNativeExtensions } from "./pi-extension-snapshot.js";
 import { configuredEnvironmentKeys } from "../../configured-environment.js";
+import { nodeCompileCacheEnvironment } from "../../node-compile-cache-environment.js";
 import { COPILOT_SYSTEM_INSTRUCTIONS_FILE } from "./copilot-profile.js";
 import { preparedHarnessHome, preconfiguredHomeEnvironment, usesPreconfiguredHome } from "../preconfigured-home.js";
 import {
@@ -385,6 +386,7 @@ export async function prepareAcpxRuntimeSandbox(input: {
     const launchEnvironment = {
       ...createSanitizedAcpxSpawnInput(input.environment, input.agent).env,
       ...homes,
+      ...nodeCompileCacheEnvironment(root),
       PAPERCLIP_ACPX_PROFILE: input.agent,
       PAPERCLIP_RUNNER_HOME_MODE: "preconfigured",
       ...(input.agent === "claude" ? { ACPX_CLAUDE_INCLUDE_USER_SETTINGS: "1" } : {}),
@@ -561,6 +563,7 @@ export async function prepareAcpxRuntimeSandbox(input: {
     XDG_CONFIG_HOME: configDirectory,
     XDG_DATA_HOME: dataDirectory,
     XDG_CACHE_HOME: cacheDirectory,
+    ...nodeCompileCacheEnvironment(cacheDirectory),
     PAPERCLIP_ACPX_PROFILE: input.agent,
     PAPERCLIP_ACPX_ISOLATED_CONTEXT: "1",
     ...(input.agent === "kimi" ? { KIMI_CODE_HOME: agentHomeDirectory, PAPERCLIP_KIMI_INSTRUCTIONS: kimiInstructionBinding(policy.systemInstructions).payload } : {}),
@@ -583,7 +586,6 @@ export async function prepareAcpxRuntimeSandbox(input: {
           CURSOR_DATA_DIR: dataDirectory,
           AGENT_CLI_CREDENTIAL_STORE: "memory",
           NO_OPEN_BROWSER: "1",
-          NODE_DISABLE_COMPILE_CACHE: "1",
           PAPERCLIP_CURSOR_INSTRUCTIONS: cursorInstructionBinding(policy.systemInstructions).payload,
         }
       : {}),

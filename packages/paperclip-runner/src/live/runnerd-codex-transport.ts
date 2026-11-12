@@ -21,6 +21,7 @@ import { resolveClaudeEffort, admittedClaudeEffort } from "../drivers/acpx/claud
 import { resolveGrokEffort, admittedGrokEffort } from "../drivers/acpx/grok-effort.js";
 import { admittedPiThinkingLevel, resolvePiThinkingLevel } from "../drivers/acpx/pi-thinking.js";
 import { configuredEnvironment } from "../configured-environment.js";
+import { nodeCompileCacheEnvironment } from "../node-compile-cache-environment.js";
 import { githubCredentialEnvironment } from "../github-credential-environment.js";
 import { resolveAcpxProviderMode } from "../drivers/acpx/provider-mode.js";
 import { NATIVE_ASSET_PROVIDERS } from "../drivers/acpx/provider-assets-root.js";
@@ -3916,7 +3917,10 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
 }
 
 export function createCapabilityRunnerdProviderEnvironment(input: Parameters<typeof createCapabilityRunnerdProviderEnvironmentBase>[0]): NodeJS.ProcessEnv {
-  return applyProviderObservabilityEnvironment(createCapabilityRunnerdProviderEnvironmentBase(input), input.options.observability, input.provider === "acpx");
+  return {
+    ...applyProviderObservabilityEnvironment(createCapabilityRunnerdProviderEnvironmentBase(input), input.options.observability, input.provider === "acpx"),
+    ...nodeCompileCacheEnvironment(input.options.stateDirectory ?? input.codexHome),
+  };
 }
 
 const OPEN_CODE_RUNNER_ENVIRONMENT_KEYS = new Set([

@@ -1116,7 +1116,10 @@ impl SupervisedProcess {
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // A runner started without the TS launch builder is safe too.
+            // The provider's local owner may enable a verified private cache.
+            .env("NODE_DISABLE_COMPILE_CACHE", "1");
         for key in [
             "PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT",
             "PAPERCLIP_RUNTIME_NOTIFICATION_HELPER",
@@ -1132,6 +1135,10 @@ impl SupervisedProcess {
             "TEMP",
             "TMP",
             "TZ",
+            // Runner-owned policy; preserve it across env_clear for every
+            // Node proxy/sidecar and its provider descendants.
+            "NODE_COMPILE_CACHE",
+            "NODE_DISABLE_COMPILE_CACHE",
         ]
         .into_iter()
         .chain(additional_environment_keys.iter().copied())
@@ -1643,6 +1650,61 @@ mod tests {
         drop(orphans);
         let _ = fs::remove_dir_all(directory);
         assert!(!alive, "tool job {} outlived its provider", job.pid);
+    }
+
+    // Boat cache EACCES regression: cross the real env_clear/spawn boundary.
+    // Isolate environment changes in a child test harness, not the parallel
+    // Rust test process (std::env::set_var would be unsafe here).
+    #[test]
+    fn supervised_children_keep_runner_owned_node_cache_policy() {
+        const GUARD: &str = "PAPERCLIP_TEST_NODE_CACHE_CHILD";
+        if std::env::var_os(GUARD).is_none() {
+            for disabled in [None, Some(""), Some("1")] {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "process_supervisor::tests::supervised_children_keep_runner_owned_node_cache_policy",
+                    ])
+                    .env(GUARD, "1")
+                    .env("NODE_COMPILE_CACHE", "/private/runtime/node-compile-cache")
+                    .env_remove("PAPERCLIP_CONFIGURED_ENV_KEYS");
+                if let Some(value) = disabled {
+                    command.env("NODE_DISABLE_COMPILE_CACHE", value);
+                } else {
+                    command.env_remove("NODE_DISABLE_COMPILE_CACHE");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "isolated cache test failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+        let mut process = SupervisedProcess::spawn(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_owned(),
+                "printf '%s|%s\\n' \"$NODE_COMPILE_CACHE\" \"$NODE_DISABLE_COMPILE_CACHE\""
+                    .to_owned(),
+            ],
+            Duration::from_millis(500),
+            1024,
+        )
+        .unwrap();
+        let observed = process.receive_stdout_line(Duration::from_secs(5)).unwrap();
+        process.terminate_group().unwrap();
+        assert_eq!(
+            observed,
+            Some(format!(
+                "/private/runtime/node-compile-cache|{}",
+                std::env::var("NODE_DISABLE_COMPILE_CACHE").unwrap_or_else(|_| "1".to_owned())
+            ))
+        );
     }
 
     #[test]
