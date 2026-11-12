@@ -103,7 +103,7 @@ describe("Pi RPC live-session L4 wiring", () => {
   it.each(["model", "effort", "busy"])("rejects inadmissible native %s and closes startup resources without prompt", async kind => {
     const f = await fixture();
     if (kind === "model") f.transport.modelReceipt = { provider: "neutral", id: "wrong" };
-    if (kind === "effort") f.transport.state.thinkingLevel = "off";
+    if (kind === "effort") f.transport.state.thinkingLevel = "max";
     if (kind === "busy") f.transport.state.isStreaming = true;
     await expect(f.open()).rejects.toThrow(/model|thinking|busy/i);
     expect(f.transport.commands.some(command => command.type === "prompt")).toBe(false);
@@ -135,7 +135,7 @@ describe("Pi RPC live-session L4 wiring", () => {
 
   it("failed attach retains the old identity and blocks input until fresh post-claim admission", async () => {
     const f = await fixture(); const { session } = await f.open();
-    f.transport.state.thinkingLevel = "off";
+    f.transport.state.thinkingLevel = "max";
     await expect(session.attachRun!({ runId: "run-b" })).rejects.toThrow(/thinking/);
     expect((await session.snapshot()).runId).toBe("run-a");
     await expect(session.startTurn({ message: { role: "user", text: "must not send" } })).rejects.toThrow(/admi/i);
@@ -265,6 +265,7 @@ describe.skipIf(!process.env.PI_TEST_BINARY)("L4 wiring with real Pi and a local
       session = await driver.openSession({ runId: "real-run-a", normalizedSessionId: "real-session", workingDirectory: workspace }) as PiRpcHarnessSession;
       const pid = session.processPid(), providerSessionId = session.ids().providerSessionId;
       const iterator = session.events()[Symbol.asyncIterator]();
+      expect((await iterator.next()).value).toMatchObject({ eventType: "session.started", payload: { context: { model: "paperclip/faux", piRpcThinkingLevel: "off" } } });
       const turns: Array<{ runId: string; turnId: string }> = [];
       for (const [index, runId] of ["real-run-a", "real-run-b"].entries()) {
         if (index > 0) { await session.attachRun({ runId }); await session.revalidateAfterClaim(); }
