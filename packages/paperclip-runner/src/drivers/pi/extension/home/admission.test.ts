@@ -1,18 +1,18 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { admitNativeHome, assertClaudeClamp, checkNativeHomeEnvironment } from "./admission.js";
+import { admitNativeHome, checkNativeHomeEnvironment } from "./admission.js";
 import { canonicalJson, computeNativeHomeManifest, sha256 } from "./manifest.js";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
-async function fixture() {
+async function fixture(config: unknown = { providers: { managed: { models: [{ id: "claude-fable-5-2", thinkingLevelMap: { max: null } }], modelOverrides: { "claude-sonnet-5": { thinkingLevelMap: { max: null } } } } } }) {
   const root = await mkdtemp(join(tmpdir(), "pi-admit-test-")); roots.push(root);
   const agentDir = join(root, "agent"), guard = join(root, "guard"), subagents = join(root, "subagents");
   for (const p of [agentDir, guard, subagents]) await mkdir(p);
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [guard, subagents] }));
-  await writeFile(join(agentDir, "models.json"), JSON.stringify({ providers: { managed: { models: [{ id: "claude-fable-5-2", thinkingLevelMap: { max: null } }], modelOverrides: { "claude-sonnet-5": { thinkingLevelMap: { max: null } } } } } }));
+  await writeFile(join(agentDir, "models.json"), JSON.stringify(config));
   for (const [path, name, version] of [[guard, "@smarty-pants-inc/tool-context-guard", "1.0.0"], [subagents, "pi-subagents", "0.88.0"]]) { await writeFile(join(path, "package.json"), JSON.stringify({ name, version, pi: { extensions: ["./index.js"] } })); await writeFile(join(path, "index.js"), "export default function() {}\n"); }
   const environment = { PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" };
   const manifest = await computeNativeHomeManifest({ agentDir, packages: [{ source: guard, root: guard }, { source: subagents, root: subagents }], resources: [], allowedExternalRoots: [root], environment, runtime: { distributionDigest: "a".repeat(64), cwd: root, argv: [], projectTrust: "denied", approvedProjectRoots: [] }, effectiveMetadata: {}, effectivePackages: [guard, subagents], effectiveExtensions: [] });
@@ -48,10 +48,11 @@ describe("native required-load admission (trust boundary)", () => {
     const input = await fixture(); await writeFile(join(input.agentDir, "models.json"), "{}");
     await expect(admitNativeHome(input)).rejects.toMatchObject({ code: "pi_home_models_drift" });
   });
-  it("requires exact Claude max:null in models and modelOverrides; never lowers the request", () => {
-    for (const max of [undefined, "high", "max", 0]) expect(() => assertClaudeClamp({ providers: { managed: { models: [{ id: "claude-fable-5-2", thinkingLevelMap: { max } }] } } })).toThrow();
-    expect(() => assertClaudeClamp({ providers: { managed: { modelOverrides: { "claude-sonnet-5": { thinkingLevelMap: { max: "high" } } } } } })).toThrow();
-    expect(() => assertClaudeClamp({ providers: { managed: { models: [{ id: "gpt-6-astra", thinkingLevelMap: { max: "max" } }, { id: "claude-fable-5-2", thinkingLevelMap: { max: null } }] } } })).not.toThrow();
+  it("admits Claude max in models and modelOverrides without changing configured policy", async () => {
+    const input = await fixture({ providers: { managed: { models: [{ id: "claude-fable-5-2", thinkingLevelMap: { max: "max" } }], modelOverrides: { "claude-sonnet-5": { thinkingLevelMap: { max: "max" } } } } } });
+    const modelFile = join(input.agentDir, "models.json"), before = await readFile(modelFile, "utf8");
+    expect(await admitNativeHome(input)).toEqual({ digest: input.manifest.digest });
+    expect(await readFile(modelFile, "utf8")).toBe(before);
   });
   it("has presence-sensitive offline policy, exact version-check policy, and F027 UI unset", () => {
     expect(() => checkNativeHomeEnvironment({ PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1" })).not.toThrow();
