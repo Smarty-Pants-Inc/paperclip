@@ -68,6 +68,7 @@ import { museRunnerBroker } from "../muse-runner-broker.js";
 import { nativeCaseHandoffResult } from "./native-case-handoff.js";
 import { assertExternalNativeRunAuthority } from "./external-native-authority.js";
 import { stageRemoteLaunchAssets } from "./remote-launch-assets.js";
+import { REMOTE_RUNNER_IDENTITY_READY_SCRIPT } from "./remote-runner-readiness.js";
 import {
   NATIVE_CONTINUITY_STATE_ENTRIES, NATIVE_SESSION_ROOT_HELD_ENTRIES, describeUnexpectedNativeSessionRootEntries,
   isKnownNativeSessionRootEntry,
@@ -14875,28 +14876,16 @@ async function waitForRemoteRunnerProcessIdentity(input: {
   runnerInstanceId: string;
   requireProcessStartFingerprint?: boolean;
 }): Promise<{ pid: number; startedAt: string; processStartFingerprint?: string }> {
-  const deadline = Date.now() + REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS;
-  while (Date.now() < deadline) {
-    const result = await input.runner
-      .execute({
-        command: "sh",
-        args: [
-          "-c",
-          'test -f "$1" && test ! -L "$1" && cat -- "$1"',
-          "paperclip-runner-process-identity",
-          input.identityPath,
-        ],
-        bypassSession: true,
-        timeoutMs: 2_000,
-      })
-      .catch(() => null);
-    const identity =
-      result && result.exitCode === 0 && !result.timedOut
-        ? parseRemoteRunnerProcessIdentity(result.stdout, input)
-        : null;
-    if (identity && (!input.requireProcessStartFingerprint || identity.processStartFingerprint)) return identity;
-    await new Promise<void>((resolve) => setTimeout(resolve, 100));
-  }
+  const result = await input.runner.execute({
+    command: "node",
+    args: ["-e", REMOTE_RUNNER_IDENTITY_READY_SCRIPT, "paperclip-runner-process-identity", input.identityPath, input.nonce,
+      input.runnerInstanceId, String(REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS), String(input.requireProcessStartFingerprint === true)],
+    bypassSession: true,
+    timeoutMs: REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS + 1_000,
+  }).catch(() => null);
+  const identity = result && result.exitCode === 0 && !result.timedOut
+    ? parseRemoteRunnerProcessIdentity(result.stdout, input) : null;
+  if (identity && (!input.requireProcessStartFingerprint || identity.processStartFingerprint)) return identity;
   throw new Error("runner_remote_process_identity_unavailable");
 }
 
