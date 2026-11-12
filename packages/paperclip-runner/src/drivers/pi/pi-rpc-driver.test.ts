@@ -21,6 +21,7 @@ class FailureTransport {
   async request(type: string) {
     return { data: type === "get_state" ? { sessionId: "native-session", model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "set_model" ? { provider: "neutral", id: "model" }
+      : type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
       : type === "get_available_thinking_levels" ? { levels: ["high"] }
       : type === "prompt" ? { disposition: "started" } : undefined };
   }
@@ -40,7 +41,7 @@ const flushFailure = () => new Promise<void>(resolve => setImmediate(resolve));
 async function failureFixture(capture = true) {
   const root = await mkdtemp(join(tmpdir(), "pi-failure-"));
   const transport = new FailureTransport();
-  const session = await new PiRpcDriver({ runtimeDirectory: join(root, "runtime"), model: "neutral/model", piThinkingLevel: "high", environment: { PI_CODING_AGENT_DIR: join(root, "agent") }, transportFactory: () => transport as unknown as PiRpcTransport })
+  const session = await new PiRpcDriver({ runtimeDirectory: join(root, "runtime"), model: "neutral/model", piRpcThinkingLevel: "high", environment: { PI_CODING_AGENT_DIR: join(root, "agent") }, transportFactory: () => transport as unknown as PiRpcTransport })
     .openSession({ runId: "run-old", normalizedSessionId: "normalized", workingDirectory: root });
   const events: PrpEvent[] = [];
   const drained = capture ? (async () => { try { for await (const event of session.events()) events.push(event); } catch { /* terminal message must precede iterator rejection */ } })() : Promise.resolve();
@@ -57,7 +58,7 @@ describe("PiRpcDriver", () => {
       codexHome: root, runtimeContextPath: join(root, "context.json"), hasRuntimeContext: false });
     const transport = new FailureTransport();
     try {
-      const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piThinkingLevel: "high",
+      const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piRpcThinkingLevel: "high",
         environment: { ...environment, PI_CODING_AGENT_DIR: join(root, "agent") },
         transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
       }).openSession({ runId: "home", normalizedSessionId: "home", workingDirectory: root });
@@ -91,7 +92,7 @@ describe("PiRpcDriver", () => {
     const rootPath = mode === "overlap" ? runtime : mode === "symlink" ? link : home;
     let launched: NodeJS.ProcessEnv | undefined;
     const transport = new FailureTransport();
-    const opening = new PiRpcDriver({ runtimeDirectory: runtime, model: "neutral/model", piThinkingLevel: "high",
+    const opening = new PiRpcDriver({ runtimeDirectory: runtime, model: "neutral/model", piRpcThinkingLevel: "high",
       environment: { PI_CODING_AGENT_DIR: join(root, "agent"), ...(mode === "registered" ? {} : { AGENT_HOME: "/controller/stale-copy", PAPERCLIP_PI_AGENT_HOME: "/caller/forged-copy" }) },
       ...(mode === "unregistered" ? {} : { runtimeContext: { instructions: { workingCopy: { ...(mode === "legacy" ? {} : { kind: "agent_files" }), rootPath, entryPath: "AGENTS.md" } }, skills: [] } }),
       transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
