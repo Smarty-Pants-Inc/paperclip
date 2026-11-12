@@ -7340,6 +7340,90 @@ done
         }
     }
 
+    // Keep: unknown child/subagent spend must survive the provider boundary;
+    // preserving the flag does not invent child token counts or billed cost.
+    #[test]
+    fn pi_child_usage_receipt_keeps_identity_and_provider_cost() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let events = normalize_provider_notification(
+            &mut state,
+            "thread/tokenUsage/updated",
+            &json!({
+                "provider": "pi_rpc", "threadId": "pi-session", "model": "pi/model",
+                "turnId": "pi-turn", "providerRequestId": "pi-receipt-with-child",
+                "childUsage": "unknown", "runDeltaAvailable": true,
+                "tokenUsage": {
+                    "total": {"inputTokens": 24, "outputTokens": 14, "providerCostUsd": 0.021},
+                    "last": {"inputTokens": 7, "outputTokens": 4, "providerCostUsd": 0.004}
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "usage.reported");
+        assert_eq!(events[0].payload["childUsage"], "unknown");
+        assert_eq!(
+            events[0].payload["providerRequestId"],
+            "pi-receipt-with-child"
+        );
+        assert_eq!(events[0].payload["runDelta"]["providerCostUsd"], 0.004);
+        assert_eq!(events[0].payload["cumulative"]["providerCostUsd"], 0.021);
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&events[0].payload)
+            .unwrap();
+    }
+
+    #[test]
+    fn pi_child_usage_is_optional_and_typed() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let params = json!({"threadId": "pi-session", "tokenUsage": {
+            "total": {"inputTokens": 7, "outputTokens": 4}
+        }});
+        let original =
+            normalize_provider_notification(&mut state, "thread/tokenUsage/updated", &params)
+                .unwrap()
+                .remove(0)
+                .payload;
+        assert!(original.get("childUsage").is_none());
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        validator.validate(&original).unwrap();
+        let mut valid = original.clone();
+        valid["childUsage"] = json!("unknown");
+        validator.validate(&valid).unwrap();
+        for invalid in [
+            Value::Null,
+            json!(true),
+            json!(3),
+            json!({}),
+            json!([]),
+            json!("included"),
+        ] {
+            let mut invalid_payload = original.clone();
+            invalid_payload["childUsage"] = invalid.clone();
+            assert!(!validator.is_valid(&invalid_payload), "{invalid}");
+            let mut invalid_params = params.clone();
+            invalid_params["childUsage"] = invalid;
+            let events = normalize_provider_notification(
+                &mut state,
+                "thread/tokenUsage/updated",
+                &invalid_params,
+            )
+            .unwrap();
+            assert_eq!(events[0].payload, original);
+        }
+    }
+
     #[test]
     fn codex_rate_limit_updates_emit_only_changed_account_notices() {
         let mut state = opencode_result_state();

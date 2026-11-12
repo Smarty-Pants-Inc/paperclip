@@ -3639,6 +3639,13 @@ export const usageSchema = {
       ],
       "maxLength": 240
     },
+    "childUsage": {
+      "description": "Child/subagent usage accounting status, when reported. Pi currently reports unknown; this is not a child token count or a billed cost.",
+      "type": "string",
+      "enum": [
+        "unknown"
+      ]
+    },
     "cumulative": {
       "$ref": "#/$defs/measurement"
     },

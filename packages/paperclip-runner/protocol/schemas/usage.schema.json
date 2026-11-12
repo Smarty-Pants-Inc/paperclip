@@ -9,6 +9,11 @@
     "model": { "type": ["string", "null"], "maxLength": 240 },
     "providerSessionId": { "type": ["string", "null"], "maxLength": 240 },
     "providerRequestId": { "type": ["string", "null"], "maxLength": 240 },
+    "childUsage": {
+      "description": "Child/subagent usage accounting status, when reported. Pi currently reports unknown; this is not a child token count or a billed cost.",
+      "type": "string",
+      "enum": ["unknown"]
+    },
     "cumulative": { "$ref": "#/$defs/measurement" },
     "runDeltaAvailable": { "type": "boolean" },
     "runDeltaBasis": { "const": "run" },

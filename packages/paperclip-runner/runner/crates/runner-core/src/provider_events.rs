@@ -861,6 +861,11 @@ pub(crate) fn normalize_pi_usage_notification(params: &Value) -> Vec<NormalizedP
             .and_then(Value::as_str)
             .map(|value| bounded_text(value, 240))
             .into();
+        // Pi currently reports child/subagent accounting only as unknown.
+        // Keep that status distinct from measured tokens and billed USD.
+        if params.get("childUsage").and_then(Value::as_str) == Some("unknown") {
+            event.payload["childUsage"] = json!("unknown");
+        }
     }
     events
 }
