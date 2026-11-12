@@ -3,6 +3,18 @@ import { posix } from "node:path";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { runRemoteProviderVerification } from "./remote-provider-pack.js";
 
+/**
+ * The provider-pack manifest digest exactly as build-provider-pack.mjs computes it:
+ * keys in UTF-16 code-unit order (Array.prototype.sort), not localeCompare.
+ * Use it only for manifest payload digests; equality checks keep canonicalProviderPackJson.
+ */
+export function canonicalProviderPackDigestJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalProviderPackDigestJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalProviderPackDigestJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
 export function canonicalProviderPackJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalProviderPackJson).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
@@ -48,7 +60,7 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
   const exactIdentity = requireExactIdentity || provider.kind === "pi_rpc";
   if (!installation.immutable || installation.root !== packRoot || !payload
     || actual.schema !== expected.schema
-    || actual.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackJson(payload)).digest("hex")}`
+    || actual.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackDigestJson(payload)).digest("hex")}`
     || canonicalProviderPackJson(payload.target) !== canonicalProviderPackJson(expected.payload.target)
     || (exactIdentity ? actual.digest !== expected.digest
       : !Number.isSafeInteger(contract) || contract! < 1 || payload.compatibility?.[provider.kind] !== contract

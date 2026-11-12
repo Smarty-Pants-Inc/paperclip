@@ -53,7 +53,7 @@ const fs=require('node:fs/promises'),path=require('node:path'),crypto=require('n
  const packIdentity=identity(await directory(pack)),sessionIdentity=identity(await directory(sessions)),m=await stat(file);
  if(!m||!m.isFile()||m.isSymbolicLink()||m.nlink!==1n||m.size>524288n)throw Error('unsafe_manifest');
  const bytes=await fs.readFile(file),manifest=JSON.parse(bytes),manifestIdentity=identity(m);
- const canonical=v=>Array.isArray(v)?'['+v.map(canonical).join(',')+']':v&&typeof v==='object'?'{'+Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>JSON.stringify(k)+':'+canonical(x)).join(',')+'}':JSON.stringify(v);
+ const canonical=v=>Array.isArray(v)?'['+v.map(canonical).join(',')+']':v&&typeof v==='object'?'{'+Object.entries(v).sort(([a],[b])=>a<b?-1:a>b?1:0).map(([k,x])=>JSON.stringify(k)+':'+canonical(x)).join(',')+'}':JSON.stringify(v);
  const manifestSha256=crypto.createHash('sha256').update(bytes).digest('hex');
  if(manifest.schema!=='paperclip-runner/remote-provider-pack/v1'||manifest.digest!==expected
    ||expected!=='sha256:'+crypto.createHash('sha256').update(canonical(manifest.payload)).digest('hex'))throw Error('manifest_changed');

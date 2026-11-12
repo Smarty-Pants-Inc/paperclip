@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { redactSensitiveText } from "../../redaction.js";
-import { canonicalProviderPackJson, type ProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { canonicalProviderPackJson, type ProviderPackIdentity, canonicalProviderPackDigestJson } from "./remote-provider-pack-verification.js";
 
 export type ProviderPackBinding = {
   companyId: string;
@@ -22,7 +22,7 @@ const maximumBytes = 512 * 1024;
 
 function assertManifest(manifest: ProviderPackIdentity): void {
   if (manifest?.schema !== "paperclip-runner/remote-provider-pack/v1" || !manifest.payload
-    || manifest.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackJson(manifest.payload)).digest("hex")}`) {
+    || manifest.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackDigestJson(manifest.payload)).digest("hex")}`) {
     throw new Error("runner_remote_provider_artifact_incompatible: saved provider pack authority is invalid");
   }
 }

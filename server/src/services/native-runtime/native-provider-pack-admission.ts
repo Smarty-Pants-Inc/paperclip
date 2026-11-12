@@ -2,7 +2,7 @@ import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import { heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { NativeSession } from "../../vendor/paperclip-runner/index.js";
-import { canonicalProviderPackJson, type ProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { canonicalProviderPackDigestJson, canonicalProviderPackJson, type ProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { assertNativeRunnerCheckpointOwner } from "./native-runner-checkpoint.js";
 
 type Selection = {
@@ -64,7 +64,7 @@ export function rememberAdmittedNativeProviderPack(session: NativeSession, input
   const proxy = input.manifest.payload.artifacts.opencodeProxy?.sha256;
   const revision = input.manifest.payload.runnerSourceRevision;
   if (!digest.test(input.manifest.digest)
-    || input.manifest.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackJson(input.manifest.payload)).digest("hex")}`
+    || input.manifest.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackDigestJson(input.manifest.payload)).digest("hex")}`
     || !digest.test(proxy ?? "") || !/^[a-f0-9]{40}$/.test(revision)
     || !input.runnerInstanceId || !input.environmentLeaseId) return unavailable();
   const selected: Selection = {

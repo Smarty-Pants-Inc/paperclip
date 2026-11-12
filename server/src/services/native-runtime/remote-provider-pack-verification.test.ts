@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 import { readFileSync } from "node:fs";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { describe, expect, it, vi } from "vitest";
-import { canonicalProviderPackJson, verifyRemoteProviderPack, type ProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { canonicalProviderPackDigestJson, canonicalProviderPackJson, verifyRemoteProviderPack, type ProviderPackIdentity } from "./remote-provider-pack-verification.js";
 
 const sha = (text: string) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
 const manifest = (revision: string): ProviderPackIdentity => {
@@ -349,5 +349,17 @@ describe("native Pi remote provider pack verification", () => {
       const provider = kind === "acpx" ? { kind, agent: "claude" } : { kind };
       await expect(verifyRemoteProviderPack({ ...fixture.input, provider })).resolves.toEqual(fixture.pack);
     } finally { await fixture.cleanup(); }
+  });
+});
+
+describe("provider pack manifest digest canonicalization", () => {
+  it("matches build-provider-pack.mjs key order, including piRpcProfileDigest before pins", () => {
+    const builder = (value: unknown): string => Array.isArray(value) ? `[${value.map(builder).join(",")}]`
+      : value && typeof value === "object" ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${builder((value as Record<string, unknown>)[key])}`).join(",")}}`
+        : JSON.stringify(value);
+    const payload = { pins: { node: "22" }, piRpcProfileDigest: "sha256:" + "a".repeat(64), nativeProviders: { pi_rpc: { piRpcProxy: { path: "p", sha256: "b" } } }, Zeta: 1, alpha: [ { B: 1, a: 2 } ] };
+    expect(canonicalProviderPackDigestJson(payload)).toBe(builder(payload));
+    expect(canonicalProviderPackDigestJson(payload).indexOf('"piRpcProfileDigest"')).toBeLessThan(canonicalProviderPackDigestJson(payload).indexOf('"pins"'));
+    expect(canonicalProviderPackJson(payload)).not.toBe(builder(payload));
   });
 });
