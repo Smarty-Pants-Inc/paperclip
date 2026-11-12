@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { resolve, dirname } from "node:path";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { validateRoleTemplate } from "./role-template.js";
 import { validateChildSelection } from "./selection.js";
@@ -33,8 +32,11 @@ describe("F084 role-only reusable templates (trust boundary)", () => {
   });
 
   it("does not count stock pi-subagents worker thinking high as compliant", () => {
-    const entry = createRequire(import.meta.url).resolve("pi-subagents");
-    const stock = readFileSync(resolve(dirname(entry), "../agents/worker.md"), "utf8");
+    // Exact package/agents/worker.md from https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.88.0.tgz
+    // Tarball sha256: 906cc26f263e3f50c078b4cc32a338d87ecdd0c0a1a7279ca2f427297f5c67db
+    // Fixture sha256: 2c3dcbebd084e744c70515ddad0a87d8d4795f477967e5fe9fdefbcb3de7f26a
+    const stock = readFileSync(new URL("./fixtures/pi-subagents-0.88.0-worker.md", import.meta.url), "utf8");
+    expect(createHash("sha256").update(stock).digest("hex")).toBe("2c3dcbebd084e744c70515ddad0a87d8d4795f477967e5fe9fdefbcb3de7f26a");
     expect(stock).toMatch(/thinking: high/);
     expect(() => validateRoleTemplate(stock)).toThrow(/thinking/);
   });
