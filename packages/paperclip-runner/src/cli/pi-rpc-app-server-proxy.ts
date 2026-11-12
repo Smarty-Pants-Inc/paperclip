@@ -284,7 +284,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       } else if (
         event.eventType === "item.started" ||
         event.eventType === "item.delta" ||
-        event.eventType === "item.completed"
+        event.eventType === "item.completed" ||
+        event.eventType === "item.failed"
       ) {
         // Facade item notifications must be bound to a turn. Do not carry
         // OpenCode's provider-specific unbound-model filtering into Pi.

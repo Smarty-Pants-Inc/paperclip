@@ -38,7 +38,7 @@ export function openCodeProxyAssistantText(
 }
 
 export function openCodeProxyItemNotification(input: {
-  eventType: "item.started" | "item.delta" | "item.completed";
+  eventType: "item.started" | "item.delta" | "item.completed" | "item.failed";
   threadId: string;
   turnId?: string;
   itemId?: string;

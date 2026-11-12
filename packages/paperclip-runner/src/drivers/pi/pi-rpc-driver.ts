@@ -314,6 +314,7 @@ interface PiTurnState extends PiEventOrigin {
   projector: ReturnType<typeof createPiEventProjector>;
   lastText: string;
   hasAssistantReceipt: boolean;
+  lastErrorMessage?: string;
   failed: boolean;
   settled: boolean;
 }
@@ -907,6 +908,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (text) turn.lastText = text;
       turn.hasAssistantReceipt ||= Boolean(text) || isRecord(message.usage);
       if (message.stopReason === "error" || message.stopReason === "aborted") turn.failed = true;
+      if (typeof message.errorMessage === "string" && message.errorMessage) turn.lastErrorMessage = message.errorMessage;
       if (this.#streamTurn === turn) this.#streamTurn = null;
       // Bind full native tool IDs before execution callbacks can arrive.
       for (const part of Array.isArray(message.content) ? message.content : []) {
@@ -923,7 +925,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (event.type === "agent_settled") {
       const empty = !turn.lastText && !turn.hasAssistantReceipt;
       const status = event.aborted === true ? "cancelled" : turn.failed || empty ? "failed" : "completed";
-      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
+      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(status === "failed" && turn.lastErrorMessage ? { error: { code: "pi_provider_error", message: turn.lastErrorMessage } } : empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
     }
   }
 

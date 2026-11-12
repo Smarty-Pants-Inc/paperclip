@@ -49,6 +49,25 @@ async function failureFixture(capture = true) {
 }
 
 describe("PiRpcDriver", () => {
+  it("forwards Pi provider error items and the last errorMessage on turn/failed", async () => {
+    const f = await failureFixture(false); const frames: string[] = [];
+    const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(frame); return true; }, once() {} },
+      environment: { PAPERCLIP_RUN_ID: "run-old" }, createDriver: () => ({ async descriptor() { throw new Error("unused"); }, async openSession() { return f.session; } }) });
+    try {
+      proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/start", params: { model: "neutral/model" } })); await flushFailure();
+      proxy.acceptLine(JSON.stringify({ id: 2, method: "turn/start", params: { input: [{ text: "work" }] } })); await flushFailure();
+      f.transport.send({ type: "agent_start" });
+      for (const [id, errorMessage] of [["first", "earlier provider error"], ["last", "Provider context window exceeded: 321 > 123"]]) {
+        const message = { role: "assistant", id, responseId: id, provider: "neutral", model: "model", content: [], stopReason: "error", errorMessage, usage: {} };
+        f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message });
+      }
+      f.transport.send({ type: "agent_settled", aborted: false }); await flushFailure();
+      const decoded = frames.map(frame => JSON.parse(frame));
+      expect(decoded.filter(frame => frame.method === "item/failed")).toHaveLength(2);
+      expect(decoded.find(frame => frame.method === "turn/failed")?.params).toMatchObject({ turn: { error: { message: "Provider context window exceeded: 321 > 123" } } });
+      expect(f.transport.closed).toBe(false);
+    } finally { await proxy.close(); await f.close(); }
+  });
   it("does not inherit ambient AGENT_HOME when server omits it", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-home-ambient-"));
     vi.stubEnv("AGENT_HOME", root);
