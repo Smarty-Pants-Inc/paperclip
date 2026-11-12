@@ -282,8 +282,8 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { reportRunFailure } from "../run-failure-report.js";
 import {
   REMOTE_RECOVERY_MARKER_READ_SCRIPT, REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT,
-  RemoteRunnerRecoveryError, attachRemoteRunnerRecoveryDiagnostic, describeExitedRemoteRunner, readRemoteRunnerRecoveryError,
-  remoteRecoveryProbeReason,
+  REMOTE_RUNNER_EXIT_EVIDENCE_SCRIPT, RemoteRunnerRecoveryError, attachRemoteRunnerRecoveryDiagnostic, boundRemoteRunnerExitEvidence,
+  describeExitedRemoteRunner, describeExitedRemoteRunnerReason, readRemoteRunnerRecoveryError, remoteRecoveryProbeReason,
 } from "./remote-runner-recovery-diagnostics.js";
 import { readRemoteRunnerRecoveryProbe, REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS } from "./remote-runner-recovery-probe.js";
 import { describeOwnFailedAttachment, inspectRemoteWarmSessionRecovery, isSettledRemoteWarmControlState, summarizePostTerminalEvents, type RemoteWarmSessionRecovery, unsettledControllerCommands } from "./remote-warm-session-recovery.js";
@@ -14775,7 +14775,15 @@ export async function verifyRemoteRunnerReattachment(input: {
   const verified = await check(undefined, probeDeadline);
   if (!verified.alive) {
     throw new RemoteRunnerRecoveryError({ stage: "process_verification", reason: verified.reason,
-      ...(verified.reason === "process_not_running" ? describeExitedRemoteRunner(runnerState) : {}) });
+      ...(verified.reason === "process_not_running" ? {
+        ...describeExitedRemoteRunner(runnerState),
+        // Why the Runner exited, from its own durable state and sandbox-local files, so the run log names it.
+        ...describeExitedRemoteRunnerReason(runnerState, redactSensitiveText),
+        // A session Runner logs beside its state; external (Dot, Muse, grok_bot) Runners log in the shared runtime root.
+        ...await readRemoteRunnerExitEvidence(runner, { nonce, pid: processIdentity.pid }, [posix.join(posix.dirname(stateDirectory), "diagnostics"),
+          posix.join(target.remoteCwd, ".paperclip-runtime", "paperclip-runner", "diagnostics")],
+          Math.min(input.recoveryDeadline ?? Number.POSITIVE_INFINITY, Date.now() + 10_000)),
+      } : {}) });
   }
   // These checks authorize an attempt to reconnect, not the task itself. The
   // transport still requires authentication against the exact durable PRP key.
@@ -14785,6 +14793,24 @@ export async function verifyRemoteRunnerReattachment(input: {
     isAlive: async () => (await check()).alive,
     signal: async (signal: NodeJS.Signals) => (await check(signal)).alive,
   };
+}
+
+/** Best effort: a missing, slow or unreadable file leaves the recovery outcome unchanged. */
+async function readRemoteRunnerExitEvidence(runner: CommandManagedRuntimeRunner, generation: { nonce: string; pid: number },
+  diagnosticsDirectories: string[], deadline: number):
+  Promise<{ runnerExitEvidence?: string }> {
+  try {
+    const result = await readRemoteRunnerRecoveryProbe({
+      runner, stage: "process_verification", deadline, readOnly: true,
+      request: { command: "sh", args: ["-c", REMOTE_RUNNER_EXIT_EVIDENCE_SCRIPT, "paperclip-runner-exit-evidence", generation.nonce, String(generation.pid), ...diagnosticsDirectories],
+        bypassSession: true },
+    });
+    if (result.exitCode !== 0 || result.timedOut) return {};
+    const evidence = boundRemoteRunnerExitEvidence(result.stdout, redactSensitiveText);
+    return evidence ? { runnerExitEvidence: evidence } : {};
+  } catch {
+    return {};
+  }
 }
 
 export async function verifyRemoteRunnerOrSettledExit(
@@ -15190,8 +15216,10 @@ export function createRemoteRunnerProcessLauncher(input: {
             command: "sh",
             args: [
               "-c",
-              'set -eu; directory=$1; file="$directory/runnerd.stderr.log"; test -d "$directory" && test ! -L "$directory" && test -f "$file" && test ! -L "$file"; tail -c 65536 -- "$file"',
+              REMOTE_RUNNER_EXIT_EVIDENCE_SCRIPT,
               "paperclip-runner-diagnostics",
+              identityNonce,
+              String(identity.pid),
               input.diagnosticsDirectory,
             ],
             bypassSession: true,
@@ -15200,7 +15228,7 @@ export function createRemoteRunnerProcessLauncher(input: {
           .catch(() => null);
         const diagnosticTail =
           diagnostic && diagnostic.exitCode === 0 && !diagnostic.timedOut
-            ? redactSensitiveText(diagnostic.stdout).slice(-16_384).trim()
+            ? boundRemoteRunnerExitEvidence(diagnostic.stdout, redactSensitiveText) ?? ""
             : "";
         const durableState = await readRemoteRunnerState({
           runner,
@@ -15227,7 +15255,8 @@ export function createRemoteRunnerProcessLauncher(input: {
           code: null,
           signal: null,
           stdout: "",
-          stderr: diagnosticTail || stateSummary,
+          // The durable state names a graceful exit; the files name a panic or what runnerd wrote to stderr.
+          stderr: diagnosticTail ? `${stateSummary}\n${diagnosticTail}` : stateSummary,
         };
       }
     })().catch((error: unknown) => {
