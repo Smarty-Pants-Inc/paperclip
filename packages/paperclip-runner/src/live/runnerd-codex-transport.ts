@@ -4839,8 +4839,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     turnId: string;
     itemId: string;
     currentRunGrant?: NativeRunRuntimeGrant;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }): Promise<void> {
+    if (input.dynamicTools !== undefined && this.options.provider !== "pi_rpc") {
+      return Promise.reject(new Error("native_runner_tool_replacement_requires_pi"));
+    }
+    const requested = input.dynamicTools === undefined ? input : { ...input, dynamicTools: structuredClone(input.dynamicTools) };
     const earlyClaim = this.#earlyClaim?.runId === input.runId ? this.#earlyClaim.operation : undefined;
     if (this.#attachmentOperation !== null && earlyClaim === undefined) {
       return Promise.reject(new Error("native_runner_run_attachment_in_progress"));
@@ -4848,7 +4853,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#earlyClaim = null;
     const operation = Promise.resolve().then(() => {
       this.#assertStartupOpen();
-      return this.#attachRun(input, earlyClaim);
+      return this.#attachRun(requested, earlyClaim);
     }).finally(() => { this.#attachmentOperation = null; });
     this.#attachmentOperation = operation;
     return operation;
@@ -4859,6 +4864,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     turnId: string;
     itemId: string;
     currentRunGrant?: NativeRunRuntimeGrant;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }, earlyClaim?: Promise<void>): Promise<void> {
     const previous = record(this.#runAttachTemplate?.provider).runtimeContext;
@@ -4887,9 +4893,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     turnId: string;
     itemId: string;
     currentRunGrant?: NativeRunRuntimeGrant;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     completionContract?: { revision: string; criterionIds: readonly string[] };
   }, earlyClaim?: Promise<void>): Promise<void> {
     const { core, retainingSource } = this.#assertRunAttachmentAdmission();
+    // Stage the attaching Pi run's normalized catalog. A failed command must
+    // not publish it as authority for a later attachment.
+    const authorizedTools = input.dynamicTools === undefined ? this.#authorizedTools
+      : authorizedToolSetForProvider(this.options.provider, input.dynamicTools);
+    const previousRunAttachTemplate = this.#runAttachTemplate;
     if (earlyClaim) {
       await earlyClaim;
       if (this.#releaseEpisode && Date.now() >= this.#releaseEpisode.deadline!) {
@@ -4938,7 +4950,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         ? retargetRunAttachPayload(
             this.#runAttachTemplate,
             desired,
-            this.#authorizedTools,
+            authorizedTools,
             // A retained transport's options belong to its first run.
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
@@ -4947,7 +4959,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         : rotatedRunAttachPayload(
             core.store.state,
             desired,
-            this.#authorizedTools,
+            authorizedTools,
             // A retained transport's options belong to its first run.
             input.completionContract ?? this.options.resumeCompletionContract,
             currentRunGrant?.runtimeContext,
@@ -5066,12 +5078,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       previousReleased = true;
       this.#controlPlaneRelease = registration?.release ?? null;
       this.#releaseEpisode = null;
+      this.#authorizedTools = authorizedTools;
       if (retainingSource) {
         core.enableSemanticInputDispatch(desired);
         this.#recoverPendingSemanticInputsWhenReady();
       }
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
+      if (!activationStarted && input.dynamicTools !== undefined) this.#runAttachTemplate = previousRunAttachTemplate;
       // The future route is ours from registration onward, including failures
       // in template construction, capability admission, and result waiting.
       // Keep the prior release owned by close until its handoff is confirmed.
