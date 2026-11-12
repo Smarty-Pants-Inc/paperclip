@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
+import { directPiProviderConfiguration, startPiProviderLoopback, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
+import { writePrivateFile } from "../private-file.js";
+import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type {
   HarnessDriver,
@@ -91,18 +94,45 @@ export class PiRpcDriver implements HarnessDriver {
     const sessionFile = join(directory, filename);
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"];
     if (this.#options.model) args.push("--model", this.#options.model);
+    const environment = { ...(this.#options.environment ?? {}) };
+    const credentialMode = environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker";
+    if (credentialMode !== "broker" && credentialMode !== "env") throw new Error("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
+    delete environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE;
+    let closeProvider: (() => Promise<void>) | undefined;
+    if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
+      const agentHome = environment.PI_CODING_AGENT_DIR ?? join(directory, "agent");
+      await mkdir(agentHome, { recursive: true, mode: 0o700 });
+      environment.PI_CODING_AGENT_DIR = agentHome;
+      if (credentialMode === "broker") {
+        const provider = await startPiProviderLoopback({ model: this.#options.model, environment });
+        closeProvider = provider.close;
+        try {
+          await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json));
+        } catch (error) {
+          await provider.close();
+          throw error;
+        }
+        for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
+      } else {
+        const provider = directPiProviderConfiguration({ model: this.#options.model, environment });
+        await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json));
+        for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
+        environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
+      }
+    }
     const transportOptions: PiRpcTransportOptions = {
       command: this.#options.command ?? "pi",
       args,
       cwd,
-      env: piProcessEnvironment(this.#options.environment),
+      env: piProcessEnvironment(environment),
       commandFd: this.#options.commandFd,
       commandLifecycle: this.#options.commandLifecycle,
       shutdownTimeoutMs: this.#options.shutdownTimeoutMs,
       killTimeoutMs: this.#options.killTimeoutMs,
     };
-    const transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
+    let transport: PiRpcTransport | undefined;
     try {
+      transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
       const response = await withAbort(
         withTimeout(transport.request("get_state"), this.#options.startupTimeoutMs ?? 10_000, "Pi RPC startup timed out"),
         input.signal,
@@ -120,9 +150,11 @@ export class PiRpcDriver implements HarnessDriver {
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
+        closeProvider,
       });
     } catch (error) {
-      await transport.close().catch(() => undefined);
+      await transport?.close().catch(() => undefined);
+      await closeProvider?.().catch(() => undefined);
       throw error;
     }
   }
@@ -137,6 +169,7 @@ interface PiSessionState {
   workingDirectory: string;
   runnerInstanceId: string;
   now: () => Date;
+  closeProvider?: () => Promise<void>;
 }
 
 class EventQueue implements AsyncIterable<PrpEvent> {
@@ -186,6 +219,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #workingDirectory: string;
   readonly #runnerInstanceId: string;
   readonly #now: () => Date;
+  readonly #closeProvider?: () => Promise<void>;
   readonly #events = new EventQueue();
   #sourceSequence = 0;
   #activeTurnId: string | null = null;
@@ -204,6 +238,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#workingDirectory = state.workingDirectory;
     this.#runnerInstanceId = state.runnerInstanceId;
     this.#now = state.now;
+    this.#closeProvider = state.closeProvider;
     void this.#pump();
   }
 
@@ -275,7 +310,8 @@ export class PiRpcHarnessSession implements HarnessSession {
     try {
       await this.#transport.close();
     } finally {
-      this.#events.close();
+      try { await this.#closeProvider?.(); }
+      finally { this.#events.close(); }
     }
   }
 

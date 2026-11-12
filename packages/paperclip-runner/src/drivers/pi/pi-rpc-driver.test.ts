@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { mapPiRpcRecord, PiRpcDriver } from "./pi-rpc-driver.js";
 import { validatePrpEvent } from "../../protocol/replay-contract.js";
@@ -7,6 +10,23 @@ describe("PiRpcDriver", () => {
     const descriptor = await new PiRpcDriver({ runtimeDirectory: "/tmp/pi-test" }).descriptor();
     expect(descriptor).toMatchObject({ kind: "pi_rpc", displayName: "Pi RPC", version: "1.5.2" });
     expect(descriptor.capabilities).toMatchObject({ interruption: true, resume: false, steering: false, structuredResult: false });
+  });
+
+  it("fails closed on an unknown managed credential mode before spawning Pi", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-rpc-mode-"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const driver = new PiRpcDriver({
+      runtimeDirectory: join(root, "runtime"),
+      environment: { PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "unknown" },
+      transportFactory: () => { throw new Error("Pi must not spawn for an unknown mode"); },
+    });
+    try {
+      await expect(driver.openSession({ runId: "mode-test", normalizedSessionId: "mode-test", workingDirectory: workspace }))
+        .rejects.toThrow("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("maps Pi deltas, tool lifecycle, and agent settlement into bound PRP events", () => {
