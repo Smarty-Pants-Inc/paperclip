@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -115,6 +116,27 @@ function requestIdentity(value: unknown): string {
   // Native request ids may be numeric, including zero. Normalize once rather
   // than treating zero as absent or falling back to another request's id.
   return typeof value === "number" && Number.isFinite(value) ? String(value) : text(value);
+}
+
+const PI_TOOL_ALIAS_PREFIX = "pi_tool_";
+
+function controllerToolCallId(callId: string | number, runId: string, nativeSessionId: string): string | number {
+  // Preserve existing malformed/non-string refusal at its owning boundary.
+  if (typeof callId !== "string" || !callId) return callId;
+  // Reserve the entire alias namespace, including otherwise-valid native IDs,
+  // so a native spelling cannot impersonate another call's generated alias.
+  if (!callId.startsWith(PI_TOOL_ALIAS_PREFIX)
+    && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}(?![\s\S])/.test(callId)) return callId;
+  if (typeof runId !== "string" || !runId || typeof nativeSessionId !== "string" || !nativeSessionId) {
+    throw new Error("Pi tool alias requires captured run and admitted native session identity");
+  }
+  // Stable across reopened native sessions and independent of RPC count, turn,
+  // epoch and arguments, preserving the controller's durable replay/conflicts.
+  // Full SHA-256 is collision-resistant, not an injection over arbitrary IDs.
+  return PI_TOOL_ALIAS_PREFIX + createHash("sha256")
+    .update("paperclip.pi.tool-call-id\0")
+    .update(JSON.stringify(["v1", runId, nativeSessionId, callId]))
+    .digest("hex");
 }
 
 export function parsePiThinkingLevel(value: unknown): PiThinkingLevel | undefined {
@@ -353,10 +375,15 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         const opened = session;
         const { runId, turnId, callId, tool, arguments: arguments_, signal } = call;
         assertCallbackAuthority(opened, runId, turnId);
+        // ids() is the already-admitted native Pi identity, not the normalized
+        // host bootstrap ID. Capture before dispatch; the native await closure
+        // retains the exact original callId and needs no reverse alias map.
+        const nativeSessionId = opened.ids().driverSessionId;
+        const controllerCallId = controllerToolCallId(callId, runId, nativeSessionId);
         const response = await requestController("item/tool/call", {
-          threadId: opened.ids().driverSessionId,
+          threadId: nativeSessionId,
           turnId,
-          callId,
+          callId: controllerCallId,
           tool,
           arguments: arguments_,
         }, true, signal);
