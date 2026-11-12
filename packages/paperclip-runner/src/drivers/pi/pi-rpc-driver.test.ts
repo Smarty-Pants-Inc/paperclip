@@ -106,8 +106,13 @@ describe("PiRpcDriver", () => {
       await expect(f.session.startTurn({ message: { role: "user", text: "still usable" } })).resolves.toHaveProperty("turnId");
     } finally { await f.close(); }
   });
-  it.each(["interrupt", "failure"])("opens a fresh Pi after %s, then completes the next turn through the facade", async mode => {
+  it.each(["interrupt", "failure"])("reuses warm Pi after interrupt or replaces failed Pi (%s), then completes the next turn through the facade", async mode => {
     const first = await failureFixture(false), second = await failureFixture(false);
+    const firstRequest = first.transport.request.bind(first.transport);
+    first.transport.request = async (type, input) => {
+      if (type === "abort") { first.transport.send({ type: "agent_end", messages: [] }); first.transport.send({ type: "agent_settled", aborted: true }); }
+      return firstRequest(type, input);
+    };
     const frames: string[] = []; let opens = 0;
     const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(frame); return true; }, once() {} },
       environment: { PAPERCLIP_RUN_ID: "run-old" }, createDriver: () => ({ async descriptor() { throw new Error("unused"); },
@@ -120,15 +125,21 @@ describe("PiRpcDriver", () => {
     try {
       await request(1, "thread/start", { model: "neutral/model" });
       const firstTurn = await request(2, "turn/start", { input: [{ text: "first" }] });
-      if (mode === "interrupt") await request(3, "turn/interrupt", { turnId: firstTurn.result.turn.id });
+      first.transport.send({ type: "agent_start" }); await flushFailure();
+      if (mode === "interrupt") {
+        expect((await request(3, "turn/interrupt", { turnId: firstTurn.result.turn.id })).error).toBeUndefined();
+        expect(first.transport.closed).toBe(false);
+        expect(first.transport.requests.map(req => req.type)).toEqual(expect.arrayContaining(["clear_queue", "abort"]));
+      }
       else { first.transport.send({ type: "process_exit", code: 1 }); await vi.waitFor(() => expect(first.transport.closed).toBe(true)); }
       await flushFailure();
       const opened = await request(4, "thread/start", { model: "neutral/model" }); expect(opened.error).toBeUndefined();
-      expect(opens).toBe(2);
+      expect(opens).toBe(mode === "interrupt" ? 1 : 2);
       const next = await request(5, "turn/start", { input: [{ text: "next" }] }); expect(next.error).toBeUndefined();
-      second.transport.send({ type: "agent_start" });
-      const message = { role: "assistant", responseId: "next", provider: "neutral", model: "model", content: [{ type: "text", text: "fresh Pi answer" }], stopReason: "stop" };
-      second.transport.send({ type: "message_start", message }); second.transport.send({ type: "message_end", message }); second.transport.send({ type: "agent_settled" });
+      const active = mode === "interrupt" ? first : second;
+      active.transport.send({ type: "agent_start" });
+      const message = { role: "assistant", responseId: "next", provider: "neutral", model: "model", content: [{ type: "text", text: "next Pi answer" }], stopReason: "stop" };
+      active.transport.send({ type: "message_start", message }); active.transport.send({ type: "message_end", message }); active.transport.send({ type: "agent_settled" });
       await vi.waitFor(() => expect(frames.map(frame => JSON.parse(frame)).some(frame => frame.method === "turn/completed" && frame.params.turnId === next.result.turn.id)).toBe(true));
     } finally { await proxy.close(); await first.close(); await second.close(); }
   });

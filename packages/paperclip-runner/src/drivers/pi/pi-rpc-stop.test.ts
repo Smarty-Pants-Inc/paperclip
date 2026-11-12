@@ -20,6 +20,7 @@ class StopTransport {
     if (type === "clear_queue") { this.steering = []; this.followUp = []; }
     if (type === "abort") await this.abort();
     return { success: true, data: type === "get_state" ? { sessionId: "native-stop", model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: this.steering.length + this.followUp.length }
+      : type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
       : type === "set_model" ? { provider: "neutral", id: "model" }
       : type === "get_available_thinking_levels" ? { levels: ["high"] }
       : type === "prompt" ? { disposition: "started" } : undefined };
