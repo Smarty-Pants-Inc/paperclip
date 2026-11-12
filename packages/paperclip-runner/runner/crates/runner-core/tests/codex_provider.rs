@@ -301,6 +301,7 @@ fn provider_config(directory: &Path, switches: &[&str]) -> CodexProviderConfig {
     ];
     args.extend(switches.iter().map(|value| (*value).to_owned()));
     CodexProviderConfig {
+        profile: None,
         provider: "codex".to_owned(),
         driver: "codex_app_server".to_owned(),
         provider_version: "fake-1".to_owned(),
@@ -772,6 +773,7 @@ fn durable_config(directory: &Path) -> DurableRunnerConfig {
         runner_version: "test-1".to_owned(),
         runner_digest: format!("sha256:{}", "a".repeat(64)),
         acpx_launch_profile: None,
+        pi_launch_profile: None,
         opencode_launch_profile: None,
         cursor_cloud_launch_profile: None,
         max_outbox_bytes: 16 * 1024 * 1024,

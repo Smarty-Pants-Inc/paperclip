@@ -173,8 +173,10 @@
     "verify:rootless": "bash scripts/verify-rootless-linux.sh",
     "test:opencode:qualification": "PAPERCLIP_OPENCODE_QUALIFY=1 node --test scripts/qualify-opencode-runtime.test.mjs",
     "generate:acpx-profiles": "node scripts/generate-acpx-profiles.mjs",
-    "check:acpx-profiles": "node scripts/generate-acpx-profiles.mjs --check",
-    "postinstall": "node scripts/install-copilot-assets.mjs"
+    "check:acpx-profiles": "node scripts/generate-acpx-profiles.mjs --check && pnpm run check:pi-rpc-profile",
+    "postinstall": "node scripts/install-copilot-assets.mjs",
+    "generate:pi-rpc-profile": "node scripts/generate-pi-rpc-profile.mjs",
+    "check:pi-rpc-profile": "node scripts/generate-pi-rpc-profile.mjs --check"
   },
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.73.0",

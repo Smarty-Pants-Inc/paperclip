@@ -1,3 +1,4 @@
+use paperclip_runner_core::durable::PiRpcLaunchProfile;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -357,6 +358,49 @@ fn opencode_launch_profile(
     }
 }
 
+fn pi_launch_profile(args: &[String]) -> Result<Option<PiRpcLaunchProfile>, LocalRunnerError> {
+    let command = optional_value(args, "--pi-proxy-command")?;
+    let command_sha256 = optional_value(args, "--pi-proxy-command-sha256")?;
+    let proxy_script = optional_value(args, "--pi-proxy-script")?;
+    let proxy_script_sha256 = optional_value(args, "--pi-proxy-script-sha256")?;
+    let executable = optional_value(args, "--pi-executable")?;
+    let executable_sha256 = optional_value(args, "--pi-executable-sha256")?;
+    match (
+        command,
+        command_sha256,
+        proxy_script,
+        proxy_script_sha256,
+        executable,
+        executable_sha256,
+    ) {
+        (None, None, None, None, None, None) => Ok(None),
+        (
+            Some(command),
+            Some(command_sha256),
+            Some(proxy_script),
+            Some(proxy_script_sha256),
+            Some(executable),
+            Some(executable_sha256),
+        ) => Ok(Some(PiRpcLaunchProfile {
+            command: QualifiedLaunchArtifact {
+                path: PathBuf::from(command),
+                sha256: command_sha256,
+            },
+            proxy_script: QualifiedLaunchArtifact {
+                path: PathBuf::from(proxy_script),
+                sha256: proxy_script_sha256,
+            },
+            executable: QualifiedLaunchArtifact {
+                path: PathBuf::from(executable),
+                sha256: executable_sha256,
+            },
+        })),
+        _ => Err(LocalRunnerError::invalid(
+            "Pi launch profile requires command, proxy, executable, and all SHA-256 digests",
+        )),
+    }
+}
+
 fn cursor_cloud_launch_profile(
     args: &[String],
 ) -> Result<Option<CursorCloudLaunchProfile>, LocalRunnerError> {
@@ -496,6 +540,7 @@ fn run_durable(args: &[String]) -> Result<(), LocalRunnerError> {
         runner_version: value(args, "--runner-version")?,
         runner_digest: value(args, "--runner-digest")?,
         acpx_launch_profile: acpx_launch_profile(args)?,
+        pi_launch_profile: pi_launch_profile(args)?,
         opencode_launch_profile: opencode_launch_profile(args)?,
         cursor_cloud_launch_profile: cursor_cloud_launch_profile(args)?,
         max_outbox_bytes: usize_value(args, "--max-outbox-bytes", 16 * 1024 * 1024)?,

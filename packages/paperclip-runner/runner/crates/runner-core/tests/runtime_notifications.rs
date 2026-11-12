@@ -48,6 +48,7 @@ fn real_cli_uses_relative_state_from_another_directory_and_never_process_run_ide
         runner_version: "1".into(),
         runner_digest: "sha256:digest".into(),
         acpx_launch_profile: None,
+        pi_launch_profile: None,
         opencode_launch_profile: None,
         cursor_cloud_launch_profile: None,
         max_outbox_bytes: 1024 * 1024,

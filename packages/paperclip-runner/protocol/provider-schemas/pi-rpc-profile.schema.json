@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "paperclip.pi-rpc-profile.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "driverKind",
+    "protocolVersion",
+    "profileVersion",
+    "runtimePackage",
+    "runtimeVersion",
+    "commandDigest"
+  ],
+  "properties": {
+    "schema": {
+      "const": "paperclip.pi-rpc-profile.v1"
+    },
+    "driverKind": {
+      "const": "pi_rpc"
+    },
+    "protocolVersion": {
+      "const": 1
+    },
+    "profileVersion": {
+      "const": 1
+    },
+    "runtimePackage": {
+      "const": "@earendil-works/pi-coding-agent"
+    },
+    "runtimeVersion": {
+      "const": "1.5.2"
+    },
+    "commandDigest": {
+      "const": "sha256:5cf3a2f9016073a363d3f8139559cdc8e59770483dfee7ebb99f02be7e92e893"
+    }
+  }
+}

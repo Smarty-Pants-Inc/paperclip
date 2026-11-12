@@ -21,7 +21,8 @@
         "openai_dot",
         "grok_bot",
         "muse",
-        "cursor_cloud"
+        "cursor_cloud",
+        "pi"
       ]
     },
     "driver": {
@@ -34,7 +35,8 @@
         "openai_dot_mcp",
         "grok_bot_mcp",
         "muse_external",
-        "cursor_cloud_api"
+        "cursor_cloud_api",
+        "pi_rpc"
       ]
     },
     "model": {
@@ -157,8 +159,11 @@
     "piThinkingLevel": {
       "enum": [
         "off",
+        "minimal",
         "low",
+        "medium",
         "high",
+        "xhigh",
         "max"
       ]
     },
@@ -192,16 +197,38 @@
         ]
       },
       "then": {
-        "properties": {
-          "provider": {
-            "const": "acpx"
+        "oneOf": [
+          {
+            "properties": {
+              "provider": {
+                "const": "pi"
+              },
+              "driver": {
+                "const": "pi_rpc"
+              }
+            }
           },
-          "agent": {
-            "const": "pi"
+          {
+            "properties": {
+              "provider": {
+                "const": "acpx"
+              },
+              "agent": {
+                "const": "pi"
+              },
+              "piThinkingLevel": {
+                "enum": [
+                  "off",
+                  "low",
+                  "high",
+                  "max"
+                ]
+              }
+            },
+            "required": [
+              "agent"
+            ]
           }
-        },
-        "required": [
-          "agent"
         ]
       }
     },
@@ -341,6 +368,22 @@
             },
             "executionKind": {
               "const": "local_process"
+            }
+          }
+        },
+        {
+          "properties": {
+            "provider": {
+              "const": "pi"
+            },
+            "driver": {
+              "const": "pi_rpc"
+            },
+            "executionKind": {
+              "const": "local_process"
+            },
+            "providerVersion": {
+              "const": "1.5.2"
             }
           }
         }

@@ -144,6 +144,7 @@ fn config(state_dir: &Path) -> DurableRunnerConfig {
         runner_version: "0.0.0".to_owned(),
         runner_digest: "sha256:test".to_owned(),
         acpx_launch_profile: None,
+        pi_launch_profile: None,
         opencode_launch_profile: None,
         cursor_cloud_launch_profile: None,
         max_outbox_bytes: 1024 * 1024,
@@ -3261,4 +3262,85 @@ fn publishes_only_changed_pi_controls_before_the_new_turn() {
         executor.shutdown().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
+}
+
+// Native Pi mirrors the resident OpenCode facade, not ACPX's `agent: pi`.
+fn pi_rpc_prepare_payload(directory: &Path) -> Value {
+    let mut payload = opencode_prepare_payload(directory);
+    payload["provider"]["kind"] = json!("pi");
+    payload["provider"]["provider"] = json!("pi");
+    payload["provider"]["driver"] = json!("pi_rpc");
+    payload["provider"]["providerVersion"] = json!("1.5.2");
+    payload["provider"]["profile"] =
+        serde_json::from_str(paperclip_runner_core::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON)
+            .unwrap();
+    payload
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_selects_the_resident_native_facade_and_keeps_its_identity() {
+    let directory = temporary_directory("pi-rpc-selection");
+    let mut config = opencode_config(&directory);
+    config.pi_launch_profile = config.opencode_launch_profile.take();
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    let prepared = executor
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(&directory),
+        ))
+        .unwrap();
+    assert_eq!(prepared.result["provider"], "pi");
+    assert_eq!(prepared.result["driver"], "pi_rpc");
+    let opened = executor
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    assert_eq!(opened.result["provider"], "pi");
+    executor.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_refuses_unqualified_launches_before_spawning() {
+    let directory = temporary_directory("pi-rpc-unqualified");
+    let config = config(&directory);
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    let error = executor
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(&directory),
+        ))
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Pi runner startup omitted its qualified launch profile"),
+        "{error}"
+    );
+    assert!(!directory.join("codex-provider-state.json").exists());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_rpc_refuses_mutable_commands_and_acpx_driver_aliases() {
+    let directory = temporary_directory("pi-rpc-override");
+    let mut config = opencode_config(&directory);
+    config.pi_launch_profile = config.opencode_launch_profile.take();
+    for (field, value) in [
+        ("command", json!("/tmp/unqualified-pi")),
+        ("driver", json!("acpx_runtime")),
+    ] {
+        let mut payload = pi_rpc_prepare_payload(&directory);
+        payload["provider"][field] = value;
+        let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        assert!(executor
+            .execute(&command(1, "run.prepare", payload))
+            .is_err());
+    }
+    assert!(!directory.join("codex-provider-state.json").exists());
+    fs::remove_dir_all(directory).unwrap();
 }

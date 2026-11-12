@@ -32,6 +32,7 @@ fn only_the_launch_flag_adds_the_note_and_the_monitor() {
 
     let log = directory.join("requests.ndjson");
     let config = CodexProviderConfig {
+        profile: None,
         provider: "codex".to_owned(),
         driver: "codex_app_server".to_owned(),
         provider_version: "fake-1".to_owned(),
