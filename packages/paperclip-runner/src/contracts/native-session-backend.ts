@@ -267,6 +267,7 @@ export interface NativeSession {
   cancel?(input: {
     reason: string;
     signal: AbortSignal;
+    failureCleanup?: boolean;
   }): NativeSessionCancellation;
   settleCancelledTurn?(input: { turnId: string; reason: string }): Promise<CancelledTurnSettlement | null>;
   resolveRuntimeRequest?(input: {

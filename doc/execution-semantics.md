@@ -1701,6 +1701,27 @@ starts by itself once the gate clears. A Retry accepted during the pre-deploy
 drain stays saved and is dispatched by the deferred-receipt worker after the
 restart.
 
+When a remote native run fails and its close cannot prove that the Runner
+suspended (for example, the Runner is unreachable after `provider_transport_failed`
+or a `turn.start` timeout), the controller no longer force-stops that Runner. It
+leaves the Runner and its saved state running, keeps the session quarantined, and
+the same-run reattachment adopts the live Runner with its real turn state. Before
+this, the close stopped the Runner mid-turn, so the reattachment always found it
+gone with an unsettled journal (`runner_remote_process_identity_unavailable`) and
+the task waited for Retry. A Stop, a cancelled turn and a `stop_cleanup` recovery
+still stop the Runner, and a Runner that settled or exited is handled as before.
+The runtime's own cleanup after a failed turn start or a failed event stream
+(for example `runnerd did not report the provider turn identity` or the
+execution timeout) revokes the turn's output but is not a Stop, so it keeps the
+Runner for the same-run reattachment too. A protocol integrity fault, which
+needs an operator, still stops the Runner. A reattachment after a restart whose recovery read
+times out or loses its transport (for example
+`PRP command session.snapshot timed out`) detaches from the Runner the same way a server restart does: it sends no turn
+stop and no suspend and does not signal the process. The Runner and its
+in-flight turn stay for the next same-run reattachment. An abort (a Stop or the
+recovery deadline), any identity or authority refusal, any other recovery
+failure, and a protocol integrity fault still stop it.
+
 A remote native run can lose its original runner or sandbox before reattachment.
 This happens after a server restart, and for a same-run retry after a turn ends
 without a semantic result. The reattachment then fails with

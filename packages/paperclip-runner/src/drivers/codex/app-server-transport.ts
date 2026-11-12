@@ -75,7 +75,7 @@ export interface CodexAppServerTransport {
    * Close the provider transport. The optional reason is controller-owned
    * diagnostic context; transports must not forward it to the provider.
    */
-  close(reason?: string): Promise<void>;
+  close(reason?: string, options?: { retainUnsettledRemoteRunner?: boolean }): Promise<void>;
   /** Return the confirmed released source, or false when active use was not released. */
   release?(): Promise<DurableRecoveryIdentity | false>;
   /** Relinquish controller authority while leaving durable runner work alive. */
