@@ -11,6 +11,20 @@ export async function prepareNativePiHomeProof(root: string, fixture: string) {
   expect(manifestSha256).toBe(process.env.PAPERCLIP_PI_E2E_FIXTURE_MANIFEST_SHA256);
   await cp(join(fixture, "SHA256SUMS"), join(root, "fixture-SHA256SUMS"));
   await cp(join(fixture, "README.md"), join(root, "fixture-README.md"));
+  // The scripted loopback model is not in Pi's public model catalog. Declare
+  // its capabilities in this COPY, not in the host fixture or product code.
+  // Unknown real models correctly default to reasoning:false on this head;
+  // requesting xhigh alone must never manufacture a capability in production.
+  const modelsPath = join(agentDir, "models.json");
+  const models = existsSync(modelsPath) ? JSON.parse(readFileSync(modelsPath, "utf8")) : {};
+  models.providers ??= {};
+  models.providers.paperclip ??= {};
+  const priorModels = models.providers.paperclip.models ?? [];
+  models.providers.paperclip.models = [
+    ...priorModels.filter((model: { id?: string }) => model.id !== "faux"),
+    { id: "faux", reasoning: true, contextWindow: 128000, maxTokens: 8192, thinkingLevelMap: { xhigh: "xhigh" } },
+  ];
+  await writeFile(modelsPath, JSON.stringify(models, null, 2) + "\n");
   const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf8"));
   await writeFile(join(root, "fixture-settings.original.json"), JSON.stringify(settings, null, 2) + "\n");
   const packagesRoot = join(fixture, "pi-packages");
