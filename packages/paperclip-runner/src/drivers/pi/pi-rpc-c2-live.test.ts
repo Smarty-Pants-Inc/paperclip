@@ -73,6 +73,16 @@ async function packagedDriver(verified = true) {
 }
 
 describe("live host Pi C2 authority", () => {
+  it("returns a seven-second dynamic tool's real result independently of the startup deadline", async () => {
+    const f = await fixture({ dynamicToolHandler: async call => {
+      await new Promise<void>(resolve => setTimeout(resolve, 7000));
+      call.signal.throwIfAborted();
+      return { content: [{ type: "text", text: "seven-second-real-result" }], details: {} };
+    } });
+    await f.start(); const request = f.call("slow"); await f.announce(request);
+    await expect(sendPiToolRequest(f.initial.toolSocketPath, request, { timeoutMs: 60000 })).resolves.toMatchObject({ content: [{ text: "seven-second-real-result" }] });
+    await f.settle(); expect(f.transport.closed).toBe(false);
+  }, 12_000);
   it("resolves the real owned extension in official verified CJS cli layout, not cwd", async () => {
     const packaged = await packagedDriver(); const f = await fixture({}, packaged.Driver);
     expect(f.launch.fatalSessionStartExtensionPaths).toEqual([
