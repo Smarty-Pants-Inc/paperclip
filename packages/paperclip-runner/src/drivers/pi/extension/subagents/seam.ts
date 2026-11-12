@@ -3,6 +3,28 @@ import { createConnection } from "node:net";
 import { validatePiBindCommand, validateBindReceipt, type AnnounceRequest, type Envelope } from "../../pi-bind-protocol.js";
 import type { Origin } from "./bind-types.js";
 
+// SDK children reload module caches. Share the live parent accessor across those
+// realms, but capture its immutable origin ONCE at child factory load, never at a
+// later tool callback. Nothing is added to tool args, env, or foreground history.
+const parentKey = Symbol.for("paperclip.pi.unbound-child-parent.v1");
+interface UnboundParent {
+  capture(): Readonly<Origin> | null;
+  accept(origin: Readonly<Origin>): boolean;
+}
+const parentGlobals = globalThis as typeof globalThis & { [parentKey]?: UnboundParent };
+export function installUnboundChildParent(parent: UnboundParent): () => void {
+  parentGlobals[parentKey] = parent;
+  return () => { if (parentGlobals[parentKey] === parent) delete parentGlobals[parentKey]; };
+}
+export function captureUnboundChildFence(): () => boolean {
+  const parent = parentGlobals[parentKey];
+  // Native/custom provider sessions have no managed run authority to borrow.
+  if (!parent) return () => true;
+  const captured = parent.capture();
+  const origin = captured && Object.freeze({ ...captured });
+  return () => origin !== null && parent.accept(origin);
+}
+
 export type ParkReady = { ready: boolean; reasons: string[] };
 export type StoppedChildren = { settled: string[]; uncertain: string[] };
 export interface SubagentSeam {

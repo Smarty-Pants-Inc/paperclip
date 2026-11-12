@@ -65,8 +65,13 @@ const leases = processRegistry[registryKey] ??= new Map<string, ChildBridgeLease
 const consumedKey = Symbol.for("paperclip.pi.child-bridge.socket-consumed.v1");
 const socketRegistry = globalThis as typeof globalThis & { [consumedKey]?: Set<string> };
 const consumedSocketTickets = socketRegistry[consumedKey] ??= new Set<string>();
-export function consumeChildBridgeLease(bindings: unknown): AnyChildBridgeLease {
-  const entry = (bindings as Record<string, { ticket?: unknown; socket?: SocketBinding }> | null)?.[CHILD_BRIDGE_BINDING];
+export function consumeChildBridgeLease(bindings: unknown): AnyChildBridgeLease | undefined {
+  // Absence is the ordinary pi-subagents path, not a failed authority grant. A
+  // present entry, including null/malformed/replayed evidence, must still validate.
+  if (bindings == null) return undefined;
+  if (typeof bindings !== "object" || Array.isArray(bindings)) childAdmissionError("binding_invalid", "Child extension bindings must be an object.");
+  if (!Object.hasOwn(bindings, CHILD_BRIDGE_BINDING)) return undefined;
+  const entry = (bindings as Record<string, { ticket?: unknown; socket?: SocketBinding } | null>)[CHILD_BRIDGE_BINDING];
   const ticket = entry?.ticket;
   if (typeof ticket !== "string") childAdmissionError("binding_missing", "Required child bridge binding is missing.");
   const lease = leases.get(ticket);

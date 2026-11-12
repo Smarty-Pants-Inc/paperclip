@@ -2,6 +2,7 @@ import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { consumeChildBridgeLease, type AnyChildBridgeLease, type ChildToolEvent } from "./host.js";
 import { acknowledgeChildSelection, childAdmissionError } from "./selection.js";
+import { captureUnboundChildFence } from "./seam.js";
 
 export type LoadChildTracing = (entry: string, pi: ExtensionAPI) => Promise<void>;
 const loadTracing: LoadChildTracing = async (entry, pi) => {
@@ -28,8 +29,34 @@ export default async function childBridge(pi: ExtensionAPI): Promise<void> {
   }
 }
 
+/** Ordinary children retain the SDK's subagent-only extension loading and parent
+ * abort lifecycle. Only the unavailable per-child native-start ACK is skipped. */
+function installUnboundChildBridge(pi: ExtensionAPI): void {
+  const parentActive = captureUnboundChildFence();
+  let closed = false, diagnosed = false;
+  const active = () => !closed && parentActive();
+  pi.on("input", (_event, ctx) => {
+    if (!active()) { ctx.abort(); return { action: "handled" }; }
+  });
+  pi.on("before_agent_start", (_event, ctx) => {
+    if (!active()) { ctx.abort(); throw new Error("Unbound child parent origin is no longer active."); }
+    if (!diagnosed) {
+      diagnosed = true;
+      // One bounded native custom message in the child's transcript/event stream.
+      // No ticket, binding, model policy, or tool data.
+      return { message: { customType: "paperclip-unbound-child", content: "unbound child", display: false } };
+    }
+  });
+  pi.on("tool_call", () => {
+    if (!active()) return { block: true, reason: "Unbound child parent origin is no longer active." };
+  });
+  pi.on("agent_settled", () => { closed = true; });
+  pi.on("session_shutdown", () => { closed = true; });
+}
+
 /** Injected separately for controlled offline children; no private SDK/package imports. */
-export async function installChildBridge(pi: ExtensionAPI, lease: AnyChildBridgeLease, load: LoadChildTracing = loadTracing): Promise<void> {
+export async function installChildBridge(pi: ExtensionAPI, lease: AnyChildBridgeLease | undefined, load: LoadChildTracing = loadTracing): Promise<void> {
+  if (!lease) { installUnboundChildBridge(pi); return; }
   if (lease.isRevoked()) childAdmissionError("revoked", "Parent origin was revoked before child extension load.");
   // Load during the factory, not session_start: Langfuse's own startup handlers must run too.
   await load(lease.closure.langfuseExtensionPath, pi);

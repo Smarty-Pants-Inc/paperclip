@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerSubagentBridge } from "./index.js";
-import { installChildBridge } from "./child-bridge.js";
+import childBridge, { installChildBridge } from "./child-bridge.js";
 import { consumeChildBridgeLease, createSubagentScope, type ChildBridgeSink } from "./host.js";
 import { validateRoleTemplate } from "./role-template.js";
-import { installSubagentSeam } from "./seam.js";
+import { installSubagentSeam, installUnboundChildParent } from "./seam.js";
+import { RunAuthority } from "../../pi-bind-protocol.js";
 
 const roleText = "---\nname: reviewer\ntools: read\n---\nReview the real change.\n";
 const origin = { epoch: 7, runId: "run-7", turnId: "parent-host-turn-7", callId: "outer-subagent-call" };
@@ -76,6 +77,62 @@ async function fixture() {
 }
 
 describe("F087 mandatory in-process child bridge (trust boundary)", () => {
+  it("admits an ordinary child without a pre-issued binding", async () => {
+    vi.stubEnv("PI_SUBAGENT_EXTENSION_BINDINGS", "null");
+    try {
+      const child = new ControlledChild("ordinary-child");
+      await childBridge(child.api);
+      await child.emit("session_start");
+      await child.emit("before_agent_start");
+      await child.emit("turn_start", { turnIndex: 0 });
+      await child.call();
+      expect(child.effects).toEqual(["native-child-call"]);
+      expect(child.aborts).toBe(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it("records one bounded unbound diagnostic per child, not per turn or tool", async () => {
+    const child = new ControlledChild("diagnosed-child");
+    await installChildBridge(child.api, undefined, async () => { throw new Error("SDK loads subagent-only tracing; do not load it twice"); });
+    expect(await child.emit("before_agent_start")).toEqual({ message: { customType: "paperclip-unbound-child", content: "unbound child", display: false } });
+    expect(await child.emit("before_agent_start")).toBeUndefined();
+    await child.call("first"); await child.call("second");
+    expect(child.effects).toEqual(["first", "second"]);
+  });
+
+  it.each(["stopped", "moved-on"])("fences an unbound child against its captured parent when %s", async state => {
+    const authority = new RunAuthority();
+    authority.bind(origin);
+    const capturedParent = authority.beginTurn(origin);
+    const seen: unknown[] = [];
+    const off = installUnboundChildParent({ capture: () => authority.capture(), accept: captured => {
+      seen.push(captured);
+      return authority.accept(captured);
+    } });
+    try {
+      const child = new ControlledChild("fenced-unbound");
+      await installChildBridge(child.api, undefined);
+      await child.call("before-stop");
+      authority.end();
+      if (state === "moved-on") {
+        const next = { epoch: 8, runId: "run-8", turnId: "turn-8" };
+        authority.bind(next); authority.beginTurn(next);
+      }
+      expect(await child.call("late-child-call")).toMatchObject({ block: true });
+      expect(child.effects).toEqual(["before-stop"]);
+      expect(seen).toEqual([capturedParent, capturedParent]);
+    } finally { off(); }
+  });
+
+  it("refuses present malformed, consumed and revoked bindings rather than falling back", async () => {
+    for (const value of [null, {}, { ticket: 1 }, { ticket: "not-issued" }]) {
+      expect(() => consumeChildBridgeLease({ "paperclip.subagents/1": value })).toThrow(/binding|lease/i);
+    }
+    const f = await fixture();
+    await f.scope.revoke();
+    expect(() => consumeChildBridgeLease(f.prepared.options.extensionBindings)).toThrow(/missing|consumed|revoked/i);
+    expect(await f.child.call("revoked-present")).toMatchObject({ block: true });
+  });
+
   it("registers the public mandatory child extension and snapshots its path", async () => {
     const { registerRequiredChildExtensions } = await import("pi-subagents/required-child-extensions");
     let captured: unknown;
@@ -110,7 +167,7 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
     const prepared = await scope.prepare({ roleText, selection: selection() }, catalog);
     consumeChildBridgeLease(prepared.options.extensionBindings);
     expect(() => consumeChildBridgeLease(prepared.options.extensionBindings)).toThrow(/missing|consumed/i);
-    expect(() => consumeChildBridgeLease({})).toThrow(/binding|missing/i);
+    expect(consumeChildBridgeLease({})).toBeUndefined();
     await scope.revoke();
   });
 

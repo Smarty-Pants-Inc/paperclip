@@ -26,9 +26,27 @@ monkey-patches, executor, MCP client, tool-cap issuer, or tracing exporter.
    selection through `scope.prepare({roleText,selection,async}, catalog)`, then merge
    the supported `{model,async,options.extensionBindings}` fields without dropping
    other namespaces. Parent-origin defaults, stock role thinking, or omitted leaf
-   selections are never admission. Installed role projections are another owner.
+   selections are never **bound** admission. Installed role projections are
+   another owner. An ordinary native child without this optional namespace uses
+   the explicit unbound fallback below.
 
-## F087 child start gate
+## Ordinary native child fallback
+
+No `paperclip.subagents/1` namespace means **unbound**, not refused. The SDK still
+loads the installed subagent-only extensions, including Langfuse, exactly once;
+the bridge does not load tracing again. It adds one bounded, non-displayed native
+custom message (`paperclip-unbound-child`, text `unbound child`) per child. This
+is a diagnostic, not an authority receipt or a host-owned child-turn claim.
+
+Within the parent's process, capture the parent's immutable active Origin when
+the child extension is created. Each child tool checks that exact Origin against
+the parent authority, so Stop, settlement or a new epoch blocks later calls.
+Absent cross-process parent capture is not replaced with guessed lineage. No
+selection, ticket, binding bytes or acknowledgement gate is invented for this
+fallback. A **present** namespace still uses the strict one-use gate below;
+malformed, consumed, revoked and replayed bindings never downgrade to unbound.
+
+## F087 bound child start gate
 
 In-process children consume a one-use process-global startup lease. Each native
 child start calls `announce(toolCallId, capturedParentOrigin)` before the local
