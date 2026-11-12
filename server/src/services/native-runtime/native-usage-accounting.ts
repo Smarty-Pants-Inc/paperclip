@@ -108,6 +108,10 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
       const terminal = terminalTypes.includes(event.eventType);
       const resumed = event.eventType === "session.resumed";
       if (payload.kind !== "usage" && event.eventType !== "turn.started" && !terminal && !resumed) return false;
+      // A display-only usage item is not a new measurement. The facade emits
+      // one immediately after its measured snapshot; do not erase paid tokens.
+      // Explicit usage objects (including unavailable deltas) still invalidate.
+      if (payload.kind === "usage" && !Object.hasOwn(payload, "usage")) return false;
       // Historical replay can revisit an earlier report after restoration.
       // Re-persist its aggregate, but never rewind or count that report twice.
       if (event.sourceInstanceId && Number.isSafeInteger(event.sourceSeq)) {

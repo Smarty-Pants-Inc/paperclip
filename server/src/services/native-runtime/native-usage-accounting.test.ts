@@ -33,6 +33,20 @@ describe("native turn accounting", () => {
     expect(nativeUsageCostUsd(snapshot.usage, provider)).toBe(0.5);
   });
 
+  // Keep reason: S11-parent's real facade emits a display-only usage item
+  // immediately after the measured usage item; it must not erase paid tokens.
+  it("ignores display-only usage items rather than resetting the measured Pi turn", () => {
+    const accounting = createNativeTurnAccounting({ kind: "pi_rpc", model: "paperclip/faux", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" });
+    accounting.observe(event(1, "turn.started"));
+    accounting.observe(event(2, "item.completed", "turn-1", { kind: "usage", usage: {
+      runDelta: { inputTokens: 14, outputTokens: 8 }, runDeltaComplete: true,
+    } }));
+    accounting.observe(event(3, "item.completed", "turn-1", { kind: "usage", item: { type: "usage", status: "completed" } }));
+    accounting.observe(event(4, "turn.completed"));
+    expect(accounting.snapshot().complete).toBe(true);
+    expect(normalizeNativeUsage(accounting.snapshot().usage)).toMatchObject({ inputTokens: 14, outputTokens: 8 });
+  });
+
   // s7501 run 0a18c2d0 (ACPX Claude): K1 killed the Runner mid-turn. ACPX
   // reports provisional zero usage until a turn ends, so the lost turn never
   // got a complete report. The restored Runner failed it as lost on restore and
