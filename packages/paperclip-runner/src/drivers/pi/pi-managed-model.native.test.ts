@@ -60,8 +60,16 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
       const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       const metadata = await piManagedModelFromSnapshot(file, `paperclip/${item.id}`, binary!, environment);
       const diagnostics = warn.mock.calls.map(call => String(call[0])); warn.mockRestore();
-      expect(diagnostics.length).toBe(item.name === "unknown-defaults" ? 1 : 0);
+      expect(diagnostics).toHaveLength(1);
       expect(diagnostics.every(line => line.length <= 256 && !line.includes("\n"))).toBe(true);
+      if (item.name === "unknown-defaults") {
+        expect(metadata.compat).toBeUndefined();
+      } else {
+        const canonical = catalog!.getBuiltinModels("anthropic").find(model => model.id === item.id && model.api === "anthropic-messages");
+        expect(canonical).toBeDefined();
+        expect(metadata.compat).toEqual(canonical!.compat);
+        expect(diagnostics[0]).toContain("canonical provider anthropic");
+      }
       const first = await createPiProviderBinding({ model: `paperclip/${item.id}`, environment, thinkingLevel: item.effective, modelConfiguration: metadata });
       const { name, ...configuration } = first.provider;
       const generated = await mergedPiModelsJson(file, JSON.stringify({ providers: { [name]: configuration } }));
@@ -85,6 +93,7 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
         const state = (await bounded(native.request("get_state"))).data as any;
         proof.first = state;
         expect(state.model).toMatchObject({ id: item.id, provider: "paperclip", contextWindow: item.contextWindow, maxTokens: item.maxTokens, reasoning: true });
+        expect(state.model.compat).toEqual(metadata.compat);
         expect(state.thinkingLevel).toBe(item.effective);
         expect(state.model.baseUrl).toBe(first.provider.baseUrl);
         // Rotate only the capability; the exact resolved descriptor must survive.
@@ -254,7 +263,7 @@ it.skipIf(!binary || !output).each(["user-cap", "no-user-file"] as const)("real 
     else await expect(readFile(userFile)).rejects.toMatchObject({ code: "ENOENT" });
     proof.userFileUnchanged = true;
     proof.diagnostics = warn.mock.calls.map(call => String(call[0]));
-    expect(proof.diagnostics).toHaveLength(name === "user-cap" ? 0 : 1);
+    expect(proof.diagnostics).toHaveLength(1);
     expect(proof.diagnostics.every((line: string) => line.length <= 256 && !line.includes("\n"))).toBe(true);
     proof.status = "passed";
   } catch (error) { proof.status = "failed"; proof.error = String(error); throw error; }

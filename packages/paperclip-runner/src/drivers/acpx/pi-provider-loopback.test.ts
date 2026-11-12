@@ -15,6 +15,8 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
 
 const key = "reusable-provider-key-canary";
+const childFallback = { id: "vendor/model", contextWindow: 128000, maxTokens: 8192, reasoning: true,
+  thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
 function environment(url: string) {
   const routing = { PAPERCLIP_AI_PROVIDER_URL: url, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key", PAPERCLIP_AI_PROVIDER_KEY: key };
   return { ...routing, ...configuredEnvironmentProjection(routing), PATH: process.env.PATH };
@@ -31,7 +33,8 @@ async function binding(model = "paperclip/vendor/model") {
 
 describe("Pi managed provider loopback", () => {
   it.each(["low", "xhigh", "max"] as const)("passes native config capabilities unchanged, independently of requested effort %s", async thinkingLevel => {
-    const metadata = { id: "vendor/model", reasoning: true, contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { max: null } };
+    const metadata = { id: "vendor/model", reasoning: true, contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { max: null },
+      compat: { forceAdaptiveThinking: true, supportsTemperature: false, futureMetadata: { optional: null, values: [false, "kept"] } } };
     const binding = await createPiProviderBinding({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel, modelConfiguration: metadata });
     cleanups.push(binding.close);
     expect(binding.provider.models).toEqual([metadata]);
@@ -45,11 +48,12 @@ describe("Pi managed provider loopback", () => {
     expect(binding.provider.models).toEqual([{ id: "vendor/model" }]);
   });
 
-  it("keeps ACPX Pi models.json byte-identical without the explicit native option", async () => {
+  it("materializes documented child fallback capabilities without a selected catalog or config", async () => {
     const binding = await startPiProviderLoopback({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1") });
     cleanups.push(binding.close);
     const provider = JSON.parse(binding.json).providers.paperclip;
-    expect(binding.json).toBe(`${JSON.stringify({ providers: { paperclip: { baseUrl: provider.baseUrl, api: "anthropic-messages", apiKey: provider.apiKey, models: [{ id: "vendor/model" }] } } })}\n`);
+    expect(provider).toEqual({ baseUrl: provider.baseUrl, api: "anthropic-messages", apiKey: provider.apiKey, models: [childFallback] });
+    expect(binding.json.endsWith("\n")).toBe(true);
   });
 
   it.each([undefined, "off"] as const)("keeps absent/off thinking metadata non-reasoning: %s", async thinkingLevel => {
@@ -85,7 +89,7 @@ describe("Pi managed provider loopback", () => {
     expect(text).not.toContain(key);
     const config = JSON.parse(text);
     const provider = config.providers.paperclip;
-    expect(provider).toEqual({ baseUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), api: "anthropic-messages", apiKey: expect.any(String), models: [{ id: "vendor/model" }] });
+    expect(provider).toEqual({ baseUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/), api: "anthropic-messages", apiKey: expect.any(String), models: [childFallback] });
     expect(provider.apiKey).not.toBe(key);
     expect(provider.apiKey.length).toBeGreaterThanOrEqual(32);
     expect(sensitive).toContain(provider.apiKey);

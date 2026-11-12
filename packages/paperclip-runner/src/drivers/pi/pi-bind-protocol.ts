@@ -19,11 +19,45 @@ export interface PiBindingConfig {
   toolSocketPath?: string;
   homeDigest?: string;
 }
+export type PiJsonValue = null | boolean | number | string | PiJsonValue[] | { [key: string]: PiJsonValue };
+export type PiModelCompat = { [key: string]: PiJsonValue };
+
+/** Lossless JSON metadata only: no prototypes, accessors, symbols, holes or cycles.
+ * Shared references are fine (JSON duplicates them); only ancestor cycles fail.
+ * Used before either config cloning or private-channel serialization.
+ */
+export function isPiModelCompat(value: unknown): value is PiModelCompat {
+  const ancestors = new Set<object>();
+  function visit(item: unknown): boolean {
+    if (item === null || typeof item === "string" || typeof item === "boolean") return true;
+    if (typeof item === "number") return Number.isFinite(item);
+    if (typeof item !== "object" || ancestors.has(item)) return false;
+    const array = Array.isArray(item);
+    const prototype = Object.getPrototypeOf(item);
+    if (array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) return false;
+    ancestors.add(item);
+    try {
+      const keys = Reflect.ownKeys(item);
+      if (array && keys.length !== item.length + 1) return false;
+      for (const key of keys) {
+        if (array && key === "length") continue;
+        if (typeof key !== "string" || array && (!/^(0|[1-9][0-9]*)$/u.test(key) || Number(key) >= item.length)) return false;
+        const descriptor = Object.getOwnPropertyDescriptor(item, key);
+        if (!descriptor?.enumerable || !Object.hasOwn(descriptor, "value") || !visit(descriptor.value)) return false;
+      }
+      return true;
+    } finally { ancestors.delete(item); }
+  }
+  try { return value !== null && typeof value === "object" && !Array.isArray(value) && visit(value); }
+  catch { return false; }
+}
+
 export interface PiBindModel {
   id: string; name?: string; reasoning?: boolean; input?: Array<"text" | "image">;
   contextWindow?: number; maxTokens?: number;
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
   thinkingLevelMap?: Partial<Record<PiThinkingLevel, string | null>>;
+  compat?: PiModelCompat;
 }
 export interface PiBindProvider {
   name: string;
@@ -109,7 +143,7 @@ function validProvider(value: unknown, model: string): value is PiBindProvider {
     const url = new URL(value.baseUrl);
     if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash) return false;
   } catch { return false; }
-  const allowed = new Set(["id", "name", "reasoning", "input", "cost", "contextWindow", "maxTokens", "thinkingLevelMap"]);
+  const allowed = new Set(["id", "name", "reasoning", "input", "cost", "contextWindow", "maxTokens", "thinkingLevelMap", "compat"]);
   const ids = new Set<string>();
   for (const entry of value.models) {
     if (!object(entry) || !text(entry.id, 512) || ids.has(entry.id) || Object.keys(entry).some(key => !allowed.has(key))
@@ -117,6 +151,7 @@ function validProvider(value: unknown, model: string): value is PiBindProvider {
       || (entry.reasoning !== undefined && typeof entry.reasoning !== "boolean")
       || (entry.input !== undefined && (!Array.isArray(entry.input) || !entry.input.length || entry.input.some(item => item !== "text" && item !== "image")))
       || (entry.contextWindow !== undefined && !integer(entry.contextWindow, 1)) || (entry.maxTokens !== undefined && !integer(entry.maxTokens, 1))) return false;
+    if (Object.hasOwn(entry, "compat") && !isPiModelCompat(entry.compat)) return false;
     if (entry.cost !== undefined) {
       const cost = entry.cost;
       if (!object(cost) || ["input", "output", "cacheRead", "cacheWrite"].some(key => typeof cost[key] !== "number" || !Number.isFinite(cost[key]) || (cost[key] as number) < 0)) return false;
