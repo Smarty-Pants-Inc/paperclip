@@ -706,6 +706,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                   run.id,
                   agent.id,
                   issueId,
+                  nativeExecution.session.lifecyclePolicy?.mode ?? "unknown",
                 )),
                 ...buildNativeProviderEnvironment(
                   adapterEnv,
@@ -730,7 +731,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                       ),
                     }
                   : {}),
-              }, nativeExecution.provider, configuredTaskEnvironment),
+              }, nativeExecution.provider, configuredTaskEnvironment, nativeExecution.session.lifecyclePolicy?.mode ?? "unknown"),
               onTaskDispatched: markDispatchStarted,
               runnerExecutionTarget: executionTarget,
               runnerIngressAuthorized: isRunnerIngressAuthorized(

@@ -38,6 +38,7 @@ directory. Pi's agent directory is private per run:
 `PI_LANGFUSE_MAX_CHARS`), parent ID and user ID is stripped, as is any extension
 entry whose path contains `langfuse` or `pi-observability` (case-insensitive).
 Only the disabled marker `LANGFUSE_TRACING_ENABLED=false` remains.
+Tracing also requires the resolved `per_turn` lifecycle (Pi's unset default); warm/reused or unknown lifecycles take the same disabled strip path even with an explicit opt-in.
 
 ## Native trusted Pi packages and extensions
 

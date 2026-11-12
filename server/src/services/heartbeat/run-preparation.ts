@@ -671,15 +671,16 @@ export function applyPiLangfuseExclusion(
   environment: NodeJS.ProcessEnv,
   provider: { kind: string; agent?: string },
   configured: NodeJS.ProcessEnv = environment,
+  lifecycleMode: string = "per_turn",
 ): NodeJS.ProcessEnv {
   if (provider.kind !== "acpx" || provider.agent !== "pi") return environment;
   // Default deny: Langfuse reaches Pi only when the agent explicitly sets
   // LANGFUSE_TRACING_ENABLED to true or 1 (trimmed, case-insensitive); unset,
   // empty or any other value strips every Langfuse key, the parent ids, the user
   // id and the Langfuse extension entries, so a client-data agent nobody flagged
-  // never traces.
+  // never traces. Reused Pi processes cannot refresh run-scoped parent ids.
   const enabled = configured.LANGFUSE_TRACING_ENABLED?.trim().toLowerCase();
-  if (enabled === "true" || enabled === "1") return environment;
+  if (lifecycleMode === "per_turn" && (enabled === "true" || enabled === "1")) return environment;
   const result: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(environment)
     .filter(([name]) => !name.startsWith("LANGFUSE_") && name !== "PI_LANGFUSE_MAX_CHARS"));
   result.LANGFUSE_TRACING_ENABLED = "false";
@@ -705,9 +706,10 @@ export function buildPiLangfuseParentEnvironment(
   runId: string,
   agentId: string,
   issueId?: string | null,
+  lifecycleMode: string = "per_turn",
 ): NodeJS.ProcessEnv {
   if (provider.kind !== "acpx" || provider.agent !== "pi") return configured;
-  const excluded = applyPiLangfuseExclusion(configured, provider);
+  const excluded = applyPiLangfuseExclusion(configured, provider, configured, lifecycleMode);
   if (excluded !== configured) return excluded;
   // Byte-exact contract shared with the server-side Langfuse plugin. Defaults
   // are run-scoped, not session-scoped; operator values (even empty) win.

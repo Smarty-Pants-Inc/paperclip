@@ -409,8 +409,9 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   }
 
-  it.each(["issue", "no-issue", "operator"] as const)("projects Pi Langfuse parent context into native Runner dispatch (%s)", async scenario => {
+  it.each(["issue", "no-issue", "operator", "per_turn"] as const)("projects Pi Langfuse parent context into native Runner dispatch (%s)", async scenario => {
     const { input } = await fixture(true, "acpx");
+    if (scenario === "per_turn") input.runtime.nativeExecution!.session.lifecyclePolicy = { mode: "per_turn", idleTimeoutMs: null };
     if (scenario === "no-issue") {
       input.task.issueId = null;
       input.task.issueRef = null;
@@ -439,10 +440,11 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(environment).not.toHaveProperty("LANGFUSE_PI_PARENT_DEPTH");
   });
 
-  it("enforces configured Pi exclusion after merging adapter values into Runner dispatch", async () => {
+  it.each(["disabled", "warm"] as const)("enforces Pi exclusion after merging adapter values into Runner dispatch (%s)", async scenario => {
     const { input } = await fixture(true, "acpx");
+    if (scenario === "warm") input.runtime.nativeExecution!.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 300_000 };
     input.config.configuredTaskEnvironment = {
-      LANGFUSE_TRACING_ENABLED: "FaLsE", LANGFUSE_SECRET_KEY: "configured-secret",
+      LANGFUSE_TRACING_ENABLED: scenario === "warm" ? "true" : "FaLsE", LANGFUSE_SECRET_KEY: "configured-secret",
       LANGFUSE_PUBLIC_KEY: "configured-public", LANGFUSE_USER_ID: "operator-user",
       LANGFUSE_PI_PARENT_TRACE_ID: "operator-trace", LANGFUSE_PI_PARENT_SPAN_ID: "operator-span",
       LANGFUSE_PI_PARENT_SESSION_ID: "operator-session", PI_LANGFUSE_MAX_CHARS: "200000",

@@ -2,6 +2,7 @@ import type { Db } from "@paperclipai/db";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
 import { describe, expect, it, vi } from "vitest";
+import { resolveHeartbeatNativeLifecyclePolicy } from "./native-lifecycle.js";
 import {
   buildPaperclipRuntimeMcpServers as legacyBuildRuntimeMcpServers,
   buildPaperclipWakePayload as legacyBuildWakePayload,
@@ -60,6 +61,31 @@ describe("Pi Langfuse parent environment", () => {
     LANGFUSE_PI_PARENT_SPAN_ID: "53485794c95451df",
     LANGFUSE_PI_PARENT_SESSION_ID: issueId,
   };
+
+  // Data safety: startup parent ids cannot follow later runs in a reused Pi.
+  it.each(["per_turn", "warm", "unknown"])("gates opted-in tracing on the resolved lifecycle (%s)", mode => {
+    const source = {
+      LANGFUSE_TRACING_ENABLED: "true", LANGFUSE_PUBLIC_KEY: "public", LANGFUSE_SECRET_KEY: "secret",
+      PI_LANGFUSE_MAX_CHARS: "200000", ...parents,
+      PAPERCLIP_PI_EXTENSIONS: '["/opt/pi/langfuse/index.ts","/opt/pi/other/index.ts"]', CUSTOM: "retained",
+    };
+    const expected = mode === "per_turn" ? source : {
+      LANGFUSE_TRACING_ENABLED: "false", PAPERCLIP_PI_EXTENSIONS: '["/opt/pi/other/index.ts"]', CUSTOM: "retained",
+    };
+    expect(buildPiLangfuseParentEnvironment(source, pi, runId, agentId, issueId, mode)).toEqual(expected);
+    expect(applyPiLangfuseExclusion(source, pi, source, mode)).toEqual(expected);
+  });
+
+  it.each([false, true])("uses Pi's per-turn default when lifecycle is unset (remote: %s)", remote => {
+    const policy = resolveHeartbeatNativeLifecyclePolicy({
+      adapterType: "paperclip_runner", backend: "acpx_runtime", acpxAgent: "pi",
+      agentMode: undefined, agentIdleTimeoutMs: undefined, managedAiSelected: false, taskOwned: true,
+      localTarget: !remote, remoteSandboxTarget: remote ? { reusableLease: true } : undefined,
+    });
+    expect(policy).toEqual({ mode: "per_turn", idleTimeoutMs: null });
+    expect(buildPiLangfuseParentEnvironment({ LANGFUSE_TRACING_ENABLED: "true" }, pi, runId, agentId, issueId, policy.mode))
+      .toEqual({ LANGFUSE_TRACING_ENABLED: "true", ...parents });
+  });
 
   // Trust boundary: these exact bytes join the server envelope and Pi spans.
   it("derives the fixed server-plugin contract vector without setting depth", () => {
