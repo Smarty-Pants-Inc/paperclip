@@ -1149,6 +1149,54 @@ describe("remote controller restart adoption", () => {
 
 
 describe("remote runner launch fingerprint compatibility", () => {
+  // Keep reason: data safety / e8b1d929; exercise the command actually dispatched
+  // to the sandbox, not a second hand-written launch command.
+  it("keeps both generations of stderr from the actual remote shell launch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "remote-runner-stderr-generations-"));
+    const diagnostics = join(root, "diagnostics");
+    const fakeRunnerd = join(root, "fake-runnerd");
+    const launches: { command: string; args: string[] }[] = [];
+    const execute = vi.fn(async (request: { command: string; args?: string[] }) => {
+      if (request.args?.[2] === "paperclip-runner-launch") {
+        launches.push({ command: request.command, args: request.args });
+      }
+      // Capture dispatch without entering process-monitor polling in the test.
+      return { exitCode: 1, timedOut: false, stdout: "", stderr: "" };
+    });
+    try {
+      await writeFile(fakeRunnerd, `#!/bin/sh
+trap 'printf "%s" "$?" > "$2"' EXIT
+printf "%s\\n" "$1" >&2
+exit 23
+`, { mode: 0o755 });
+      for (const generation of ["first-generation-crash", "second-generation-crash"]) {
+        const done = join(root, `${generation}.done`);
+        const handle = createRemoteRunnerProcessLauncher({
+          target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: root },
+          runner: { execute } as never, remoteBinary: fakeRunnerd,
+          processIdentityPath: join(root, "state", "identity"), stateDirectory: join(root, "state"),
+          diagnosticsDirectory: diagnostics, runnerInstanceId: "runner-stderr-generations",
+        })({ command: fakeRunnerd, args: [generation, done], cwd: root, environment: {} });
+        await expect(handle.completion).rejects.toThrow("runner_remote_process_launch_failed");
+        const launch = launches.at(-1)!;
+        expect(spawnSync(launch.command, launch.args, { cwd: root, encoding: "utf8" }).status).toBe(0);
+        await vi.waitFor(async () => expect(await readFile(done, "utf8")).toBe("23"));
+      }
+      const logs = await readdir(diagnostics);
+      const contents = await Promise.all(logs.map(async name => {
+        const path = join(diagnostics, name);
+        expect((await lstat(path)).mode & 0o777).toBe(0o600);
+        return readFile(path, "utf8");
+      }));
+      expect(contents).toContain("first-generation-crash\n");
+      expect(contents).toContain("second-generation-crash\n");
+      expect(logs).toHaveLength(2);
+      expect((await lstat(diagnostics)).mode & 0o777).toBe(0o700);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("verifies the generation emitted by the actual launch writer", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-generation-roundtrip-"));
     const marker = join(root, "identity");
