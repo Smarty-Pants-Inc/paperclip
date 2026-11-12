@@ -11,6 +11,7 @@ export const PROVIDER_PERFORMANCE_PHASES = [
   "runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn", "runner.pi.interrupt_wait", "runner.pi.prompt_to_started",
   "runner.pi.admission.get_state", "runner.pi.admission.set_model",
   "runner.pi.admission.get_available_thinking_levels", "runner.pi.admission.set_thinking_level",
+  "pi.request.sent",
 ] as const;
 export type ProviderPerformancePhase = typeof PROVIDER_PERFORMANCE_PHASES[number];
 export interface ProviderPerformanceSpan {
@@ -36,7 +37,8 @@ export function parseProviderPerformanceSpans(payload: unknown, observedAtMs: nu
     if (typeof name !== "string" || !names.has(name) || typeof startedAtMs !== "number" || typeof endedAtMs !== "number"
       || !Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs)
       || startedAtMs < observedAtMs - maxDurationMs || endedAtMs > observedAtMs + 1000
-      || endedAtMs < startedAtMs || endedAtMs - startedAtMs > maxDurationMs) return [];
+      || endedAtMs < startedAtMs || endedAtMs - startedAtMs > maxDurationMs
+      || (name === "pi.request.sent" && endedAtMs !== startedAtMs)) return [];
     const count = counts.get(name) ?? 0;
     if (count >= 16) return [];
     counts.set(name, count + 1);

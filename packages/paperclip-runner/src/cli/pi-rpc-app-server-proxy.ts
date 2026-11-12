@@ -501,9 +501,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           message: payload.summary, severity: payload.severity, category: payload.category, noticeKey: payload.noticeId, details: payload.details } });
       } else if (event.eventType === "harness.diagnostic") {
         if (payload.code === PROVIDER_PERFORMANCE_DIAGNOSTIC) {
-          send({ method: "paperclip/providerPerformance", params: {
-            threadId: opened.ids().driverSessionId, turnId: event.turnId,
-            spans: parseProviderPerformanceSpans(payload, Date.now()),
+          const spans = parseProviderPerformanceSpans(payload, Date.now());
+          if (spans.length) send({ method: "paperclip/providerPerformance", params: {
+            threadId: opened.ids().driverSessionId, turnId: event.turnId, spans,
           } });
           continue;
         }

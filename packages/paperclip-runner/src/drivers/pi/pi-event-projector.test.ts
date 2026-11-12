@@ -126,17 +126,26 @@ describe("Pi compaction lifecycle and warning projection (L17)", () => {
 });
 
 describe("large native tool output projection (synthetic incident regression)", () => {
-  it("digests the real 403238-byte custom entry for display without losing the turn", () => {
+  it("omits the real 403238-byte custom entry without traversing or losing the turn", () => {
     const raw = fixture("tool-context-guard-full.json");
     const input = JSON.parse(raw);
     const before = JSON.stringify(input);
     expect(Buffer.byteLength(before)).toBe(403238);
     const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
     const events = projector.project(input);
-    expect(events).toMatchObject([{ eventType: "harness.diagnostic", payload: { code: "pi_native_activity", providerMethod: "entry_appended" }, debug: { piProjection: { truncated: true, recordBytes: 403238, recordSha256: createHash("sha256").update(before).digest("hex") } } }]);
+    expect(events).toEqual([{ runId: "run", turnId: "turn", eventType: "harness.diagnostic", payload: { code: "pi_native_activity", providerMethod: "entry_appended" } }]);
     expect(Buffer.byteLength(JSON.stringify(events))).toBeLessThan(2048);
     expect(JSON.stringify(input)).toBe(before);
     expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
+  it("never walks an unknown custom entry, including opaque enumerable getters", () => {
+    let reads = 0;
+    const input = { type: "entry_appended", entry: Object.defineProperty({ type: "custom", customType: "foreign.extension" }, "data", {
+      enumerable: true, get() { reads++; throw new Error("private extension content"); },
+    }) };
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(reads).toBe(0);
+    expect(events).toEqual([{ runId: "run", turnId: "turn", eventType: "harness.diagnostic", payload: { code: "pi_native_activity", providerMethod: "entry_appended" } }]);
   });
   it("preserves a safe small escaped record exactly instead of applying a blanket JSON text cap", () => {
     const body = "\\".repeat(50000);

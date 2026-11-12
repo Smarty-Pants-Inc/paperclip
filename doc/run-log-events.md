@@ -131,6 +131,41 @@ not qualify. No deliverable text means no timing sample. A recovered dispatch ca
 record newly committed output from the original start; it does not reproduce
 earlier output timing. The event contains no text or provider identifiers.
 
+## Pi logical request observations
+
+Native Pi runs write `run.performance.span` with `span: "pi.request.sent"` for
+Pi 1.5.2's public `before_provider_request` hook. Despite the phase name, this is
+an observation of a **logical request immediately before dispatch**, not proof
+of socket transmission or provider success. It occurs after payload construction;
+later hooks or dispatch can still fail. Provider-internal HTTP retries do not
+necessarily re-enter this hook; tool-loop invocations and session-level retries
+that construct another request do. Turn/retry notices never synthesize samples.
+
+The hook captures `Date.now()` locally, sets equal start/end times, and appends
+only the fixed `paperclip.provider-performance.v1` custom entry with normalized
+`provider_performance_spans` timing data. `durationMs` is zero and `outcome: "ok"`
+means the hook was observed. Request payloads, headers, URLs, model IDs, prompts,
+tools and arbitrary entry attributes are neither inspected nor copied. Append
+failure is fail-open. The append uses Pi's existing session persistence and
+`entry_appended` event, adding a small persistence operation on the request path;
+it adds no new transport or stdout record.
+
+Only bound Runner-origin events for an admitted Pi execution persist this instant;
+payload claims cannot authorize it. Originating run/turn identity and the opened
+native thread survive the existing projector/facade path, not mutable active-turn
+state. Each hook batch is separate, including distinct requests in the same
+millisecond and turns with more than 16 requests. Bounded per-batch validation and
+closed phase allowlists remain in force.
+
+The child is grouped under `provider.runtime` → `native.session.execute`.
+`wallStartedAtMs` retains the hook's timestamp and `startOffsetMs` is trace-relative,
+not the later server arrival/write time. Writes are deferred, fail-open, and
+settled at trace finish; a slow sink does not block committed-event progress.
+The grouping parent and existing OpenCode duration phases keep their no-duplicate
+run-log policy. Missing hook evidence produces no sample. These observations do
+not change TTFT and are local run evidence (plus operator-configured Observability),
+not first-party Telemetry.
+
 ## Speed budget breaches
 
 `run.performance.budget_exceeded` (schema `paperclip.run-performance-budget.v1`,
