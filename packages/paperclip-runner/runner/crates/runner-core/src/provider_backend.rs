@@ -853,6 +853,11 @@ fn normalize_provider_notification(
         }
         return Ok(events);
     }
+    if state.config.provider == "pi_rpc" && method == "thread/tokenUsage/updated" {
+        return Ok(crate::provider_events::normalize_pi_usage_notification(
+            params,
+        ));
+    }
     if method != "paperclip/runResult" {
         return Ok(
             normalize_codex_notification_in(method, params, Some(&state.config.cwd))
@@ -7428,6 +7433,170 @@ done
         state.active_provider_turn_id = Some("turn-1".to_owned());
         state.lifecycle = "turn_active".to_owned();
         state
+    }
+
+    // Keep: provider receipt identity and billed cost cross the proxy/accounting
+    // trust boundary. Use the Pi projector + app-server proxy's wire shape.
+    #[test]
+    fn pi_usage_keeps_receipt_identity_and_provider_cost() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let params = json!({
+            "provider": "pi_rpc", "model": "pi/model", "threadId": "pi-session",
+            "turnId": "pi-turn", "providerRequestId": "pi-receipt-1",
+            "tokenUsage": {
+                "total": {"inputTokens": 24, "outputTokens": 14, "cacheReadTokens": 6,
+                    "cacheWriteTokens": 2, "providerCostUsd": 0.021},
+                "last": {"inputTokens": 7, "outputTokens": 4, "cacheReadTokens": 2,
+                    "cacheWriteTokens": 1, "providerCostUsd": 0.004}
+            },
+            "runDeltaAvailable": true,
+            "runDelta": {"inputTokens": 7, "outputTokens": 4, "cacheReadTokens": 2,
+                "cacheWriteTokens": 1, "providerCostUsd": 0.004}
+        });
+        let events =
+            normalize_provider_notification(&mut state, "thread/tokenUsage/updated", &params)
+                .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "usage.reported");
+        assert_eq!(events[0].priority, EventPriority::P0);
+        // Check cost before identity: billed cost already survives the base;
+        // receipt identity is the regression, not a catalog-price conversion.
+        assert_eq!(events[0].payload["runDelta"]["providerCostUsd"], 0.004);
+        assert_eq!(events[0].payload["cumulative"]["providerCostUsd"], 0.021);
+        assert_eq!(events[0].payload["providerRequestId"], "pi-receipt-1");
+        assert_eq!(events[0].payload["provider"], "pi_rpc");
+        assert_eq!(events[0].payload["runDeltaAvailable"], true);
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&events[0].payload)
+            .unwrap();
+    }
+
+    #[test]
+    fn non_pi_usage_ignores_pi_receipt_metadata_byte_for_byte() {
+        let params = json!({
+            "threadId": "provider-session", "turnId": "provider-turn", "model": "model",
+            "tokenUsage": {
+                "total": {"inputTokens": 24, "outputTokens": 14, "providerCostUsd": 0.021},
+                "last": {"inputTokens": 7, "outputTokens": 4, "providerCostUsd": 0.004}
+            }
+        });
+        let mut with_pi_metadata = params.clone();
+        with_pi_metadata["providerRequestId"] = json!("pi-receipt-1");
+        with_pi_metadata["childUsage"] = json!("unknown");
+        for provider in ["codex", "opencode", "cursor_cloud"] {
+            let mut plain_state = opencode_result_state();
+            plain_state.config.provider = provider.to_owned();
+            let mut metadata_state = plain_state.clone();
+            let plain = normalize_provider_notification(
+                &mut plain_state,
+                "thread/tokenUsage/updated",
+                &params,
+            )
+            .unwrap();
+            let enriched = normalize_provider_notification(
+                &mut metadata_state,
+                "thread/tokenUsage/updated",
+                &with_pi_metadata,
+            )
+            .unwrap();
+            assert_eq!(plain, enriched, "{provider}");
+            let bytes = serde_json::to_vec(&enriched[0].payload).unwrap();
+            assert_eq!(serde_json::to_vec(&plain[0].payload).unwrap(), bytes);
+            println!(
+                "B8_PROVIDER_BYTES {provider} {}",
+                String::from_utf8(bytes).unwrap()
+            );
+        }
+    }
+
+    // Keep: unknown child/subagent spend must survive the provider boundary;
+    // preserving the flag does not invent child token counts or billed cost.
+    #[test]
+    fn pi_child_usage_receipt_keeps_identity_and_provider_cost() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let events = normalize_provider_notification(
+            &mut state,
+            "thread/tokenUsage/updated",
+            &json!({
+                "provider": "pi_rpc", "threadId": "pi-session", "model": "pi/model",
+                "turnId": "pi-turn", "providerRequestId": "pi-receipt-with-child",
+                "childUsage": "unknown", "runDeltaAvailable": true,
+                "tokenUsage": {
+                    "total": {"inputTokens": 24, "outputTokens": 14, "providerCostUsd": 0.021},
+                    "last": {"inputTokens": 7, "outputTokens": 4, "providerCostUsd": 0.004}
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "usage.reported");
+        assert_eq!(events[0].payload["childUsage"], "unknown");
+        assert_eq!(
+            events[0].payload["providerRequestId"],
+            "pi-receipt-with-child"
+        );
+        assert_eq!(events[0].payload["runDelta"]["providerCostUsd"], 0.004);
+        assert_eq!(events[0].payload["cumulative"]["providerCostUsd"], 0.021);
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&events[0].payload)
+            .unwrap();
+    }
+
+    #[test]
+    fn pi_child_usage_is_optional_and_typed() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let params = json!({"threadId": "pi-session", "tokenUsage": {
+            "total": {"inputTokens": 7, "outputTokens": 4}
+        }});
+        let original =
+            normalize_provider_notification(&mut state, "thread/tokenUsage/updated", &params)
+                .unwrap()
+                .remove(0)
+                .payload;
+        assert!(original.get("childUsage").is_none());
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../protocol/schemas/usage.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        validator.validate(&original).unwrap();
+        let mut valid = original.clone();
+        valid["childUsage"] = json!("unknown");
+        validator.validate(&valid).unwrap();
+        for invalid in [
+            Value::Null,
+            json!(true),
+            json!(3),
+            json!({}),
+            json!([]),
+            json!("included"),
+        ] {
+            let mut invalid_payload = original.clone();
+            invalid_payload["childUsage"] = invalid.clone();
+            assert!(!validator.is_valid(&invalid_payload), "{invalid}");
+            let mut invalid_params = params.clone();
+            invalid_params["childUsage"] = invalid;
+            let events = normalize_provider_notification(
+                &mut state,
+                "thread/tokenUsage/updated",
+                &invalid_params,
+            )
+            .unwrap();
+            assert_eq!(events[0].payload, original);
+        }
     }
 
     #[test]
