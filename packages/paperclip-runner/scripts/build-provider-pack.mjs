@@ -283,6 +283,8 @@ try {
   }
 
   const piRpcProxyPath = "dist/cli/pi-rpc-app-server-proxy.cjs";
+  const piExtensionPath = "dist/drivers/pi/extension/index.js";
+  const piChildBridgePath = "dist/drivers/pi/extension/child-bridge.js";
   const piRpcExecutablePath = "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
   const opencodeProxyPath = "dist/cli/opencode-app-server-proxy.cjs";
   const acpxSidecarPath = "dist/cli/acpx-runtime-sidecar.cjs";
@@ -299,6 +301,8 @@ try {
     productionLock,
     opencodeProxyPath,
     piRpcProxyPath,
+    piExtensionPath,
+    piChildBridgePath,
     ...(nativeProviders.pi_rpc ? [piRpcExecutablePath] : []),
     acpxSidecarPath,
     opencodeCommand,
@@ -365,6 +369,8 @@ try {
     ...providerPackManifestFields(candidateProviders, candidates),
     artifacts: {
       piRpcProxy: { path: piRpcProxyPath, sha256: sha256File(join(temporaryRoot, piRpcProxyPath)) },
+      piExtension: { path: piExtensionPath, sha256: sha256File(join(temporaryRoot, piExtensionPath)) },
+      piChildBridge: { path: piChildBridgePath, sha256: sha256File(join(temporaryRoot, piChildBridgePath)) },
       ...(nativeProviders.pi_rpc ? { piRpcExecutable: { path: piRpcExecutablePath,
         sha256: sha256File(join(temporaryRoot, piRpcExecutablePath)) } } : {}),
       grokLauncher: {

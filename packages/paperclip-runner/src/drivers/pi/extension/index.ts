@@ -3,6 +3,9 @@ import { readFileSync } from "node:fs";
 import { chmod, lstat, realpath, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createSubagentLifecycle, registerSubagentBridge, type SubagentEventBus } from "./subagents/index.js";
+import { installSubagentSeam } from "./subagents/seam.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -31,6 +34,7 @@ export interface PiBindTool {
 }
 type LifecycleHandler = (event: any, ctx: PiBindContext) => any;
 export interface PiBindApi {
+  events?: SubagentEventBus;
   on(event: "session_start", handler: LifecycleHandler): () => void;
   on(event: "session_shutdown", handler: LifecycleHandler): () => void;
   on(event: "input", handler: LifecycleHandler): () => void;
@@ -122,7 +126,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   const registeredTools = new Map<string, PiDynamicTool>();
   const pendingTools = new Set<string>();
   const sockets = new Set<Socket>();
-  const aborters = new Set<AbortController>();
+  const aborters = new Map<AbortController, boolean>();
   // Only the latest lifecycle transaction is retryable. Queries/announcements never evict it.
   let lastTransaction: { nonce: string; fingerprint: string; receipt: PiBindReceipt } | undefined;
   function hooks(): PiBindHooks[] { return [...hookRegistrations, ...(options.hooks ? [options.hooks] : [])]; }
@@ -130,15 +134,15 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     ++fenceVersion;
     authority.end(); prepared = admitted = running = null;
     lastTransaction = undefined;
-    for (const aborter of aborters) aborter.abort();
+    for (const [aborter, fenceBound] of aborters) if (fenceBound) aborter.abort();
     if (registeredProvider) {
       const provider = registeredProvider; registeredProvider = undefined;
       try { pi.unregisterProvider(provider); } catch { failed = true; }
     }
   }
   function mustIdle() { if (!ctx || !ctx.isIdle() || ctx.hasPendingMessages() || pendingTools.size || pendingDialogs || running || admitted) throw new Error(PI_BIND_ERROR); }
-  async function deadline<T>(operation: (signal: AbortSignal) => Promise<T> | T, external?: AbortSignal, ms = timeoutMs): Promise<T> {
-    const controller = new AbortController(); aborters.add(controller);
+  async function deadline<T>(operation: (signal: AbortSignal) => Promise<T> | T, external?: AbortSignal, ms = timeoutMs, fenceBound = true): Promise<T> {
+    const controller = new AbortController(); aborters.set(controller, fenceBound);
     const signal = external ? AbortSignal.any([controller.signal, external]) : controller.signal;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let cancel: (() => void) | undefined;
@@ -251,7 +255,9 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     for (const stop of stopChildrenHooks) {
       try {
         if (Date.now() >= until) throw new Error();
-        const result = await deadline(stop, undefined, Math.max(1, until - Date.now()));
+        // Parent settlement revokes turn authority, but must not cancel the Stop
+        // barrier that is waiting for precisely that settlement and its children.
+        const result = await deadline(stop, undefined, Math.max(1, until - Date.now()), false);
         if (!result || !stringList(result.settled) || !stringList(result.uncertain)) throw new Error();
         settled.push(...result.settled); uncertain.push(...result.uncertain);
       } catch { uncertain.push("stop hook unavailable"); }
@@ -347,6 +353,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   async function close() {
     if (closing) return closing;
     closed = true; fence();
+    for (const aborter of aborters.keys()) aborter.abort();
     closing = (async () => {
       for (const socket of sockets) socket.destroy();
       if (server?.listening) await new Promise<void>(resolveClose => server!.close(() => resolveClose()));
@@ -392,6 +399,55 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   return { authority, close, dispatch, ready: () => starting };
 }
 
+/** The CLI host extension loads before settings packages. Register this handler
+ * before pi-subagents' session_start so its liveness provider is observable.
+ * Both bundled registry copies use pi-subagents' process-global Symbol.for key.
+ */
+export function installPiSubagentComposition(
+  pi: PiBindApi,
+  childBridgePath = fileURLToPath(new URL("./child-bridge.js", import.meta.url)),
+) {
+  if (!pi.events) throw new Error("Pi subagent event bus unavailable");
+  const events = pi.events;
+  const offSeam = installSubagentSeam({ announce, registerParkReadyContributor, registerStopChildren });
+  let lifecycle: ReturnType<typeof createSubagentLifecycle> | undefined;
+  let bridge: ReturnType<typeof registerSubagentBridge> | undefined;
+  let disposed = false;
+  const settled = new Set<(error?: Error) => void>();
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    lifecycle?.dispose(); bridge?.dispose(); offSeam();
+    for (const finish of [...settled]) finish(new Error("Pi subagent lifecycle disposed"));
+  }
+  pi.on("agent_settled", () => { for (const finish of [...settled]) finish(); });
+  pi.on("session_start", (_event, context) => {
+    try {
+      if (disposed || lifecycle) throw new Error("Pi subagent lifecycle already started");
+      const sessionId = context.sessionManager.getSessionId();
+      lifecycle = createSubagentLifecycle({ sessionId, events, abortParent: async signal => {
+        // ctx.abort() is a public void API. Observe agent_settled rather than
+        // mistaking that fire-and-forget call for completed parent settlement.
+        signal.throwIfAborted();
+        let finish!: (error?: Error) => void;
+        const completion = new Promise<void>((resolveDone, reject) => {
+          finish = error => { settled.delete(finish); error ? reject(error) : resolveDone(); };
+        });
+        const canceled = () => finish(new Error("Pi parent abort not settled"));
+        settled.add(finish); signal.addEventListener("abort", canceled, { once: true });
+        try {
+          context.abort();
+          if (context.isIdle()) finish();
+          await completion;
+        } finally { settled.delete(finish); signal.removeEventListener("abort", canceled); }
+      } });
+      bridge = registerSubagentBridge({ sessionId, childBridgePath });
+    } catch (error) { dispose(); context.abort(); throw error; }
+  });
+  pi.on("session_shutdown", dispose); // also emitted for Pi extension reload
+  return { dispose };
+}
+
 export default function paperclipPiBindExtension(pi: PiBindApi): void {
   const socketPath = process.env.PAPERCLIP_PI_BIND_SOCKET;
   const initialJson = process.env.PAPERCLIP_PI_BIND_INITIAL;
@@ -401,6 +457,7 @@ export default function paperclipPiBindExtension(pi: PiBindApi): void {
     const path = process.env.PAPERCLIP_PI_INSTRUCTIONS_FILE;
     const boundary = process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY;
     if (!path || !boundary) throw new Error(PI_BIND_ERROR);
+    installPiSubagentComposition(pi);
     pi.on("before_agent_start", event => {
       const segment = readFileSync(path, "utf8");
       const start = `<!-- ${boundary}:start -->\n`, end = `\n<!-- ${boundary}:end -->`;
@@ -412,5 +469,7 @@ export default function paperclipPiBindExtension(pi: PiBindApi): void {
   if (!socketPath || !initialJson || Buffer.byteLength(initialJson) > PI_BIND_MAX_FRAME_BYTES) throw new Error(PI_BIND_ERROR);
   let initial: PiBindInitial;
   try { initial = JSON.parse(initialJson) as PiBindInitial; } catch { throw new Error(PI_BIND_ERROR); }
-  installPiBindExtension(pi, { socketPath, initial });
+  const composition = installPiSubagentComposition(pi);
+  try { installPiBindExtension(pi, { socketPath, initial }); }
+  catch (error) { composition.dispose(); throw error; }
 }

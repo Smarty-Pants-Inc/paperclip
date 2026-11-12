@@ -134,8 +134,33 @@ export async function bundleVerifiedProviderEntrypoints({ write = true } = {}) {
     }
     results.push({ entrypoint, result, verifiedResult });
   }
+  await bundlePiExtensions({ write });
   await bundlePiProvisioner({ write });
   await bundleKimiProvisioner({ write });
+  return results;
+}
+
+/** Pi loads the host factory and required child factory independently. Neither
+ * bundle may depend on the source tree, a second loader, or pack pi-subagents.
+ */
+export const piExtensionEntrypoints = Object.freeze([
+  Object.freeze({ name: "pi-host-extension", source: resolve(packageRoot, "src/drivers/pi/extension/index.ts"), filename: "index.js" }),
+  Object.freeze({ name: "pi-child-bridge", source: resolve(packageRoot, "src/drivers/pi/extension/subagents/child-bridge.ts"), filename: "child-bridge.js" }),
+]);
+export async function bundlePiExtensions({ write = true, outputRoot = resolve(packageRoot, "dist/drivers/pi/extension") } = {}) {
+  const results = [];
+  for (const entrypoint of piExtensionEntrypoints) {
+    const output = resolve(outputRoot, entrypoint.filename);
+    const result = await build({
+      entryPoints: [entrypoint.source], outfile: output,
+      bundle: true, platform: "node", format: "esm", target: "node24", packages: "bundle",
+      splitting: false, sourcemap: false, legalComments: "none", metafile: true,
+      treeShaking: true, write, logLevel: "silent",
+    });
+    assertSelfContainedBundle(entrypoint, result);
+    if (write) await chmod(output, 0o444);
+    results.push({ entrypoint, result });
+  }
   return results;
 }
 

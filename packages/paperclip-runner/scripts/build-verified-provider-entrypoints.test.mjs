@@ -5,6 +5,8 @@ import test from "node:test";
 import {
   bundleVerifiedProviderEntrypoints,
   verifiedProviderEntrypoints,
+  bundlePiExtensions,
+  piExtensionEntrypoints,
 } from "./build-verified-provider-entrypoints.mjs";
 
 test("provider entrypoints include self-contained ESM and descriptor-safe CommonJS bundles", async () => {
@@ -37,6 +39,19 @@ test("written provider entrypoints satisfy qualified launch permissions", async 
       assert.notEqual(mode & 0o100, 0, entrypoint.name);
     }
   }
+});
+
+test("Pi host and child bridge are separate self-contained ESM entrypoints", async () => {
+  const bundles = await bundlePiExtensions({ write: false });
+  assert.equal(bundles.length, 2);
+  assert.deepEqual(piExtensionEntrypoints.map(entry => entry.filename), ["index.js", "child-bridge.js"]);
+  for (const { entrypoint, result } of bundles) {
+    assert.equal(result.outputFiles.length, 1, entrypoint.name);
+    const output = Object.values(result.metafile.outputs).find(value => value.entryPoint);
+    assert.ok(output.imports.every(value => value.external), entrypoint.name);
+  }
+  assert.match(bundles[0].result.outputFiles[0].text, /new URL\("\.\/child-bridge\.js", import\.meta\.url\)/);
+  assert.match(bundles[0].result.outputFiles[0].text, /pi-subagents\.required-child-extensions\.v1/);
 });
 
 // Package-layout regression runs in the existing verified-entrypoint test lane.
