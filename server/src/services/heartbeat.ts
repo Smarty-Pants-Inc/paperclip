@@ -337,10 +337,9 @@ import {
 import {
   authorizeFailedChatRunRetryWake,
 } from "./durable-chat-wakeup.js";
-import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js";
+import { prepareHeartbeatGitHubLaunchers, prepareHeartbeatGitHubEnvironment } from "./heartbeat-github-launchers.js";
 import {
   cleanupGitHubOperationLaunchers,
-  prepareGitHubExecutionEnvironment,
   startAdapterExecutionTargetPaperclipBridge,
 } from "@paperclipai/adapter-utils/execution-target";
 import { agentInstructionWorkingCopyService } from "./agent-instruction-working-copies.js";
@@ -3096,57 +3095,8 @@ export function heartbeatService(
       if (issueId && (!executionTarget || executionTarget.kind === "local")) {
         await recordLegacyCaseHandoffCleanupIntent(db, { runId: run.id, issueId, controllerBootId: legacyControllerBootId, scratch: runScratch });
       }
-      const gitExecutionEnv = await timePreparation("github_environment", () => prepareGitHubExecutionEnvironment({
-        target: executionTarget,
-        cwd: executionWorkspace.cwd,
-        env: Object.fromEntries(
-          Object.entries(parseObject(runtimeConfig.env)).filter(
-            (entry): entry is [string, string] => typeof entry[1] === "string",
-          ),
-        ),
-        hostCredentials: useHostGitHub,
-        // Networking is a controller-owned trust decision, independent of
-        // whether GitHub is configured or a credential can be acquired.
-        networkAccess:
-          trustPreset.kind === "standard" &&
-          process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
-      }));
-      runtimeConfig = { ...runtimeConfig, env: gitExecutionEnv };
       for (const key of MANAGED_GITHUB_TOKEN_KEYS) secretKeys.add(key);
       context.githubAuthenticationMode = useHostGitHub ? "host" : "managed";
-      if (!useHostGitHub && !providerApiPlacement) {
-        const githubLaunchers = await timePreparation("github_launchers", () => prepareHeartbeatGitHubLaunchers({
-          native: agent.adapterType === "paperclip_runner",
-          githubConfigured: githubSelection.configured,
-          agentId: agent.id,
-          runId: run.id,
-          target: executionTarget,
-          cwd: executionWorkspace.cwd,
-          env: gitExecutionEnv,
-          brokerUrl: configuredPaperclipApiBaseUrl() ?? "",
-          ...(activeEnvironmentLease ? { preparation: {
-            lease: activeEnvironmentLease.lease,
-            configuration: { environment: selectedEnvironment?.config, adapter: agent.adapterConfig, runtime: agent.runtimeConfig },
-            save: async (receipt: import("./heartbeat-github-launchers.js").AnonymousGitHubLauncherReceipt) => {
-              await db.update(environmentLeases).set({
-                metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ anonymousGitHubLaunchers: receipt })}::jsonb`,
-              }).where(and(eq(environmentLeases.id, activeEnvironmentLease.lease.id),
-                eq(environmentLeases.companyId, agent.companyId), eq(environmentLeases.status, "active"),
-                eq(environmentLeases.heartbeatRunId, run.id)));
-            },
-          } } : {}),
-          createBrokerToken: () => createRuntimeToolsToken({
-            agentId: agent.id,
-            companyId: agent.companyId,
-            runId: run.id,
-            responsibleUserId: responsibleUserId ?? "",
-            scope: "github_credentials",
-          })?.token ?? "",
-        }));
-        githubLauncherLocation = githubLaunchers.cleanupLocation;
-        runtimeConfig = { ...runtimeConfig, env: githubLaunchers.env };
-        secretKeys.add("PAPERCLIP_GITHUB_BROKER_TOKEN");
-      }
       context.paperclipEnvironment = selectedEnvironment && activeEnvironmentLease ? {
         id: selectedEnvironment.id,
         name: selectedEnvironment.name,
@@ -3405,6 +3355,49 @@ export function heartbeatService(
           environmentDriver: selectedEnvironment?.driver ?? "provider_api",
           leaseMetadata: activeEnvironmentLease?.lease.metadata ?? {},
         }));
+        // Preserve immutable runtime selection, after the running-agent check.
+        const nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({
+          persisted: run,
+          enabled: resolvedInstanceSettings.experimental.enableNativeRunner === true,
+          museEnabled: resolvedInstanceSettings.experimental.enableMuse === true,
+          grokEnabled: resolvedInstanceSettings.experimental.enableGrokBot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
+          dotEnabled: resolvedInstanceSettings.experimental.enableOpenAiDot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
+          runtimeConfig: agent.runtimeConfig, adapterConfig: agent.adapterConfig,
+          agent: { id: agent.id, companyId: agent.companyId, status: runningAgent.status, adapterType: agent.adapterType },
+          issue: issueRef, target: executionTarget, workspaceId: persistedExecutionWorkspace?.id ?? null,
+        });
+        const githubEnvironment = await timePreparation("github_environment", () => prepareHeartbeatGitHubEnvironment({
+          defer: nativeRuntimeResolution.kind === "native" && nativeRuntimeResolution.profile.backend === "pi_rpc",
+          target: executionTarget, cwd: executionWorkspace.cwd,
+          env: Object.fromEntries(Object.entries(parseObject(runtimeConfig.env)).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string")),
+          hostCredentials: useHostGitHub,
+          networkAccess: trustPreset.kind === "standard" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
+        }));
+        runtimeConfig = { ...runtimeConfig, env: githubEnvironment.env };
+        if (!useHostGitHub && !providerApiPlacement) {
+          const githubLaunchers = await timePreparation("github_launchers", () => prepareHeartbeatGitHubLaunchers({
+            native: agent.adapterType === "paperclip_runner", githubConfigured: githubSelection.configured,
+            agentId: agent.id, runId: run.id, target: executionTarget, cwd: executionWorkspace.cwd,
+            env: githubEnvironment.env, brokerUrl: configuredPaperclipApiBaseUrl() ?? "",
+            ...(activeEnvironmentLease ? { preparation: {
+              lease: activeEnvironmentLease.lease,
+              configuration: { environment: selectedEnvironment?.config, adapter: agent.adapterConfig, runtime: agent.runtimeConfig },
+              save: async (receipt: import("./heartbeat-github-launchers.js").AnonymousGitHubLauncherReceipt) => {
+                await db.update(environmentLeases).set({
+                  metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ anonymousGitHubLaunchers: receipt })}::jsonb`,
+                }).where(and(eq(environmentLeases.id, activeEnvironmentLease.lease.id),
+                  eq(environmentLeases.companyId, agent.companyId), eq(environmentLeases.status, "active"),
+                  eq(environmentLeases.heartbeatRunId, run.id)));
+              },
+            } } : {}),
+            createBrokerToken: () => createRuntimeToolsToken({ agentId: agent.id, companyId: agent.companyId,
+              runId: run.id, responsibleUserId: responsibleUserId ?? "", scope: "github_credentials" })?.token ?? "",
+          }));
+          githubLauncherLocation = githubLaunchers.cleanupLocation;
+          runtimeConfig = { ...runtimeConfig, env: githubLaunchers.env };
+          secretKeys.add("PAPERCLIP_GITHUB_BROKER_TOKEN");
+        }
         const adapterEnv = Object.fromEntries(
           Object.entries(parseObject(runtimeConfig.env)).filter(
             (entry): entry is [string, string] =>
@@ -3442,28 +3435,6 @@ export function heartbeatService(
           }
           throw new Error("direct_adapter_goal_controller_unavailable");
         }
-        // Runtime selection is immutable once persisted. In particular, turning the instance flag
-        // off prevents new native runs without changing the recovery path for an already-native run.
-        const nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({
-          persisted: run,
-          enabled:
-            resolvedInstanceSettings.experimental.enableNativeRunner === true,
-          museEnabled: resolvedInstanceSettings.experimental.enableMuse === true,
-          grokEnabled: resolvedInstanceSettings.experimental.enableGrokBot === true && resolvedInstanceSettings.experimental.enablePublicMcp === true,
-          dotEnabled: resolvedInstanceSettings.experimental.enableOpenAiDot === true
-            && resolvedInstanceSettings.experimental.enablePublicMcp === true,
-          runtimeConfig: agent.runtimeConfig,
-          adapterConfig: agent.adapterConfig,
-          agent: {
-            id: agent.id,
-            companyId: agent.companyId,
-            status: runningAgent.status,
-            adapterType: agent.adapterType,
-          },
-          issue: issueRef,
-          target: executionTarget,
-          workspaceId: persistedExecutionWorkspace?.id ?? null,
-        });
         const hasInstructionFilesystem = nativeRuntimeResolution.kind !== "native"
           ? adapter.supportsInstructionsBundle === true
           : nativeRuntimeHasInstructionFilesystem(nativeRuntimeResolution.profile.backend);
@@ -3586,6 +3557,7 @@ export function heartbeatService(
             runtimeEnv,
             useHostGitHub,
             githubSelection,
+            prepareGitHubEnvironment: githubEnvironment.prepare,
           },
           session: {
             runtimeSessionParamsForAdapter,
