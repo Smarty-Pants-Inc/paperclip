@@ -672,8 +672,14 @@ export function applyPiLangfuseExclusion(
   provider: { kind: string; agent?: string },
   configured: NodeJS.ProcessEnv = environment,
 ): NodeJS.ProcessEnv {
-  if (provider.kind !== "acpx" || provider.agent !== "pi"
-    || configured.LANGFUSE_TRACING_ENABLED?.toLowerCase() !== "false") return environment;
+  if (provider.kind !== "acpx" || provider.agent !== "pi") return environment;
+  // Default deny: Langfuse reaches Pi only when the agent explicitly sets
+  // LANGFUSE_TRACING_ENABLED to true or 1 (trimmed, case-insensitive); unset,
+  // empty or any other value strips every Langfuse key, the parent ids, the user
+  // id and the Langfuse extension entries, so a client-data agent nobody flagged
+  // never traces.
+  const enabled = configured.LANGFUSE_TRACING_ENABLED?.trim().toLowerCase();
+  if (enabled === "true" || enabled === "1") return environment;
   const result: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(environment)
     .filter(([name]) => !name.startsWith("LANGFUSE_") && name !== "PI_LANGFUSE_MAX_CHARS"));
   result.LANGFUSE_TRACING_ENABLED = "false";

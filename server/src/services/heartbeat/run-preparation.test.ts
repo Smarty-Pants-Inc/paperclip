@@ -12,6 +12,7 @@ import {
   buildPaperclipRuntimeMcpServers,
   buildPaperclipWakePayload,
   buildPiLangfuseParentEnvironment,
+  applyPiLangfuseExclusion,
   ConfigurationIncompleteFailure,
   createHeartbeatRunPreparation,
   resolveExecutionRunAdapterConfig,
@@ -68,18 +69,18 @@ describe("Pi Langfuse parent environment", () => {
   });
 
   it.each([null, undefined])("uses the heartbeat run for a run without an issue (%s)", issue => {
-    expect(buildPiLangfuseParentEnvironment({}, pi, runId, agentId, issue)).toEqual({ ...parents, LANGFUSE_PI_PARENT_SESSION_ID: runId });
+    expect(buildPiLangfuseParentEnvironment({ LANGFUSE_TRACING_ENABLED: "true" }, pi, runId, agentId, issue)).toEqual({ LANGFUSE_TRACING_ENABLED: "true", ...parents, LANGFUSE_PI_PARENT_SESSION_ID: runId });
   });
 
   it.each(Object.keys(parents))("preserves an operator-set %s independently, including an empty value", name => {
     for (const value of ["operator-value", ""]) {
-      expect(buildPiLangfuseParentEnvironment({ [name]: value }, pi, runId, agentId, issueId)).toEqual({ ...parents, [name]: value });
+      expect(buildPiLangfuseParentEnvironment({ LANGFUSE_TRACING_ENABLED: "true", [name]: value }, pi, runId, agentId, issueId)).toEqual({ LANGFUSE_TRACING_ENABLED: "true", ...parents, [name]: value });
     }
   });
 
   // Data safety: the exclusion decision must precede both default generation
   // and controller projection, even when an operator supplied keys or parents.
-  it.each(["false", "FALSE", "FaLsE"])("excludes Langfuse before Pi starts (%s)", enabled => {
+  it.each([undefined, "false", " false", "FALSE ", "0", "no", "off", "", "garbage", "FALSE", "FaLsE"])("excludes Langfuse before Pi starts (%j)", enabled => {
     const source = {
       CUSTOM: "retained", OPENAI_API_KEY: "model-key",
       LANGFUSE_TRACING_ENABLED: enabled,
@@ -105,9 +106,31 @@ describe("Pi Langfuse parent environment", () => {
       .toEqual({ LANGFUSE_TRACING_ENABLED: "false" });
   });
 
-  it.each(["true", "0", "", "false-ish"])("does not broaden the exclusion signal (%s)", enabled => {
-    const source = { LANGFUSE_TRACING_ENABLED: enabled, LANGFUSE_FLUSH_AT: "1", PI_LANGFUSE_MAX_CHARS: "200000" };
+  it.each(["true", " TRUE ", "1"])("keeps tracing enabled only when explicitly on (%j)", enabled => {
+    const source = {
+      ...(enabled === undefined ? {} : { LANGFUSE_TRACING_ENABLED: enabled }),
+      LANGFUSE_PUBLIC_KEY: "synthetic-public", LANGFUSE_SECRET_KEY: "synthetic-secret",
+      LANGFUSE_FLUSH_AT: "1", PI_LANGFUSE_MAX_CHARS: "200000",
+      PAPERCLIP_PI_EXTENSIONS: '["/opt/pi/langfuse/index.ts","/opt/pi/other/index.ts"]',
+    };
     expect(buildPiLangfuseParentEnvironment(source, pi, runId, agentId, issueId)).toEqual({ ...source, ...parents });
+    expect(applyPiLangfuseExclusion(source, pi)).toBe(source);
+  });
+
+  // Late provider merges must not override the original configured decision.
+  it.each([undefined, "false", " false", "FALSE ", "0", "no", "off", "", "garbage"])("fences later provider values using the configured flag (%j)", enabled => {
+    const merged = {
+      LANGFUSE_TRACING_ENABLED: "true", LANGFUSE_PUBLIC_KEY: "late-public",
+      LANGFUSE_SECRET_KEY: "late-secret", LANGFUSE_NEW_SETTING: "late-setting",
+      PI_LANGFUSE_MAX_CHARS: "200000", ...parents,
+      PAPERCLIP_PI_EXTENSIONS: '["/opt/pi/langfuse/index.ts","/opt/pi/other/index.ts"]',
+      CUSTOM: "retained",
+    };
+    expect(applyPiLangfuseExclusion(merged, pi, { LANGFUSE_TRACING_ENABLED: enabled })).toEqual({
+      CUSTOM: "retained", LANGFUSE_TRACING_ENABLED: "false",
+      PAPERCLIP_PI_EXTENSIONS: '["/opt/pi/other/index.ts"]',
+    });
+    expect(merged.LANGFUSE_SECRET_KEY).toBe("late-secret");
   });
 
   it.each(["not-json", "{}", '[1]'])("fails closed on malformed excluded extension configuration (%s)", raw => {
