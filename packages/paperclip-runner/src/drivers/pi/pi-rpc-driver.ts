@@ -67,6 +67,8 @@ export interface PiRpcDriverOptions {
   dynamicToolTimeoutMs?: number;
   /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
   promptTimeoutMs?: number;
+  /** No Pi events during an accepted turn, default 10 minutes. Host callbacks pause it. */
+  turnIdleTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
@@ -96,6 +98,7 @@ export class PiRpcDriver implements HarnessDriver {
   readonly #options: PiRpcDriverOptions;
 
   constructor(options: PiRpcDriverOptions) {
+    if (options.turnIdleTimeoutMs !== undefined && (!Number.isSafeInteger(options.turnIdleTimeoutMs) || options.turnIdleTimeoutMs < 1 || options.turnIdleTimeoutMs > 2_147_483_647)) throw new Error("Pi turnIdleTimeoutMs must be a positive timer-safe integer");
     this.#options = options;
   }
 
@@ -260,6 +263,7 @@ export class PiRpcDriver implements HarnessDriver {
         instructionBoundary,
         admissionTimeoutMs: this.#options.startupTimeoutMs,
         promptTimeoutMs: this.#options.promptTimeoutMs,
+        turnIdleTimeoutMs: this.#options.turnIdleTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
@@ -320,6 +324,7 @@ interface PiSessionState {
   bindRequest: typeof sendPiBindRequest;
   admissionTimeoutMs?: number;
   promptTimeoutMs?: number;
+  turnIdleTimeoutMs?: number;
 }
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
@@ -423,6 +428,8 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
   readonly #promptTimeoutMs?: number;
+  readonly #turnIdleTimeoutMs: number;
+  #turnIdleTimer: ReturnType<typeof setTimeout> | undefined;
   // Only active identities retain a projector. Fixed-memory tombstones prevent
   // old/reused IDs from binding to a later turn, without a growing warm history.
   // Outstanding native tools separately retain only their original IDs/name.
@@ -461,6 +468,8 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     this.#piMetadata = state.piMetadata;
     this.#promptTimeoutMs = state.promptTimeoutMs;
+    this.#turnIdleTimeoutMs = state.turnIdleTimeoutMs ?? 600_000;
+    this.#callbacks?.setActivityListener(() => this.#armTurnIdleTimer());
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
     for (const diagnostic of state.initialContext.diagnostics) this.#emit("harness.diagnostic", diagnostic);
@@ -673,8 +682,10 @@ export class PiRpcHarnessSession implements HarnessSession {
           try { await this.#finishTurn(turn, "completed", { outcome: "handled", modelOutput: false }); }
           catch (cleanup) { await this.#fenceFailure(cleanup); throw cleanup; }
           releaseAcceptance(false, true);
-        } else if (disposition === "started" || disposition === "queued") releaseAcceptance(true);
-        else throw new Error(`Pi RPC prompt returned an invalid disposition (${disposition ?? "missing"})`);
+        } else if (disposition === "started" || disposition === "queued") {
+          releaseAcceptance(true);
+          this.#armTurnIdleTimer();
+        } else throw new Error(`Pi RPC prompt returned an invalid disposition (${disposition ?? "missing"})`);
       } catch (error) {
         const unknown = error instanceof PiRpcRequestTimeoutError && error.command === "prompt";
         // On a lost ACK, let the captured lifecycle drain before inspecting Pi.
@@ -683,7 +694,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         if (unknown) {
           // A lost ACK is not a rejection. Keep the sole input owner while
           // inspecting Pi; never submit the prompt a second time.
-          if (await this.#reconcilePrompt(turn)) return { turnId: turn.turnId };
+          if (await this.#reconcilePrompt(turn)) { this.#armTurnIdleTimer(); return { turnId: turn.turnId }; }
           this.#callbacks?.fence();
           this.#admitted = false;
           const failure = new Error(error.message, { cause: error });
@@ -888,6 +899,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#callbacks?.fence();
     this.#closed = true;
     this.#admitted = false;
+    this.#clearTurnIdleTimer();
     this.#dialogs.clear();
     this.#closing = (async () => {
       const failures: unknown[] = [];
@@ -923,10 +935,46 @@ export class PiRpcHarnessSession implements HarnessSession {
     return this.#closing;
   }
 
+  #clearTurnIdleTimer(): void {
+    clearTimeout(this.#turnIdleTimer);
+    this.#turnIdleTimer = undefined;
+  }
+
+  #armTurnIdleTimer(): void {
+    this.#clearTurnIdleTimer();
+    const turn = this.#activeTurn;
+    // Prompt acceptance has its own deadline. Only admitted host execution
+    // pauses this safety net; a socket/queued peer cannot keep Pi alive.
+    if (this.#closed || this.#failure || !turn || turn.settled || this.#promptAcceptance || this.#callbacks?.activeCount()) return;
+    this.#turnIdleTimer = setTimeout(() => {
+      this.#turnIdleTimer = undefined;
+      void this.#expireTurnIdle(turn);
+    }, this.#turnIdleTimeoutMs);
+    this.#turnIdleTimer.unref();
+  }
+
+  async #expireTurnIdle(turn: PiTurnState): Promise<void> {
+    if (this.#closed || this.#failure || turn.settled || this.#activeTurn !== turn) return;
+    this.#failure = new Error(`Pi emitted no events for ${this.#turnIdleTimeoutMs} ms during the active turn.`);
+    const detail = { code: "pi_turn_idle_timeout", message: this.#failure.message, recoverable: false };
+    this.#admitted = false;
+    this.#callbacks?.fence();
+    try { await this.#finishTurn(turn, "failed", { error: detail }); }
+    catch { this.#emit("turn.failed", { status: "failed", error: detail }, turn); }
+    finally {
+      // The existing Stop path fences callbacks, revokes the broker, stops
+      // children and physically retires Pi with bounded transport escalation.
+      await this.close().catch(() => undefined);
+    }
+  }
+
   async #pump(): Promise<void> {
     try {
       for await (const record of this.#transport.events()) {
-        if (this.#closed) break;
+        if (this.#closed || this.#failure) break;
+        // Activity is the native event, not its display projection: hidden
+        // thinking, tool progress, retries and compaction all reset the deadline.
+        this.#armTurnIdleTimer();
         await this.#consume(record);
       }
     } catch (error) {
@@ -1139,6 +1187,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   async #finishTurn(turn: PiTurnState, status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): Promise<void> {
     if (turn.settled) return;
     turn.settled = true;
+    if (this.#activeTurn === turn) this.#clearTurnIdleTimer();
     // Fence host authority synchronously; native extension fences on the same
     // agent_settled boundary. Do not publish a terminal until revocation finishes.
     const captured = this.#callbacks?.authority.capture();
@@ -1210,6 +1259,10 @@ class PiHostCallbacks {
   readonly #announcements = new Map<string, { origin: Readonly<Origin>; tool: string; arguments: unknown }>();
   readonly #waiters = new Map<string, Set<() => void>>();
   #toolNames: Record<string, string> = Object.create(null);
+  #activeCount = 0;
+  #activityListener?: () => void;
+  setActivityListener(listener: () => void): void { this.#activityListener = listener; }
+  activeCount(): number { return this.#activeCount; }
   constructor(sessionId: string, handler: PiRpcDriverOptions["dynamicToolHandler"]) { this.#sessionId = sessionId; this.#handler = handler; }
   setNativeSessionId(id: string): void { if (this.#nativeSessionId !== null) throw new Error("Pi callback identity already assigned"); this.#nativeSessionId = id; }
   async listen(socketPath: string, timeoutMs = 60000): Promise<void> {
@@ -1218,10 +1271,18 @@ class PiHostCallbacks {
       handleTool: async (call, signal) => {
         if (!this.#handler || !this.#nativeSessionId || !this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
         const { runId, turnId } = call.origin;
-        const result = await this.#handler({ runId, turnId, threadId: this.#nativeSessionId, tool: Object.hasOwn(this.#toolNames, call.tool) ? this.#toolNames[call.tool]! : call.tool, callId: call.toolCallId, arguments: structuredClone(call.arguments), signal });
-        signal.throwIfAborted();
-        if (!this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
-        return normalizePiToolResult(result);
+        let active = true;
+        const finished = () => { if (active) { active = false; --this.#activeCount; this.#activityListener?.(); } };
+        ++this.#activeCount;
+        this.#activityListener?.();
+        signal.addEventListener("abort", finished, { once: true });
+        try {
+          signal.throwIfAborted();
+          const result = await this.#handler({ runId, turnId, threadId: this.#nativeSessionId, tool: Object.hasOwn(this.#toolNames, call.tool) ? this.#toolNames[call.tool]! : call.tool, callId: call.toolCallId, arguments: structuredClone(call.arguments), signal });
+          signal.throwIfAborted();
+          if (!this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
+          return normalizePiToolResult(result);
+        } finally { signal.removeEventListener("abort", finished); finished(); }
       },
     });
   }

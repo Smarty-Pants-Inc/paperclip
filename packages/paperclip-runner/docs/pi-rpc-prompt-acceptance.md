@@ -53,6 +53,31 @@ regressions run unchanged in `pi-rpc-driver.test.ts`. Its cross-run late-termina
 case also checks canonical item identity, duplicate suppression, mixed-owner
 refusal and completion of the next prompt.
 
+## Active-turn event-idle deadline
+
+After Pi accepts a prompt (`started` or `queued`), the driver arms a one-shot
+10-minute event-idle deadline. `PiRpcDriverOptions.turnIdleTimeoutMs` changes
+that budget; it must be a positive integer within Node's timer range. Prompt
+acceptance retains its separate deadline below.
+
+Every native Pi event resets the deadline, including hidden thinking deltas,
+tool updates, retries, and compaction progress. An admitted host tool callback
+pauses the timer while its execution is in flight and starts a fresh budget on
+result, rejection, or cancellation. Host execution keeps its own bounded callback
+deadline; merely opening a socket or waiting for an unannounced call is not
+activity. A long tool that emits updates does not time out. A silent native tool
+with no host callback or native progress remains subject to the event-idle limit.
+
+Expiry fails only the captured active turn with `pi_turn_idle_timeout` and
+physically retires the Pi session through the existing Stop cleanup path. The
+next input needs a fresh session. Settlement, Stop, and close cancel the timer;
+an idle warm session has no active-turn deadline and does not poll.
+
+Regression checks live in `pi-rpc-idle.test.ts` (silent streams, progress, hidden
+activity and warm-run ownership) and `pi-rpc-c2-live.test.ts` (actual Unix callback
+execution and Stop retirement). These hermetic checks do not qualify a live
+provider deployment.
+
 ## Lost acknowledgments
 
 `PiRpcTransport` gives commands a 30-second client response deadline. Set

@@ -73,6 +73,48 @@ async function packagedDriver(verified = true) {
 }
 
 describe("live host Pi C2 authority", () => {
+  it("counts an in-flight host callback as activity and restarts the idle deadline after its result", async () => {
+    const entered = deferred<void>(), result = deferred<unknown>();
+    const f = await fixture({ turnIdleTimeoutMs: 100, dynamicToolHandler: async () => { entered.resolve(); return result.promise; } });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await f.start(); const request = f.call("idle-active"); await f.announce(request);
+      pending = sendPiToolRequest(f.initial.toolSocketPath, request);
+      const receipt = expect(pending).resolves.toMatchObject({ content: [{ text: "callback result" }] });
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(f.transport.closed).toBe(false);
+      expect(f.events.some(event => event.eventType === "turn.failed")).toBe(false);
+      result.resolve({ content: [{ type: "text", text: "callback result" }], details: {} });
+      await receipt;
+      await vi.advanceTimersByTimeAsync(99); expect(f.transport.closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); await tick(); await tick();
+      await f.session.close();
+      expect(f.transport.closed).toBe(true);
+      expect(f.events.filter(event => event.eventType === "turn.failed")).toMatchObject([{ payload: { error: { code: "pi_turn_idle_timeout" } } }]);
+      expect(f.ipc.some(command => command.type === "stop_children")).toBe(true);
+    } finally {
+      result.resolve({ content: [], details: {} });
+      vi.useRealTimers(); await pending?.catch(() => {});
+    }
+  });
+  it("does not let an aborted host callback suppress the idle deadline indefinitely", async () => {
+    const entered = deferred<void>(), result = deferred<unknown>();
+    const f = await fixture({ turnIdleTimeoutMs: 100, dynamicToolTimeoutMs: 50, dynamicToolHandler: async () => { entered.resolve(); return result.promise; } });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await f.start(); const request = f.call("idle-aborted"); await f.announce(request);
+      pending = sendPiToolRequest(f.initial.toolSocketPath, request);
+      const refused = expect(pending).rejects.toThrow();
+      await entered.promise;
+      await vi.advanceTimersByTimeAsync(50); await refused;
+      await vi.advanceTimersByTimeAsync(99); expect(f.transport.closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); await tick(); await tick(); await f.session.close();
+      expect(f.events.filter(event => event.eventType === "turn.failed")).toMatchObject([{ payload: { error: { code: "pi_turn_idle_timeout" } } }]);
+    } finally { result.resolve({ content: [], details: {} }); vi.useRealTimers(); await pending?.catch(() => {}); }
+  });
   it("returns a seven-second dynamic tool's real result independently of the startup deadline", async () => {
     const f = await fixture({ dynamicToolHandler: async call => {
       await new Promise<void>(resolve => setTimeout(resolve, 7000));

@@ -53,18 +53,18 @@ const fakePi = `
       if (promptCount === 1 && mode === "invalid") {
         emit({ type: "response", id: request.id, command: request.type, success: true, data: { disposition: "not-a-disposition" } }); return;
       }
-      start();
+      if (mode !== "accepted-silent") start();
       if (mode === "streaming" || mode === "wrong-session") return;
       if (mode === "settled") { finish(); return; }
       data = { disposition: mode === "queued" && promptCount === 1 ? "queued" : "started" };
       emit({ type: "response", id: request.id, command: request.type, success: true, data });
-      if (data.disposition !== "queued") finish(); return;
+      if (data.disposition !== "queued" && !["accepted-silent", "started-silent"].includes(mode)) finish(); return;
     }
     emit({ type: "response", id: request.id, command: request.type, success: true, data });
   }).on("close", () => process.exit(0));
 `;
 
-async function fixture(mode: string) {
+async function fixture(mode: string, turnIdleTimeoutMs?: number) {
   const root = await mkdtemp(join(tmpdir(), "pi-prompt-"));
   const log = join(root, "commands.jsonl");
   const sessions: PiRpcHarnessSession[] = [];
@@ -75,6 +75,7 @@ async function fixture(mode: string) {
   const driver = new PiRpcDriver({
     runtimeDirectory: join(root, "sessions"), model: "neutral/model", piRpcThinkingLevel: "high",
     promptTimeoutMs: deadline,
+    turnIdleTimeoutMs,
     environment: { PI_CODING_AGENT_DIR: join(root, "agent") },
     transportFactory: (options: PiRpcTransportOptions) => {
       const transport = new PiRpcTransport({ ...options, command: process.execPath, args: ["-e", fakePi],
@@ -109,6 +110,23 @@ async function bounded<T>(promise: Promise<T>, timeoutMs = 600): Promise<T> {
     })]);
   } finally { clearTimeout(timer); }
 }
+
+describe("Pi RPC event-idle deadline through real subprocess pipes (L15)", () => {
+  it.each(["accepted-silent", "started-silent"])("retires %s Pi and forwards the captured turn's idle failure", async mode => {
+    const f = await fixture(mode, 80);
+    try {
+      const session = await f.open();
+      const turn = await session.startTurn({ message: { role: "user", text: "accepted once" } });
+      await expect.poll(() => f.events[0].find(event => event.eventType === "turn.failed" && event.turnId === turn.turnId)).toMatchObject({
+        runId: "run-0", payload: { error: { code: "pi_turn_idle_timeout", recoverable: false } },
+      });
+      await session.close();
+      expect(session.processExited()).toBe(true);
+      expect(f.events[0].filter(event => event.eventType.startsWith("turn.") && event.eventType !== "turn.started")).toHaveLength(1);
+      expect((await f.commands()).filter(command => command.type === "prompt")).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
 
 // The watchdog is only a RED-test escape hatch; it does not enforce the client deadline.
 describe("Pi RPC prompt acceptance deadline (K3)", () => {
