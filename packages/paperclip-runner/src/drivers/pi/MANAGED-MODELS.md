@@ -10,8 +10,9 @@ Resolution order:
    otherwise an exact-id entry on another provider in the same file, in file
    order. This supports connections named, for example, `cliproxyapi-anthropic`.
 2. Missing capability fields and thinking-map keys come from the original user's
-   `models.json`: the runner's inherited `PI_CODING_AGENT_DIR`, if set, otherwise
-   its original `HOME/.pi/agent` (with `os.homedir()` as the HOME fallback). The
+   `models.json`: the explicit original `PI_CODING_AGENT_DIR`, if set, otherwise
+   the original `HOME/.pi/agent` (with the process HOME / `os.homedir()` fallback).
+   Capture these paths before managed-home projection. The
    same exact-id/provider precedence applies within this file. This optional
    source is read-only; missing, unreadable, oversized or invalid user config is
    skipped with one bounded diagnostic, not a startup refusal. Agent-snapshot
@@ -23,17 +24,55 @@ Resolution order:
    key is inherited only when every match agrees on that key; snapshot map keys
    override catalog keys, including explicit `null` caps.
 4. Unresolved fields use `contextWindow: 128000`, `maxTokens: 8192`, and
-   `reasoning: false`, with one bounded diagnostic at initial resolution.
+   `reasoning: true`, with one bounded diagnostic at initial resolution. The
+   existing all-level thinking-map fallback applies only when the catalog is
+   unresolved AND the configured limits/reasoning tuple is incomplete; complete
+   explicit configurations do not acquire synthetic map entries.
 
-Only `thinkingLevelMap`, `contextWindow`, `maxTokens` and `reasoning` cross from
-the snapshot/catalog into the broker descriptor. API, URL and key always come
+`compat` follows the same exact-id config selection but has its own API guard:
+`model.api ?? provider.api` must equal the API selected by the actual managed
+connection protocol (`messages` -> `anthropic-messages`, `chat` ->
+`openai-completions`, `responses` -> `openai-responses`). A mismatch skips only
+compat, with a bounded diagnostic, and preserves all other capabilities.
+Provider/model compat uses Pi 1.5.2's shallow per-field override and its one-level
+merges for `openRouterRouting`, `vercelGatewayRouting`, `chatTemplateKwargs` and
+`chatTemplateArgs`. No other nested value is recursively blended. Across config
+sources, the resulting agent compat wins as a WHOLE field over original-HOME
+compat, including `{}`; configured compat similarly replaces catalog compat.
+
+Catalog compat comes only from the exact-id, matching-API model of the canonical
+API owner: `anthropic` for Messages; `openai` for Completions and Responses. The
+whole object is copied, never a union, intersection, anonymous consensus or the
+first provider's flags. Other providers cannot contribute or suppress compat.
+Absent canonical id/API/compat is diagnosed and skipped. Copying fallback emits
+a bounded diagnostic naming the canonical provider. This does not change the
+cross-provider consensus policy for limits, reasoning or thinking-map keys.
+
+Only `thinkingLevelMap`, `contextWindow`, `maxTokens`, `reasoning` and the whole
+validated `compat` object cross from the snapshot/catalog into the broker descriptor. API, URL and key always come
 from the active managed connection/broker, never from the snapshot model or
-catalog provider. Names, input types and costs keep Pi's existing registration
-defaults. Non-managed snapshot providers and top-level settings remain intact.
+catalog provider. Names, input types and top-level costs keep Pi's existing
+registration defaults. Compat has no flag allowlist: false, nested null, arrays
+and nested cost metadata survive. A shared plain-JSON validator rejects
+non-JSON/nonplain values and cycles at configuration and private bind boundaries.
+Strict agent config errors refuse startup; optional original-HOME errors skip
+that source without altering it. Non-managed snapshot providers and top-level
+settings remain intact. The defensive snapshot reread uses the incoming managed
+API, so mismatched compat cannot be reintroduced during models.json merging.
 
 The driver retains the resolved descriptor for the resident session. Warm binds
 rotate the revocable broker capability, not the model capabilities. The bind
-extension passes those same fields into Pi's in-memory registration.
+extension passes those same fields into Pi's in-memory registration. Startup
+resolution and the defensive reread emit at most one bounded nonleaking line;
+warm broker rotation does not reread sources or repeat startup diagnostics.
+
+The ACPX child bootstrap uses this same capability builder with the original
+pre-projection environment, even when the caller supplies only model/environment.
+It serializes the entire resolved model, not just its id. This legacy ACPX path
+has no selected 1.5.2 catalog handoff (its selected Pi is 1.0.0); it uses allowed
+original config and documented defaults, never an ambient Pi installation or an
+unverified SDK. Catalog-only compat on that legacy path remains unproven and is
+not synthesized from model families, URLs, requested effort or another runtime.
 
 A requested thinking level never constructs a capability map, and no model or
 provider family is capped in code. Pi interprets the capability map itself. The

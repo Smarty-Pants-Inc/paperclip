@@ -3,7 +3,9 @@ import { constants } from "node:fs";
 import { findPackageJSON } from "node:module";
 import { dirname, isAbsolute, join, delimiter } from "node:path";
 import { pathToFileURL } from "node:url";
-import { configuredPiManagedModel, resolvePiManagedModel, type PiBuiltinModelCatalog, type PiManagedModel } from "./pi-managed-model.js";
+import { buildPiManagedModel, configuredPiManagedModel, originalPiModelsFile, type PiBuiltinModelCatalog, type PiManagedModel } from "./pi-managed-model.js";
+import { piManagedProviderApi } from "../acpx/pi-provider-loopback.js";
+import type { PiBindProvider } from "./pi-bind-protocol.js";
 
 export async function readPiModelsSnapshot(filePath: string): Promise<Record<string, unknown>> {
   let text: string;
@@ -42,23 +44,23 @@ export async function loadPiBuiltinModelCatalog(command: string, environment: No
 
 export async function piManagedModelFromSnapshot(filePath: string, model: string, command: string, environment: NodeJS.ProcessEnv) {
   const id = model.startsWith("paperclip/") ? model.slice("paperclip/".length) : model;
-  const configured = configuredPiManagedModel(await readPiModelsSnapshot(filePath), id);
-  const catalog = await loadPiBuiltinModelCatalog(command, environment);
-  return resolvePiManagedModel(configured, catalog);
+  const original = originalPiModelsFile(environment);
+  return buildPiManagedModel({ snapshot: await readPiModelsSnapshot(filePath), id, api: piManagedProviderApi(environment),
+    originalModelsFile: original === filePath ? undefined : original, catalog: await loadPiBuiltinModelCatalog(command, environment) });
 }
 
 /** Keep the agent's providers/top-level settings and its exact-id capability
  * overrides, but replace all managed routing/auth with the new broker's values.
  */
-export async function mergedPiModelsJson(filePath: string, providerJson: string): Promise<string> {
-  const ours = JSON.parse(providerJson) as { providers: Record<string, { models?: PiManagedModel[] }> };
+export async function mergedPiModelsJson(filePath: string, providerJson: string, warn?: (message: string) => void): Promise<string> {
+  const ours = JSON.parse(providerJson) as { providers: Record<string, { api?: PiBindProvider["api"]; models?: PiManagedModel[] }> };
   const snapshot = await readPiModelsSnapshot(filePath);
   if (!Object.keys(snapshot).length) return providerJson;
   const providers = snapshot.providers && typeof snapshot.providers === "object" && !Array.isArray(snapshot.providers)
     ? snapshot.providers as Record<string, unknown> : {};
   const paperclip = ours.providers.paperclip;
   if (Array.isArray(paperclip?.models)) paperclip.models = paperclip.models.map(model => {
-    const configured = configuredPiManagedModel(snapshot, model.id);
+    const configured = configuredPiManagedModel(snapshot, model.id, paperclip.api, warn);
     return { ...model, ...configured,
       ...(model.thinkingLevelMap || configured.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap, ...configured.thinkingLevelMap } } : {}) };
   });

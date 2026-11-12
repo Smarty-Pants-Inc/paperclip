@@ -2,13 +2,14 @@ import { startProviderLoopbackBroker, type LoopbackRouteAdapter, type LoopbackUp
 import { chatLoopbackAdapter } from "../provider-loopback/chat.js";
 import { messagesLoopbackAdapter } from "../provider-loopback/messages.js";
 import { responsesLoopbackAdapter } from "../provider-loopback/responses.js";
-import type { PiManagedModel } from "../pi/pi-managed-model.js";
-import type { PiBindProvider } from "../pi/pi-bind-protocol.js";
+import { buildPiManagedModel, originalPiModelsFile, type PiManagedModel } from "../pi/pi-managed-model.js";
+import { isPiModelCompat, type PiBindProvider } from "../pi/pi-bind-protocol.js";
 import { PI_NATIVE_THINKING_LEVELS, type PiNativeThinkingLevel } from "../pi/pi-native-config.js";
 
 function managedModel(model: string, thinkingLevel?: PiNativeThinkingLevel, configuration?: PiManagedModel): PiManagedModel {
   if (thinkingLevel !== undefined && !PI_NATIVE_THINKING_LEVELS.includes(thinkingLevel)) throw new Error("Pi managed model thinking level is invalid");
   if (configuration && configuration.id !== model) throw new Error("Pi managed model configuration id mismatch");
+  if (configuration && Object.hasOwn(configuration, "compat") && !isPiModelCompat(configuration.compat)) throw new Error("Pi managed model has invalid compat");
   // Effort is a request, not a capability declaration. Only snapshot/catalog
   // metadata may describe support; Pi owns normalization of the requested level.
   return { id: model,
@@ -16,6 +17,7 @@ function managedModel(model: string, thinkingLevel?: PiNativeThinkingLevel, conf
     ...(configuration?.contextWindow === undefined ? {} : { contextWindow: configuration.contextWindow }),
     ...(configuration?.maxTokens === undefined ? {} : { maxTokens: configuration.maxTokens }),
     ...(configuration?.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: structuredClone(configuration.thinkingLevelMap) }),
+    ...(configuration?.compat === undefined ? {} : { compat: structuredClone(configuration.compat) }),
   };
 }
 
@@ -24,6 +26,14 @@ const PI_MANAGED_PROVIDER_PROTOCOLS: Readonly<Record<string, { adapter: Loopback
   messages: { adapter: messagesLoopbackAdapter, api: "anthropic-messages" },
   responses: { adapter: responsesLoopbackAdapter, api: "openai-responses" },
 };
+
+/** The API comes only from the active managed protocol, never model metadata. */
+export function piManagedProviderApi(environment: NodeJS.ProcessEnv): PiBindProvider["api"] {
+  const protocol = environment.PAPERCLIP_AI_PROVIDER_PROTOCOL ?? "";
+  const route = Object.hasOwn(PI_MANAGED_PROVIDER_PROTOCOLS, protocol) ? PI_MANAGED_PROVIDER_PROTOCOLS[protocol] : undefined;
+  if (!route) throw new Error("Pi managed provider protocol is unsupported");
+  return route.api;
+}
 
 /** Managed connections are runner-owned; native Pi providers keep their existing configuration path. */
 export function usesPiProviderLoopback(model: string, environment?: NodeJS.ProcessEnv): boolean {
@@ -36,10 +46,15 @@ export async function startPiProviderLoopback(input: {
   environment: NodeJS.ProcessEnv;
   onSensitiveValues?(values: readonly string[]): void;
 }): Promise<{ json: string; close(): Promise<void> }> {
-  const binding = await createPiProviderBinding(input);
+  // The real ACPX sandbox calls this before HOME projection, with no metadata.
+  // No selected 1.5.2 catalog is supplied by this legacy installation path.
+  const modelConfiguration = await buildPiManagedModel({ snapshot: {},
+    id: input.model.startsWith("paperclip/") ? input.model.slice("paperclip/".length) : input.model,
+    api: piManagedProviderApi(input.environment), originalModelsFile: originalPiModelsFile(input.environment) });
+  const binding = await createPiProviderBinding({ ...input, modelConfiguration });
   const { baseUrl, api, apiKey, models } = binding.provider;
   return {
-    json: piProviderJson({ baseUrl, api, apiKey, model: models[0].id }),
+    json: piProviderJson({ baseUrl, api, apiKey, model: models[0].id, modelConfiguration: models[0] }),
     close: binding.close,
   };
 }

@@ -3,14 +3,14 @@ import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink } from "node:fs/pr
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
+import { createPiProviderBinding, directPiProviderConfiguration, piManagedProviderApi, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
 import { RunAuthority, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { loadPiBuiltinModelCatalog, mergedPiModelsJson, readPiModelsSnapshot } from "./pi-models-merge.js";
-import { configuredPiManagedModelSources, resolvePiManagedModel, type PiManagedModel } from "./pi-managed-model.js";
+import { buildPiManagedModel, originalPiModelsFile, type PiManagedModel } from "./pi-managed-model.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
@@ -123,8 +123,7 @@ export class PiRpcDriver implements HarnessDriver {
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
     // Capture the runner's original Pi home before selecting the managed home.
-    const originalPiModelsFile = join(process.env.PI_CODING_AGENT_DIR
-      ?? join(environment.HOME ?? process.env.HOME ?? homedir(), ".pi", "agent"), "models.json");
+    const originalModelsFile = originalPiModelsFile({ ...process.env, ...environment, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR });
     // Environment paths may still name a controller-side copy. Only the
     // authenticated runtime-context grant can select a provider-local home.
     delete environment.AGENT_HOME;
@@ -166,9 +165,15 @@ export class PiRpcDriver implements HarnessDriver {
       await mkdir(agentHome, { recursive: true, mode: 0o700 });
       environment.PI_CODING_AGENT_DIR = agentHome;
       const modelsFile = join(agentHome, "models.json");
-      const modelConfiguration = resolvePiManagedModel(await configuredPiManagedModelSources(await readPiModelsSnapshot(modelsFile),
-        this.#options.model.slice("paperclip/".length), originalPiModelsFile === modelsFile ? undefined : originalPiModelsFile),
-      await loadPiBuiltinModelCatalog(this.#options.command ?? "pi", environment));
+      // Resolution and the defensive snapshot reread share one startup warning.
+      let diagnosed = false;
+      const warn = (message: string) => {
+        if (!diagnosed) { diagnosed = true; console.warn(`Pi managed model metadata: ${message}`); }
+      };
+      const modelConfiguration = await buildPiManagedModel({ snapshot: await readPiModelsSnapshot(modelsFile),
+        id: this.#options.model.slice("paperclip/".length), api: piManagedProviderApi(environment),
+        originalModelsFile: originalModelsFile === modelsFile ? undefined : originalModelsFile,
+        catalog: await loadPiBuiltinModelCatalog(this.#options.command ?? "pi", environment), warn });
       if (credentialMode === "broker") {
         // Broker/models.json is the FIRST bind. INITIAL contains no provider
         // capability and prepares exactly one preallocated host turn, without IPC.
@@ -192,7 +197,7 @@ export class PiRpcDriver implements HarnessDriver {
             binding: { origin, close: provider.close, initial: true }, toolSocketPath };
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
-          await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json));
+          await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json, warn));
           environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
           environment.PAPERCLIP_PI_BIND_INITIAL = JSON.stringify(initial);
         } catch (error) {
@@ -204,7 +209,7 @@ export class PiRpcDriver implements HarnessDriver {
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
       } else {
         const provider = directPiProviderConfiguration({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
-        await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json));
+        await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json, warn));
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
         environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
       }

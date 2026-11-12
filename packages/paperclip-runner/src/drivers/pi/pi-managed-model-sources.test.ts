@@ -60,14 +60,14 @@ it("reads the exact-id cap only in the original HOME when the runner has no Pi d
   expect(f.disk.providers.paperclip.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:/);
   expect(f.disk.providers["cliproxyapi-anthropic"]).toBeUndefined();
   expect(await readFile(f.userFile, "utf8")).toBe(JSON.stringify(snapshot));
-  expect(f.diagnostics).toEqual([]);
+  expect(f.diagnostics).toEqual(["Pi managed model metadata: canonical provider openai: no exact API/id compat; skipped"]);
 });
 
 it("prefers the agent source per field, then the user's paperclip entry over its other provider", async () => {
   const f = await fixture({ providers: { paperclip: provider({ contextWindow: 111111, thinkingLevelMap: { max: null } }), other: provider({ maxTokens: 1, reasoning: true }) } },
     { providers: { native: provider({ contextWindow: 999999, maxTokens: 2, reasoning: true }), paperclip: provider({ contextWindow: 222222, maxTokens: 33333, reasoning: false, thinkingLevelMap: { max: "max", xhigh: null } }) } });
   expect(f.metadata).toEqual(model({ contextWindow: 111111, maxTokens: 33333, reasoning: false, thinkingLevelMap: { max: null, xhigh: null } }));
-  expect(f.diagnostics).toEqual([]);
+  expect(f.diagnostics).toEqual(["Pi managed model metadata: canonical provider openai: no exact API/id compat; skipped"]);
 });
 
 it("keeps an exact agent entry on another provider ahead of a user paperclip entry", async () => {
