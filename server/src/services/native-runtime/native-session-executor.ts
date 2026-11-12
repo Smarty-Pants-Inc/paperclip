@@ -2078,7 +2078,10 @@ export function nativeSessionScopeDigestIsBusy(digest: string): boolean {
   );
 }
 
-function nativeSessionKey(execution: NativeExecutionInput): string {
+export function nativeSessionKey(execution: NativeExecutionInput): string {
+  if (execution.provider?.kind === "pi_rpc" && !execution.session.normalizedSessionId) {
+    throw new Error("pi_conversation_identity_missing");
+  }
   return (
     execution.session.normalizedSessionId ??
     `session-${execution.binding.runId}`
@@ -8462,6 +8465,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING ||
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_UNREAD ||
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_CHANGED_AFTER_READ ||
+    sourceFailureCode === "pi_conversation_identity_missing" ||
     sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
     sourceFailureCode === "native_provider_usage_limit" ||
@@ -8561,6 +8565,7 @@ function runnerClosedTurnStartSession(error: unknown, depth = 0): boolean {
 export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
+  | "pi_conversation_identity_missing"
   | "native_permission_declined"
   | "native_provider_terminal_failed"
   | "native_governed_wait_settlement_pending"
@@ -8599,6 +8604,7 @@ export function nativeSessionFailureSourceCode(
   | "runner_ingress_acquisition_failed"
   | "local_runtime_api_listener_unavailable"
   | "native_session_interrupted" {
+  if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
   if (error instanceof NativeProviderStateIncompatibleError) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;

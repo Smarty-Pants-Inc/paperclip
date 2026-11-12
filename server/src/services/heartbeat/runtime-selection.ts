@@ -27,6 +27,8 @@ import type { CaseExecutionContext } from "../case-context.js";
 import type { buildExecutionContinuation } from "../execution-continuation.js";
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHash, randomUUID } from "node:crypto";
+import { nativeSha256 } from "../native-runtime/canonical.js";
+import { selectPiConversation } from "../native-runtime/pi-conversation-record.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentHarnessType, CHAT_PROVIDERS } from "@paperclipai/shared";
@@ -526,8 +528,31 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     const resumableTaskSessionId = isDotRun ? null : taskResumeRunId
       ? taskNativeSessionId
       : (legacyRetrySessionId ?? null);
+    // Conversation C is durable; checkpoints and runner generations only attach
+    // to it. Framework forceFreshSession/config freshness is not New Conversation.
+    const piConversation = nativeRuntimeResolution.profile.backend === "pi_rpc"
+      ? await selectPiConversation(db, {
+          companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id, runId: run.id,
+          boundary: {
+            provider: nativeRuntimeResolution.profile.backend,
+            cwd: executionWorkspace.cwd,
+            remoteCwd: executionTarget?.kind === "remote" ? executionTarget.remoteCwd : null,
+            workspaceId: persistedExecutionWorkspace?.id ?? null,
+            trust: nativeSha256({
+              trustPreset: runtimeConfig.trustPreset ?? null, trust: runtimeConfig.trust ?? null,
+              permissionMode: runtimeConfig.permissionMode ?? null, approvalPolicy: runtimeConfig.approvalPolicy ?? null,
+              sandboxMode: runtimeConfig.sandboxMode ?? null, homeMode: runtimeConfig.homeMode ?? "isolated",
+              // The account/principal is a trust boundary; refreshing its token
+              // or disposable credential home is only a runtime generation.
+              account: managedAiRuntime ? {
+                connectionId: managedAiRuntime.attribution.connectionId, grantId: managedAiRuntime.attribution.grantId,
+                responsibleUserId: managedAiRuntime.attribution.responsibleUserId,
+              } : null,
+            }),
+          },
+        }) : null;
     const requestedNativeSessionId =
-      run.nativeSessionId ?? resumableTaskSessionId;
+      run.nativeSessionId ?? piConversation?.id ?? resumableTaskSessionId;
     // A task-session lastRunId can lag a failed turn or point at an older
     // normalized session. Find the newest exact-session authority instead.
     // Rows that already acquired provider authority are progress barriers,
@@ -550,11 +575,11 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     nativeRunnerInstanceId =
       previousNativeRun?.runnerInstanceId &&
       previousNativeRun.nativeSessionId ===
-        (run.nativeSessionId ?? resumableTaskSessionId)
+        requestedNativeSessionId
         ? previousNativeRun.runnerInstanceId
         : (run.runnerInstanceId ?? randomUUID());
     let nativeSessionId =
-      run.nativeSessionId ?? resumableTaskSessionId ?? randomUUID();
+      run.nativeSessionId ?? piConversation?.id ?? resumableTaskSessionId ?? randomUUID();
     let nativeResumeCheckpoint: ReturnType<
       typeof rebindNativeSessionCheckpoint
     > = null;
@@ -1020,6 +1045,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
           runnerProfileJson: {
             ...nativeRuntimeResolution.profile,
             ...lockedProfile,
+            ...(piConversation ? { piConversation } : {}),
             ...(runtimeSkillPreservation ? { nativeRuntimeSkillPreservation: runtimeSkillPreservation } : {}),
             ...(nativeExecution?.provider.kind === "cursor_cloud" ? { executionPlacement: resolveProviderApiPlacement({ agent, run }) } : {}),
             nativePreparationFencingVersion: !lockedRun.runnerInstanceId && !lockedRun.nativeSessionId
