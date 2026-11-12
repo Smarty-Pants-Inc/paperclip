@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
 import { RunAuthority, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
@@ -10,7 +10,7 @@ import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { configurePiNativeMcp } from "./pi-native-mcp.js";
-import { piHostInstructionSegment } from "./extension/index.js";
+import { piHostInstructionSegment, verifiedPiChildBridgePath } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
@@ -134,6 +134,7 @@ export class PiRpcDriver implements HarnessDriver {
     await configurePiNativeMcp(agentHome, environment);
     await syncPiCompanySkills(agentHome, initialContext.runtimeContext);
     const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
+    const fatalSessionStartExtensionPaths = [extension, verifiedPiChildBridgePath(pathToFileURL(extension).href)];
     await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
     args.push("--append-system-prompt", instructionFile, "--extension", extension);
     environment.PAPERCLIP_PI_INSTRUCTIONS_FILE = instructionFile;
@@ -191,6 +192,7 @@ export class PiRpcDriver implements HarnessDriver {
       env: piProcessEnvironment(environment),
       commandFd: this.#options.commandFd,
       commandLifecycle: this.#options.commandLifecycle,
+      fatalSessionStartExtensionPaths,
       shutdownTimeoutMs: this.#options.shutdownTimeoutMs,
       killTimeoutMs: this.#options.killTimeoutMs,
     };
@@ -754,6 +756,14 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async #consume(event: PiRpcRecord): Promise<void> {
+    if (event.type === "extension_error" && event.event === "session_start") {
+      // Startup diagnostics precede any turn. Publish at session scope instead
+      // of losing them to the turn-origin gate below. Transport bounds count.
+      this.#emit("harness.diagnostic", { code: "pi_extension_startup_failed", event: "session_start",
+        extensionPath: typeof event.extensionPath === "string" ? event.extensionPath.slice(0, 1024) : "",
+        message: typeof event.error === "string" ? event.error.slice(0, 2048) : "Extension startup failed" });
+      return;
+    }
     if (event.type === "process_exit" || event.type === "transport_error") {
       const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
       this.#callbacks?.fence();

@@ -403,11 +403,11 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
  * loaded child factory before registering it. Never register a missing/tampered
  * sibling merely because it existed at build time. Source-mode tests have no pack.
  */
-function verifyPiChildBridge(childBridgePath: string): void {
+function verifyPiChildBridge(childBridgePath: string, hostExtensionUrl = import.meta.url): void {
   try {
     if (!lstatSync(childBridgePath).isFile()) throw new Error("not a regular file");
-    if (import.meta.url.endsWith(".ts")) return;
-    const packRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
+    if (hostExtensionUrl.endsWith(".ts")) return;
+    const packRoot = resolve(dirname(fileURLToPath(hostExtensionUrl)), "../../../..");
     const manifest = JSON.parse(readFileSync(resolve(packRoot, "provider-pack.json"), "utf8"));
     const artifact = manifest?.payload?.artifacts?.piChildBridge;
     if (!artifact || typeof artifact.path !== "string" || !/^sha256:[a-f0-9]{64}$/.test(artifact.sha256)
@@ -419,13 +419,21 @@ function verifyPiChildBridge(childBridgePath: string): void {
   }
 }
 
+/** One exact owned layout, shared with the driver's startup-error attribution.
+ * This is the same child artifact verified before composition, not home discovery. */
+export function verifiedPiChildBridgePath(hostExtensionUrl = import.meta.url): string {
+  const path = fileURLToPath(new URL(hostExtensionUrl.endsWith(".ts") ? "./subagents/child-bridge.ts" : "./child-bridge.js", hostExtensionUrl));
+  verifyPiChildBridge(path, hostExtensionUrl);
+  return realpathSync(path);
+}
+
 /** The CLI host extension loads before settings packages. Register this handler
  * before pi-subagents' session_start so its liveness provider is observable.
  * Both bundled registry copies use pi-subagents' process-global Symbol.for key.
  */
 export function installPiSubagentComposition(
   pi: PiBindApi,
-  childBridgePath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./subagents/child-bridge.ts" : "./child-bridge.js", import.meta.url)),
+  childBridgePath = verifiedPiChildBridgePath(),
 ) {
   if (!pi.events) throw new Error("Pi subagent event bus unavailable");
   verifyPiChildBridge(childBridgePath);

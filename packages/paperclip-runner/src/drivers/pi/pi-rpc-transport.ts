@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { realpathSync } from "node:fs";
 
 export type PiRpcRecord = Record<string, unknown>;
 
@@ -16,6 +17,8 @@ export interface PiRpcTransportOptions {
   env?: NodeJS.ProcessEnv;
   commandFd?: number;
   commandLifecycle?: { beforeSpawn(): void; afterSpawn(): void; afterExit(): void };
+  /** Canonical owned host/child paths already resolved and verified by the driver. */
+  fatalSessionStartExtensionPaths?: readonly string[];
   maxRecordBytes?: number;
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
@@ -80,6 +83,8 @@ export class PiRpcTransport {
   readonly #maxRecordBytes: number;
   readonly #shutdownTimeoutMs: number;
   readonly #killTimeoutMs: number;
+  readonly #fatalSessionStartExtensionPaths: ReadonlySet<string>;
+  #reportedStartupExtensionError = false;
   #buffer = Buffer.alloc(0);
   #nextId = 0;
   #closed = false;
@@ -91,6 +96,7 @@ export class PiRpcTransport {
 
   constructor(options: PiRpcTransportOptions) {
     this.#maxRecordBytes = options.maxRecordBytes ?? 4 * 1024 * 1024;
+    this.#fatalSessionStartExtensionPaths = new Set(options.fatalSessionStartExtensionPaths);
     this.#shutdownTimeoutMs = boundedTimeout(options.shutdownTimeoutMs, 1500);
     this.#killTimeoutMs = boundedTimeout(options.killTimeoutMs, 750);
     const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "pipe"];
@@ -265,12 +271,30 @@ export class PiRpcTransport {
         this.#fail(new Error("Pi RPC emitted a non-object JSON record"));
         return;
       }
-      // Pi 1.5.2 reports handler failures but may still answer get_state.
-      // Never admit a resident whose startup authority/required extension failed.
+      // Pi 1.5.2 RPC includes ExtensionError.extensionPath (a required string).
+      // Home packages may fail without breaking our startup authority. Attribute
+      // only by exact canonical path, never package names, suffixes, or messages.
       if (record.type === "extension_error" && record.event === "session_start") {
-        this.#records.push(record);
-        this.#fail(new Error("Pi RPC extension session_start failed"));
-        return;
+        let path: string | undefined;
+        try { if (typeof record.extensionPath === "string") path = realpathSync(record.extensionPath); }
+        catch { /* An unavailable/foreign path cannot identify an owned extension. */ }
+        const diagnostic = { type: "extension_error", event: "session_start",
+          extensionPath: typeof record.extensionPath === "string" ? record.extensionPath.slice(0, 1024) : "",
+          error: typeof record.error === "string" ? record.error.slice(0, 2048) : "Extension startup failed" };
+        if (path && this.#fatalSessionStartExtensionPaths.has(path)) {
+          this.#records.push(diagnostic);
+          this.#fail(new Error("Pi RPC extension session_start failed"));
+          return;
+        }
+        // Bound both diagnostic size and count for a noisy third-party package.
+        if (!this.#reportedStartupExtensionError) {
+          this.#reportedStartupExtensionError = true;
+          if (!this.#records.push(diagnostic)) {
+            this.#fail(new Error("Pi RPC event queue exceeded its limit"));
+            return;
+          }
+        }
+        continue;
       }
       if (record.type === "response" && typeof record.id === "string") {
         const pending = this.#pending.get(record.id);

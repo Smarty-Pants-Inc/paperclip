@@ -1,4 +1,5 @@
 import { createServer as httpServer, type Server as HttpServer } from "node:http";
+import { createHash } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -46,7 +47,7 @@ async function fixture(options: Partial<PiRpcDriverOptions> = {}, Driver: typeof
   async function start() { const turn = await session.startTurn({ message: { role: "user", text: "one" } }); transport.send({ type: "agent_start" }); await tick(); return turn; }
   async function announce(request: PiToolCallRequest) { transport.send({ type: "tool_execution_start", toolCallId: request.toolCallId, toolName: request.tool, args: request.arguments }); await tick(); }
   async function settle(n = 1) { const message = { role: "assistant", id: `m-${n}`, responseId: `receipt-${n}`, timestamp: n, provider: "paperclip", model: "faux", content: [{ type: "text", text: "done" }], usage: {}, stopReason: "stop" }; transport.send({ type: "message_start", message }); transport.send({ type: "message_end", message }); transport.send({ type: "agent_settled" }); await vi.waitFor(() => expect(events.filter(e => e.eventType === "turn.completed")).toHaveLength(n)); }
-  return { root, session, transport, ipc, initial, events, effects, call, start, announce, settle, setStop: (value: typeof stop) => { stop = value; }, setPark: (value: typeof park) => { park = value; }, setStopGate: (value: Promise<void>) => { stopGate = value; } };
+  return { root, session, transport, launch, ipc, initial, events, effects, call, start, announce, settle, setStop: (value: typeof stop) => { stop = value; }, setPark: (value: typeof park) => { park = value; }, setStopGate: (value: Promise<void>) => { stopGate = value; } };
 }
 
 async function packagedDriver(verified = true) {
@@ -62,13 +63,21 @@ async function packagedDriver(verified = true) {
   await Promise.all([
     build({ entryPoints: [fileURLToPath(new URL("./extension/index.ts", import.meta.url))], outfile: join(dist, "drivers/pi/extension/index.js"), platform: "node", format: "esm", target: "node24", bundle: false, logLevel: "silent" }),
     build({ entryPoints: [fileURLToPath(new URL("./pi-bind-protocol.ts", import.meta.url))], outfile: join(dist, "drivers/pi/pi-bind-protocol.js"), platform: "node", format: "esm", target: "node24", bundle: false, logLevel: "silent" }),
+    build({ entryPoints: [fileURLToPath(new URL("./extension/subagents/child-bridge.ts", import.meta.url))], outfile: join(dist, "drivers/pi/extension/child-bridge.js"), platform: "node", format: "esm", target: "node24", bundle: true, logLevel: "silent" }),
   ]);
+  const path = "dist/drivers/pi/extension/child-bridge.js";
+  const sha256 = `sha256:${createHash("sha256").update(await readFile(join(root, path))).digest("hex")}`;
+  await writeFile(join(root, "provider-pack.json"), JSON.stringify({ payload: { artifacts: { piChildBridge: { path, sha256 } } } }));
   return { root, Driver: (createRequire(import.meta.url)(output) as { PiRpcDriver: typeof PiRpcDriver }).PiRpcDriver };
 }
 
 describe("live host Pi C2 authority", () => {
   it("resolves the real owned extension in official verified CJS cli layout, not cwd", async () => {
     const packaged = await packagedDriver(); const f = await fixture({}, packaged.Driver);
+    expect(f.launch.fatalSessionStartExtensionPaths).toEqual([
+      join(packaged.root, "dist/drivers/pi/extension/index.js"),
+      join(packaged.root, "dist/drivers/pi/extension/child-bridge.js"),
+    ]);
     expect(f.initial.toolSocketPath.startsWith(tmpdir())).toBe(true);
     expect(Buffer.byteLength(f.initial.toolSocketPath)).toBeLessThanOrEqual(103);
     expect(f.initial.toolSocketPath).not.toMatch(/^\/tmp\/pcpi-/);
