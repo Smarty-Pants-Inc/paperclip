@@ -230,6 +230,7 @@ try {
   writePortableExecutableShim(temporaryRoot, "opencode", "opencode-ai/bin/opencode.exe");
   writePortableCopilotShims(temporaryRoot);
   writePortableNodeShim("acpx", "acpx/dist/cli.js");
+  writePortableNodeShim("yaml", "yaml/bin.mjs");
   writePortableNodeShim("paperclip-runner-copilot-metadata-probe", "../dist/cli/copilot-metadata-probe.js");
   writePortableNodeShim(
     "claude-agent-acp",
@@ -291,6 +292,7 @@ try {
   const piExtensionPath = "dist/drivers/pi/extension/index.js";
   const piChildBridgePath = "dist/drivers/pi/extension/child-bridge.js";
   const piRpcExecutablePath = "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
+  if (nativeProviders.pi_rpc) chmodSync(join(temporaryRoot, piRpcExecutablePath), 0o755);
   const opencodeProxyPath = "dist/cli/opencode-app-server-proxy.cjs";
   const acpxSidecarPath = "dist/cli/acpx-runtime-sidecar.cjs";
   const opencodeCommand = "node_modules/.bin/opencode";
