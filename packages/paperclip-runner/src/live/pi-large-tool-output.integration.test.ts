@@ -7,10 +7,13 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { connect } from "node:net";
 import { expect, it, vi } from "vitest";
 import { PiRpcDriver, type PiRpcHarnessSession } from "../drivers/pi/pi-rpc-driver.js";
 import { PiRpcTransport } from "../drivers/pi/pi-rpc-transport.js";
+import { bindAcpxAgentFiles } from "../drivers/acpx/agent-files-binding.js";
+import { canonicalNativeRuntimeContextDigest, parseNativeRuntimeContext, type NativeRuntimeContextSnapshot } from "../contracts/runtime-context.js";
 
 const binary = process.env.PI_TEST_BINARY;
 const out = process.env.PI_LARGE_OUTPUT_OUT;
@@ -34,11 +37,40 @@ async function refused(base: string) {
   }), 2000);
 }
 
+function nativeRuntimeContext(home: string, bundle: string): NativeRuntimeContextSnapshot {
+  const instruction = `Native proof instruction root AGENT_HOME=${home}`;
+  const value: Omit<NativeRuntimeContextSnapshot, "aggregateDigest"> = {
+    prompt: { revision: "native-output", text: instruction, digest: sha(instruction) },
+    instructions: {
+      entryPath: "AGENTS.md",
+      bundle: { schema: "paperclip.runtime-asset.v1", digest: sha(instruction), manifestDigest: sha(instruction), rootPath: bundle, fileCount: 1, totalBytes: Buffer.byteLength(instruction) },
+      workingCopy: { kind: "agent_files", rootPath: home, entryPath: "AGENTS.md" },
+    },
+    skills: [], mcp: { assignmentSetId: "none", digest: sha("none"), bindingId: null },
+  };
+  return { ...value, aggregateDigest: canonicalNativeRuntimeContextDigest(value) };
+}
+
+// Keep reason: the native fixture must cross the current agent-files grant
+// boundary without sharing its registered home with protected provider state.
+it("builds a canonical native-output runtime grant with a separately registered agent home", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-output-grant-"));
+  const home = join(root, "registered"), agent = join(root, "pi-agent"), bundle = join(root, "bundle");
+  await Promise.all([home, agent, bundle].map(p => mkdir(p)));
+  const context = parseNativeRuntimeContext(nativeRuntimeContext(home, bundle));
+  const binding = bindAcpxAgentFiles(context, [agent]);
+  expect(binding?.root).toBe(home);
+  expect(context.instructions.workingCopy).toEqual({ kind: "agent_files", rootPath: home, entryPath: "AGENTS.md" });
+  binding!.assertHeld();
+});
+
 it.skipIf(!binary || !out)("native Bash large output survives the production PiRpcDriver and broker without losing final results", async () => {
   await mkdir(out!, { recursive: true });
   const root = await mkdtemp(join(out!, "native-"));
-  const home = join(root, "agent"), workspace = join(root, "workspace"), temp = join(root, "tmp");
-  await Promise.all([mkdir(home), mkdir(workspace), mkdir(temp)]);
+  const home = join(root, "agent"), agent = join(root, "pi-agent"), bundle = join(root, "bundle"), workspace = join(root, "workspace"), temp = join(root, "tmp");
+  await Promise.all([home, agent, bundle, workspace, temp].map(p => mkdir(p)));
+  const runtimeContext = nativeRuntimeContext(home, bundle);
+  await Promise.all([home, bundle].map(p => writeFile(join(p, "AGENTS.md"), runtimeContext.prompt.text)));
   await writeFile(join(workspace, "SKILL.md"), "---\nname: native-output-proof\ndescription: Private installed SDK listing fixture.\n---\nNo real home or client data.\n");
   // One installed SDK package's actual files, not a synthetic file forest and
   // not another full runtime copy. GNU find uses its default no-follow policy.
@@ -99,10 +131,10 @@ it.skipIf(!binary || !out)("native Bash large output survives the production PiR
   let session: PiRpcHarnessSession | undefined, owned: ReturnType<typeof identity> = null;
   const events: any[] = [];
   try {
-    session = await new PiRpcDriver({ command: binary, model: "paperclip/gpt-5.4", piRpcThinkingLevel: "xhigh", runtimeDirectory: join(root, "sessions"), systemInstructions: `Native proof instruction root AGENT_HOME=${home}`,
-      runtimeContext: { instructions: { workingCopy: { rootPath: home } }, skills: [] },
+    session = await new PiRpcDriver({ command: binary, model: "paperclip/gpt-5.4", piRpcThinkingLevel: "xhigh", runtimeDirectory: join(root, "sessions"), systemInstructions: runtimeContext.prompt.text,
+      runtimeContext,
       // The real registered runner environment must match the current-run grant.
-      environment: { AGENT_HOME: home, HOME: root, TMPDIR: temp, PATH: process.env.PATH, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: home, PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${a.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker", HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1,localhost" },
+      environment: { AGENT_HOME: home, HOME: root, TMPDIR: temp, PATH: process.env.PATH, PI_OFFLINE: "1", PI_CODING_AGENT_DIR: agent, PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${a.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker", HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1,localhost" },
       transportFactory: options => {
         initialPrivate = { directory: dirname(options.env!.PAPERCLIP_PI_BIND_SOCKET!), socket: options.env!.PAPERCLIP_PI_BIND_SOCKET! };
         native = new PiRpcTransport(options);
@@ -129,7 +161,7 @@ it.skipIf(!binary || !out)("native Bash large output survives the production PiR
       const item: Record<string, any> = { ...c, status: "running", firstRawIndex: wire.length, startedAt: new Date().toISOString() }; proof.cases.push(item);
       try {
         await within(session.startTurn({ message: { role: "user", text: `Execute native Bash scenario ${c.name}` } }));
-        const models = JSON.parse(readFileSync(join(home, "models.json"), "utf8"));
+        const models = JSON.parse(readFileSync(join(agent, "models.json"), "utf8"));
         item.broker = models.providers.paperclip.baseUrl;
         for (;;) {
           const n = await within(iterator.next()); if (n.done) throw new Error("native stream ended"); events.push(n.value);
