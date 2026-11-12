@@ -1,4 +1,4 @@
-import { QUALIFIED_PI_RPC_PROFILE, parsePiRpcProfile, type NativePiRpcProfileSnapshot } from "../../vendor/paperclip-runner/index.js";
+import { PI_RPC_BUILTIN_THINKING_CATALOG, QUALIFIED_PI_RPC_PROFILE, parsePiRpcProfile, type NativePiRpcProfileSnapshot } from "../../vendor/paperclip-runner/index.js";
 import type { PaperclipRunnerPiRpcThinkingLevel } from "@paperclipai/adapter-utils";
 import { resolveGrokDisableWebSearch } from "../../vendor/paperclip-runner/index.js";
 import { agentHarnessType, normalizeClaudeRunnerOptions } from "@paperclipai/shared";
@@ -461,7 +461,7 @@ export function resolvePaperclipRunnerProviderProfile(
 ): PaperclipRunnerProviderProfile {
   const config = asRecord(adapterConfig);
   const candidate = config.provider ?? "codex";
-  try { resolvePaperclipRunnerPiRpcThinkingLevel(candidate, config.piRpcThinkingLevel); } catch (error) {
+  try { resolvePaperclipRunnerPiRpcThinkingLevel(candidate, config.piRpcThinkingLevel, config.model, config.thinkingLevelMap, PI_RPC_BUILTIN_THINKING_CATALOG); } catch (error) {
     throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_thinking_invalid", error instanceof Error ? error.message : "Invalid Pi RPC thinking level");
   }
   if (!isPaperclipRunnerProvider(candidate)) {
@@ -480,7 +480,7 @@ export function resolvePaperclipRunnerProviderProfile(
       .filter(key => config[key] !== undefined);
     if (unsupported.length) throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_config_invalid", `Native Pi RPC cannot honor ACPX or other-provider selectors: ${unsupported.join(", ")}.`);
     try {
-      resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel);
+      resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel, config.model, config.thinkingLevelMap, PI_RPC_BUILTIN_THINKING_CATALOG);
       if (config.profile !== undefined) parsePiRpcProfile(config.profile);
     } catch (error) {
       throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_profile_invalid", error instanceof Error ? error.message : "Native Pi profile is invalid");
@@ -754,7 +754,7 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
   }
   if (profile.provider === "pi_rpc") {
     return { provider: "pi_rpc", model: profile.model, profile: profile.profile,
-      piRpcThinkingLevel: resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel) };
+      piRpcThinkingLevel: resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel, config.model, config.thinkingLevelMap, PI_RPC_BUILTIN_THINKING_CATALOG) };
   }
   if (profile.provider === "opencode") {
     return {

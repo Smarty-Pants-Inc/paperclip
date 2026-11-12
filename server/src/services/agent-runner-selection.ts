@@ -1,3 +1,4 @@
+import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../vendor/paperclip-runner/index.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import type { Db } from "@paperclipai/db";
 import { agentHarnessType, paperclipRunnerProfileForHarness, isEnvironmentDriverSupportedForAdapter, paperclipRunnerSupportsPlatform, type AgentRunnerChoice, type AgentRunnerAvailability } from "@paperclipai/shared";
@@ -108,7 +109,7 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
   if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
   if (config.stdoutLogMode !== undefined && config.stdoutLogMode !== "compact") unsupported.push("stdoutLogMode");
   const thinking = config.piRpcThinkingLevel ?? config.thinking;
-  try { resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", thinking); } catch { unsupported.push("piRpcThinkingLevel"); }
+  try { resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", thinking, typeof config.model === "string" ? config.model.trim() : config.model, config.thinkingLevelMap, PI_RPC_BUILTIN_THINKING_CATALOG); } catch { unsupported.push("piRpcThinkingLevel"); }
   for (const key of ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel"]) if (config[key] !== undefined) unsupported.push(key);
   if (config.piRpcThinkingLevel !== undefined && config.thinking !== undefined && config.piRpcThinkingLevel !== config.thinking) unsupported.push("thinking");
   if (unsupported.length) incompatible(unsupported);
@@ -118,7 +119,7 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
     ...translated,
     provider: "pi_rpc",
     model: typeof config.model === "string" ? config.model.trim() : "",
-    piRpcThinkingLevel: thinking ?? "low",
+    piRpcThinkingLevel: resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", thinking, typeof config.model === "string" ? config.model.trim() : config.model, config.thinkingLevelMap, PI_RPC_BUILTIN_THINKING_CATALOG),
     ...(config.lifecycleMode === undefined ? {} : { lifecycleMode: config.lifecycleMode }),
   };
 }
@@ -226,7 +227,9 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
     }
     if (harness === "pi_local" || harness === "pi_rpc") {
       if (!native) return { adapterType, adapterConfig: config };
-      const thinking = config.thinking ?? (harness === "pi_rpc" ? config.piRpcThinkingLevel : config.piThinkingLevel) ?? "low";
+      const thinking = config.thinking ?? (harness === "pi_rpc"
+        ? resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel, config.model, config.thinkingLevelMap, PI_RPC_BUILTIN_THINKING_CATALOG)
+        : config.piThinkingLevel ?? "low");
       const unsupported = [
         ...(config.acpxPermissionMode !== undefined && config.acpxPermissionMode !== "approve-all" ? ["acpxPermissionMode"] : []),
         ...(config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn" ? ["lifecycleMode"] : []),

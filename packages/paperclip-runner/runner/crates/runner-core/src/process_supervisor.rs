@@ -761,6 +761,7 @@ pub(crate) enum ProcessOutput {
     Stdout(String),
     Stderr(String),
     StdoutError(String),
+    StdoutFrameRejected(String),
     StdoutClosed,
     StderrClosed,
 }
@@ -827,6 +828,7 @@ fn forward_bounded_output<R: io::Read + Send + 'static>(
     sender: SyncSender<ProcessOutput>,
     stdout: bool,
     max_line_bytes: usize,
+    recover_oversized_stdout: bool,
 ) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
@@ -834,6 +836,11 @@ fn forward_bounded_output<R: io::Read + Send + 'static>(
             let output = match read_bounded_line(&mut reader, max_line_bytes) {
                 Ok(BoundedLine::Line(line)) if stdout => ProcessOutput::Stdout(line),
                 Ok(BoundedLine::Line(line)) => ProcessOutput::Stderr(line),
+                Ok(BoundedLine::TooLong) if stdout && recover_oversized_stdout => {
+                    ProcessOutput::StdoutFrameRejected(format!(
+                        "harness stdout frame exceeded {max_line_bytes} bytes"
+                    ))
+                }
                 Ok(BoundedLine::TooLong) if stdout => ProcessOutput::StdoutError(format!(
                     "harness stdout frame exceeded {max_line_bytes} bytes"
                 )),
@@ -841,6 +848,15 @@ fn forward_bounded_output<R: io::Read + Send + 'static>(
                     "[harness stderr frame exceeded {max_line_bytes} bytes]"
                 )),
                 Ok(BoundedLine::Eof) => break,
+                Err(error)
+                    if stdout
+                        && recover_oversized_stdout
+                        && error.kind() == io::ErrorKind::InvalidData =>
+                {
+                    ProcessOutput::StdoutFrameRejected(
+                        "harness stdout frame was not valid UTF-8".to_owned(),
+                    )
+                }
                 Err(error) if stdout => {
                     ProcessOutput::StdoutError(format!("failed to read harness stdout: {error}"))
                 }
@@ -979,6 +995,7 @@ impl SupervisedProcess {
             additional_environment_keys,
             None,
             None,
+            false,
         )
     }
 
@@ -998,6 +1015,7 @@ impl SupervisedProcess {
             additional_environment_keys,
             None,
             Some(cwd),
+            false,
         )
     }
 
@@ -1006,6 +1024,39 @@ impl SupervisedProcess {
         shutdown_grace: Duration,
         max_line_bytes: usize,
         additional_environment_keys: &[&str],
+    ) -> Result<Self, LocalRunnerError> {
+        Self::spawn_verified_with_stdout_policy(
+            launch,
+            shutdown_grace,
+            max_line_bytes,
+            additional_environment_keys,
+            false,
+        )
+    }
+
+    /// Recover only framing rejections; real stdout I/O errors remain fatal.
+    /// Other launch paths retain the original fail-closed reader policy.
+    pub(crate) fn spawn_verified_with_recoverable_stdout(
+        launch: &VerifiedProcessLaunch,
+        shutdown_grace: Duration,
+        max_line_bytes: usize,
+        additional_environment_keys: &[&str],
+    ) -> Result<Self, LocalRunnerError> {
+        Self::spawn_verified_with_stdout_policy(
+            launch,
+            shutdown_grace,
+            max_line_bytes,
+            additional_environment_keys,
+            true,
+        )
+    }
+
+    fn spawn_verified_with_stdout_policy(
+        launch: &VerifiedProcessLaunch,
+        shutdown_grace: Duration,
+        max_line_bytes: usize,
+        additional_environment_keys: &[&str],
+        recover_oversized_stdout: bool,
     ) -> Result<Self, LocalRunnerError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -1020,6 +1071,7 @@ impl SupervisedProcess {
                     .inherit_runtime_executable
                     .then_some(inherited.program.as_path()),
                 None,
+                recover_oversized_stdout,
             );
             #[cfg(target_os = "macos")]
             if let Ok(process) = result.as_mut() {
@@ -1037,6 +1089,7 @@ impl SupervisedProcess {
                 shutdown_grace,
                 max_line_bytes,
                 additional_environment_keys,
+                recover_oversized_stdout,
             );
             Err(LocalRunnerError::invalid(
                 "verified process launch is supported only on Linux and macOS",
@@ -1052,6 +1105,7 @@ impl SupervisedProcess {
         additional_environment_keys: &[&str],
         verified_runtime_executable: Option<&Path>,
         cwd: Option<&Path>,
+        recover_oversized_stdout: bool,
     ) -> Result<Self, LocalRunnerError> {
         let mut command = Command::new(program);
         if let Some(cwd) = cwd {
@@ -1147,8 +1201,14 @@ impl SupervisedProcess {
             .take()
             .ok_or_else(|| LocalRunnerError::invalid("supervised process stderr was not piped"))?;
         let (sender, output) = mpsc::sync_channel(PROCESS_OUTPUT_QUEUE_CAPACITY);
-        forward_bounded_output(stdout, sender.clone(), true, max_line_bytes.max(1));
-        forward_bounded_output(stderr, sender, false, max_line_bytes.max(1));
+        forward_bounded_output(
+            stdout,
+            sender.clone(),
+            true,
+            max_line_bytes.max(1),
+            recover_oversized_stdout,
+        );
+        forward_bounded_output(stderr, sender, false, max_line_bytes.max(1), false);
 
         Ok(Self {
             child,
@@ -1240,7 +1300,8 @@ impl SupervisedProcess {
             match self.recv_timeout(remaining) {
                 Ok(ProcessOutput::Stdout(line)) => return Ok(Some(line)),
                 Ok(ProcessOutput::Stderr(_)) | Ok(ProcessOutput::StderrClosed) => {}
-                Ok(ProcessOutput::StdoutError(message)) => {
+                Ok(ProcessOutput::StdoutError(message))
+                | Ok(ProcessOutput::StdoutFrameRejected(message)) => {
                     return Err(LocalRunnerError::invalid(message));
                 }
                 Ok(ProcessOutput::StdoutClosed) => return Ok(None),

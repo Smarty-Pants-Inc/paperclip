@@ -568,7 +568,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
         if (params.model !== undefined && params.model !== activeModel) throw new Error("Pi turn model differs from the admitted session");
         const piRpcThinkingLevel = parsePiThinkingLevel(
-          params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
+          params.effort ?? params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
         );
         const turnInput = {
           message: userMessage,

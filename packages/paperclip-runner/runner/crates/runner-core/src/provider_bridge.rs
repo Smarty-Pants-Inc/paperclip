@@ -965,6 +965,28 @@ impl ProviderToolBridge {
         Ok(Vec::new())
     }
 
+    /// Stop waiting for results from an already closed turn. This is NOT an
+    /// operation result: the caller must record that each effect's outcome is
+    /// unknown. Retain exact tombstones so timeout cannot authorize re-dispatch.
+    pub(crate) fn abandon_closed_turn_pending_calls(
+        &mut self,
+    ) -> Result<Vec<PendingToolCall>, ProviderBridgeError> {
+        if !self.turn_closed {
+            return Err(ProviderBridgeError::invalid(
+                "cannot abandon tool waiters while the provider turn is active",
+            ));
+        }
+        if !self.settled_identity_capacity_allows(0) {
+            return Err(ProviderBridgeError::active_turn_receipt_limit());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let evicted = self
+            .settled_call_ids
+            .extend_recent(pending.keys().cloned(), MAX_SETTLED_CALL_IDS);
+        debug_assert!(evicted.is_empty());
+        Ok(pending.into_values().collect())
+    }
+
     fn retained_value_bytes(&self) -> Result<usize, ProviderBridgeError> {
         let pending = self
             .pending

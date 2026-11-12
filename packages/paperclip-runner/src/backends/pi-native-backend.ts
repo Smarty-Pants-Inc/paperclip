@@ -1,3 +1,5 @@
+import { resolveDefaultPiRpcThinkingLevel } from "@paperclipai/adapter-utils/pi-rpc-default-thinking";
+import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { NATIVE_EXECUTION_INPUT_SCHEMA, NATIVE_EXECUTION_INPUT_SCHEMA_V7, NATIVE_EXECUTION_INPUT_SCHEMA_V9, NATIVE_EXECUTION_INPUT_SCHEMA_V10 } from "../contracts/native-execution.js";
 import type { NativeExecutionInput } from "../contracts/native-execution.js";
@@ -21,7 +23,7 @@ export function createPiNativeSessionBackend(
   return new HarnessDriverBackend(new PiRpcDriver({
     ...options,
     environment: options.environment,
-    piRpcThinkingLevel: input.provider.piRpcThinkingLevel,
+    piRpcThinkingLevel: resolveDefaultPiRpcThinkingLevel(input.provider.piRpcThinkingLevel, input.provider.model, undefined, PI_RPC_BUILTIN_THINKING_CATALOG),
     systemInstructions: nativeSystemInstructions(input),
     runtimeContext: "runtimeContext" in input ? input.runtimeContext : null,
     model: input.provider.model,

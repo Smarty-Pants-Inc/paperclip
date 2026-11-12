@@ -879,7 +879,8 @@ impl AcpxSidecarTransport {
                 Ok(ProcessOutput::Stderr(line)) => {
                     self.record_stderr(&line);
                 }
-                Ok(ProcessOutput::StdoutError(message)) => {
+                Ok(ProcessOutput::StdoutError(message))
+                | Ok(ProcessOutput::StdoutFrameRejected(message)) => {
                     return Err(LocalRunnerError::invalid(format!(
                         "ACPX sidecar stdout failed at {stage}: {}{}",
                         message,
@@ -971,6 +972,7 @@ impl AcpxSidecarTransport {
                 Some(ProcessOutput::StderrClosed) | None => break,
                 Some(ProcessOutput::Stdout(_))
                 | Some(ProcessOutput::StdoutError(_))
+                | Some(ProcessOutput::StdoutFrameRejected(_))
                 | Some(ProcessOutput::StdoutClosed) => {}
             }
         }

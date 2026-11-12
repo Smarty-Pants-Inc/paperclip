@@ -1,3 +1,4 @@
+import { getBuiltinModels, getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import { resolvePaperclipRunnerPiRpcThinkingLevel } from "./paperclip-runner-permissions.js";
 import { resolvePaperclipRunnerPiThinkingLevel } from "./paperclip-runner-permissions.js";
 import { describe, expect, it } from "vitest";
@@ -137,6 +138,9 @@ describe("Pi thinking configuration", () => {
 
 
 describe("native Pi RPC admission", () => {
+  it.each([[undefined, "max"], ["low", "low"]] as const)("uses the shared catalog default only without an explicit level (%s)", (configured, expected) => {
+    expect(resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", configured, "paperclip/claude-opus-5-5", undefined, getBuiltinProviders().flatMap(provider => getBuiltinModels(provider)))).toBe(expected);
+  });
   it("admits a distinct native provider without ACPX transition selectors", () => {
     expect(isPaperclipRunnerProvider("pi_rpc")).toBe(true);
     const converted = paperclipRunnerTransitionConfig("pi_local", "cliproxyapi-anthropic/claude-opus-5-5", "pi_rpc");

@@ -1,3 +1,5 @@
+import { PI_RPC_THINKING_LEVELS, resolveDefaultPiRpcThinkingLevel, type PiThinkingCatalogModel } from "./pi-rpc-default-thinking.js";
+
 export type PaperclipRunnerProvider =
   "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "cursor_cloud";
 
@@ -288,18 +290,15 @@ export function resolvePaperclipRunnerPiThinkingLevel(provider: unknown, agent: 
 }
 
 
-/** Exact Pi RPC levels. Browser-safe admission contract, not ACPX's piThinkingLevel.
- * TODO: import the runner's PI_THINKING_LEVELS once it has a browser-safe package export.
- * A server parity test binds this temporary catalog to the qualified Pi 1.5.2 declaration.
+/** Exact Pi RPC vocabulary shared with default selection, not ACPX's piThinkingLevel.
+ * A server parity test binds it to the qualified Pi 1.5.2 declaration.
  */
-export const PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS = PI_RPC_THINKING_LEVELS;
 export type PaperclipRunnerPiRpcThinkingLevel = typeof PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS[number];
-export function resolvePaperclipRunnerPiRpcThinkingLevel(provider: unknown, value: unknown): PaperclipRunnerPiRpcThinkingLevel | undefined {
+export function resolvePaperclipRunnerPiRpcThinkingLevel(provider: unknown, value: unknown, model?: unknown, thinkingLevelMap?: unknown, catalog?: readonly PiThinkingCatalogModel[]): PaperclipRunnerPiRpcThinkingLevel | undefined {
   if (provider !== "pi_rpc") {
     if (value !== undefined) throw new Error("piRpcThinkingLevel is supported only for native Pi RPC");
     return undefined;
   }
-  if (value === undefined) return "low";
-  if (typeof value === "string" && PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS.includes(value as PaperclipRunnerPiRpcThinkingLevel)) return value as PaperclipRunnerPiRpcThinkingLevel;
-  throw new Error(`Pi RPC thinking level must be one of ${PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS.join(", ")}`);
+  return resolveDefaultPiRpcThinkingLevel(value, model, thinkingLevelMap, catalog);
 }

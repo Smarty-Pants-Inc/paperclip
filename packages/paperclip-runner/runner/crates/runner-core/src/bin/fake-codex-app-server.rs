@@ -2106,6 +2106,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "method": "turn/started",
                     "params": {"turn": {"id": provider_turn_id}}
                 }))?;
+                if let Some(kind) = argument(&args, "--stdout-bad-line") {
+                    let mut stdout = io::stdout().lock();
+                    match kind.as_str() {
+                        "oversized" => stdout.write_all(&vec![b'x'; 4 * 1024 * 1024 + 1])?,
+                        "non-json" => stdout.write_all(b"not a JSON-RPC frame: private-content")?,
+                        "non-object" => stdout.write_all(b"[]")?,
+                        "non-utf8" => stdout.write_all(&[0xff, 0xfe])?,
+                        _ => return Err("unknown bad stdout line fixture".into()),
+                    }
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
                 if consume_steer {
                     // Real Codex records the turn's own input as its first userMessage item.
                     for method in ["item/started", "item/completed"] {

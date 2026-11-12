@@ -3,7 +3,7 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { resolvePaperclipRunnerPiRpcThinkingLevel, type AdapterEnvironmentTestContext, type AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
-import { NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment } from "../../vendor/paperclip-runner/index.js";
+import { PI_RPC_BUILTIN_THINKING_CATALOG, NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment } from "../../vendor/paperclip-runner/index.js";
 import { resolvePaperclipRunnerProviderProfile, PaperclipRunnerProviderProfileError } from "./provider-profile.js";
 import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
@@ -36,7 +36,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     const profile = resolvePaperclipRunnerProviderProfile(context.config, { companyId: context.companyId });
     const model = profile.model;
     if (profile.provider !== "pi_rpc" || !model || model !== context.config.model) throw new Error("Pi needs an unchanged explicit model ID");
-    const piRpcThinkingLevel = resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", context.config.piRpcThinkingLevel);
+    const piRpcThinkingLevel = resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", context.config.piRpcThinkingLevel, context.config.model, context.config.thinkingLevelMap, PI_RPC_BUILTIN_THINKING_CATALOG);
     const environment = Object.fromEntries(Object.entries(context.config.env as Record<string, unknown> ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
     const target = context.executionTarget;
     if (target?.kind !== "remote" || target.transport === "sandbox" && target.runnerTask) throw new Error("Native Pi setup requires a remote command factory");

@@ -851,6 +851,27 @@ fn measurement(value: &Value) -> Value {
     })
 }
 
+/// Pi's proxy uses the Codex token-usage envelope, but its request identity
+/// belongs to the individual Pi receipt. Keep provider-reported costs in the
+/// existing measurements; catalog estimates are not provider billing.
+pub(crate) fn normalize_pi_usage_notification(params: &Value) -> Vec<NormalizedProviderEvent> {
+    let mut events = normalize_codex_notification("thread/tokenUsage/updated", params);
+    for event in &mut events {
+        event.payload["provider"] = json!("pi_rpc");
+        event.payload["providerRequestId"] = params
+            .get("providerRequestId")
+            .and_then(Value::as_str)
+            .map(|value| bounded_text(value, 240))
+            .into();
+        // Pi currently reports child/subagent accounting only as unknown.
+        // Keep that status distinct from measured tokens and billed USD.
+        if params.get("childUsage").and_then(Value::as_str) == Some("unknown") {
+            event.payload["childUsage"] = json!("unknown");
+        }
+    }
+    events
+}
+
 /// Context-window occupancy from a Codex `thread/tokenUsage/updated` payload.
 /// Codex sizes the live context by the most recent request's total tokens.
 pub(crate) fn codex_context_usage(params: &Value) -> Option<Value> {
