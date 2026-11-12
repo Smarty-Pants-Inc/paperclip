@@ -128,30 +128,40 @@ async function productionRuntime(root: string) {
   await runtimeReadOnly(packageRoot);
   const executable = join(packageRoot, "node_modules", closure.executableRelative);
   expect(execFileSync(process.execPath, [executable, "--version"], { encoding: "utf8", timeout: 10_000 }).trim()).toBe("1.5.2");
-  const proxy = join(root, "cli", "pi-rpc-app-server-proxy.cjs");
-  const extension = join(root, "drivers", "pi", "extension", "index.js");
+  const proxy = join(root, "dist", "cli", "pi-rpc-app-server-proxy.cjs");
+  const extension = join(root, "dist", "drivers", "pi", "extension", "index.js");
+  const childBridge = join(root, "dist", "drivers", "pi", "extension", "child-bridge.js");
   const artifacts = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
     import { build } from "esbuild";
     import { builtinModules } from "node:module";
+    import { bundlePiExtensions } from "./scripts/build-verified-provider-entrypoints.mjs";
     const common = { bundle: true, platform: "node", target: "node24", packages: "bundle", splitting: false, sourcemap: false, legalComments: "none", metafile: true, treeShaking: true, write: false, logLevel: "silent" };
     const proxy = await build({ ...common, entryPoints: ["src/cli/pi-rpc-app-server-proxy.ts"], outfile: "cli/pi-rpc-app-server-proxy.cjs", format: "cjs",
       banner: { js: 'const __paperclipVerifiedEntrypointUrl = require("node:url").pathToFileURL(__filename).href;' },
       define: { "import.meta.dirname": "__dirname", "import.meta.url": "__paperclipVerifiedEntrypointUrl" },
     });
-    const extension = await build({ ...common, entryPoints: ["src/drivers/pi/extension/index.ts"], outfile: "drivers/pi/extension/index.js", format: "esm" });
+    // Use the production pack builder: sub-wire7 requires both independent factories.
+    const extensions = await bundlePiExtensions({ write: false, outputRoot: "drivers/pi/extension" });
+    const extension = extensions.find(bundle => bundle.entrypoint.filename === "index.js").result;
+    const childBridge = extensions.find(bundle => bundle.entrypoint.filename === "child-bridge.js").result;
     const builtins = new Set([...builtinModules, ...builtinModules.map(name => "node:" + name)]);
-    for (const result of [proxy, extension]) {
+    for (const result of [proxy, extension, childBridge]) {
       const entries = Object.values(result.metafile.outputs).filter(output => output.entryPoint !== undefined);
       if (entries.length !== 1 || entries[0].imports.some(dependency => !dependency.external || !builtins.has(dependency.path))) throw new Error("production bundle is not self-contained");
     }
-    process.stdout.write(JSON.stringify({ proxy: proxy.outputFiles[0].text, extension: extension.outputFiles[0].text, proxyMetafile: proxy.metafile, extensionMetafile: extension.metafile }));
-  `], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 })) as { proxy: string; extension: string; proxyMetafile: unknown; extensionMetafile: unknown };
+    process.stdout.write(JSON.stringify({ proxy: proxy.outputFiles[0].text, extension: extension.outputFiles[0].text, childBridge: childBridge.outputFiles[0].text, proxyMetafile: proxy.metafile, extensionMetafile: extension.metafile, childBridgeMetafile: childBridge.metafile }));
+  `], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 })) as { proxy: string; extension: string; childBridge: string; proxyMetafile: unknown; extensionMetafile: unknown; childBridgeMetafile: unknown };
   await mkdir(dirname(proxy), { recursive: true }); await mkdir(dirname(extension), { recursive: true });
   await writeFile(join(root, "package.json"), `${JSON.stringify({ private: true, type: "module" })}\n`);
   await writeFile(proxy, artifacts.proxy, { mode: 0o755 });
   await writeFile(extension, artifacts.extension, { mode: 0o444 });
-  await writeFile(join(root, "production-bundle-metafiles.json"), `${JSON.stringify({ proxy: artifacts.proxyMetafile, extension: artifacts.extensionMetafile }, null, 2)}\n`);
-  return { executable, proxy, extension, closure };
+  await writeFile(childBridge, artifacts.childBridge, { mode: 0o444 });
+  // Preserve the production layout and exact manifest binding checked by the
+  // real loader; this scoped fixture does not claim full provider-pack admission.
+  const payload = { artifacts: { piChildBridge: { path: "dist/drivers/pi/extension/child-bridge.js", sha256: digest(childBridge) } } };
+  await writeFile(join(root, "provider-pack.json"), `${JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1", digest: `sha256:${createHash("sha256").update(JSON.stringify(payload)).digest("hex")}`, payload })}\n`, { mode: 0o444 });
+  await writeFile(join(root, "production-bundle-metafiles.json"), `${JSON.stringify({ proxy: artifacts.proxyMetafile, extension: artifacts.extensionMetafile, childBridge: artifacts.childBridgeMetafile }, null, 2)}\n`);
+  return { executable, proxy, extension, childBridge, closure };
 }
 
 type ModelRequest = { method: string | undefined; url: string | undefined; raw: string; body: Record<string, unknown>; rawSse: string };
@@ -329,6 +339,7 @@ it.skipIf(process.platform !== "linux" || !pi)(`real runnerd/Pi ${modelProtocol}
   const runnerBinary = process.env.PAPERCLIP_RUNNERD_PATH ?? defaultCapabilityRunnerdBinary();
   const sourcePaths = [
     "src/live/runnerd-pi-responses-tool-ids.integration.test.ts", "src/live/runnerd-codex-transport.ts", "src/cli/pi-rpc-app-server-proxy.ts",
+    "scripts/build-verified-provider-entrypoints.mjs", "src/drivers/pi/extension/subagents/child-bridge.ts",
     "src/drivers/pi/pi-rpc-driver.ts", "src/drivers/pi/extension/index.ts", "src/drivers/pi/pi-bind-protocol.ts", "src/drivers/pi/pi-rpc-callback-server.ts",
     "src/drivers/pi/pi-native-config.ts", "src/drivers/acpx/pi-provider-loopback.ts", "src/drivers/provider-loopback/broker.ts", "src/drivers/provider-loopback/responses.ts", "src/drivers/provider-loopback/messages.ts", "src/drivers/provider-loopback/chat.ts",
   ];
@@ -344,7 +355,7 @@ it.skipIf(process.platform !== "linux" || !pi)(`real runnerd/Pi ${modelProtocol}
   };
   await writeFile(join(root, "setup-proof.json"), `${JSON.stringify(proof, null, 2)}\n`);
   const runtime = await productionRuntime(root);
-  Object.assign(proof, { piVersion: "1.5.2", piSha256: digest(runtime.executable), proxySha256: digest(runtime.proxy), extensionSha256: digest(runtime.extension), installedClosure: runtime.closure });
+  Object.assign(proof, { piVersion: "1.5.2", piSha256: digest(runtime.executable), proxySha256: digest(runtime.proxy), extensionSha256: digest(runtime.extension), childBridgeSha256: digest(runtime.childBridge), installedClosure: runtime.closure });
   expect(proof.piSha256, "exact installed Pi 1.5.2 CLI pin").toBe("sha256:e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774");
   expect(Object.fromEntries(sourcePaths.map(path => [path, digest(path)])), "source frozen during bundle").toEqual(sourceHashes);
   const workspace = join(root, "workspace"), agentDirectory = join(root, "pi-agent");

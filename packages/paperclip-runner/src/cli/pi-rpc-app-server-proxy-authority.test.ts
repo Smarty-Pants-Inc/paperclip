@@ -478,7 +478,8 @@ describe("Pi RPC proxy captured run authority", () => {
     h.respond(currentRequest, { contentItems: [{ text: "" }] });
     await expect(currentOutcome).resolves.toEqual({ contentItems: [{ text: "" }] });
     expect(h.session.turns).toEqual([
-      { message: { role: "user", text: "" } }, { message: { role: "user", text: "" } },
+      { message: { role: "user", text: "" }, model: "test/model" },
+      { message: { role: "user", text: "" }, model: "test/model" },
     ]);
   });
 
