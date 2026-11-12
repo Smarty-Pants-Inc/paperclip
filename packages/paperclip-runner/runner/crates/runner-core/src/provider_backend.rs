@@ -465,12 +465,12 @@ fn semantic_result_event(
     }
 }
 
-/// Local Codex app-server and OpenCode server restart their own process and
+/// Local Codex app-server, OpenCode, and native Pi restart their own process and
 /// restore the same conversation after runner loss, so a turn that vanished
 /// meanwhile is a restart interruption the controller may continue once. A
 /// Cursor Cloud agent runs remotely; its lost turn is not a process restart.
 fn restart_lost_turn_is_continuable(provider: &str) -> bool {
-    matches!(provider, "codex" | "opencode")
+    matches!(provider, "codex" | "opencode" | "pi_rpc")
 }
 
 /// True only when signal 0 reports that no such process (or process group)
@@ -1727,7 +1727,7 @@ impl CodexProviderState {
                     !matches!(disposition, "done" | "blocked" | "needs_review" | "yielded")
                         || !matches!(
                             self.config.provider.as_str(),
-                            "codex" | "opencode" | "cursor_cloud"
+                            "codex" | "opencode" | "pi_rpc" | "cursor_cloud"
                         )
                 })
             || (matches!(
@@ -6218,6 +6218,7 @@ mod tests {
     fn restart_lost_turns_continue_only_for_locally_restored_providers() {
         assert!(super::restart_lost_turn_is_continuable("codex"));
         assert!(super::restart_lost_turn_is_continuable("opencode"));
+        assert!(super::restart_lost_turn_is_continuable("pi_rpc"));
         assert!(!super::restart_lost_turn_is_continuable("cursor_cloud"));
     }
 
@@ -8286,6 +8287,26 @@ done
         .to_string()
         .contains("incompatible work disposition"));
         assert!(state.active_provider_result_fingerprint.is_none());
+    }
+
+    #[test]
+    fn pi_rpc_keeps_proxy_results_reserved_and_rejects_invalid_finish_dispositions() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        // Pi's current finish authority comes from the correlated semantic tool,
+        // not an independently emitted paperclip/runResult notification.
+        let params = json!({"threadId":"thread-1", "turnId":"turn-1", "result":valid_opencode_result()});
+        assert!(normalize_provider_notification(&mut state, "paperclip/runResult", &params)
+            .unwrap_err().to_string().contains("reserved for verified provider proxies"));
+        for disposition in ["blocked", "invalid"] {
+            let mut input = valid_opencode_result();
+            input["reportedWorkDisposition"] = json!(disposition);
+            assert!(admit_terminal_tool_authority(&mut state, "paperclip_finish", &input, false)
+                .unwrap_err().to_string().contains("incompatible work disposition"));
+            assert!(state.active_provider_result_fingerprint.is_none());
+            assert!(state.active_provider_result_disposition.is_none());
+        }
     }
 
     #[test]
