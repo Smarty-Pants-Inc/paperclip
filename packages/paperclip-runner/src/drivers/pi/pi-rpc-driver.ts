@@ -9,6 +9,7 @@ import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
+import { configurePiNativeMcp } from "./pi-native-mcp.js";
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
@@ -129,6 +130,7 @@ export class PiRpcDriver implements HarnessDriver {
       ? environment.PI_CODING_AGENT_DIR ?? join(directory, "agent")
       : piCompanySkillsAgentHome(environment);
     environment.PI_CODING_AGENT_DIR = agentHome;
+    await configurePiNativeMcp(agentHome, environment);
     await syncPiCompanySkills(agentHome, initialContext.runtimeContext);
     const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
     await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
