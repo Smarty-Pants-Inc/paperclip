@@ -44,6 +44,18 @@ describe("ordinary native Pi setup hello through the run's configured driver", (
     expect(value.startTurn.mock.calls[0]).toEqual([{ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." } }]);
     expect(value.close).toHaveBeenCalledOnce();
   });
+  it("accepts the explicit final phase when the facade cached a progress start", async () => {
+    const value = stub({ events: [event("item.completed", { kind: "agentMessage", channel: "progress", providerPhase: "final_answer", text: "hello" }), terminal()] });
+    await expect(probe(value.driver)).resolves.toMatchObject({ helloProbePassed: true });
+  });
+  it.each([
+    ["turn.failed", "authentication_required", "Authentication required: no API key"],
+    ["session.failed", "model_unavailable", "Model unavailable"],
+  ] as const)("retains %s account/model failure for lifecycle classification", async (type, code, message) => {
+    const value = stub({ events: [event(type, { error: { code, message } })] });
+    await expect(probe(value.driver)).rejects.toMatchObject({ code, message });
+    expect(value.close).toHaveBeenCalledOnce();
+  });
   it.each([
     ["acceptance only", []], ["terminal only", [terminal()]],
     ["empty reply", [event("item.completed", { kind: "agentMessage", text: " " }), terminal()]],

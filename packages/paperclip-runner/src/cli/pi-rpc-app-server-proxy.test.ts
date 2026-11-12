@@ -149,6 +149,35 @@ async function request(
 }
 
 describe("Pi RPC app-server facade proxy", () => {
+  it.each([
+    ["final", "final_answer"],
+    ["progress", "commentary"],
+    ["unknown", undefined],
+  ])("preserves native Pi %s assistant channels through the facade", async (channel, phase) => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    await request(proxy, sink, 1, "thread/start", { model: "paperclip/faux" });
+    session.push("item.completed", { kind: "agentMessage", channel, text: "hello" }, "turn-1", "item-1");
+    await waitFor(() => sink.decoded().some(frame => frame.method === "item/completed"));
+    const frame = sink.decoded().find(frame => frame.method === "item/completed")!;
+    expect((frame.params as any).item.phase).toBe(phase);
+    await proxy.close();
+  });
+
+  it.each(["401 Authentication required", "404 model not found"])("preserves native Pi failure details (%s)", async message => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    await request(proxy, sink, 1, "thread/start", { model: "paperclip/faux" });
+    session.push("item.failed", { code: "pi_turn_failed", message }, "turn-1", "failure-1");
+    session.push("turn.failed", { status: "failed" }, "turn-1");
+    await waitFor(() => sink.decoded().some(frame => frame.method === "turn/failed"));
+    const frame = sink.decoded().find(frame => frame.method === "turn/failed")!;
+    expect((frame.params as any).turn.error).toEqual({ code: "pi_turn_failed", message });
+    await proxy.close();
+  });
+
   it("adapts real Pi usage to Rust total/last without double counting warm turns", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });

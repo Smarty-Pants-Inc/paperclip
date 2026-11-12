@@ -20,6 +20,13 @@ import {
   hasActiveAdapterOverride,
 } from "../adapters/registry.js";
 
+import { assertHarnessTestPassed } from "../services/agent-harness-verification.js";
+
+vi.mock("@paperclipai/adapter-opencode-local/server", async original => ({
+  ...await original<typeof import("@paperclipai/adapter-opencode-local/server")>(),
+  testEnvironment: vi.fn(async () => ({ adapterType: "opencode_local", status: "fail", testedAt: "", checks: [{ code: "opencode_hello_probe_failed", level: "error", message: "Wrong provider" }] })),
+}));
+
 const nativeSetup = vi.hoisted(() => ({ authenticate: vi.fn() }));
 vi.mock("../services/native-runtime/setup-readiness.js", () => ({
   testNativeRunnerAuthentication: nativeSetup.authenticate,
@@ -284,6 +291,24 @@ describe("server adapter registry", () => {
     const result = await requireServerAdapter("paperclip_runner").testEnvironment(context);
     expect(result.status).toBe(status);
     expect(nativeSetup.authenticate).toHaveBeenCalledWith(context, "codex", "gpt-5.6-sol");
+  });
+
+  // Recorded catch: every fresh pi_rpc agent fell through to OpenCode and parked.
+  it.each([
+    ["passed", "pass", null],
+    ["auth_required", "fail", "harness_auth_failed"],
+    ["model_unavailable", "fail", "harness_model_unavailable"],
+  ] as const)("routes native Pi setup and classifies %s", async (suffix, status, failure) => {
+    nativeSetup.authenticate.mockReset().mockResolvedValue({ adapterType: "paperclip_runner", status, testedAt: "",
+      checks: [{ code: `pi_rpc_hello_probe_${suffix}`, level: status === "pass" ? "info" : "error", message: "Selected native Pi account" }] });
+    const context = { companyId: "company-1", adapterType: "paperclip_runner",
+      config: { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "max", env: { PAPERCLIP_AI_PROVIDER_KEY: "selected-pi-key" } },
+      executionTarget: { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: "/boat/workspace", runner: { execute: vi.fn() } } };
+    const result = await requireServerAdapter("paperclip_runner").testEnvironment(context);
+    expect(nativeSetup.authenticate).toHaveBeenCalledExactlyOnceWith(context, "pi_rpc", "paperclip/claude-opus-5-5");
+    expect(result.checks[0].code).toBe(`pi_rpc_hello_probe_${suffix}`);
+    if (failure) expect(() => assertHarnessTestPassed(result)).toThrow(expect.objectContaining({ code: failure }));
+    else expect(() => assertHarnessTestPassed(result)).not.toThrow();
   });
 
   it("identifies only active external overrides for automatic runner selection", () => {

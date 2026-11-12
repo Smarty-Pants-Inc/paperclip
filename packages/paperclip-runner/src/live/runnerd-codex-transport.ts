@@ -1,3 +1,4 @@
+import { probePiNativeEnvironment, PiEnvironmentProbeCleanupError } from "../drivers/pi/pi-environment-probe.js";
 import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { readProviderFailure } from "../contracts/provider-failure.generated.js";
 import { confirmAntigravityProbeNativeRetirement } from "../drivers/acpx/antigravity-probe-retirement.js";
@@ -9117,7 +9118,7 @@ function retainNativeProbeCleanup(cleanup: (retry: boolean) => Promise<void>) {
 
 export async function probeNativeRunnerEnvironment(options: {
   runtimeDirectory: string;
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   model: string | null;
   reasoningEffort?: string;
   /** Verify native session identity/model and cleanup without a billable turn. */
@@ -9131,7 +9132,7 @@ export async function probeNativeRunnerEnvironment(options: {
   onCodexCredentialRefresh?: (filename: string) => Promise<void>;
   onCleanupConfirmed?: () => Promise<void>;
 }): Promise<{
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   providerDriver: string;
   effectiveModel: string;
   helloProbePassed: boolean;
@@ -9217,7 +9218,9 @@ export async function probeNativeRunnerEnvironment(options: {
     ...(options.model ? { model: options.model } : {}),
     ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
     conversationMode: "direct",
-    requestedCollaborationMode: "plan",
+    // Native Pi requires its ordinary writable assigned environment; the Pi
+    // probe still refuses all tool events and requires a real settled response.
+    requestedCollaborationMode: options.provider === "pi_rpc" ? "default" : "plan",
     approvalPolicy: "never",
     includeCollaborationModeInstructions: false,
     dynamicTools: [],
@@ -9239,6 +9242,24 @@ export async function probeNativeRunnerEnvironment(options: {
   let effectiveModel: string | undefined;
   let failure: unknown;
   const operation = (async () => {
+    if (options.provider === "pi_rpc") {
+      if (options.admissionOnly) throw new Error("Pi setup requires a real hello turn.");
+      const receipt = await probePiNativeEnvironment({
+        driver: { openSession: async input => { session = await driver.openSession(input); return session; } },
+        // The generic PRP facade does not expose provider-specific effort in
+        // session.started. The selected piRpcThinkingLevel is passed in the
+        // launch options and admitted against live Pi state by PiRpcDriver on
+        // the target. Do not invent an effective level in this facade context.
+        config: { provider: "pi_rpc", model: options.model ?? "" },
+        runId: options.transportOptions?.prpIdentity?.runId ?? "environment-probe",
+        normalizedSessionId: options.transportOptions?.prpIdentity?.normalizedSessionId ?? "environment-probe",
+        workingDirectory, signal: controller.signal, timeoutMs: options.timeoutMs, cleanupTimeoutMs: cleanupBudget,
+      });
+      if (bundle.evidence().providerDriver !== "pi_rpc") throw new Error("Pi setup returned an incompatible native provider driver.");
+      effectiveModel = receipt.effectiveModel;
+      completed = true;
+      return;
+    }
     session = await driver.openSession({ runId: options.transportOptions?.prpIdentity?.runId ?? "environment-probe", normalizedSessionId: options.transportOptions?.prpIdentity?.normalizedSessionId ?? "environment-probe",
       workingDirectory, signal: controller.signal });
     controller.signal.throwIfAborted();
@@ -9309,6 +9330,10 @@ export async function probeNativeRunnerEnvironment(options: {
     } catch (error) { teardownErrors.push(error); }
     try { await awaitTeardown(operation.catch(() => undefined), "draining native setup"); }
     catch (error) { teardownErrors.push(error); }
+    if (failure instanceof PiEnvironmentProbeCleanupError) {
+      try { await awaitTeardown(failure.retired, "joining native Pi retirement"); }
+      catch (error) { teardownErrors.push(error); }
+    }
     if (registrationOperation) {
       try { await awaitTeardown(registrationOperation.catch(() => undefined), "draining authority registration"); }
       catch (error) { teardownErrors.push(error); }
@@ -9333,6 +9358,7 @@ export async function probeNativeRunnerEnvironment(options: {
     if (teardownErrors.length) {
       const retained = retainNativeProbeCleanup(async retry => {
         const deadline = Date.now() + cleanupBudget;
+        if (failure instanceof PiEnvironmentProbeCleanupError) await awaitProbeCleanup(failure.retryCleanup(), deadline, "joining native Pi retirement");
         await awaitProbeCleanup(Promise.allSettled([operation, closingOperation, registrationOperation]), deadline, "joining original probe operations");
         if (!bundle.retireProbeResources) throw new Error("Native probe physical retirement proof is unavailable");
         await awaitProbeCleanup(bundle.retireProbeResources(Math.max(1, deadline - Date.now())), deadline, "confirming physical retirement");
