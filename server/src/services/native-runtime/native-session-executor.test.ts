@@ -15860,10 +15860,17 @@ describe("runnerd provider runtime wiring", () => {
     const current = { ...scopedNativeExecution(`pi-rpc-${piRpcThinkingLevel}`),
       provider: { kind: "pi_rpc", model: "paperclip/selected-model-exactly", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel },
     } as unknown as NativeExecutionInput;
-    await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "pi-rpc-controller", runnerEnvironment: {} });
+    const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+    const { packRoot, manifest } = await nativePiProviderPackFixture(join(isolatedStateDirectory, `pi-pack-${piRpcThinkingLevel}`));
+    await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "pi-rpc-controller", runnerEnvironment: {},
+      runnerRemoteProviderPackPath: packRoot });
     state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
     const transport = state.createTransport.mock.calls.at(-1)![0];
-    expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel });
+    expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel,
+      piCommand: join(packRoot, manifest.payload.artifacts.piRpcExecutable.path),
+      piProxyPath: join(packRoot, manifest.payload.artifacts.piRpcProxy.path),
+      providerPackAuthorityDigest: manifest.digest,
+    });
     expect(state.createBackend.mock.calls.at(-1)![0].provider).toMatchObject(current.provider);
     expect(transport.environment?.PI_CODING_AGENT_DIR).toBe(join(transport.stateDirectory!, "pi-agent"));
   });

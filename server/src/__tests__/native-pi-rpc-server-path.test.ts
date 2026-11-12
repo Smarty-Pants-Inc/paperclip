@@ -446,15 +446,17 @@ describe("native Pi RPC complete executor attempts", () => {
       transport = new PiRunnerdTransport();
       return { transport } as never;
     });
-    const remote = target === "remote sandbox" ? await providerPack() : null;
+    const pack = await providerPack();
+    const remote = target === "remote sandbox" ? pack : null;
     const execute = vi.fn(async (command: { command: string; args?: string[] }) => ({ exitCode: 0, signal: null, timedOut: false, stderr: "",
       stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
         schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
         durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
       }) : command.args?.[0] === "--version" ? "1.18.34\n" : "" }));
     const outcome = await executePaperclipNativeSession({ db: attemptDb(execution), execution, useRunnerd: true, runnerInstanceId: "runner",
+      runnerRemoteProviderPackPath: pack.packRoot,
       billingIdentity: { provider: "anthropic", biller: "anthropic", billingType: "metered_api" },
-      ...(remote ? { runnerIngressAuthorized: true, runnerRemoteBinaryPath: mocks.runnerBinary, runnerRemoteProviderPackPath: remote.packRoot,
+      ...(remote ? { runnerIngressAuthorized: true, runnerRemoteBinaryPath: mocks.runnerBinary,
         runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "environment", leaseId: "lease",
           effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn: async () => undefined } } as never,
       } : { runnerExecutionTarget: { kind: "local" as const } }),
