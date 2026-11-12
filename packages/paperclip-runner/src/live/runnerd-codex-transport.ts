@@ -4188,6 +4188,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #closePromise: Promise<void> | null = null;
   #retainUnsettledRemoteRunner = false;
   #shutdownSettled = false;
+  #closeFinished = false;
   #probeRetirement: Promise<void> | null = null;
   readonly prepareConversationResume?: CodexAppServerTransport["prepareConversationResume"];
   #detachPromise: Promise<void> | null = null;
@@ -4422,6 +4423,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   evidence(): CapabilityRunnerdProcessEvidence {
     return structuredClone(this.#evidence);
+  }
+
+  /**
+   * True only when this transport's startup failed before any provider
+   * identity existed, its close has finished, and the runner process's exit
+   * was observed (it suspended and exited, or close killed it and waited).
+   * A runner that failed session.open cannot always suspend, and its
+   * controller checkpoint can be refused for lack of a provider identity, so
+   * neither is required. A remote same-run bootstrap retry may then launch a
+   * new runner: the old one is gone, and its provider never opened a thread.
+   */
+  runnerExitConfirmed(): boolean {
+    return this.#closeFinished && !this.#startupComplete && this.#providerIdentity === null
+      && this.#evidence.runnerExited === true && this.#handle?.isExitConfirmed?.() !== false;
   }
 
   async request(
@@ -5588,7 +5603,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const deadline = Date.now() + runnerCloseGraceMs(this.options);
     try {
       await this.#closeAndSettle();
+      this.#closeFinished = true;
     } catch (error) {
+      this.#closeFinished = true;
       this.#queue.close();
       try { await this.#retireControllerForRecovery(deadline); }
       catch (retirementError) {

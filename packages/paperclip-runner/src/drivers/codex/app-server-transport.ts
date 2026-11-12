@@ -77,6 +77,8 @@ export interface CodexAppServerTransport {
    * diagnostic context; transports must not forward it to the provider.
    */
   close(reason?: string, options?: { retainUnsettledRemoteRunner?: boolean }): Promise<void>;
+  /** After close: the runner settled and its process exit was observed. */
+  runnerExitConfirmed?(): boolean;
   /** Return the confirmed released source, or false when active use was not released. */
   release?(): Promise<DurableRecoveryIdentity | false>;
   /** Relinquish controller authority while leaving durable runner work alive. */
