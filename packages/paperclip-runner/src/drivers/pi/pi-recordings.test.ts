@@ -1,5 +1,7 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { createPiRpcAppServerProxy, type PiRpcProxyFrameSink } from "../../cli/pi-rpc-app-server-proxy.js";
+import type { HarnessDriver, HarnessSession } from "../../contracts/harness-driver.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
 import { projectPiRecording } from "../../../test-support/pi-rpc-golden.js";
 
@@ -70,21 +72,221 @@ describe("immutable real Pi 1.5.2 lifecycle recordings against the controlled pe
   });
 });
 
-// Expected skip: the required production encoder is absent on exact b7bfd4e5.
-// Port below is the explicit test seam code-lead must expose, not a claimed
-// existing export. Do not replace it with the OpenCode encoder as fake proof.
-const proxy = new URL("../../cli/pi-app-server-proxy.ts", import.meta.url);
-it.skipIf(!existsSync(proxy))("goldens -> production Pi proxy encoder (missing src/cli/pi-app-server-proxy.ts)", async () => {
-  const { encodePiProjectedEvent, decodePiProxyReplayFrame } = await import(proxy.href);
-  expect(typeof encodePiProjectedEvent).toBe("function");
-  expect(typeof decodePiProxyReplayFrame).toBe("function");
-  for (const name of scenarios) {
-    const golden = JSON.parse(fixture(`${name}-1.5.2.normalized.json`));
-    for (const event of golden) {
-      const frames = encodePiProjectedEvent({ threadId: "pi-session", runId: "pi-capture", ...event });
-      // Exercise the real JSONL byte boundary, preserving Unicode separators.
-      const decoded = Buffer.from(frames.map((frame: unknown) => JSON.stringify(frame) + "\n").join(""), "utf8").toString("utf8").trim().split("\n").map(line => decodePiProxyReplayFrame(JSON.parse(line)));
-      expect(decoded).toContainEqual(expect.objectContaining(event));
+type ProjectedPiEvent = ReturnType<typeof projectPiRecording>[number];
+type NativeFrame = Record<string, unknown>;
+
+class JsonlSink implements PiRpcProxyFrameSink {
+  readonly chunks: string[] = [];
+  write(chunk: string): boolean { this.chunks.push(chunk); return true; }
+  once(_event: "drain", _listener: () => void): unknown { return this; }
+}
+
+class RecordingHarnessSession {
+  readonly complete: Promise<void>;
+  #resolveComplete!: () => void;
+
+  constructor(readonly replay: PrpEvent[]) {
+    this.complete = new Promise(resolve => { this.#resolveComplete = resolve; });
+  }
+
+  ids() { return { driverSessionId: "pi-session", providerSessionId: "pi-session" }; }
+
+  async *events(): AsyncIterable<PrpEvent> {
+    try {
+      for (const event of this.replay) {
+        yield event;
+        // The production facade batches adjacent assistant deltas. Let its real
+        // timer flush so each golden delta has an independently checked frame.
+        if (event.eventType === "item.delta") await new Promise(resolve => setTimeout(resolve, 60));
+      }
+    } finally {
+      this.#resolveComplete();
     }
   }
+
+  async close(): Promise<void> {}
+}
+
+function settlementTerminals(name: string, raw: Record<string, unknown>[]): ProjectedPiEvent[] {
+  // The projector owns content/usage/tool/diagnostic events. The native session
+  // separately reports turn settlement from this recorded Pi boundary. The
+  // extension scenario was fenced before an admitted prompt, so it has no turn.
+  if (name === "extension") return [];
+  let turn = 0;
+  let active = false;
+  const terminals: ProjectedPiEvent[] = [];
+  for (const event of raw) {
+    if (event.type === "agent_start" && !active) { turn += 1; active = true; }
+    if (event.type === "agent_settled" && active) {
+      const cancelled = event.aborted === true;
+      terminals.push({
+        runId: "pi-capture",
+        turnId: `turn-${turn}`,
+        eventType: cancelled ? "turn.cancelled" : "turn.completed",
+        payload: { status: cancelled ? "cancelled" : "completed", piAgentSettled: true },
+      });
+      active = false;
+    }
+  }
+  return terminals;
+}
+
+function replayWithSettlements(projected: ProjectedPiEvent[], terminals: ProjectedPiEvent[]): ProjectedPiEvent[] {
+  const pending = new Map(terminals.map(event => [event.turnId, event]));
+  const replay: ProjectedPiEvent[] = [];
+  for (const [index, event] of projected.entries()) {
+    replay.push(event);
+    if (projected[index + 1]?.turnId !== event.turnId) {
+      const terminal = pending.get(event.turnId);
+      if (terminal) { replay.push(terminal); pending.delete(event.turnId); }
+    }
+  }
+  replay.push(...pending.values());
+  return replay;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  throw new Error("timed out waiting for Pi proxy JSONL output");
+}
+
+describe("immutable Pi 1.5.2 recordings through the production Pi facade JSONL boundary", () => {
+  it.each(scenarios)("replays %s with native facade mappings", async name => {
+    const raw = wire(name);
+    const projected = projectPiRecording(raw, name === "extension");
+    const golden = JSON.parse(fixture(`${name}-1.5.2.normalized.json`));
+    expect(projected).toEqual(golden);
+
+    const projectedEnvelopes = projected.map((event, index) => envelope(event, index));
+    for (const [index, event] of projected.entries()) {
+      expect(validatePrpEvent(projectedEnvelopes[index]!, JSON.stringify(event))).toMatchObject({ ok: true });
+      expect(event).toMatchObject({ runId: "pi-capture", turnId: expect.stringMatching(/^turn-/) });
+    }
+    const projectedWithTerminals = replayWithSettlements(projected, settlementTerminals(name, raw));
+    const replay = projectedWithTerminals.map((event, index) => envelope(event, index));
+
+    const session = new RecordingHarnessSession(replay);
+    const driver = {
+      async openSession() { return session as unknown as HarnessSession; },
+    } as unknown as HarnessDriver;
+    const sink = new JsonlSink();
+    const proxy = createPiRpcAppServerProxy({
+      stdout: sink,
+      createDriver: () => driver,
+      environment: { PAPERCLIP_RUN_ID: "pi-capture", PAPERCLIP_NORMALIZED_SESSION_ID: "pi-session" },
+    });
+
+    try {
+      proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/start", params: { cwd: process.cwd(), model: "neutral/recording" } }));
+      await waitFor(() => sink.chunks.some(chunk => chunk.includes('"id":1')));
+      await session.complete;
+    } finally {
+      await proxy.close();
+    }
+
+    // Decode exactly the production facade's newline-delimited UTF-8 output.
+    const jsonl = Buffer.from(sink.chunks.join(""), "utf8").toString("utf8");
+    const frames = jsonl.split("\n").filter(Boolean).map(line => JSON.parse(line) as NativeFrame);
+    expect(frames.find(frame => frame.id === 1)).toMatchObject({ result: { thread: { id: "pi-session" } } });
+    const notifications = frames.filter(frame => typeof frame.method === "string");
+    let outputIndex = 0;
+    for (const event of projectedWithTerminals) {
+      expect(event.runId, `${name} ${event.eventType} captured run`).toBe("pi-capture");
+      expect(event.turnId, `${name} ${event.eventType} captured turn`).toMatch(/^turn-/);
+      const payload = event.payload;
+      if (event.eventType === "context.compacted") {
+        // This Runner-internal marker has no Pi RPC notification equivalent.
+        continue;
+      }
+      if (event.eventType === "item.failed") {
+        // The Pi facade does not forward PRP item failures directly; the same
+        // recording's tool or turn settlement carries the native terminal state.
+        expect(notifications.some(frame => frame.method === "item/failed"
+          && (frame.params as Record<string, unknown> | undefined)?.itemId === event.itemId)).toBe(false);
+        continue;
+      }
+      const frame = notifications[outputIndex++];
+      expect(frame, `${name} ${event.eventType} has its native facade frame`).toBeDefined();
+      const params = frame!.params as Record<string, unknown>;
+
+      if (event.eventType === "item.started" || event.eventType === "item.delta" || event.eventType === "item.completed" || event.eventType === "item.failed") {
+        const assistantText = (payload.kind === "agentMessage" || payload.kind === "text") && typeof payload.text === "string"
+          ? payload.text
+          : null;
+        const method = event.eventType === "item.delta" && assistantText !== null
+          ? "item/agentMessage/delta"
+          : event.eventType.replace(".", "/");
+        const sourceItem = isRecord(payload.item)
+          ? payload.item
+          : { ...(event.itemId === undefined ? {} : { id: event.itemId }), ...(payload.kind === undefined ? {} : { type: payload.kind }), ...(payload.text === undefined ? {} : { text: payload.text }) };
+        const nativeItem = assistantText === null
+          ? sourceItem
+          : { ...sourceItem, id: event.itemId, type: "agentMessage", text: assistantText };
+        expect(frame).toMatchObject({
+          method,
+          params: {
+            threadId: "pi-session", turnId: event.turnId,
+            ...(event.itemId === undefined ? {} : { itemId: event.itemId }),
+            ...payload,
+            item: nativeItem,
+            ...(method === "item/agentMessage/delta" ? { delta: assistantText } : {}),
+          },
+        });
+      } else if (event.eventType === "tool.execution.started" || event.eventType === "tool.execution.progressed" || event.eventType === "tool.execution.completed") {
+        const phase = event.eventType === "tool.execution.started" ? "started"
+          : event.eventType === "tool.execution.progressed" ? "updated" : "completed";
+        const nativeToolType = payload.transport === "process" ? "commandExecution"
+          : payload.transport === "dynamic" ? "dynamicToolCall"
+            : payload.transport === "builtin" ? "builtinToolCall" : "mcpToolCall";
+        expect(frame).toMatchObject({
+          method: `item/${phase}`,
+          params: {
+            threadId: "pi-session", turnId: event.turnId, itemId: payload.executionId,
+            item: {
+              id: payload.executionId, type: nativeToolType, tool: payload.name,
+              status: payload.status,
+              output: typeof payload.output === "string" ? payload.output.slice(0, 16_384) : "",
+            },
+          },
+        });
+      } else if (event.eventType === "usage.reported") {
+        expect(frame).toMatchObject({
+          method: "thread/tokenUsage/updated",
+          params: {
+            threadId: "pi-session", turnId: event.turnId,
+            cumulative: isRecord(payload.cumulative) ? payload.cumulative : {},
+            runDelta: isRecord(payload.runDelta) ? payload.runDelta : {},
+            runDeltaAvailable: payload.runDeltaAvailable === true,
+            ...(payload.context === undefined ? {} : { context: isRecord(payload.context) ? payload.context : {} }),
+          },
+        });
+      } else if (event.eventType === "harness.diagnostic") {
+        expect(frame).toMatchObject({
+          method: "warning",
+          params: { threadId: "pi-session", message: payload.message ?? payload.code },
+        });
+      } else if (["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) {
+        const status = event.eventType.slice("turn.".length);
+        expect(frame).toMatchObject({
+          method: event.eventType.replace(".", "/"),
+          params: { threadId: "pi-session", turnId: event.turnId, turn: { id: event.turnId, status } },
+        });
+      } else {
+        throw new Error(`No independent native Pi facade expectation for ${event.eventType}`);
+      }
+      if (event.eventType !== "harness.diagnostic") expect(params.turnId).toBe(event.turnId);
+    }
+    expect(outputIndex).toBe(notifications.length);
+    if (name === "extension") {
+      expect(notifications).toHaveLength(1);
+      expect(notifications[0]).toMatchObject({ method: "warning", params: { message: "pi_unrequested_agent_start_fenced" } });
+    }
+  });
 });

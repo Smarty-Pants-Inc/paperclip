@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bindContent, sendPiBindRequest, type PiBindCommand } from "./pi-bind-protocol.js";
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
-import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { PiRpcTransport, type PiRpcExtensionUiResponseInput, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 
 // Keep reason: revocable model capabilities, receipt admission, and callback refusal
@@ -30,6 +30,7 @@ const digest = (text: string) => createHash("sha256").update(text).digest("hex")
 class FakeTransport {
   pid = 42; exited = false; closed = false;
   commands: string[] = [];
+  uiResponses: PiRpcExtensionUiResponseInput[] = [];
   order: string[] = [];
   ready: Promise<void> = Promise.resolve();
   mismatch = false;
@@ -42,6 +43,11 @@ class FakeTransport {
     return { success: true, data: type === "get_state" ? { sessionId: "native-session", model, thinkingLevel: this.effortMismatch ? "high" : "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "set_model" ? model : type === "get_available_thinking_levels" ? { levels: ["off"] }
       : type === "prompt" ? { disposition: "started" } : undefined };
+  }
+  async sendExtensionUiResponse(input: PiRpcExtensionUiResponseInput): Promise<void> {
+    if (this.closed || this.exited) throw new Error("Pi RPC transport is closed");
+    // Native UI responses are one-way writes, not correlated request() RPCs.
+    this.uiResponses.push(structuredClone(input));
   }
   send(value: PiRpcRecord) { if (this.#wake) { const wake = this.#wake; this.#wake = undefined; wake({ value, done: false }); } else this.#records.push(value); }
   events(): AsyncIterable<PiRpcRecord> { return { [Symbol.asyncIterator]: () => ({ next: async () => {
@@ -82,7 +88,10 @@ async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale
             buffer += chunk; if (!buffer.endsWith("\n")) return;
             const request = JSON.parse(buffer) as PiBindCommand; ipc.push(request); transport.order.push(`ipc:${request.type}`);
             if ((request.type === "bind" && fault === "lost") || (request.type === "begin_turn" && fault === "begin-lost")) return;
-            const receipt = request.type === "bind" ? { schema: 1, nonce: request.nonce, sessionId: request.sessionId, type: "bind", epoch: fault === "stale" ? request.epoch - 1 : request.epoch, runId: request.runId, provider: request.provider.name, model: request.model, thinkingLevel: request.thinkingLevel, ...bindContent(request) } : { ...request, ack: true };
+            const receipt = request.type === "bind" ? { schema: 1, nonce: request.nonce, sessionId: request.sessionId, type: "bind", epoch: fault === "stale" ? request.epoch - 1 : request.epoch, runId: request.runId, provider: request.provider.name, model: request.model, thinkingLevel: request.thinkingLevel, ...bindContent(request) }
+              : request.type === "stop_children" ? { schema: 1, type: request.type, nonce: request.nonce, sessionId: request.sessionId, settled: [], uncertain: [] }
+              : request.type === "park_ready" ? { schema: 1, type: request.type, nonce: request.nonce, sessionId: request.sessionId, ready: true, reasons: [] }
+              : { ...request, ack: true };
             socket.end(`${JSON.stringify(receipt)}\n`);
           });
         }); peers.push(server);
@@ -102,7 +111,8 @@ async function finish(f: Awaited<ReturnType<typeof fixture>>, n = 1) {
   await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.completed" && event.turnId === f.events.filter(event => event.eventType === "turn.started").at(-1)?.turnId)).toBe(true));
 }
 async function revoked(provider: { baseUrl: string; apiKey: string }) {
-  return fetch(`${provider.baseUrl}/chat/completions`, { method: "POST", headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" }, body: JSON.stringify({ model: "faux", messages: [] }) }).then(res => res.status === 401, () => true);
+  // A 401, timeout or unrelated network failure is not physical revocation.
+  return fetch(`${provider.baseUrl}/chat/completions`, { method: "POST", headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" }, body: JSON.stringify({ model: "faux", messages: [] }) }).then(() => false, error => error?.cause?.code === "ECONNREFUSED");
 }
 
 describe("resident Pi model binding", () => {
@@ -165,24 +175,33 @@ describe("resident Pi model binding", () => {
     const f = await fixture(); await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     if (kind === "model") f.transport.mismatch = true; else f.transport.effortMismatch = true;
     await expect(f.session.attachRun({ runId: "run-b" })).rejects.toThrow(/model|thinking/i);
-    expect(f.ipc.map(command => command.type)).toEqual(["bind"]); expect(f.transport.commands.filter(command => command === "prompt")).toHaveLength(1);
+    // Cleanup IPC is required after the refusal; it is not a bind retry.
+    expect(f.ipc.filter(command => command.type !== "stop_children").map(command => command.type)).toEqual(["bind"]);
+    expect(f.ipc.filter(command => command.type === "stop_children")).toHaveLength(1);
+    expect(f.transport.commands.filter(command => command === "prompt")).toHaveLength(1);
     expect(await revoked((f.ipc[0] as any).provider)).toBe(true);
   });
   it.each(["nonce", "sessionId", "runId", "model", "thinkingLevel", "instructionHash", "instructionLength", "toolRevision"])("independently rejects a forged %s receipt from a private-channel adapter", async field => {
     const client: typeof sendPiBindRequest = async (path, request, options) => {
       const receipt = await sendPiBindRequest(path, request, options);
-      return { ...receipt, [field]: field === "instructionLength" ? -1 : "forged" };
+      // Forge only the bind under test, not the independent Stop receipt.
+      return request.type === "bind" ? { ...receipt, [field]: field === "instructionLength" ? -1 : "forged" } : receipt;
     };
     const f = await fixture({ bindRequest: client }); await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await expect(f.session.attachRun({ runId: "run-b" })).rejects.toThrow(/receipt/i);
     expect(f.transport.commands.filter(command => command === "prompt")).toHaveLength(1); expect(await revoked((f.ipc[0] as any).provider)).toBe(true);
   });
-  it("does not execute semantic or UI callbacks before the live host guard exists", async () => {
+  it("refuses unannounced semantic callbacks and cancels anonymous UI with the exact native ID", async () => {
     const handler = vi.fn(); const f = await fixture({ dynamicToolHandler: handler });
     await f.session.startTurn({ message: { role: "user", text: "one" } });
     f.transport.send({ type: "extension_ui_request", id: "old-ui", method: "confirm", title: "stale" });
+    f.transport.send({ type: "extension_ui_request", id: 0, method: "input", title: "anonymous" });
     f.transport.send({ type: "tool_call", toolName: "old_tool", toolCallId: "old", args: {} }); await tick();
     expect(handler).not.toHaveBeenCalled();
+    expect(f.transport.uiResponses).toEqual([{ id: "old-ui", cancelled: true }, { id: 0, cancelled: true }]);
+    expect(f.events.some(event => event.eventType === "runtime_request.created")).toBe(false);
+    expect(f.transport.commands).toEqual([...admission, "prompt"]);
+    expect(f.ipc).toEqual([]);
   });
 });
 

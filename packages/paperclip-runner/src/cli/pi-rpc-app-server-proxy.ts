@@ -5,11 +5,12 @@ import { resolve } from "node:path";
 
 import type {
   HarnessDriver,
+  HarnessRuntimeRequest,
   HarnessRuntimeRequestResolution,
   HarnessSession,
   PersistedHarnessSession,
 } from "../contracts/harness-driver.js";
-import { PiRpcDriver, type PiRpcDriverOptions } from "../drivers/pi/pi-rpc-driver.js";
+import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 import {
   openCodeProxyItemNotification,
@@ -61,14 +62,34 @@ export interface PiRpcDriverLaunchConfig {
   dynamicTools: Record<string, unknown>[];
   durableToolRequests: true;
   dynamicToolHandler(call: {
-    turnId: string;
-    callId: string;
+    readonly runId: string;
+    readonly turnId: string;
+    callId: string | number;
     tool: string;
     arguments: unknown;
     signal?: AbortSignal;
   }): Promise<unknown>;
   isolateProcessGroup: false;
 }
+
+// Pi's resident-run refresh and admission remain local to its facade/driver;
+// other HarnessSession implementations need not adopt provider-specific inputs.
+type PiRpcRunAttachment = Parameters<NonNullable<HarnessSession["attachRun"]>>[0] & {
+  baseInstructions?: string;
+  dynamicTools?: Record<string, unknown>[];
+  runtimeContext?: ReturnType<typeof parseNativeRuntimeContext> | null;
+};
+type PiRpcRuntimeResolution = Parameters<NonNullable<HarnessSession["resolveRuntimeRequest"]>>[0] & {
+  runId: string;
+  origin?: HarnessRuntimeRequest["origin"];
+};
+type PiRpcProxySession = Omit<HarnessSession, "attachRun" | "resolveRuntimeRequest"> & {
+  attachRun?(input: PiRpcRunAttachment): Promise<void> | void;
+  resolveRuntimeRequest?(input: PiRpcRuntimeResolution): Promise<void>;
+  revalidateAfterClaim?(): Promise<void> | void;
+  reconnect?(): Promise<void> | void;
+  parkReady?(): Promise<{ ready: boolean; reasons: string[] }>;
+};
 
 export interface PiRpcAppServerProxyOptions {
   stdout: PiRpcProxyFrameSink;
@@ -87,6 +108,12 @@ function record(value: unknown): Record<string, unknown> {
 
 function text(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function requestIdentity(value: unknown): string {
+  // Native request ids may be numeric, including zero. Normalize once rather
+  // than treating zero as absent or falling back to another request's id.
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : text(value);
 }
 
 export function parsePiThinkingLevel(value: unknown): PiThinkingLevel | undefined {
@@ -129,7 +156,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   const send = output.send;
   const controller = createOpenCodeProxyControllerRequests(send);
   const requestController = controller.request;
-  let session: HarnessSession | null = null;
+  let session: PiRpcProxySession | null = null;
   let eventPump: Promise<void> | null = null;
   let pendingInput = Promise.resolve();
   let bootstrapFailure: Error | null = null;
@@ -158,7 +185,41 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     });
   }
 
-  async function pumpEvents(opened: HarnessSession): Promise<void> {
+  function assertCallbackAuthority(opened: PiRpcProxySession | null, runId: unknown, turnId: unknown): asserts opened is PiRpcProxySession {
+    if (typeof runId !== "string" || !runId || typeof turnId !== "string" || !turnId) {
+      throw new Error("Pi callback requires captured run and turn identity");
+    }
+    if (inputEnded || !opened || session !== opened || runId !== activeRunId) {
+      throw new Error("Pi callback has stale run authority");
+    }
+  }
+
+  async function attachRun(params: Record<string, unknown>, runId: unknown): Promise<void> {
+    if (typeof runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(runId)) {
+      throw new Error("Invalid Paperclip run identity");
+    }
+    const opened = session;
+    if (!opened?.attachRun) throw new Error("Pi RPC run attachment unavailable");
+    const input: PiRpcRunAttachment = { runId };
+    if (params.baseInstructions !== undefined) {
+      if (typeof params.baseInstructions !== "string") throw new Error("Pi baseInstructions must be a string");
+      input.baseInstructions = params.baseInstructions;
+    }
+    if (params.dynamicTools !== undefined) {
+      if (!Array.isArray(params.dynamicTools)) throw new Error("Pi dynamicTools must be an array");
+      input.dynamicTools = params.dynamicTools.map(record);
+    }
+    if (params.runtimeContext !== undefined) {
+      input.runtimeContext = params.runtimeContext === null ? null : parseNativeRuntimeContext(params.runtimeContext);
+    }
+    // The driver admits/rebinds the native session before the facade publishes
+    // the new run. A failed admission must leave the old identity in place.
+    await opened.attachRun(input);
+    if (inputEnded || session !== opened) throw new Error("Pi RPC session closed during run attachment");
+    activeRunId = runId;
+  }
+
+  async function pumpEvents(opened: PiRpcProxySession): Promise<void> {
     for await (const event of opened.events()) {
       const payload = record(event.payload);
       const toolActivity = openCodeProxyToolNotification({
@@ -211,17 +272,26 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           },
         });
       } else if (event.eventType === "runtime_request.created") {
-        const request = record(payload.request);
-        const requestId = text(request.requestId);
-        const turnId = text(request.turnId, text(event.turnId, activeTurnId ?? ""));
-        if (!requestId || !turnId || !opened.resolveRuntimeRequest) {
-          throw new Error("Pi runtime request is not resolvable");
-        }
+        // Capture the originating projector's identity, never mutable active
+        // state. Clone the presentation/origin before yielding to the controller.
+        const runId = event.runId;
+        const turnId = text(event.turnId);
         void (async () => {
+          assertCallbackAuthority(opened, runId, turnId);
+          const request = structuredClone(record(payload.request));
+          const requestId = requestIdentity(request.requestId);
+          if (!requestId || !opened.resolveRuntimeRequest) throw new Error("Pi runtime request is not resolvable");
+          if (request.turnId !== undefined && request.turnId !== turnId) {
+            throw new Error("Pi runtime request has mismatched captured turn identity");
+          }
+          const origin = request.origin as HarnessRuntimeRequest["origin"];
           const controllerResponse = record(await requestController("paperclip/runtimeRequest", { request }));
-          await opened.resolveRuntimeRequest!({
+          assertCallbackAuthority(opened, runId, turnId);
+          await opened.resolveRuntimeRequest({
+            runId,
             requestId,
             turnId,
+            ...(origin === undefined ? {} : { origin }),
             resolution: record(controllerResponse.resolution) as HarnessRuntimeRequestResolution,
           });
         })().catch((error) => log(`[pi_rpc] runtime request failed: ${String(error)}\n`));
@@ -235,7 +305,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           turnId: event.turnId,
           payload,
         }));
-        activeTurnId = null;
+        if (event.runId === activeRunId && event.turnId === activeTurnId) activeTurnId = null;
       } else if (event.eventType === "harness.diagnostic") {
         send({
           method: "warning",
@@ -277,18 +347,27 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       runtimeContext,
       dynamicTools,
       durableToolRequests: true,
-      dynamicToolHandler: async (call) => requestController("item/tool/call", {
-        threadId: session?.ids().driverSessionId ?? "opening",
-        turnId: call.turnId,
-        callId: call.callId,
-        tool: call.tool,
-        arguments: call.arguments,
-      }, false, call.signal),
+      dynamicToolHandler: async (call) => {
+        const opened = session;
+        const { runId, turnId, callId, tool, arguments: arguments_, signal } = call;
+        assertCallbackAuthority(opened, runId, turnId);
+        const response = await requestController("item/tool/call", {
+          threadId: opened.ids().driverSessionId,
+          turnId,
+          callId,
+          tool,
+          arguments: arguments_,
+        }, true, signal);
+        // The controller may answer after another run has attached to this
+        // resident Pi. Never deliver that old result into the current run.
+        assertCallbackAuthority(opened, runId, turnId);
+        return response;
+      },
       isolateProcessGroup: false,
     };
     const driver: HarnessDriver = options.createDriver?.(config)
-      ?? new PiRpcDriver(config as unknown as PiRpcDriverOptions);
-    let opened: HarnessSession;
+      ?? new PiRpcDriver(config);
+    let opened: PiRpcProxySession;
     if (resume) {
       const threadId = text(params.threadId);
       if (!threadId || !driver.recoverSession) throw new Error("Pi RPC session recovery is unavailable");
@@ -346,17 +425,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       case "turn/start": {
         if (!session) throw new Error("Pi RPC thread is not open");
         assertPiCollaborationMode(params);
-        if (params.paperclipRunId !== undefined) {
-          const runId = params.paperclipRunId;
-          if (typeof runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(runId)) {
-            throw new Error("Invalid Paperclip run identity");
-          }
-          if (runId !== activeRunId) {
-            if (!session.attachRun) throw new Error("Pi RPC run attachment unavailable");
-            await session.attachRun({ runId });
-            activeRunId = runId;
-          }
-        }
+        if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
         const inputItems = Array.isArray(params.input) ? params.input.map(record) : [];
         const messageText = inputItems.map((entry) => text(entry.text)).filter(Boolean).join("\n");
         const piThinkingLevel = parsePiThinkingLevel(
@@ -374,6 +443,28 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         result = { turn: { id: turn.turnId, status: "inProgress" } };
         break;
       }
+      case "run.attach":
+        if (params.runId !== undefined && params.paperclipRunId !== undefined && params.runId !== params.paperclipRunId) {
+          throw new Error("Conflicting Paperclip run identity");
+        }
+        await attachRun(params, params.paperclipRunId !== undefined ? params.paperclipRunId : params.runId);
+        result = true;
+        break;
+      case "session.revalidate":
+        if (!session?.revalidateAfterClaim) throw new Error("Pi RPC post-claim revalidation is unavailable");
+        await session.revalidateAfterClaim();
+        result = true;
+        break;
+      case "session.reconnect":
+        if (!session?.reconnect) throw new Error("Pi RPC reconnection is unavailable");
+        await session.reconnect();
+        result = true;
+        break;
+      case "paperclip/host_park_ready":
+        if (Object.keys(params).length !== 0) throw new Error("Pi host park readiness takes no parameters");
+        if (!session?.parkReady) throw new Error("Pi host park readiness unavailable");
+        result = await session.parkReady();
+        break;
       case "turn/interrupt":
         if (!session?.interrupt) throw new Error("Pi RPC interruption is unavailable");
         await session.interrupt({ turnId: text(params.turnId, activeTurnId ?? "") });
@@ -446,11 +537,14 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       inputEnded = true;
       controller.closeInput(new Error("Pi RPC controller input closed before its response"));
     }
-    await session?.close({ reason: "proxy_shutdown", force: true }).catch(() => {});
+    const closing = session;
     session = null;
-    await eventPump?.catch(() => {});
-    output.flush();
-    stdoutFrames.drain();
+    try { await closing?.close({ reason: "proxy_shutdown", force: true }); }
+    finally {
+      await eventPump?.catch(() => {});
+      output.flush();
+      stdoutFrames.drain();
+    }
   }
 
   async function endInput(): Promise<void> {
@@ -479,7 +573,7 @@ async function runCli(): Promise<void> {
   const finish = (close: () => Promise<void>) => {
     shutdownPromise ??= close()
       .then(() => new Promise<void>((resolve) => process.stdout.write("", () => resolve())))
-      .finally(() => process.exit(0));
+      .then(() => process.exit(0), () => { process.stderr.write("Pi cleanup uncertain\n"); process.exit(1); });
     return shutdownPromise;
   };
   input.on("line", (line) => proxy.acceptLine(line));
