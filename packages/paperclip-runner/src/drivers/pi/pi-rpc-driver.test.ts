@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -225,6 +225,74 @@ describe("PiRpcDriver P0 regressions", () => {
       auditFinal(f.transport, 100, [result]); await flushFailure();
       expect(f.events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType)).toEqual(["turn.started", "turn.completed"]);
       expect(f.events.some(event => event.eventType === "tool.execution.completed" && event.payload.status === "completed")).toBe(true);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+  it.each([true, false])("P0-2 replays Pi 1.5.2 auto-retry inside the admitted prompt (success=%s)", async success => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "retry a transient failure" } });
+      const records: PiRpcRecord[] = (await readFile(new URL("../../../test-fixtures/pi-rpc/retry-1.5.2.jsonl", import.meta.url), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(records.filter(record => record.type === "agent_start")).toHaveLength(2);
+      for (const event of records.slice(records.findIndex(record => record.type === "agent_start"))) {
+        if (event.type === "response") continue;
+        if (!success && event.type === "message_end" && (event.message as Record<string, unknown>)?.stopReason === "stop") {
+          f.transport.send({ ...event, message: { ...(event.message as Record<string, unknown>), stopReason: "error", errorMessage: "500 exhausted retries" } });
+        } else if (!success && event.type === "auto_retry_end") f.transport.send({ ...event, success: false, finalError: "500 exhausted retries" });
+        else f.transport.send(event);
+      }
+      await flushFailure();
+      expect(f.events.filter(event => /^(turn\.(completed|failed|cancelled)|session\.failed)$/.test(event.eventType))).toMatchObject([{ eventType: success ? "turn.completed" : "turn.failed", turnId: turn.turnId }]);
+      expect(f.transport.closed).toBe(false);
+      await f.session.startTurn({ message: { role: "user", text: "next prompt" } });
+      f.transport.send({ type: "agent_start" }); auditFinal(f.transport, 999); await flushFailure();
+      expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed" });
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+  it.each([false, true])("P0-2 still refuses unrequested agent_start (active duplicate=%s)", async active => {
+    const f = await failureFixture();
+    try {
+      if (active) {
+        await f.session.startTurn({ message: { role: "user", text: "one prompt only" } });
+        f.transport.send({ type: "agent_start" });
+      } else f.transport.send({ type: "auto_retry_start", attempt: 1 });
+      f.transport.send({ type: "agent_start" }); await flushFailure();
+      expect(f.events.find(event => event.eventType === "session.failed")?.payload.code).toBe("pi_unrequested_agent_start");
+      expect(f.transport.closed).toBe(true);
+    } finally { await f.close(); }
+  });
+});
+
+// Merge regression: K1 must supersede transient failure without losing K2 length classification.
+describe("merged K1/K2 final assistant classification", () => {
+  it.each([
+    ["error", "stop", "completed"],
+    ["error", "length", "failed"],
+    ["length", "stop", "completed"],
+    ["stop", "length", "failed"],
+    ["stop", "error", "failed"],
+    ["error", "aborted", "failed"],
+  ] as const)("uses only %s -> %s at settlement (%s, K1/K2)", async (first, last, status) => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "retry without a failure latch" } });
+      for (const [index, stopReason] of [first, last].entries()) {
+        const message = { role: "assistant", provider: "paperclip", model: "faux", timestamp: index + 1,
+          responseId: `attempt-${index}`, content: [{ type: "text", text: `attempt ${index}: ${stopReason}` }], usage: {}, stopReason };
+        f.transport.send({ type: "agent_start" });
+        f.transport.send({ type: "message_start", message });
+        f.transport.send({ type: "message_end", message });
+        f.transport.send({ type: "agent_end", messages: [message], willRetry: index === 0 });
+        await flushFailure();
+        expect(f.events.filter(event => /^turn\.(completed|failed|cancelled)$/.test(event.eventType))).toEqual([]);
+      }
+      f.transport.send({ type: "agent_settled", aborted: false }); await flushFailure();
+      const terminals = f.events.filter(event => /^turn\.(completed|failed|cancelled)$/.test(event.eventType));
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0]).toMatchObject({ eventType: `turn.${status}`, turnId: turn.turnId });
+      if (last === "length") expect(terminals[0]?.payload).toMatchObject({ error: { code: "pi_output_truncated", recoverable: false } });
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
       expect(f.transport.closed).toBe(false);
     } finally { await f.close(); }
   });
