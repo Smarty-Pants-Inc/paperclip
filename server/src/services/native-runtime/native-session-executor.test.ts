@@ -439,6 +439,7 @@ import {
   nativeSessionFailureDisposition,
   nativeFailedRunRetryStateIsSafe,
   verifyStoppedNativeSessionForContinuation,
+  scopedRunnerdStateRoot,
   nativePreProviderRetryAfterCleanupStateIsSafe,
   reconcileRetainedNativeSessionCleanup,
   retainedNativeCleanupJournalMatches,
@@ -6804,7 +6805,7 @@ describe("retained native cleanup activation", () => {
 });
 
 describe("stopped native conversation physical cleanup", () => {
-  it.each(["codex", "acpx"].flatMap(provider => [
+  it.each(["codex", "acpx", "pi_rpc"].flatMap(provider => [
     "stopped", "provider_alive", "worker_alive", "missing_receipt", "wrong_receipt", "new_launch",
     "foreign_run", "foreign_company", "foreign_runner", "remote", "unreleased", "changed_state", "changed_pid", "symlink", "startup_intent", "pending_identity", "wrong_schema", "replacement", "replacement_alive", "agent_alive", "checkpoint_owner_alive", "diagnostic_owner_alive", "normalized_session_receipt",
   ].map(mode => ({ provider, mode }))))("$provider $mode", async ({ provider, mode }) => {
@@ -6812,20 +6813,21 @@ describe("stopped native conversation physical cleanup", () => {
     const previous = process.env.PAPERCLIP_RUNNER_STATE_DIR;
     process.env.PAPERCLIP_RUNNER_STATE_DIR = base;
     const input = parseNativeExecutionInput({ ...execution,
-      provider: provider === "codex" ? execution.provider : { kind: "acpx", agent: "claude", model: "claude-sonnet-5", permissionPolicy: "interactive",
+      ...(provider === "pi_rpc" ? { schema: "paperclip.native-execution-input.v9", homeMode: "isolated",
+        executionMode: "default", planningContext: null, runtimeContext: nativeRuntimeContextFixture() } : {}),
+      provider: provider === "pi_rpc" ? { kind: "pi_rpc", model: "anthropic/test", profile: QUALIFIED_PI_RPC_PROFILE }
+        : provider === "codex" ? execution.provider : { kind: "acpx", agent: "claude", model: "claude-sonnet-5", permissionPolicy: "interactive",
         profile: { driverKind: "acpx_runtime", protocolVersion: 1, acpxVersion: "0.22.0", agent: "claude", agentProfileVersion: 1,
           agentServerPackage: "@zed-industries/claude-agent-acp", agentServerVersion: "1", agentRuntimePackage: null,
           agentRuntimeVersion: null, commandDigest: "fixture" } },
-      session: { ...execution.session, driverKind: provider === "codex" ? "codex_app_server" : "acpx_runtime" },
+      session: { ...execution.session, driverKind: provider === "pi_rpc" ? "pi_rpc" : provider === "codex" ? "codex_app_server" : "acpx_runtime" },
     });
     const canonical = (value: any): string => value && typeof value === "object" && !Array.isArray(value)
       ? `{${Object.entries(value).filter(([, v]) => v !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([k,v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`
       : JSON.stringify(value);
     const hash = (value: unknown) => createHash("sha256").update(canonical(value)).digest("hex");
-    const providerScope = input.provider.kind === "acpx" ? { kind: "acpx", agent: input.provider.agent, profile: input.provider.profile } : { kind: "codex" };
-    const root = join(base, hash({ schema: "paperclip.native-session-scope.v2", companyId: input.binding.companyId,
-      agentId: input.binding.agentId, workspace: { kind: "managed", executionWorkspaceId: input.binding.executionWorkspaceId },
-      provider: { driverKind: input.session.driverKind, identity: providerScope }, normalizedSessionId: input.session.normalizedSessionId }));
+    const root = scopedRunnerdStateRoot(input);
+    const providerFile = provider === "acpx" ? "acpx" : "codex";
     const identity = { runId: input.binding.runId, normalizedSessionId: input.session.normalizedSessionId,
       runnerInstanceId: "runner-crashed", environmentLeaseId: "lease", turnId: "turn", itemId: "item" };
     const event = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner", sourceSeq: 1,
@@ -6838,7 +6840,7 @@ describe("stopped native conversation physical cleanup", () => {
     const providerEvents = mode.startsWith("replacement") ? [event, replacement] : [event];
     if (mode === "diagnostic_owner_alive") providerEvents.push({ ...event, eventType: "harness.diagnostic",
       payload: { providerMethod: "acpx/process", role: "acp_agent", pid: process.pid } } as unknown as typeof event);
-    const providerState = { schema: mode === "wrong_schema" ? "unknown" : `paperclip.runner.${provider}-provider-state.${provider === "codex" ? "v1" : "v3"}`, lifecycle: "turn_active",
+    const providerState = { schema: mode === "wrong_schema" ? "unknown" : `paperclip.runner.${providerFile}-provider-state.${providerFile === "codex" ? "v1" : "v3"}`, lifecycle: "turn_active",
       ...(mode === "startup_intent" ? { startupAttempt: { phase: "intent" } } : {}),
       ...(mode === "pending_identity" ? { pendingEvents: [{ eventType: "session.started" }] } : {}),
     };
@@ -6870,7 +6872,7 @@ describe("stopped native conversation physical cleanup", () => {
       const runnerPath = join(root, "runner/runner-state.json");
       await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify({ ...durableControlPlaneState(identity), committedEvents: providerEvents.map(payload => ({ envelope: { payload } })) }));
       await writeFile(runnerPath, JSON.stringify(durableRunnerState({ ...identity, ...(mode === "foreign_run" ? { runId: "foreign" } : {}) }, "ready")));
-      await writeFile(join(root, `runner/${provider}-provider-state.json`), JSON.stringify(providerState));
+      await writeFile(join(root, `runner/${providerFile}-provider-state.json`), JSON.stringify(providerState));
       if (mode === "symlink") { await rename(runnerPath, join(base, "external")); await symlink(join(base, "external"), runnerPath); }
       const proof = await verifyStoppedNativeSessionForContinuation(db, run);
       if (["stopped", "changed_state", "changed_pid", "replacement", "normalized_session_receipt"].includes(mode)) {
@@ -6878,7 +6880,7 @@ describe("stopped native conversation physical cleanup", () => {
         if (mode === "changed_state") await writeFile(runnerPath, "{}");
         const kill = mode === "changed_pid" ? vi.spyOn(process, "kill").mockReturnValue(true) : null;
         try { expect(proof!.retire()).toBe(["stopped", "replacement", "normalized_session_receipt"].includes(mode)); } finally { kill?.mockRestore(); }
-        expect(await readFile(join(root, `runner/${provider}-provider-state.json`), "utf8")).toBe(JSON.stringify(providerState));
+        expect(await readFile(join(root, `runner/${providerFile}-provider-state.json`), "utf8")).toBe(JSON.stringify(providerState));
       } else expect(proof).toBeNull();
     } finally {
       if (previous === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR = previous;

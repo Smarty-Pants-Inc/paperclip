@@ -3244,7 +3244,7 @@ export async function verifyStoppedNativeSessionForContinuation(
     if (run.runtimeMode !== "native" || !["failed", "cancelled", "interrupted", "timed_out"].includes(run.status) ||
         !run.finishedAt || !run.nativeIssueId || !run.nativeSessionId || !run.runnerInstanceId) return null;
     const execution = parseNativeExecutionInput(record(run.runnerProfileJson).nativeExecutionInput);
-    if (!(["codex", "acpx"] as string[]).includes(execution.provider.kind) ||
+    if (!(["codex", "acpx", "pi_rpc"] as string[]).includes(execution.provider.kind) ||
         execution.binding.runId !== run.id || execution.binding.companyId !== run.companyId ||
         execution.binding.agentId !== run.agentId || execution.binding.issueId !== run.nativeIssueId ||
         nativeSessionKey(execution) !== run.nativeSessionId) return null;
@@ -3326,7 +3326,7 @@ export async function verifyStoppedNativeSessionForContinuation(
     // session identity. It cannot be certified from an earlier owner's receipt.
     if (!RUNNERD_CONTROL_PLANE_STATE_SCHEMAS.has(String(snapshot.control.schema)) ||
         snapshot.runner.schema !== RUNNERD_STATE_SCHEMA ||
-        snapshot.provider.schema !== (execution.provider.kind === "codex" ? "paperclip.runner.codex-provider-state.v1" : ACPX_PROVIDER_STATE_SCHEMA) ||
+        snapshot.provider.schema !== (execution.provider.kind === "acpx" ? ACPX_PROVIDER_STATE_SCHEMA : "paperclip.runner.codex-provider-state.v1") ||
         !["turn_active", "prepared", "suspended", "session_open"].includes(String(snapshot.provider.lifecycle)) ||
         !failedStartupRetired(snapshot.provider.startupAttempt)) return null;
     const pending = JSON.stringify([snapshot.runner.outbox, snapshot.provider.pendingEvents, snapshot.provider.queuedEvents]);
