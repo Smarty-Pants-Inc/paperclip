@@ -12,3 +12,5 @@ export type { ChildBridgeSink, ChildClosure, ChildReadyReceipt, ChildToolEvent, 
 export { validateChildSelection, acknowledgeChildSelection } from "./selection.js";
 export type { ChildModelCatalog, ChildSelection } from "./selection.js";
 export { validateRoleTemplate } from "./role-template.js";
+export { createSubagentLifecycle } from "./lifecycle.js";
+export type { LivenessProvider, LivenessRegistry, SubagentEventBus } from "./lifecycle.js";

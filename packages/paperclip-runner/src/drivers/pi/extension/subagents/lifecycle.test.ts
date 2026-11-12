@@ -112,6 +112,29 @@ describe("S-1 pi-web liveness and public RPC Stop (trust boundary)", () => {
     f.bus.handle = (method, params) => method === "stop" ? {} : params.id ? { details: { lifecycleStatus: { processTerminal: ++targeted === 1 ? proof("a", "runner-1", "pending") : proof("a", "runner-2") } } } : snapshot([{ id: "a", state: "running" }]);
     expect(await f.lifecycle.stopAll("test")).toEqual({ settled: [], uncertain: ["a"] });
   });
+  it("still sends stop to other async roots while one targeted status does not answer", async () => {
+    const f = setup({ timeoutMs: 200 });
+    f.registry.register({ name: "pi-subagents", sessionId: "parent", isActive: () => false });
+    f.bus.handle = (method, params) => {
+      if (method === "stop") { f.bus.emit("subagent:process-terminal", proof(String(params.id))); return {}; }
+      if (params.id === "a") return undefined;
+      if (params.id === "b") return { details: { lifecycleStatus: { processTerminal: proof("b", "runner-1", "pending") } } };
+      return snapshot([{ id: "a", state: "running" }, { id: "b", state: "running" }]);
+    };
+    const result = await f.lifecycle.stopAll("test");
+    expect(f.bus.requests.filter(request => request.method === "stop").map(request => request.params.id)).toEqual(["b", "a"]);
+    expect(result).toEqual({ settled: ["b"], uncertain: ["a"] });
+  });
+  it("does not let an old observed event settle a run whose targeted runner instance changed", async () => {
+    const f = setup({ timeoutMs: 35 }); let targeted = 0;
+    f.registry.register({ name: "pi-subagents", sessionId: "parent", isActive: () => false });
+    f.bus.handle = (method, params) => {
+      if (method === "stop") { f.bus.emit("subagent:process-terminal", proof("a", "runner-1")); return {}; }
+      if (params.id) return { details: { lifecycleStatus: { processTerminal: ++targeted === 1 ? proof("a", "runner-1", "pending") : proof("a", "runner-2", "pending") } } };
+      return snapshot([{ id: "a", state: "running" }]);
+    };
+    expect(await f.lifecycle.stopAll("test")).toEqual({ settled: [], uncertain: ["a"] });
+  });
   it("closes active listeners on cancellation/disposal and never reports canceled Stop as success", async () => {
     const f = setup({ timeoutMs: 1000 });
     f.registry.register({ name: "pi-subagents", sessionId: "parent", isActive: () => true });

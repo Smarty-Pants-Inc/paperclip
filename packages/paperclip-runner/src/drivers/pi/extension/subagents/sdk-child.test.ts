@@ -36,7 +36,7 @@ describe("F087 real Pi SDK event-order canary (controlled offline stream)", () =
       toolExecutionEnd: async event => { events.push({ ...event }); },
     };
     const origin = { epoch: 3, runId: "parent-run-3", turnId: "host-parent-turn", callId: "outer-subagent-call" };
-    const scope = createSubagentScope({ origin, closure: { langfuseExtensionPath: tracePath }, sink });
+    const scope = createSubagentScope({ origin, closure: { langfuseExtensionPath: tracePath }, sink, announce: () => true });
     const prepared = await scope.prepare({ roleText, selection: {
       selectionId: `canary-${mode}`, roleId: "probe", roleDigest: validateRoleTemplate(roleText).digest,
       paretoChoice: "quality", paretoRevision: "r1", complexity: "small", rationale: "offline canary", budget: 1,

@@ -4,6 +4,7 @@ import { registerSubagentBridge } from "./index.js";
 import { installChildBridge } from "./child-bridge.js";
 import { consumeChildBridgeLease, createSubagentScope, type ChildBridgeSink } from "./host.js";
 import { validateRoleTemplate } from "./role-template.js";
+import { installSubagentSeam } from "./seam.js";
 
 const roleText = "---\nname: reviewer\ntools: read\n---\nReview the real change.\n";
 const origin = { epoch: 7, runId: "run-7", turnId: "parent-host-turn-7", callId: "outer-subagent-call" };
@@ -61,7 +62,7 @@ function host() {
 }
 async function fixture() {
   const h = host();
-  const scope = createSubagentScope({ origin, closure, sink: h.sink });
+  const scope = createSubagentScope({ origin, closure, sink: h.sink, announce: () => true });
   const prepared = await scope.prepare({ roleText, selection: selection() }, catalog);
   const child = new ControlledChild("child-session");
   let traceLoads = 0;
@@ -101,7 +102,7 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
 
   it("requires a fresh explicit selection and matching role digest before each child starts", async () => {
     const h = host();
-    const scope = createSubagentScope({ origin, closure, sink: h.sink });
+    const scope = createSubagentScope({ origin, closure, sink: h.sink, announce: () => true });
     await expect(scope.prepare({ roleText, selection: undefined }, catalog)).rejects.toThrow(/selection/i);
     await expect(scope.prepare({ roleText, selection: { ...selection(), roleDigest: "wrong" } }, catalog)).rejects.toThrow(/digest/i);
     await expect(scope.prepare({ roleText: "---\nthinking: high\n---\nRole", selection: selection() }, catalog)).rejects.toThrow(/thinking/);
@@ -116,7 +117,7 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
   it("refuses mismatched SDK identity and missing tracing before any child prompt", async () => {
     for (const failure of ["clamp", "trace-load"]) {
       const h = host();
-      const scope = createSubagentScope({ origin, closure, sink: h.sink });
+      const scope = createSubagentScope({ origin, closure, sink: h.sink, announce: () => true });
       const prepared = await scope.prepare({ roleText, selection: selection(failure) }, catalog);
       const child = new ControlledChild(failure);
       const install = () => installChildBridge(child.api, consumeChildBridgeLease(prepared.options.extensionBindings), async () => {
@@ -174,7 +175,7 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
   it("late child callback cannot borrow a newly committed parent epoch", async () => {
     const f = await fixture();
     await f.scope.revoke();
-    const next = createSubagentScope({ origin: { ...origin, epoch: 8, runId: "run-8", turnId: "turn-8" }, closure, sink: f.sink });
+    const next = createSubagentScope({ origin: { ...origin, epoch: 8, runId: "run-8", turnId: "turn-8" }, closure, sink: f.sink, announce: () => true });
     expect(await f.child.call("late")).toMatchObject({ block: true });
     expect(f.events.find(e => e.toolCallId === "late" && e.type === "tool_execution_start")).toMatchObject({ origin, revoked: true });
     expect(f.child.effects).toEqual([]);
@@ -203,7 +204,7 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
 
   it("does not authorize a native start before the host has started a child turn", async () => {
     const h = host();
-    const scope = createSubagentScope({ origin, closure, sink: h.sink });
+    const scope = createSubagentScope({ origin, closure, sink: h.sink, announce: () => true });
     const prepared = await scope.prepare({ roleText, selection: selection() }, catalog);
     const child = new ControlledChild("not-yet-started");
     await installChildBridge(child.api, consumeChildBridgeLease(prepared.options.extensionBindings), async () => {});
@@ -219,11 +220,51 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
     await f.child.emit("session_shutdown");
     expect(f.scope.stopReceipt()).toMatchObject({ status: "abort-requested", unconfirmedChildSessions: ["child-session"] });
     const h = host();
-    const scope = createSubagentScope({ origin, closure, sink: h.sink });
+    const scope = createSubagentScope({ origin, closure, sink: h.sink, announce: () => true });
     const prepared = await scope.prepare({ roleText, selection: selection() }, catalog);
     const lease = consumeChildBridgeLease(prepared.options.extensionBindings);
     lease.attach("abort-failed", async () => { throw new Error("child abort unavailable"); });
     expect(await scope.revoke()).toMatchObject({ status: "uncertain", unconfirmedChildSessions: ["abort-failed"], errors: ["abort-failed: child abort unavailable"] });
+  });
+
+  it("routes in-process native starts through announce with the captured parent Origin", async () => {
+    const h = host();
+    const announced: unknown[] = [];
+    let allowed = false;
+    const off = installSubagentSeam({
+      announce: (id, captured) => { announced.push([id, captured]); return allowed; },
+      registerParkReadyContributor: () => () => {}, registerStopChildren: () => () => {},
+    });
+    const scope = createSubagentScope({ origin, closure, sink: h.sink });
+    try {
+      const prepared = await scope.prepare({ roleText, selection: selection() }, catalog);
+      const child = new ControlledChild("announced-child");
+      await installChildBridge(child.api, consumeChildBridgeLease(prepared.options.extensionBindings), async () => {});
+      await child.emit("session_start"); await child.emit("turn_start", { turnIndex: 0 });
+      expect(await child.call("denied-by-authority")).toMatchObject({ block: true });
+      expect(h.events.filter(e => e.type === "tool_execution_start")).toEqual([]);
+      allowed = true; await child.call("accepted-by-authority");
+      expect(child.effects).toEqual(["accepted-by-authority"]);
+      expect(announced).toEqual([["denied-by-authority", { epoch: origin.epoch, runId: origin.runId, turnId: origin.turnId }], ["accepted-by-authority", { epoch: origin.epoch, runId: origin.runId, turnId: origin.turnId }]]);
+    } finally { await scope.revoke(); off(); }
+  });
+
+  it("admits explicit async preparation only with a socket-qualified fresh startup binding", async () => {
+    const h = host();
+    const scope = createSubagentScope({ origin, closure, sink: h.sink, sessionId: "parent-session" });
+    try {
+      const prepared = await scope.prepare({ roleText, selection: selection(), async: true }, catalog);
+      expect(prepared.async).toBe(true);
+      const binding = JSON.parse(JSON.stringify(prepared.options.extensionBindings));
+      expect(binding["paperclip.subagents/1"].socket).toMatchObject({ schema: 1, sessionId: "parent-session", ownerPid: process.pid, origin, selection: { selectionId: "s1" } });
+      // The original in-process association remains one-shot, even when async was requested.
+      consumeChildBridgeLease(binding);
+      expect(() => consumeChildBridgeLease(binding)).toThrow(/missing|consumed/i);
+      expect(await scope.revoke()).toMatchObject({ status: "uncertain", unconfirmedAsyncSelections: ["s1"] });
+    } finally { await scope.revoke(); }
+    const unqualified = createSubagentScope({ origin, closure, sink: h.sink });
+    await expect(unqualified.prepare({ roleText, selection: selection(), async: true }, catalog)).rejects.toThrow(/session/i);
+    await unqualified.revoke();
   });
 
   it("revocation during host ACK cannot admit a tool or a delayed spawn", async () => {
@@ -232,7 +273,7 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
     expect(await f.child.call()).toMatchObject({ block: true });
     expect(f.child.effects).toEqual([]);
     const h = host();
-    const scope = createSubagentScope({ origin, closure, sink: h.sink });
+    const scope = createSubagentScope({ origin, closure, sink: h.sink, announce: () => true });
     h.sink.recordSelection = async () => { await scope.revoke(); };
     await expect(scope.prepare({ roleText, selection: selection() }, catalog)).rejects.toThrow(/revoked/);
   });
