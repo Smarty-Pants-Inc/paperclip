@@ -101,6 +101,24 @@ describe("Pi Langfuse parent environment", () => {
     expect(source).toEqual(original);
   });
 
+  it("strips every Langfuse-named path segment for an excluded agent", () => {
+    const retained = ["/opt/pi-packages/tool-cap", "/opt/pi-packages/pi-subagents"];
+    const source = {
+      LANGFUSE_TRACING_ENABLED: "false",
+      PAPERCLIP_PI_EXTENSIONS: JSON.stringify([
+        "/opt/pi-packages/langfuse-pi",
+        "/opt/smarty-pi/extensions/langfuse/node_modules/@langfuse/pi-observability-plugin",
+        "/opt/X/LangFuse-Plugin",
+        "/opt/pi-packages/custom-pi-observability-extension",
+        ...retained,
+      ]),
+    };
+    expect(applyPiLangfuseExclusion(source, pi)).toEqual({
+      LANGFUSE_TRACING_ENABLED: "false",
+      PAPERCLIP_PI_EXTENSIONS: JSON.stringify(retained),
+    });
+  });
+
   it("keeps the exclusion empty when no keys or extensions were configured", () => {
     expect(buildPiLangfuseParentEnvironment({ LANGFUSE_TRACING_ENABLED: "false" }, pi, runId, agentId, issueId))
       .toEqual({ LANGFUSE_TRACING_ENABLED: "false" });

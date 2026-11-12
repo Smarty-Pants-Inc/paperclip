@@ -692,7 +692,7 @@ export function applyPiLangfuseExclusion(
     let extensions: unknown;
     try { extensions = JSON.parse(raw); } catch { throw invalid(); }
     if (!Array.isArray(extensions) || extensions.some(path => typeof path !== "string")) throw invalid();
-    const retained = (extensions as string[]).filter(path => !/(?:^|\/)(?:@langfuse|langfuse|pi-observability-plugin)(?:\/|$)/i.test(path));
+    const retained = (extensions as string[]).filter(path => !/(?:langfuse|pi-observability)/i.test(path));
     if (retained.length !== extensions.length) result.PAPERCLIP_PI_EXTENSIONS = JSON.stringify(retained);
   }
   return result;

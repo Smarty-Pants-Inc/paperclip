@@ -14,6 +14,31 @@ the Runner's ACPX patch with the other Runner contracts. Launch and recovery adm
 and digest. Saved inputs with an earlier profile version still decode, so
 recovery can refuse them.
 
+## Operator-named and native Pi extensions (fork)
+
+Both settings below are read only from the agent's resolved environment
+(operator-set), never ambient host exports. Unset means today's closed launch.
+
+`PAPERCLIP_PI_EXTENSIONS` is a JSON array of at most 32 canonical absolute local
+paths: a file, or a package directory with a valid `package.json` carrying its
+own dependencies inside it. Paths resolve inside the sandbox, are frozen and
+hashed, and are passed as `-e` after Paperclip's owned extension.
+
+`PAPERCLIP_PI_EXTENSIONS_MODE=native` enables Pi's own discovery: resource flags
+are not disabled, and the run workspace is trusted as a project, including
+`.pi/settings.json` and `.pi/extensions`. `--offline` stays: installed packages
+load, but no fetch/update occurs. The owned extension stays first with its
+readiness sentinel, and the session directory is forced into the private agent
+directory. Pi's agent directory is private per run:
+`PI_CODING_AGENT_DIR=<runtimeRoot>/pi-home`. A snapshot's `~/.pi` or
+`settings.json` is never read.
+
+`LANGFUSE_*` reach Pi only when `LANGFUSE_TRACING_ENABLED` is `true` or `1`
+(trimmed, case-insensitive). Otherwise every Langfuse key (including
+`PI_LANGFUSE_MAX_CHARS`), parent ID and user ID is stripped, as is any extension
+entry whose path contains `langfuse` or `pi-observability` (case-insensitive).
+Only the disabled marker `LANGFUSE_TRACING_ENABLED=false` remains.
+
 ## Native trusted Pi packages and extensions
 
 Set `PAPERCLIP_PI_EXTENSIONS_MODE=native` in the agent's resolved `env`
@@ -131,10 +156,11 @@ install an extension, enable tracing, or establish successful export delivery.
 For Cloud export, configure `PI_LANGFUSE_MAX_CHARS=200000` and
 `LANGFUSE_FLUSH_AT=1`; these are forwarded operator values, not server defaults.
 
-Set `LANGFUSE_TRACING_ENABLED=false` in an excluded agent's resolved task
-configuration **before dispatch** (the value is case-insensitive). For Pi, this
-removes every other `LANGFUSE_*` value, `PI_LANGFUSE_MAX_CHARS`, and the official
-Langfuse extension entries from `PAPERCLIP_PI_EXTENSIONS`, and emits only
+Only `LANGFUSE_TRACING_ENABLED=true` or `1` in an agent's resolved task
+configuration **before dispatch** enables tracing (trimmed, case-insensitive).
+Any other value or an unset flag removes every other `LANGFUSE_*` value,
+`PI_LANGFUSE_MAX_CHARS`, and extension entries whose paths contain `langfuse` or
+`pi-observability` (case-insensitive) from `PAPERCLIP_PI_EXTENSIONS`, and emits only
 `LANGFUSE_TRACING_ENABLED=false` for Langfuse. No parent IDs or user ID are added.
 The exclusion is reapplied after provider environment merging so bootstrap
 values cannot restore keys. Unrelated environment and explicit extensions remain
