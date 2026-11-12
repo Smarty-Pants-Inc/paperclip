@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,7 @@ import { mapPiRpcRecord, PiRpcDriver } from "./pi-rpc-driver.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
 import { createPiRpcAppServerProxy } from "../../cli/pi-rpc-app-server-proxy.js";
+import * as piTurnImages from "./pi-turn-images.js";
 
 // Keep reason: recorded large-output incident439 and failure attribution across
 // resident runs. Drive the real session pump rather than a projector surrogate.
@@ -61,7 +62,7 @@ async function inputProxyFixture() {
     return frames.find(frame => frame.id === id)! as { result?: any; error?: { message: string } };
   };
   await request("thread/start", { model: "neutral/model" });
-  return { ...f, request, async close() { await proxy.close(); await f.close(); } };
+  return { ...f, frames, request, async close() { await proxy.close(); await f.close(); } };
 }
 describe("PiRpcDriver", () => {
   it.each(["native", "data-url", "mixed-native", "mixed-data-url"])("passes %s images through the facade into prompt and steer RPC images", async shape => {
@@ -142,6 +143,57 @@ describe("PiRpcDriver", () => {
       expect(f.transport.closed).toBe(false);
     } finally { await proxy.close(); await f.close(); }
   });
+  it("refuses a corrupt staged image only for that request and then accepts image-only prompt and steer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-staged-request-"));
+    const path = join(root, "image");
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const input = [{ type: "localImage", path }];
+    const f = await inputProxyFixture();
+    try {
+      await writeFile(path, "%PDF-1.7\n");
+      expect((await f.request("turn/start", { input })).error?.message).toMatch(/Pi image input/);
+      expect(f.transport.requests.filter(req => req.type === "prompt")).toEqual([]);
+      expect(f.frames.some(frame => frame.method === "turn/started" || frame.method === "turn/failed")).toBe(false);
+      expect(f.transport.closed).toBe(false);
+      await writeFile(path, png);
+      const started = await f.request("turn/start", { input }); expect(started.error).toBeUndefined();
+      const expected = { message: "", images: [{ type: "image", data: png.toString("base64"), mimeType: "image/png" }] };
+      expect(f.transport.requests.find(req => req.type === "prompt")?.input).toEqual(expected);
+      await writeFile(path, "%PDF-1.7\n");
+      expect((await f.request("turn/steer", { expectedTurnId: started.result.turn.id, input })).error?.message).toMatch(/Pi image input/);
+      expect(f.transport.requests.filter(req => req.type === "steer")).toEqual([]);
+      expect(f.frames.some(frame => frame.method === "turn/failed")).toBe(false);
+      expect(f.transport.closed).toBe(false);
+      await writeFile(path, png);
+      expect((await f.request("turn/steer", { expectedTurnId: started.result.turn.id, input })).error).toBeUndefined();
+      expect(f.transport.requests.find(req => req.type === "steer")?.input).toEqual(expected);
+    } finally { await f.close(); await rm(root, { recursive: true, force: true }); }
+  });
+  it("does not send a late prompt when image preparation outlives close", async () => {
+    const fixture = await failureFixture();
+    let release!: (message: { message: string }) => void;
+    let began!: () => void;
+    const reading = new Promise<void>(resolve => { began = resolve; });
+    const held = new Promise<{ message: string }>(resolve => { release = resolve; });
+    const imageRead = vi.spyOn(piTurnImages, "piTurnImageInput").mockImplementationOnce(() => { began(); return held; });
+    const requests = vi.spyOn(fixture.transport, "request");
+    const started = fixture.session.startTurn({ message: { role: "user", text: "Inspect staged PNG", localImagePaths: ["/runner/image.png"] } })
+      .then(() => null, error => error);
+    try {
+      await reading;
+      await fixture.session.close();
+      release({ message: "Inspect staged PNG" });
+      expect(await started).toBeInstanceOf(Error);
+      expect(requests.mock.calls.some(([type]) => type === "prompt")).toBe(false);
+    } finally {
+      release({ message: "Inspect staged PNG" });
+      await started;
+      imageRead.mockRestore();
+      requests.mockRestore();
+      await fixture.close();
+    }
+  });
+
   it("does not inherit ambient AGENT_HOME when server omits it", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-home-ambient-"));
     vi.stubEnv("AGENT_HOME", root);

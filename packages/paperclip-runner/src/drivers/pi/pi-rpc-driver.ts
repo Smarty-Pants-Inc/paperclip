@@ -17,6 +17,7 @@ import { piRpcUserInput } from "./pi-user-input.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { piTurnImageInput } from "./pi-turn-images.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -564,7 +565,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
-    const message = piRpcUserInput(input.message);
+    piRpcUserInput(input.message);
     return this.#serialize(async () => {
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
@@ -573,6 +574,15 @@ export class PiRpcHarnessSession implements HarnessSession {
       const selected = resolvePiNativeConfig({ ...this.#config, ...(input.model === undefined ? {} : { model: input.model }),
         ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }) });
       if (selected.model !== this.#config.model || selected.piRpcThinkingLevel !== this.#config.piRpcThinkingLevel) throw new PiNativeAdmissionError("pi_turn_selection_mismatch", "Pi turn selection differs from the admitted session.");
+      // Validate/resolve both image forms before changing admission or turn
+      // authority. A bad staged file refuses only this request, not the session.
+      this.#pendingInput++;
+      let message: Awaited<ReturnType<typeof piTurnImageInput>>;
+      try {
+        message = await piTurnImageInput(input.message, this.#workingDirectory);
+        if (this.#closed) throw new Error("Pi RPC session closed while preparing image input");
+        if (this.#failure) throw this.#failure;
+      } finally { this.#pendingInput--; }
       // Every prompt, including direct-env and first hello, re-proves selection.
       // A failed attach/claim must still be recovered by an explicit admission;
       // startTurn may not silently revive a cancelled or rejected authority.
@@ -615,9 +625,14 @@ export class PiRpcHarnessSession implements HarnessSession {
     const turn = this.#activeTurn;
     if (this.#closed || !turn || turn.settled) throw new HarnessOperationAlreadyTerminalError("steering");
     if (input.turnId !== turn.turnId) throw new HarnessStaleTurnError(input.turnId);
-    const message = piRpcUserInput(input.message);
+    piRpcUserInput(input.message);
     this.#pendingInput++;
-    const response = await this.#transport.request("steer", message).finally(() => { this.#pendingInput--; });
+    let response: PiRpcRecord;
+    try {
+      const message = await piTurnImageInput(input.message, this.#workingDirectory);
+      if (this.#closed || turn.settled || this.#activeTurn !== turn) throw new HarnessOperationAlreadyTerminalError("steering");
+      response = await this.#transport.request("steer", message);
+    } finally { this.#pendingInput--; }
     const disposition = stringValue(record(response.data).disposition);
     if (disposition !== "queued") {
       throw new Error(`Pi RPC steer did not queue input (disposition=${disposition ?? "missing"})`);

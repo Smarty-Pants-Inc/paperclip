@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { NativeWakeAttachmentInput } from "./contracts/types.js";
 import { nativeSystemInstructions } from "./backends/runtime-context.js";
 
 import type {
@@ -308,10 +309,10 @@ export interface ExecuteNativeSessionOptions {
   getFreshSessionHandoff?: () => Promise<string | null>;
   /**
    * Seals this run's first-turn input immediately before `turn.start` and
-   * returns user messages that arrived while the run was preparing. Repeated
-   * calls for the same run return the same messages.
+   * returns user messages that arrived while the run was preparing.
    */
   getFirstTurnQueuedInput?: () => Promise<string | null>;
+  prepareWakeAttachmentPrompt?: () => Promise<string | NativeWakeAttachmentInput>;
   /**
    * Steered messages the provider acknowledged but the model never read, read
    * when a restart continuation starts. The provider lost them with the
@@ -2795,8 +2796,10 @@ export async function executeNativeSession(
       return snapshot;
     };
     const recoveredSnapshot = await session.snapshot();
-    const restartContinuation = (steeredMessages: Array<{ id: string; text: string }>) => ({
-      message: { role: "user" as const, text: JSON.stringify({
+    const attachmentInput = (value: string | NativeWakeAttachmentInput | undefined): NativeWakeAttachmentInput =>
+      typeof value === "string" ? { prompt: value } : value ?? { prompt: "" };
+    const restartContinuation = (steeredMessages: Array<{ id: string; text: string }>, attachments: NativeWakeAttachmentInput) => ({
+      message: { role: "user" as const, localImagePaths: attachments.localImagePaths, text: JSON.stringify({
         schema: "paperclip.native-continuation.v1",
         events: [
           "This is a resumed session. The process running the previous turn was lost, for example in a Paperclip restart. Paperclip restored this same conversation and workspace; that loss interrupted the previous turn.",
@@ -2809,6 +2812,7 @@ export async function executeNativeSession(
           "Do not repeat completed work. Before you repeat an action with external effects, such as a push, a message or a deployment, check whether it already took effect. If you cannot determine that, report the specific blocker.",
           "Finish in this turn. Nothing resumes this conversation after the turn ends, so do not end it to wait for a background command or a notification; wait for or check that work first.",
           "Then invoke exactly one paperclip_finish or paperclip_block with the accurate disposition.",
+          ...(attachments.prompt ? ["", attachments.prompt] : []),
         ].join("\n"),
         ...(steeredMessages.length > 0 ? { steeredMessages: steeredMessages.map(message => message.text) } : {}),
         completion: {
@@ -2860,7 +2864,9 @@ export async function executeNativeSession(
         // later snapshot may already show the marker returned.
         const steeredMessages = await options.getUnreadSteeredMessages?.() ?? [];
         signal?.throwIfAborted();
-        const started = await session.startTurn(restartContinuation(steeredMessages));
+        const attachments = attachmentInput(await options.prepareWakeAttachmentPrompt?.());
+        signal?.throwIfAborted();
+        const started = await session.startTurn(restartContinuation(steeredMessages, attachments));
         restartContinuationTurnId = started.turnId;
         if (started.borrowedDispositionMarker === true) borrowedContinuationTurnId = started.turnId;
         await checkpoint(signal);
@@ -3191,16 +3197,20 @@ export async function executeNativeSession(
           if ("workspace" in modelEnvelope && modelEnvelope.workspace && recoveredSnapshot.workingDirectory) {
             modelEnvelope.workspace.cwd = recoveredSnapshot.workingDirectory;
           }
-          if (!(dispositionOnlyRecovery && !effectFreeInitialAcpxTurn) && options.getFirstTurnQueuedInput) {
-            const queuedInput = await options.getFirstTurnQueuedInput();
-            if (queuedInput && "task" in modelEnvelope) {
-              modelEnvelope.task.prompt = `${modelEnvelope.task.prompt}\n\n${queuedInput}`;
-            } else if (queuedInput && "events" in modelEnvelope) {
-              modelEnvelope.events = `${modelEnvelope.events}\n\n${queuedInput}`;
+          let localImagePaths: readonly string[] | undefined;
+          if (!dispositionOnlyRecovery || effectFreeInitialAcpxTurn) {
+            const attachments = attachmentInput(await options.prepareWakeAttachmentPrompt?.());
+            localImagePaths = attachments.localImagePaths;
+            const queuedInput = await options.getFirstTurnQueuedInput?.();
+            const supplemental = [attachments.prompt, queuedInput].filter(Boolean).join("\n\n");
+            if (supplemental && "task" in modelEnvelope) {
+              modelEnvelope.task.prompt = `${modelEnvelope.task.prompt}\n\n${supplemental}`;
+            } else if (supplemental && "events" in modelEnvelope) {
+              modelEnvelope.events = `${modelEnvelope.events}\n\n${supplemental}`;
             }
           }
           await session.startTurn({
-            message: { role: "user", text: JSON.stringify(modelEnvelope) },
+            message: { role: "user", text: JSON.stringify(modelEnvelope), ...(localImagePaths?.length ? { localImagePaths } : {}) },
             ...(recovered && modelEnvelope.schema === "paperclip.native-continuation.v1"
               ? { continuation: true as const } : {}),
             requestedCollaborationMode:
