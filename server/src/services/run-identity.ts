@@ -378,7 +378,15 @@ export async function prepareSteeredIdentity(
     eq(issueThreadInteractions.issueId, input.issueId),
     inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"]),
   )) : [];
-  const responsibleUserId = interaction?.resolvedByUserId ?? comment?.authorUserId;
+  const [authorRun] = comment?.authorAgentId && comment.createdByRunId
+    ? await executor.select({ agentId: heartbeatRuns.agentId, responsibleUserId: heartbeatRuns.responsibleUserId })
+        .from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, comment.createdByRunId),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, comment.authorAgentId),
+        )).limit(1)
+    : [];
+  const responsibleUserId = interaction?.resolvedByUserId ?? comment?.authorUserId ?? authorRun?.responsibleUserId;
   if (!run || !responsibleUserId)
     throw forbidden("Steering requires an authenticated message author");
   if (

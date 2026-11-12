@@ -57,6 +57,7 @@ type ProofCase = {
   mentionPostCallId?: string;
   steerOldReported?: boolean;
   steerNewReported?: boolean;
+  steerAccepted?: boolean;
 };
 type ModelRequest = { tools: string[]; marker: string; hasSteerText: boolean; request: number };
 
@@ -346,6 +347,10 @@ async function scriptModel(parsed: any, res: import("node:http").ServerResponse)
       return;
     }
     if (!state.steerNewReported) {
+      if (!state.steerAccepted) {
+        await respondMessages(res, { text: "The manager steer was not accepted; closing the fixture run after test failure." });
+        return;
+      }
       expect(hasSteerText, "new model turn must receive the actual direct-manager steer text").toBe(true);
       if (!hasSteerText) {
         await respondMessages(res, { text: "The manager steer did not reach this Pi turn." });
@@ -522,7 +527,11 @@ async function stopAndWriteEvidence() {
     if (db) {
       const rowsA = agentAId ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentAId)) : [];
       const rowsB = agentBId ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentBId)) : [];
-      await writeFile(join(root, "proof.json"), JSON.stringify({ stages: proofStages, modelRequests, cases: cases.map(item => ({ ...item, workerRelease: undefined, managerRelease: undefined, releaseWorker: undefined, releaseManager: undefined, firstRequestSeen: undefined, managerRequestSeen: undefined })), runs: [...rowsA, ...rowsB] }, null, 2) + "\n");
+      const safeRun = (run: typeof rowsA[number]) => ({ id: run.id, agentId: run.agentId, status: run.status, startedAt: run.startedAt, finishedAt: run.finishedAt,
+        error: run.error, exitCode: run.exitCode, signal: run.signal, errorCode: run.errorCode, nativeIssueId: run.nativeIssueId,
+        runtimeMode: run.runtimeMode, nativePhase: run.nativePhase, processPid: run.processPid, stdoutExcerpt: run.stdoutExcerpt,
+        stderrExcerpt: run.stderrExcerpt, logRef: run.logRef, logBytes: run.logBytes });
+      await writeFile(join(root, "proof.json"), JSON.stringify({ stages: proofStages, modelRequests, cases: cases.map(item => ({ ...item, workerRelease: undefined, managerRelease: undefined, releaseWorker: undefined, releaseManager: undefined, firstRequestSeen: undefined, managerRequestSeen: undefined })), runs: [...rowsA, ...rowsB].map(safeRun) }, null, 2) + "\n");
       const commentsA = agentAId ? await db.select().from(issueComments).where(eq(issueComments.authorAgentId, agentAId)) : [];
       const commentsB = agentBId ? await db.select().from(issueComments).where(eq(issueComments.authorAgentId, agentBId)) : [];
       await writeFile(join(root, "agent-comments.json"), JSON.stringify([...commentsA, ...commentsB], null, 2) + "\n");
@@ -692,17 +701,26 @@ describe("rung 4 agent talk: full-server Pi RPC proofs", () => {
     const managerToken = createLocalAgentJwt(agentBId, companyId, "paperclip_runner", managerRun.id, null);
     expect(managerToken, "mint manager's test-only signed identity for its active native run").toBeTruthy();
     const token = { value: managerToken!, runId: managerRun.id };
+    stage("worker run active immediately before manager steer", { workerRunId: workerRun.id, workerStatus: workerRun.status,
+      workerStartedAt: workerRun.startedAt, managerRunId: managerRun.id, workerIssueId: workerIssue.id });
 
     const queuedComment = await api("POST", `/issues/${workerIssue.id}/comments`, { body: steerText }, 201, token);
     expect(queuedComment.authorAgentId).toBe(agentBId);
-    const queue = await api("GET", `/issues/${workerIssue.id}/queued-comments`, undefined, 200, token);
+    stage("manager steer comment posted", { workerRunId: workerRun.id, commentId: queuedComment.id });
+    const queue = await waitFor("manager comment appears in the active run's deferred queue", async () => {
+      const current = await api("GET", `/issues/${workerIssue.id}/queued-comments`, undefined, 200, token);
+      return current.state === "deferred" && current.targetRunId === workerRun.id
+        && current.steeringDisposition !== "temporarily_unavailable" ? current : null;
+    });
     expect(queue).toMatchObject({ state: "deferred", targetRunId: workerRun.id, protocol: "paperclip_runner_v1", steeringDisposition: "available" });
     const queueEntry = (queue.entries ?? []).find((entry: any) => entry.comment?.id === queuedComment.id);
     expect(queueEntry).toBeTruthy();
     const accepted = await api("POST", `/issues/${workerIssue.id}/queued-comments/${queuedComment.id}/steer`, {
       queueId: queue.queueId, revision: queue.revision, targetRunId: workerRun.id,
     }, 200, token);
-    expect(accepted).toMatchObject({ queueId: queue.queueId, targetRunId: workerRun.id });
+    // A successful steer consumes the queue entry, so the endpoint returns the current empty queue snapshot.
+    expect(accepted).toMatchObject({ state: null, queueId: null, targetRunId: null, protocol: "paperclip_runner_v1" });
+    state.steerAccepted = true;
     const acknowledged = await waitFor("persisted same-turn steer acknowledgement", async () => {
       const [row] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, workerRun.id));
       const ack = (row?.resultJson as any)?.queuedSteeringAcknowledgements?.[queuedComment.id];
