@@ -599,6 +599,9 @@ export interface HarnessSession {
   attachRun?(input: { runId: string; currentRunGrant?: NativeRunRuntimeGrant; completionContract?: { revision: string; criterionIds: readonly string[] } }): Promise<void> | void;
   startTurn(input: {
     message: NativeUserMessage;
+    /** Native Pi exact session selection; never a legacy ACPX thinking alias. */
+    model?: string;
+    piRpcThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
     /** Set by orchestration only after successful provider-session recovery. */
     continuation?: true;
     requestedCollaborationMode?: "default" | "plan";

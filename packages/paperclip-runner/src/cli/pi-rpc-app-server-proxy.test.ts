@@ -295,10 +295,10 @@ describe("Pi RPC app-server facade proxy", () => {
       result: { serverInfo: { name: "pi_rpc" } },
     });
     expect(await request(proxy, sink, 2, "thread/start", {
-      cwd: "/workspace", model: "openrouter/test", piThinkingLevel: "high",
+      cwd: "/workspace", model: "openrouter/test", piRpcThinkingLevel: "high",
     })).toMatchObject({ result: { thread: { id: "pi-session", cwd: "/workspace" } } });
     expect(await request(proxy, sink, 3, "turn/start", {
-      input: [{ type: "text", text: "hello" }], piThinkingLevel: "high",
+      input: [{ type: "text", text: "hello" }], piRpcThinkingLevel: "high",
     })).toMatchObject({ result: { turn: { id: "turn-1", status: "inProgress" } } });
     await waitFor(() => sink.decoded().some((frame) =>
       (frame.params as Record<string, unknown> | undefined)?.turnId === "turn-1"
@@ -318,7 +318,7 @@ describe("Pi RPC app-server facade proxy", () => {
         runDeltaAvailable: true,
         context: { usedTokens: 15, windowTokens: 1000 },
       } });
-    expect(session.turnInputs[0]).toMatchObject({ piThinkingLevel: "high" });
+    expect(session.turnInputs[0]).toMatchObject({ piRpcThinkingLevel: "high" });
 
     await request(proxy, sink, 4, "turn/interrupt", { turnId: "turn-1" });
     expect(session.interrupted).toEqual(["turn-1"]);

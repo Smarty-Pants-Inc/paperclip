@@ -3783,6 +3783,7 @@ impl CodexCommandExecutor {
             active_provider_turn_id,
             goal_probe,
             observed_model,
+            observed_pi_admission,
         ) = {
             let provider = self.ensure_provider()?;
             (
@@ -3796,6 +3797,7 @@ impl CodexCommandExecutor {
                     Some(provider.get_goal())
                 },
                 provider.observed_model().map(str::to_owned),
+                provider.observed_pi_admission().cloned(),
             )
         };
         let (goal_capability, goal) = match goal_probe {
@@ -3887,7 +3889,7 @@ impl CodexCommandExecutor {
                         "providerSessionId": thread_id,
                         "providerAccountSessionId": provider_session_id,
                         "processId": process_id,
-                        "providerDescriptor": { "driver": driver, "providerVersion": provider_version, "effectiveModel": observed_model },
+                        "providerDescriptor": { "driver": driver, "providerVersion": provider_version, "effectiveModel": observed_model, "piNativeAdmission": observed_pi_admission },
                     }),
                 ),
                 (

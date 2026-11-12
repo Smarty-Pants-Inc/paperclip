@@ -42,6 +42,7 @@ class FakeTransport {
     await this.ready; this.commands.push(type); this.order.push(type);
     const model = { provider: "paperclip", id: this.mismatch ? "wrong" : "faux" };
     return { success: true, data: type === "get_state" ? { sessionId: "native-session", model, thinkingLevel: this.effortMismatch ? "high" : this.thinkingLevel, isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+      : type === "get_available_models" ? { models: [{ ...model, name: "Fixture", api: "openai-completions" }] }
       : type === "set_model" ? model : type === "get_available_thinking_levels" ? { levels: [this.thinkingLevel] }
       : type === "prompt" ? { disposition: "started" } : undefined };
   }
@@ -145,7 +146,7 @@ describe("resident Pi model binding", () => {
     const socket = f.launch.env!.PAPERCLIP_PI_BIND_SOCKET!; expect(Buffer.byteLength(socket)).toBeLessThanOrEqual(103);
     expect((await stat(dirname(socket))).mode & 0o777).toBe(0o700);
     const turn = await f.session.startTurn({ message: { role: "user", text: "one" } }); expect(turn.turnId).toBe(initial.turnId);
-    expect(f.ipc).toEqual([]); expect(f.transport.commands).toEqual([...admission, "prompt"]);
+    expect(f.ipc).toEqual([]); expect(f.transport.commands).toEqual([...admission, "get_available_models", ...admission, "prompt"]);
     await finish(f);
   });
   it("keeps INITIAL for initial/same-context attach and post-claim admission, without bind/begin IPC", async () => {
@@ -155,7 +156,7 @@ describe("resident Pi model binding", () => {
     expect((await f.session.snapshot()).binding).toMatchObject({ epoch: 1, preparedTurnId: initial.turnId });
     const turn = await f.session.startTurn({ message: { role: "user", text: "one" } });
     expect(turn.turnId).toBe(initial.turnId); expect(f.ipc).toEqual([]);
-    expect(f.transport.commands).toEqual([...admission, ...admission, ...admission, "prompt"]); await finish(f);
+    expect(f.transport.commands).toEqual([...admission, "get_available_models", ...admission, ...admission, ...admission, "prompt"]); await finish(f);
     await f.session.attachRun({ runId: "run-a", baseInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 } });
     await f.session.attachRun({ runId: "run-a", baseInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 } });
     await f.session.revalidateAfterClaim(); await f.session.startTurn({ message: { role: "user", text: "two" } });
@@ -169,7 +170,7 @@ describe("resident Pi model binding", () => {
     await f.session.startTurn({ message: { role: "user", text: "two" } });
     const secondBind = f.ipc.find(command => command.type === "bind")!;
     expect(secondBind).toMatchObject({ type: "bind", sessionId: "host-session", expectedPriorEpoch: 1, epoch: 2, runId: "run-a" });
-    expect(f.transport.order.slice(6)).toEqual(["ipc:bind", ...admission, "ipc:begin_turn", "prompt"]);
+    expect(f.transport.order.slice(12)).toEqual(["ipc:bind", ...admission, "ipc:begin_turn", "prompt"]);
     await finish(f, 2);
     expect(await revoked((secondBind as any).provider)).toBe(true);
     await f.session.attachRun({ runId: "run-b", baseInstructions: "", dynamicTools: [], runtimeContext: null });
@@ -218,7 +219,7 @@ describe("resident Pi model binding", () => {
     expect(handler).not.toHaveBeenCalled();
     expect(f.transport.uiResponses).toEqual([{ id: "old-ui", cancelled: true }, { id: 0, cancelled: true }]);
     expect(f.events.some(event => event.eventType === "runtime_request.created")).toBe(false);
-    expect(f.transport.commands).toEqual([...admission, "prompt"]);
+    expect(f.transport.commands).toEqual([...admission, "get_available_models", ...admission, "prompt"]);
     expect(f.ipc).toEqual([]);
   });
 });

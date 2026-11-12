@@ -59,7 +59,7 @@ export interface PiRpcDriverLaunchConfig {
   runtimeDirectory: string;
   environment: NodeJS.ProcessEnv;
   runnerInstanceId: string;
-  piThinkingLevel?: PiThinkingLevel;
+  piRpcThinkingLevel?: PiThinkingLevel;
   systemInstructions: string;
   runtimeContext: ReturnType<typeof parseNativeRuntimeContext> | null;
   dynamicTools: Record<string, unknown>[];
@@ -206,6 +206,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let bootstrapFailure: Error | null = null;
   let cwd = "";
   let activeModel = "";
+  let piNativeAdmission: Record<string, unknown> | undefined;
   let activeTurnId: string | null = null;
   let activeRunId = environment.PAPERCLIP_RUN_ID ?? "runnerd-run";
   let inputEnded = false;
@@ -214,7 +215,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   const log = (message: string) => options.writeStderr?.(message);
 
   function threadResponse(id: string): Record<string, unknown> {
-    return { thread: { id, sessionId: id, cwd }, model: activeModel };
+    return { thread: { id, sessionId: id, cwd }, model: activeModel, ...(piNativeAdmission ? { piNativeAdmission } : {}) };
   }
 
   function announceTurnStarted(opened: HarnessSession, turnId: string): void {
@@ -386,12 +387,13 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   async function open(params: Record<string, unknown>, resume: boolean): Promise<Record<string, unknown>> {
     if (session) return threadResponse(session.ids().providerSessionId ?? session.ids().driverSessionId);
     cwd = resolve(text(params.cwd, process.cwd()));
-    const model = text(params.model).trim();
+    const model = text(params.model);
+    if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
     if (!model) throw new Error("Pi RPC proxy requires a model");
     activeModel = model;
     const dynamicTools = Array.isArray(params.dynamicTools) ? params.dynamicTools.map(record) : [];
-    const piThinkingLevel = parsePiThinkingLevel(
-      params.piThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
+    const piRpcThinkingLevel = parsePiThinkingLevel(
+      params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
     );
     const runtimeContextPath = environment.PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH?.trim();
     const runtimeContext = runtimeContextPath
@@ -408,7 +410,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         : runtimeDirectory(environment),
       environment: withoutAmbientPiCommand(environment),
       runnerInstanceId: environment.PAPERCLIP_RUNNER_INSTANCE_ID ?? "paperclip-runnerd-pi-rpc",
-      ...(piThinkingLevel === undefined ? {} : { piThinkingLevel }),
+      ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
       systemInstructions: text(params.baseInstructions, "Complete only the supplied task."),
       runtimeContext,
       dynamicTools,
@@ -464,6 +466,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       });
     }
     session = opened;
+    piNativeAdmission = (opened as PiRpcProxySession & { piNativeAdmission?(): Record<string, unknown> }).piNativeAdmission?.();
+    if (!options.createDriver && !piNativeAdmission) throw new Error("Native Pi omitted admitted model/thinking metadata");
+    if (piNativeAdmission) activeModel = String(piNativeAdmission.model);
     eventPump = pumpEvents(opened);
     void eventPump.catch((error) => {
       log(`[pi_rpc] fatal proxy event pump error: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -497,15 +502,18 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (!session) throw new Error("Pi RPC thread is not open");
         assertPiCollaborationMode(params);
         if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
+        if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
+        if (params.model !== undefined && params.model !== activeModel) throw new Error("Pi turn model differs from the admitted session");
         const inputItems = Array.isArray(params.input) ? params.input.map(record) : [];
         const messageText = inputItems.map((entry) => text(entry.text)).filter(Boolean).join("\n");
-        const piThinkingLevel = parsePiThinkingLevel(
-          params.piThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
+        const piRpcThinkingLevel = parsePiThinkingLevel(
+          params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
         );
         const turnInput = {
           message: { role: "user" as const, text: messageText },
-          ...(piThinkingLevel === undefined ? {} : { piThinkingLevel }),
-        } as Parameters<HarnessSession["startTurn"]>[0] & { piThinkingLevel?: PiThinkingLevel };
+          model: activeModel,
+          ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
+        } as Parameters<HarnessSession["startTurn"]>[0] & { piRpcThinkingLevel?: PiThinkingLevel };
         const turn = await session.startTurn(turnInput);
         activeTurnId = turn.turnId;
         queueMicrotask(() => {

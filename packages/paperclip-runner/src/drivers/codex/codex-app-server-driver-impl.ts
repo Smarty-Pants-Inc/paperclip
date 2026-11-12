@@ -1007,6 +1007,10 @@ export class CodexAppServerDriver implements HarnessDriver {
           version: DRIVER_VERSION,
         },
         model: boundedText(response.model),
+        ...(Object.keys(record(response.piNativeAdmission)).length ? {
+          piRpcThinkingLevel: record(response.piNativeAdmission).piRpcThinkingLevel,
+          piMetadata: record(response.piNativeAdmission).piMetadata,
+        } : {}),
         modelProvider: boundedText(
           response.modelProvider,
           boundedText(thread.modelProvider),

@@ -914,6 +914,7 @@ pub struct CodexProvider {
     thread_id: String,
     provider_session_id: Option<String>,
     observed_model: Option<String>,
+    observed_pi_admission: Option<Value>,
     active_provider_turn_id: Option<String>,
     pending_messages: VecDeque<BufferedProviderMessage>,
     deferred_ambiguous_messages: VecDeque<BufferedProviderMessage>,
@@ -1387,6 +1388,7 @@ impl CodexProvider {
             thread_id: String::new(),
             provider_session_id: None,
             observed_model: None,
+            observed_pi_admission: None,
             active_provider_turn_id: None,
             pending_messages: VecDeque::new(),
             deferred_ambiguous_messages: VecDeque::new(),
@@ -1536,6 +1538,9 @@ impl CodexProvider {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
+            if config.provider == "pi_rpc" {
+                provider.observed_pi_admission = opened.get("piNativeAdmission").cloned();
+            }
             provider.observed_model = opened
                 .get("model")
                 .or_else(|| opened.pointer("/thread/model"))
@@ -1591,6 +1596,10 @@ impl CodexProvider {
 
     pub fn observed_model(&self) -> Option<&str> {
         self.observed_model.as_deref()
+    }
+
+    pub fn observed_pi_admission(&self) -> Option<&Value> {
+        self.observed_pi_admission.as_ref()
     }
 
     pub(crate) fn take_provider_trace_frame_id(&mut self) -> Option<u64> {

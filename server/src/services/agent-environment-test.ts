@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { probeManagedNativePiRunner } from "./native-runtime/pi-runner-probe.js";
 import { probePluginRunnerEnvironment } from "./native-runtime/plugin-runner-probe.js";
 import { pluginRunnerAiConnectionRequiredTestResult } from "./plugin-runner-ai-connection.js";
 import { registerPluginTaskCredentialHandoff } from "./plugin-task-credential-writeback.js";
@@ -572,12 +573,18 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
   }
 
   async function testManagedEnvironment(adapterType: string, context: Parameters<ReturnType<typeof requireServerAdapter>["testEnvironment"]>[0], binding: AiConnectionBinding, managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>>, agentId?: string) {
-    // Native Pi must use the ordinary LocalFacade/proxy launch. Until that runner
-    // path supports a setup hello, never validate it with ACPX or a legacy CLI.
+    // Only the selected remote command factory has a native LocalFacade probe.
+    // Unsupported targets stay fail closed; never fall through to ACPX/CLI.
+    if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc"
+      && context.executionTarget?.kind === "remote"
+      && !(context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask)) {
+      await assertManagedAiProjectAuth(context.config, binding.provider, context.executionTarget);
+      return probeManagedNativePiRunner(context);
+    }
     if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc") return {
       adapterType, status: "fail" as const, testedAt: new Date().toISOString(), checks: [{
         code: "pi_rpc_environment_test_unavailable", level: "error" as const,
-        message: "Native Pi connection testing is not available yet. No hello probe was run.",
+        message: "Native Pi connection testing requires a selected remote command factory. Local and plugin-task targets are not supported; no hello probe was run.",
       }],
     };
     const startedAt = new Date();

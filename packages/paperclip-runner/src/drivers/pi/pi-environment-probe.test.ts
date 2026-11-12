@@ -41,7 +41,7 @@ describe("ordinary native Pi setup hello through the run's configured driver", (
     await expect(probe(value.driver)).resolves.toEqual({ provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: config.model, providerSessionId: "native-session", helloProbePassed: true });
     expect(value.openSession).toHaveBeenCalledWith(expect.objectContaining({ runId: "probe-run", normalizedSessionId: "probe-session", workingDirectory: "/prepared/selected-remote-target", signal: expect.any(AbortSignal) }));
     expect(value.startTurn).toHaveBeenCalledOnce();
-    expect(value.startTurn.mock.calls[0]).toEqual([{ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." } }]);
+    expect(value.startTurn.mock.calls[0]).toEqual([{ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." }, model: config.model, piRpcThinkingLevel: config.piRpcThinkingLevel }]);
     expect(value.close).toHaveBeenCalledOnce();
   });
   it.each([

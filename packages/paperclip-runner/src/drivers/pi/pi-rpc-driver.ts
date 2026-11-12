@@ -39,9 +39,8 @@ export interface PiRpcDriverOptions {
   taskEnvelope?: unknown;
   conversationMode?: string;
   isolateProcessGroup?: boolean;
-  /** Native selection. The existing proxy's piThinkingLevel is normalized here only. */
+  /** Exact native selection, separate from the legacy ACPX field. */
   piRpcThinkingLevel?: PiNativeThinkingLevel;
-  piThinkingLevel?: string;
   commandFd?: number;
   /** Proxy resource URL admitted by the runner-owned descriptor binding. */
   trustedProxyEntrypointUrl?: string;
@@ -127,7 +126,7 @@ export class PiRpcDriver implements HarnessDriver {
     const config = resolvePiNativeConfig({
       provider: "pi_rpc",
       model: this.#options.model,
-      piRpcThinkingLevel: this.#options.piRpcThinkingLevel ?? this.#options.piThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
+      piRpcThinkingLevel: this.#options.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
     });
     if (config.piRpcThinkingLevel === undefined) throw new PiNativeAdmissionError("pi_thinking_required", "Pi RPC requires an explicit thinking effort before admission.");
     const instructionFile = join(directory, `${safeSessionName(input.normalizedSessionId)}-${randomUUID()}.instructions.md`);
@@ -208,6 +207,14 @@ export class PiRpcDriver implements HarnessDriver {
       // --session loads an existing file too: no saved selection bypasses live
       // admission. The broker/models.json bootstrap above remains first.
       const identity = await admitPiRpcSession(piAdmissionPort(transport, this.#options.startupTimeoutMs), config, input.signal);
+      // Discovery is separate from inference. Keep catalog/auth contents private;
+      // the receipt exposes only qualified version, provider names and auth shape.
+      const discovery = await withAbort(withTimeout(transport.request("get_available_models"), this.#options.startupTimeoutMs ?? 10_000, "Pi metadata timed out"), input.signal);
+      const models = record(discovery.data).models;
+      if (!Array.isArray(models) || models.length > 100_000) throw new PiNativeAdmissionError("pi_metadata_invalid", "Pi omitted its model/provider metadata.");
+      const providers = [...new Set(models.flatMap(value => typeof record(value).provider === "string" && /^[A-Za-z0-9._-]{1,80}$/u.test(record(value).provider as string) ? [record(value).provider as string] : []))].sort();
+      const piMetadata = { version: "1.5.2", versionSource: "qualified-profile", providers, credentialMode, promptSent: false,
+        authShape: { mode: credentialMode, source: usesPiProviderLoopback(config.model, this.#options.environment ?? {}) ? "managed-provider" : "configured-provider" } };
       return new PiRpcHarnessSession({
         transport,
         runId: input.runId,
@@ -215,6 +222,7 @@ export class PiRpcDriver implements HarnessDriver {
         providerSessionId: identity.providerSessionId,
         sessionFile,
         config,
+        piMetadata,
         systemInstructions: this.#options.systemInstructions,
         initialContext,
         agentHome,
@@ -268,6 +276,7 @@ interface PiSessionState {
   resident?: PiResidentState;
   callbacks?: PiHostCallbacks;
   config: PiNativeConfig;
+  piMetadata: Record<string, unknown>;
   systemInstructions?: string;
   initialContext: PiRunContext;
   agentHome: string;
@@ -360,6 +369,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #events = new EventQueue();
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
+  readonly #piMetadata: Record<string, unknown>;
   #initialContext: PiRunContext;
   readonly #agentHome: string;
   readonly #instructionFile: string;
@@ -396,7 +406,13 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#instructionFile = state.instructionFile;
     this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
+    this.#piMetadata = state.piMetadata;
+    this.#emit("session.started", { context: { model: state.config.model, piRpcThinkingLevel: state.config.piRpcThinkingLevel, piMetadata: state.piMetadata } });
     void this.#pump();
+  }
+
+  piNativeAdmission(): Record<string, unknown> {
+    return structuredClone({ ...this.#config, providerSessionId: this.#providerSessionId, piMetadata: this.#piMetadata });
   }
 
   ids(): ReturnType<HarnessSession["ids"]> {
@@ -531,8 +547,18 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
       if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
+      if ((input as Record<string, unknown>).piThinkingLevel !== undefined) throw new PiNativeAdmissionError("pi_thinking_invalid", "Native Pi turns use piRpcThinkingLevel, not the ACPX alias.");
+      const selected = resolvePiNativeConfig({ ...this.#config, ...(input.model === undefined ? {} : { model: input.model }),
+        ...(input.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: input.piRpcThinkingLevel }) });
+      if (selected.model !== this.#config.model || selected.piRpcThinkingLevel !== this.#config.piRpcThinkingLevel) throw new PiNativeAdmissionError("pi_turn_selection_mismatch", "Pi turn selection differs from the admitted session.");
+      // Every prompt, including direct-env and first hello, re-proves selection.
+      // A failed attach/claim must still be recovered by an explicit admission;
+      // startTurn may not silently revive a cancelled or rejected authority.
       if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
-      if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
+      else {
+        if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
+        await this.#admit();
+      }
       const binding = this.#resident?.binding;
       const origin = binding?.origin ?? { runId: this.#runId, turnId: `pi-turn-${randomUUID()}` };
       if (binding && !binding.initial) {
@@ -551,7 +577,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         this.#pendingInput++;
         const response = await this.#transport.request("prompt", { message: input.message.text }).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
-        if (disposition !== "started") throw new Error(`Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
+        if (disposition !== "started") throw new PiNativeAdmissionError("pi_prompt_rejected", `Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
       } catch (error) {
         await this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } });
         if (this.#resident) await this.#fenceFailure(error);

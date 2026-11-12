@@ -20,7 +20,8 @@ export function createPiNativeSessionBackend(
 
   return new HarnessDriverBackend(new PiRpcDriver({
     ...options,
-    environment: { ...options.environment, PAPERCLIP_PI_THINKING_LEVEL: input.provider.piRpcThinkingLevel ?? "low" },
+    environment: options.environment,
+    piRpcThinkingLevel: input.provider.piRpcThinkingLevel,
     systemInstructions: nativeSystemInstructions(input),
     runtimeContext: "runtimeContext" in input ? input.runtimeContext : null,
     model: input.provider.model,

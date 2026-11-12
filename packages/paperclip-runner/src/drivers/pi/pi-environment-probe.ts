@@ -21,6 +21,64 @@ async function untilAbort<T>(operation: Promise<T>, signal: AbortSignal): Promis
   finally { signal.removeEventListener("abort", abort); }
 }
 
+interface PiProbeObservation {
+  session: HarnessSession;
+  config: PiNativeConfig;
+  runId: string;
+  normalizedSessionId: string;
+  signal: AbortSignal;
+}
+
+/** Read-only native admission. No prompt and no retirement claim. */
+export async function admitPiProbeSession(options: PiProbeObservation) {
+  const active = options.session, config = resolvePiNativeConfig(options.config), signal = options.signal;
+    const ids = active.ids();
+    if (!ids.driverSessionId || !ids.providerSessionId) throw new PiNativeAdmissionError("pi_probe_session_missing", "Pi hello probe returned no native session identity.");
+    const providerSessionId = ids.providerSessionId;
+    const events = active.events()[Symbol.asyncIterator]();
+    const first = await untilAbort(events.next(), signal);
+    const event = first.value;
+    const context = record(event?.payload.context);
+    if (first.done || event.eventType !== "session.started" || event.runId !== options.runId || event.normalizedSessionId !== options.normalizedSessionId || context.model !== config.model) {
+      throw new PiNativeAdmissionError("pi_probe_model_mismatch", "Pi hello probe returned a missing or mismatched admitted model/session.");
+    }
+    if (config.piRpcThinkingLevel !== undefined && context.piRpcThinkingLevel !== config.piRpcThinkingLevel) throw new PiNativeAdmissionError("pi_probe_thinking_mismatch", "Pi hello probe did not acknowledge the selected thinking level.");
+
+  return { providerSessionId, events, context };
+}
+
+/** The L4b hello body shared by direct native and LocalFacade setup probes. */
+export async function observePiNativeHello(options: PiProbeObservation): Promise<string> {
+  const active = options.session, config = resolvePiNativeConfig(options.config), signal = options.signal;
+  const { providerSessionId, events } = await admitPiProbeSession(options);
+    // Subscribe before startTurn: the native peer may complete synchronously.
+    let next = events.next();
+    void next.catch(() => undefined);
+    const started = await untilAbort(active.startTurn({ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." }, model: config.model, ...(config.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: config.piRpcThinkingLevel }) }), signal);
+    let responseObserved = false;
+    while (true) {
+      const received = await untilAbort(next, signal);
+      if (received.done) throw new PiNativeAdmissionError("pi_probe_stream_ended", "Pi hello probe ended without a settled successful turn.");
+      const current = received.value;
+      if (current.runId !== options.runId || current.normalizedSessionId !== options.normalizedSessionId) throw new PiNativeAdmissionError("pi_probe_session_mismatch", "Pi hello probe received a mismatched run/session.");
+      if (current.eventType === "session.failed") throw new PiNativeAdmissionError("pi_probe_session_failed", "Pi hello probe session failed.");
+      if (current.turnId && current.turnId !== started.turnId) throw new PiNativeAdmissionError("pi_probe_turn_mismatch", "Pi hello probe received a stale or mismatched turn.");
+      if (current.turnId === started.turnId) {
+        if (current.eventType.startsWith("tool.execution.") || (current.eventType.startsWith("item.") && ["tool", "commandExecution", "mcpToolCall"].includes(String(current.payload.kind)))) {
+          throw new PiNativeAdmissionError("pi_probe_tool_used", "Pi hello probe unexpectedly used a tool.");
+        }
+        if (current.eventType === "item.completed" && current.payload.kind === "agentMessage" && current.payload.channel === "final" && typeof current.payload.text === "string" && current.payload.text.trim()) responseObserved = true;
+        if (["turn.failed", "turn.cancelled", "turn.interrupted", "item.failed"].includes(current.eventType)) throw new PiNativeAdmissionError("pi_probe_turn_failed", "Pi hello probe failed or was interrupted.");
+        if (current.eventType === "turn.completed") {
+          if (!responseObserved) throw new PiNativeAdmissionError("pi_probe_empty_response", "Pi hello probe settled without an assistant response.");
+          return providerSessionId;
+        }
+      }
+      next = events.next();
+      void next.catch(() => undefined);
+    }
+}
+
 /**
  * Native setup Test, following runnerd-codex-transport.ts:9005-9242.
  * The caller supplies the SAME admitted/prepared driver used by a real run,
@@ -55,43 +113,8 @@ export async function probePiNativeEnvironment(options: {
   try {
     await untilAbort(opening, signal);
     const active = session!;
-    const ids = active.ids();
-    if (!ids.driverSessionId || !ids.providerSessionId) throw new PiNativeAdmissionError("pi_probe_session_missing", "Pi hello probe returned no native session identity.");
-    providerSessionId = ids.providerSessionId;
-    const events = active.events()[Symbol.asyncIterator]();
-    const first = await untilAbort(events.next(), signal);
-    const event = first.value;
-    const context = record(event?.payload.context);
-    if (first.done || event.eventType !== "session.started" || event.runId !== options.runId || event.normalizedSessionId !== options.normalizedSessionId || context.model !== config.model) {
-      throw new PiNativeAdmissionError("pi_probe_model_mismatch", "Pi hello probe returned a missing or mismatched admitted model/session.");
-    }
-    if (config.piRpcThinkingLevel !== undefined && context.piRpcThinkingLevel !== config.piRpcThinkingLevel) throw new PiNativeAdmissionError("pi_probe_thinking_mismatch", "Pi hello probe did not acknowledge the selected thinking level.");
-    // Subscribe before startTurn: the native peer may complete synchronously.
-    let next = events.next();
-    void next.catch(() => undefined);
-    const started = await untilAbort(active.startTurn({ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." } }), signal);
-    let responseObserved = false;
-    while (true) {
-      const received = await untilAbort(next, signal);
-      if (received.done) throw new Error("Pi hello probe ended without a settled successful turn.");
-      const current = received.value;
-      if (current.runId !== options.runId || current.normalizedSessionId !== options.normalizedSessionId) throw new Error("Pi hello probe received a mismatched run/session.");
-      if (current.eventType === "session.failed") throw new Error("Pi hello probe session failed.");
-      if (current.turnId === started.turnId) {
-        if (current.eventType.startsWith("tool.execution.") || (current.eventType.startsWith("item.") && ["tool", "commandExecution", "mcpToolCall"].includes(String(current.payload.kind)))) {
-          throw new Error("Pi hello probe unexpectedly used a tool.");
-        }
-        if (current.eventType === "item.completed" && current.payload.kind === "agentMessage" && current.payload.channel === "final" && typeof current.payload.text === "string" && current.payload.text.trim()) responseObserved = true;
-        if (["turn.failed", "turn.cancelled", "turn.interrupted", "item.failed"].includes(current.eventType)) throw new Error("Pi hello probe failed or was interrupted.");
-        if (current.eventType === "turn.completed") {
-          if (!responseObserved) throw new Error("Pi hello probe settled without an assistant response.");
-          passed = true;
-          break;
-        }
-      }
-      next = events.next();
-      void next.catch(() => undefined);
-    }
+    providerSessionId = await observePiNativeHello({ ...options, session: active, config, signal });
+    passed = true;
   } catch (error) { operationError = error; }
   finally {
     clearTimeout(timer);

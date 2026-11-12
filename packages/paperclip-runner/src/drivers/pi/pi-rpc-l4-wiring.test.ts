@@ -26,6 +26,7 @@ class FakeTransport {
     await this.hold?.(type);
     const data = type === "get_state" ? { ...this.state }
       : type === "set_model" ? this.modelReceipt
+      : type === "get_available_models" ? { models: [{ ...this.modelReceipt, name: "Fixture", api: "openai-responses" }] }
       : type === "get_available_thinking_levels" ? { levels: this.levels }
       : type === "prompt" ? { disposition: "started" } : undefined;
     return { type: "response", command: type, success: true, data };
@@ -60,7 +61,7 @@ const admission = ["get_state", "set_model", "get_available_thinking_levels", "s
 async function fixture(overrides: Partial<PiRpcDriverOptions> = {}, transport = new FakeTransport()) {
   const root = await mkdtemp(join(tmpdir(), "pi-l4-wiring-")); roots.push(root);
   const workspace = join(root, "workspace"); await mkdir(workspace);
-  const driver = new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/nested/model", piThinkingLevel: "high", transportFactory: () => transport as unknown as PiRpcTransport, ...overrides });
+  const driver = new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/nested/model", piRpcThinkingLevel: "high", transportFactory: () => transport as unknown as PiRpcTransport, ...overrides });
   const input = { runId: "run-a", normalizedSessionId: "session", workingDirectory: workspace };
   const open = async () => {
     const session = await driver.openSession(input) as PiRpcHarnessSession; sessions.push(session);
@@ -88,13 +89,13 @@ async function settle(transport: FakeTransport, id: string) {
 describe("Pi RPC live-session L4 wiring", () => {
   it("adapts admission commands to the transport and unwraps response.data before returning a session", async () => {
     const f = await fixture(); const { session } = await f.open();
-    expect(f.transport.commands.map(command => command.type)).toEqual(admission);
+    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models"]);
     expect(f.transport.commands[1]).toEqual({ type: "set_model", params: { provider: "neutral", modelId: "nested/model" } });
     expect(f.transport.commands[3]).toEqual({ type: "set_thinking_level", params: { level: "high" } });
     expect(session.ids().providerSessionId).toBe("native-session");
   });
 
-  it.each([{ model: undefined }, { piThinkingLevel: undefined }, { piThinkingLevel: "ultra" }])("requires an explicit exact model/effort before spawn: %j", async overrides => {
+  it.each([{ model: undefined }, { piRpcThinkingLevel: undefined }, { piRpcThinkingLevel: "ultra" }])("requires an explicit exact model/effort before spawn: %j", async overrides => {
     const f = await fixture(overrides);
     await expect(f.open()).rejects.toThrow(/model|thinking|effort/i);
     expect(f.transport.commands).toEqual([]);
@@ -130,7 +131,7 @@ describe("Pi RPC live-session L4 wiring", () => {
     expect(f.transport.commands.some(command => command.type === "prompt")).toBe(false);
     release(); await attach; await start;
     expect((await session.snapshot()).runId).toBe("run-b");
-    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, ...admission, "prompt"]);
+    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models", ...admission, ...admission, "prompt"]);
   });
 
   it("failed attach retains the old identity and blocks input until fresh post-claim admission", async () => {
@@ -148,7 +149,7 @@ describe("Pi RPC live-session L4 wiring", () => {
   it("revalidates exact model/effort on reconnect and after claim", async () => {
     const f = await fixture(); const { session } = await f.open();
     await session.reconnect(); await session.revalidateAfterClaim();
-    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, ...admission, ...admission]);
+    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models", ...admission, ...admission]);
   });
 
   it("rejects a changed native session after claim and cannot prompt with the old admission", async () => {
@@ -164,7 +165,7 @@ describe("Pi RPC live-session L4 wiring", () => {
     const controller = new AbortController(); controller.abort(new Error("claim revoked"));
     await expect(session.attachRun({ runId: "run-b", signal: controller.signal })).rejects.toThrow("claim revoked");
     expect((await session.snapshot()).runId).toBe("run-a");
-    expect(f.transport.commands.map(command => command.type)).toEqual(admission);
+    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models"]);
     await expect(session.startTurn({ message: { role: "user", text: "must not send" } })).rejects.toThrow(/admission/);
   });
 

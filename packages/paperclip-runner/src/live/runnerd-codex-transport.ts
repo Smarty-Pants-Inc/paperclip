@@ -1,3 +1,5 @@
+import { admitPiProbeSession, observePiNativeHello } from "../drivers/pi/pi-environment-probe.js";
+import { resolvePiNativeConfig } from "../drivers/pi/pi-native-config.js";
 import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { readProviderFailure } from "../contracts/provider-failure.generated.js";
 import { confirmAntigravityProbeNativeRetirement } from "../drivers/acpx/antigravity-probe-retirement.js";
@@ -3771,8 +3773,9 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     return { ...selected, ...Object.fromEntries(PI_SIDECAR_PROVIDER_ROUTE_NAMES.flatMap(name => {
       const value = input.options.environment?.[name]; return value === undefined ? [] : [[name, value]];
     })), ...(input.options.environment?.PI_CODING_AGENT_DIR ? { PI_CODING_AGENT_DIR: input.options.environment.PI_CODING_AGENT_DIR } : {}),
+      PAPERCLIP_PI_RPC_CREDENTIAL_MODE: input.options.environment?.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker",
       PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
-      PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel ?? "low", ...commonIdentity };
+      ...(input.options.piRpcThinkingLevel === undefined ? {} : { PAPERCLIP_PI_THINKING_LEVEL: input.options.piRpcThinkingLevel }), ...commonIdentity };
   }
   if (input.provider === "opencode") {
     return {
@@ -4021,6 +4024,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #recoveryTurnBindingPending = false;
   #threadId = "";
   #observedProviderModel: string | undefined;
+  #observedPiAdmission: Record<string, unknown> | undefined;
   #sessionId: string | null = null;
   #providerIdentity: Record<string, unknown> | null = null;
   #turnControls: NativeTurnControlCapabilities = { steering: false, queuedFollowUp: false };
@@ -6277,6 +6281,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const acpxAgent = this.options.acpxAgent ?? "codex";
     return {
       model: this.#observedProviderModel,
+      ...(this.#observedPiAdmission ? { piNativeAdmission: this.#observedPiAdmission } : {}),
       ...this.#preparedThreadWorkingDirectory(),
       thread: {
         id: this.#threadId,
@@ -8349,6 +8354,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const providerIdentity = record(started.providerIdentity);
     const observedModel = this.options.provider === "acpx" ? providerIdentity.effectiveModel : descriptor.effectiveModel;
     if (typeof observedModel === "string" && observedModel.trim()) this.#observedProviderModel = observedModel;
+    if (this.options.provider === "pi_rpc") {
+      const admitted = record(descriptor.piNativeAdmission);
+      if (admitted.model !== observedModel || admitted.piRpcThinkingLevel !== this.options.piRpcThinkingLevel) {
+        throw new Error("Native Pi did not acknowledge the selected model/thinking identity");
+      }
+      this.#observedPiAdmission = admitted;
+    }
     this.#confirmCheckpointProviderIdentity(started, event.eventType);
     if (this.options.provider === "acpx") {
       if (descriptor.turnControls !== undefined && descriptor.agent !== (this.options.acpxAgent ?? "codex")) {
@@ -9076,7 +9088,7 @@ function retainNativeProbeCleanup(cleanup: (retry: boolean) => Promise<void>) {
 
 export async function probeNativeRunnerEnvironment(options: {
   runtimeDirectory: string;
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   model: string | null;
   reasoningEffort?: string;
   /** Verify native session identity/model and cleanup without a billable turn. */
@@ -9090,7 +9102,8 @@ export async function probeNativeRunnerEnvironment(options: {
   onCodexCredentialRefresh?: (filename: string) => Promise<void>;
   onCleanupConfirmed?: () => Promise<void>;
 }): Promise<{
-  provider: "codex" | "opencode" | "acpx";
+  provider: "codex" | "opencode" | "acpx" | "pi_rpc";
+  piMetadata?: Record<string, unknown>;
   providerDriver: string;
   effectiveModel: string;
   helloProbePassed: boolean;
@@ -9196,15 +9209,30 @@ export async function probeNativeRunnerEnvironment(options: {
   let session: HarnessSession | undefined;
   let completed = false;
   let effectiveModel: string | undefined;
+  let piMetadata: Record<string, unknown> | undefined;
   let failure: unknown;
   const operation = (async () => {
     session = await driver.openSession({ runId: options.transportOptions?.prpIdentity?.runId ?? "environment-probe", normalizedSessionId: options.transportOptions?.prpIdentity?.normalizedSessionId ?? "environment-probe",
       workingDirectory, signal: controller.signal });
     controller.signal.throwIfAborted();
     const ids = session.ids();
-    const expectedDriver = { codex: "codex_app_server", opencode: "opencode_server", acpx: "acpx_runtime" }[options.provider];
+    const expectedDriver = { codex: "codex_app_server", opencode: "opencode_server", acpx: "acpx_runtime", pi_rpc: "pi_rpc" }[options.provider];
     if (!ids.driverSessionId || !ids.providerSessionId || bundle.evidence().providerDriver !== expectedDriver) {
       throw new Error(`The native environment probe returned no matching provider identity (${bundle.evidence().providerDriver ?? "missing driver"}).`);
+    }
+    if (options.provider === "pi_rpc") {
+      const config = resolvePiNativeConfig({ provider: "pi_rpc", model: options.model, piRpcThinkingLevel: options.transportOptions?.piRpcThinkingLevel });
+      const observation = { session, config, runId: options.transportOptions?.prpIdentity?.runId ?? "environment-probe",
+        normalizedSessionId: options.transportOptions?.prpIdentity?.normalizedSessionId ?? "environment-probe", signal: controller.signal };
+      if (options.admissionOnly) {
+        const admitted = await admitPiProbeSession(observation);
+        piMetadata = record(admitted.context.piMetadata);
+        if (piMetadata.version !== "1.5.2" || piMetadata.promptSent !== false || !Array.isArray(piMetadata.providers)
+          || !["broker", "env"].includes(String(piMetadata.credentialMode))) throw new Error("Native Pi metadata admission was incomplete");
+      } else await observePiNativeHello(observation);
+      effectiveModel = config.model;
+      completed = true;
+      return;
     }
     const events = session.events()[Symbol.asyncIterator]();
     const first = await events.next();
@@ -9308,7 +9336,7 @@ export async function probeNativeRunnerEnvironment(options: {
   }
   if (failure !== undefined) throw failure;
   if (!completed) throw new Error("The native provider hello probe did not complete.");
-  return Object.freeze({ provider: options.provider, providerDriver: bundle.evidence().providerDriver!, effectiveModel: effectiveModel!,
+  return Object.freeze({ ...(piMetadata ? { piMetadata } : {}), provider: options.provider, providerDriver: bundle.evidence().providerDriver!, effectiveModel: effectiveModel!,
     ...(options.admissionOnly ? { helloProbePassed: false, admissionOnly: true as const, sessionAdmissionPassed: true as const } : { helloProbePassed: true }) });
 }
 

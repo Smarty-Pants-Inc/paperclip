@@ -1011,6 +1011,79 @@ describe("agent routes adapter validation", () => {
     expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: runner === "legacy" ? "pi_local" : "paperclip_runner", adapterConfig: runner === "legacy" ? { model } : { provider: "acpx", acpxAgent: "pi", model, piThinkingLevel: "low", acpxPermissionMode: "approve-all" } });
   });
 
+  // Keep reason: new native Pi hires were stuck in verifying even though an
+  // already-ready PATCH could launch. Persistence/remote runner are test ports;
+  // the HTTP route, environment service, facade driver, hello observer, readiness
+  // assertion and lifecycle worker are real. No provider/network inference occurs.
+  it.each(["hello", "empty"] as const)("fresh native Pi create becomes ready only after a retired nonempty hello (%s)", async mode => {
+    mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableNativeRunner: true });
+    const { FakeCodexTransport, WORKSPACE } = await import("../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.js");
+    const { CodexAppServerDriver } = await import("../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.js");
+    const { probePiNativeEnvironment } = await import("../../../packages/paperclip-runner/src/drivers/pi/pi-environment-probe.js");
+    const { createLifecycleWorker } = await import("../modules/agent-lifecycle/application/worker.js");
+    const { transition } = await import("../modules/agent-lifecycle/domain/policy.js");
+    const model = "paperclip/claude-opus-5-5";
+    const config = { provider: "pi_rpc", model, piRpcThinkingLevel: "xhigh" };
+    let transport: InstanceType<typeof FakeCodexTransport> | undefined;
+    const probe = vi.fn(async (context: { config: Record<string, unknown> }) => {
+      class SetupTransport extends FakeCodexTransport {
+        override async request(method: string, params: Record<string, unknown>) {
+          const response = await super.request(method, params);
+          if (method === "thread/start") return { ...response, model, piNativeAdmission: { model, piRpcThinkingLevel: "xhigh" } };
+          if (method === "turn/start") setImmediate(() => {
+            if (mode === "hello") this.push("item/completed", { threadId: this.threadId, turnId: "turn-1", item: { id: "hello", type: "agentMessage", phase: "final_answer", text: "hello" } });
+            this.push("turn/completed", { threadId: this.threadId, turn: { id: "turn-1", status: "completed", items: [] } });
+          });
+          return response;
+        }
+      }
+      transport = new SetupTransport();
+      const driver = new CodexAppServerDriver({ model, conversationMode: "direct", transportFactory: () => transport!,
+         taskEnvelope: { schema: "paperclip.skillless_task.v1", objective: "Verify native Pi hello", completionContract: { revision: "setup-v1", criteria: [] }, constraints: [], expectedResultSchema: "paperclip.run_result.v1" } });
+      try {
+        await probePiNativeEnvironment({ driver, config: context.config, runId: "fresh-setup", normalizedSessionId: "fresh-setup-session", workingDirectory: WORKSPACE, timeoutMs: 1000 });
+        return { adapterType: "paperclip_runner", testedAt: new Date().toISOString(), status: "pass", checks: [{ code: "pi_hello_probe_passed", level: "info", message: "Native hello retired" }] };
+      } catch (error) {
+        return { adapterType: "paperclip_runner", testedAt: new Date().toISOString(), status: "fail", checks: [{ code: "pi_hello_probe_failed", level: "error", message: error instanceof Error ? error.message : "Hello failed" }] };
+      }
+    });
+    const nativePiProbe = await import("../services/native-runtime/pi-runner-probe.js");
+    const probeSpy = vi.spyOn(nativePiProbe, "probeManagedNativePiRunner").mockImplementation(probe as never);
+    try {
+      const app = await createApp();
+      const response = await requestApp(app, base => request(base).post("/api/companies/company-1/agents").send({ name: "Fresh Pi", adapterType: "paperclip_runner", runner: "paperclip", adapterConfig: config }));
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
+      const saved = mockAgentService.create.mock.calls.at(-1)![1];
+      expect(saved).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: config });
+      const { agentEnvironmentTestService } = await import("../services/agent-environment-test.js");
+      const { assertHarnessTestPassed } = await import("../services/agent-harness-verification.js");
+      const tests = agentEnvironmentTestService({} as never);
+      let state: any = { id: response.body.id, companyId: "company-1", lifecycleState: "verifying", lifecycleVersion: 1,
+        lifecycleRequiredPluginIds: [], lifecycleError: null, lifecycleOperation: { id: "fresh-operation", hostComplete: false, completedPluginIds: [], attempts: 1 } };
+      let verdict: any;
+      const ready = vi.fn();
+      const work = createLifecycleWorker({
+        get: async () => state, claim: async () => state, renew: async () => true, setRequiredPlugins: async () => true,
+        completeHost: async () => true, completePlugin: async () => true, pending: async () => [],
+        defer: async (_agent, _owner, error) => { state.lifecycleError = error; return true; },
+        change: async () => { state = { ...state, lifecycleState: transition(state.lifecycleState, "complete"), lifecycleOperation: null }; return state; },
+      }, { requiredPluginIds: async () => [], runPlugin: async () => "complete", onReady: ready, runHost: async () => {
+        verdict = await tests.testManagedEnvironment("paperclip_runner", { companyId: "company-1", adapterType: "paperclip_runner", config: saved.adapterConfig,
+          executionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/factory", runner: { execute: vi.fn(async () => ({ exitCode: 0, timedOut: false, stdout: "", stderr: "" })) } } as never },
+          { provider: "anthropic", mode: "responsible_user", method: "api_key" }, {} as never);
+        assertHarnessTestPassed(verdict); return "complete";
+      } }, () => {});
+      await work.process(state.id);
+      await work.stop();
+      expect(verdict, JSON.stringify(verdict)).toMatchObject({ status: mode === "hello" ? "pass" : "fail" });
+      expect(state.lifecycleState).toBe(mode === "hello" ? "ready" : "verifying");
+      expect(ready).toHaveBeenCalledTimes(mode === "hello" ? 1 : 0);
+      expect(probe).toHaveBeenCalledOnce();
+      expect(transport!.calls.find(c => c.method === "thread/start")?.params.model, JSON.stringify(verdict)).toBe(model);
+      expect(transport!.calls.some(c => c.method === "turn/start")).toBe(true);
+    } finally { probeSpy.mockRestore(); }
+  }, 60000);
+
   it("allows model-free Pi only as an inactive setup draft", async () => {
     const selection = await import("../services/agent-runner-selection.js");
     vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
