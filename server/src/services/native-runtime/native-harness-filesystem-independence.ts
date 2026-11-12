@@ -116,7 +116,7 @@ async function databaseFacts(db: Db, input: Scope, lock: boolean, webOnly = fals
   if (!source) fail();
   const execution = parseNativeExecutionInput(anchor.runnerProfileJson?.nativeExecutionInput);
   const checkpoint = source.runnerProfileJson.sessionCheckpoint as { identity?: Record<string, unknown> } | null;
-  if (!["codex", "opencode"].includes(execution.provider.kind) || !("runtimeContext" in execution)
+  if (!["codex", "opencode", "pi_rpc"].includes(execution.provider.kind) || !("runtimeContext" in execution)
     || execution.binding.companyId !== anchor.companyId || execution.binding.agentId !== anchor.agentId
     || execution.binding.issueId !== anchor.nativeIssueId || execution.binding.runId !== anchor.id
     || execution.session.normalizedSessionId !== anchor.nativeSessionId || basename(scopedRunnerdStateRoot(execution)) !== input.scopeDigest
@@ -591,7 +591,7 @@ async function captureWebEvidence(facts: Awaited<ReturnType<typeof databaseFacts
     entries.push({ path: "web-home", type: "directory", mode: rootStat.mode & 0o777 },
       { path: "web-state", type: "directory", mode: rootStat.mode & 0o777 });
     for (const name of names) {
-      if (["runner", "codex-home", "opencode", "acpx"].includes(name) && !profiles.some(profile => profile.name === name)) fail();
+      if (["runner", "codex-home", "opencode", "acpx", "pi-agent"].includes(name) && !profiles.some(profile => profile.name === name)) fail();
       await visit(join(root, name), `${profiles.some(profile => profile.name === name) ? "web-home" : "web-state"}/${name}`, name);
     }
     if (digest(await directoryNames(root)) !== digest(names)) fail();
@@ -635,7 +635,7 @@ async function localFacts(facts: Awaited<ReturnType<typeof databaseFacts>>, asse
     if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) fail();
     const names = await readdir(root);
     if (names.some(name => !isKnownNativeSessionRootEntry(name))) fail();
-    if (names.some(name => ["runner", "codex-home", "opencode", "acpx"].includes(name)
+    if (names.some(name => ["runner", "codex-home", "opencode", "acpx", "pi-agent"].includes(name)
       && !directories.some(directory => directory.name === name))) fail();
     const control = await stat(join(root, "control-plane"));
     if (control && (!control.isDirectory() || control.isSymbolicLink()

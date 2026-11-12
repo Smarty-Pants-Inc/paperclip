@@ -15,6 +15,7 @@ export const NATIVE_CONTINUITY_STATE_ENTRIES: readonly string[] = [
   "codex-home",
   "opencode",
   "acpx",
+  "pi-agent",
   "failover-backups",
   "provider-pack-authority.json",
   "provider-artifacts",

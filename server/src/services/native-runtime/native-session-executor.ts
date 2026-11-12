@@ -2130,6 +2130,7 @@ function nativeProviderSessionScope(execution: NativeExecutionInput) {
       };
     case "codex":
     case "opencode":
+    case "pi_rpc":
       // These local providers have no separate persisted profile id. Company,
       // agent, and workspace bind their credential/session context; mutable
       // model and permission settings remain in nativeSessionConfigDigest so
@@ -7356,7 +7357,7 @@ type NativeProviderKind = NativeExecutionInput["provider"]["kind"];
 type NativeDriverKind = NativeExecutionInput["session"]["driverKind"];
 
 export interface NativeHarnessPersistenceDirectory {
-  name: "runner" | "codex-home" | "opencode" | "acpx";
+  name: "runner" | "codex-home" | "opencode" | "acpx" | "pi-agent";
   location: "runner" | "filesystem";
   excludeEntries: readonly string[];
 }
@@ -7401,6 +7402,14 @@ export function resolveNativeHarnessPersistenceProfile(
           // instead of putting credentials into the disaster-recovery copy.
           excludeEntries: CODEX_HOME_CHECKPOINT_EXCLUDED_ENTRIES,
         })
+      : execution.provider.kind === "pi_rpc"
+        ? {
+            name: "pi-agent",
+            location: "filesystem",
+            // Pi sessions are durable; credentials and launch configuration
+            // must be re-materialized, not restored into another sandbox.
+            excludeEntries: ["auth.json", "auth.json.lock", "models.json", "settings.json"],
+          }
       : execution.provider.kind === "opencode"
         ? {
             name: "opencode",
@@ -7639,6 +7648,7 @@ export function remoteProviderStateNeverOpened(execution: NativeExecutionInput, 
     case "cursor_cloud":
     case "codex":
     case "opencode":
+    case "pi_rpc":
       return state.schema === CODEX_PROVIDER_STATE_SCHEMA && (state.threadId ?? null) === null
         && (state.providerSessionId ?? null) === null && (state.activeProviderTurnId ?? null) === null
         && state.ambiguousTurnStartPending !== true;
@@ -10896,7 +10906,7 @@ async function executePaperclipNativeSessionAttempt(
   };
   // OpenCode and ACPX report their current turn; Codex reports a cumulative run delta.
   // Rebuild per-turn state from the durable event log when a controller resumes.
-  const turnAccounting = ["opencode", "acpx"].includes(input.execution.provider.kind) ? createNativeTurnAccounting(input.execution.provider) : null;
+  const turnAccounting = ["opencode", "acpx", "pi_rpc"].includes(input.execution.provider.kind) ? createNativeTurnAccounting(input.execution.provider) : null;
   if (turnAccounting || cursorCloudAccounting) {
     const history = await input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, input.execution.binding.companyId), eq(heartbeatRunEvents.runId, input.execution.binding.runId),
@@ -13213,7 +13223,7 @@ export function resolveNativeBilling(provider: NativeExecutionInput["provider"],
     if (env.CLAUDE_CODE_USE_BEDROCK === "1") return { provider: "anthropic", biller: "aws_bedrock", billingType: "metered_api" };
     return { provider: "anthropic", biller: "anthropic", billingType: env.ANTHROPIC_API_KEY ? "metered_api" : env.CLAUDE_CODE_OAUTH_TOKEN ? "subscription_included" : "unknown" };
   }
-  if (provider.kind === "opencode" || (provider.kind === "acpx" && provider.agent === "pi")) {
+  if (provider.kind === "opencode" || provider.kind === "pi_rpc" || (provider.kind === "acpx" && provider.agent === "pi")) {
     const parts = (provider.model ?? "").split("/");
     const biller = parts.length > 1 ? parts[0] : provider.kind === "acpx" ? nativeUsageBiller(provider) : "unknown";
     const modelProvider = biller === "openrouter" && parts.length > 2 ? parts[1] : biller;
@@ -15322,7 +15332,7 @@ async function createRunnerdBackendWithinSessionClaim(
   // Codex and OpenCode send dynamic tool calls over authenticated PRP. Keep
   // the assigned gateway on the control plane instead of asking the sandbox to
   // reach the host's HTTP origin (which may be private or loopback-only).
-  const relayAssignedMcp = Boolean(pluginTask) || input.execution.provider.kind === "cursor_cloud" || input.execution.provider.kind === "opencode" || (remoteTarget !== null && input.execution.provider.kind === "codex") || input.execution.schema === "paperclip.native-execution-input.v6";
+  const relayAssignedMcp = Boolean(pluginTask) || input.execution.provider.kind === "cursor_cloud" || input.execution.provider.kind === "opencode" || input.execution.provider.kind === "pi_rpc" || (remoteTarget !== null && input.execution.provider.kind === "codex") || input.execution.schema === "paperclip.native-execution-input.v6";
   const assignedMcpUrl = input.runnerEnvironment?.PAPERCLIP_NATIVE_MCP_URL;
   const assignedMcpToken = input.runnerEnvironment?.PAPERCLIP_NATIVE_MCP_TOKEN;
   const assignedMcpName = input.runnerEnvironment?.PAPERCLIP_NATIVE_MCP_NAME;

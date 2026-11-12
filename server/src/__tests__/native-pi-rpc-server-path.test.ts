@@ -5,8 +5,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Db } from "@paperclipai/db";
-import { PI_RPC_DISTRIBUTION, QUALIFIED_ACPX_PROFILES, QUALIFIED_PI_RPC_PROFILE } from "@paperclipai/paperclip-runner";
+import { activityLog, budgetReservations, heartbeatRuns, heartbeatRunEvents, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
+import type { AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
+import { FakeCodexTransport } from "../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.js";
+import { canonicalNativeRuntimeContextDigest, PI_RPC_DISTRIBUTION, QUALIFIED_ACPX_PROFILES, QUALIFIED_PI_RPC_PROFILE } from "@paperclipai/paperclip-runner";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { resolvePaperclipRunnerNativeProviderInput, resolvePaperclipRunnerProviderProfile } from "../services/native-runtime/provider-profile.js";
@@ -19,6 +22,9 @@ const mocks = vi.hoisted(() => ({
   createBackend: vi.fn((_input: unknown, _options: BackendOptions) => ({ kind: "test" })),
   createTransport: vi.fn((_options: TransportOptions) => ({ transport: {} })),
   runnerBinary: "",
+  usageCapture: vi.fn(async (receipt: unknown) => receipt),
+  producerCapture: vi.fn(async (_event: unknown) => undefined),
+  events: [] as Array<{ eventType: string }>,
 }));
 
 // Same HTTP/service doubles as agent-adapter-validation-routes.test.ts. The
@@ -77,6 +83,7 @@ vi.mock("../services/native-runtime/native-controller-recovery.js", async import
 vi.mock("../services/native-runtime/current-wake-comments.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/native-runtime/current-wake-comments.js")>(),
   resolveCurrentWakeCommentsBinding: async () => null,
+  assertCurrentWakeCommentsRead: async () => undefined,
 }));
 vi.mock("../services/native-runtime/native-codex-runner.js", () => ({
   resolvePaperclipRunnerBinary: () => mocks.runnerBinary,
@@ -85,7 +92,42 @@ vi.mock("../services/native-runtime/native-codex-runner.js", () => ({
   verifiedBundledRemoteRunnerBinary: async () => mocks.runnerBinary,
 }));
 
-import { createRunnerdBackend, sha256DirectoryTree } from "../services/native-runtime/native-session-executor.js";
+// Persistence is an in-memory port; executor, runnerd backend, native runtime
+// and facade driver remain real. As in the executor suite, no durable recovery
+// or DB integration claim is made by this fake-runnerd attempt harness.
+vi.mock("../services/usage-receipts.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/usage-receipts.js")>(),
+  createRunUsageRecorder: async () => ({ capture: mocks.usageCapture }),
+}));
+vi.mock("../services/native-runtime/native-runner-file-handoff.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/native-runtime/native-runner-file-handoff.js")>(),
+  stageNativeRunnerWakeAttachments: async () => ({ attachments: [], cleanup: async () => undefined }),
+  renderNativeRunnerStagedAttachmentPrompt: () => "",
+}));
+vi.mock("../services/native-runtime/native-usage-delivery.js", () => ({
+  createNativeUsageDelivery: vi.fn(async () => ({ capture: mocks.producerCapture })),
+}));
+vi.mock("../services/native-runtime/paperclip-control-plane-port.js", async importOriginal => {
+  const original = await importOriginal<typeof import("../services/native-runtime/paperclip-control-plane-port.js")>();
+  return { ...original, PaperclipControlPlanePort: class {
+    cursor = 0;
+    constructor(_db: unknown, _binding: unknown,
+      readonly options: ConstructorParameters<typeof original.PaperclipControlPlanePort>[2] = {}) {}
+    async openRun() {}
+    async loadSessionCheckpoint() { return null; }
+    async checkpointSession() {}
+    async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }
+    normalizeReplayPayload(payload: unknown) { return payload; }
+    async appendEvent(event: PrpEvent) {
+      mocks.events.push(event);
+      await this.options.onCommittedEvent?.(event, ++this.cursor);
+      return { cursor: this.cursor, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
+    }
+    async completeRun() { await this.options.onResultCommitted?.(); }
+  } };
+});
+
+import { createRunnerdBackend, executePaperclipNativeSession, sha256DirectoryTree } from "../services/native-runtime/native-session-executor.js";
 
 const agentId = "11111111-1111-4111-8111-111111111111";
 const companyId = "10000000-0000-4000-8000-000000000001";
@@ -149,6 +191,9 @@ async function patchSavedPi() {
 function executionFor(saved: { adapterConfig: Record<string, unknown> }) {
   const profile = resolvePaperclipRunnerProviderProfile(saved.adapterConfig, { companyId });
   const provider = resolvePaperclipRunnerNativeProviderInput({ companyId, backend: profile.backend, adapterConfig: saved.adapterConfig });
+  const context = nativeRuntimeContextFixture();
+  context.instructions.bundle.rootPath = root;
+  context.aggregateDigest = canonicalNativeRuntimeContextDigest(context);
   return buildNativeExecutionInput({
     ...provider, companyId, agentId, runId: randomUUID(), normalizedSessionId: randomUUID(),
     issue: { id: "30000000-0000-4000-8000-000000000003", identifier: "PI-SERVER-1", title: "Native Pi server path", description: null, workMode: "standard" },
@@ -157,7 +202,7 @@ function executionFor(saved: { adapterConfig: Record<string, unknown> }) {
     lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
     completionContract: { id: "50000000-0000-4000-8000-000000000005", sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
       contract: { revision: "1", objective: "Preserve the selected provider", criteria: [{ id: "launch", requirement: "Launch the selected harness" }] } },
-    runtimeContext: nativeRuntimeContextFixture(),
+    runtimeContext: context,
   });
 }
 
@@ -215,7 +260,11 @@ async function providerPack() {
 
 beforeEach(async () => {
   vi.clearAllMocks();
+  mocks.events = [];
+  mocks.createBackend.mockImplementation(() => ({ kind: "test" }));
+  mocks.createTransport.mockImplementation(() => ({ transport: {} }));
   root = await mkdtemp(join(tmpdir(), "native-pi-rpc-server-path-"));
+  await writeFile(join(root, "AGENTS.md"), "X");
   vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", join(root, "runner-state"));
   vi.stubEnv("PAPERCLIP_HOME", join(root, "paperclip-home"));
   vi.stubEnv("PAPERCLIP_ACPX_CANDIDATE_ADMISSION", undefined);
@@ -328,6 +377,100 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
     expect(launch.acpxAgent).toBeUndefined();
     expect(launch.piCommand).toBeUndefined();
     expect(launch.piProxyPath).toBeUndefined();
+  });
+});
+
+// Same leaseDb shape used by native-session-executor.test.ts full attempts.
+function attemptDb(execution: ReturnType<typeof executionFor>): Db {
+  const rows = new Map<unknown, unknown[]>([
+    [nativeRunFinalizations, [{ ...execution.binding, phase: "observed", attempt: 0, leaseOwner: null, leaseExpiresAt: null, resultId: null }]],
+    [heartbeatRuns, [{ id: execution.binding.runId, companyId, agentId,
+      nativeIssueId: execution.binding.issueId, nativeSessionId: execution.session.normalizedSessionId,
+      runnerInstanceId: "runner", completionContractId: execution.completionContract.id,
+      completionContractSha256: execution.completionContract.sha256, resultJson: {}, runnerProfileJson: {}, runtimeMode: "native", status: "running" }]],
+    [issues, [{ id: execution.binding.issueId, companyId, assigneeAgentId: agentId,
+      status: "todo", executionRunId: execution.binding.runId, checkoutRunId: null }]],
+    [budgetReservations, [{ id: "held-reservation" }]], [activityLog, []], [heartbeatRunEvents, []],
+  ]);
+  const query = (values: unknown[]) => {
+    const result = Promise.resolve(values);
+    const q: any = { then: result.then.bind(result), from: (table: unknown) => query(rows.get(table) ?? []),
+      leftJoin: () => q, where: () => q, orderBy: () => q, for: () => q, limit: () => q,
+      returning: async () => values, onConflictDoUpdate: () => q, onConflictDoNothing: () => q };
+    return q;
+  };
+  const db: any = {
+    select: () => query([]), update: () => ({ set: () => query([{ runId: execution.binding.runId, nextEventSeq: 2 }]) }),
+    insert: () => ({ values: (value: unknown) => query([value]) }), execute: async () => [],
+    transaction: async (operation: (tx: Db) => Promise<unknown>) => operation(db),
+  };
+  return db;
+}
+
+// Keep reason: the recorded hq-test native attempt gate and silent accounting
+// omissions. Only provider transport and persistence are doubles, not execution.
+describe("native Pi RPC complete executor attempts", () => {
+  it.each(["local", "remote sandbox"] as const)("%s: starts provider work and completes a real native turn with usage", async target => {
+    const saved = await patchSavedPi();
+    const execution = executionFor(saved);
+    const actual = await vi.importActual<typeof import("../vendor/paperclip-runner/index.js")>("../vendor/paperclip-runner/index.js");
+    const { rehydrateRunnerdUsageNotification } = await import("@paperclipai/paperclip-runner/live");
+    const result = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Native Pi attempt completed.",
+      completionClaim: { contractRevision: "1", objectiveSatisfied: true,
+        criteria: [{ criterionId: "launch", status: "satisfied", evidenceRefs: [] }], remainingWork: [] },
+      evidence: [], verification: [{ commandOrCheck: "fake runnerd native turn", status: "passed" }], attentionRequests: [], artifacts: [] };
+    let transport: FakeCodexTransport | undefined;
+    mocks.createBackend.mockImplementation((input, options) => actual.createNativeSessionBackend(input as never, options) as never);
+    mocks.createTransport.mockImplementation(options => {
+      class PiRunnerdTransport extends FakeCodexTransport {
+        override async request(method: string, params: Record<string, unknown>) {
+          const response = await super.request(method, params);
+          if (method === "thread/start" || method === "thread/resume") {
+            return { ...response, model: piConfig.model, cwd: options.workingDirectory,
+              thread: { ...(response.thread as object), cwd: options.workingDirectory } };
+          }
+          if (method === "turn/start") {
+            const usage = rehydrateRunnerdUsageNotification({ provider: "pi_rpc", runDeltaAvailable: true,
+              runDelta: { inputTokens: 120, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, providerCostUsd: 0.25 },
+              cumulative: { inputTokens: 120, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, providerCostUsd: 0.25 } }, this.threadId, "turn-1");
+            queueMicrotask(() => {
+              this.push("turn/started", { threadId: this.threadId, turn: { id: "turn-1", status: "inProgress" } });
+              this.push("thread/tokenUsage/updated", usage);
+              this.push("paperclip/runResult", { threadId: this.threadId, turnId: "turn-1", result });
+              this.push("turn/completed", { threadId: this.threadId, turn: { id: "turn-1", status: "completed", items: [] } });
+            });
+          }
+          return response;
+        }
+      }
+      transport = new PiRunnerdTransport();
+      return { transport } as never;
+    });
+    const remote = target === "remote sandbox" ? await providerPack() : null;
+    const execute = vi.fn(async (command: { command: string; args?: string[] }) => ({ exitCode: 0, signal: null, timedOut: false, stderr: "",
+      stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+        durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+      }) : command.args?.[0] === "--version" ? "1.18.34\n" : "" }));
+    const outcome = await executePaperclipNativeSession({ db: attemptDb(execution), execution, useRunnerd: true, runnerInstanceId: "runner",
+      billingIdentity: { provider: "anthropic", biller: "anthropic", billingType: "metered_api" },
+      ...(remote ? { runnerIngressAuthorized: true, runnerRemoteBinaryPath: mocks.runnerBinary, runnerRemoteProviderPackPath: remote.packRoot,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "environment", leaseId: "lease",
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn: async () => undefined } } as never,
+      } : { runnerExecutionTarget: { kind: "local" as const } }),
+    });
+    const providerWorkStarted = transport?.calls.some(call => call.method === "turn/start") === true
+      && mocks.events.some(event => event.eventType === "turn.started");
+    expect(providerWorkStarted).toBe(true);
+    expect(mocks.events.some(event => event.eventType === "turn.completed")).toBe(true);
+    expect(outcome).toMatchObject({ exitCode: 0, usageComplete: true, usage: { inputTokens: 120, outputTokens: 10 }, costUsdExact: "0.250000000" });
+    expect(outcome.resultJson).toMatchObject({ nativeTerminal: { runTerminalState: "succeeded", turnTerminalState: "completed" } });
+    expect(mocks.createTransport.mock.calls.at(-1)![0]).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel: "xhigh", lifecyclePolicy: { mode: "warm" } });
+    if (remote) {
+      const { createNativeUsageDelivery } = await import("../services/native-runtime/native-usage-delivery.js");
+      expect(createNativeUsageDelivery).toHaveBeenCalledOnce();
+      expect(mocks.createTransport.mock.calls.at(-1)![0].onAccountingEvent).toBeTypeOf("function");
+    }
   });
 });
 

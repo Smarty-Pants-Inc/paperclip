@@ -114,7 +114,7 @@ async function captureLateUsageForOwner(db: Db, input: NativeUsageDeliveryInput,
 function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sourceId: string,
   saved: Awaited<ReturnType<typeof loadNativeUsageReceipts>>, verifySaved = false, terminalAcknowledged = false) {
   const accepted = new Map<string, UsageReceiptEnvelope>();
-  const turnAccounting = ["opencode", "acpx"].includes(input.provider.kind) ? createNativeTurnAccounting(input.provider) : null;
+  const turnAccounting = ["opencode", "acpx", "pi_rpc"].includes(input.provider.kind) ? createNativeTurnAccounting(input.provider) : null;
   let observedUsage: Record<string, unknown> | null = null;
   let observedTurn: string | undefined;
   let activeProviderTurn: string | undefined;
