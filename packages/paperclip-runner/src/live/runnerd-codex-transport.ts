@@ -3764,7 +3764,10 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     return selected;
   }
   if (input.provider === "pi_rpc") {
-    const selected = createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env;
+    const selected = { ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env };
+    // Native Pi bypasses ACPX's home sandbox. Preserve only the explicit
+    // server-provided home; PiRpcDriver validates it at the final spawn boundary.
+    if (input.options.environment?.AGENT_HOME !== undefined) selected.AGENT_HOME = input.options.environment.AGENT_HOME;
     return { ...selected, ...Object.fromEntries(PI_SIDECAR_PROVIDER_ROUTE_NAMES.flatMap(name => {
       const value = input.options.environment?.[name]; return value === undefined ? [] : [[name, value]];
     })), ...(input.options.environment?.PI_CODING_AGENT_DIR ? { PI_CODING_AGENT_DIR: input.options.environment.PI_CODING_AGENT_DIR } : {}),

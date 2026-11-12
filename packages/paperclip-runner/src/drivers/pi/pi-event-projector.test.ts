@@ -54,6 +54,32 @@ describe("real Pi 1.5.2 RPC -> canonical events -> existing reducer/transcript",
 });
 
 describe("large native tool output projection (synthetic incident regression)", () => {
+  it.each([262145, 1170000])("bounds only the known toolcap custom display body (%s bytes)", bytes => {
+    // Shape from the lead's independent-probe.mts; not a production capture.
+    const input = { type: "entry_appended", entry: { type: "custom", customType: "tool-context-guard-full", data: { fullOutput: "x".repeat(bytes) } } };
+    const serialized = JSON.stringify(input);
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(events).toMatchObject([{ eventType: "harness.diagnostic", payload: { code: "pi_native_activity" }, debug: { piProjection: { truncated: true, recordBytes: Buffer.byteLength(serialized), recordSha256: createHash("sha256").update(serialized).digest("hex") } } }]);
+    expect(JSON.stringify(input)).toBe(serialized);
+    expect(Buffer.byteLength(JSON.stringify(events))).toBeLessThan(256 * 1024);
+    expect(JSON.stringify(events)).not.toContain("fullOutput");
+    for (const other of [
+      { ...input, args: { command: "x".repeat(bytes) } },
+      { ...input, entry: { ...input.entry, data: { ...input.entry.data, control: "x".repeat(bytes) } } },
+      { ...input, entry: { ...input.entry, customType: "unrecognized" } },
+    ]) expect(() => createPiEventProjector({ runId: "run", turnId: "turn" }).project(other)).toThrow(/pi_projection_record_limit/);
+  });
+  it.each(["tool_execution_end", "message_end"])("normalizes native Pi truncation details on %s without changing the native journal", type => {
+    const result = { role: "toolResult", toolCallId: "native-truncation", toolName: "bash", content: [{ type: "text", text: "native bounded output" }], details: { truncation: { truncated: true }, fullOutputPath: "/native/spill" }, structuredContent: { exit_code: 0 } };
+    const input = type === "message_end" ? { type, message: result } : { type, toolCallId: result.toolCallId, toolName: result.toolName, result };
+    const serialized = JSON.stringify(input);
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(events.at(-1)?.payload).toMatchObject({ output: "native bounded output", outputTruncated: true, exitCode: 0 });
+    expect(JSON.stringify(input)).toBe(serialized);
+    expect(result.details.fullOutputPath).toBe("/native/spill");
+    expect(JSON.stringify(events)).not.toContain("/native/spill");
+    expect(events.some(event => event.eventType.startsWith("artifact."))).toBe(false);
+  });
   it("preserves a safe small escaped record exactly instead of applying a blanket JSON text cap", () => {
     const body = "\\".repeat(50000);
     const input = { type: "tool_execution_end", toolCallId: "ordinary", toolName: "bash", isError: false, result: { content: [{ type: "text", text: body }] } };
