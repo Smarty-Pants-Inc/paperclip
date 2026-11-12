@@ -201,6 +201,31 @@ describe("F087 mandatory in-process child bridge (trust boundary)", () => {
     expect(f.child.aborts).toBe(1);
   });
 
+  it("does not authorize a native start before the host has started a child turn", async () => {
+    const h = host();
+    const scope = createSubagentScope({ origin, closure, sink: h.sink });
+    const prepared = await scope.prepare({ roleText, selection: selection() }, catalog);
+    const child = new ControlledChild("not-yet-started");
+    await installChildBridge(child.api, consumeChildBridgeLease(prepared.options.extensionBindings), async () => {});
+    await child.emit("session_start");
+    expect(await child.call()).toMatchObject({ block: true });
+    expect(child.effects).toEqual([]);
+    await scope.revoke();
+  });
+
+  it("keeps failed abort and active shutdown uncertain instead of inventing Stop success", async () => {
+    const f = await fixture();
+    await f.scope.revoke();
+    await f.child.emit("session_shutdown");
+    expect(f.scope.stopReceipt()).toMatchObject({ status: "abort-requested", unconfirmedChildSessions: ["child-session"] });
+    const h = host();
+    const scope = createSubagentScope({ origin, closure, sink: h.sink });
+    const prepared = await scope.prepare({ roleText, selection: selection() }, catalog);
+    const lease = consumeChildBridgeLease(prepared.options.extensionBindings);
+    lease.attach("abort-failed", async () => { throw new Error("child abort unavailable"); });
+    expect(await scope.revoke()).toMatchObject({ status: "uncertain", unconfirmedChildSessions: ["abort-failed"], errors: ["abort-failed: child abort unavailable"] });
+  });
+
   it("revocation during host ACK cannot admit a tool or a delayed spawn", async () => {
     const f = await fixture();
     f.sink.toolExecutionStart = async () => { await f.scope.revoke(); return true; };
