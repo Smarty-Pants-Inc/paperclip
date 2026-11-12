@@ -11,6 +11,7 @@ import { basename, dirname, join, relative } from "node:path";
 import { expect, it, vi } from "vitest";
 import { canonicalNativeRuntimeContextDigest } from "../contracts/runtime-context.js";
 import { paperclipSemanticAction } from "../catalog/semantic-action-catalog.js";
+import { PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA, PRP_COMPLETION_TOOL_DESCRIPTION } from "../contracts/completion-result.js";
 import { createRunnerdCodexTransport } from "./runnerd-codex-transport.js";
 const rec = (v: any): Record<string, any> => v && typeof v === "object" ? v : {};
 const sha = (v: string | Buffer) => createHash("sha256").update(v).digest("hex");
@@ -59,8 +60,13 @@ const calls: Array<{ name: string; args: Record<string, any> }> = [
   { name: "call_api", args: { operationId: "GET /api/goals/{id}", pathParams: { id: "10000000-0000-4000-8000-000000000001" } } },
 ];
 const tools = calls.map(c => { const d = paperclipSemanticAction(c.name as Parameters<typeof paperclipSemanticAction>[0]); if (!d) throw new Error(`canonical tool absent: ${c.name}`); return { name: c.name, description: d.description, inputSchema: structuredClone(d.inputSchema) }; });
-const scenarios = process.env.PI_NESTED_CASES?.split(",") ?? ["nested-four-bash"];
+// Adopt the image1b canonical completion fixture, not a generic ACK-shaped tool.
+const completionContract = { revision: "1", criterionIds: ["native-proof"] };
+const finishInput = { reportedWorkDisposition: "done", summary: "Local native proof complete.", completionClaim: { contractRevision: "1", objectiveSatisfied: true, criteria: [{ criterionId: "native-proof", status: "satisfied", evidenceRefs: ["native:local-proof"] }], remainingWork: [] }, evidence: [{ ref: "native:local-proof" }], verification: [] };
+const finishTools = [{ name: "paperclip_finish", description: PRP_COMPLETION_TOOL_DESCRIPTION, inputSchema: structuredClone(PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA) }];
+const scenarios = process.env.PI_NESTED_CASES?.split(",") ?? ["nested-four-bash", "finish-warm"];
 it.skipIf(!pi || !process.env.PAPERCLIP_RUNNERD_PATH).each(scenarios)("actual Rust/Pi native codemode callback %s", async scenario => {
+  const finishWarm = scenario === "finish-warm", dynamicTools = finishWarm ? finishTools : tools;
   const evidence = process.env.PI_NESTED_EVIDENCE; if (!evidence) throw new Error("PI_NESTED_EVIDENCE must name a private persistent attempt directory");
   await mkdir(evidence, { recursive: true });
   // Allocate the complete raw run inside persistent evidence, outside test-env cleanup.
@@ -87,7 +93,16 @@ it.skipIf(!pi || !process.env.PAPERCLIP_RUNNERD_PATH).each(scenarios)("actual Ru
       const emitTool = (index: number, id: string, name: string, input: any) => { event("content_block_start", { index, content_block: { type: "tool_use", id, name, input: {} } }); event("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }); event("content_block_stop", { index }); };
       const last = body.messages.at(-1), results = Array.isArray(last.content) ? last.content.filter((v: any) => v.type === "tool_result") : [];
       if (results.length) {
-        item.returned = results;
+        item.returned = results; item.returnedAtMs = Date.now();
+        if (finishWarm) {
+          expect(results).toHaveLength(1); expect(results[0].tool_use_id).toBe(`native-finish-${activeStep}`);
+          expect(results[0].is_error ?? false).toBe(false);
+          const content = results[0].content;
+          const text = typeof content === "string" ? content : content.filter((v: any) => v.type === "text").map((v: any) => v.text).join("");
+          expect(JSON.parse(text)).toEqual({ accepted: true });
+          item.stateAtNativeReturn = JSON.parse(readFileSync(join(root, "runner-state/runner/codex-provider-state.json"), "utf8"));
+          expect(item.stateAtNativeReturn.toolBridge.pending).toEqual({});
+        }
         event("content_block_start", { index: 0, content_block: { type: "text", text: "" } }); event("content_block_delta", { index: 0, delta: { type: "text_delta", text: "All native results consumed; settle normally." } }); event("content_block_stop", { index: 0 });
         event("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } });
       } else {
@@ -97,11 +112,25 @@ it.skipIf(!pi || !process.env.PAPERCLIP_RUNNERD_PATH).each(scenarios)("actual Ru
         // Pi rewrites process.title/argv to `pi`; bind its exact spawn receipt, not a name match.
         const spawns = readdirSync(root).filter(p => /^proxy-child-\d+\.lifecycle\.jsonl$/.test(p)).flatMap(p => jsonLines(join(root, p))).filter(p => p.command === proof.piCommand);
         expect(spawns).toHaveLength(1); proof.piSpawn = spawns[0];
-        proof.piBeforeCalls = identity(proof.piSpawn.pid); expect(proof.piBeforeCalls).not.toBeNull();
+        const currentPi = identity(proof.piSpawn.pid);
+        if (finishWarm && activeStep) {
+          expect(currentPi?.birth).toBe(proof.piBeforeCalls.birth);
+          expect(currentPi?.pid).toBe(proof.piBeforeCalls.pid);
+          expect(proof.beforeCalls.runner.birth).toBe(proof.phases[0].afterTurn.runner.birth);
+          expect(proof.beforeCalls.runner.pid).toBe(proof.phases[0].afterTurn.runner.pid);
+        }
+        proof.piBeforeCalls = currentPi; expect(proof.piBeforeCalls).not.toBeNull();
         expect(proof.piBeforeCalls.birth).toBe(proof.piSpawn.birth.slice(proof.piSpawn.birth.lastIndexOf(")") + 2).split(" ")[19]);
         expect(proof.beforeCalls.descendants.some((p: any) => p.pid === proof.piBeforeCalls.pid && p.birth === proof.piBeforeCalls.birth)).toBe(true);
         expect(proof.piBeforeCalls.state).not.toBe("Z");
-        if (scenario === "top-serial") { const c = calls[activeStep]!; emitTool(0, `top-${activeStep}`, c.name, c.args); }
+        if (finishWarm) {
+          expect(names).toContain("paperclip_finish");
+          const definition = body.tools.find((v: any) => v.name === "paperclip_finish");
+          const schema = PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA;
+          expect(definition.input_schema).toEqual({ type: schema.type, properties: schema.properties, required: schema.required });
+          emitTool(0, `native-finish-${activeStep}`, "paperclip_finish", structuredClone(finishInput));
+        }
+        else if (scenario === "top-serial") { const c = calls[activeStep]!; emitTool(0, `top-${activeStep}`, c.name, c.args); }
         else {
           expect(names).toContain("codemode"); const selected = scenario === "nested-two" ? calls.slice(0, 2) : calls;
           const expressions = selected.map(c => `tools.${c.name}(${JSON.stringify(c.args)})`);
@@ -122,37 +151,89 @@ it.skipIf(!pi || !process.env.PAPERCLIP_RUNNERD_PATH).each(scenarios)("actual Ru
     const built = await runtime(root); proof.piSha = digest(built.command); proof.piCommand = built.command;
     proof.nodeSha = digest(process.execPath); proof.proxySha = digest(built.proxy); proof.extensionSha = digest(built.extension);
     proof.testSha = digest(join(process.cwd(), "src/live/runnerd-pi-nested-tools.integration.test.ts"));
-    const workspace = join(root, "workspace"), agent = join(root, "agent"), registered = join(root, "registered"), bundle = join(root, "bundle"), temp = join(root, "tmp");
-    await Promise.all([workspace, agent, registered, bundle, temp].map(p => mkdir(p)));
+    const workspace = join(root, "workspace"), agent = join(root, "agent"), registered = join(root, "registered"), bundle = join(root, "bundle");
+    await Promise.all([workspace, agent, registered, bundle].map(p => mkdir(p)));
     const instruction = "# Native nested P0 private fixture\nUse only fake loopback data.\n";
     await Promise.all([registered, bundle].map(p => writeFile(join(p, "AGENTS.md"), instruction)));
     // Passive observer only: no invented native events or callback authority.
     await mkdir(join(agent, "extensions"));
-    await writeFile(join(agent, "extensions/observe.js"), `import {appendFileSync} from 'node:fs'; export default function(pi){for(const type of ['tool_execution_start','tool_execution_end','tool_call','tool_result','agent_settled','extension_error'])pi.on(type,(event)=>{appendFileSync(${JSON.stringify(join(root, "native-events.jsonl"))},JSON.stringify({at:new Date().toISOString(),pid:process.pid,event})+'\\n')});}`);
+    await writeFile(join(agent, "extensions/observe.js"), `import {appendFileSync} from 'node:fs'; export default function(pi){for(const type of ['tool_execution_start','tool_execution_end','tool_call','tool_result','agent_settled','extension_error'])pi.on(type,(event)=>{appendFileSync(${JSON.stringify(join(root, "native-events.jsonl"))},JSON.stringify({at:new Date().toISOString(),atMs:Date.now(),pid:process.pid,event})+'\\n')});}`);
     await writeFile(join(agent, "settings.json"), JSON.stringify({ defaultTools: ["+codemode"] }));
     const value: any = { prompt: { revision: "p0", text: instruction, digest: sha(instruction) }, instructions: { entryPath: "AGENTS.md", bundle: { schema: "paperclip.runtime-asset.v1", digest: sha(instruction), manifestDigest: sha(instruction), rootPath: bundle, fileCount: 1, totalBytes: Buffer.byteLength(instruction) }, workingCopy: { kind: "agent_files", rootPath: registered, entryPath: "AGENTS.md" } }, skills: [], mcp: { assignmentSetId: "none", digest: sha("none"), bindingId: null } };
     const grant = { ...value, aggregateDigest: canonicalNativeRuntimeContextDigest(value) };
     ({ transport } = createRunnerdCodexTransport({ provider: "pi_rpc", runnerBinary: process.env.PAPERCLIP_RUNNERD_PATH, stateDirectory: join(root, "runner-state"), sourceCodexHome: "", providerNodeCommand: process.execPath, providerNodeCommandSha256: digest(process.execPath), piCommand: built.command, piCommandSha256: digest(built.command), piProxyPath: built.proxy, piProxySha256: digest(built.proxy), piRuntimeDirectory: join(root, "pi-runtime"), piRpcThinkingLevel: "xhigh", baseInstructions: instruction, runtimeContext: grant, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60000 },
       prpIdentity: { runnerInstanceId: `runner-${scenario}`, environmentLeaseId: `lease-${scenario}`, runId: `run-${scenario}`, normalizedSessionId: `session-${scenario}`, turnId: `turn-${scenario}`, itemId: `item-${scenario}` },
-      environment: { PATH: process.env.PATH, HOME: root, TMPDIR: temp, AGENT_HOME: registered, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker", HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1,localhost" },
+      environment: { PATH: process.env.PATH, HOME: root, TMPDIR: process.env.TMPDIR, AGENT_HOME: registered, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker", HTTP_PROXY: "", HTTPS_PROXY: "", ALL_PROXY: "", NO_PROXY: "127.0.0.1,localhost" },
       onDiagnostic: s => { diagnostics.push(s); appendFileSync(join(root, "diagnostics.txt"), s + "\n"); }, onAccountingEvent: async e => { accounting.push(e); appendFileSync(join(root, "accounting.jsonl"), JSON.stringify(e) + "\n"); },
     }));
-    transport.setServerRequestHandler(async request => { handlerCalls.push({ at: new Date().toISOString(), request }); appendFileSync(join(root, "handler-calls.jsonl"), JSON.stringify(handlerCalls.at(-1)) + "\n"); const name = String(request.params.tool); expect(calls.map(c => c.name)).toContain(name); const result = { fixture: true, tool: name, marker: `returned-${name}`, data: name === "list_agents" ? { actors: [] } : name === "list_projects" ? { projects: [] } : name === "search_tasks" ? { tasks: [] } : { id: calls[3]!.args.pathParams!.id } }; return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(result) }] }; });
+    transport.setServerRequestHandler(async request => { handlerCalls.push({ at: new Date().toISOString(), request }); appendFileSync(join(root, "handler-calls.jsonl"), JSON.stringify(handlerCalls.at(-1)) + "\n"); const name = String(request.params.tool);
+      if (finishWarm) {
+        expect(request.method).toBe("item/tool/call");
+        expect(request.params).toMatchObject({ tool: "paperclip_finish", callId: `native-finish-${activeStep}`, arguments: finishInput });
+        expect(request.paperclipTrace?.sourceEventId).toBeTypeOf("string");
+        expect(request.paperclipTrace?.sourceEventType).toBe("semantic_tool.input");
+        // Authenticated controller authority is the sole fixture. Real transport
+        // submits semantic_tool.result; Rust admits terminal authority and RFL.
+        return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ accepted: true }) }] };
+      }
+      expect(calls.map(c => c.name)).toContain(name); const result = { fixture: true, tool: name, marker: `returned-${name}`, data: name === "list_agents" ? { actors: [] } : name === "list_projects" ? { projects: [] } : name === "search_tasks" ? { tasks: [] } : { id: calls[3]!.args.pathParams!.id } }; return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify(result) }] }; });
     // Cold private SDK copy/pack qualification is not a product latency assertion.
-    const opened = await within(transport.request("thread/start", { cwd: workspace, model: "paperclip/claude-opus-5-5", dynamicTools: tools }), 60000); proof.opened = opened;
+    const opened = await within(transport.request("thread/start", { cwd: workspace, model: "paperclip/claude-opus-5-5", dynamicTools, ...(finishWarm ? { completionContract } : {}) }), 60000); proof.opened = opened;
     const runnerPid = transport.processInfo!().pid!; owned = [identity(runnerPid), ...descendants(runnerPid)].filter(Boolean); proof.initialOwned = owned;
     const iterator = transport.notifications()[Symbol.asyncIterator]();
-    const count = scenario === "top-serial" ? 4 : 1;
+    const count = finishWarm ? 2 : scenario === "top-serial" ? 4 : 1;
     for (let i = 0; i < count; i++) {
       activeStep = i; turnRequests = 0;
-      if (i) await within(transport.attachRun!({ runId: `run-${scenario}-${i}`, turnId: `turn-${scenario}-${i}`, itemId: `item-${scenario}-${i}`, currentRunGrant: { instructions: instruction, runtimeContext: grant }, dynamicTools: tools }));
+      if (i) {
+        const atMs = Date.now(), before = { runner: identity(runnerPid), pi: identity(proof.piBeforeCalls.pid) };
+        const attached = await within(transport.attachRun!({ runId: `run-${scenario}-${i}`, turnId: `turn-${scenario}-${i}`, itemId: `item-${scenario}-${i}`, currentRunGrant: { instructions: instruction, runtimeContext: grant }, dynamicTools, ...(finishWarm ? { completionContract } : {}) }));
+        if (finishWarm) {
+          proof.warmAttach = { startMs: atMs, endMs: Date.now(), durationMs: Date.now() - atMs, attached, before, after: { runner: identity(runnerPid), pi: identity(proof.piBeforeCalls.pid) } };
+          expect(proof.warmAttach.after.runner?.birth).toBe(before.runner.birth);
+          expect(proof.warmAttach.after.pi?.birth).toBe(before.pi.birth);
+          expect(JSON.parse(readFileSync(join(root, "runner-state/runner/codex-provider-state.json"), "utf8")).toolBridge.pending).toEqual({});
+        }
+      }
       const started = await within(transport.request("turn/start", { input: [{ type: "text", text: `Run exact ${scenario} step ${i}` }] })); proof.phases.push({ started });
       for (;;) { const n = await within(iterator.next(), 20000); if (n.done) throw new Error("native stream ended"); notifications.push(n.value); appendFileSync(join(root, "notifications.jsonl"), JSON.stringify(n.value) + "\n"); if (n.value.method === "turn/completed") { expect(n.value.params.status ?? rec(n.value.params.turn).status).toBe("completed"); proof.phases.at(-1).terminal = n.value; break; } if (n.value.method === "turn/failed") throw new Error(JSON.stringify(n.value)); }
       proof.phases.at(-1).completed = true;
+      if (finishWarm) {
+        const phase = proof.phases.at(-1), callId = `native-finish-${i}`;
+        await vi.waitFor(() => {
+          phase.state = JSON.parse(readFileSync(join(root, "runner-state/runner/codex-provider-state.json"), "utf8"));
+          expect(phase.state.toolBridge.pending).toEqual({});
+          expect(phase.state.pendingEvents).toEqual([]); expect(phase.state.queuedEvents).toEqual([]);
+          expect(phase.state.activeProviderTurnId).toBeNull(); expect(phase.state.completedTurnAuthoritative).toBe(true);
+          phase.control = JSON.parse(readFileSync(join(root, "runner-state/control-plane/control-plane-state.json"), "utf8"));
+          expect(phase.control.commands.every((c: any) => c.status !== "pending")).toBe(true);
+        }, { timeout: 5000, interval: 50 });
+        expect(phase.state.toolBridge.settledResults[callId]).toEqual({ call: { callId, operationId: "paperclip_finish", input: finishInput }, result: { callId, operationId: "paperclip_finish", result: { accepted: true }, isError: false } });
+        const native = jsonLines(join(root, "native-events.jsonl"));
+        const starts = native.filter(e => e.event.type === "tool_execution_start" && e.event.toolCallId === callId);
+        const ends = native.filter(e => e.event.type === "tool_execution_end" && e.event.toolCallId === callId);
+        expect(starts).toHaveLength(1); expect(ends).toHaveLength(1);
+        expect(starts[0].event.toolName).toBe("paperclip_finish"); expect(ends[0].event.isError).toBe(false);
+        expect(starts[0].pid).toBe(proof.piBeforeCalls.pid); expect(ends[0].pid).toBe(proof.piBeforeCalls.pid);
+        const text = ends[0].event.result.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("");
+        expect(JSON.parse(text)).toEqual({ accepted: true });
+        const returned = requests.find(r => r.returned?.some((v: any) => v.tool_use_id === callId)); expect(returned).toBeDefined();
+        phase.finish = { start: starts[0], end: ends[0], returnedAtMs: returned.returnedAtMs, nativeDurationMs: ends[0].atMs - starts[0].atMs, returnedDurationMs: returned.returnedAtMs - starts[0].atMs, rpcResult: ends[0].event.result, modelResult: returned.returned, pendingAtReturn: returned.stateAtNativeReturn.toolBridge.pending };
+        expect(phase.finish.nativeDurationMs).toBeGreaterThanOrEqual(0); expect(phase.finish.nativeDurationMs).toBeLessThan(1000);
+        expect(phase.finish.returnedDurationMs).toBeGreaterThanOrEqual(phase.finish.nativeDurationMs); expect(phase.finish.returnedDurationMs).toBeLessThan(1000);
+        const terminal = accounting.filter(e => e.eventType === "run.terminal").map(e => e.payload);
+        expect(terminal).toHaveLength(i + 1);
+        expect(terminal[i]).toEqual({ schema: "paperclip.prp.terminal.v1", provider: "pi_rpc", turnTerminalState: "completed", runTerminalState: "succeeded", reportedWorkDisposition: "done" });
+        phase.afterTurn = { runner: identity(runnerPid), pi: identity(proof.piBeforeCalls.pid) };
+        expect(phase.afterTurn.runner?.birth).toBe(proof.initialOwned[0].birth);
+        expect(phase.afterTurn.pi?.birth).toBe(proof.piBeforeCalls.birth);
+        expect(phase.afterTurn.pi?.state).not.toBe("Z");
+        const settled = native.filter(e => e.event.type === "agent_settled");
+        expect(settled).toHaveLength(i + 1); expect(settled[i].event.aborted).toBe(false);
+      }
     }
     const returns = requests.flatMap(r => r.returned ?? []); proof.returned = returns;
-    expect(handlerCalls).toHaveLength(scenario === "nested-two" ? 2 : 4);
-    for (const c of (scenario === "nested-two" ? calls.slice(0, 2) : calls)) expect(JSON.stringify(returns)).toContain(`returned-${c.name}`);
+    expect(handlerCalls).toHaveLength(finishWarm ? 2 : scenario === "nested-two" ? 2 : 4);
+    for (const c of (finishWarm ? [] : scenario === "nested-two" ? calls.slice(0, 2) : calls)) expect(JSON.stringify(returns)).toContain(`returned-${c.name}`);
     if (scenario === "nested-four-bash") expect(readFileSync(join(root, "bash.marker"), "utf8")).toBe("real-os-bash-marker\n");
     // Completion notification is the event source; wait only for its durable ACK suffix.
     await vi.waitFor(() => {
