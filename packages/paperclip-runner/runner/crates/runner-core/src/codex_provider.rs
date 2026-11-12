@@ -2281,7 +2281,11 @@ impl CodexProvider {
             )?;
             // Attachment precedes the authority claim; this admission observes
             // the claimed authority before any next-prompt bytes are sent.
-            if self.request("session.revalidate", json!({}))? != json!(true) {
+            // Revalidation runs the managed-session refresher after authority
+            // rotates. Supply the newly admitted grant, not its launch-time base.
+            if self.request("session.revalidate", json!({
+                "baseInstructions": params["baseInstructions"],
+            }))? != json!(true) {
                 return Err(LocalRunnerError::invalid("Pi post-claim admission was not acknowledged"));
             }
             Some(params)
@@ -6585,6 +6589,7 @@ done
     fn pi_attachment_turn_sends_fresh_context_before_prompt() {
         let mut provider = completion_tail_provider_with_pi_reply(false, Some("\"result\":true"));
         provider.config.provider = "pi_rpc".to_owned();
+        provider.config.instructions = "FIRST run instructions".to_owned();
         let tool = AuthorizedTool {
             operation_id: "second_run_operation".to_owned(),
             version: 1,
@@ -6619,6 +6624,10 @@ done
         let revalidate = frames.iter().position(|frame| frame["method"] == "session.revalidate").unwrap();
         let prompt = frames.iter().position(|frame| frame["method"] == "turn/start").unwrap();
         assert!(attach < revalidate && revalidate < prompt);
+        // The post-claim refresher must use the admitted attachment's grant,
+        // not the retained proxy's launch-time FIRST instructions.
+        assert_eq!(frames[revalidate]["params"]["baseInstructions"], start["params"]["baseInstructions"]);
+        assert!(!frames[revalidate]["params"]["baseInstructions"].as_str().unwrap().contains("FIRST"));
         for key in ["baseInstructions", "dynamicTools", "runtimeContext", "paperclipRunId"] {
             assert_eq!(frames[attach]["params"][key], start["params"][key], "{key}");
         }
