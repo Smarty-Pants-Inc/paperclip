@@ -265,9 +265,6 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
 
   async function pumpEvents(opened: PiRpcProxySession): Promise<void> {
     for await (const event of opened.events()) {
-      // Never project an old resident continuation onto the receiver's current
-      // run. Test each event independently: a later current failure is valid.
-      if (event.runId !== activeRunId && event.eventType !== "runtime_request.created") continue;
       const payload = piPartialToolPayload(event.eventType, record(event.payload));
       const toolActivity = openCodeProxyToolNotification({
         eventType: event.eventType,
@@ -357,7 +354,6 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       } else if (event.eventType === "session.failed") {
         // Rust maps `error` to provider.notice.recorded, retaining error.message
         // even when there is no active turn. Keep captured IDs, never invent one.
-        if (activeTurnId && event.turnId && event.turnId !== activeTurnId) continue;
         send({ method: "error", params: {
           threadId: opened.ids().driverSessionId,
           ...(event.turnId ? { turnId: event.turnId } : {}),
@@ -369,7 +365,6 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         event.eventType === "turn.completed" || event.eventType === "turn.failed" ||
         event.eventType === "turn.interrupted" || event.eventType === "turn.cancelled"
       ) {
-        if (activeTurnId && event.turnId && event.turnId !== activeTurnId) continue;
         send(openCodeProxyTerminalNotification({
           eventType: event.eventType,
           threadId: opened.ids().driverSessionId,

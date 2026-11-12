@@ -172,22 +172,71 @@ describe("Pi RPC app-server facade proxy", () => {
       expect(usage.reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
     } finally { await proxy.close(); }
   });
-  // Keep reason: incident439 lost the actionable cause at the facade/Rust wire
-  // boundary. A stale diagnostic must not poison a later current-run failure.
-  it("forwards session failure cause to the receiver, rejects stale origin, then accepts a legitimate current failure", async () => {
+  // Keep reason: the Pi/Rust facade boundary must retain non-zero accounting.
+  // Run usage is computed after this wire boundary in runner-core's
+  // provider_events.rs (normalize_codex_notification reads total/last into
+  // usage.reported); these TypeScript proxy/driver tests do not run Rust.
+  it("emits Pi usage.reported as thread/tokenUsage/updated with non-zero total and last", async () => {
     const sink = new FakeSink();
-    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 110, "thread/start", { model: "neutral/model" });
+      const cumulative = { inputTokens: 24, outputTokens: 6, totalTokens: 30 };
+      const runDelta = { inputTokens: 12, outputTokens: 3, totalTokens: 15 };
+      session.push("usage.reported", { cumulative, runDelta, runDeltaAvailable: true }, "usage-turn");
+      await waitFor(() => sink.decoded().some(frame => frame.method === "thread/tokenUsage/updated"));
+      const frames = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
+      expect(frames).toEqual([{
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "pi-session", turnId: "usage-turn",
+          tokenUsage: { total: cumulative, last: runDelta },
+          cumulative, runDelta, runDeltaAvailable: true,
+        },
+      }]);
+    } finally { await proxy.close(); }
+  });
+
+  // Keep reason: incident439 lost the actionable cause at the facade/Rust wire
+  // boundary. Forward captured IDs; the receiver owns run/turn attribution.
+  it.each([
+    ["inactive run", "run-1"],
+    ["inactive turn", "run-2"],
+  ])("forwards session failure cause and every terminal event for an %s", async (_origin, runId) => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), {
+      async attachRun() {},
+      async startTurn() { return { turnId: "current-turn" }; },
+    });
     const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
     try {
       await request(proxy, sink, 80, "thread/start", { model: "neutral/model" });
       await request(proxy, sink, 81, "run.attach", { runId: "run-2" });
-      session.push("session.failed", { code: "pi_rpc_transport_failed", message: "OLD_ECONNREFUSED" }, "old-turn", undefined, "run-1");
-      session.push("turn.failed", { error: { code: "pi_rpc_transport_failed", message: "OLD_CONTINUATION" } }, "old-turn", undefined, "run-1");
+      await request(proxy, sink, 82, "turn/start", { input: [] });
+      session.push("session.failed", { code: "pi_rpc_transport_failed", message: "CAPTURED_ECONNREFUSED" }, "old-turn", undefined, runId);
+      const terminalTypes = ["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"];
+      for (const eventType of terminalTypes) {
+        session.push(eventType, { error: { code: "pi_rpc_transport_failed", message: "CAPTURED_CONTINUATION" } }, "old-turn", undefined, runId);
+      }
       session.push("session.failed", { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" }, undefined, undefined, "run-2");
-      await new Promise<void>(resolve => setImmediate(resolve));
-      expect(sink.frames.join("")).not.toContain("OLD_ECONNREFUSED");
-      expect(sink.frames.join("")).not.toContain("OLD_CONTINUATION");
-      expect(sink.decoded().find(frame => frame.method === "error")).toMatchObject({ params: { threadId: "pi-session", message: "CURRENT_ECONNREFUSED", error: { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" } } });
+      await waitFor(() => sink.decoded().some(frame => frame.method === "error"
+        && (frame.params as Record<string, unknown>).message === "CURRENT_ECONNREFUSED"));
+      expect(sink.decoded().filter(frame => frame.method === "error")).toEqual([
+        { method: "error", params: { threadId: "pi-session", turnId: "old-turn", message: "CAPTURED_ECONNREFUSED", error: { code: "pi_rpc_transport_failed", message: "CAPTURED_ECONNREFUSED" }, willRetry: false } },
+        { method: "error", params: { threadId: "pi-session", message: "CURRENT_ECONNREFUSED", error: { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" }, willRetry: false } },
+      ]);
+      expect(sink.decoded().filter(frame => terminalTypes.some(type => frame.method === type.replace(".", "/"))))
+        .toEqual(terminalTypes.map(type => ({
+          method: type.replace(".", "/"),
+          params: { threadId: "pi-session", turnId: "old-turn", turn: {
+            id: "old-turn", status: type.slice("turn.".length),
+            ...(type === "turn.failed" ? { error: { code: "pi_rpc_transport_failed", message: "CAPTURED_CONTINUATION" } } : {}),
+          } },
+        })));
+      expect(await request(proxy, sink, 83, "thread/read")).toMatchObject({
+        result: { thread: { turns: [{ id: "current-turn", status: "inProgress" }] } },
+      });
     } finally { await proxy.close(); }
   });
 
