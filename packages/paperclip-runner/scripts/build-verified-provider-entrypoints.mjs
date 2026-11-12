@@ -158,7 +158,7 @@ export async function bundlePiExtensions({ write = true, outputRoot = resolve(pa
       treeShaking: true, write, logLevel: "silent",
     });
     assertSelfContainedBundle(entrypoint, result);
-    if (write) await chmod(output, 0o444);
+    if (write) await chmod(output, 0o644);
     results.push({ entrypoint, result });
   }
   return results;

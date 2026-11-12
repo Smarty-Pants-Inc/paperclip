@@ -26,7 +26,7 @@ import { parseProviderPackArguments, materializeCandidateProviderPack, providerP
 import { smokeKimiProviderPack } from "./kimi-provider-pack-smoke.mjs";
 import { buildNodeStartupTimeout } from "./build-node-startup-timeout.mjs";
 import { writePortableExecutableShim, writePortableCopilotShims } from "./provider-pack-executable-shims.mjs";
-import { providerPackLibc, removeControllerArtifactsFromProviderPack, removeForeignLibcPackagesFromProviderPack } from "./provider-pack-runtime-tree.mjs";
+import { providerPackLibc, removeControllerArtifactsFromProviderPack, removeForeignLibcPackagesFromProviderPack, removePnpmStoreEntries } from "./provider-pack-runtime-tree.mjs";
 import { packContractDigest } from "./contracts/contract-fingerprints.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -124,6 +124,11 @@ try {
     throw new Error(`pnpm deploy failed with exit code ${deployed.status}`);
   }
   removeControllerArtifactsFromProviderPack(temporaryRoot);
+  // Pi loads pi-subagents from its admitted home package, never this pack.
+  // Only its process-global registration API is bundled into the host factory.
+  removePnpmStoreEntries(temporaryRoot, readdirSync(join(temporaryRoot, "node_modules/.pnpm"))
+    .filter(name => name.startsWith("pi-subagents@")));
+  rmSync(join(temporaryRoot, "node_modules/.bin/pi-subagents"), { force: true });
   const foreignLibcPackages = removeForeignLibcPackagesFromProviderPack(temporaryRoot, providerPackLibc());
   if (foreignLibcPackages.length) {
     process.stderr.write(`Removed ${foreignLibcPackages.length} provider-pack packages built for another libc: ${foreignLibcPackages.join(", ")}\n`);

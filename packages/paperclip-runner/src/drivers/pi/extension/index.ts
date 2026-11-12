@@ -405,7 +405,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
  */
 export function installPiSubagentComposition(
   pi: PiBindApi,
-  childBridgePath = fileURLToPath(new URL("./child-bridge.js", import.meta.url)),
+  childBridgePath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./subagents/child-bridge.ts" : "./child-bridge.js", import.meta.url)),
 ) {
   if (!pi.events) throw new Error("Pi subagent event bus unavailable");
   const events = pi.events;

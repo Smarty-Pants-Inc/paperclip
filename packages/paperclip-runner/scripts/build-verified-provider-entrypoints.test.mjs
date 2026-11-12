@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
-import { stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { registerRequiredChildExtensions } from "pi-subagents/required-child-extensions";
 
 import {
   bundleVerifiedProviderEntrypoints,
@@ -50,8 +54,33 @@ test("Pi host and child bridge are separate self-contained ESM entrypoints", asy
     const output = Object.values(result.metafile.outputs).find(value => value.entryPoint);
     assert.ok(output.imports.every(value => value.external), entrypoint.name);
   }
-  assert.match(bundles[0].result.outputFiles[0].text, /new URL\("\.\/child-bridge\.js", import\.meta\.url\)/);
-  assert.match(bundles[0].result.outputFiles[0].text, /pi-subagents\.required-child-extensions\.v1/);
+});
+
+test("relocated built host registers its sibling bridge in the independently loaded package registry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-built-extensions-"));
+  const keys = ["PAPERCLIP_PI_BIND_SOCKET", "PAPERCLIP_PI_BIND_INITIAL", "PAPERCLIP_PI_INSTRUCTIONS_FILE", "PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY"];
+  const prior = new Map(keys.map(key => [key, process.env[key]]));
+  const handlers = new Map();
+  const pi = { events: { on() { return () => {}; }, emit() {} }, on(name, fn) { const list = handlers.get(name) ?? []; list.push(fn); handlers.set(name, list); } };
+  const ctx = { sessionManager: { getSessionId: () => "relocated-built-parent" }, isIdle: () => true, abort() {} };
+  const emit = async name => { for (const fn of handlers.get(name) ?? []) await fn({}, ctx); };
+  try {
+    await writeFile(join(root, "package.json"), '{"type":"module"}');
+    await bundlePiExtensions({ outputRoot: root });
+    delete process.env.PAPERCLIP_PI_BIND_SOCKET; delete process.env.PAPERCLIP_PI_BIND_INITIAL;
+    process.env.PAPERCLIP_PI_INSTRUCTIONS_FILE = join(root, "instructions.md");
+    process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY = "test-host";
+    const { default: factory } = await import(pathToFileURL(join(root, "index.js")).href);
+    factory(pi); await emit("session_start");
+    const register = () => registerRequiredChildExtensions({ sessionId: ctx.sessionManager.getSessionId(), extensions: [{ id: "probe", path: join(root, "child-bridge.js") }] });
+    assert.throws(register, /already registered/);
+    await emit("session_shutdown");
+    register().dispose();
+  } finally {
+    await emit("session_shutdown");
+    for (const [key, value] of prior) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 // Package-layout regression runs in the existing verified-entrypoint test lane.
