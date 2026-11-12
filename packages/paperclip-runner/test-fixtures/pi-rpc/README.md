@@ -68,6 +68,46 @@ session, and no paid provider. This catches native input-admission failures that
 recording peers cannot reproduce. `PI_STEER_PROOF_PATH` optionally saves its
 commands, model requests, projected events and native session trace.
 
+## Dynamic callback burst regression
+
+Pi 1.5.2 executes sibling tools in parallel by default (see the pinned runtime's
+`docs/extensions.md`, **tool_call** and **Tool Definition / Execution mode**).
+`src/drivers/pi/pi-rpc-callback-hol.test.ts` drives the actual Pi child and owned
+extension through `PiRpcDriver`, using a loopback SSE peer that emits 130 ordinary
+calls, then `paperclip_finish` either in the next response or last in the same
+response. Each fake host round trip takes 200 ms. It asserts 131 successful
+native results, no callback refusals, and finish within 10 seconds, and writes
+requests, native records, the session and measured latencies when
+`PI_HOL_PROOF_DIR` is set. This is a real-runtime protocol/load regression, not
+production-organization or live-provider qualification.
+
+The host callback server allows eight ordinary dispatches plus a separate slot
+for `paperclip_finish` / `paperclip_block`. Controls retain the exact native
+announcement, authority, once-only and cancellation gates. At most eight request
+frames are read concurrently and 128 parsed calls wait for dispatch; additional
+connected peers remain paused, applying stream backpressure rather than dropping
+the ninth socket. This bounds buffered application work, not the number of
+connected OS sockets. Close drains paused, queued and active peers.
+
+Reading, announcement waiting and result writing are separately bounded. The
+host-execution deadline starts only after dispatch admission and the native
+announcement join; queue residence does not spend it. The existing extension
+and private-request **60-second overall transport deadlines remain unchanged**;
+this regression does not qualify batches whose total queue plus execution time
+exceeds that outer bound. Priority applies once a control request has been read;
+peers beyond the parsed/read budget wait for read capacity first.
+
+From the Runner package, with `PI_TEST_BINARY` pointing to a Pi 1.5.2 CLI wrapper:
+
+```bash
+PI_TEST_BINARY=/absolute/path/to/pi-1.5.2 PI_HOL_PROOF_DIR=/absolute/path/to/evidence pnpm exec vitest run src/drivers/pi/pi-rpc-callback-hol.test.ts src/drivers/pi/pi-rpc-callback-server.test.ts
+```
+
+Without `PI_TEST_BINARY`, the real-runtime cases explicitly skip; the Unix-socket
+server regressions still run. Those also cover queue residence longer than a
+host deadline, independent announcement/execution budgets, control-slot priority,
+a 300-call backpressured burst, queued cancellation and close.
+
 ## Reproduce (no provider credentials required)
 
 From `packages/paperclip-runner`, with the repo's dependencies already installed and `tsx` available:
