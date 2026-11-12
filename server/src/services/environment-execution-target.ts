@@ -1,4 +1,7 @@
 import { environmentTaskOperationSchema } from "@paperclipai/plugin-sdk";
+import { and, eq } from "drizzle-orm";
+import { environmentLeases } from "@paperclipai/db";
+import { RetainedSandboxAbsentError } from "./retained-sandbox-absent-error.js";
 import type { Db } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
@@ -224,6 +227,57 @@ function setSandboxExecSpanFailure(
   span.setStatus({ code: SPAN_STATUS_CODE_ERROR });
 }
 
+/** Exact lease-row owner, separate from the immutable Runner lease identity.
+ * A pending stop intent is reconciled by the durable cleanup path; it never
+ * becomes a successful release merely because a worker swallowed an error.
+ */
+function bindSandboxRunnerLeaseLifecycle(input: {
+  db: Db; companyId: string; environment: { id?: string; driver: string; config: Record<string, unknown> | null };
+  lease: EnvironmentLease; environmentRuntime: EnvironmentRuntimeService;
+}) {
+  const { lease, environmentRuntime: runtime } = input;
+  const environment = input.environment as Environment;
+  let releaseUncertain = false;
+  const exact = (candidate: EnvironmentLease | null | undefined): candidate is EnvironmentLease => !!candidate &&
+    candidate.id === lease.id && candidate.companyId === input.companyId && candidate.environmentId === environment.id &&
+    candidate.provider === lease.provider && candidate.providerLeaseId === lease.providerLeaseId &&
+    candidate.heartbeatRunId === lease.heartbeatRunId && candidate.executionWorkspaceId === lease.executionWorkspaceId &&
+    candidate.issueId === lease.issueId && candidate.metadata?.agentId === lease.metadata?.agentId &&
+    candidate.leasePolicy === "reuse_by_environment";
+  const acknowledged = (candidate: EnvironmentLease | null | undefined) => exact(candidate) &&
+    candidate.status === "released" && candidate.cleanupStatus === "success";
+  return {
+    releaseLease: async () => {
+      if (releaseUncertain) {
+        const [current] = await input.db.select().from(environmentLeases).where(and(
+          eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, input.companyId)));
+        if (!exact(current as EnvironmentLease)) throw new Error("native_sandbox_runner_lease_allocation_mismatch");
+        if (acknowledged(current as EnvironmentLease)) return;
+        // Ordinary release failure already wrote the durable stop-only intent.
+        // Never bypass its claim, or use destroy as a retention fallback.
+        if (current.status === "pending_cleanup") throw new Error("native_sandbox_runner_release_pending_cleanup");
+      }
+      releaseUncertain = true;
+      const driver = runtime.getDriver("sandbox");
+      if (!driver) throw new Error("native_sandbox_runner_environment_driver_unavailable");
+      const result = await driver.releaseRunLease({ environment, lease, status: "released" });
+      if (!acknowledged(result)) throw new Error("native_sandbox_runner_release_unconfirmed");
+      releaseUncertain = false;
+    },
+    resumeLease: async (): Promise<"resumed" | "unavailable"> => {
+      try {
+        const resumed = await runtime.resumeRunLease({ environment, lease,
+          ...(typeof environment.config?.runnerIdleTimeoutMs === "number" ? { warmRunnerIdleTimeoutMs: environment.config.runnerIdleTimeoutMs } : {}) });
+        if (!resumed || resumed.providerLeaseId !== lease.providerLeaseId) throw new Error("native_sandbox_runner_resume_allocation_mismatch");
+        return "resumed";
+      } catch (error) {
+        if (error instanceof RetainedSandboxAbsentError) return "unavailable";
+        throw error;
+      }
+    },
+  };
+}
+
 export async function resolveEnvironmentExecutionTarget(input: {
   db: Db;
   companyId: string;
@@ -426,6 +480,14 @@ export async function resolveEnvironmentExecutionTarget(input: {
       // binds it to the fixed observability surface. Absent keeps the no-op
       // default, so the surface stays inert on a run with no injected recorder.
       duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
+      ...(input.lease?.metadata?.runnerGuardianVersion === 1 ? { runnerGuardian: { version: 1 as const } } : {}),
+      ...(parsed.config.reuseLease === true && effectiveCapabilities?.reusableLeases === true &&
+          effectiveCapabilities.duplexCommandStream === true && input.lease && input.environmentRuntime &&
+          input.lease.companyId === input.companyId && input.lease.environmentId === input.environment.id &&
+          input.lease.id === input.leaseId && input.lease.providerLeaseId && input.lease.leasePolicy === "reuse_by_environment" &&
+          input.lease.status === "active" && input.lease.heartbeatRunId && (input.lease.executionWorkspaceId || input.lease.issueId) &&
+          typeof input.lease.metadata?.agentId === "string" && input.lease.metadata.agentId.trim()
+        ? { runnerLeaseLifecycle: bindSandboxRunnerLeaseLifecycle(input as Parameters<typeof bindSandboxRunnerLeaseLifecycle>[0]) } : {}),
       ...(effectiveCapabilities ? { effectiveCapabilities: Object.freeze({ ...effectiveCapabilities }) } : {}),
       ...(input.environmentRuntime?.getRunnerIngressEndpoint && input.lease
         ? {

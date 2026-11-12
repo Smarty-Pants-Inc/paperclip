@@ -9,6 +9,7 @@ import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
+import { configurePiNativeMcp } from "./pi-native-mcp.js";
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
@@ -20,6 +21,7 @@ import type {
   OpenHarnessSessionInput,
   PersistedHarnessSession,
 } from "../../contracts/harness-driver.js";
+import { HarnessCapabilityUnavailableError, HarnessOperationAlreadyTerminalError, HarnessStaleTurnError } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 
@@ -65,7 +67,7 @@ const PI_CAPABILITIES: NativeSessionCapabilities = {
   resume: false,
   typedEvents: true,
   providerTranscriptStreaming: true,
-  steering: false,
+  steering: true,
   queuedFollowUp: false,
   interruption: true,
   structuredResult: false,
@@ -77,7 +79,7 @@ const PI_CAPABILITIES: NativeSessionCapabilities = {
   runtimeRequestHandoff: false,
   goals: false,
   threadLineage: false,
-  unsupported: ["resume", "steering", "queuedFollowUp", "structuredResult", "runtimeRequests", "goals", "threadLineage"],
+  unsupported: ["resume", "queuedFollowUp", "structuredResult", "runtimeRequests", "goals", "threadLineage"],
 };
 
 export class PiRpcDriver implements HarnessDriver {
@@ -129,6 +131,7 @@ export class PiRpcDriver implements HarnessDriver {
       ? environment.PI_CODING_AGENT_DIR ?? join(directory, "agent")
       : piCompanySkillsAgentHome(environment);
     environment.PI_CODING_AGENT_DIR = agentHome;
+    await configurePiNativeMcp(agentHome, environment);
     await syncPiCompanySkills(agentHome, initialContext.runtimeContext);
     const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
     await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
@@ -543,6 +546,23 @@ export class PiRpcHarnessSession implements HarnessSession {
     });
   }
 
+  async steer(input: Parameters<NonNullable<HarnessSession["steer"]>>[0]): Promise<void> {
+    // The Codex executor admits active-turn steering, not queued follow-ups.
+    if (input.mode === "follow_up") throw new HarnessCapabilityUnavailableError("follow-up", "Pi RPC follow-up is not admitted by the executor");
+    const turn = this.#activeTurn;
+    if (this.#closed || !turn || turn.settled) throw new HarnessOperationAlreadyTerminalError("steering");
+    if (input.turnId !== turn.turnId) throw new HarnessStaleTurnError(input.turnId);
+    this.#pendingInput++;
+    const response = await this.#transport.request("steer", { message: input.message.text }).finally(() => { this.#pendingInput--; });
+    const disposition = stringValue(record(response.data).disposition);
+    if (disposition !== "queued") {
+      throw new Error(`Pi RPC steer did not queue input (disposition=${disposition ?? "missing"})`);
+    }
+    if (this.#closed || turn.settled || this.#activeTurn !== turn) throw new HarnessOperationAlreadyTerminalError("steering");
+    // Acceptance is not consumption. The native user message is projected only
+    // when Pi emits it; agent_settled remains the single turn-terminal authority.
+  }
+
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
     if (input.turnId && input.turnId !== this.#activeTurn?.turnId) return;
     // Stop is a physical retirement, not a reusable prompt cancellation.
@@ -773,13 +793,13 @@ export class PiRpcHarnessSession implements HarnessSession {
       turn = owner;
       known = true;
     }
-    if (event.type === "message_start" && record(event.message).role === "assistant") {
+    if (event.type === "message_start" && ["assistant", "user"].includes(String(record(event.message).role))) {
       // A new native message may be announced only within the prompt's captured
       // agent lifecycle. Later callbacks use this binding, not active run state.
       turn ??= keys.length > 0 && !known ? this.#agentTurn : null;
       if (!turn || turn.settled) return;
       this.#remember(keys, turn);
-      this.#streamTurn = turn;
+      if (record(event.message).role === "assistant") this.#streamTurn = turn;
     } else if (!turn && event.type === "tool_execution_start" && keys.length > 0 && keys.every(key => key.startsWith("tool:")) && !known) {
       // Native execution_start is the announcement source. Initial tool IDs can
       // arrive without message IDs; retain that captured lifecycle owner.

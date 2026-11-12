@@ -11,6 +11,8 @@ describe("driver-owned Pi projection origin", () => {
   it("stamps every output family, ignoring ownership claimed by native payloads", () => {
     const projector = createPiEventProjector({ ...origin, includeThinking: true });
     const events = [
+      { type: "message_start", message: { role: "user", timestamp: 42, content: [{ type: "text", text: "steering-marker" }] } },
+      { type: "message_end", message: { role: "user", timestamp: 42, content: [{ type: "text", text: "steering-marker" }] } },
       { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "partial" } },
       { type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 1, delta: "reason" } },
       { type: "tool_execution_start", toolCallId: "call", toolName: "bash", args: { command: "exit 7" } },

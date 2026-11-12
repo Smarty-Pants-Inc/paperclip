@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import type { SandboxRunnerRetention } from "./sandbox-runner-retention.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { resolvePaperclipRunnerTransport, type PaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
 import type { RunnerExecutionDriver } from "../../vendor/paperclip-runner/index.js";
@@ -21,6 +22,7 @@ type RunnerIdentity = Parameters<ConnectionRegistration>[1];
 
 export interface NativeRunnerExecutionDriverInput {
   target: AdapterExecutionTarget;
+  sandboxRetention?: SandboxRunnerRetention;
   binding: Omit<Parameters<typeof registerRunnerPrpAuthority>[0], "authority">;
   runnerIngressAuthorized?: boolean;
   runnerPublicUrl?: string | null;
@@ -98,8 +100,30 @@ export async function prepareNativeRemoteRunner(input: RemotePreparation) {
  * only environment preparation, process ownership, and connection routing vary.
  */
 export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDriverInput): RunnerExecutionDriver {
-  return {
+  // A cached transport retains this driver object. Rebind ALL host callbacks,
+  // including PRP preparation/checkpoint, rather than just the lease pair.
+  const retained = input.sandboxRetention?.rebindNativeDriver(input);
+  if (retained) return retained;
+  // A fresh cold controller uses the ordinary suspended-source maintenance
+  // lane. Only a released adoption/rebound cached owner fences source work to
+  // the current business epoch while it claims and attaches that live source.
+  let retainedRunAuthority = input.sandboxRetention?.released === true;
+  const checkpoint: NativeRunnerExecutionDriverInput["checkpoint"] = input.sandboxRetention ? async settlement => {
+    await input.sandboxRetention!.retire();
+    await input.checkpoint?.(settlement);
+  } : input.checkpoint;
+  const driver: RunnerExecutionDriver = {
     ...input.process,
+    get authorityRunId() {
+      const owner = retainedRunAuthority ? input.controllerPersistence?.authorityRunId : undefined;
+      return typeof owner === "function" ? owner() : owner ?? input.process?.authorityRunId;
+    },
+    ...(input.sandboxRetention ? {
+      readRunnerState: input.process?.readRunnerState ? () => input.process!.readRunnerState!() : undefined,
+      prepareExternalRunnerState: input.process?.prepareExternalRunnerState ? () => input.process!.prepareExternalRunnerState!() : undefined,
+      archiveExternalRunnerState: input.process?.archiveExternalRunnerState ? archive => input.process!.archiveExternalRunnerState!(archive) : undefined,
+    } : {}),
+    get releaseResume() { return input.sandboxRetention?.driver ?? input.process?.releaseResume; },
     onStagedRunAttachment: input.controllerPersistence && input.binding.issueId
       ? async (authority, proof) => {
           // Both journals use the current business lease. Install persistence
@@ -243,6 +267,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                 }),
               { parentName: "runner.transport.connect" },
             );
+            input.sandboxRetention?.bindRoute({ quiesce: () => {}, close: () => inbound.release() });
             return {
               connection: {
                 mode: "connect" as const,
@@ -250,9 +275,9 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                 ...(caBundlePath ? { caBundlePath } : {}),
               },
               startupFailureCode: "runner_direct_wss_failed" as const,
-              checkpoint: input.checkpoint,
+              checkpoint,
               ready: input.processIdentityReady ? async () => { await input.processIdentityReady; } : undefined,
-              release: () => inbound.release(),
+              release: async reason => { if (reason === "detach") input.sandboxRetention?.detach(); await inbound.release(); },
             };
           }
 
@@ -266,6 +291,11 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           let outbound: ReturnType<typeof connectRunnerPrpIngress> | null =
             null;
           let activation: Promise<void> | null = null;
+          const closeRoute = async () => {
+            if (outbound) await outbound.close();
+            else await transport.ingress.close();
+          };
+          input.sandboxRetention?.bindRoute({ quiesce: () => outbound?.quiesce(), close: closeRoute });
           return {
             connection: {
               mode: "listen" as const,
@@ -326,14 +356,16 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
               return outbound?.failure;
             },
             startupFailureCode: "runner_ingress_unavailable" as const,
-            checkpoint: input.checkpoint,
-            release: async () => {
-              if (outbound) await outbound.close();
-              else await transport.ingress.close();
+            checkpoint,
+            release: async reason => {
+              if (reason === "detach") input.sandboxRetention?.detach();
+              await closeRoute();
             },
           };
         },
       );
     },
   };
+  input.sandboxRetention?.bindNativeDriver(driver, next => { input = next; retainedRunAuthority = true; });
+  return driver;
 }

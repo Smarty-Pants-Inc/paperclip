@@ -3,6 +3,46 @@
     "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
+    "itemId": "turn-1:pi-user:8c7dd568f321e662232ac430ca2c39084521e6c6cae1a3a42404acd16cf09f56",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:queue",
+      "item": {
+        "id": "turn-1:pi-user:8c7dd568f321e662232ac430ca2c39084521e6c6cae1a3a42404acd16cf09f56",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:queue"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-user:8c7dd568f321e662232ac430ca2c39084521e6c6cae1a3a42404acd16cf09f56",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:queue",
+      "item": {
+        "id": "turn-1:pi-user:8c7dd568f321e662232ac430ca2c39084521e6c6cae1a3a42404acd16cf09f56",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:queue"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.started",
     "itemId": "turn-1:pi-message:1:block:0",
     "payload": {
       "kind": "agentMessage",
@@ -129,6 +169,46 @@
     "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
+    "itemId": "turn-1:pi-user:4dace56386a6a60ef54e8286957aca56d62c409d2d62a9b2fb2e39f59ca88fd4",
+    "payload": {
+      "kind": "userMessage",
+      "text": "steering-marker",
+      "item": {
+        "id": "turn-1:pi-user:4dace56386a6a60ef54e8286957aca56d62c409d2d62a9b2fb2e39f59ca88fd4",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "steering-marker"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-user:4dace56386a6a60ef54e8286957aca56d62c409d2d62a9b2fb2e39f59ca88fd4",
+    "payload": {
+      "kind": "userMessage",
+      "text": "steering-marker",
+      "item": {
+        "id": "turn-1:pi-user:4dace56386a6a60ef54e8286957aca56d62c409d2d62a9b2fb2e39f59ca88fd4",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "steering-marker"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.started",
     "itemId": "turn-1:pi-message:2:block:0",
     "payload": {
       "kind": "agentMessage",
@@ -231,6 +311,46 @@
     "payload": {
       "code": "pi_native_activity",
       "providerMethod": "queue_update"
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-user:c8e206dacd7844e1159dc89461db072d0cd9b532237f410de812eafdce4900e2",
+    "payload": {
+      "kind": "userMessage",
+      "text": "followup-marker",
+      "item": {
+        "id": "turn-1:pi-user:c8e206dacd7844e1159dc89461db072d0cd9b532237f410de812eafdce4900e2",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "followup-marker"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-user:c8e206dacd7844e1159dc89461db072d0cd9b532237f410de812eafdce4900e2",
+    "payload": {
+      "kind": "userMessage",
+      "text": "followup-marker",
+      "item": {
+        "id": "turn-1:pi-user:c8e206dacd7844e1159dc89461db072d0cd9b532237f410de812eafdce4900e2",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "followup-marker"
+          }
+        ]
+      }
     }
   },
   {

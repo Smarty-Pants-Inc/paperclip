@@ -10,6 +10,7 @@ import type {
   HarnessSession,
   PersistedHarnessSession,
 } from "../contracts/harness-driver.js";
+import { HarnessStaleTurnError } from "../contracts/harness-driver.js";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 import {
@@ -469,6 +470,17 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (!session?.parkReady) throw new Error("Pi host park readiness unavailable");
         result = await session.parkReady();
         break;
+      case "turn/steer": {
+        const turnId = text(params.expectedTurnId);
+        if (!activeTurnId || turnId !== activeTurnId) throw new HarnessStaleTurnError(turnId);
+        if (!session?.steer) throw new Error("Pi RPC steering is unavailable");
+        if (params.mode !== undefined && params.mode !== "steer") throw new Error("Pi RPC follow-up is unavailable");
+        const inputItems = Array.isArray(params.input) ? params.input.map(record) : [];
+        const messageText = inputItems.map((entry) => text(entry.text)).filter(Boolean).join("\n");
+        await session.steer({ turnId, message: { role: "user", text: messageText } });
+        result = { accepted: true };
+        break;
+      }
       case "turn/interrupt":
         if (!session?.interrupt) throw new Error("Pi RPC interruption is unavailable");
         await session.interrupt({ turnId: text(params.turnId, activeTurnId ?? "") });

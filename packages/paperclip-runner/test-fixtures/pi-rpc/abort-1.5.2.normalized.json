@@ -3,6 +3,46 @@
     "runId": "pi-capture",
     "turnId": "turn-1",
     "eventType": "item.started",
+    "itemId": "turn-1:pi-user:a4bbf9de043393a3df402dd478d733e3b1821397e4b63bd107379e5ef17a2a4a",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:abort",
+      "item": {
+        "id": "turn-1:pi-user:a4bbf9de043393a3df402dd478d733e3b1821397e4b63bd107379e5ef17a2a4a",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:abort"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-user:a4bbf9de043393a3df402dd478d733e3b1821397e4b63bd107379e5ef17a2a4a",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:abort",
+      "item": {
+        "id": "turn-1:pi-user:a4bbf9de043393a3df402dd478d733e3b1821397e4b63bd107379e5ef17a2a4a",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:abort"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.started",
     "itemId": "turn-1:pi-message:1:block:0",
     "payload": {
       "kind": "agentMessage",

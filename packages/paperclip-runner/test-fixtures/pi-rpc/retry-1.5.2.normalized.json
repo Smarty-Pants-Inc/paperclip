@@ -2,6 +2,46 @@
   {
     "runId": "pi-capture",
     "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-user:8c9917ea00524ce8b0f57eaf32458d9e7d069daa65c98514ce5141ecebbd8eb4",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:retry",
+      "item": {
+        "id": "turn-1:pi-user:8c9917ea00524ce8b0f57eaf32458d9e7d069daa65c98514ce5141ecebbd8eb4",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:retry"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-user:8c9917ea00524ce8b0f57eaf32458d9e7d069daa65c98514ce5141ecebbd8eb4",
+    "payload": {
+      "kind": "userMessage",
+      "text": "scenario:retry",
+      "item": {
+        "id": "turn-1:pi-user:8c9917ea00524ce8b0f57eaf32458d9e7d069daa65c98514ce5141ecebbd8eb4",
+        "type": "userMessage",
+        "content": [
+          {
+            "type": "text",
+            "text": "scenario:retry"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "runId": "pi-capture",
+    "turnId": "turn-1",
     "eventType": "item.failed",
     "itemId": "turn-1:pi-message:1:failure",
     "payload": {
