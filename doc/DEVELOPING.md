@@ -5323,3 +5323,14 @@ Previous releases have no receipt and stage normally on their first turn.
 Focused coverage: `pnpm exec vitest run server/src/services/heartbeat-github-launchers.test.ts`.
 The real shell-backed wrapper test checks that the second turn makes no staging
 commands, still excludes image credentials and keeps local Git identity usable.
+
+Native sandbox folder realization also records a content-keyed receipt on the
+existing lease. Unchanged native turns reuse its layout without the driver's
+realization RPC or repeated lease/workspace metadata writes. The key includes
+the live lease/allocation, agent, environment configuration, remote root and
+workspace realization request (excluding only the per-turn run ID). Workspace
+file synchronization, execution-target resolution, acquisition authority and
+Stop/admission checks still run; this receipt is not proof of workspace file
+contents. Old releases without the optional receipt realize normally.
+
+Focused coverage: `pnpm exec vitest run server/src/__tests__/environment-run-orchestrator.test.ts`.

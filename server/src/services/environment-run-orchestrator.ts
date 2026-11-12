@@ -18,6 +18,7 @@ import { prepareRemoteWorkspace, readRemoteWorkspaceAuthority, remoteWorkspaceRe
  * and transport logic.
  */
 
+import { createHash } from "node:crypto";
 import { environmentLeases, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
@@ -579,7 +580,29 @@ export function environmentRunOrchestrator(
     if (pluginTaskWorkspace && !await environmentRuntime.supportsTasks({ lease })) {
       throw new EnvironmentRunError("unsupported_adapter_environment", "Plugin environment does not provide native Runner task execution");
     }
-    if (ENVIRONMENT_DRIVER_TRAITS[environment.driver].realizesWorkspace) {
+    // Sandbox realization only establishes the folder/layout; workspace file
+    // synchronization has its own manifest and ownership protocol. Reuse only
+    // on the exact live allocation, never from workspace metadata alone.
+    const preparationKey = environment.driver === "sandbox" && adapterType === "paperclip_runner"
+      && lease.status === "active" && !lease.releasedAt && !lease.cleanupStatus && lease.providerLeaseId
+      && lease.companyId === companyId && lease.environmentId === environment.id
+      && typeof lease.metadata?.agentId === "string" && lease.metadata.agentId.length > 0
+      && (!lease.expiresAt || new Date(lease.expiresAt).getTime() > Date.now())
+      ? createHash("sha256").update(JSON.stringify({ version: 1,
+          leaseId: lease.id, providerLeaseId: lease.providerLeaseId, companyId,
+          agentId: lease.metadata?.agentId, environmentId: environment.id, config: environment.config,
+          provider: lease.provider, remoteCwd: lease.metadata?.remoteCwd ?? null,
+          request: { ...workspaceRealizationRequest, heartbeatRunId: undefined },
+        })).digest("hex") : null;
+    const priorPreparation = parseObject(lease.metadata?.nativeWorkspaceRealizationPreparation);
+    const reusePreparation = preparationKey !== null && priorPreparation.key === preparationKey
+      && typeof priorPreparation.cwd === "string" && priorPreparation.cwd.length > 0
+      && Object.keys(parseObject(priorPreparation.realization)).length > 0;
+    if (reusePreparation) {
+      realizedWorkspaceCwd = priorPreparation.cwd as string;
+      workspaceRealization = parseObject(priorPreparation.realization);
+    }
+    if (!reusePreparation && ENVIRONMENT_DRIVER_TRAITS[environment.driver].realizesWorkspace) {
       try {
         const remoteCwd =
           typeof lease.metadata?.remoteCwd === "string" && lease.metadata.remoteCwd.trim().length > 0
@@ -680,10 +703,13 @@ export function environmentRunOrchestrator(
     }
 
     // Step 3: Persist realization metadata on lease and execution workspace
-    if (Object.keys(workspaceRealization).length > 0) {
+    if (!reusePreparation && Object.keys(workspaceRealization).length > 0) {
       const nextLeaseMetadata = {
         ...(lease.metadata ?? {}),
         workspaceRealization,
+        ...(preparationKey ? { nativeWorkspaceRealizationPreparation: {
+          key: preparationKey, cwd: realizedCwd, realization: workspaceRealization,
+        } } : {}),
       };
       const updatedLease = await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
       if (updatedLease) {

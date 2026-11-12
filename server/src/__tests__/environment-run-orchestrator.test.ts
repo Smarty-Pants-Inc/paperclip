@@ -642,6 +642,50 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     );
   });
 
+  it("reuses sandbox layout on the same lease, invalidating config, workspace and allocation changes", async () => {
+    const environment = makeEnvironment("sandbox");
+    const lease = makeLease({ provider: "daytona", providerLeaseId: "box-1", metadata: { agentId: "agent-1" } });
+    mockUpdateLeaseMetadata.mockImplementation(async (_id, metadata) => ({ ...lease, metadata }));
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "remote", transport: "sandbox", remoteCwd: "/remote/workspace" });
+    const runtime = makeMockRuntime({ realizeWorkspace: vi.fn().mockResolvedValue({ cwd: "/remote/workspace",
+      metadata: { workspaceRealization: { version: 1, mode: "copy", authoritativeRoot: "/remote/workspace" } } }) });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+    const input = { ...makeRealizeInput({ environment, lease }), adapterType: "paperclip_runner" };
+    const first = await orchestrator.realizeForRun(input);
+    const second = await orchestrator.realizeForRun({ ...input, heartbeatRunId: "run-2", lease: first.lease });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledTimes(1);
+    expect(second.executionTarget).toEqual(first.executionTarget);
+    expect(second.workspaceRealization).toEqual(first.workspaceRealization);
+    environment.config = { changed: true };
+    const changed = await orchestrator.realizeForRun({ ...input, heartbeatRunId: "run-3", lease: second.lease });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(2);
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({ ...mockBuildWorkspaceRealizationRequest.mock.results[0]!.value,
+      source: { localPath: "/different/workspace" } });
+    const workspaceChanged = await orchestrator.realizeForRun({ ...input, heartbeatRunId: "run-4", lease: changed.lease });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(3);
+    const allocationChanged = await orchestrator.realizeForRun({ ...input, heartbeatRunId: "run-5",
+      lease: { ...workspaceChanged.lease, providerLeaseId: "box-2" } });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(4);
+    await orchestrator.realizeForRun({ ...input, heartbeatRunId: "run-6", lease: { ...allocationChanged.lease, id: "lease-2" } });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not cache failed sandbox realization or reuse an expired lease", async () => {
+    const environment = makeEnvironment("sandbox");
+    const lease = makeLease({ provider: "daytona", providerLeaseId: "box", metadata: {} });
+    mockUpdateLeaseMetadata.mockImplementation(async (_id, metadata) => ({ ...lease, metadata }));
+    const runtime = makeMockRuntime({ realizeWorkspace: vi.fn().mockRejectedValueOnce(new Error("layout failed"))
+      .mockResolvedValue({ cwd: "/remote/workspace", metadata: { workspaceRealization: { mode: "copy" } } }) });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+    const input = { ...makeRealizeInput({ environment, lease }), adapterType: "paperclip_runner" };
+    await expect(orchestrator.realizeForRun(input)).rejects.toThrow("layout failed");
+    expect(mockUpdateLeaseMetadata).not.toHaveBeenCalled();
+    const first = await orchestrator.realizeForRun(input);
+    await orchestrator.realizeForRun({ ...input, lease: { ...first.lease, expiresAt: new Date(0) } });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(3);
+  });
+
   it("does not rerun the provision command during local environment realization", async () => {
     mockBuildWorkspaceRealizationRequest.mockReturnValue({
       version: 1,
