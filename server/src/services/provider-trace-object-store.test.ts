@@ -68,6 +68,8 @@ describe.skipIf(!endpoint)("encrypted object provider traces (S3 integration)", 
         await expect(b.open(ref, fileB, async () => undefined)).rejects.toThrow();
         expect(await b.settled(ref)).toBe(true);
         await expect(fs.stat(fileB)).rejects.toMatchObject({ code: "ENOENT" });
+        // R-keep-all-traces: the failed capture's local copy is kept, marked failed.
+        expect((await fs.readdir(directory)).some((name) => name.startsWith("b.ndjson.capture-failed-"))).toBe(true);
         expect(await b.read(ref)).toEqual(Buffer.concat([bytes, interpretation]));
         await fs.rmdir(`${fileB}.rehydration`);
         await b.open(ref, fileB, async () => undefined);

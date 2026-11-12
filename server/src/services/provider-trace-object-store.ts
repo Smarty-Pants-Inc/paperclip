@@ -214,8 +214,12 @@ export function createProviderTraceObjectStore(
           await channel.journal.close(channel.writer, capture.signal);
         }),
       );
-      if (options.restore !== false)
-        await Promise.allSettled(capture.channels.map((channel) => fs.unlink(channel.path)));
+      // R-keep-all-traces: keep the local copy and mark it failed; never unlink it.
+      if (options.restore !== false) {
+        const failedAt = Date.now();
+        await Promise.allSettled(capture.channels.map((channel) =>
+          fs.rename(channel.path, `${channel.path}.capture-failed-${failedAt}`)));
+      }
       captures.delete(ref);
       capture.finishIdle();
       throw error;
