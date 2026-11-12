@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
+import { QUALIFIED_PI_RPC_PROFILE, type PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { createNativeTurnAccounting, nativeUsageCostUsd, normalizeNativeUsage, usesNativeUsageDelivery } from "./native-usage-accounting.js";
 
 const provider = { kind: "opencode" as const, model: "test-model" };
@@ -17,7 +17,10 @@ describe("native turn accounting", () => {
     expect(usesNativeUsageDelivery({ runnerd: true, remote: true, provider: { kind: "muse", model: null } as never })).toBe(false);
   });
 
-  it("reconstructs cumulative turn usage without counting repeated producer events twice", () => {
+  it.each([
+    provider,
+    { kind: "pi_rpc" as const, model: "anthropic/claude-opus-5-5", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" as const },
+  ])("$kind reconstructs cumulative turn usage without counting repeated producer events twice", provider => {
     const accounting = createNativeTurnAccounting(provider);
     const usage = { kind: "usage", usage: { runDeltaComplete: true, runDelta: { inputTokens: 120, outputTokens: 10, providerCostUsd: 0.25 } } };
     const history = [event(1, "turn.started"), event(2, "item.completed", "turn-1", usage), event(3, "turn.completed"),

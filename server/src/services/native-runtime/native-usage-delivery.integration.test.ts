@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, budgetPolicies, companies, costEvents, createDb, heartbeatRuns, runUsageReceipts, type Db } from "@paperclipai/db";
-import { type PrpEvent } from "../../vendor/paperclip-runner/index.js";
+import { QUALIFIED_PI_RPC_PROFILE, type PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { flushBudgetEvaluationWork } from "../budgets.js";
 import { accountingIntegrityService } from "../accounting-integrity.js";
@@ -607,8 +607,11 @@ describe("producer-owned native usage", () => {
     });
   });
 
-  it("replays partial and final usage once after a lost commit response and restores turn aggregation", async () => {
-    const input = { ...await seed(), provider: { kind: "opencode" as const, model: "test-model" } };
+  it.each([
+    { kind: "opencode" as const, model: "test-model" },
+    { kind: "pi_rpc" as const, model: "anthropic/claude-opus-5-5", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" as const },
+  ])("$kind replays partial and final usage once after a lost commit response and restores turn aggregation", async provider => {
+    const input = { ...await seed(), provider };
     let loseResponse = false;
     const failingDb = new Proxy(db, { get(target, property) {
       if (property === "transaction") return async (...args: Parameters<Db["transaction"]>) => {

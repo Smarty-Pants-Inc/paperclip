@@ -4356,6 +4356,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       return this.options.provider === undefined ||
         this.options.provider === "codex" ||
         this.options.provider === "opencode" ||
+        this.options.provider === "pi_rpc" ||
         this.options.provider === "acpx"
         ? {
             data: [

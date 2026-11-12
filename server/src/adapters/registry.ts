@@ -404,7 +404,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
       timedOut: false,
       errorMessage: message,
       errorCode: "paperclip_runner_coordinator_required",
-      provider: ctx.config.provider === "opencode"
+      provider: ctx.config.provider === "pi_rpc" ? "pi_rpc" : ctx.config.provider === "opencode"
         ? "opencode"
         : ctx.config.provider === "claude_managed"
           ? "anthropic"
@@ -634,6 +634,7 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   getRuntimeCommandSpec: (config) => config.provider === "claude_managed"
     || config.provider === "aws_agentcore"
     || config.provider === "acpx"
+    || config.provider === "pi_rpc"
     || config.provider === "cursor_cloud"
     ? { command: "paperclip-runnerd", detectCommand: null, installCommand: null }
     : config.provider === "opencode"

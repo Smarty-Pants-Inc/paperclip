@@ -3279,7 +3279,7 @@ it("does not bind ambient candidate credentials from an inherited or caller-supp
   } finally { vi.unstubAllEnvs(); }
 });
 
-it.each(["opencode", "acpx"] as const)(
+it.each(["opencode", "acpx", "pi_rpc"] as const)(
   "advertises runner-managed planning through the %s provider boundary",
   async (provider) => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-runner-plan-mode-"));

@@ -507,6 +507,11 @@ const compatibilityInput = {
 } as const;
 
 describe("resolveHeartbeatRuntimeMode compatibility", () => {
+  it("keeps fresh native Pi provider metadata instead of implicit Codex", () => {
+    expect(resolveHeartbeatRuntimeMode({ ...compatibilityInput, adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", model: "anthropic/claude-sonnet-4-6" },
+    })).toMatchObject({ kind: "native", provider: "pi_rpc" });
+  });
   it("keeps every direct built-in adapter on the legacy path", () => {
     for (const adapterType of BUILTIN_ADAPTER_TYPES) {
       if (adapterType === "paperclip_runner") continue;

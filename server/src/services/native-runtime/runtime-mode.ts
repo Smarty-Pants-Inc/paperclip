@@ -254,7 +254,7 @@ export function resolveHeartbeatRuntimeMode(input: {
     kind: "native",
     resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION,
     reason: "explicit_paperclip_runner",
-    provider: resolution.profile.backend === "opencode_server"
+    provider: resolution.profile.backend === "pi_rpc" ? "pi_rpc" : resolution.profile.backend === "opencode_server"
       ? "opencode"
       : resolution.profile.backend === "claude_managed_agents_api"
         ? "claude_managed"

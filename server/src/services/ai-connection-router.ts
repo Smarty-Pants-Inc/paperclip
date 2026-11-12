@@ -1,4 +1,5 @@
 import type { ConnectionManagementContext } from "./connection-management.js";
+import { PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS } from "@paperclipai/adapter-utils";
 import { randomUUID } from "node:crypto";
 import { and, eq, ne, sql } from "drizzle-orm";
 import { aiConnectionPools, aiConnectionRouterCursors, aiConnectionTaskPins, companySecrets, connectionGrants, instanceSettings, plugins, toolApplications, toolConnections, toolConnectionInstalls, type Db } from "@paperclipai/db";
@@ -15,7 +16,7 @@ import { resolvePaperclipRunnerProviderProfile, resolvePaperclipRunnerNativeProv
 
 const usageCache = new Map<string, { expires: number; value: AiConnectionUsage }>();
 const usageInFlight = new Map<string, Promise<AiConnectionUsage | undefined>>();
-const routedRuntimeKeys = new Set(["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant"]);
+const routedRuntimeKeys = new Set(["provider", "acpxAgent", "model", "modelReasoningEffort", "reasoningEffort", "effort", "variant", "piRpcThinkingLevel"]);
 export function applyAiConnectionRouterTaskSettings(config: Record<string, unknown>, selection: AiConnectionRouterSelection) {
   return { ...Object.fromEntries(Object.entries(config).filter(([key]) => !routedRuntimeKeys.has(key))), ...selection.runtimeConfig };
 }
@@ -29,12 +30,16 @@ export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterT
   const notes: string[] = [];
   const provider = member.binding.provider;
   const profile = member.profile;
-  const expected = provider === "openai" ? profile.provider === "codex"
+  const piRpc = profile.provider === "pi_rpc";
+  const expected = piRpc || (provider === "openai" ? profile.provider === "codex"
     : provider === "anthropic" ? profile.provider === "acpx" && profile.acpxAgent === "claude"
     : provider === "xai" ? profile.provider === "acpx" && profile.acpxAgent === "grok"
-    : profile.provider === "opencode";
+    : profile.provider === "opencode");
   if (!expected) throw unprocessable("Pool member harness does not match its account");
-  const supportsModel = (value: string) => provider === "openai" ? isCodexLocalKnownModel(value)
+  const supportsModel = (value: string) => piRpc
+    ? value.split("/", 1)[0] === profile.model.split("/", 1)[0]
+      && isAiConnectionCompatible(member.binding, adapterType, value, "pi_rpc")
+    : provider === "openai" ? isCodexLocalKnownModel(value)
     : provider === "anthropic" ? claudeModels.some((m) => m.id === value)
     : provider === "xai" ? grokModels.some((m) => m.id === value) : value.startsWith("openrouter/");
   const config: Record<string, unknown> = { provider: profile.provider, ...(profile.acpxAgent ? { acpxAgent: profile.acpxAgent } : {}), model: profile.model };
@@ -53,12 +58,12 @@ export function poolMemberRuntimeConfig(member: AiConnectionPoolMember, adapterT
     } else notes.push("Model override is unavailable for this member; using its default.");
   }
   const model = String(config.model);
-  const efforts = provider === "openai" ? codexLocalReasoningEffortsForModel(model)
+  const efforts: readonly string[] = piRpc ? PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS : provider === "openai" ? codexLocalReasoningEffortsForModel(model)
     : provider === "anthropic" ? claudeLocalReasoningEffortsForModel(model)
     : provider === "xai" ? grokLocalReasoningEffortsForModel(model) : [];
-  const effortKey = adapterType === "paperclip_runner" ? profile.provider === "codex" || (profile.provider === "acpx" && profile.acpxAgent === "claude") ? "modelReasoningEffort" : null
+  const effortKey = adapterType === "paperclip_runner" ? piRpc ? "piRpcThinkingLevel" : profile.provider === "codex" || (profile.provider === "acpx" && profile.acpxAgent === "claude") ? "modelReasoningEffort" : null
     : provider === "anthropic" ? "effort" : provider === "xai" ? "reasoningEffort" : provider === "openai" ? "modelReasoningEffort" : "variant";
-  const requested = overrides.modelReasoningEffort ?? overrides.reasoningEffort ?? overrides.effort ?? overrides.variant;
+  const requested = (piRpc ? overrides.piRpcThinkingLevel : undefined) ?? overrides.modelReasoningEffort ?? overrides.reasoningEffort ?? overrides.effort ?? overrides.variant;
   const effort = typeof requested === "string" && efforts.includes(requested) && effortKey ? requested
     : profile.effort && efforts.includes(profile.effort) && effortKey ? profile.effort : null;
   if (requested && requested !== effort) notes.push("Effort override is unavailable for this member; using its default.");

@@ -441,6 +441,11 @@ describe("server adapter registry", () => {
       detectCommand: "opencode",
       installCommand: expectedRunnerOpenCodeInstall,
     });
+    expect(findActiveServerAdapter("paperclip_runner")?.getRuntimeCommandSpec?.({ provider: "pi_rpc" })).toEqual({
+      command: "paperclip-runnerd",
+      detectCommand: null,
+      installCommand: null,
+    });
     expect(findActiveServerAdapter("paperclip_runner")?.getRuntimeCommandSpec?.({ provider: "acpx" })).toEqual({
       command: "paperclip-runnerd",
       detectCommand: null,
