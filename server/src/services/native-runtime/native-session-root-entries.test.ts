@@ -78,6 +78,15 @@ describe("native session root entry contract", () => {
     expect(unclassified).toEqual([]);
   });
 
+  // Data safety: the build-owned pack manifest is not session state. A
+  // pack-verification read must not broaden the retirement allowlist.
+  it("does not confuse a provider pack root with the native session root", () => {
+    expect(writtenRootEntries().names).not.toContain("provider-pack.json");
+    expect(isKnownNativeSessionRootEntry("provider-pack.json")).toBe(false);
+    expect(NATIVE_SESSION_ROOT_HELD_ENTRIES).not.toContain("provider-pack.json");
+    expect(NATIVE_CONTINUITY_STATE_ENTRIES).toContain("provider-pack-authority.json");
+  });
+
   it("keeps the classes disjoint so an entry has one retirement meaning", () => {
     const all = [...NATIVE_CONTINUITY_STATE_ENTRIES, ...NATIVE_SESSION_ROOT_LAUNCH_ENTRIES,
       ...NATIVE_SESSION_ROOT_HELD_ENTRIES, NATIVE_CONTINUITY_ARCHIVE_ENTRY];
