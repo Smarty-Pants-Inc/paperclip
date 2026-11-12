@@ -1937,6 +1937,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
   async function finalizeWorkspaceSourceLockWait(
     run: typeof heartbeatRuns.$inferSelect,
     error: IsolatedRepositorySourceBusy,
+    options: { wasIssueAssignee: boolean },
   ) {
     const now = new Date();
     const runContext = parseObject(run.contextSnapshot);
@@ -1957,7 +1958,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           recordedAt: now.toISOString(),
         },
       },
-      contextSnapshot: runContext,
+      // Same flag as the shared-workspace deferral: inherited by the
+      // scheduled retry's context so a non-assignee wake is not misread as a
+      // reassignment by the retry promotion gate.
+      contextSnapshot: {
+        ...runContext,
+        workspaceBusyDeferredWhileAssignee: options.wasIssueAssignee,
+      },
     });
     if (!cancelWrite.updated) {
       logger.info(
