@@ -3513,6 +3513,33 @@ impl CodexCommandExecutor {
         })
     }
 
+    // A readiness drain is fail-closed for reuse, but must not discard the
+    // completed run or turn a provider-local tail failure into a runner exit.
+    // The caller saves this diagnostic with the terminal (or park refusal)
+    // before retiring the unsafe provider process.
+    fn retain_completed_accounting_tail_for_poll(&mut self) -> Result<bool, DurableRunnerError> {
+        let Err(error) = self.retain_completed_accounting_tail() else {
+            return Ok(true);
+        };
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider has not been prepared"))?;
+        state.lifecycle = "reconciliation_required".to_owned();
+        state.push_terminal_event(NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: sanitize_value(&json!({
+                "provider": state.config.provider,
+                "code": "provider_completed_tail_drain_failed",
+                "severity": "warning",
+                "message": error.to_string().chars().take(2048).collect::<String>(),
+            })),
+        })?;
+        self.unsaved_frame_state.set(true);
+        Ok(false)
+    }
+
     fn attach_run(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
         self.retain_completed_accounting_tail()?;
         let mut next_state = self
@@ -5599,9 +5626,10 @@ impl CodexCommandExecutor {
                         .state
                         .as_ref()
                         .is_some_and(|state| goal_continues_after_turn(state, goal_remains_active));
-                    if terminal_event_type.as_deref() == Some("turn.completed") && !run_continues {
-                        self.retain_completed_accounting_tail()?;
-                    }
+                    let tail_drain_failed = terminal_event_type.as_deref()
+                        == Some("turn.completed")
+                        && !run_continues
+                        && !self.retain_completed_accounting_tail_for_poll()?;
                     let working_now = self
                         .provider
                         .as_ref()
@@ -5783,6 +5811,13 @@ impl CodexCommandExecutor {
                     } else {
                         self.unsaved_frame_state.set(true);
                     }
+                    if tail_drain_failed {
+                        // The terminal and warning are durable before cleanup.
+                        // Do not poll a broken reader again on the next loop.
+                        if let Some(mut provider) = self.provider.take() {
+                            let _ = provider.shutdown();
+                        }
+                    }
                     if reconciliation_required {
                         break;
                     }
@@ -5943,7 +5978,13 @@ impl CommandExecutor for CodexCommandExecutor {
         {
             return Ok(false);
         }
-        self.retain_completed_accounting_tail()?;
+        if !self.retain_completed_accounting_tail_for_poll()? {
+            self.save_state()?;
+            if let Some(mut provider) = self.provider.take() {
+                let _ = provider.shutdown();
+            }
+            return Ok(false);
+        }
         let state = self
             .state
             .as_ref()
