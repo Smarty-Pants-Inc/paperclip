@@ -135,6 +135,7 @@ function createTransportBackedNativeSessionBackend(
   const supportsCollaborativePlanning =
     isCodex ||
     input.provider.kind === "opencode" ||
+    input.provider.kind === "pi_rpc" ||
     input.provider.kind === "acpx";
   if (
     input.provider.kind === "codex" &&

@@ -126,6 +126,12 @@ function opencodeExecution(): NativeExecutionInputV1 {
   };
 }
 
+function piRpcExecution(): NativeExecutionInputV1 {
+  const input = execution({ kind: "pi_rpc", model: "managed/my-model", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" });
+  input.session.driverKind = "pi_rpc";
+  return input;
+}
+
 function planningExecution(input: NativeExecutionInputV1): NativeExecutionInputV2 {
   return {
     ...input,
@@ -653,6 +659,7 @@ describe("native backend factory", () => {
 
   it.each([
     ["OpenCode", opencodeExecution()],
+    ["Pi RPC", piRpcExecution()],
     ["ACPX Codex", acpxExecution("codex")],
     ["ACPX Claude", acpxExecution("claude")],
   ])(
@@ -988,5 +995,6 @@ it("routes native pi_rpc through the same runnerd factory as OpenCode", async ()
   input.session.driverKind = "pi_rpc";
   const backend = createNativeSessionBackend(input, { codexTransportFactory: () => new FakeCodexTransport() });
   const descriptor = await backend.descriptor();
-  expect(descriptor).toMatchObject({ kind: "runner", name: "pi_rpc", version: "1.5.2" });
+  expect(descriptor).toMatchObject({ kind: "runner", name: "pi_rpc", version: "1.5.2",
+    capabilities: { collaborationModes: ["default", "plan"] } });
 });

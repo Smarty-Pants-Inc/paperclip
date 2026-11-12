@@ -160,7 +160,7 @@ export type NativeProviderConfig =
 export type NativeProviderConfigV4 =
   | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode: NativeOpenCodePermissionMode }
-  | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" | "cursor_cloud" | "pi" }>
+  | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" | "cursor_cloud" | "pi_rpc" }>
   | {
       kind: "acpx";
       agent: NativeAcpxAgent;
