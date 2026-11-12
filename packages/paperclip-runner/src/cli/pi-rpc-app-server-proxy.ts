@@ -489,6 +489,7 @@ async function runCli(): Promise<void> {
 }
 
 // The file is also imported by the protocol tests with an injected HarnessDriver.
-if (process.argv[1]?.endsWith("pi-rpc-app-server-proxy.js")) {
+if (process.argv[1]?.endsWith("pi-rpc-app-server-proxy.js")
+  || process.argv.includes("--paperclip-trusted-pi-executable")) {
   void runCli();
 }
