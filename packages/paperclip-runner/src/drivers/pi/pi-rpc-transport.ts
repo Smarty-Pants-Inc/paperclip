@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 export type PiRpcRecord = Record<string, unknown>;
 
@@ -130,6 +131,9 @@ export class PiRpcTransport {
   #streamsClosed = false;
   #exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   #stderr = "";
+  // Pi's bash tool creates detached groups too. Capture descendants before
+  // TERM can orphan them; retain birth identities, never signal a reused PID.
+  readonly #descendants = new Map<number, string>();
 
   constructor(options: PiRpcTransportOptions) {
     this.#maxRecordBytes = options.maxRecordBytes ?? 64 * 1024 * 1024;
@@ -149,6 +153,8 @@ export class PiRpcTransport {
       cwd: options.cwd,
       env: options.env ?? process.env,
       stdio,
+      // Never signal the runner's group. Escalation owns Pi and its tool children.
+      detached: process.platform !== "win32",
       windowsHide: true,
     }) as ChildProcessWithoutNullStreams;
     options.commandLifecycle?.afterSpawn();
@@ -294,14 +300,65 @@ export class PiRpcTransport {
   async close(): Promise<void> {
     if (this.#closed) return this.#exit.then(() => undefined);
     this.#closed = true;
-    if (this.#exited) return this.#exit.then(() => undefined);
-    this.#child.stdin.end();
-    if (await settledWithin(this.#exit, this.#shutdownTimeoutMs)) return;
-    this.#child.kill("SIGTERM");
-    if (await settledWithin(this.#exit, this.#killTimeoutMs)) return;
-    this.#child.kill("SIGKILL");
+    this.#captureDescendants();
+    if (!this.#exited) this.#child.stdin.end();
+    if (await settledWithin(this.#exit, this.#shutdownTimeoutMs)) {
+      this.#signalGroup("SIGKILL"); // no descendants may outlive a retired owner
+      return;
+    }
+    this.#signalGroup("SIGTERM");
+    if (await settledWithin(this.#exit, this.#killTimeoutMs)) {
+      this.#signalGroup("SIGKILL");
+      return;
+    }
+    this.#signalGroup("SIGKILL");
     if (!(await settledWithin(this.#exit, this.#killTimeoutMs))) {
       throw new Error("Pi RPC process did not exit after bounded shutdown escalation");
+    }
+  }
+
+  #captureDescendants(): void {
+    if (process.platform === "linux" && this.#child.pid) {
+      const visited = new Set<number>();
+      const visit = (pid: number) => {
+        if (visited.has(pid)) return;
+        visited.add(pid);
+        let children: string[];
+        try { children = readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8").trim().split(/\s+/); }
+        catch { return; } // an already-exited child has no new descendants
+        for (const child of children) {
+          const id = Number(child);
+          if (!Number.isSafeInteger(id) || id <= 0) continue;
+          try {
+            const fields = readFileSync(`/proc/${id}/stat`, "utf8").split(") ").at(-1)!.split(" ");
+            if (this.#descendants.has(id) && this.#descendants.get(id) !== fields[19]) continue;
+            this.#descendants.set(id, fields[19]!);
+            visit(id);
+          } catch { /* exited during capture */ }
+        }
+      };
+      visit(this.#child.pid);
+    }
+  }
+
+  #signalGroup(signal: NodeJS.Signals): void {
+    if (process.platform === "win32") { this.#child.kill(signal); return; }
+    if (!this.#child.pid) return;
+    this.#captureDescendants();
+    try { process.kill(-this.#child.pid, signal); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    if (process.platform === "linux" && signal === "SIGKILL") {
+      for (const [pid, birth] of this.#descendants) {
+        try {
+          const fields = readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").at(-1)!.split(" ");
+          if (fields[19] !== birth) continue;
+          // Native bash is a group leader; kill its whole group atomically so
+          // `sleep; trailing-effect` cannot advance when only sleep dies.
+          process.kill(Number(fields[2]) === pid ? -pid : pid, "SIGKILL");
+        } catch (error) {
+          if (!["ESRCH", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        }
+      }
     }
   }
 
@@ -356,7 +413,7 @@ export class PiRpcTransport {
     this.#pending.clear();
     this.#records.push({ type: "transport_error", message: error.message });
     this.#records.close(error);
-    this.#child.kill("SIGTERM");
+    this.#signalGroup("SIGTERM");
   }
 }
 

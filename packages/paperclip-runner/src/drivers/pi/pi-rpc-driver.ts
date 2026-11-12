@@ -64,6 +64,8 @@ export interface PiRpcDriverOptions {
   dynamicToolTimeoutMs?: number;
   /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
   promptTimeoutMs?: number;
+  /** Stop's queue/abort/native-settlement deadline; default 5s, then retire. */
+  abortTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
@@ -240,6 +242,7 @@ export class PiRpcDriver implements HarnessDriver {
         instructionBoundary,
         admissionTimeoutMs: this.#options.startupTimeoutMs,
         promptTimeoutMs: this.#options.promptTimeoutMs,
+        abortTimeoutMs: this.#options.abortTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
@@ -297,6 +300,7 @@ interface PiSessionState {
   bindRequest: typeof sendPiBindRequest;
   admissionTimeoutMs?: number;
   promptTimeoutMs?: number;
+  abortTimeoutMs?: number;
 }
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
@@ -316,6 +320,7 @@ interface PiTurnState extends PiEventOrigin {
   /** Latest receipt only; native recovery can replace it before settlement. */
   lastAssistantStopReason?: string | null;
   settled: boolean;
+  cancelRequested?: boolean;
 }
 
 /** Carries the projector's captured owner across the pump's async failure path. */
@@ -398,6 +403,9 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
   readonly #promptTimeoutMs?: number;
+  readonly #abortTimeoutMs: number;
+  #interrupting?: Promise<void>;
+  #nativeAbortSettled?: { turn: PiTurnState; resolve(): void };
   // Only active identities retain a projector. Fixed-memory tombstones prevent
   // old/reused IDs from binding to a later turn, without a growing warm history.
   // Outstanding native tools separately retain only their original IDs/name.
@@ -435,6 +443,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     this.#promptTimeoutMs = state.promptTimeoutMs;
+    this.#abortTimeoutMs = Number.isFinite(state.abortTimeoutMs) ? Math.max(1, Math.min(30_000, state.abortTimeoutMs!)) : 5000;
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
     void this.#pump();
@@ -455,6 +464,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     runtimeContext?: unknown;
   }): Promise<void> {
     return this.#serialize(async () => {
+      await this.#interrupting;
       if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
       if (this.#resident) {
         const previous = this.#resident.context;
@@ -583,6 +593,7 @@ export class PiRpcHarnessSession implements HarnessSession {
 
   async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
     return this.#serialize(async () => {
+      await this.#interrupting;
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
       if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
@@ -670,10 +681,48 @@ export class PiRpcHarnessSession implements HarnessSession {
 
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
     if (input.turnId && input.turnId !== this.#activeTurn?.turnId) return;
-    // Stop is a physical retirement, not a reusable prompt cancellation.
+    if (this.#interrupting) return this.#interrupting;
+    const turn = this.#activeTurn;
+    if (this.#closed || !turn || turn.settled) return;
+    // Fence synchronously, before the first IPC await. No callback (including
+    // one already waiting for its native announcement) may borrow this turn.
+    turn.cancelRequested = true;
     this.#callbacks?.fence();
     this.#admitted = false;
-    await this.close();
+    const settled = new Promise<void>(resolve => { this.#nativeAbortSettled = { turn, resolve }; });
+    const stopping = async () => {
+      try {
+        await withTimeout((async () => {
+          // Pi 1.5.2: abort continues queued steering/follow-ups unless cleared
+          // first. Never replay either queue or the interrupted input.
+          await this.#transport.request("clear_queue", {}, { timeoutMs: this.#abortTimeoutMs });
+          if (this.#resident) {
+            const receipt = await this.#sendBind({ schema: 1, type: "stop_children", nonce: randomUUID(), sessionId: this.#normalizedSessionId });
+            if (receipt.uncertain.length) throw new Error("Pi child cleanup uncertain");
+          }
+          // Native dialogs can hold the lifecycle open; cancel, never answer.
+          for (const dialog of this.#dialogs.values()) if (dialog.turn === turn) {
+            await this.#transport.sendExtensionUiResponse({ id: dialog.id, cancelled: true });
+          }
+          // abort ACK proves native idle, while agent_settled proves the pump
+          // has consumed the final tool receipts and revoked the old binding.
+          await this.#transport.request("abort", {}, { timeoutMs: this.#abortTimeoutMs });
+          await settled;
+          if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi closed during Stop");
+          await this.#admit();
+        })(), this.#abortTimeoutMs, "Pi abort did not settle within the Stop deadline");
+      } catch (error) {
+        this.#emit("harness.diagnostic", { code: "pi_abort_escalated", message: error instanceof Error ? error.message : String(error) }, turn);
+        // Uncertain idle/child cleanup retires only this process generation.
+        // Transport close owns the bounded process-group TERM/KILL ladder.
+        await this.close();
+      } finally {
+        if (this.#nativeAbortSettled?.turn === turn) this.#nativeAbortSettled = undefined;
+      }
+    };
+    this.#interrupting = stopping();
+    try { await this.#interrupting; }
+    finally { this.#interrupting = undefined; }
   }
 
   async parkReady(): Promise<{ ready: boolean; reasons: string[] }> {
@@ -905,7 +954,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       // Pi 1.5.2 rpc.md/json.md: retries, overflow recovery and queued
       // continuations can start another low-level run before agent_settled.
       // Only an observed agent_end within this admitted prompt permits it.
-      if (!this.#admitted || !this.#activeTurn || (this.#agentTurn && !this.#activeTurn.agentEnded)) {
+      if ((!this.#admitted && !this.#activeTurn?.cancelRequested) || !this.#activeTurn || (this.#agentTurn && !this.#activeTurn.agentEnded)) {
         this.#callbacks?.fence();
         this.#failure = new Error("Pi started work without an admitted prompt");
         this.#admitted = false;
@@ -1026,10 +1075,11 @@ export class PiRpcHarnessSession implements HarnessSession {
       // A length receipt is incomplete even with text/mandatory usage. Judge
       // only the final receipt, after Pi has exhausted native recovery.
       const truncated = turn.lastAssistantStopReason === "length";
-      const status = event.aborted === true ? "cancelled" : turn.failed || truncated || empty ? "failed" : "completed";
+      const status = event.aborted === true || turn.cancelRequested ? "cancelled" : turn.failed || truncated || empty ? "failed" : "completed";
       const error = truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
         : empty ? { code: "pi_empty_turn", message: "Pi settled without an assistant response." } : undefined;
       await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
+      if (this.#nativeAbortSettled?.turn === turn) this.#nativeAbortSettled.resolve();
     }
   }
 
