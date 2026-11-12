@@ -13489,16 +13489,16 @@ async function providerPackMetadata(requests: ProviderPackHashRequest[]): Promis
 export async function verifyRemoteProviderPackManifest(packRoot: string, provider?: PackProvider): Promise<RemoteProviderPackManifest> {
   // Preserve manifest validation and its bounded diagnostic errors on every hit.
   const identity = readRemoteProviderPackIdentity(packRoot, false);
-  const root = await providerPackRealpath(packRoot);
+  const resolvedPackRoot = await providerPackRealpath(packRoot);
   const manifestMetadata = async () => {
-    const metadata = await providerPackStat(resolve(root, "provider-pack.json"), { bigint: true });
-    const rootMetadata = await providerPackStat(root, { bigint: true });
+    const metadata = await providerPackStat(resolve(resolvedPackRoot, "provider-pack.json"), { bigint: true });
+    const rootMetadata = await providerPackStat(resolvedPackRoot, { bigint: true });
     return [rootMetadata.dev, rootMetadata.ino, metadata.dev, metadata.ino, metadata.size,
       metadata.mtimeNs, metadata.ctimeNs].join(":");
   };
   const generation = await manifestMetadata();
   const selection = provider?.kind === "acpx" ? [provider.kind, provider.agent] : [provider?.kind ?? "all"];
-  const key = JSON.stringify([root, identity.digest, generation, selection]);
+  const key = JSON.stringify([resolvedPackRoot, identity.digest, generation, selection]);
   const cached = verifiedProviderPacks.get(key);
   if (cached) {
     const verified = await cached;
@@ -13511,7 +13511,7 @@ export async function verifyRemoteProviderPackManifest(packRoot: string, provide
   const pending = verifiedProviderPacks.get(key);
   if (pending && pending !== cached) return structuredClone((await pending).manifest);
   const verification = (async (): Promise<VerifiedProviderPack> => {
-    const checks = providerPackIdentityChecks(root, true, provider);
+    const checks = providerPackIdentityChecks(resolvedPackRoot, true, provider);
     const requests: ProviderPackHashRequest[] = [];
     const before: string[] = [];
     const digests = new Map<string, string>();
