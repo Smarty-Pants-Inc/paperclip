@@ -96,6 +96,8 @@ export class PiRpcDriver implements HarnessDriver {
       args,
       cwd,
       env: piProcessEnvironment(this.#options.environment),
+      commandFd: this.#options.commandFd,
+      commandLifecycle: this.#options.commandLifecycle,
       shutdownTimeoutMs: this.#options.shutdownTimeoutMs,
       killTimeoutMs: this.#options.killTimeoutMs,
     };
