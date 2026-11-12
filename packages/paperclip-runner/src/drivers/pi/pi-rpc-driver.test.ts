@@ -47,6 +47,24 @@ async function failureFixture(capture = true) {
 }
 
 describe("PiRpcDriver", () => {
+  it("opens a partial runtime context without granting an agent-files home", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-home-partial-"));
+    const transport = new FailureTransport();
+    let launched: NodeJS.ProcessEnv | undefined;
+    try {
+      const session = await new PiRpcDriver({ runtimeDirectory: join(root, "sessions"), model: "neutral/model", piRpcThinkingLevel: "high",
+        runtimeContext: { skills: [] },
+        environment: { PI_CODING_AGENT_DIR: join(root, "agent"), AGENT_HOME: "/controller/stale-copy", PAPERCLIP_PI_AGENT_HOME: "/caller/forged-copy" },
+        transportFactory: options => { launched = options.env; return transport as unknown as PiRpcTransport; },
+      }).openSession({ runId: "partial", normalizedSessionId: "partial", workingDirectory: root });
+      try {
+        expect(launched).toBeDefined();
+        expect(launched?.AGENT_HOME).toBeUndefined();
+        expect(launched?.PAPERCLIP_PI_AGENT_HOME).toBeUndefined();
+      } finally { await session.close(); }
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it.each(["registered", "controller-path", "unregistered", "legacy", "symlink", "overlap"] as const)("binds AGENT_HOME from the authenticated runtime context, never env (%s)", async mode => {
     const root = await mkdtemp(join(tmpdir(), "pi-agent-home-"));
     const home = join(root, "instruction-copy"); await mkdir(home);
