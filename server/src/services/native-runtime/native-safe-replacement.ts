@@ -16,6 +16,7 @@ import {
   issues,
   issueRecoveryActions,
   nativeRunFinalizations,
+  nativeRunResults,
   toolInvocations,
   workspaceOperations,
   type Db,
@@ -27,6 +28,8 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
+import { isAcknowledgedNativeStop } from "../acknowledged-native-stop.js";
+import { hasRequiredWorkspaceRecovery } from "../workspace-restore-recovery-state.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-retired-backup-source.js";
 import { completedWorkspaceRecoveryCondition } from "../workspace-recovery-receipt.js";
 import { nativeRunHasNoWorkspaceAccess } from "../workspace-restore-recovery-state.js";
@@ -190,7 +193,7 @@ export async function remoteWorkspaceReplacementEvidence(
     const [currentRun] = await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id),
     )).for("update");
-    if (!currentRun || currentRun.status !== "failed") return { workspacePreserved: false, providerStopped: false };
+    if (!currentRun || !["failed", "cancelled", "succeeded"].includes(currentRun.status)) return { workspacePreserved: false, providerStopped: false };
     run = currentRun;
     leases = await db.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
@@ -233,6 +236,80 @@ export async function remoteWorkspaceReplacementEvidence(
   const reused = operation ? null : await verifiedWorkspaceSnapshotReuse(db, {
     companyId: run.companyId, issueId, runId: run.id, reference, snapshot });
   return { workspacePreserved: Boolean(operation || reused), providerStopped };
+}
+
+/** A new turn may replace a cancelled remote generation, never replay its work.
+ * A committed successful turn whose lease was retired uses the same proof.
+ * The executor supplies the exact settled controller journal; Stop alone, a
+ * released lease alone, or the provider's 'lease inactive' error proves nothing.
+ * Keep this decision in the same safety policy as automatic replacements.
+ */
+export async function stoppedRemoteNativeReplacementEvidence(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; runId: string;
+  normalizedSessionId: string; settledJournal: boolean | (() => Promise<boolean>);
+}) {
+  const [source] = await db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+    .innerJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+      eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId)))
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+      eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId), eq(nativeRunFinalizations.issueId, input.issueId))).limit(1);
+  if (!source || source.run.runtimeMode !== "native" || !source.run.finishedAt) return false;
+  const { run, owner } = source;
+  const cleanStop = isAcknowledgedNativeStop(run) && owner.phase === "terminal_failure";
+  const retiredCrash = run.status === "failed" && owner.phase === "terminal_failure" &&
+    ["provider_transport_failed", "native_session_cleanup_quarantined"].includes(owner.failureCode ?? "");
+  const [completed] = run.status === "succeeded" && owner.phase === "committed" && owner.resultId && !owner.recoveryState
+    ? await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
+        eq(nativeRunResults.companyId, input.companyId), eq(nativeRunResults.issueId, input.issueId),
+        eq(nativeRunResults.runId, input.runId), eq(nativeRunResults.id, owner.resultId), eq(nativeRunResults.schemaStatus, "accepted"),
+        sql`${nativeRunResults.resultJson}#>>'{terminal,runTerminalState}' = 'succeeded'`)).limit(1) : [];
+  if ((!cleanStop && !retiredCrash && !completed) || owner.leaseOwner || owner.leaseExpiresAt ||
+      (owner.recoveryState && owner.recoveryState !== "blocked") || hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  const leases = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, input.runId)));
+  if (!leases.length || !leases.every(lease => lease.provider !== "local" && hasRemoteTerminationReceipt(lease))) return false;
+  const invocations = await db.select().from(toolInvocations).where(and(
+    eq(toolInvocations.companyId, input.companyId), eq(toolInvocations.runId, input.runId)));
+  const events = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, input.companyId), eq(heartbeatRunEvents.runId, input.runId),
+      inArray(heartbeatRunEvents.eventType, [...REPLACEMENT_ACTION_EVENT_TYPES])));
+  const workspace = await remoteWorkspaceReplacementEvidence(db, run, input.issueId, leases);
+  return decideNativeReplacement({
+    failedSession: true, failureMeaningKnown: true, predecessorFenced: true, providerStopped: true,
+    workspacePreserved: workspace?.workspacePreserved ?? run.runnerProfileJson?.nativeWorkspaceSync == null,
+    historyComplete: await replacementHistoryReady(db, run, input.issueId) === true,
+    effectInventoryComplete: typeof input.settledJournal === "function" ? await input.settledJournal() : input.settledJournal,
+    attempts: 0, invocations,
+    apiReceipts: record(run.resultJson?.apiToolReceipts), uncertainProviderActions: uncertainNativeReplacementActions(events, invocations),
+  }).allowed;
+}
+
+const REPLACEMENT_ACTION_EVENT_TYPES = ["harness.diagnostic", "tool.execution.started", "workspace.changed",
+  "workspace.change.updated", "delegation.started", "terminal.input.sent", "artifact.generated", "item.started"] as const;
+
+function uncertainNativeReplacementActions(events: Array<{ eventType: string; payload: unknown }>,
+  invocations: Array<typeof toolInvocations.$inferSelect>, stoppedEvidence?: Record<string, unknown>) {
+  const safeControlReads = new Set(["connections_search", "connection_request", "paperclip_get_agent", "paperclip_get_issue",
+    "paperclip_list_issues", "paperclip_read_document"]);
+  return events.flatMap(event => {
+    const envelope = record(event.payload);
+    const p = envelope.prpEvent ? record(record(envelope.prpEvent).payload) : envelope;
+    if (event.eventType === "harness.diagnostic") return p.classification === "descendant"
+      ? [`descendant ${String(p.receivedThreadId ?? "unknown")}`] : [];
+    if (["workspace.changed", "workspace.change.updated", "delegation.started", "terminal.input.sent", "artifact.generated"].includes(event.eventType))
+      return [event.eventType];
+    if (event.eventType === "tool.execution.started") {
+      const name = typeof p.name === "string" ? p.name : "unknown tool";
+      const completed = stoppedEvidence?.completedTaskControlCallIds;
+      if (name === "paperclip_finish" && Array.isArray(completed) && completed.includes(p.executionId)) return [];
+      const receiptedRead = invocations.some(row => (row.id === p.executionId || row.correlationId === p.executionId)
+        && row.toolName === name && row.riskLevel === "read" && row.status === "succeeded" && row.resultHash);
+      return p.transport === "process" || (!receiptedRead && !safeControlReads.has(name)) ? [String(p.executionId ?? name)] : [];
+    }
+    return ["command_execution", "commandExecution", "file_change", "fileChange", "collabAgentToolCall", "subAgentActivity"]
+      .includes(String(p.kind ?? p.type)) ? [String(p.kind ?? p.type)] : [];
+  });
 }
 
 export function nativeReplacementPending() {
@@ -413,75 +490,10 @@ export async function reconcileSafeNativeReplacements(
           and(
             eq(heartbeatRunEvents.companyId, run.companyId),
             eq(heartbeatRunEvents.runId, run.id),
-            inArray(heartbeatRunEvents.eventType, [
-              "harness.diagnostic",
-              "tool.execution.started",
-              "workspace.changed",
-              "workspace.change.updated",
-              "delegation.started",
-              "terminal.input.sent",
-              "artifact.generated",
-              "item.started",
-            ]),
+            inArray(heartbeatRunEvents.eventType, [...REPLACEMENT_ACTION_EVENT_TYPES]),
           ),
         );
-      const safeControlReads = new Set([
-        "connections_search",
-        "connection_request",
-        "paperclip_get_agent",
-        "paperclip_get_issue",
-        "paperclip_list_issues",
-        "paperclip_read_document",
-      ]);
-      const uncertainProviderActions = events.flatMap((event) => {
-        const envelope = record(event.payload);
-        const p = envelope.prpEvent
-          ? record(record(envelope.prpEvent).payload)
-          : envelope;
-        if (event.eventType === "harness.diagnostic")
-          return p.classification === "descendant"
-            ? [`descendant ${String(p.receivedThreadId ?? "unknown")}`]
-            : [];
-        if (
-          [
-            "workspace.changed",
-            "workspace.change.updated",
-            "delegation.started",
-            "terminal.input.sent",
-            "artifact.generated",
-          ].includes(event.eventType)
-        )
-          return [event.eventType];
-        if (event.eventType === "tool.execution.started") {
-          const name = typeof p.name === "string" ? p.name : "unknown tool";
-          const completedTaskControlCallIds = stoppedSession?.evidence.completedTaskControlCallIds;
-          if (name === "paperclip_finish" && Array.isArray(completedTaskControlCallIds) &&
-              completedTaskControlCallIds.includes(p.executionId)) return [];
-          const receiptedRead = invocations.some(
-            (row) =>
-              (row.id === p.executionId ||
-                row.correlationId === p.executionId) &&
-              row.toolName === name &&
-              row.riskLevel === "read" &&
-              row.status === "succeeded" &&
-              row.resultHash,
-          );
-          return p.transport === "process" ||
-            (!receiptedRead && !safeControlReads.has(name))
-            ? [String(p.executionId ?? name)]
-            : [];
-        }
-        return [
-          "command_execution",
-          "commandExecution",
-          "file_change",
-          "fileChange",
-          "collabAgentToolCall",
-          "subAgentActivity",
-        ].includes(String(p.kind ?? p.type))
-          ? [String(p.kind ?? p.type)]
-          : [];
-      });
+      const uncertainProviderActions = uncertainNativeReplacementActions(events, invocations, stoppedSession?.evidence);
       const history = await replacementHistoryReady(db, run, coordinator.issueId);
       if (history === false) continue;
       const historyComplete = history === true;

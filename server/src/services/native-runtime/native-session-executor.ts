@@ -695,6 +695,7 @@ type WarmNativeSession = {
   ingressOwner?: NativeWarmIngressOwner;
   onReleased: () => void;
   sessionCheckpointPersisted?: (snapshot: PersistedNativeSession) => void;
+  retireStoppedRemote?: () => Promise<boolean>;
   pluginTaskId?: string;
   observabilityCompatibilityKey?: string;
   runId: string;
@@ -730,6 +731,10 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
   // Revoke before awaiting process retirement/checkpoint IO.
   const stopping = entry.githubAccess?.stop();
   try {
+    // A terminated remote generation cannot checkpoint or collect through its
+    // old lease. Retire only its local transport after the shared replacement
+    // policy proves its saved journal, workspace and action history are safe.
+    if (await entry.retireStoppedRemote?.()) return;
     try { await entry.session.close({ reason }); }
     catch (error) {
       // A new conversation does not consume the old checkpoint, so the old
@@ -766,6 +771,69 @@ async function detachReleasedWarmNativeSession(entry: WarmNativeSession) {
   if (!entry.session.detachControllerForRestart) throw new Error("native_session_released_detach_unavailable");
   await entry.session.detachControllerForRestart();
   await entry.githubAccess?.stop();
+}
+
+/** A failed process probe is not proof of absence. Before even attempting a
+ * stale reattach, use the replacement policy's positive stop receipt plus the
+ * exact settled journal to select a cold Runner for the same conversation. */
+async function canReplaceStoppedRemoteOwner(db: Db, execution: NativeExecutionInput,
+  identity: Record<string, unknown>, root: string): Promise<boolean> {
+  const exact: Record<string, string> = {};
+  for (const key of ["runId", "normalizedSessionId", "runnerInstanceId", "environmentLeaseId", "turnId", "itemId"]) {
+    const value = identity[key];
+    if (typeof value !== "string" || !value) return false;
+    exact[key] = value;
+  }
+  if (activeNativeSessions.has(exact.runId) || nativeSessionStartups.has(exact.runId)) return false;
+  const { stoppedRemoteNativeReplacementEvidence } = await import("./native-safe-replacement.js");
+  try {
+    return await stoppedRemoteNativeReplacementEvidence(db, { ...execution.binding, runId: exact.runId,
+      normalizedSessionId: exact.normalizedSessionId, settledJournal: async () => {
+        try { return readSettledRunnerdProjection(root, exact, { remoteRunnerGone: true }).refused === undefined; }
+        catch { return false; }
+      } });
+  } catch { return false; }
+}
+
+function stoppedRemoteWarmRetirement(input: { db: Db; execution: NativeExecutionInput;
+  runnerExecutionTarget?: AdapterExecutionTarget | null }, session: NativeSession): (() => Promise<boolean>) | undefined {
+  if (input.runnerExecutionTarget?.kind !== "remote" || input.runnerExecutionTarget.transport !== "sandbox") return undefined;
+  return async () => {
+    const { binding } = input.execution;
+    if (!session.detachControllerForRestart || activeNativeSessions.has(binding.runId) || nativeSessionStartups.has(binding.runId)) return false;
+    try {
+      const { stoppedRemoteNativeReplacementEvidence } = await import("./native-safe-replacement.js");
+      const safe = await stoppedRemoteNativeReplacementEvidence(input.db, { ...binding,
+        normalizedSessionId: nativeSessionKey(input.execution), settledJournal: async () => {
+          const checkpoint = await loadNativeRunnerCheckpoint(input.db, binding);
+          if (!checkpoint) return false;
+          const scratch = mkdtempSync(join(tmpdir(), "paperclip-stopped-remote-owner-"));
+          try {
+            checkpoint.restoreSessionDirectory(scratch);
+            const identity = readRunnerdDurableIdentity(scratch);
+            return identity?.runId === binding.runId && identity.normalizedSessionId === nativeSessionKey(input.execution)
+              && readSettledRunnerdProjection(scratch, identity as Record<string, string>, { remoteRunnerGone: true }).refused === undefined;
+          } finally { rmSync(scratch, { recursive: true, force: true }); }
+        } });
+      if (!safe) return false;
+    } catch { return false; }
+    // This is local controller detachment, not session.close on the old lease.
+    await session.detachControllerForRestart();
+    return true;
+  };
+}
+
+async function forgetStoppedRemoteWarmSession(scope: string, entry: WarmNativeSession): Promise<boolean> {
+  if (entry.busy || entry.preparingRunId || !entry.retireStoppedRemote) return false;
+  entry.busy = true;
+  try {
+    if (!await entry.retireStoppedRemote()) return false;
+    if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+    entry.idleTimer = null;
+    await entry.githubAccess?.stop();
+    forgetWarmNativeSession(scope, entry);
+    return true;
+  } finally { entry.busy = false; }
 }
 
 const warmNativeSessions = new Map<string, WarmNativeSession>();
@@ -833,6 +901,7 @@ export async function claimWarmNativeInstructionCopy(input: {
   // Re-read after the wait: the release may have retired or replaced the session.
   const entry = warmNativeSessions.get(scope);
   if (!entry || !entry.instructionWorkingCopy?.runId || entry.environmentId !== input.environmentId) return null;
+  if (await forgetStoppedRemoteWarmSession(scope, entry)) return null;
   if (entry.busy) throw new Error("native_session_supervisor_busy");
   entry.busy = true;
   if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
@@ -886,6 +955,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
 }): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
+    if (await forgetStoppedRemoteWarmSession(id, entry)) return null;
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
@@ -5827,7 +5897,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
       return refuse("target_not_sandbox_runner");
     }
-    if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
+    if (!["created", "replacement", "resumed"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
   }
@@ -5843,7 +5913,15 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   try { originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8"); }
   catch { return refuse("journal_unreadable"); }
   const { binding } = input.execution;
-  const remoteRunnerGone = !localRunner && await priorRemoteSandboxLeasesEnded(input.db, {
+  const stoppedReplacementInput = { companyId: binding.companyId, agentId: binding.agentId, issueId: binding.issueId,
+    runId: identity.runId, normalizedSessionId: identity.normalizedSessionId, settledJournal: true };
+  const { stoppedRemoteNativeReplacementEvidence } = await import("./native-safe-replacement.js");
+  const stoppedReplacement = !localRunner && await canReplaceStoppedRemoteOwner(input.db, input.execution, identity, input.root);
+  // A resumed box can contain a dead old generation. Only positive retirement
+  // evidence, never probe_transport_failed by itself, authorizes this path.
+  if (target?.kind === "remote" && target.transport === "sandbox" &&
+      target.sandboxLeaseAcquisition?.outcome === "resumed" && !stoppedReplacement) return refuse("sandbox_resumed");
+  const remoteRunnerGone = stoppedReplacement || !localRunner && await priorRemoteSandboxLeasesEnded(input.db, {
     companyId: binding.companyId, runId: identity.runId,
     currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
       ? target.sandboxLeaseAcquisition?.providerLeaseId : undefined,
@@ -5866,10 +5944,14 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   }
   if (!prior || prior.run.runtimeMode !== "native") return refuse("owner_missing");
   if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(prior.run.status)) return refuse("owner_run_not_terminal");
-  if (prior.owner.phase !== "committed") return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
-  if (!prior.owner.resultId) return refuse("owner_result_missing");
+  // Stop has no accepted result to commit. The replacement policy can instead
+  // prove this exact cancelled generation is fenced, its remote resource is
+  // stopped, its journal settled and its action/workspace history preserved.
+  // This replaces Runner authority only, not the durable conversation ID.
+  if (prior.owner.phase !== "committed" && !stoppedReplacement) return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
+  if (!prior.owner.resultId && !stoppedReplacement) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
-  if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
+  if (prior.owner.recoveryState && !stoppedReplacement) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
   // A durable controller is fenced by its released database lease; a legacy
   // controller still needs process evidence, exactly as for warm recovery.
   const finishedHere = () => isCurrentNativeControllerProcess(prior!.owner) &&
@@ -5921,6 +6003,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     // Database reads can await. Retire only the exact evidence proven above.
     if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8") !== originalBytes
       || readSettledRunnerdProjection(input.root, identity, projectionOptions).bytes !== controlBytes) return "journal_changed";
+    if (stoppedReplacement && !await stoppedRemoteNativeReplacementEvidence(input.db, stoppedReplacementInput)) return "stopped_replacement_changed";
     if (provenFinishedHere && !finishedHere()) return "controller_restarted_here";
     if (localRunner && !(await proveLocalRunnerStopped()).stopped) return "runner_process_restarted";
     return null;
@@ -7208,6 +7291,10 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
   if (target?.kind !== "remote" || target.transport !== "sandbox" || target.sandboxLeaseAcquisition?.outcome !== "resumed"
     || !durableIdentityMatchesSession(prior, input.execution) || prior.runId === input.execution.binding.runId
     || runnerdAuthorityLifecycle(root, prior) !== "absent") return;
+  // The old resource may already be stopped even when Boat returns that same
+  // box as "resumed". Do not read/reattach its stale Runner: migration will
+  // retire the settled controller using the same positive replacement proof.
+  if (!target.runnerTask && await canReplaceStoppedRemoteOwner(input.db, input.execution, prior, root)) return;
   let state: Record<string, unknown>;
   // A Runner left in an abandoned allocation is never adopted live: the new
   // execution restored the last save into its own root of the same sandbox.
@@ -10031,6 +10118,9 @@ export async function executePaperclipNativeSession(input: {
           || input.runnerExecutionTarget.transport !== "sandbox")) {
       throw new Error(input.execution.provider.kind === "muse" ? "muse_cloud_requires_managed_runner" : "dot_cloud_requires_managed_runner");
     }
+    const priorWarmScope = nativeSessionScopeKey(input.execution);
+    const priorWarmOwner = warmNativeSessions.get(priorWarmScope);
+    if (priorWarmOwner) await forgetStoppedRemoteWarmSession(priorWarmScope, priorWarmOwner);
     if (!input.useRunnerd) {
       return await executePaperclipNativeSessionWithinScope(input, undefined, false, ownDiagnosticLease);
     }
@@ -10438,7 +10528,12 @@ async function executePaperclipNativeSessionAttempt(
     if (durableIdentityMatchesSession(identity, input.execution) && identity.runId !== input.execution.binding.runId &&
         runnerdAuthorityLifecycleWithVerifiedBackup({ root, identity, execution: input.execution, allowVerifiedBackup: true }) !== "suspended") {
       let releasedSource: DurableRecoveryIdentity | undefined;
-      remoteWarmRecovery = await inspectRemoteWarmSessionRecovery({
+      // A stopped/retired generation must not become remoteWarmRecovery: that
+      // would unconditionally probe the archived Boat lease at process_verification
+      // and turn probe_transport_failed into a reconciliation hold. Migration
+      // below retires only the proven stale controller and bootstraps cold.
+      const stoppedOwner = await canReplaceStoppedRemoteOwner(input.db, input.execution, identity, root);
+      remoteWarmRecovery = stoppedOwner ? undefined : await inspectRemoteWarmSessionRecovery({
         db: input.db, execution: input.execution, target: input.runnerExecutionTarget, identity,
         readControlState: () => record(JSON.parse(readBoundedNativeFile(
           resolve(root, "control-plane", "control-plane-state.json"), NATIVE_CONTROL_PLANE_STATE_MAX_BYTES,
@@ -11979,6 +12074,7 @@ async function executePaperclipNativeSessionAttempt(
                   existing.ingressOwner = ingress ? { ...input.execution.binding, ingress,
                     controllerBootId: controller.bootId, controllerGeneration } : undefined;
                   existing.session = session;
+                  existing.retireStoppedRemote = stoppedRemoteWarmRetirement(input, session);
                   existing.runId = input.execution.binding.runId;
                   existing.issueId = input.execution.binding.issueId;
                 } else
@@ -11988,6 +12084,7 @@ async function executePaperclipNativeSessionAttempt(
                       return ingress ? { ...input.execution.binding, ingress, controllerBootId: controller.bootId, controllerGeneration } : undefined;
                     })(),
                     sessionCheckpointPersisted: runnerdBackend?.sessionCheckpointPersisted,
+                    retireStoppedRemote: stoppedRemoteWarmRetirement(input, session),
                     onReleased: () => releaseRetainedNativeSessionCleanup(input.db, {
                       companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
                     }, { companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,

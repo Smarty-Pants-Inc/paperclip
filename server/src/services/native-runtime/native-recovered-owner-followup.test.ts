@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
+  agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
   nativeRunnerCheckpoints, nativeRunResults,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
@@ -93,7 +93,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   async function seedRecoveredPriorRun(control: "settled" | "pending-command" | "unanswered-tool"
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
-    options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode";
+    options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
       lifecycle?: "warm" } = {}) {
     const issueId = randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
@@ -104,6 +104,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const executionFor = (currentRunId: string) => buildNativeExecutionInput({
       companyId, agentId, runId: currentRunId, provider: options.provider ?? "acpx", acpxAgent: "claude",
       model: options.provider === "codex" ? "gpt-6.1-sol"
+        : options.provider === "pi_rpc" ? "anthropic/claude-opus-5-5"
         : options.provider === "opencode" ? "openrouter/deepseek/deepseek-v4.1-flash-1017" : "claude-opus-5-5",
       issue: { id: issueId, identifier: "ROF-1", title: "Continue after recovery", description: null, workMode: "standard" },
       taskPrompt: "Continue the conversation.",
@@ -189,10 +190,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
 
   /** Mirrors runtime selection: the follow-up inherits the selected source's
    * provider checkpoint before the executor admits its durable root. */
-  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, commentId?: string, replacementProviderLeaseId?: string) {
     const runId = randomUUID();
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
-      nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId, contextSnapshot: { issueId: prior.issueId } }).returning();
+      nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId,
+      contextSnapshot: { issueId: prior.issueId, ...(commentId ? { wakeCommentId: commentId } : {}) } }).returning();
     const next = await prepareNativeHeartbeatRun({ db, run: row, issue: issueFields(prior.issueId), environmentLeaseId: randomUUID() });
     await db.insert(nativeRunFinalizations).values({ companyId, issueId: prior.issueId, runId, phase: "observed" });
     await db.update(issues).set({ executionRunId: runId, status: "in_progress" }).where(eq(issues.id, prior.issueId));
@@ -206,7 +208,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson, nativeExecutionInput: execution,
       nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("remote", execution.provider.kind),
       sessionCheckpoint: admission.checkpoint } }).where(eq(heartbeatRuns.id, runId));
-    const logs: string[] = [], environmentId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `sandbox-${runId}`;
+    const logs: string[] = [], environmentId = randomUUID(), leaseId = randomUUID(), providerLeaseId = replacementProviderLeaseId ?? `sandbox-${runId}`;
     const remoteExecute = vi.fn(async (_request: unknown): Promise<{ exitCode: number; timedOut: boolean; stdout: string; stderr: string }> => {
       throw new Error("admission must not reach the sandbox");
     });
@@ -290,6 +292,58 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       .where(eq(nativeRunFinalizations.runId, runId));
     return { runId, execution, identity };
   }
+
+  it.each(["clean", "same-box", "retired-success", "retired-crash", "live-owner", "recovering-owner", "uncertain-action", "unverified-stop", "unsafe-stop", "pending-tool", "provider-action"] as const)(
+    "admits the same Pi conversation on a new lease after a cancelled owner: %s", async mode => {
+      const prior = await seedRecoveredPriorRun(mode === "pending-tool" ? "unanswered-tool" : "settled", {
+        provider: "pi_rpc", ...(mode === "same-box" ? { lifecycle: "warm" as const } : {}),
+      });
+      const stoppedAt = new Date();
+      await db.update(heartbeatRuns).set({ status: mode === "retired-success" ? "succeeded" : mode === "retired-crash" ? "failed" : "cancelled", finishedAt: stoppedAt, resultJson: {
+        cancelledByActorType: "user", cancelledByUserId: "operator", nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", runId: prior.runId, companyId, issueId: prior.issueId,
+          scope: "run", reasonCode: "cancellation_run_only", dispatchState: mode === "unsafe-stop" ? "pending" : "acknowledged", dispatched: true,
+          intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+        },
+        ...(mode === "uncertain-action" ? { apiToolReceipts: { pending: { state: "pending" } } } : {}),
+      } }).where(eq(heartbeatRuns.id, prior.runId));
+      if (mode === "retired-success") await db.update(nativeRunResults).set({ resultJson: { terminal: { runTerminalState: "succeeded" } } })
+        .where(eq(nativeRunResults.runId, prior.runId));
+      await db.update(nativeRunFinalizations).set({ ...(mode === "retired-success" ? { phase: "committed" } : { phase: "terminal_failure", resultId: null }),
+        failureCode: mode === "retired-crash" ? "provider_transport_failed" : null,
+        recoveryState: mode === "recovering-owner" ? "resuming_session" : null,
+        leaseOwner: mode === "live-owner" ? "still-running" : null,
+        leaseExpiresAt: mode === "live-owner" ? new Date(Date.now() + 60_000) : null,
+      }).where(eq(nativeRunFinalizations.runId, prior.runId));
+      const environmentId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `retired-${prior.runId}`;
+      await db.insert(environments).values({ id: environmentId, name: `Retired sandbox ${environmentId}`, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: prior.runId,
+        provider: "boat", providerLeaseId, status: "released", releasedAt: stoppedAt, cleanupStatus: "success",
+        metadata: mode === "unverified-stop" ? {} : { remoteExecutionTermination: {
+          schema: "paperclip.remote-termination.v1", companyId, runId: prior.runId, leaseId, provider: "boat",
+          providerLeaseId, state: mode === "same-box" ? "stopped" : "destroyed", confirmedAt: stoppedAt.toISOString(),
+        } },
+      });
+      if (mode === "provider-action") await db.insert(heartbeatRunEvents).values({ companyId, runId: prior.runId, agentId,
+        seq: 1, eventType: "tool.execution.started", payload: { name: "send_email", executionId: "unconfirmed-write", transport: "process" } });
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId: prior.issueId,
+        authorType: "user", authorUserId: "operator", body: "Continue with this new message after Stop." }).returning();
+      const followUp = await admitFollowUp(prior, comment!.id, mode === "same-box" ? providerLeaseId : undefined);
+      // Boat may return the same box through a different lease handle.
+      const outcome = await followUp.start(mode === "same-box" ? "resumed" : "created");
+      if (mode === "clean" || mode === "same-box" || mode === "retired-success" || mode === "retired-crash") {
+        expect(outcome).toBe(ADMITTED);
+        expect(followUp.native.normalizedSessionId).toBe(prior.native.normalizedSessionId);
+        expect(followUp.selectedRunId).toBe(prior.runId);
+        const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+        expect(successor?.contextSnapshot?.wakeCommentId).toBe(comment!.id);
+        expect(successor?.runnerProfileJson?.sessionCheckpoint).toMatchObject({ providerSessionId: "provider-session-before-recovery",
+          identity: { sessionId: prior.native.normalizedSessionId, runId: followUp.runId } });
+        expect(await archivedOwners(scopedRunnerdStateRoot(prior.executionFor(followUp.runId)))).toEqual([prior.runId]);
+      } else expect(outcome).not.toBe(ADMITTED);
+      // Admission must never try to contact the stopped source's sandbox.
+      expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    }, 60_000);
 
   async function staleProjection(provider: "codex" | "acpx" = "codex", external = false) {
     const prior = await seedRecoveredPriorRun("settled", { provider });

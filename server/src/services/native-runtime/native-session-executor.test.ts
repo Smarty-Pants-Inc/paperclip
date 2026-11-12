@@ -11346,6 +11346,43 @@ describe("native warm session supervision", () => {
       expect(secondCopy.collectStopped).toHaveBeenCalledOnce();
     });
 
+    it.each([true, false])("never reopens an expired lease when stopped-owner evidence is verified=%s", async verified => {
+      // The durable proof is covered against Postgres in the recovered-owner
+      // suite. Here inject that boundary and exercise the retained transport:
+      // every operation on the old Boat lease would fail after lease teardown.
+      const name = `managed-retired-lease-${verified}`, f = await start(name);
+      const detached = vi.fn(async () => undefined);
+      Object.assign(f.session, { detachControllerForRestart: detached });
+      f.close.mockRejectedValue(new Error("Boat sandbox lease is no longer active"));
+      const policy = await import("./native-safe-replacement.js");
+      const proof = vi.spyOn(policy, "stoppedRemoteNativeReplacementEvidence").mockResolvedValue(verified);
+      const newTarget = { ...f.target, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: `${name}-new-box` } };
+      try {
+        if (!verified) {
+          await expect(f.reserve(async () => true, newTarget)).rejects.toThrow("Boat sandbox lease is no longer active");
+          expect(detached).not.toHaveBeenCalled();
+          return;
+        }
+        expect(await f.reserve(async () => true, newTarget)).toBeNull();
+        expect(detached).toHaveBeenCalledOnce();
+        expect(f.close).not.toHaveBeenCalled();
+        expect(f.copy.collectStopped).not.toHaveBeenCalled();
+        const next = { ...f.current, binding: { ...f.current.binding, runId: `${name}-two` } };
+        state.execute.mockImplementationOnce(async options => {
+          expect(options.existingSession).toBeUndefined();
+          expect(options.input.session.normalizedSessionId).toBe(f.current.session.normalizedSessionId);
+          return result;
+        });
+        await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name,
+          runnerExecutionTarget: newTarget })).resolves.toMatchObject({ exitCode: 0 });
+        expect(proof).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ runId: f.current.binding.runId,
+          normalizedSessionId: f.current.session.normalizedSessionId }));
+      } finally {
+        proof.mockRestore(); f.close.mockResolvedValue(undefined);
+        await closeWarmNativeSessionsForEnvironment({ environmentId: f.target.environmentId, reason: "test cleanup" });
+      }
+    });
+
     it("stops before collecting when a checkpoint cannot stabilize", async () => {
       const f = await start("managed-fallback", false);
       expect(f.close).toHaveBeenCalledOnce();
