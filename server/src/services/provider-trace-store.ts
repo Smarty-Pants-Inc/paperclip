@@ -293,6 +293,8 @@ export function providerTraceStore(db: Db, options: { objectStore?: ProviderTrac
   }
 
   async function expireRow(row: TraceRow, now: Date, signal?: AbortSignal) {
+    // R-keep-all-traces: nothing expires, so a trace never becomes hidden by age.
+    if (PROVIDER_TRACE_KEEP_FOREVER) return null;
     let expired = row;
     let newlyExpired = false;
     if (!row.deletedAt) {
