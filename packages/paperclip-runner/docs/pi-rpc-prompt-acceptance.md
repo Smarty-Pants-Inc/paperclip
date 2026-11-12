@@ -28,6 +28,31 @@ See [Pi's prompt command contract](https://github.com/earendil-works/pi/blob/v1.
 Disposition, independent-extension ownership and same-resident reuse regressions
 are in `pi-rpc-prompt.test.ts` and `pi-rpc-resident-binding.test.ts`.
 
+## Late receipts and bounded identity history
+
+Settlement releases the turn's projector, arguments, text and exact identity
+map. An unfinished native tool remains a park blocker with only its captured
+`runId`, `turnId` and tool name. Its matching final `tool_execution_end` can still
+complete the original canonical display item, including while a handled prompt
+is awaiting or has received its acknowledgment. This does not start an item,
+report new usage, complete a new turn, announce tool execution, or restore any
+host capability. Unknown extra identities and conflicting tool names remain
+refused. The first matching terminal consumes the blocker; duplicates are dropped.
+
+Retired identities use a fixed 1 MiB, four-hash tombstone filter rather than a
+resident-lifetime map. It never forgets an inserted identity. Hash collisions
+can conservatively suppress projection of a new identity; a filter match can
+never select an owner or grant authority. The active exact identity budget
+resets every turn. Genuine unresolved tool blockers are separately capped at
+65,536; exceeding that bound fails closed instead of forgetting live work.
+No settled projector or display body is retained for late receipts.
+
+See [Pi's final tool receipt contract](https://github.com/earendil-works/pi/blob/v1.5.2/packages/coding-agent/docs/json.md#tool-execution-events).
+The original K4 before/after-ACK regressions and P0-4 warm-session/stale-callback
+regressions run unchanged in `pi-rpc-driver.test.ts`. Its cross-run late-terminal
+case also checks canonical item identity, duplicate suppression, mixed-owner
+refusal and completion of the next prompt.
+
 ## Lost acknowledgments
 
 `PiRpcTransport` gives commands a 30-second client response deadline. Set
