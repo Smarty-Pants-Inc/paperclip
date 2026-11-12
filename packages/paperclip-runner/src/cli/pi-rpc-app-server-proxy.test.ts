@@ -168,10 +168,105 @@ describe("Pi RPC app-server facade proxy", () => {
       }
       const usage = sink.decoded().filter(f => f.method === "thread/tokenUsage/updated");
       expect(usage).toHaveLength(4);
-      for (const [index, frame] of usage.entries()) expect(frame).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 * (index + 1), outputTokens: 3 * (index + 1), cacheReadTokens: 2 * (index + 1) }, last: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 } } } });
-      expect(usage.reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
+      for (const [index, frame] of usage.entries()) expect(frame).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 * (index + 1), outputTokens: 3 * (index + 1), cacheReadTokens: 2 * (index + 1) }, last: { inputTokens: 11 * (index % 2 + 1), outputTokens: 3 * (index % 2 + 1), cacheReadTokens: 2 * (index % 2 + 1) } } } });
+      // `last` is a turn snapshot, not another delta to sum on every update.
+      expect([usage[1], usage[3]].reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
     } finally { await proxy.close(); }
   });
+  // Keep reason: harness-comparison gap #4 corrupts persisted spend at the
+  // native Pi -> facade -> Rust total/last contract boundary.
+  it("deduplicates re-sent message usage at the facade, including after another turn", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 120, "thread/start", { model: "neutral/model" });
+      const payload = { providerRequestId: "receipt-1", runDelta: { inputTokens: 11, outputTokens: 0 }, runDeltaAvailable: true, accountingComplete: true };
+      session.push("usage.reported", payload, "turn-a", "usage-1");
+      session.push("usage.reported", { ...payload, runDelta: { outputTokens: 0, inputTokens: 11 } }, "turn-a", "usage-1");
+      session.push("usage.reported", { ...payload, providerRequestId: "receipt-2" }, "turn-b", "usage-2");
+      session.push("usage.reported", payload, "turn-a", "usage-1");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const usage = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
+      expect(usage).toHaveLength(2);
+      expect(usage[0]).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 }, last: { inputTokens: 11 } } } });
+      expect(usage[1]).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 22 }, last: { inputTokens: 11 } } } });
+    } finally { await proxy.close(); }
+  });
+
+  it("reconciles T1-T4 turn snapshots to the sum of native Pi message receipts", async () => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    const turns = [[11, 11], [3, 7], [5], [2, 4, 8]];
+    let sessionInput = 0;
+    try {
+      await request(proxy, sink, 130, "thread/start", { model: "neutral/model" });
+      for (const [index, messages] of turns.entries()) {
+        const runId = index < 2 ? "run-1" : "run-2";
+        if (index === 2) await request(proxy, sink, 131, "run.attach", { runId });
+        const turnId = `T${index + 1}`;
+        const projector = createPiEventProjector({ runId, turnId });
+        let turnInput = 0;
+        for (const [message, input] of messages.entries()) {
+          const events = projector.project({ type: "message_end", message: {
+            role: "assistant", provider: "neutral", model: "model", responseId: `${turnId}-${message}`,
+            stopReason: "stop", content: [], usage: { input, output: input, cacheRead: 1, cacheWrite: 2 },
+          } });
+          for (const event of events.filter(event => event.eventType === "usage.reported")) session.push(event.eventType, event.payload, event.turnId, event.itemId, runId);
+          sessionInput += input; turnInput += input;
+          await new Promise<void>(resolve => setImmediate(resolve));
+          const latest = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1)!;
+          expect(latest).toMatchObject({ params: { turnId, tokenUsage: {
+            total: { inputTokens: sessionInput, outputTokens: sessionInput },
+            last: { inputTokens: turnInput, outputTokens: turnInput, cacheReadTokens: message + 1, cacheWriteTokens: 2 * (message + 1) },
+          } } });
+        }
+      }
+      const finals = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated")
+        .filter((frame, index, all) => (all[index + 1]?.params as any)?.turnId !== (frame.params as any).turnId);
+      expect(finals.map(frame => (frame.params as any).tokenUsage.last.inputTokens)).toEqual(turns.map(messages => messages.reduce((sum, value) => sum + value, 0)));
+      expect((finals.at(-1)!.params as any).tokenUsage.total.inputTokens).toBe(51);
+    } finally { await proxy.close(); }
+  });
+
+  it.each(["first", "last"])("does not label a turn complete when its %s message lacks usage", async missing => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 140, "thread/start", { model: "neutral/model" });
+      const projector = createPiEventProjector({ runId: "run-1", turnId: "incomplete" });
+      for (const [index, hasUsage] of (missing === "first" ? [false, true] : [true, false]).entries()) {
+        const events = projector.project({ type: "message_end", message: {
+          role: "assistant", provider: "neutral", model: "model", responseId: `message-${index}`, stopReason: "stop", content: [],
+          ...(hasUsage ? { usage: { input: 11, output: 0, cacheRead: 0, cacheWrite: 0 } } : {}),
+        } });
+        for (const event of events) session.push(event.eventType, event.payload, event.turnId, event.itemId);
+      }
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const latest = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1)!;
+      expect(latest).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 } }, runDeltaAvailable: false } });
+      // Rust uses the presence of tokenUsage.last as runDeltaAvailable. A
+      // top-level accountingComplete:false alone does not survive normalization.
+      expect((latest.params as any).tokenUsage).not.toHaveProperty("last");
+    } finally { await proxy.close(); }
+  });
+
+  it("preserves explicit incomplete accounting even when the message has all token fields", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 150, "thread/start", { model: "neutral/model" });
+      session.push("usage.reported", { providerRequestId: "partial", runDelta: { inputTokens: 11 }, runDeltaAvailable: true, accountingComplete: false }, "partial", "partial");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const latest = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1)!;
+      expect(latest).toMatchObject({ params: { runDeltaAvailable: false, tokenUsage: { total: { inputTokens: 11 } } } });
+      expect((latest.params as any).tokenUsage).not.toHaveProperty("last");
+    } finally { await proxy.close(); }
+  });
+
   // Keep reason: the Pi/Rust facade boundary must retain non-zero accounting.
   // Run usage is computed after this wire boundary in runner-core's
   // provider_events.rs (normalize_codex_notification reads total/last into
