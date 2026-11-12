@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { chmod, lstat, realpath, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, resolve } from "node:path";
@@ -62,6 +63,19 @@ export interface PiBindHooks {
   dispatchTool?: (request: PiToolCallRequest, signal: AbortSignal) => Promise<PiToolResult>;
 }
 export interface PiBindOptions { socketPath: string; initial: PiBindInitial; hooks?: PiBindHooks; timeoutMs?: number }
+
+export function piHostInstructionSegment(instructions: string, boundary: string): string {
+  return `<!-- ${boundary}:start -->\n${instructions}\n<!-- ${boundary}:end -->`;
+}
+
+/** Replace only the host-owned CLI append, keeping native AGENTS/home context. */
+export function replacePiHostInstructions(prompt: string, instructions: string, boundary?: string): string {
+  if (!boundary) return instructions ? `${prompt}\n\n${instructions}` : prompt;
+  const start = `<!-- ${boundary}:start -->`, end = `<!-- ${boundary}:end -->`;
+  const first = prompt.indexOf(start), last = prompt.lastIndexOf(end);
+  if (first < 0 || last < first) throw new Error("Pi host instruction segment unavailable");
+  return prompt.slice(0, first) + piHostInstructionSegment(instructions, boundary) + prompt.slice(last + end.length);
+}
 
 const homeAdmissions = new Set<HomeAdmission>();
 const parkContributors = new Set<ParkReadyContributor>();
@@ -360,7 +374,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
       fence(); context.abort(); throw new Error("Pi turn authority refused");
     }
     running = admitted; admitted = null;
-    return { systemPrompt: config.instructions ? `${event.systemPrompt}\n\n${config.instructions}` : event.systemPrompt };
+    return { systemPrompt: replacePiHostInstructions(event.systemPrompt, config.instructions, process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY) };
   });
   pi.on("cache_warming_decision", () => ({ action: "stop" }));
   pi.on("tool_execution_start", event => {
@@ -377,6 +391,20 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
 export default function paperclipPiBindExtension(pi: PiBindApi): void {
   const socketPath = process.env.PAPERCLIP_PI_BIND_SOCKET;
   const initialJson = process.env.PAPERCLIP_PI_BIND_INITIAL;
+  if (!socketPath && !initialJson) {
+    // Native/custom providers still load the host prompt refresher independently
+    // of broker routing. This does not grant managed callback/broker authority.
+    const path = process.env.PAPERCLIP_PI_INSTRUCTIONS_FILE;
+    const boundary = process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY;
+    if (!path || !boundary) throw new Error(PI_BIND_ERROR);
+    pi.on("before_agent_start", event => {
+      const segment = readFileSync(path, "utf8");
+      const start = `<!-- ${boundary}:start -->\n`, end = `\n<!-- ${boundary}:end -->`;
+      if (!segment.startsWith(start) || !segment.endsWith(end)) throw new Error(PI_BIND_ERROR);
+      return { systemPrompt: replacePiHostInstructions(event.systemPrompt, segment.slice(start.length, -end.length), boundary) };
+    });
+    return;
+  }
   if (!socketPath || !initialJson || Buffer.byteLength(initialJson) > PI_BIND_MAX_FRAME_BYTES) throw new Error(PI_BIND_ERROR);
   let initial: PiBindInitial;
   try { initial = JSON.parse(initialJson) as PiBindInitial; } catch { throw new Error(PI_BIND_ERROR); }

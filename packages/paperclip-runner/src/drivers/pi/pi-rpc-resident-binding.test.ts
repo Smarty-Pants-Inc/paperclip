@@ -118,7 +118,11 @@ async function revoked(provider: { baseUrl: string; apiKey: string }) {
 describe("resident Pi model binding", () => {
   it("bootstraps nonsecret INITIAL + merged models before spawn; turn 1 has zero bind/begin IPC", async () => {
     const f = await fixture();
-    expect(f.launch.args).toContain("--no-extensions"); expect(f.launch.args).toContain("--extension");
+    expect(f.launch.args).not.toContain("--no-extensions"); expect(f.launch.args).toContain("--extension");
+    expect(f.launch.args).toContain("--append-system-prompt");
+    const instructionFile = f.launch.args![f.launch.args!.indexOf("--append-system-prompt") + 1]!;
+    expect((await stat(instructionFile)).mode & 0o777).toBe(0o600);
+    expect(await readFile(instructionFile, "utf8")).toContain("initial π");
     const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
     expect(initial).toMatchObject({ schema: 1, sessionId: "host-session", epoch: 1, runId: "run-a", model: "paperclip/faux", thinkingLevel: "off", tools: [tool("old_tool")] });
     expect(initial.instructions).toContain("initial π"); expect(initial.instructions).toContain('"revision":1');

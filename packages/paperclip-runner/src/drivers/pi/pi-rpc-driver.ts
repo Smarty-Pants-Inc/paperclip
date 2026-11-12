@@ -8,6 +8,7 @@ import { RunAuthority, sendPiBindRequest, validateBindReceipt, validateBindReque
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
+import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
@@ -108,7 +109,7 @@ export class PiRpcDriver implements HarnessDriver {
     await chmod(directory, 0o700);
     const filename = `${safeSessionName(input.normalizedSessionId)}.jsonl`;
     const sessionFile = join(directory, filename);
-    const args = ["--mode", "rpc", "--session", sessionFile, "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"];
+    const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
     const credentialMode = environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker";
@@ -120,6 +121,14 @@ export class PiRpcDriver implements HarnessDriver {
       piRpcThinkingLevel: this.#options.piRpcThinkingLevel ?? this.#options.piThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
     });
     if (config.piRpcThinkingLevel === undefined) throw new PiNativeAdmissionError("pi_thinking_required", "Pi RPC requires an explicit thinking effort before admission.");
+    const instructionFile = join(directory, `${safeSessionName(input.normalizedSessionId)}-${randomUUID()}.instructions.md`);
+    const instructionBoundary = `paperclip-host-${randomUUID()}`;
+    const initialContext = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
+    const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
+    await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
+    args.push("--append-system-prompt", instructionFile, "--extension", extension);
+    environment.PAPERCLIP_PI_INSTRUCTIONS_FILE = instructionFile;
+    environment.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY = instructionBoundary;
     let closeProvider: (() => Promise<void>) | undefined;
     let resident: PiResidentState | undefined;
     let callbacks: PiHostCallbacks | undefined;
@@ -151,8 +160,6 @@ export class PiRpcDriver implements HarnessDriver {
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
           await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json));
-          const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
-          args.push("--extension", extension);
           environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
           environment.PAPERCLIP_PI_BIND_INITIAL = JSON.stringify(initial);
         } catch (error) {
@@ -193,7 +200,9 @@ export class PiRpcDriver implements HarnessDriver {
         sessionFile,
         config,
         systemInstructions: this.#options.systemInstructions,
-        initialContext: bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext),
+        initialContext,
+        instructionFile,
+        instructionBoundary,
         admissionTimeoutMs: this.#options.startupTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
@@ -208,6 +217,7 @@ export class PiRpcDriver implements HarnessDriver {
       await transport?.close().catch(() => undefined);
       await closeProvider?.().catch(() => undefined);
       if (resident) await cleanPiPrivateDirectory(resident).catch(() => undefined);
+      await unlink(instructionFile).catch(() => undefined);
       throw error;
     }
   }
@@ -243,6 +253,8 @@ interface PiSessionState {
   config: PiNativeConfig;
   systemInstructions?: string;
   initialContext: PiRunContext;
+  instructionFile: string;
+  instructionBoundary: string;
   bindRequest: typeof sendPiBindRequest;
   admissionTimeoutMs?: number;
 }
@@ -323,7 +335,9 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #events = new EventQueue();
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
-  readonly #initialContext: PiRunContext;
+  #initialContext: PiRunContext;
+  readonly #instructionFile: string;
+  readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
   // Values retain the originating turn/projector after settlement and attach.
   // Ambiguous reused native identities are tombstoned, never rebound.
@@ -352,6 +366,8 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#bindRequest = state.bindRequest;
     this.#config = state.config;
     this.#initialContext = state.initialContext;
+    this.#instructionFile = state.instructionFile;
+    this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     void this.#pump();
   }
@@ -390,8 +406,10 @@ export class PiRpcHarnessSession implements HarnessSession {
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
           input.dynamicTools !== undefined ? input.dynamicTools : previous.tools,
           input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
-        if (JSON.stringify(context) !== JSON.stringify(previous)) throw new Error("Pi RPC run context refresh requires a provider bind receipt");
+        if (JSON.stringify(context.tools) !== JSON.stringify(previous.tools)) throw new Error("Pi RPC tool refresh requires a provider bind receipt");
         await this.#admit(input.signal);
+        await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
+        this.#initialContext = context;
       }
       this.#runId = input.runId;
     });
@@ -449,6 +467,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       await this.#sendBind(request, signal);
       resident.epoch = origin.epoch;
       await this.#admit(signal);
+      await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
       resident.context = context;
     } catch (error) {
       await this.#fenceFailure(error);
@@ -666,7 +685,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       }
       const revoked = await revocation;
       if (!revoked.ok) failures.push(revoked.error);
-      for (const cleanup of [() => this.#callbacks?.close(), () => this.#transport.close(), () => this.#closeProvider?.(), () => this.#resident ? cleanPiPrivateDirectory(this.#resident) : undefined]) {
+      for (const cleanup of [() => this.#callbacks?.close(), () => this.#transport.close(), () => this.#closeProvider?.(), () => this.#resident ? cleanPiPrivateDirectory(this.#resident) : undefined, () => unlink(this.#instructionFile)]) {
         try { await cleanup(); } catch (error) { failures.push(error); }
       }
       const turn = this.#activeTurn;

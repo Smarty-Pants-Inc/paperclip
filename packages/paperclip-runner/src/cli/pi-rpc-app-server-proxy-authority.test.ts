@@ -142,6 +142,15 @@ function deferred() {
 }
 
 describe("Pi RPC proxy captured run authority", () => {
+  it("refreshes from session.revalidate baseInstructions before post-claim admission", async () => {
+    const h = await setup();
+    await h.request("run.attach", { runId: "run-2" });
+    expect(await h.request("session.revalidate", { baseInstructions: "SECOND" })).toMatchObject({ result: true });
+    expect(h.session.attachments.at(-1)).toEqual({ runId: "run-2", baseInstructions: "SECOND" });
+    expect(h.session.revalidations).toBe(1);
+    expect(await h.request("session.revalidate", { baseInstructions: 42 })).toHaveProperty("error");
+    expect(h.session.revalidations).toBe(1);
+  });
   it("routes the actual host park method with an empty parameter object and private blockers", async () => {
     const h = await setup();
     expect(await h.request("paperclip/host_park_ready")).toMatchObject({ result: { ready: true, reasons: [] } });

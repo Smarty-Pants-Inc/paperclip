@@ -454,6 +454,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         break;
       case "session.revalidate":
         if (!session?.revalidateAfterClaim) throw new Error("Pi RPC post-claim revalidation is unavailable");
+        // The newly admitted grant, not bootstrap environment, owns this run's base.
+        if (params.baseInstructions !== undefined) await attachRun(params, activeRunId);
         await session.revalidateAfterClaim();
         result = true;
         break;
