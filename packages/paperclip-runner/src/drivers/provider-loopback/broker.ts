@@ -59,9 +59,7 @@ export async function startProviderLoopbackBroker(input: {
   }
   const agent = upstreamUrl.protocol === "https:" ? new HttpsAgent({ proxyEnv, ca }) : new HttpAgent({ proxyEnv });
   const controllers = new Set<AbortController>();
-  let active = true;
   const server = createServer((request, response) => {
-    if (!active) { response.writeHead(401).end(); return; }
     const controller = new AbortController();
     controllers.add(controller);
     response.once("close", () => controller.abort());
@@ -145,14 +143,9 @@ export async function startProviderLoopbackBroker(input: {
     baseURL: input.adapter.harnessBaseUrl(address.port),
     token,
     close: () => closing ??= (async () => {
-      active = false;
       for (const controller of controllers) controller.abort();
       agent.destroy();
-      server.closeAllConnections();
-      // Keep a short loopback-only revocation tombstone so an escaped session
-      // capability receives an explicit 401 instead of being silently reused.
-      const timer = setTimeout(() => { server.close(); server.closeAllConnections(); }, 1_000);
-      timer.unref();
+      await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); });
     })(),
   };
 }
