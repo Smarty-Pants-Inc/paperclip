@@ -219,3 +219,16 @@ describe("provider routing", () => {
     for (const key of ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"]) expect(projected.env).not.toHaveProperty(key);
   });
 });
+
+
+describe("native Pi RPC gateway admission", () => {
+  it.each(["messages", "responses"] as const)("admits %s only through the native harness capability", protocol => {
+    const route = aiProviderRoutingSchema.parse({ kind: "gateway", protocol, auth: "bearer", baseUrl: "https://gateway.example/v1" });
+    const connection = { provider: protocol === "messages" ? "anthropic" as const : "openai" as const, method: "api_key" as const, routing: route };
+    expect(aiRoutingHarness("paperclip_runner", "pi_rpc")).toBe("pi_runtime");
+    expect(aiRoutingHarness("pi_rpc")).toBe("pi_runtime");
+    expect(isAiConnectionCompatible(connection, "paperclip_runner", "cliproxyapi-anthropic/model", "pi_rpc")).toBe(true);
+    expect(isAiConnectionCompatible(connection, "pi_rpc", "cliproxyapi-anthropic/model")).toBe(true);
+    expect(isAiConnectionCompatible(connection, "pi_local", "cliproxyapi-anthropic/model")).toBe(false);
+  });
+});

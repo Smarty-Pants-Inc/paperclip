@@ -75,3 +75,19 @@ describe("default lifecycle for an agent that never chose one", () => {
     expect(resolveHeartbeatNativeLifecyclePolicy({ ...unset, ...change })).toEqual(expected);
   });
 });
+
+
+describe("managed native Pi lifecycle", () => {
+  const input: Input = { ...base, backend: "pi_rpc", agentMode: undefined, localTarget: true,
+    managedAiSelected: true, managedAiAttribution: { provider: "anthropic", method: "api_key" },
+    managedAiRouting: { kind: "gateway", protocol: "messages", auth: "bearer" } };
+  it("keeps a managed native Pi resident locally and on a reusable remote sandbox", () => {
+    expect(resolveHeartbeatNativeLifecyclePolicy(input)).toEqual({ mode: "warm", idleTimeoutMs: 300_000 });
+    expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, localTarget: false, remoteSandboxTarget: { reusableLease: true } })).toEqual({ mode: "warm", idleTimeoutMs: 300_000 });
+  });
+  it("fails closed without a broker route and respects pinned per-turn", () => {
+    expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, managedAiRouting: undefined })).toEqual(perTurn);
+    expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, persistedPolicy: perTurn })).toEqual(perTurn);
+    expect(resolveHeartbeatNativeLifecyclePolicy({ ...input, agentMode: "per_turn" })).toEqual(perTurn);
+  });
+});

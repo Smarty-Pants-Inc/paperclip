@@ -285,6 +285,7 @@ function resolveRuntimeLifecyclePolicy(input: HeartbeatRuntimeSelectionInput): N
     environmentPolicy: sandboxTarget ? sandboxTarget.runnerLifecyclePolicy : null,
     persistedPolicy: input.session.persistedNativeExecutionInput?.session.lifecyclePolicy,
     managedAiSelected: Boolean(input.config.managedAiRuntime), managedAiAttribution: input.config.managedAiRuntime?.attribution,
+    managedAiRouting: parseObject(input.config.resolvedConfig.managedAiRouting),
     taskOwned: Boolean(sandboxTarget?.runnerTask),
     localTarget: target?.kind !== "remote",
     remoteSandboxTarget: sandboxTarget && !sandboxTarget.runnerTask
@@ -761,6 +762,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       }));
       getNativeFreshSessionHandoff = nativeReviewRequest ? undefined : getFreshSessionHandoff;
       const nativeProviderConfig = nativeRuntimeResolution.profile.backend === "cursor_cloud_api"
+        || nativeRuntimeResolution.profile.backend === "pi_rpc"
         || nativeRuntimeResolution.profile.backend === "codex_app_server"
         || (nativeRuntimeResolution.profile.backend === "acpx_runtime" && ["claude_local", "grok_local"].includes(agentHarnessType(agent.adapterType, parseObject(agent.adapterConfig))))
         || nativeRuntimeResolution.profile.backend === "opencode_server"

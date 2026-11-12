@@ -296,6 +296,8 @@ export interface AdapterExecutionContext {
 }
 
 export interface AdapterModel {
+  /** Omitted unless the source model catalog declares native reasoning levels. */
+  thinkingLevels?: string[];
   id: string;
   label: string;
 }

@@ -727,3 +727,21 @@ describe("Claude effort and master home-mode compatibility", () => {
     expect(JSON.stringify(buildNativeModelEnvelope(value))).not.toContain("grokEffort");
   });
 });
+
+
+describe("native Pi execution input", () => {
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const)("serializes exact %s on the pi_rpc boundary", piRpcThinkingLevel => {
+    const input = buildNativeExecutionInput({
+      companyId: "10000000-0000-4000-8000-000000000001", runId: "50000000-0000-4000-8000-000000000005", agentId: "30000000-0000-4000-8000-000000000003",
+      issue: { id: "20000000-0000-4000-8000-000000000002", identifier: "PI-1", title: "Exact Pi configuration", description: null, workMode: "standard" },
+      taskPrompt: "Complete the assigned task", workspace: { id: "50000000-0000-4000-8000-000000000005", cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      normalizedSessionId: null, provider: "pi_rpc", model: "paperclip/gateway/nested/model", piRpcThinkingLevel,
+      completionContract: { id: "70000000-0000-4000-8000-000000000007", sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1", contract: { revision: "1", objective: "Deliver the result", criteria: [{ id: "output", requirement: "Deliver the result" }] } },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+    expect(input.session.driverKind).toBe("pi_rpc");
+    expect(input.provider).toMatchObject({ kind: "pi_rpc", model: "paperclip/gateway/nested/model", piRpcThinkingLevel, profile: { driverKind: "pi_rpc", runtimeVersion: "1.5.2" } });
+    expect(input.provider).not.toHaveProperty("agent");
+    expect(input.provider).not.toHaveProperty("permissionMode");
+  });
+});

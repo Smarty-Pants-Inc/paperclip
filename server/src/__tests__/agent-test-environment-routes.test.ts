@@ -507,6 +507,61 @@ describe("agent test-environment route", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  // Trust boundary: the scoped model endpoint must not fall back to another provider's catalog.
+  it.each([false, true])("lists only the selected Pi RPC connection catalog (refresh=%s)", async refresh => {
+    const binding = { provider: "anthropic", method: "api_key", mode: "responsible_user" };
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1", aiConnection: binding });
+    mockSelectAiConnection.mockResolvedValueOnce({ connection: { config: { ai: { provider: "anthropic", method: "api_key", routing: {
+      kind: "gateway", protocol: "messages", baseUrl: "https://gateway.example", auth: "bearer", models: [
+        { id: "nested/claude-opus-5-5", label: "Gateway Opus" }, { id: "tenant/custom-model" },
+      ],
+    } } } } } as never);
+    const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models")
+      .query({ provider: "pi_rpc", agentId: "agent-1", refresh: String(refresh) });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toEqual([{ id: "paperclip/nested/claude-opus-5-5", label: "Gateway Opus" }, { id: "paperclip/tenant/custom-model", label: "tenant/custom-model" }]);
+    expect(response.body.every((row: Record<string, unknown>) => !Object.hasOwn(row, "thinkingLevels"))).toBe(true);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(mockSelectAiConnection).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ companyId: "company-1", agentId: "agent-1", runnerProvider: "pi_rpc", binding }));
+    expect(mockAiCredential).not.toHaveBeenCalled();
+  });
+  it("carries only exact, source-declared Pi thinking capabilities", async () => {
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
+    mockSelectAiConnection.mockResolvedValueOnce({ connection: { config: { ai: { provider: "anthropic", method: "api_key", routing: {
+      kind: "gateway", protocol: "messages", baseUrl: "https://gateway.example", auth: "bearer", models: [
+        { id: "reasoning-model", thinkingLevels: ["off", "minimal", "medium", "xhigh", "ultra"] },
+        { id: "nonreasoning-model", thinkingLevels: ["off"] }, { id: "unknown-model" },
+      ],
+    } } } } } as never);
+    const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models").query({ provider: "pi_rpc", agentId: "agent-1" });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toEqual([
+      { id: "paperclip/reasoning-model", label: "reasoning-model", thinkingLevels: ["off", "minimal", "medium", "xhigh"] },
+      { id: "paperclip/nonreasoning-model", label: "nonreasoning-model", thinkingLevels: ["off"] },
+      { id: "paperclip/unknown-model", label: "unknown-model" },
+    ]);
+  });
+  it("does not borrow Codex models when the selected Pi connection has no catalog", async () => {
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
+    mockSelectAiConnection.mockResolvedValueOnce({ connection: { config: { ai: { provider: "anthropic", method: "api_key", routing: {
+      kind: "gateway", protocol: "messages", baseUrl: "https://gateway.example", auth: "bearer", models: [],
+    } } } } } as never);
+    const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models").query({ provider: "pi_rpc", agentId: "agent-1" });
+    expect(response.status).toBe(200); expect(response.body).toEqual([]);
+  });
+  it("refuses a foreign agent before selecting a Pi RPC model connection", async () => {
+    mockAgentService.getById.mockResolvedValue({ id: "agent-foreign", companyId: "company-2" });
+    const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models").query({ provider: "pi_rpc", agentId: "agent-foreign" });
+    expect(response.status).toBe(404); expect(mockSelectAiConnection).not.toHaveBeenCalled();
+  });
+  it("refuses a non-editor and a denied Pi RPC connection without resolving its credential", async () => {
+    mockAccessService.decide.mockResolvedValue({ allowed: false, explanation: "No config update grant" });
+    mockAccessService.canUser.mockResolvedValue(false);
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
+    const response = await request(await createApp({ type: "board" })).get("/api/companies/company-1/adapters/paperclip_runner/models").query({ provider: "pi_rpc", agentId: "agent-1" });
+    expect(response.status).toBe(403); expect(mockSelectAiConnection).not.toHaveBeenCalled(); expect(mockAiCredential).not.toHaveBeenCalled();
+  });
+
   it("lets an authorized agent editor discover Copilot models", async () => {
     mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
     const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models")

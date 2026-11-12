@@ -1,7 +1,7 @@
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import type { Db } from "@paperclipai/db";
 import { agentHarnessType, paperclipRunnerProfileForHarness, isEnvironmentDriverSupportedForAdapter, paperclipRunnerSupportsPlatform, type AgentRunnerChoice, type AgentRunnerAvailability } from "@paperclipai/shared";
-import { normalizeLegacyRunnerProvider, PAPERCLIP_RUNNER_DEFAULT_MODELS } from "@paperclipai/adapter-utils";
+import { resolvePaperclipRunnerPiRpcThinkingLevel, normalizeLegacyRunnerProvider, PAPERCLIP_RUNNER_DEFAULT_MODELS } from "@paperclipai/adapter-utils";
 import { resolveClaudeModel } from "@paperclipai/adapter-claude-local";
 import { DEFAULT_GROK_LOCAL_MODEL } from "@paperclipai/adapter-grok-local";
 import { findActiveServerAdapter, hasActiveAdapterOverride, waitForExternalAdapters } from "../adapters/registry.js";
@@ -107,19 +107,24 @@ function resolvePiRunnerConfig(config: Record<string, unknown>): Record<string, 
   if (config.command && config.command !== "pi") unsupported.push("command");
   if (config.model !== undefined && typeof config.model !== "string") unsupported.push("model");
   if (config.stdoutLogMode !== undefined && config.stdoutLogMode !== "compact") unsupported.push("stdoutLogMode");
-  const thinking = config.piThinkingLevel ?? config.thinking;
-  if (thinking !== undefined && !["off", "low", "high", "max"].includes(String(thinking))) unsupported.push("thinking");
+  const nativePi = config.provider === "pi_rpc";
+  const thinking = nativePi ? config.piRpcThinkingLevel ?? config.thinking : config.piThinkingLevel ?? config.thinking;
+  if (nativePi) {
+    try { resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", thinking); } catch { unsupported.push("piRpcThinkingLevel"); }
+    for (const key of ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel"]) if (config[key] !== undefined) unsupported.push(key);
+    if (config.piRpcThinkingLevel !== undefined && config.thinking !== undefined && config.piRpcThinkingLevel !== config.thinking) unsupported.push("thinking");
+  } else if (thinking !== undefined && !["off", "low", "high", "max"].includes(String(thinking))) unsupported.push("thinking");
   if (config.piThinkingLevel !== undefined && config.thinking !== undefined && config.piThinkingLevel !== config.thinking) unsupported.push("thinking", "piThinkingLevel");
   if (unsupported.length) incompatible(unsupported);
   const translated = { ...config };
   for (const key of ["command", "extraArgs", "args", "thinking", "stdoutLogMode"]) delete translated[key];
   return {
     ...translated,
-    provider: "acpx", acpxAgent: "pi",
+    ...(nativePi ? { provider: "pi_rpc" } : { provider: "acpx", acpxAgent: "pi" }),
     model: typeof config.model === "string" ? config.model.trim() : "",
-    piThinkingLevel: thinking ?? "low",
-    acpxPermissionMode: config.acpxPermissionMode ?? "approve-all",
-    lifecycleMode: config.lifecycleMode ?? "per_turn",
+    ...(nativePi ? { piRpcThinkingLevel: thinking ?? "low" } : { piThinkingLevel: thinking ?? "low" }),
+    ...(nativePi ? {} : { acpxPermissionMode: config.acpxPermissionMode ?? "approve-all" }),
+    ...(nativePi && config.lifecycleMode === undefined ? {} : { lifecycleMode: config.lifecycleMode ?? "per_turn" }),
   };
 }
 
@@ -298,7 +303,7 @@ function resolveAgentRunner(input: AgentRunnerSelection): { adapterType: string;
     config = resolvePiRunnerConfig(config);
     if (input.setupOnly && !config.model) return { adapterType: "paperclip_runner", adapterConfig: config };
     if (typeof config.model !== "string" || !/^[^/\s]+\/\S+$/.test(config.model)) throw unprocessable("Pi requires an explicit provider/model. Select a model before testing or hiring.", { code: "agent_runner_config_incompatible", fields: ["model"] });
-    try { resolvePaperclipRunnerNativeProviderInput({ backend: "acpx_runtime", adapterConfig: config }); }
+    try { resolvePaperclipRunnerNativeProviderInput({ backend: config.provider === "pi_rpc" ? "pi_rpc" : "acpx_runtime", adapterConfig: config }); }
     catch (error) {
       if (error instanceof PaperclipRunnerProviderProfileError) throw unprocessable(error.message, { code: error.code });
       throw error;

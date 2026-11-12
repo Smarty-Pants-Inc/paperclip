@@ -1,3 +1,4 @@
+import { PI_THINKING_LEVELS } from "@paperclipai/paperclip-runner";
 import { assertLoginEnvironmentTarget } from "../services/login-environment.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
@@ -3110,6 +3111,36 @@ export function agentRoutes(
       return;
     }
     const provider = asNonEmptyString(req.query.provider);
+    if (type === "paperclip_runner" && provider === "pi_rpc") {
+      const modelAgentId = asNonEmptyString(req.query.agentId);
+      let savedBinding: unknown;
+      if (modelAgentId) {
+        const modelAgent = await svc.getById(modelAgentId);
+        if (!modelAgent || modelAgent.companyId !== companyId) throw notFound("Agent not found");
+        await assertCanUpdateAgent(req, modelAgent);
+        savedBinding = modelAgent.aiConnection;
+      } else await assertCanCreateAgentsForCompany(req, companyId);
+      let binding: AiConnectionBinding;
+      try {
+        if (typeof req.query.aiConnection === "string" && req.query.aiConnection.length > 4096) throw new Error("Binding too large");
+        binding = aiConnectionBindingSchema.parse(typeof req.query.aiConnection === "string" ? JSON.parse(req.query.aiConnection)
+          : savedBinding ?? { provider: "anthropic", method: "api_key", mode: "responsible_user" });
+      } catch { throw unprocessable("Invalid AI connection binding"); }
+      const allowUninstalledShared = !modelAgentId && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, binding);
+      const selection = await aiConnectionService(db).select({ companyId, userId: responsibleUserForAiRequest(req),
+        agentId: modelAgentId ?? "00000000-0000-0000-0000-000000000000", adapterType: type, runnerProvider: "pi_rpc", binding,
+        allowUninstalledPersonal: true, allowUninstalledShared });
+      const routing = aiConnectionMetadataSchema.parse(selection.connection.config.ai).routing;
+      res.setHeader("Cache-Control", "no-store");
+      // Pi 1.5.2 docs/rpc-commands.md get_available_thinking_levels is per selected
+      // runtime model (off-only for nonreasoning). Preserve an explicitly supplied
+      // catalog capability, but an id/label-only connection does not prove any level.
+      res.json((routing?.models ?? []).map(model => ({
+        id: aiRoutingModel(routing!, "pi_runtime", model.id), label: model.label ?? model.id,
+        ...(model.thinkingLevels === undefined ? {} : { thinkingLevels: model.thinkingLevels.filter(level => PI_THINKING_LEVELS.includes(level as typeof PI_THINKING_LEVELS[number])) }),
+      })));
+      return;
+    }
     if (type === "paperclip_runner" && provider === "acpx" && req.query.acpxAgent === "kimi") {
       res.json([]);
       return;

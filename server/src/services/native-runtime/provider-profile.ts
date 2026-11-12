@@ -1,3 +1,5 @@
+import { QUALIFIED_PI_RPC_PROFILE, parsePiRpcProfile, type NativePiRpcProfileSnapshot } from "../../vendor/paperclip-runner/index.js";
+import type { PaperclipRunnerPiRpcThinkingLevel } from "@paperclipai/adapter-utils";
 import { resolveGrokDisableWebSearch } from "../../vendor/paperclip-runner/index.js";
 import { agentHarnessType, normalizeClaudeRunnerOptions } from "@paperclipai/shared";
 import { resolveClaudeEffort, resolveGrokEffort, resolveQualifiedAcpxProfile } from "../../vendor/paperclip-runner/index.js";
@@ -8,6 +10,7 @@ import {
   resolvePaperclipRunnerPermissionMode,
   resolvePaperclipRunnerCursorMode,
   resolvePaperclipRunnerPiThinkingLevel,
+  resolvePaperclipRunnerPiRpcThinkingLevel,
   type PaperclipRunnerProvider,
 } from "@paperclipai/adapter-utils";
 import {
@@ -43,6 +46,7 @@ export type QualifiedPaperclipRunnerAcpxAgent =
 type AdmittedPaperclipRunnerAcpxAgent = QualifiedPaperclipRunnerAcpxAgent | AcpxQualificationCandidate | "antigravity";
 
 export type PaperclipRunnerProviderProfile =
+  | { provider: "pi_rpc"; backend: "pi_rpc"; model: string; profile: NativePiRpcProfileSnapshot }
   | { provider: "cursor_cloud"; backend: "cursor_cloud_api"; model: string }
   | { provider: "muse"; backend: "muse_external"; model: null; museBindingId: string }
   | { provider: "grok_bot"; backend: "grok_bot_mcp"; model: null; externalBindingId: string }
@@ -79,6 +83,7 @@ export type PaperclipRunnerProviderProfile =
     };
 
 export type PaperclipRunnerNativeProviderInput =
+  | { provider: "pi_rpc"; model: string; profile: NativePiRpcProfileSnapshot; piRpcThinkingLevel?: PaperclipRunnerPiRpcThinkingLevel }
   | { provider: "cursor_cloud"; model: string; cursorCloud: NativeCursorCloudConfig }
   | { provider: "muse"; model: null; museBinding: import("../../vendor/paperclip-runner/index.js").MuseBindingSnapshot }
   | { provider: "grok_bot"; model: null; dotBinding: import("../../vendor/paperclip-runner/index.js").DotBindingSnapshot }
@@ -239,7 +244,7 @@ export function validatePaperclipRunnerGrokConfig(config: Record<string, unknown
 
 /** A task may change a Runner model (and supported effort), but not provider identity. */
 export function projectPaperclipRunnerTaskConfig(
-  backend: "codex_app_server" | "opencode_server" | "acpx_runtime" | "cursor_cloud_api",
+  backend: "codex_app_server" | "opencode_server" | "pi_rpc" | "acpx_runtime" | "cursor_cloud_api",
   agentConfig: unknown,
   taskOverrides: unknown,
   managedModel?: string,
@@ -259,6 +264,10 @@ export function projectPaperclipRunnerTaskConfig(
     delete config.modelReasoningEffort;
     delete config.reasoningEffort;
     delete config.effort;
+  }
+  if (backend === "pi_rpc") {
+    if (model !== null && model !== optionalString(base.model)) delete config.piRpcThinkingLevel;
+    if (Object.hasOwn(task, "piRpcThinkingLevel")) config.piRpcThinkingLevel = task.piRpcThinkingLevel;
   }
   if (model !== null) config.model = model;
   if (effortKey !== undefined) config[grok ? "reasoningEffort" : "modelReasoningEffort"] = task[effortKey];
@@ -452,13 +461,35 @@ export function resolvePaperclipRunnerProviderProfile(
 ): PaperclipRunnerProviderProfile {
   const config = asRecord(adapterConfig);
   const candidate = config.provider ?? "codex";
+  try { resolvePaperclipRunnerPiRpcThinkingLevel(candidate, config.piRpcThinkingLevel); } catch (error) {
+    throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_thinking_invalid", error instanceof Error ? error.message : "Invalid Pi RPC thinking level");
+  }
   if (!isPaperclipRunnerProvider(candidate)) {
     throw new PaperclipRunnerProviderProfileError(
       "paperclip_runner_provider_unsupported",
-      "Paperclip Runner provider must be Codex, OpenCode, Claude Managed, AWS AgentCore, or ACPX.",
+      "Paperclip Runner provider must be Codex, OpenCode, native Pi RPC, Claude Managed, AWS AgentCore, or ACPX.",
     );
   }
 
+  if (candidate === "pi_rpc") {
+    const model = optionalString(config.model);
+    if (!model || !model.includes("/") || model.endsWith("/") || model.length > 240 || /[\x00-\x1f\x7f]/.test(model)) {
+      throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_model_invalid", "Native Pi RPC requires an explicit provider/model selection.");
+    }
+    const unsupported = ["acpxAgent", "acpxPermissionMode", "acpxSessionMode", "piThinkingLevel", "codexPermissionMode", "opencodePermissionMode"]
+      .filter(key => config[key] !== undefined);
+    if (unsupported.length) throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_config_invalid", `Native Pi RPC cannot honor ACPX or other-provider selectors: ${unsupported.join(", ")}.`);
+    try {
+      const thinking = resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel);
+      if (thinking === "max" && /(?:^|[/.-])claude(?:[/.-]|$)/i.test(model)) {
+        throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_rpc_claude_thinking_cap", "Claude models support Pi RPC thinking at most xhigh; max is not admitted.");
+      }
+      if (config.profile !== undefined) parsePiRpcProfile(config.profile);
+    } catch (error) {
+      throw new PaperclipRunnerProviderProfileError("paperclip_runner_pi_profile_invalid", error instanceof Error ? error.message : "Native Pi profile is invalid");
+    }
+    return { provider: "pi_rpc", backend: "pi_rpc", model, profile: { ...QUALIFIED_PI_RPC_PROFILE } };
+  }
   if (candidate === "cursor_cloud") {
     const model = optionalString(config.model);
     if (!model) throw new PaperclipRunnerProviderProfileError("paperclip_runner_cursor_cloud_model_required", "Cursor Cloud requires an explicit model. Select a model before testing or assigning work.");
@@ -723,6 +754,10 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
   if (profile.provider === "openai_dot") {
     if (!input.dotBinding || input.dotBinding.bindingId !== profile.dotBindingId) throw new PaperclipRunnerProviderProfileError("paperclip_runner_dot_binding_unavailable", "Dot binding must be resolved by the server after normal admission.");
     return { provider: "openai_dot", model: null, dotBinding: input.dotBinding };
+  }
+  if (profile.provider === "pi_rpc") {
+    return { provider: "pi_rpc", model: profile.model, profile: profile.profile,
+      piRpcThinkingLevel: resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", config.piRpcThinkingLevel) };
   }
   if (profile.provider === "opencode") {
     return {

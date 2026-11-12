@@ -18,7 +18,7 @@ export function resolveWarmProviderSelection(adapterConfig: unknown, companyId?:
 
 /** Providers with a session-owned home and the current instruction-grant handoff. */
 export function supportsNativeWarmFiles(profile: WarmProviderSelection): boolean {
-  return profile.backend === "codex_app_server" ||
+  return profile.backend === "pi_rpc" || profile.backend === "codex_app_server" ||
     (profile.backend === "acpx_runtime" && profile.acpxAgent === "copilot");
 }
 
@@ -27,7 +27,17 @@ export function supportsNativeWarmFiles(profile: WarmProviderSelection): boolean
 export function supportsManagedNativeWarmSession(
   profile: WarmProviderSelection,
   attribution: { provider: string; method: string } | undefined,
+  routing?: { kind?: string; protocol?: string; auth?: string },
 ): boolean {
+  // managedProviderRouting(pi_runtime) emits these broker coordinates; the runner's
+  // credential broker keeps the upstream key and gives Pi only its loopback endpoint.
+  if (profile.backend === "pi_rpc") {
+    return attribution?.method === "api_key"
+      && (routing?.kind === "gateway" || routing?.kind === "local")
+      && (routing.auth === "bearer" || routing.auth === "api_key" || routing.auth === "none")
+      && ((routing.protocol === "messages" && attribution.provider === "anthropic")
+        || (routing.protocol === "responses" && attribution.provider === "openai"));
+  }
   return profile.backend === "codex_app_server" ||
     (profile.backend === "acpx_runtime" && profile.acpxAgent === "copilot" &&
       attribution?.provider === "github" && attribution.method === "api_key");
@@ -42,7 +52,7 @@ export function supportsManagedNativeWarmSession(
  * gains from warm there too.
  */
 export function defaultsToWarmFollowUp(profile: WarmProviderSelection, target: "local" | "remote_sandbox"): boolean {
-  if (profile.backend === "codex_app_server" || profile.backend === "opencode_server") return true;
+  if (profile.backend === "pi_rpc" || profile.backend === "codex_app_server" || profile.backend === "opencode_server") return true;
   return target === "remote_sandbox" && profile.backend === "acpx_runtime" && profile.acpxAgent === "claude";
 }
 
@@ -58,9 +68,9 @@ export function defaultsToWarmFollowUp(profile: WarmProviderSelection, target: "
 export function defaultsRemoteSandboxRunToWarm(input: {
   profile: WarmProviderSelection;
   reusableLeaseSupported: boolean;
-  managedAi: { attribution?: { provider: string; method: string } } | null;
+  managedAi: { attribution?: { provider: string; method: string }; routing?: { kind?: string; protocol?: string; auth?: string } } | null;
 }): boolean {
   return input.reusableLeaseSupported
     && defaultsToWarmFollowUp(input.profile, "remote_sandbox")
-    && (input.managedAi === null || supportsManagedNativeWarmSession(input.profile, input.managedAi.attribution));
+    && (input.managedAi === null || supportsManagedNativeWarmSession(input.profile, input.managedAi.attribution, input.managedAi.routing));
 }

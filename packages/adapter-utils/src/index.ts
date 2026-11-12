@@ -129,6 +129,9 @@ export {
   resolvePaperclipRunnerPermissionMode,
   resolvePaperclipRunnerCursorMode,
   resolvePaperclipRunnerPiThinkingLevel,
+  resolvePaperclipRunnerPiRpcThinkingLevel,
+  PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS,
+  type PaperclipRunnerPiRpcThinkingLevel,
 } from "./paperclip-runner-permissions.js";
 export {
   PAPERCLIP_RUNNER_INGRESS_PORT,

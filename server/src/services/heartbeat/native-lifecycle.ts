@@ -16,6 +16,7 @@ export function resolveHeartbeatNativeLifecyclePolicy(input: {
   persistedPolicy?: NativeLifecyclePolicy | null;
   managedAiSelected: boolean;
   managedAiAttribution?: { provider: string; method: string };
+  managedAiRouting?: { kind?: string; protocol?: string; auth?: string };
   taskOwned: boolean;
   /** The run executes on this controller's host (no remote transport). */
   localTarget?: boolean;
@@ -37,7 +38,7 @@ export function resolveHeartbeatNativeLifecyclePolicy(input: {
   const remoteDefault = input.remoteSandboxTarget !== undefined && defaultsRemoteSandboxRunToWarm({
     profile,
     reusableLeaseSupported: input.remoteSandboxTarget.reusableLease,
-    managedAi: input.managedAiSelected ? { attribution: input.managedAiAttribution } : null,
+    managedAi: input.managedAiSelected ? { attribution: input.managedAiAttribution, routing: input.managedAiRouting } : null,
   });
   const agentMode = explicit ? input.agentMode
     : input.adapterType === "paperclip_runner" && (localDefault || remoteDefault) ? "warm" : "per_turn";
@@ -50,7 +51,7 @@ export function resolveHeartbeatNativeLifecyclePolicy(input: {
         : PAPERCLIP_RUNNER_IDLE_TIMEOUT_DEFAULT_MS }
     : { mode: "per_turn", idleTimeoutMs: null };
   const supportsManagedWarm = input.adapterType === "paperclip_runner" && (input.taskOwned ||
-    supportsManagedNativeWarmSession(profile, input.managedAiAttribution));
+    supportsManagedNativeWarmSession(profile, input.managedAiAttribution, input.managedAiRouting));
   return input.persistedPolicy ??
     (["openai_dot_mcp", "grok_bot_mcp", "muse_external", "cursor_cloud_api"].includes(input.backend) || input.managedAiSelected && !supportsManagedWarm
       ? { mode: "per_turn", idleTimeoutMs: null }

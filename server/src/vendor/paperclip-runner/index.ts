@@ -10,6 +10,7 @@
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  NativePiRpcProfileSnapshot,
   NativeCursorCloudConfig,
   AcpxCandidateAdmission,
   DotHarnessDriver,
@@ -238,3 +239,6 @@ export const CursorCloudClient = runner.CursorCloudClient;
 export const parseNativeCursorCloudConfig = runner.parseNativeCursorCloudConfig;
 
 export const archiveCursorCloudSessionCheckpoint = runner.archiveCursorCloudSessionCheckpoint;
+
+export const QUALIFIED_PI_RPC_PROFILE = runner.QUALIFIED_PI_RPC_PROFILE;
+export const parsePiRpcProfile = runner.parsePiRpcProfile;

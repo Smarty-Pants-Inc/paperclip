@@ -19,6 +19,9 @@ export const aiProviderRoutingSchema = z
           .object({
             id: z.string().trim().min(1).max(256),
             label: z.string().trim().max(160).optional(),
+            // Optional declared capability from the selected runtime's model catalog.
+            // Never infer native levels from a display label or a model family table.
+            thinkingLevels: z.array(z.string().trim().min(1).max(32)).max(16).optional(),
           })
           .strict(),
       )
@@ -80,6 +83,7 @@ export function aiRoutingHarness(
   provider?: unknown,
   acpxAgent?: unknown,
 ): string {
+  if (adapter === "pi_rpc") return "pi_runtime";
   if (adapter !== "paperclip_runner") return adapter;
   if (provider === "acpx" && acpxAgent === "copilot") return "copilot_runtime";
   if (provider === "acpx" && acpxAgent === "antigravity") return "antigravity_runtime";
@@ -95,6 +99,7 @@ export function aiRoutingHarness(
         opencode: "opencode_local",
         grok: "grok_local",
         pi: "pi_runtime",
+        pi_rpc: "pi_runtime",
       } as Record<string, string>
     )[String(runner)] ?? "unsupported"
   );

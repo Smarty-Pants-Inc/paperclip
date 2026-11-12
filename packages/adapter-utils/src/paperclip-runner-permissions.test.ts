@@ -1,3 +1,4 @@
+import { resolvePaperclipRunnerPiRpcThinkingLevel } from "./paperclip-runner-permissions.js";
 import { resolvePaperclipRunnerPiThinkingLevel } from "./paperclip-runner-permissions.js";
 import { describe, expect, it } from "vitest";
 
@@ -131,5 +132,25 @@ describe("Pi thinking configuration", () => {
     expect(() => resolvePaperclipRunnerPiThinkingLevel("codex", "pi", "low")).toThrow(/only/);
     expect(() => resolvePaperclipRunnerPiThinkingLevel("acpx", "cursor", "low")).toThrow(/only/);
     expect(resolvePaperclipRunnerPiThinkingLevel("codex", undefined, undefined)).toBeUndefined();
+  });
+});
+
+
+describe("native Pi RPC admission", () => {
+  it("admits a distinct native provider without ACPX transition selectors", () => {
+    expect(isPaperclipRunnerProvider("pi_rpc")).toBe(true);
+    const converted = paperclipRunnerTransitionConfig("pi_local", "cliproxyapi-anthropic/claude-opus-5-5", "pi_rpc");
+    expect(converted).toMatchObject({ provider: "pi_rpc", model: "cliproxyapi-anthropic/claude-opus-5-5" });
+    expect(converted).not.toHaveProperty("acpxAgent");
+    expect(converted).not.toHaveProperty("acpxPermissionMode");
+    expect(converted).not.toHaveProperty("undefined");
+  });
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"])("preserves native Pi level %s exactly", level => {
+    expect(resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", level)).toBe(level);
+  });
+  it("does not widen the historical ACPX vocabulary or unrelated providers", () => {
+    expect(() => resolvePaperclipRunnerPiThinkingLevel("acpx", "pi", "xhigh")).toThrow();
+    expect(() => resolvePaperclipRunnerPiThinkingLevel("codex", undefined, "xhigh")).toThrow();
+    expect(() => resolvePaperclipRunnerPiRpcThinkingLevel("pi_rpc", "ultra")).toThrow();
   });
 });

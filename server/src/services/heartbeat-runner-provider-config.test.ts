@@ -542,3 +542,26 @@ describe("Paperclip Runner native provider configuration", () => {
     ).toMatchObject({ provider: "acpx", acpxAgent: "pi", model: "pi-model" });
   });
 });
+
+
+// Data safety: task overrides may tune the selected provider, never replace its identity.
+describe("native Pi task thinking", () => {
+  const base = { provider: "pi_rpc", model: "gateway/nested/model", piRpcThinkingLevel: "low" };
+  it.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"])("projects exact task level %s", piRpcThinkingLevel => {
+    const config = projectPaperclipRunnerTaskConfig("pi_rpc", base, { piRpcThinkingLevel, provider: "codex", profile: { driverKind: "acpx_runtime" } });
+    expect(config).toEqual({ ...base, piRpcThinkingLevel });
+    expect(resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: config })).toMatchObject({ provider: "pi_rpc", model: base.model, piRpcThinkingLevel });
+    expect(base.piRpcThinkingLevel).toBe("low");
+  });
+  it("does not reinterpret generic effort aliases as Pi thinking", () => {
+    expect(projectPaperclipRunnerTaskConfig("pi_rpc", base, { effort: "max", modelReasoningEffort: "high", reasoningEffort: "medium" })).toEqual(base);
+  });
+  it("clears inherited thinking on model change and preserves explicit task thinking", () => {
+    expect(projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "gateway/other" })).toEqual({ provider: "pi_rpc", model: "gateway/other" });
+    expect(projectPaperclipRunnerTaskConfig("pi_rpc", base, { model: "gateway/other", piRpcThinkingLevel: "off" })).toEqual({ provider: "pi_rpc", model: "gateway/other", piRpcThinkingLevel: "off" });
+    expect(projectPaperclipRunnerTaskConfig("pi_rpc", base, {}, "paperclip/gateway/nested/model")).toEqual({ provider: "pi_rpc", model: "paperclip/gateway/nested/model" });
+  });
+  it.each(["ultra", "x-high", null, 4])("rejects a non-native task level %j", piRpcThinkingLevel => {
+    expect(() => resolvePaperclipRunnerNativeProviderInput({ backend: "pi_rpc", adapterConfig: projectPaperclipRunnerTaskConfig("pi_rpc", base, { piRpcThinkingLevel }) })).toThrow();
+  });
+});

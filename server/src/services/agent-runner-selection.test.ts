@@ -896,3 +896,12 @@ describe("Claude runner defaults", () => {
     expect(() => resolveNewAgentRunner({ adapterType: "claude_local", target: mac })).toThrow("Claude is disabled");
   });
 });
+
+
+describe("explicit native Pi conversion", () => {
+  it("converts a pi_local configuration to pi_rpc without inheriting ACPX defaults", () => {
+    const config = { provider: "pi_rpc", model: "gateway/nested/model", thinking: "xhigh" };
+    const selected = resolveNewAgentRunner({ adapterType: "pi_local", adapterConfig: config, runner: "paperclip", target: { driver: "local", platform: "linux", architecture: "x64", libc: "glibc", glibcVersion: "2.39" } });
+    expect(selected).toEqual({ adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: config.model, piRpcThinkingLevel: "xhigh" } });
+  });
+});

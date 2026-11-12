@@ -1,5 +1,5 @@
 export type PaperclipRunnerProvider =
-  "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "cursor_cloud";
+  "codex" | "opencode" | "pi_rpc" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "cursor_cloud";
 
 export type CodexPermissionMode = "never" | "on-request" | "untrusted";
 export type OpenCodePermissionMode = "allow" | "ask" | "deny";
@@ -89,6 +89,7 @@ export const PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES = {
       },
     ],
   },
+  pi_rpc: { configurable: false, defaultMode: "provider-managed", options: [], description: "Native Pi RPC uses the assigned environment and Paperclip tool policy; no ACPX permission selector applies." },
   claude_managed: {
     configurable: false,
     defaultMode: "provider-managed",
@@ -149,6 +150,7 @@ export function isPaperclipRunnerProvider(
   return (
     value === "codex" ||
     value === "opencode" ||
+    value === "pi_rpc" ||
     value === "claude_managed" ||
     value === "aws_agentcore" ||
     value === "acpx" || value === "openai_dot" || value === "grok_bot" || value === "muse" || value === "cursor_cloud"
@@ -205,7 +207,7 @@ export function resolvePaperclipRunnerIdleTimeoutMs(value: unknown): number {
  * until its follow-up relaunch is removed). Others keep an explicit per_turn.
  */
 export function paperclipRunnerFollowsLifecycleDefault(config: Record<string, unknown>): boolean {
-  return config.provider === "codex" || config.provider === "opencode"
+  return config.provider === "codex" || config.provider === "opencode" || config.provider === "pi_rpc"
     || (config.provider === "acpx" && config.acpxAgent === "claude");
 }
 
@@ -227,12 +229,14 @@ export function paperclipRunnerTransitionConfig(
   const provider =
     providerOverride === "codex" ||
     providerOverride === "opencode" ||
+    providerOverride === "pi_rpc" ||
     providerOverride === "acpx"
       ? providerOverride
       : previousProvider;
   const converted: Record<string, unknown> = {
     provider,
-    model: provider === "acpx" && previousAdapterType === "grok_local"
+    model: provider === "pi_rpc" ? typeof previousModel === "string" ? previousModel.trim() : ""
+      : provider === "acpx" && previousAdapterType === "grok_local"
       ? typeof previousModel === "string" && previousModel.trim() && previousModel.trim() !== "grok-build" ? previousModel.trim() : "grok-4.7"
       : provider === "acpx" && previousAdapterType === "pi_local"
       ? typeof previousModel === "string" ? previousModel.trim() : ""
@@ -241,8 +245,8 @@ export function paperclipRunnerTransitionConfig(
       provider === previousProvider ? previousModel : undefined,
     ),
     ...(provider === "acpx" ? { acpxAgent: previousAdapterType === "grok_local" ? "grok" : previousAdapterType === "pi_local" ? "pi" : "claude" } : {}),
-    [PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES[provider].configKey]:
-      PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES[provider].defaultMode,
+    ...(provider === "pi_rpc" ? {} : { [PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES[provider].configKey]:
+      PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES[provider].defaultMode }),
   };
   return paperclipRunnerFollowsLifecycleDefault(converted) ? converted : { ...converted, lifecycleMode: "per_turn" };
 }
@@ -281,4 +285,21 @@ export function resolvePaperclipRunnerPiThinkingLevel(provider: unknown, agent: 
   if (value === undefined) return "low";
   if (value === "off" || value === "low" || value === "high" || value === "max") return value;
   throw new Error("Pi thinking level must be off, low, high, or max");
+}
+
+
+/** Exact Pi RPC levels. Browser-safe admission contract, not ACPX's piThinkingLevel.
+ * TODO: import the runner's PI_THINKING_LEVELS once it has a browser-safe package export.
+ * A server parity test binds this temporary catalog to the qualified Pi 1.5.2 declaration.
+ */
+export const PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type PaperclipRunnerPiRpcThinkingLevel = typeof PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS[number];
+export function resolvePaperclipRunnerPiRpcThinkingLevel(provider: unknown, value: unknown): PaperclipRunnerPiRpcThinkingLevel | undefined {
+  if (provider !== "pi_rpc") {
+    if (value !== undefined) throw new Error("piRpcThinkingLevel is supported only for native Pi RPC");
+    return undefined;
+  }
+  if (value === undefined) return "low";
+  if (typeof value === "string" && PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS.includes(value as PaperclipRunnerPiRpcThinkingLevel)) return value as PaperclipRunnerPiRpcThinkingLevel;
+  throw new Error(`Pi RPC thinking level must be one of ${PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS.join(", ")}`);
 }

@@ -32,6 +32,7 @@ import type {
 import {
   parseNativeExecutionInput,
   resolveQualifiedAcpxProfile,
+  QUALIFIED_PI_RPC_PROFILE,
 } from "../../vendor/paperclip-runner/index.js";
 import {
   isPaperclipExternalChatContractTurn,
@@ -96,7 +97,7 @@ export interface BuildNativeExecutionInput {
     branchName: string | null;
   };
   normalizedSessionId: string | null;
-  provider?: "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse";
+  provider?: "pi_rpc" | "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse";
   museBinding?: MuseBindingSnapshot;
   dotBinding?: DotBindingSnapshot;
   acpxAgent?: NativeAcpxAgent;
@@ -108,6 +109,7 @@ export interface BuildNativeExecutionInput {
   acpxPermissionMode?: NativeAcpxPermissionMode;
   acpxSessionMode?: "agent" | "plan" | "ask";
   piThinkingLevel?: "off" | "low" | "high" | "max";
+  piRpcThinkingLevel?: import("@paperclipai/paperclip-runner").PiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;
@@ -310,7 +312,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     },
     session: {
       normalizedSessionId: input.normalizedSessionId,
-      driverKind: input.provider === "cursor_cloud" ? "cursor_cloud_api" : input.provider === "opencode"
+      driverKind: input.provider === "pi_rpc" ? "pi_rpc" : input.provider === "cursor_cloud" ? "cursor_cloud_api" : input.provider === "opencode"
         ? "opencode_server"
         : input.provider === "claude_managed"
           ? "claude_managed_agents_api"
@@ -322,7 +324,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       protocolVersion: 1,
       lifecyclePolicy: input.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
     },
-    provider: input.provider === "cursor_cloud" ? { kind: "cursor_cloud", model: input.model, cursorCloud: input.cursorCloud } : input.provider === "claude_managed"
+    provider: input.provider === "pi_rpc" ? { kind: "pi_rpc", model: input.model, piRpcThinkingLevel: input.piRpcThinkingLevel, profile: QUALIFIED_PI_RPC_PROFILE } : input.provider === "cursor_cloud" ? { kind: "cursor_cloud", model: input.model, cursorCloud: input.cursorCloud } : input.provider === "claude_managed"
       ? {
           kind: "claude_managed",
           model: input.model,

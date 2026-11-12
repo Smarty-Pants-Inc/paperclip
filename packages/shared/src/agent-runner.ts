@@ -1,3 +1,7 @@
+/** Native Pi RPC identity and its provider-owned effort key. ACPX Pi is separate. */
+export const PI_RPC_PROVIDER = "pi_rpc" as const;
+export const PI_RPC_THINKING_LEVEL_KEY = "piRpcThinkingLevel" as const;
+
 export type AgentRunnerChoice = "auto" | "paperclip" | "legacy";
 export type AgentRunner = Exclude<AgentRunnerChoice, "auto">;
 
@@ -6,10 +10,11 @@ export interface AgentRunnerAvailability {
   defaultRunner: AgentRunner;
 }
 
-export function paperclipRunnerProfileForHarness(harness: string): { provider: "codex" | "opencode" | "cursor_cloud" } | { provider: "acpx"; acpxAgent: "claude" | "pi" | "grok" } | undefined {
+export function paperclipRunnerProfileForHarness(harness: string): { provider: "codex" | "opencode" | "pi_rpc" | "cursor_cloud" } | { provider: "acpx"; acpxAgent: "claude" | "pi" | "grok" } | undefined {
+  if (harness === "pi_rpc") return { provider: "pi_rpc" };
   if (harness === "codex_local") return { provider: "codex" };
   if (harness === "claude_local") return { provider: "acpx", acpxAgent: "claude" };
-  if (harness === "pi_local") return { provider: "acpx", acpxAgent: "pi" };
+  if (harness === "pi_local") return { provider: "pi_rpc" };
   if (harness === "grok_local") return { provider: "acpx", acpxAgent: "grok" };
   if (harness === "opencode_local") return { provider: "opencode" };
   if (harness === "cursor_cloud") return { provider: "cursor_cloud" };
@@ -24,7 +29,7 @@ export function paperclipRunnerProfileForHarness(harness: string): { provider: "
 export function paperclipRunnerCreationLifecycle(
   profile: NonNullable<ReturnType<typeof paperclipRunnerProfileForHarness>>,
 ): { lifecycleMode?: "per_turn" } {
-  return profile.provider === "codex" || profile.provider === "opencode"
+  return profile.provider === "codex" || profile.provider === "opencode" || profile.provider === "pi_rpc"
     || (profile.provider === "acpx" && profile.acpxAgent === "claude")
     ? {} : { lifecycleMode: "per_turn" };
 }
@@ -45,7 +50,7 @@ function supportsLinuxLibc(libc?: "glibc" | "musl" | "unknown", version?: string
 export function paperclipRunnerSupportsPlatform(harness: string, platform: string, architecture: string, libc?: "glibc" | "musl" | "unknown", glibcVersion?: string): boolean {
   return !!paperclipRunnerProfileForHarness(harness)
     && (harness !== "grok_local" || (platform === "linux" && architecture === "x64") || (platform === "darwin" && architecture === "arm64"))
-    && !(["opencode_local", "pi_local"].includes(harness) && platform === "linux" && architecture === "arm64")
+    && !(["opencode_local", "pi_local", "pi_rpc"].includes(harness) && platform === "linux" && architecture === "arm64")
     && ((platform === "linux" && supportsLinuxLibc(libc, glibcVersion) && (architecture === "x64" || architecture === "arm64"))
       || (platform === "darwin" && (architecture === "arm64" || architecture === "x64")));
 }
@@ -54,6 +59,7 @@ export function agentHarnessType(adapterType: string, config: Record<string, unk
   if (adapterType !== "paperclip_runner") return adapterType;
   if (config.provider === undefined || config.provider === "codex") return "codex_local";
   if (config.provider === "opencode") return "opencode_local";
+  if (config.provider === "pi_rpc") return "pi_rpc";
   if (config.provider === "acpx") {
     const agent = config.acpxAgent ?? "claude";
     return ({ codex: "codex_local", claude: "claude_local", grok: "grok_local", cursor: "cursor", pi: "pi_local", kimi: "kimi_local", antigravity: "antigravity_runtime" } as Record<string, string>)[String(agent)] ?? `acpx:${String(agent)}`;
