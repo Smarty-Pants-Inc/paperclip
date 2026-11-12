@@ -7465,6 +7465,7 @@ function runnerProviderStateFilename(execution: NativeExecutionInput): string {
     case "cursor_cloud":
     case "codex":
     case "opencode":
+    case "pi_rpc":
       return "codex-provider-state.json";
     case "acpx":
       return "acpx-provider-state.json";
@@ -7565,12 +7566,13 @@ export function providerSessionIdentityFromDurableProviderState(input: {
     }
     case "cursor_cloud":
     case "codex":
-    case "opencode": {
+    case "opencode":
+    case "pi_rpc": {
       const config = record(state.config);
       const expectedDriver =
         input.execution.provider.kind === "cursor_cloud" ? "cursor_cloud_api" : input.execution.provider.kind === "codex"
           ? "codex_app_server"
-          : "opencode_server";
+          : input.execution.provider.kind === "pi_rpc" ? "pi_rpc" : "opencode_server";
       if (
         state.schema !== CODEX_PROVIDER_STATE_SCHEMA ||
         !["prepared", "session_open", "provider_exited"].includes(

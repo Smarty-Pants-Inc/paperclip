@@ -3905,6 +3905,7 @@ describe("split durable provider checkpoint identity", () => {
   it.each([
     ["codex", "codex_app_server"],
     ["opencode", "opencode_server"],
+    ["pi_rpc", "pi_rpc"],
   ] as const)(
     "reads %s identity from the split Codex-provider state",
     (provider, driverKind) => {
@@ -3928,6 +3929,24 @@ describe("split durable provider checkpoint identity", () => {
       });
     },
   );
+
+  it.each([
+    { config: { provider: "pi_rpc", driver: "opencode_server" } },
+    { config: { provider: "opencode", driver: "pi_rpc" } },
+    { activeProviderTurnId: "still-running" },
+    { ambiguousTurnStartPending: true },
+    { schema: "paperclip.runner.acpx-provider-state.v3" },
+  ])("rejects incompatible or unsettled native Pi facade recovery: %j", (override) => {
+    expect(providerSessionIdentityFromDurableProviderState({
+      execution: execution({ kind: "pi_rpc" }, "pi_rpc"),
+      providerState: {
+        schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared",
+        config: { provider: "pi_rpc", driver: "pi_rpc" },
+        threadId: "driver-session-1", providerSessionId: "provider-session-1",
+        activeProviderTurnId: null, ambiguousTurnStartPending: false, ...override,
+      },
+    })).toEqual({ providerSessionId: null, providerBackendSessionId: null, providerSessionIdentity: null });
+  });
 
   it("rejects active or scope-conflicting provider state", () => {
     const profileDigest = `sha256:${"a".repeat(64)}`;
