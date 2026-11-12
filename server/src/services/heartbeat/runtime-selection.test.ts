@@ -189,12 +189,15 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(next).toMatchObject({ nativeExecution: { session: { normalizedSessionId: id } } });
     expect((await read(f.input.run.id)).runnerProfileJson).toMatchObject({ piConversation: { id, reason: "adopted_existing_conversation" } });
   });
-  it("refuses an unverified legacy pointer instead of guessing ownership or silently replacing it", async () => {
+  it("does not adopt an unverified legacy pointer, and does not fail the turn either (existing prod rows)", async () => {
     const f = await piFixture();
+    const legacy = randomUUID();
     await db.insert(agentTaskSessions).values({ companyId: f.agent.companyId, agentId: f.agent.id,
-      adapterType: "paperclip_runner", taskKey: f.issue.id, sessionParamsJson: { sessionId: randomUUID() } });
-    await expect(selectHeartbeatRuntime(db, f.input)).rejects.toThrow("pi_conversation_legacy_binding_unverified");
-    expect((await read(f.input.run.id)).nativeSessionId).toBeNull();
+      adapterType: "paperclip_runner", taskKey: f.issue.id, sessionParamsJson: { sessionId: legacy } });
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected selection");
+    expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(legacy);
+    expect((await read(f.input.run.id)).runnerProfileJson).toMatchObject({ piConversation: { reason: "legacy_binding_unverified" } });
   });
   async function connectorFixture(durable = true) {
     const f = await fixture(), { input } = f;
