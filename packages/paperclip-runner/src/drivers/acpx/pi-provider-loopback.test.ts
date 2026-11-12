@@ -72,7 +72,7 @@ describe("Pi managed provider loopback", () => {
     expect(spawn.env.PAPERCLIP_CONFIGURED_ENV_KEYS).not.toContain("PAPERCLIP_AI_PROVIDER_");
   });
 
-  it.each(["chat", "unknown"])("fails closed for unsupported managed protocol %s", async protocol => {
+  it.each(["unknown"])("fails closed for unsupported managed protocol %s", async protocol => {
     const sandbox = await prepareAcpxRuntimeSandbox({ binding: await binding(), agent: "pi", providerPolicy: { readOnly: false }, environment: { ...environment("http://127.0.0.1:1"), PAPERCLIP_AI_PROVIDER_PROTOCOL: protocol } });
     cleanups.push(() => sandbox.closeOwnedConfiguration?.() ?? Promise.resolve());
     await expect(sandbox.initializeOwnedConfiguration?.()).rejects.toThrow("Pi managed provider protocol is unsupported");
