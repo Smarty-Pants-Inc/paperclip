@@ -1635,6 +1635,7 @@ describe("TaskChatThread runtime transcript selection", () => {
   });
 
   it("keeps ordinary task previews on the compact conversation endpoint", () => {
+    nativeTranscriptState.hydratedRunIds = new Set();
     renderThread({
       issueId: "task-preview", compactHistory: true, conversationMode: false,
       comments: [], onAdd: async () => {},
