@@ -2966,7 +2966,8 @@ describe("remote provider pack manifest", () => {
       });
       const execute = vi.fn(async (command: { command: string; args?: string[]; timeoutMs?: number }) => {
         expect(command.timeoutMs).toBeGreaterThan(0);
-        expect(command.timeoutMs).toBeLessThanOrEqual(30_000);
+        // Environment-sync RPCs use the image-2 120 s floor.
+        expect(command.timeoutMs).toBeLessThanOrEqual(120_000);
         const verification = command.args?.[0] === "-e";
         const packRoot = command.args?.[2];
         const valid = mode === "staged" || mode === "preinstalled" && packRoot === "/opt/paperclip-runner/provider-pack"
