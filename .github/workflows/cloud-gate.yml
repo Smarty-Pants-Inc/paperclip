@@ -1,0 +1,187 @@
+name: Cloud gate
+run-name: Cloud gate · ${{ inputs.ref || github.event.pull_request.head.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Public Paperclip source ref or full commit SHA
+        type: string
+        required: true
+        default: 2b34dc49b03b216f62f819bec93383827f0543d4
+  pull_request:
+    paths:
+      - .github/workflows/cloud-gate.yml
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - .npmrc
+      - tsconfig*.json
+      - vitest.config.ts
+      - scripts/**
+      - server/**
+      - packages/**
+
+# Standard ubuntu-24.04 runners are free for public repositories:
+# https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+# Public source only: no secrets, external home directories or private artifacts.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_BUILD_JOBS: '4'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  runner-core-lib:
+    name: Runner core library (not full-server acceptance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.96.1
+      - name: Test runner-core library under umask 0022
+        id: cargo
+        run: |
+          umask 0022
+          set -euo pipefail
+          rustc +1.96.1 --version
+          cargo +1.96.1 --version
+          cargo +1.96.1 test --locked \
+            --manifest-path packages/paperclip-runner/runner/Cargo.toml \
+            -p paperclip-runner-core --lib
+      - name: Write library summary
+        if: always()
+        env:
+          RESULT: ${{ steps.cargo.outcome }}
+        run: |
+          umask 0022
+          mkdir -p "$RUNNER_TEMP/cloud-gate-lib"
+          printf 'Runner-core library: %s\nScope: --lib only; not full-server acceptance.\n' "$RESULT" \
+            | tee "$RUNNER_TEMP/cloud-gate-lib/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: cloud-gate-library-summary
+          path: ${{ runner.temp }}/cloud-gate-lib/summary.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  full-server-gate:
+    name: Full-server gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PAPERCLIP_PI_FULL_SERVER_E2E: '1'
+      PAPERCLIP_PI_E2E_PROTOCOL: messages
+      PAPERCLIP_PI_E2E_THINKING_LEVEL: xhigh
+      PAPERCLIP_PI_E2E_TOOL_CALL: '1'
+      PAPERCLIP_PI_E2E_BIG_OUTPUT_BYTES: 300000,1500000
+      PAPERCLIP_PI_E2E_FINISH: '1'
+      PAPERCLIP_PI_E2E_STRICT_CANDIDATE: '1'
+      PAPERCLIP_PI_E2E_EXPECT_FINISH_RED: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Require a public, self-contained gate
+        id: prerequisites
+        run: |
+          umask 0022
+          set -euo pipefail
+          mapfile -t tests < <(git ls-files 'server/src/__tests__/native-pi-rpc-*.e2e.test.ts')
+          if (( ${#tests[@]} == 0 )); then
+            echo '::error::The selected public source has no native-pi-rpc-*.e2e.test.ts gate. Full-server acceptance is BLOCKED, not passed.'
+            exit 1
+          fi
+          # These must be reviewed public inputs, never a copied operator home.
+          git ls-files --error-unmatch \
+            server/src/__tests__/native-pi-rpc-full-server.e2e.test.ts \
+            server/src/__tests__/helpers/native-pi-home-load-proof.ts \
+            scripts/build-pi-e2e-home-fixture.sh \
+            server/src/__tests__/fixtures/pi-home/pi-subagents/package-lock.json \
+            server/src/__tests__/fixtures/pi-home/langfuse-pi/package.json \
+            server/src/__tests__/fixtures/pi-home/langfuse-pi/package-lock.json >/dev/null
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.19.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.96.1
+      - name: Prepare package tools
+        run: |
+          umask 0022
+          set -euo pipefail
+          npm install --global npm@11.17.0 pnpm@9.15.4
+          node --version
+          npm --version
+          pnpm --version
+          pnpm install --frozen-lockfile
+      - name: Build runner and TypeScript
+        run: |
+          umask 0022
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/cloud-gate-target"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+          cargo +1.96.1 build --manifest-path packages/paperclip-runner/runner/Cargo.toml \
+            --locked -p paperclip-runner-core --bin paperclip-runnerd &
+          cargo_pid=$!
+          pnpm --filter @paperclipai/paperclip-runner build:typescript
+          wait "$cargo_pid"
+          pnpm --filter @paperclipai/plugin-sdk build
+          (cd server && node ../scripts/run-tsc.mjs)
+      - name: Build official provider pack
+        run: |
+          umask 0022
+          set -euo pipefail
+          pack="$RUNNER_TEMP/cloud-gate-provider-pack"
+          (cd packages/paperclip-runner && node scripts/build-provider-pack.mjs "$pack")
+          chmod -R go-w "$pack"
+          echo "PAPERCLIP_RUNNER_BINARY=$CARGO_TARGET_DIR/debug/paperclip-runnerd" >> "$GITHUB_ENV"
+          echo "PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=$pack" >> "$GITHUB_ENV"
+      - name: Run public full-server gate
+        id: gate
+        run: |
+          umask 0022
+          set -euo pipefail
+          export TMPDIR="$RUNNER_TEMP/cloud-gate-tmp"
+          mkdir -p "$TMPDIR"
+          export PAPERCLIP_PI_E2E_HOME_FIXTURE="$RUNNER_TEMP/cloud-gate-pi-home"
+          # Committed builder + integrity-pinned public npm packages only.
+          # Private tool-cap/redact-secrets is absent: the test explicitly skips
+          # the 300 KB/1.5 MB persistence leg, not finish or warm-turn checks.
+          bash scripts/build-pi-e2e-home-fixture.sh "$PAPERCLIP_PI_E2E_HOME_FIXTURE"
+          (cd "$PAPERCLIP_PI_E2E_HOME_FIXTURE" && sha256sum --check --quiet SHA256SUMS)
+          PAPERCLIP_PI_E2E_FIXTURE_MANIFEST_SHA256=$(sha256sum "$PAPERCLIP_PI_E2E_HOME_FIXTURE/SHA256SUMS")
+          export PAPERCLIP_PI_E2E_FIXTURE_MANIFEST_SHA256="${PAPERCLIP_PI_E2E_FIXTURE_MANIFEST_SHA256%% *}"
+          unset PAPERCLIP_PI_E2E_EXCLUDE_SUBAGENTS
+          cd server
+          timeout --kill-after=10s 600s ../node_modules/.bin/vitest run --config vitest.config.ts \
+            src/__tests__/native-pi-rpc-full-server.e2e.test.ts
+      - name: Write full-server summary
+        if: always()
+        env:
+          PREREQUISITES: ${{ steps.prerequisites.outcome }}
+          RESULT: ${{ steps.gate.outcome }}
+        run: |
+          umask 0022
+          mkdir -p "$RUNNER_TEMP/cloud-gate-server"
+          printf 'Public gate prerequisites: %s\nFull-server gate: %s\nPublic fixture only; private tool-cap 300 KB/1.5 MB persistence leg explicitly skipped.\nA missing public gate is not a pass.\n' "$PREREQUISITES" "$RESULT" \
+            | tee "$RUNNER_TEMP/cloud-gate-server/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: cloud-gate-server-summary
+          path: ${{ runner.temp }}/cloud-gate-server/summary.txt
+          if-no-files-found: error
+          retention-days: 7
