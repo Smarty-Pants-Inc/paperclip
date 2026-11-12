@@ -902,7 +902,11 @@ enum AmbiguousTurnMessage {
     ReconciledNeedsStart { provider_turn_id: String },
 }
 
+#[path = "pi_park_readiness.rs"]
+mod pi_park_readiness;
+
 pub struct CodexProvider {
+    pi_park_readiness: pi_park_readiness::PiParkReadiness,
     process: SupervisedProcess,
     _stdio_mcp: Option<crate::stdio_mcp::StdioMcpSession>,
     stderr_tail: BoundedLogBuffer,
@@ -1381,6 +1385,7 @@ impl CodexProvider {
             ),
             config: config.clone(),
             pi_runtime_context: Value::Null,
+            pi_park_readiness: Default::default(),
             authorized_tools,
             next_request_id: 1,
             thread_id: String::new(),
@@ -1855,6 +1860,10 @@ impl CodexProvider {
             blockers.push("pending_runtime_requests");
         }
         blockers
+    }
+
+    pub(crate) fn pi_park_ready(&self) -> bool {
+        self.pi_park_readiness.ready()
     }
 
     pub(crate) fn warm_run_attachment_blockers(
@@ -3131,6 +3140,20 @@ impl CodexProvider {
             })?;
             (message, trace_frame_id)
         };
+        if self.config.provider == "pi_rpc"
+            && self.pi_park_readiness.observe(
+                &message,
+                &self.thread_id,
+                self.active_provider_turn_id.as_deref(),
+                self.completed_turn_authority
+                    .as_ref()
+                    .map(|authority| authority.provider_turn_id.as_str()),
+            )
+        {
+            // A proxy liveness report is volatile, process-local proof only.
+            // It is not a turn event and must not enter durable result history.
+            return Ok(None);
+        }
         if !allow_control && !self.disconnected_message_is_passive(&message) {
             let bytes = json_size(&message, "buffered Codex provider message")?;
             self.pending_message_bytes =
@@ -4105,6 +4128,11 @@ impl CodexProvider {
     }
 
     fn trace_inbound(&mut self, line: &str) -> Option<u64> {
+        if self.config.provider == "pi_rpc" {
+            // Invalidate before parsing, on every read path (including replies
+            // to synchronous requests). Malformed late bytes are activity too.
+            self.pi_park_readiness.invalidate();
+        }
         let trace = self.trace.as_mut()?;
         let frame_id = trace.frame("provider_to_client", line.as_bytes())?;
         trace.interpretation(

@@ -5906,6 +5906,15 @@ impl CodexCommandExecutor {
 impl CommandExecutor for CodexCommandExecutor {
     fn host_park_ready(&mut self) -> Result<bool, DurableRunnerError> {
         self.save_before_provider_writes(false)?;
+        let pi_rpc = self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.config.provider == "pi_rpc");
+        if pi_rpc {
+            // Observe the existing app-server channel without selecting or
+            // restoring a provider. Preserve any late events before parking.
+            self.poll_current_provider()?;
+        }
         let Some(state) = self.state.as_ref() else {
             return Ok(false);
         };
@@ -5946,7 +5955,8 @@ impl CommandExecutor for CodexCommandExecutor {
             .expect("checked surviving native provider");
         // Tail draining can consume a late goal update before the executor
         // journal sees it. Check the live provider after that drain.
-        if provider.has_active_goal()
+        if (pi_rpc && !provider.pi_park_ready())
+            || provider.has_active_goal()
             || provider.has_known_descendants()
             || provider.observed_completed_turn_authority() != provider.completed_turn_authority()
             || provider.completed_turn_authority()

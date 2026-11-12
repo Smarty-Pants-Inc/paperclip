@@ -3420,9 +3420,13 @@ fn pi_rpc_parks_only_after_its_completed_turn_is_quiescent() {
     poll_opencode_until(&mut executor, "turn.completed");
     acknowledge_delivered_events(&mut executor);
     assert!(
-        executor.host_park_ready().unwrap(),
-        "native Pi must join the settled native-facade park gate"
+        !executor.host_park_ready().unwrap(),
+        "settlement alone is not Pi child/goal readiness proof"
     );
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(unix)]
+#[path = "support/pi_park_readiness.rs"]
+mod pi_park_readiness;
