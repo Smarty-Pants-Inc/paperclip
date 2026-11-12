@@ -298,7 +298,8 @@ describe("server adapter registry", () => {
       config: { provider: "pi_rpc", model: "anthropic/claude-opus-5-5", piRpcThinkingLevel: "xhigh" },
       executionTarget: target === "local" ? { kind: "local" } : {
         kind: "remote", transport: "ssh", remoteCwd: "/workspace",
-        spec: { host: "unused.invalid", port: 22, username: "test" },
+        spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd: "/workspace",
+          remoteWorkspacePath: "/workspace", privateKey: null, knownHosts: null, strictHostKeyChecking: true },
       },
     });
     expect(result).toMatchObject({ adapterType: "paperclip_runner", status: "fail", checks: [{
@@ -307,8 +308,9 @@ describe("server adapter registry", () => {
     expect(openCodeProbe).not.toHaveBeenCalled();
   });
 
-  it("exposes native Pi in the Runner provider configuration options", () => {
-    const provider = requireServerAdapter("paperclip_runner").getConfigSchema!().fields.find(field => field.key === "provider");
+  it("exposes native Pi in the Runner provider configuration options", async () => {
+    const schema = await requireServerAdapter("paperclip_runner").getConfigSchema!();
+    const provider = schema.fields.find(field => field.key === "provider");
     expect(provider?.options).toContainEqual({ value: "pi_rpc", label: "Pi" });
   });
 
