@@ -67,13 +67,21 @@ export interface PiRpcDriverOptions {
   dynamicToolTimeoutMs?: number;
   /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
   promptTimeoutMs?: number;
-  /** No Pi events during an accepted turn, default 10 minutes. Host callbacks pause it. */
+  /** No Pi events during an accepted turn, default 10 minutes. Native tools and host callbacks pause it. */
   turnIdleTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
   bindRequest?: typeof sendPiBindRequest;
 }
+
+// The runner's longest configured Pi tool deadline is 60_000 ms: see the
+// callback protocol maximum in pi-bind-protocol.ts and extension/index.ts's
+// sendPiToolRequest/dispatchPiToolCall. Pi 1.5.2 core/tools/bash.ts has NO default
+// timeout (and we configure none); native execution pauses this deadline rather
+// than assuming a finite bash limit. Keep a minute above configured tool waits.
+const PI_TURN_IDLE_TIMEOUT_MS = Math.max(600_000, 60_000 + 60_000);
+const PI_TURN_IDLE_ABORT_TIMEOUT_MS = 5000;
 
 const PI_CAPABILITIES: NativeSessionCapabilities = {
   resume: false,
@@ -430,6 +438,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #promptTimeoutMs?: number;
   readonly #turnIdleTimeoutMs: number;
   #turnIdleTimer: ReturnType<typeof setTimeout> | undefined;
+  #turnIdleRecovery: { settle: (settled: boolean) => void } | undefined;
   // Only active identities retain a projector. Fixed-memory tombstones prevent
   // old/reused IDs from binding to a later turn, without a growing warm history.
   // Outstanding native tools separately retain only their original IDs/name.
@@ -468,7 +477,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     this.#piMetadata = state.piMetadata;
     this.#promptTimeoutMs = state.promptTimeoutMs;
-    this.#turnIdleTimeoutMs = state.turnIdleTimeoutMs ?? 600_000;
+    this.#turnIdleTimeoutMs = state.turnIdleTimeoutMs ?? PI_TURN_IDLE_TIMEOUT_MS;
     this.#callbacks?.setActivityListener(() => this.#armTurnIdleTimer());
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
@@ -900,6 +909,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#closed = true;
     this.#admitted = false;
     this.#clearTurnIdleTimer();
+    this.#turnIdleRecovery?.settle(false);
     this.#dialogs.clear();
     this.#closing = (async () => {
       const failures: unknown[] = [];
@@ -943,28 +953,42 @@ export class PiRpcHarnessSession implements HarnessSession {
   #armTurnIdleTimer(): void {
     this.#clearTurnIdleTimer();
     const turn = this.#activeTurn;
-    // Prompt acceptance has its own deadline. Only admitted host execution
-    // pauses this safety net; a socket/queued peer cannot keep Pi alive.
-    if (this.#closed || this.#failure || !turn || turn.settled || this.#promptAcceptance || this.#callbacks?.activeCount()) return;
+    // Prompt acceptance has its own deadline. Any unresolved native execution
+    // (including nested IDs) or admitted host callback is activity even without
+    // output. A socket/queued peer alone cannot keep Pi alive.
+    if (this.#closed || this.#failure || !turn || turn.settled || this.#promptAcceptance || this.#turnIdleRecovery || this.#pendingNativeTools.size || this.#callbacks?.activeCount()) return;
     this.#turnIdleTimer = setTimeout(() => {
       this.#turnIdleTimer = undefined;
-      void this.#expireTurnIdle(turn);
+      // Keep next-turn admission behind abort settlement, while the independent
+      // event pump remains free to consume agent_settled.
+      void this.#serialize(() => this.#expireTurnIdle(turn)).catch(() => undefined);
     }, this.#turnIdleTimeoutMs);
     this.#turnIdleTimer.unref();
   }
 
   async #expireTurnIdle(turn: PiTurnState): Promise<void> {
-    if (this.#closed || this.#failure || turn.settled || this.#activeTurn !== turn) return;
-    this.#failure = new Error(`Pi emitted no events for ${this.#turnIdleTimeoutMs} ms during the active turn.`);
-    const detail = { code: "pi_turn_idle_timeout", message: this.#failure.message, recoverable: false };
-    this.#admitted = false;
+    if (this.#closed || this.#failure || turn.settled || this.#activeTurn !== turn || this.#pendingNativeTools.size || this.#callbacks?.activeCount()) return;
+    const detail = { code: "pi_turn_idle_timeout", message: `Pi emitted no events for ${this.#turnIdleTimeoutMs} ms during the active turn.`, recoverable: false };
+    const settled = new Promise<boolean>(resolve => { this.#turnIdleRecovery = { settle: resolve }; });
     this.#callbacks?.fence();
-    try { await this.#finishTurn(turn, "failed", { error: detail }); }
-    catch { this.#emit("turn.failed", { status: "failed", error: detail }, turn); }
-    finally {
-      // The existing Stop path fences callbacks, revokes the broker, stops
-      // children and physically retires Pi with bounded transport escalation.
-      await this.close().catch(() => undefined);
+    let nativeSettled = false;
+    // An ACK is not settlement; conversely a lost ACK cannot invalidate an
+    // observed agent_settled. Bound and observe both waits without resending.
+    const abort = this.#transport.request("abort", {}, { timeoutMs: PI_TURN_IDLE_ABORT_TIMEOUT_MS }).catch(() => undefined);
+    try {
+      try { nativeSettled = await withTimeout(settled, PI_TURN_IDLE_ABORT_TIMEOUT_MS, "Pi idle abort did not settle"); }
+      catch { /* Only an unresponsive abort requires physical retirement. */ }
+      await abort;
+      if (!this.#closed) await this.#finishTurn(turn, "failed", { error: detail });
+    } catch {
+      nativeSettled = false; // Uncertain capability cleanup also retires Pi.
+      this.#emit("turn.failed", { status: "failed", error: detail }, turn);
+    } finally {
+      this.#turnIdleRecovery = undefined;
+      // No session-level failure: a settled abort leaves this session usable.
+      // Retirement never deletes #sessionFile; the next open resumes it using
+      // the same normalizedSessionId and native provider conversation identity.
+      if (!nativeSettled || this.#transport.exited) await this.close().catch(() => undefined);
     }
   }
 
@@ -974,10 +998,15 @@ export class PiRpcHarnessSession implements HarnessSession {
         if (this.#closed || this.#failure) break;
         // Activity is the native event, not its display projection: hidden
         // thinking, tool progress, retries and compaction all reset the deadline.
+        // Reset before awaiting projection/IPC, then reconcile execution below.
         this.#armTurnIdleTimer();
         await this.#consume(record);
+        // Inspect execution state AFTER the event: start pauses immediately;
+        // the last matching end starts a fresh silence budget.
+        this.#armTurnIdleTimer();
       }
     } catch (error) {
+      if (this.#turnIdleRecovery) { this.#turnIdleRecovery.settle(false); return; }
       if (!this.#closed) {
         this.#callbacks?.fence();
         const turn = error instanceof PiProjectionFailure ? error.turn : this.#activeTurn;
@@ -999,6 +1028,9 @@ export class PiRpcHarnessSession implements HarnessSession {
         }
       }
     }
+    // EOF during abort also requires retirement, without reclassifying the
+    // expired input as a session failure or waiting the entire abort budget.
+    this.#turnIdleRecovery?.settle(false);
   }
 
   async #consume(event: PiRpcRecord): Promise<void> {
@@ -1015,6 +1047,14 @@ export class PiRpcHarnessSession implements HarnessSession {
     // discard it or make it borrow the pending input's origin.
     const knownOwner = acceptance && piRecordIdentityKeys(event).some(key => this.#owners.has(key) || this.#retiredIdentities.has(key));
     if (acceptance && !knownOwner && event.type !== "process_exit" && event.type !== "transport_error" && !(await acceptance)) return;
+    if (this.#turnIdleRecovery) {
+      // Abort-drain events still belong to the expired input, never a queued
+      // next turn. Keep its timeout classification even if Pi exits instead
+      // of settling; only native settlement permits warm-session reuse.
+      if (event.type === "agent_settled") this.#turnIdleRecovery.settle(true);
+      else if (event.type === "process_exit" || event.type === "transport_error") this.#turnIdleRecovery.settle(false);
+      return;
+    }
     if (event.type === "process_exit" || event.type === "transport_error") {
       const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
       this.#callbacks?.fence();

@@ -24,7 +24,7 @@ class FakeTransport {
   pid = 42; exited = false; closed = false; ready = Promise.resolve();
   writes: PiRpcRecord[] = []; order: string[] = []; state: PiRpcRecord = {}; uiGate = Promise.resolve();
   #queue: PiRpcRecord[] = []; #wake?: (value: IteratorResult<PiRpcRecord>) => void;
-  async request(type: string) { await this.ready; this.order.push(type); return { success: true, data: type === "get_state" ? { sessionId: "native", model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0, ...this.state } : type === "get_available_models" ? { models: [{ provider: "paperclip", id: "faux", name: "Fixture", api: "openai-completions" }] } : type === "set_model" ? { provider: "paperclip", id: "faux" } : type === "get_available_thinking_levels" ? { levels: ["off"] } : type === "prompt" ? { disposition: "started" } : undefined }; }
+  async request(type: string) { await this.ready; this.order.push(type); if (type === "abort") this.send({ type: "agent_settled", aborted: true }); return { success: true, data: type === "get_state" ? { sessionId: "native", model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0, ...this.state } : type === "get_available_models" ? { models: [{ provider: "paperclip", id: "faux", name: "Fixture", api: "openai-completions" }] } : type === "set_model" ? { provider: "paperclip", id: "faux" } : type === "get_available_thinking_levels" ? { levels: ["off"] } : type === "prompt" ? { disposition: "started" } : undefined }; }
   async sendExtensionUiResponse(value: PiRpcRecord) { this.writes.push(structuredClone(value)); await this.uiGate; }
   send(value: PiRpcRecord) { if (this.#wake) { const wake = this.#wake; this.#wake = undefined; wake({ value, done: false }); } else this.#queue.push(value); }
   events(): AsyncIterable<PiRpcRecord> { return { [Symbol.asyncIterator]: () => ({ next: async () => { const value = this.#queue.shift(); if (value) return { value, done: false }; if (this.closed) return { value: undefined, done: true }; return new Promise<IteratorResult<PiRpcRecord>>(r => { this.#wake = r; }); } }) }; }
@@ -73,7 +73,7 @@ async function packagedDriver(verified = true) {
 }
 
 describe("live host Pi C2 authority", () => {
-  it("counts an in-flight host callback as activity and restarts the idle deadline after its result", async () => {
+  it.each([false, true])("counts host callbacks AND native execution independently (native ends first: %s)", async nativeEndsFirst => {
     const entered = deferred<void>(), result = deferred<unknown>();
     const f = await fixture({ turnIdleTimeoutMs: 100, dynamicToolHandler: async () => { entered.resolve(); return result.promise; } });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -83,23 +83,38 @@ describe("live host Pi C2 authority", () => {
       pending = sendPiToolRequest(f.initial.toolSocketPath, request);
       const receipt = expect(pending).resolves.toMatchObject({ content: [{ text: "callback result" }] });
       await entered.promise;
+      if (nativeEndsFirst) {
+        f.transport.send({ type: "tool_execution_end", toolCallId: request.toolCallId, toolName: request.tool, result: { content: [] } }); await tick();
+      }
       await vi.advanceTimersByTimeAsync(500);
       expect(f.transport.closed).toBe(false);
       expect(f.events.some(event => event.eventType === "turn.failed")).toBe(false);
       result.resolve({ content: [{ type: "text", text: "callback result" }], details: {} });
       await receipt;
-      await vi.advanceTimersByTimeAsync(99); expect(f.transport.closed).toBe(false);
+      if (!nativeEndsFirst) {
+        // The callback result is not Pi's execution_end. Native execution still
+        // suppresses expiry until its exact terminal receipt arrives.
+        await vi.advanceTimersByTimeAsync(500);
+        expect(f.events.some(event => event.eventType === "turn.failed")).toBe(false);
+        f.transport.send({ type: "tool_execution_end", toolCallId: request.toolCallId, toolName: request.tool, result: { content: [] } }); await tick();
+      }
+      await vi.advanceTimersByTimeAsync(99); expect(f.transport.order).not.toContain("abort");
       await vi.advanceTimersByTimeAsync(1); await tick(); await tick();
-      await f.session.close();
-      expect(f.transport.closed).toBe(true);
-      expect(f.events.filter(event => event.eventType === "turn.failed")).toMatchObject([{ payload: { error: { code: "pi_turn_idle_timeout" } } }]);
-      expect(f.ipc.some(command => command.type === "stop_children")).toBe(true);
+      vi.useRealTimers();
+      await vi.waitFor(() => expect(f.events.filter(event => event.eventType === "turn.failed")).toMatchObject([{ payload: { error: { code: "pi_turn_idle_timeout" } } }]));
+      expect(f.transport.closed).toBe(false);
+      expect(f.transport.order).toContain("abort");
+      expect(f.ipc.some(command => command.type === "stop_children")).toBe(false);
+      await f.session.attachRun({ runId: "run-after-timeout" });
+      await f.start(); await f.settle();
+      expect(f.transport.closed).toBe(false);
+      expect(f.ipc.some(command => command.type === "bind")).toBe(true);
     } finally {
       result.resolve({ content: [], details: {} });
       vi.useRealTimers(); await pending?.catch(() => {});
     }
   });
-  it("does not let an aborted host callback suppress the idle deadline indefinitely", async () => {
+  it("keeps an aborted callback's native tool active until its execution_end", async () => {
     const entered = deferred<void>(), result = deferred<unknown>();
     const f = await fixture({ turnIdleTimeoutMs: 100, dynamicToolTimeoutMs: 50, dynamicToolHandler: async () => { entered.resolve(); return result.promise; } });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -110,9 +125,14 @@ describe("live host Pi C2 authority", () => {
       const refused = expect(pending).rejects.toThrow();
       await entered.promise;
       await vi.advanceTimersByTimeAsync(50); await refused;
-      await vi.advanceTimersByTimeAsync(99); expect(f.transport.closed).toBe(false);
-      await vi.advanceTimersByTimeAsync(1); await tick(); await tick(); await f.session.close();
-      expect(f.events.filter(event => event.eventType === "turn.failed")).toMatchObject([{ payload: { error: { code: "pi_turn_idle_timeout" } } }]);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(f.events.some(event => event.eventType === "turn.failed")).toBe(false);
+      f.transport.send({ type: "tool_execution_end", toolCallId: request.toolCallId, toolName: request.tool, result: { content: [] }, isError: true }); await tick();
+      await vi.advanceTimersByTimeAsync(99); expect(f.transport.order).not.toContain("abort");
+      await vi.advanceTimersByTimeAsync(1); await tick(); await tick();
+      vi.useRealTimers();
+      await vi.waitFor(() => expect(f.events.filter(event => event.eventType === "turn.failed")).toMatchObject([{ payload: { error: { code: "pi_turn_idle_timeout" } } }]));
+      expect(f.transport.closed).toBe(false);
     } finally { result.resolve({ content: [], details: {} }); vi.useRealTimers(); await pending?.catch(() => {}); }
   });
   it("returns a seven-second dynamic tool's real result independently of the startup deadline", async () => {
