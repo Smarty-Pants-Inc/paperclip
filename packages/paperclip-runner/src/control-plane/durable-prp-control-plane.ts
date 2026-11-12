@@ -1608,6 +1608,23 @@ function syncParentDirectory(path: string): void {
   }
 }
 
+/** Move a previous runnerd generation's non-empty diagnostic aside so the
+ * next launch starts a fresh file without erasing it. Never deletes. */
+export function rotatePriorDiagnostic(path: string): void {
+  let size: number;
+  try {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile()) return;
+    size = metadata.size;
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return;
+    throw error;
+  }
+  if (size === 0) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  renameSync(path, path.replace(/\.log$/, "") + `.${stamp}.${randomUUID().slice(0, 8)}.log`);
+}
+
 export function atomicPrivateWrite(path: string, contents: string): void {
   const temporary = resolve(
     dirname(path),
@@ -4933,6 +4950,10 @@ export function spawnRunner(options: {
     // the complete value before a byte reaches disk. Raw process output is
     // intentionally discarded below; these files are only the runner-owned
     // restart-survivable diagnostic channel.
+    // Keep every earlier generation's diagnostics: a relaunch must never
+    // erase the only evidence of why the previous runnerd exited.
+    rotatePriorDiagnostic(stdoutPath);
+    rotatePriorDiagnostic(stderrPath);
     atomicPrivateWrite(stdoutPath, "");
     atomicPrivateWrite(stderrPath, "");
   }
