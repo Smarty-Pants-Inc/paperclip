@@ -32,7 +32,8 @@ use crate::provider_bridge::{
 };
 use crate::provider_events::{
     codex_context_usage, normalize_codex_notification, normalize_codex_notification_in,
-    normalized_codex_terminal_event_type, with_terminal_outcome, NormalizedProviderEvent,
+    normalize_pi_notification_in, normalized_codex_terminal_event_type, with_terminal_outcome,
+    NormalizedProviderEvent, MAX_PI_FINAL_TEXT_CHARS,
 };
 use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
 
@@ -832,12 +833,15 @@ fn normalize_provider_notification(
         return Ok(events);
     }
     if method != "paperclip/runResult" {
-        return Ok(
+        let events = if state.config.provider == "pi_rpc" {
+            normalize_pi_notification_in(method, params, Some(&state.config.cwd))
+        } else {
             normalize_codex_notification_in(method, params, Some(&state.config.cwd))
-                .into_iter()
-                .map(|event| relabel_provider_event(event, &state.config.provider))
-                .collect(),
-        );
+        };
+        return Ok(events
+            .into_iter()
+            .map(|event| relabel_provider_event(event, &state.config.provider))
+            .collect());
     }
     let (result, fingerprint, disposition) = validate_proxy_run_result(state, params)?;
     match (
@@ -980,6 +984,11 @@ fn terminal_events(
             format!("The {provider_name} run failed before it completed.")
         }
     });
+    let summary = if provider == "pi_rpc" {
+        summary.chars().take(MAX_PI_FINAL_TEXT_CHARS).collect()
+    } else {
+        summary
+    };
     let evidence_ref = format!("provider:{provider}:agent-message");
     let criteria = contract
         .criterion_ids
@@ -8386,6 +8395,113 @@ done
         .unwrap_err()
         .to_string()
         .contains("reserved for verified provider proxies"));
+    }
+
+    // B7: the real Pi proxy carries `channel` beside `item`, not in `item.phase`.
+    // Keep these boundary checks: misclassification silently cuts the user's reply.
+    #[test]
+    fn b7_pi_final_channel_preserves_a_5000_character_answer() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let answer = "x".repeat(5_000);
+        let events = normalize_provider_notification(
+            &mut state,
+            "item/completed",
+            &json!({"threadId": "thread-1", "turnId": "turn-1", "channel": "final",
+                "item": {"id": "pi-message", "type": "agentMessage", "text": answer}}),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "item.completed");
+        assert_eq!(events[0].payload["provider"], "pi_rpc");
+        assert_eq!(events[0].payload["channel"], "final");
+        assert_eq!(events[0].payload["text"], answer);
+        assert!(events[0].payload.get("providerPhase").is_none());
+
+        state.last_agent_message = Some(answer.clone());
+        let terminal = terminal_events(&state, "turn.completed", None);
+        assert_eq!(terminal[0].event_type, "run.result.proposed");
+        assert_eq!(terminal[0].payload["summary"], answer);
+    }
+
+    #[test]
+    fn b7_pi_final_channel_is_bounded_at_12000_characters() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        for length in [12_000, 12_001, 33_000] {
+            let answer = "🦀".repeat(length);
+            let events = normalize_provider_notification(
+                &mut state,
+                "item/completed",
+                &json!({"channel": "final", "item": {
+                    "id": "pi-message", "type": "agentMessage", "text": answer}}),
+            )
+            .unwrap();
+            assert_eq!(events[0].payload["channel"], "final");
+            let text = events[0].payload["text"].as_str().unwrap();
+            assert_eq!(text.chars().count(), 12_000, "input length {length}");
+            assert_eq!(text, "🦀".repeat(12_000));
+        }
+    }
+
+    #[test]
+    fn b7_pi_synthesized_summary_is_bounded_at_12000_characters() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        for length in [5_000, 12_000, 12_001, 33_000] {
+            let answer = "🦀".repeat(length);
+            state.last_agent_message = Some(answer);
+            let events = terminal_events(&state, "turn.completed", None);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            let summary = events[0].payload["summary"].as_str().unwrap();
+            assert_eq!(summary.chars().count(), length.min(12_000));
+            assert_eq!(summary, "🦀".repeat(length.min(12_000)));
+        }
+    }
+
+    #[test]
+    fn b7_channel_override_is_pi_only_and_progress_stays_bounded() {
+        for provider in ["codex", "opencode", "cursor_cloud", "pi_rpc"] {
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+            for channel in ["final", "progress"] {
+                if provider == "pi_rpc" && channel == "final" {
+                    continue;
+                }
+                let params = json!({"channel": channel, "item": {
+                    "id": "message", "type": "agentMessage", "text": "x".repeat(5_000)}});
+                let expected = normalize_codex_notification_in(
+                    "item/completed",
+                    &params,
+                    Some(&state.config.cwd),
+                )
+                .into_iter()
+                .map(|event| relabel_provider_event(event, provider))
+                .collect::<Vec<_>>();
+                let actual =
+                    normalize_provider_notification(&mut state, "item/completed", &params).unwrap();
+                assert_eq!(actual, expected, "{provider} {channel}");
+                assert_eq!(actual[0].payload["channel"], "progress");
+                assert_eq!(
+                    actual[0].payload["text"].as_str().unwrap().chars().count(),
+                    4_000
+                );
+            }
+            // Other providers keep their existing explicit phase semantics and 32K cap.
+            if provider != "pi_rpc" {
+                let answer = "x".repeat(13_000);
+                let events = normalize_provider_notification(
+                    &mut state,
+                    "item/completed",
+                    &json!({"channel": "progress", "item": {"id": "final", "type": "agentMessage",
+                        "phase": "final_answer", "text": answer}}),
+                )
+                .unwrap();
+                assert_eq!(events[0].payload["channel"], "final");
+                assert_eq!(events[0].payload["providerPhase"], "final_answer");
+                assert_eq!(events[0].payload["text"], answer);
+            }
+        }
     }
 
     #[test]
