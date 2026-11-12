@@ -13,7 +13,7 @@ export interface PiProjectedEvent extends PiEventOrigin {
   payload: Record<string, unknown>;
   debug?: Record<string, unknown>;
 }
-interface Block { id: string; kind: string; text: string; terminal: boolean }
+interface Block { id: string; kind: string; text: string; terminal: boolean; truncated?: boolean }
 interface Tool { id: string; name: string; args?: unknown; input: string; terminal: boolean; started: boolean }
 const MAX_RECORD_BYTES = 256 * 1024;
 const MAX_TEXT_BYTES = 64 * 1024;
@@ -22,17 +22,26 @@ const record = (value: unknown): Record<string, unknown> => value !== null && ty
 const text = (value: unknown): string => typeof value === "string" ? value : "";
 const nativeId = (value: unknown): string | undefined => typeof value === "string" && value.length > 0 ? `s:${value}` : typeof value === "number" && Number.isSafeInteger(value) ? `n:${value}` : undefined;
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
-function boundedText(value: string): string {
-  if (Buffer.byteLength(value) > MAX_TEXT_BYTES) throw new Error("pi_projection_text_limit");
-  return value;
+const TEXT_TRUNCATION_MARKER = "[Pi projection truncated]";
+/** Display copies only; Pi executes and persists the untouched native input. */
+function boundedText(value: string, budget = MAX_TEXT_BYTES): string {
+  if (Buffer.byteLength(JSON.stringify(value)) <= budget) return value;
+  let low = 0, high = Math.min(value.length, budget);
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(JSON.stringify(value.slice(0, mid) + TEXT_TRUNCATION_MARKER)) <= budget) low = mid;
+    else high = mid - 1;
+  }
+  if (low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1]!)) low--;
+  return value.slice(0, low) + TEXT_TRUNCATION_MARKER;
 }
 /** Same sensitive-parent rule as codex-boundaries.ts:364-385, before flattening. */
-function displayValue(value: unknown, depth = 0): unknown {
+function displayValue(value: unknown, depth = 0, preview = (value: string) => value, previewStrings = false): unknown {
   if (depth > 32) throw new Error("pi_projection_depth_limit");
-  if (typeof value === "string") return redactProviderDiagnostic(value);
-  if (Array.isArray(value)) return value.map(entry => displayValue(entry, depth + 1));
+  if (typeof value === "string") return redactProviderDiagnostic(previewStrings && Buffer.byteLength(value) > MAX_TEXT_BYTES ? preview(value) : value);
+  if (Array.isArray(value)) return value.map(entry => displayValue(entry, depth + 1, preview, previewStrings));
   if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key,
-    /token|secret|password|api.?key|authorization|credential|thinkingSignature|thoughtSignature/i.test(key) && !/^(?:totalTokens|inputTokens|outputTokens|cachedInputTokens|cacheWriteTokens|tokensBefore|estimatedTokensAfter)$/u.test(key) ? "[REDACTED]" : displayValue(entry, depth + 1),
+    /token|secret|password|api.?key|authorization|credential|thinkingSignature|thoughtSignature/i.test(key) && !/^(?:totalTokens|inputTokens|outputTokens|cachedInputTokens|cacheWriteTokens|tokensBefore|estimatedTokensAfter)$/u.test(key) ? "[REDACTED]" : displayValue(entry, depth + 1, preview, previewStrings || /^(?:args|arguments|text|thinking|content|delta|errorMessage)$/u.test(key)),
   ]));
   return value;
 }
@@ -104,6 +113,11 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   let compactionCount = 0;
   let childUsageUnknown = false;
   let displayTruncated = false;
+  const projectText = (value: string, budget = MAX_TEXT_BYTES): string => {
+    const preview = boundedText(value, budget);
+    if (preview !== value) displayTruncated = true;
+    return preview;
+  };
   let originalToolOutput: { body: string; truncated: boolean } | undefined;
   const diagnostic = (type: string, code = "pi_unknown_event"): PiProjectedEvent[] => {
     // Never copy arbitrary native payloads, extension text or paths to diagnostics.
@@ -139,7 +153,9 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   };
   const argumentsFor = (tool: Tool, args: unknown) => {
     if (args === undefined) throw new Error("pi_projection_tool_arguments_missing");
-    tool.input = boundedText(JSON.stringify(args)); tool.args = structuredClone(args);
+    const serialized = JSON.stringify(args);
+    tool.input = projectText(serialized);
+    tool.args = tool.input === serialized ? structuredClone(args) : { truncated: true, preview: tool.input };
   };
   const usageFor = (message: Record<string, unknown>, key: string, output: PiProjectedEvent[]) => {
     if (message.usage === undefined) {
@@ -251,7 +267,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         observed = { ...control, [key]: { ...record(control[key]), content: [{ type: "text", text: preview }] } };
       }
     }
-    const event = record(displayValue(observed));
+    const event = record(displayValue(observed, 0, projectText));
     const output: PiProjectedEvent[] = [];
     if (event.type === "message_start" && record(event.message).role === "assistant") {
       messageId = `${prefix}:pi-message:${++ordinal}`;
@@ -271,11 +287,19 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         const payload = { kind, channel: thinking ? "detail" : "unknown" };
         if (!existing) output.push(emit("item.started", block.id, { ...payload, text: "" }));
         if (type.endsWith("_delta")) {
-          const delta = boundedText(text(update.delta));
-          block.text = boundedText(block.text + delta);
-          if (delta) output.push(emit("item.delta", block.id, { ...payload, text: delta }));
+          if (!block.truncated) {
+            const combined = block.text + text(update.delta);
+            // Reserve room for the marker even when prior deltas already filled
+            // the preview. A terminal snapshot replaces this streamed display.
+            const next = projectText(combined, MAX_TEXT_BYTES - 128);
+            block.truncated = next !== combined;
+            const delta = block.truncated && next.length - TEXT_TRUNCATION_MARKER.length < block.text.length
+              ? TEXT_TRUNCATION_MARKER : next.slice(block.text.length);
+            block.text = next;
+            if (delta) output.push(emit("item.delta", block.id, { ...payload, text: delta }));
+          }
         } else if (type.endsWith("_end")) {
-          block.text = boundedText(text(update.content));
+          block.text = projectText(text(update.content));
           // The block-end snapshot is not a delta. message_end publishes its
           // authoritative final content/status without duplicating streamed text.
         }
@@ -312,19 +336,19 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
             const kind = part.type === "thinking" ? "reasoning" : "agentMessage";
             const block = blockFor(index, kind);
             if (block.terminal) continue;
-            block.text = boundedText(text(kind === "reasoning" ? part.thinking : part.text)); block.terminal = true;
+            block.text = projectText(text(kind === "reasoning" ? part.thinking : part.text)); block.terminal = true;
             output.push(emit(failed ? "item.failed" : "item.completed", block.id, { kind, channel: kind === "reasoning" ? "detail" : message.stopReason === "toolUse" ? "progress" : "final", text: block.text,
-              ...(failed ? { message: boundedText(text(message.errorMessage) || `Pi ${message.stopReason}`) } : {}),
+              ...(failed ? { message: projectText(text(message.errorMessage) || `Pi ${message.stopReason}`) } : {}),
             }));
           }
         }
         let omittedBlock = false;
         for (const block of blocks.values()) if (!block.terminal) {
           omittedBlock = true; block.terminal = true;
-          output.push(emit("item.failed", block.id, { kind: block.kind, text: "", message: boundedText(text(message.errorMessage) || "Pi final receipt omitted a streamed block.") }));
+          output.push(emit("item.failed", block.id, { kind: block.kind, text: "", message: projectText(text(message.errorMessage) || "Pi final receipt omitted a streamed block.") }));
         }
         if (failed && !omittedBlock && !content.some(part => record(part).type === "text")) {
-          output.push(emit("item.failed", `${ensureMessage()}:failure`, { kind: "agentMessage", message: boundedText(text(message.errorMessage) || `Pi ${message.stopReason}`) }));
+          output.push(emit("item.failed", `${ensureMessage()}:failure`, { kind: "agentMessage", message: projectText(text(message.errorMessage) || `Pi ${message.stopReason}`) }));
         }
         usageFor(message, receiptKey, output);
         messageId = undefined; blocks = new Map();
@@ -362,7 +386,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       output.push(...diagnostic(text(event.type)));
     }
     // Bound the actual wire payload, including duplicate text fields and JSON
-    // escapes. Never shorten input/arguments, identities, names or usage.
+    // escapes. Inputs/arguments here are display copies, never execution authority.
     for (const projected of output) {
       if (Buffer.byteLength(JSON.stringify(projected)) <= MAX_RECORD_BYTES - 2048) continue;
       const isTool = projected.eventType.startsWith("tool.execution.") || ["tool", "commandExecution"].includes(text(projected.payload.kind));

@@ -129,6 +129,40 @@ describe("large native tool output projection (synthetic incident regression)", 
   });
 });
 
+// Keep reason: reproduced audit A P0-3; display limits must not kill native work.
+describe("P0-3 bounded display text and arguments", () => {
+  it.each(["toolcall_end", "tool_execution_start"])("previews 70KB write arguments from %s and retains tool completion", type => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const args = { path: "big.txt", content: "y".repeat(70_000) };
+    const input = type === "toolcall_end" ? update(type, { toolCall: { id: "write-large", name: "write", arguments: args } })
+      : { type, toolCallId: "write-large", toolName: "write", args };
+    const before = JSON.stringify(input);
+    const events = projector.project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "write", input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    const end = projector.project({ type: "tool_execution_end", toolCallId: "write-large", toolName: "write", result: { content: [{ type: "text", text: "ok" }] } });
+    expect(end[0]).toMatchObject({ eventType: "item.completed", itemId: events[0].itemId, payload: { toolName: "write", output: "ok" } });
+    expect(JSON.stringify(input)).toBe(before);
+  });
+  it.each(["x", "🌍\\\"\n"])("previews oversized assistant final text without losing terminal status (%j)", alphabet => {
+    const input = final({ content: [{ type: "text", text: alphabet.repeat(70_000 / alphabet.length) }] });
+    const before = JSON.stringify(input);
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    expect(Buffer.byteLength(JSON.stringify(envelope(events[0], 0)))).toBeLessThan(256 * 1024);
+    expect(JSON.stringify(input)).toBe(before);
+  });
+  it("bounds cumulative streamed text and emits the truncation marker only once", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const events = Array.from({ length: 100 }, () => projector.project(update("text_delta", { delta: "x".repeat(2000) }))).flat();
+    const streamed = events.filter(event => event.eventType === "item.delta").map(event => event.payload.text).join("");
+    expect(streamed).toContain("[Pi projection truncated]");
+    expect(streamed.match(/\[Pi projection truncated\]/g)).toHaveLength(1);
+    expect(Buffer.byteLength(JSON.stringify(streamed))).toBeLessThanOrEqual(64 * 1024);
+    expect(projector.project(final({ content: [{ type: "text", text: "x".repeat(200_000) }] }))[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") } });
+  });
+});
+
 describe("synthetic boundary cases (not claimed as native capture)", () => {
   it("replaces streamed partials with final authoritative receipts, not another delta", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
@@ -263,7 +297,6 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
   it("rejects missing IDs, changed receipts and bounds instead of silently approving truncation", () => {
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "tool_execution_start", toolName: "bash" })).toThrow(/id_missing/);
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ responseId: undefined, timestamp: undefined }))).toThrow(/identity_missing/);
-    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(update("text_delta", { delta: "x".repeat(65537) }))).toThrow(/text_limit/);
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "unknown", body: "x".repeat(262145) })).toThrow(/record_limit/);
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" }); projector.project(final());
     expect(() => projector.project(final({ content: [] }))).toThrow(/conflicting_receipt/);

@@ -162,6 +162,47 @@ describe("Pi canonical SDK dialogs", () => {
   });
 });
 
+// Audit A's transport inputs, through the real session pump.
+function auditToolRound(transport: FailureTransport, id: string, stamp: number, args: unknown = { path: "a" }, output = "ok") {
+  const message = { role: "assistant", provider: "neutral", model: "model", timestamp: stamp, responseId: `response-${stamp}`, stopReason: "toolUse", content: [{ type: "toolCall", id, name: "read", arguments: args }] };
+  const result = { role: "toolResult", toolCallId: id, toolName: "read", timestamp: stamp + 1, content: [{ type: "text", text: output }], isError: false };
+  transport.send({ type: "message_start", message: { ...message, responseId: undefined, content: [] } });
+  transport.send({ type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] } });
+  transport.send({ type: "message_end", message });
+  transport.send({ type: "tool_execution_start", toolCallId: id, toolName: "read", args });
+  transport.send({ type: "tool_execution_end", toolCallId: id, toolName: "read", result, isError: false });
+  transport.send({ type: "message_start", message: result });
+  transport.send({ type: "message_end", message: result });
+  transport.send({ type: "turn_end", message, toolResults: [result] });
+  return [message, result];
+}
+function auditFinal(transport: FailureTransport, stamp: number, messages: unknown[] = []) {
+  const message = { role: "assistant", provider: "neutral", model: "model", timestamp: stamp, responseId: `response-${stamp}`, stopReason: "stop", content: [{ type: "text", text: "done" }] };
+  transport.send({ type: "message_start", message: { ...message, responseId: undefined, content: [] } });
+  transport.send({ type: "message_end", message });
+  transport.send({ type: "agent_end", messages: [...messages, message], willRetry: false });
+  transport.send({ type: "agent_settled", aborted: false });
+}
+
+describe("PiRpcDriver P0 regressions", () => {
+  it("P0-3 completes a 70KB write and the next prompt without closing Pi", async () => {
+    const f = await failureFixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "write a large file" } });
+      f.transport.send({ type: "agent_start" });
+      auditFinal(f.transport, 100, auditToolRound(f.transport, "large-write", 1, { path: "big.txt", content: "y".repeat(70_000) }));
+      await flushFailure();
+      expect(f.events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType)).toEqual(["turn.started", "turn.completed"]);
+      expect(f.transport.closed).toBe(false);
+      await f.session.startTurn({ message: { role: "user", text: "continue" } });
+      f.transport.send({ type: "agent_start" }); auditFinal(f.transport, 200); await flushFailure();
+      expect(f.events.filter(event => event.eventType === "turn.completed")).toHaveLength(2);
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+    } finally { await f.close(); }
+  // Real-sized homogeneous argument previews exercise diagnostic redaction too.
+  }, 30_000);
+});
+
 describe("PiRpcDriver", () => {
   it.each([true, false])("keeps known old receipts on their original turn while handled input owns no new work (before ACK=%s, K4)", async beforeAck => {
     const f = await failureFixture();
