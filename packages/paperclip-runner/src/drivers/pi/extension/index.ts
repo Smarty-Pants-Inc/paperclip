@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { chmod, lstat, realpath, unlink } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, resolve } from "node:path";
@@ -399,6 +399,26 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   return { authority, close, dispatch, ready: () => starting };
 }
 
+/** The driver admits the pack manifest; this realm rechecks the independently
+ * loaded child factory before registering it. Never register a missing/tampered
+ * sibling merely because it existed at build time. Source-mode tests have no pack.
+ */
+function verifyPiChildBridge(childBridgePath: string): void {
+  try {
+    if (!lstatSync(childBridgePath).isFile()) throw new Error("not a regular file");
+    if (import.meta.url.endsWith(".ts")) return;
+    const packRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
+    const manifest = JSON.parse(readFileSync(resolve(packRoot, "provider-pack.json"), "utf8"));
+    const artifact = manifest?.payload?.artifacts?.piChildBridge;
+    if (!artifact || typeof artifact.path !== "string" || !/^sha256:[a-f0-9]{64}$/.test(artifact.sha256)
+      || resolve(packRoot, artifact.path) !== realpathSync(childBridgePath)) throw new Error("manifest entry mismatch");
+    const actual = `sha256:${createHash("sha256").update(readFileSync(childBridgePath)).digest("hex")}`;
+    if (actual !== artifact.sha256) throw new Error("sha256 mismatch");
+  } catch (error) {
+    throw new Error(`Pi child bridge integrity check failed: ${error instanceof Error ? error.message : "unavailable"}`);
+  }
+}
+
 /** The CLI host extension loads before settings packages. Register this handler
  * before pi-subagents' session_start so its liveness provider is observable.
  * Both bundled registry copies use pi-subagents' process-global Symbol.for key.
@@ -408,6 +428,7 @@ export function installPiSubagentComposition(
   childBridgePath = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "./subagents/child-bridge.ts" : "./child-bridge.js", import.meta.url)),
 ) {
   if (!pi.events) throw new Error("Pi subagent event bus unavailable");
+  verifyPiChildBridge(childBridgePath);
   const events = pi.events;
   const offSeam = installSubagentSeam({ announce, registerParkReadyContributor, registerStopChildren });
   let lifecycle: ReturnType<typeof createSubagentLifecycle> | undefined;
@@ -424,6 +445,8 @@ export function installPiSubagentComposition(
   pi.on("session_start", (_event, context) => {
     try {
       if (disposed || lifecycle) throw new Error("Pi subagent lifecycle already started");
+      // Recheck at registration too: files may change after the factory loaded.
+      verifyPiChildBridge(childBridgePath);
       const sessionId = context.sessionManager.getSessionId();
       lifecycle = createSubagentLifecycle({ sessionId, events, abortParent: async signal => {
         // ctx.abort() is a public void API. Observe agent_settled rather than

@@ -33,7 +33,7 @@ export interface PiBindProvider {
   apiKey: string;
   models: PiBindModel[];
 }
-interface Envelope { schema: 1; nonce: string; sessionId: string }
+export interface Envelope { schema: 1; nonce: string; sessionId: string }
 export interface BindRequest extends Envelope, PiBindingConfig {
   type: "bind";
   expectedPriorEpoch: number;

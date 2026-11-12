@@ -1,9 +1,10 @@
-import { createServer, type Server } from "node:net";
+import { createServer } from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { announce, installSubagentSeam, registerParkReadyContributor, registerStopChildren, socketAnnounce } from "./seam.js";
+import { validatePiBindCommand, validateBindReceipt, type AnnounceRequest } from "../../pi-bind-protocol.js";
 
 const origin = { epoch: 7, runId: "parent-run", turnId: "parent-turn" };
 const cleanups: Array<() => unknown | Promise<unknown>> = [];
@@ -41,16 +42,37 @@ describe("S-1 exact authority seam (trust boundary)", () => {
   });
   it("sends the captured origin over a real UNIX socket and waits for ack", async () => {
     let release!: () => void;
-    let received!: () => void;
+    let received!: () => void, request!: Record<string, unknown>;
     const arrived = new Promise<void>(resolve => { received = resolve; });
-    const path = await socket((request, send) => {
-      expect(request).toMatchObject({ kind: "announce", schema: 1, sessionId: "parent-session", toolCallId: "native-call", origin });
-      expect(request.nonce).toEqual(expect.any(String));
-      release = () => send(JSON.stringify({ ack: true, nonce: request.nonce, sessionId: request.sessionId })); received();
+    const path = await socket((value, send) => {
+      request = value;
+      release = () => send(JSON.stringify({ ...request, ack: true })); received();
     });
     let dispatched = false;
     const pending = socketAnnounce({ socketPath: path, sessionId: "parent-session", toolCallId: "native-call", origin }).then(ack => { dispatched = ack; return ack; });
-    await arrived; expect(dispatched).toBe(false); release(); expect(await pending).toBe(true);
+    await arrived; expect(dispatched).toBe(false); release();
+    const accepted = await pending;
+    expect(validatePiBindCommand(request)).toBe(true);
+    expect(request).toMatchObject({ type: "announce", schema: 1, sessionId: "parent-session", toolCallId: "native-call", origin });
+    expect(validateBindReceipt({ ...request, ack: true }, request as unknown as AnnounceRequest)).toBe(true);
+    expect(accepted).toBe(true);
+  });
+  it.each([
+    { schema: 2 }, { type: "park_ready" }, { nonce: "wrong" }, { sessionId: "wrong" },
+    { toolCallId: "wrong" }, { origin: { ...origin, turnId: "wrong" } }, { ack: false },
+    { schema: undefined }, { type: undefined }, { nonce: undefined }, { sessionId: undefined },
+    { toolCallId: undefined }, { origin: undefined },
+  ])("rejects an otherwise valid receipt with mismatch %j", async mismatch => {
+    const path = await socket((request, send) => send(JSON.stringify({ ...request, ack: true, ...mismatch })));
+    expect(await socketAnnounce({ socketPath: path, sessionId: "parent-session", toolCallId: "native-call", origin })).toBe(false);
+  });
+  it("rejects invalid command fields before connecting", async () => {
+    let connected = false;
+    const path = await socket(() => { connected = true; });
+    for (const invalid of [{ sessionId: "s\n" }, { toolCallId: "c\n" }, { origin: { ...origin, epoch: 0 } }]) {
+      expect(await socketAnnounce({ socketPath: path, sessionId: "s", toolCallId: "c", origin, timeoutMs: 20, ...invalid })).toBe(false);
+    }
+    expect(connected).toBe(false);
   });
   it("blocks missing sockets, malformed/refused/miscorrelated ack and bounded timeout", async () => {
     for (const reply of ['{"ack":false}', '{"ack":true,"nonce":"wrong"}', '{"ack":true,"sessionId":"wrong"}', "not JSON"]) {

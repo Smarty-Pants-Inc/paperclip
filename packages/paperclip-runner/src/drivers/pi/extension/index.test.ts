@@ -8,7 +8,8 @@ import {
   registerParkReadyContributor, registerStopChildren, registerHomeAdmission, configurePiBindHooks,
   type PiBindApi, type PiBindContext, type PiBindInitial, type PiBindTool,
 } from "./index.js";
-import { bindContent, sendPiBindRequest, type BindRequest, type PiBindCommand, type Origin } from "../pi-bind-protocol.js";
+import { bindContent, sendPiBindRequest, validateBindReceipt, validatePiBindCommand, type BindRequest, type PiBindCommand, type Origin } from "../pi-bind-protocol.js";
+import { socketAnnounce } from "./subagents/seam.js";
 
 const initial: PiBindInitial = { schema: 1, sessionId: "session", epoch: 1, runId: "run-1", turnId: "turn-1", model: "paperclip/m", thinkingLevel: "low", instructions: "first instructions", tools: [] };
 const first: Origin = { epoch: 1, runId: "run-1", turnId: "turn-1" };
@@ -204,6 +205,27 @@ describe("owned Pi bind extension", () => {
     expect(await raw(f.socketPath, announceCommand)).toMatchObject({ ack: true });
     expect(authorizeCallback(first, "child")).toBe(true);
     expect(await raw(f.socketPath, { ...announceCommand, nonce: "stale", origin: { ...first, runId: "old" } })).toEqual({ error: "Pi private request rejected" });
+  });
+  it("accepts announce, park_ready and stop_children on the actual host bind listener with correlated receipts", async () => {
+    const f = await fixture();
+    const request: PiBindCommand = { schema: 1, type: "announce", nonce: "real-host-announce", sessionId: "session", toolCallId: "raw-child", origin: first };
+    expect(validatePiBindCommand(request)).toBe(true);
+    const receipt = await raw(f.socketPath, request);
+    expect(validateBindReceipt(receipt, request)).toBe(true);
+    expect(authorizeCallback(first, "raw-child")).toBe(true);
+    // The production child sender, not a fixture copy of its envelope.
+    expect(await socketAnnounce({ socketPath: f.socketPath, sessionId: "session", toolCallId: "seam-child", origin: first })).toBe(true);
+    expect(authorizeCallback(first, "seam-child")).toBe(true);
+    await f.emit("agent_settled");
+    cleanups.push(registerParkReadyContributor(() => ({ ready: true, reasons: [] })));
+    cleanups.push(registerStopChildren(() => ({ settled: ["real-child"], uncertain: [] })));
+    for (const type of ["park_ready", "stop_children"] as const) {
+      const command: PiBindCommand = { schema: 1, type, nonce: `real-host-${type}`, sessionId: "session" };
+      expect(validatePiBindCommand(command)).toBe(true);
+      const reply = await raw(f.socketPath, command);
+      expect(validateBindReceipt(reply, command)).toBe(true);
+      expect(reply).toMatchObject(type === "park_ready" ? { ready: true, reasons: [] } : { settled: ["real-child"], uncertain: [] });
+    }
   });
   it("aggregates park blockers and stop-child receipts with bounded failures", async () => {
     const f = await fixture();

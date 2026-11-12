@@ -87,6 +87,7 @@ export class PiRpcTransport {
   #streamsClosed = false;
   #exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   #stderr = "";
+  #failure: Error | null = null;
 
   constructor(options: PiRpcTransportOptions) {
     this.#maxRecordBytes = options.maxRecordBytes ?? 4 * 1024 * 1024;
@@ -168,6 +169,7 @@ export class PiRpcTransport {
   }
 
   async request(command: string, params: PiRpcRecord = {}): Promise<PiRpcRecord> {
+    if (this.#failure) throw this.#failure;
     if (this.#closed || this.#exited) throw new Error("Pi RPC transport is closed");
     const id = `paperclip-pi-${++this.#nextId}`;
     const response = new Promise<PiRpcRecord>((resolve, reject) => {
@@ -263,6 +265,13 @@ export class PiRpcTransport {
         this.#fail(new Error("Pi RPC emitted a non-object JSON record"));
         return;
       }
+      // Pi 1.5.2 reports handler failures but may still answer get_state.
+      // Never admit a resident whose startup authority/required extension failed.
+      if (record.type === "extension_error" && record.event === "session_start") {
+        this.#records.push(record);
+        this.#fail(new Error("Pi RPC extension session_start failed"));
+        return;
+      }
       if (record.type === "response" && typeof record.id === "string") {
         const pending = this.#pending.get(record.id);
         if (pending) {
@@ -280,6 +289,8 @@ export class PiRpcTransport {
   }
 
   #fail(error: Error): void {
+    if (this.#failure) return;
+    this.#failure = error;
     for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
     this.#records.push({ type: "transport_error", message: error.message });

@@ -33,7 +33,7 @@ describe("S-1 detached-realm bridge with real Pi SDK and UNIX socket (synthetic 
         void readFile(join(scratch, "socket-nonce.txt"), "utf8").catch(() => null).then(nonce => {
           beforeAckNonce = nonce;
           const activeRun = mode === "stale-origin" ? "new-parent-run" : origin.runId;
-          client.end(JSON.stringify({ ack: mode === "accepted" && request.origin.runId === activeRun, nonce: request.nonce, sessionId: request.sessionId }) + "\n");
+          client.end(JSON.stringify({ ...request, ack: mode === "accepted" && request.origin.runId === activeRun }) + "\n");
         }).catch(error => { socketError = error; client.destroy(); });
       });
     });
@@ -55,7 +55,7 @@ describe("S-1 detached-realm bridge with real Pi SDK and UNIX socket (synthetic 
       }
       if (["accepted", "refused", "stale-origin"].includes(mode)) {
         expect(requests).toHaveLength(1);
-        expect(requests[0]).toMatchObject({ schema: 1, kind: "announce", sessionId: "parent-session", toolCallId: "native-socket-call", origin: { epoch: origin.epoch, runId: origin.runId, turnId: origin.turnId } });
+        expect(requests[0]).toMatchObject({ schema: 1, type: "announce", sessionId: "parent-session", toolCallId: "native-socket-call", origin: { epoch: origin.epoch, runId: origin.runId, turnId: origin.turnId } });
       } else expect(requests).toEqual([]);
       const evidenceDir = process.env.PI_CHILD_CANARY_EVIDENCE_DIR;
       if (evidenceDir) { await mkdir(evidenceDir, { recursive: true }); await writeFile(join(evidenceDir, `s1-socket-${mode}.json`), JSON.stringify({ mode, realSdk: "1.5.2", syntheticModel: true, realSeparateProcess: true, beforeAckNonce, requests, result }, null, 2) + "\n"); }

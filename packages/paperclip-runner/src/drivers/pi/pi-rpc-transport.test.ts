@@ -41,6 +41,34 @@ describe("PiRpcTransport", () => {
     await expect(iterator.next()).resolves.toMatchObject({ done: true });
   });
 
+  it("refuses a startup handler error even if Pi emits a successful response in the same chunk", async () => {
+    const child = transport(`
+      process.stdin.once("data", chunk => {
+        const request = JSON.parse(chunk.toString().trim());
+        process.stdout.write(JSON.stringify({ type: "extension_error", event: "session_start", error: "startup failed" }) + "\\n"
+          + JSON.stringify({ type: "response", id: request.id, command: request.type, success: true, data: { sessionId: "must-not-admit" } }) + "\\n");
+      });
+    `);
+    try { await expect(child.request("get_state")).rejects.toThrow("Pi RPC extension session_start failed"); }
+    finally { await child.close(); }
+    expect(child.exited).toBe(true);
+  });
+
+  it("keeps non-startup extension errors observable without treating them as startup admission", async () => {
+    const child = transport(`
+      process.stdin.once("data", chunk => {
+        const request = JSON.parse(chunk.toString().trim());
+        process.stdout.write(JSON.stringify({ type: "extension_error", event: "tool_result", error: "nonfatal activity" }) + "\\n"
+          + JSON.stringify({ type: "response", id: request.id, command: request.type, success: true, data: {} }) + "\\n");
+      });
+      process.stdin.on("end", () => process.exit(0));
+    `);
+    try {
+      await expect(child.request("get_state")).resolves.toMatchObject({ success: true });
+      await expect(child.events()[Symbol.asyncIterator]().next()).resolves.toMatchObject({ value: { type: "extension_error", event: "tool_result" } });
+    } finally { await child.close(); }
+  });
+
   it("rejects outstanding commands and emits a terminal event when the child exits", async () => {
     const child = transport(`process.stdin.resume(); setTimeout(() => process.exit(17), 15);`);
     const pending = child.request("never");

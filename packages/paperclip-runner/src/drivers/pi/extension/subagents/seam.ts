@@ -1,6 +1,6 @@
-/** TEMP: replaced by imports from ../index.js */
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
+import { validatePiBindCommand, validateBindReceipt, type AnnounceRequest, type Envelope } from "../../pi-bind-protocol.js";
 import type { Origin } from "./bind-types.js";
 
 export type ParkReady = { ready: boolean; reasons: string[] };
@@ -10,8 +10,8 @@ export interface SubagentSeam {
   registerParkReadyContributor(fn: (signal: AbortSignal) => ParkReady | Promise<ParkReady>): () => void;
   registerStopChildren(fn: (signal: AbortSignal) => StoppedChildren | Promise<StoppedChildren>): () => void;
 }
-// No authority is manufactured by the shim. Missing composition fails closed. Once the real
-// extension exists, these three delegates become imports; only socketAnnounce remains local.
+// No authority is manufactured by the shim. Missing composition fails closed.
+// The host installs these delegates; child realms use only socketAnnounce.
 let seam: SubagentSeam | undefined;
 export function installSubagentSeam(value: SubagentSeam): () => void {
   if (seam) throw new Error("Subagent seam is already installed.");
@@ -43,12 +43,11 @@ export async function socketAnnounce(input: {
   timeoutMs?: number;
 }): Promise<boolean> {
   const path = input.socketPath ?? process.env.PAPERCLIP_PI_BIND_SOCKET;
-  if (!path || input.signal?.aborted || !input.sessionId || !input.toolCallId
-      || !Number.isSafeInteger(input.origin.epoch) || input.origin.epoch < 0
-      || !input.origin.runId || !input.origin.turnId) return false;
-  const nonce = randomUUID();
-  const request = { schema: 1, kind: "announce", nonce, sessionId: input.sessionId, toolCallId: input.toolCallId,
+  if (!path || input.signal?.aborted) return false;
+  const envelope: Envelope = { schema: 1, nonce: randomUUID(), sessionId: input.sessionId };
+  const request: AnnounceRequest = { ...envelope, type: "announce", toolCallId: input.toolCallId,
     origin: { epoch: input.origin.epoch, runId: input.origin.runId, turnId: input.origin.turnId } };
+  if (!validatePiBindCommand(request)) return false;
   return new Promise<boolean>(resolve => {
     const socket = createConnection({ path });
     let done = false, buffer = "";
@@ -77,11 +76,8 @@ export async function socketAnnounce(input: {
       const end = buffer.indexOf("\n");
       if (end < 0) return;
       try {
-        const reply = JSON.parse(buffer.slice(0, end)) as Record<string, unknown>;
-        finish(reply !== null && reply.ack === true
-          && (reply.nonce === undefined || reply.nonce === nonce)
-          && (reply.sessionId === undefined || reply.sessionId === input.sessionId)
-          && (reply.schema === undefined || reply.schema === 1));
+        const reply: unknown = JSON.parse(buffer.slice(0, end));
+        finish(validateBindReceipt(reply, request));
       } catch { finish(false); }
     });
     if (input.signal?.aborted) abort();
