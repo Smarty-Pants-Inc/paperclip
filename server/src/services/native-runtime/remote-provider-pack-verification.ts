@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { runRemoteProviderVerification } from "./remote-provider-pack.js";
+import { verifyWithRemoteProviderPackMemo } from "./remote-provider-pack-memo.js";
 
 /**
  * The provider-pack manifest digest exactly as build-provider-pack.mjs computes it:
@@ -97,7 +98,7 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
   return structuredClone(actual);
 }
 
-export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false }: {
+export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false, memoScope, onMemoHit }: {
   runner: CommandManagedRuntimeRunner;
   cwd: string;
   packRoot: string;
@@ -106,6 +107,8 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   provider?: PackProvider;
   requireExactIdentity?: boolean;
   requireCurrentOpenCodeProxy?: boolean;
+  memoScope?: string;
+  onMemoHit?: (startedAtMs: number, endedAtMs: number) => Promise<void>;
 }): Promise<T> {
   const nativePi = manifest.payload.nativeProviders?.pi_rpc;
   if (provider?.kind === "pi_rpc" && !nativePi) {
@@ -117,6 +120,13 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   if (installation) {
     if (!provider) throw new Error("runner_remote_provider_artifact_incompatible: provider interface is required");
     return compatibleInstallation(installation, manifest, packRoot, provider, requireExactIdentity, requireCurrentOpenCodeProxy);
+  }
+  if (memoScope) {
+    return verifyWithRemoteProviderPackMemo({ runner, cwd, packRoot, scope: memoScope, onMemoHit,
+      expectedIdentity: createHash("sha256").update(canonicalProviderPackJson({ manifest, provider,
+        requireExactIdentity, requireCurrentOpenCodeProxy })).digest("hex") },
+    resolvedRoot => verifyRemoteProviderPack({ runner, cwd, packRoot: resolvedRoot, manifest, provider,
+      requireExactIdentity, requireCurrentOpenCodeProxy }));
   }
   const expected = Buffer.from(
     canonicalProviderPackJson(manifest),

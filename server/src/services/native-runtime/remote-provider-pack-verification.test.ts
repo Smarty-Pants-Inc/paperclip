@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +7,8 @@ import { promisify } from "node:util";
 import { readFileSync } from "node:fs";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { describe, expect, it, vi } from "vitest";
+import { performance } from "node:perf_hooks";
+import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
 import { canonicalProviderPackDigestJson, canonicalProviderPackJson, verifyRemoteProviderPack, type ProviderPackIdentity } from "./remote-provider-pack-verification.js";
 
 const sha = (text: string) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
@@ -395,6 +397,184 @@ describe("native Pi remote provider pack verification", () => {
       const provider = kind === "acpx" ? { kind, agent: "claude" } : { kind };
       await expect(verifyRemoteProviderPack({ ...fixture.input, provider })).resolves.toEqual(fixture.pack);
     } finally { await fixture.cleanup(); }
+  });
+});
+
+// Keep reason: trust boundary. Real verifier subprocesses read fixture bytes;
+// only root-owned OS metadata is simulated because the test user cannot chown.
+describe("lease-scoped remote provider pack verification memo", () => {
+  async function memoFixture() {
+    const fixture = await nativePiFixture();
+    const state = { mode: "41ed", uid: 0, manifestMode: "81a4", manifestUid: 0, remoteUid: 1000,
+      inode: 10, boot: "boot-a", failProbe: false, immutable: true, resolvedRoot: fixture.root,
+      fullCalls: 0, probes: 0, audits: 0 };
+    const execute = vi.fn(async (request: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) => {
+      const script = request.args?.[1] ?? "";
+      const result = (stdout: string, exitCode = 0) => ({ stdout, stderr: "", exitCode, signal: null,
+        timedOut: false, pid: null, startedAt: new Date().toISOString() });
+      if (script.includes("paperclip-provider-pack-fingerprint-v1")) {
+        state.probes++;
+        if (state.failProbe) return result("", 1);
+        return result([state.resolvedRoot, state.boot, String(state.remoteUid), `1:${state.inode}:1:4096:${state.uid}:${state.mode}:1`,
+          `1:11:1:1024:${state.manifestUid}:${state.manifestMode}:1`, sha(readFileSync(join(fixture.root, "provider-pack.json"), "utf8")).slice(7)].join("\n") + "\n");
+      }
+      if (script.includes("paperclip-provider-pack-immutable-v1")) {
+        state.audits++;
+        return result(state.immutable ? "immutable\n" : "", state.immutable ? 0 : 1);
+      }
+      state.fullCalls++;
+      return fixture.execute(request);
+    });
+    const onMemoHit = vi.fn(async (_startedAt: number, _endedAt: number) => {});
+    return { ...fixture, state, execute, onMemoHit,
+      input: { ...fixture.input, runner: { execute }, memoScope: randomUUID(), onMemoHit } };
+  }
+
+  it("does the first full verify, then only one cheap round trip on the same lease", async () => {
+    const f = await memoFixture();
+    try {
+      const started = performance.now();
+      const first = await verifyRemoteProviderPack(f.input);
+      const coldMs = performance.now() - started;
+      expect(f.state.fullCalls).toBe(2); // content hash + OpenCode version
+      f.execute.mockClear();
+      const warmStarted = performance.now();
+      const second = await verifyRemoteProviderPack({ ...f.input, runner: { execute: f.execute } });
+      const warmMs = performance.now() - warmStarted;
+      expect(f.state.fullCalls).toBe(2);
+      expect(f.execute).toHaveBeenCalledOnce();
+      expect(f.onMemoHit).toHaveBeenCalledOnce();
+      expect(second).toEqual(first);
+      expect(second).not.toBe(first);
+      first.payload.runnerSourceRevision = "caller mutation";
+      expect(second.payload.runnerSourceRevision).not.toBe("caller mutation");
+      console.log(JSON.stringify({ evidence: "remote-pack-memo", coldMs, warmMs,
+        fullVerifierInvocations: f.state.fullCalls / 2, warmRemoteRoundTrips: f.execute.mock.calls.length }));
+    } finally { await f.cleanup(); }
+  });
+
+  it.each(["lease", "digest", "inode", "boot", "manifest-bytes", "provider"])("fully re-verifies a changed %s", async change => {
+    const f = await memoFixture();
+    try {
+      await verifyRemoteProviderPack(f.input);
+      const next = { ...f.input };
+      if (change === "lease") next.memoScope = randomUUID();
+      if (change === "digest") { f.pack.payload.runnerSourceRevision = "b".repeat(40); await f.seal(); }
+      if (change === "inode") f.state.inode++;
+      if (change === "boot") f.state.boot = "boot-b";
+      if (change === "manifest-bytes") await writeFile(join(f.root, "provider-pack.json"), JSON.stringify(f.pack, null, 2));
+      if (change === "provider") Object.assign(next, { provider: { kind: "opencode" } });
+      await verifyRemoteProviderPack(next);
+      expect(f.state.fullCalls).toBe(4);
+      expect(f.onMemoHit).not.toHaveBeenCalled();
+    } finally { await f.cleanup(); }
+  });
+
+  it.each(["writable-root", "unowned-root", "writable-manifest", "unowned-manifest", "root-user", "writable-descendant", "failed-probe"])("never memoizes a %s", async failure => {
+    const f = await memoFixture();
+    try {
+      if (failure === "writable-root") f.state.mode = "41fd";
+      if (failure === "unowned-root") f.state.uid = 1000;
+      if (failure === "writable-manifest") f.state.manifestMode = "81b4";
+      if (failure === "unowned-manifest") f.state.manifestUid = 1000;
+      if (failure === "root-user") f.state.remoteUid = 0;
+      if (failure === "writable-descendant") f.state.immutable = false;
+      if (failure === "failed-probe") f.state.failProbe = true;
+      await verifyRemoteProviderPack(f.input);
+      await verifyRemoteProviderPack(f.input);
+      expect(f.state.fullCalls).toBe(4);
+      expect(f.onMemoHit).not.toHaveBeenCalled();
+    } finally { await f.cleanup(); }
+  });
+
+  it("never memoizes a failed full verification and still verifies before caching a retry", async () => {
+    const f = await memoFixture();
+    try {
+      const path = join(f.root, f.pack.payload.artifacts.piRpcProxy.path);
+      const original = readFileSync(path, "utf8");
+      await writeFile(path, "tampered");
+      await expect(verifyRemoteProviderPack(f.input)).rejects.toThrow("piRpcProxy digest mismatch");
+      await writeFile(path, original);
+      await verifyRemoteProviderPack(f.input);
+      expect(f.state.fullCalls).toBe(3);
+      await verifyRemoteProviderPack(f.input);
+      expect(f.state.fullCalls).toBe(3);
+      expect(f.onMemoHit).toHaveBeenCalledOnce();
+    } finally { await f.cleanup(); }
+  });
+
+  it("verifies the resolved root rather than a mutable workspace alias", async () => {
+    const f = await memoFixture();
+    try {
+      const alias = `${f.root}-alias`;
+      await symlink(f.root, alias);
+      try {
+        await verifyRemoteProviderPack({ ...f.input, packRoot: alias });
+        const full = f.execute.mock.calls.find(([request]) => request.args?.[0] === "-e");
+        expect(full?.[0].args?.[2]).toBe(f.root);
+        await verifyRemoteProviderPack(f.input);
+        expect(f.state.fullCalls).toBe(2);
+      } finally { await rm(alias); }
+    } finally { await f.cleanup(); }
+  });
+
+  it("does not carry a successful memo across a server-module restart", async () => {
+    const f = await memoFixture();
+    try {
+      await verifyRemoteProviderPack(f.input);
+      vi.resetModules();
+      const restarted = await import("./remote-provider-pack-verification.js");
+      await restarted.verifyRemoteProviderPack(f.input);
+      expect(f.state.fullCalls).toBe(4);
+      expect(f.onMemoHit).not.toHaveBeenCalled();
+    } finally { await f.cleanup(); }
+  });
+
+  it("executes the real single-round-trip probe in milliseconds and refuses an unowned fixture", async () => {
+    const f = await nativePiFixture();
+    const probeMs: number[] = [];
+    const execute = async (request: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) => {
+      const started = performance.now();
+      const result = await f.execute(request);
+      if (request.args?.[1]?.includes("paperclip-provider-pack-fingerprint-v1")) probeMs.push(performance.now() - started);
+      return result;
+    };
+    const onMemoHit = vi.fn(async () => {});
+    try {
+      const input = { ...f.input, runner: { execute }, memoScope: randomUUID(), onMemoHit };
+      await verifyRemoteProviderPack(input);
+      await verifyRemoteProviderPack(input);
+      expect(probeMs).toHaveLength(2);
+      expect(onMemoHit).not.toHaveBeenCalled();
+      expect(f.execute.mock.calls.filter(([request]) => request.args?.[0] === "-e")).toHaveLength(2);
+      console.log(JSON.stringify({ evidence: "real-remote-fingerprint-shell", probeMs }));
+    } finally { await f.cleanup(); }
+  });
+
+  it("requires both the controller lease and physical allocation, scoped to the environment", () => {
+    const target = { transport: "sandbox", environmentId: "env-a", leaseId: "lease-a",
+      sandboxLeaseAcquisition: { providerLeaseId: "allocation-a" } };
+    const scope = remoteProviderPackMemoScope(target);
+    expect(scope).toBeDefined();
+    expect(remoteProviderPackMemoScope({ ...target })).toBe(scope);
+    for (const changed of [{ environmentId: "env-b" }, { leaseId: "lease-b" },
+      { sandboxLeaseAcquisition: { providerLeaseId: "allocation-b" } }]) {
+      expect(remoteProviderPackMemoScope({ ...target, ...changed })).not.toBe(scope);
+    }
+    for (const missing of [{ transport: "ssh" }, { environmentId: null }, { leaseId: null }, { sandboxLeaseAcquisition: null }]) {
+      expect(remoteProviderPackMemoScope({ ...target, ...missing })).toBeUndefined();
+    }
+  });
+
+  it("falls back to full verification after a failed warm probe and refuses corrupt bytes", async () => {
+    const f = await memoFixture();
+    try {
+      await verifyRemoteProviderPack(f.input);
+      f.state.failProbe = true;
+      await writeFile(join(f.root, f.pack.payload.artifacts.piRpcProxy.path), "tampered");
+      await expect(verifyRemoteProviderPack(f.input)).rejects.toThrow("piRpcProxy digest mismatch");
+      expect(f.onMemoHit).not.toHaveBeenCalled();
+    } finally { await f.cleanup(); }
   });
 });
 

@@ -46,6 +46,7 @@ import { notifyInstructionCollection } from "../instruction-collection-notificat
 import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { nativeProviderPackAdmissionFailureCode, nativeProviderPackAdmissionPending, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
 import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
@@ -14086,7 +14087,12 @@ export async function prepareRemoteProviderPackOnTarget(input: {
   let preinstalledProviderPackRoots: string[] = [];
   const verifyRemoteProviderPack = async (packRoot: string) => {
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
-      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: input.provider });
+      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: input.provider,
+      memoScope: remoteProviderPackMemoScope(remoteTarget),
+      onMemoHit: async (startedAtMs, endedAtMs) => { await input.trace?.record({
+        name: "provider_pack.verify_memo_hit", startedAtMs, endedAtMs,
+      }); },
+    });
   };
   const discoverPreinstalledProviderPack = async () => {
     if (!remoteTarget || !remoteCommandRunner) return [];
@@ -16241,7 +16247,12 @@ async function createRunnerdBackendWithinSessionClaim(
     if (!remoteTarget || !remoteCommandRunner || !expectedProviderPackManifest)
       return;
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
-      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: packProvider });
+      cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: packProvider,
+      memoScope: remoteProviderPackMemoScope(remoteTarget),
+      onMemoHit: async (startedAtMs, endedAtMs) => { await input.trace?.record({
+        name: "provider_pack.verify_memo_hit", startedAtMs, endedAtMs,
+      }); },
+    });
     providerPackVerified = true;
   };
 
