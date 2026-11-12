@@ -125,7 +125,7 @@ describe("provider loopback broker", () => {
     await broker.close();
     await upstreamAborted;
     expect(await pending).toBe("aborted");
-    await expect(post(broker.baseURL, broker.token)).rejects.toThrow();
+    expect((await post(broker.baseURL, broker.token)).status).toBe(401);
   });
 
   it("aborts an upstream request when the downstream disconnects", async () => {
