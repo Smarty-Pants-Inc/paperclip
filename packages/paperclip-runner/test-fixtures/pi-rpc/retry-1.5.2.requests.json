@@ -1,0 +1,30 @@
+[
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "retry",
+    "round": 1,
+    "roles": [
+      "system",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "retry",
+    "round": 2,
+    "roles": [
+      "system",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  }
+]

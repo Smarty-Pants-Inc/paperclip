@@ -1,0 +1,860 @@
+[
+  {
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Hello "
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "🌍 line"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Hello 🌍 line"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "usage.reported",
+    "itemId": "turn-1:pi-usage:097ab55f9ffa267b713f8901fdaa1b720469aef1a418f78121321c0db12215d1",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "097ab55f9ffa267b713f8901fdaa1b720469aef1a418f78121321c0db12215d1",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 11,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.0000172
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-usage:097ab55f9ffa267b713f8901fdaa1b720469aef1a418f78121321c0db12215d1",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "678866a5a8e1c3281eda64241eed3b0b2b4227d9dfc489193de99fa68505ed5a",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDelta": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.0000172,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.started",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+        "name": "bash"
+      }
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.delta",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-ok\\\\n'\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.delta",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-ok\\\\n'\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "usage.reported",
+    "itemId": "turn-2:pi-usage:fee4a8a3f6ae390eaf0cff9145a4e59e788a4fe3848e404959ec331e830004a1",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "fee4a8a3f6ae390eaf0cff9145a4e59e788a4fe3848e404959ec331e830004a1",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 11,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.0000172
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.completed",
+    "itemId": "turn-2:pi-usage:fee4a8a3f6ae390eaf0cff9145a4e59e788a4fe3848e404959ec331e830004a1",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "79cd8850d18427c99289481722cbe1067d04b99f292e72e3ccf63d4e219c34ed",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDelta": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.0000172,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.delta",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-ok\\\\n'\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "tool.execution.started",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-ok\\n'",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "running",
+      "durationMs": null,
+      "exitCode": null,
+      "progress": null,
+      "output": null,
+      "outputBytes": 0,
+      "outputTruncated": false,
+      "outputDigest": null
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.delta",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-ok\\\\n'\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "tool.execution.progressed",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-ok\\n'",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "running",
+      "durationMs": null,
+      "exitCode": null,
+      "progress": null,
+      "output": null,
+      "outputBytes": 0,
+      "outputTruncated": false,
+      "outputDigest": null
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.delta",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-ok\\\\n'\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        }
+      },
+      "output": "pi-native-tool-ok\n"
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "tool.execution.progressed",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-ok\\n'",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "running",
+      "durationMs": null,
+      "exitCode": null,
+      "progress": null,
+      "output": "pi-native-tool-ok\n",
+      "outputBytes": 18,
+      "outputTruncated": false,
+      "outputDigest": "sha256:03a849f169e66b25f2e878475a64536379b0a0d60374f6a5f2f15cb2db9f867b"
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.completed",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-ok\\\\n'\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-ok\\n'"
+        }
+      },
+      "text": "pi-native-tool-ok\n",
+      "output": "pi-native-tool-ok\n",
+      "durationMs": 7
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "tool.execution.completed",
+    "itemId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-2:pi-tool:d17747ad8f25c00bdccbfa90af947dbce503b58848720d744bdbeede0bde28a5",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-ok\\n'",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "completed",
+      "durationMs": 7,
+      "exitCode": 0,
+      "progress": null,
+      "output": "pi-native-tool-ok\n",
+      "outputBytes": 18,
+      "outputTruncated": false,
+      "outputDigest": "sha256:03a849f169e66b25f2e878475a64536379b0a0d60374f6a5f2f15cb2db9f867b"
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.started",
+    "itemId": "turn-2:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.delta",
+    "itemId": "turn-2:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Tool s"
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.delta",
+    "itemId": "turn-2:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "ucceeded."
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.completed",
+    "itemId": "turn-2:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Tool succeeded."
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "usage.reported",
+    "itemId": "turn-2:pi-usage:02f96f67b411f781407b6194475503eb405e8d82cf6b53f1b5339665bc5679a6",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "02f96f67b411f781407b6194475503eb405e8d82cf6b53f1b5339665bc5679a6",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 12,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.000018200000000000002
+    }
+  },
+  {
+    "turnId": "turn-2",
+    "eventType": "item.completed",
+    "itemId": "turn-2:pi-usage:02f96f67b411f781407b6194475503eb405e8d82cf6b53f1b5339665bc5679a6",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "9ca99351266f2eabde6b3239d6c3a02d6164b2c0d3e229460781695447691b99",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDelta": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.00003540000000000001,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.started",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+        "name": "bash"
+      }
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.delta",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-error\\\\n' >&2; exit 7\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.delta",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-error\\\\n' >&2; exit 7\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "usage.reported",
+    "itemId": "turn-3:pi-usage:13126369be7ce8cc3eba295326186b41999164f31677ae87fb423fe8e7937bd1",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "13126369be7ce8cc3eba295326186b41999164f31677ae87fb423fe8e7937bd1",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 11,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.0000172
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.completed",
+    "itemId": "turn-3:pi-usage:13126369be7ce8cc3eba295326186b41999164f31677ae87fb423fe8e7937bd1",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "7d69daa3909c6f41c842bf783ba183f040828fd8c42aa77541732d9769758bcd",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDelta": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.0000172,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.delta",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-error\\\\n' >&2; exit 7\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "tool.execution.started",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-error\\n' >&2; exit 7",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "running",
+      "durationMs": null,
+      "exitCode": null,
+      "progress": null,
+      "output": null,
+      "outputBytes": 0,
+      "outputTruncated": false,
+      "outputDigest": null
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.delta",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-error\\\\n' >&2; exit 7\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "tool.execution.progressed",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-error\\n' >&2; exit 7",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "running",
+      "durationMs": null,
+      "exitCode": null,
+      "progress": null,
+      "output": null,
+      "outputBytes": 0,
+      "outputTruncated": false,
+      "outputDigest": null
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.delta",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-error\\\\n' >&2; exit 7\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        }
+      },
+      "output": "pi-native-tool-error\n"
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "tool.execution.progressed",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-error\\n' >&2; exit 7",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "running",
+      "durationMs": null,
+      "exitCode": null,
+      "progress": null,
+      "output": "pi-native-tool-error\n",
+      "outputBytes": 21,
+      "outputTruncated": false,
+      "outputDigest": "sha256:e34cc5d6377301338b9fe326a5582ff1dd4c08d9d79aee77fc6ffe1651f4c0c5"
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.failed",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "kind": "commandExecution",
+      "toolName": "bash",
+      "input": "{\"command\":\"printf 'pi-native-tool-error\\\\n' >&2; exit 7\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+        "name": "bash",
+        "input": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        },
+        "arguments": {
+          "command": "printf 'pi-native-tool-error\\n' >&2; exit 7"
+        }
+      },
+      "text": "pi-native-tool-error\n\n\nCommand exited with code 7",
+      "output": "pi-native-tool-error\n\n\nCommand exited with code 7",
+      "message": "pi-native-tool-error\n\n\nCommand exited with code 7",
+      "durationMs": 4
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "tool.execution.completed",
+    "itemId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-3:pi-tool:cc834014f7ffb674ffefeb9f35d00deea7c9ebe8cb310d695a3240ea3039c009",
+      "transport": "process",
+      "operation": "execute",
+      "name": "printf 'pi-native-tool-error\\n' >&2; exit 7",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "failed",
+      "durationMs": 4,
+      "exitCode": 7,
+      "progress": null,
+      "output": "pi-native-tool-error\n\n\nCommand exited with code 7",
+      "outputBytes": 49,
+      "outputTruncated": false,
+      "outputDigest": "sha256:3984141a75da42c7d046623b8e92fa0977e8fd9d5735c8d997dbb71e1004f86f"
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.started",
+    "itemId": "turn-3:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.delta",
+    "itemId": "turn-3:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Tool f"
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.delta",
+    "itemId": "turn-3:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "ailure was observed."
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.completed",
+    "itemId": "turn-3:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Tool failure was observed."
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "usage.reported",
+    "itemId": "turn-3:pi-usage:5debade53f5e0bbcdd4046aef315e007dd930b40a7a41fae28bf287cd2be0d3d",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "5debade53f5e0bbcdd4046aef315e007dd930b40a7a41fae28bf287cd2be0d3d",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 12,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.000018200000000000002
+    }
+  },
+  {
+    "turnId": "turn-3",
+    "eventType": "item.completed",
+    "itemId": "turn-3:pi-usage:5debade53f5e0bbcdd4046aef315e007dd930b40a7a41fae28bf287cd2be0d3d",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "8daa9c325840559738614422d17f56db69fddeaf5019c4994f9cbd0354d48416",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDelta": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.00003540000000000001,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  }
+]

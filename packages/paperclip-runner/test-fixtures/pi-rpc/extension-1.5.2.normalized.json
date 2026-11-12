@@ -1,0 +1,9 @@
+[
+  {
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_unrequested_agent_start_fenced",
+      "providerMethod": "agent_start"
+    }
+  }
+]

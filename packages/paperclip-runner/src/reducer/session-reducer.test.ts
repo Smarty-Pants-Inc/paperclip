@@ -62,6 +62,18 @@ describe("deterministic PRP session reducer", () => {
     expect(reduceSessionEvents(first, fixture.events)).toEqual(first);
   });
 
+  it.each(["item.completed", "item.failed"] as const)("%s replaces streamed partial text with an explicitly empty authoritative receipt", async eventType => {
+    const fixture = await loadFixture("happy-path");
+    const base = fixture.events[0]!;
+    const events: PrpEvent[] = [
+      { ...base, sourceEventId: "empty-final-1", sourceSeq: 1, itemId: "empty-final", eventType: "item.delta", payload: { kind: "agentMessage", text: "unconfirmed partial" } },
+      { ...base, sourceEventId: "empty-final-2", sourceSeq: 2, itemId: "empty-final", eventType, payload: { kind: "agentMessage", text: "" } },
+    ];
+    expect(reduceSessionEvents(createSessionSnapshot(fixture), events).items[0]?.text).toBe("");
+    events[1]!.payload = { kind: "agentMessage" };
+    expect(reduceSessionEvents(createSessionSnapshot(fixture), events).items[0]?.text).toBe("unconfirmed partial");
+  });
+
   it("deduplicates at-least-once delivery before projection effects", async () => {
     const snapshot = reducePrpFixture(await loadFixture("duplicate-event"));
     expect(snapshot.duplicateEventIds).toEqual(["event_duplicate_03"]);

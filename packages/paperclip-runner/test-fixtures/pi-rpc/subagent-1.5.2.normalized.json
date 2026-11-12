@@ -1,0 +1,319 @@
+[
+  {
+    "turnId": "turn-0",
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_extension_ui_notice",
+      "providerMethod": "extension_ui_request.setWidget"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+    "payload": {
+      "kind": "tool",
+      "toolName": "subagent",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+        "name": "subagent"
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+    "payload": {
+      "kind": "tool",
+      "toolName": "subagent",
+      "input": "{\"action\":\"list\",\"agentScope\":\"both\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+        "name": "subagent",
+        "input": {
+          "action": "list",
+          "agentScope": "both"
+        },
+        "arguments": {
+          "action": "list",
+          "agentScope": "both"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+    "payload": {
+      "kind": "tool",
+      "toolName": "subagent",
+      "input": "{\"action\":\"list\",\"agentScope\":\"both\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+        "name": "subagent",
+        "input": {
+          "action": "list",
+          "agentScope": "both"
+        },
+        "arguments": {
+          "action": "list",
+          "agentScope": "both"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "usage.reported",
+    "itemId": "turn-1:pi-usage:194f1f8efd334b2ac309899a2f4c7309f5646ab8715b96b2ba502f2dbf83607b",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "194f1f8efd334b2ac309899a2f4c7309f5646ab8715b96b2ba502f2dbf83607b",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 11,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.0000172
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-usage:194f1f8efd334b2ac309899a2f4c7309f5646ab8715b96b2ba502f2dbf83607b",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "52834600b1a834dc33f3b08e7291300638eaca00ba8581b8c7eaafdecd9fdad8",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDelta": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.0000172,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+    "payload": {
+      "kind": "tool",
+      "toolName": "subagent",
+      "input": "{\"action\":\"list\",\"agentScope\":\"both\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+        "name": "subagent",
+        "input": {
+          "action": "list",
+          "agentScope": "both"
+        },
+        "arguments": {
+          "action": "list",
+          "agentScope": "both"
+        }
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "tool.execution.started",
+    "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+      "transport": "dynamic",
+      "operation": "unknown",
+      "name": "subagent",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "running",
+      "durationMs": null,
+      "exitCode": null,
+      "progress": null,
+      "output": null,
+      "outputBytes": 0,
+      "outputTruncated": false,
+      "outputDigest": null
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+    "payload": {
+      "kind": "tool",
+      "toolName": "subagent",
+      "input": "{\"action\":\"list\",\"agentScope\":\"both\"}",
+      "item": {
+        "type": "tool_use",
+        "id": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+        "name": "subagent",
+        "input": {
+          "action": "list",
+          "agentScope": "both"
+        },
+        "arguments": {
+          "action": "list",
+          "agentScope": "both"
+        }
+      },
+      "text": "Executable agents:\nBuiltin agents\n- claude-code (builtin, external-cli:claude): Read-only Claude Code CLI analysis; requires local authentication and trusted user settings/hooks\n- claude-code-writer (builtin, external-cli:claude): Explicit file-writing Claude Code CLI mode; requires local authentication and trusted user settings/hooks\n- codex-exec (builtin, external-cli:codex): Read-only one-shot analysis through the installed Codex CLI\n- codex-exec-writer (builtin, external-cli:codex): Explicit workspace-writing one-shot execution through the installed Codex CLI\n- cursor-agent (builtin, external-cli:cursor-agent): Read-only one-shot analysis through the installed Cursor CLI\n- cursor-agent-writer (builtin, external-cli:cursor-agent): Explicit workspace-writing one-shot execution through the installed Cursor CLI\n- delegate (builtin): Lightweight subagent that inherits the parent model with no default reads\n- evidence-auditor (builtin): Independent evidence reviewer for checking whether important research claims are supported by their sources\n- oracle (builtin, context: fork, aliases: advisor): High-context decision-consistency oracle that protects inherited state and prevents drift\n- researcher (builtin): Autonomous web researcher — searches, evaluates, and synthesizes a focused research brief\n- reviewer (builtin): Versatile review specialist for code diffs, plans, proposed solutions, codebase health, and PR/issue validation\n- scout (builtin): Fast codebase recon that returns compressed context for handoff\n- worker (builtin, context: fresh, aliases: developer, coder, implementer, develop): Implementation agent for normal tasks and approved oracle handoffs",
+      "output": "Executable agents:\nBuiltin agents\n- claude-code (builtin, external-cli:claude): Read-only Claude Code CLI analysis; requires local authentication and trusted user settings/hooks\n- claude-code-writer (builtin, external-cli:claude): Explicit file-writing Claude Code CLI mode; requires local authentication and trusted user settings/hooks\n- codex-exec (builtin, external-cli:codex): Read-only one-shot analysis through the installed Codex CLI\n- codex-exec-writer (builtin, external-cli:codex): Explicit workspace-writing one-shot execution through the installed Codex CLI\n- cursor-agent (builtin, external-cli:cursor-agent): Read-only one-shot analysis through the installed Cursor CLI\n- cursor-agent-writer (builtin, external-cli:cursor-agent): Explicit workspace-writing one-shot execution through the installed Cursor CLI\n- delegate (builtin): Lightweight subagent that inherits the parent model with no default reads\n- evidence-auditor (builtin): Independent evidence reviewer for checking whether important research claims are supported by their sources\n- oracle (builtin, context: fork, aliases: advisor): High-context decision-consistency oracle that protects inherited state and prevents drift\n- researcher (builtin): Autonomous web researcher — searches, evaluates, and synthesizes a focused research brief\n- reviewer (builtin): Versatile review specialist for code diffs, plans, proposed solutions, codebase health, and PR/issue validation\n- scout (builtin): Fast codebase recon that returns compressed context for handoff\n- worker (builtin, context: fresh, aliases: developer, coder, implementer, develop): Implementation agent for normal tasks and approved oracle handoffs",
+      "durationMs": 81
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "tool.execution.completed",
+    "itemId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+    "payload": {
+      "schema": "paperclip.tool.execution.v1",
+      "executionId": "turn-1:pi-tool:65a032f3f8760d775bb54867d7e6adea9a569d68f5f68a405725da8d43af9802",
+      "transport": "dynamic",
+      "operation": "unknown",
+      "name": "subagent",
+      "target": null,
+      "namespace": null,
+      "readOnly": null,
+      "status": "completed",
+      "durationMs": 81,
+      "exitCode": null,
+      "progress": null,
+      "output": "Executable agents:\nBuiltin agents\n- claude-code (builtin, external-cli:claude): Read-only Claude Code CLI analysis; requires local authentication and trusted user settings/hooks\n- claude-code-writer (builtin, external-cli:claude): Explicit file-writing Claude Code CLI mode; requires local authentication and trusted user settings/hooks\n- codex-exec (builtin, external-cli:codex): Read-only one-shot analysis through the installed Codex CLI\n- codex-exec-writer (builtin, external-cli:codex): Explicit workspace-writing one-shot execution through the installed Codex CLI\n- cursor-agent (builtin, external-cli:cursor-agent): Read-only one-shot analysis through the installed Cursor CLI\n- cursor-agent-writer (builtin, external-cli:cursor-agent): Explicit workspace-writing one-shot execution through the installed Cursor CLI\n- delegate (builtin): Lightweight subagent that inherits the parent model with no default reads\n- evidence-auditor (builtin): Independent evidence reviewer for checking whether important research claims are supported by their sources\n- oracle (builtin, context: fork, aliases: advisor): High-context decision-consistency oracle that protects inherited state and prevents drift\n- researcher (builtin): Autonomous web researcher — searches, evaluates, and synthesizes a focused research brief\n- reviewer (builtin): Versatile review specialist for code diffs, plans, proposed solutions, codebase health, and PR/issue validation\n- scout (builtin): Fast codebase recon that returns compressed context for handoff\n- worker (builtin, context: fresh, aliases: developer, coder, implementer, develop): Implementation agent for normal tasks and approved oracle handoffs",
+      "outputBytes": 1684,
+      "outputTruncated": false,
+      "outputDigest": "sha256:777c844a29165f70fe3a8e57ea55a83169b45d2eafec62a3aa1cd7fc6ec667ad"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Tool f"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "ailure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Tool failure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "usage.reported",
+    "itemId": "turn-1:pi-usage:d6d68276da7356c5b29f15ce1abbc4c3a21913bee6aa416c1c65c6de64bc8c31",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "d6d68276da7356c5b29f15ce1abbc4c3a21913bee6aa416c1c65c6de64bc8c31",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 12,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": false,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.000018200000000000002
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-usage:d6d68276da7356c5b29f15ce1abbc4c3a21913bee6aa416c1c65c6de64bc8c31",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "5a04945e9d6125c3434b72c7652ee72b5450b1216a6c5923555f6227c2aa0108",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDelta": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDeltaComplete": false,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.00003540000000000001,
+        "costProvenance": "catalog_estimate",
+        "costComplete": false
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_extension_ui_notice",
+      "providerMethod": "extension_ui_request.setWidget"
+    }
+  }
+]

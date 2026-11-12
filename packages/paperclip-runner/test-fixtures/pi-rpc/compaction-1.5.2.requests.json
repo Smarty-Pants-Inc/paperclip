@@ -1,0 +1,44 @@
+[
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "compaction",
+    "round": 1,
+    "roles": [
+      "system",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "compaction",
+    "round": 2,
+    "roles": [
+      "system",
+      "user",
+      "assistant",
+      "user"
+    ],
+    "tools": [
+      "bash"
+    ]
+  },
+  {
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "model": "neutral/vendor-model-not-in-bundled-catalog",
+    "scenario": "compaction",
+    "round": 3,
+    "roles": [
+      "system",
+      "user"
+    ],
+    "tools": []
+  }
+]

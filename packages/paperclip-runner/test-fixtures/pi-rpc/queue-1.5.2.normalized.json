@@ -1,0 +1,313 @@
+[
+  {
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Tool f"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_native_activity",
+      "providerMethod": "queue_update"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_native_activity",
+      "providerMethod": "queue_update"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "ailure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Tool failure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "usage.reported",
+    "itemId": "turn-1:pi-usage:071344113b85db2fe641305854d3eafe57be9d55b8e8058a994eb1b17dd282d1",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "071344113b85db2fe641305854d3eafe57be9d55b8e8058a994eb1b17dd282d1",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 11,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.0000172
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-usage:071344113b85db2fe641305854d3eafe57be9d55b8e8058a994eb1b17dd282d1",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "4e4f806ded8564edeb977030063bbe5adddb0c40a061d0444d88adb5ff3d0cff",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDelta": {
+          "inputTokens": 11,
+          "outputTokens": 3,
+          "cachedInputTokens": 2,
+          "cacheWriteTokens": 0,
+          "totalTokens": 16
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.0000172,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_native_activity",
+      "providerMethod": "queue_update"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Tool f"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "ailure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-message:2:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Tool failure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "usage.reported",
+    "itemId": "turn-1:pi-usage:b81ef4d5bae2b207a4565f77dd5db7f1b98f8a3e2b99a990ace6b8fee7d277aa",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "b81ef4d5bae2b207a4565f77dd5db7f1b98f8a3e2b99a990ace6b8fee7d277aa",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 12,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.000018200000000000002
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-usage:b81ef4d5bae2b207a4565f77dd5db7f1b98f8a3e2b99a990ace6b8fee7d277aa",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "e94e409316d89ba117349bf71462332f0865a4bc52c42f0c8bec30652c74e75d",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDelta": {
+          "inputTokens": 23,
+          "outputTokens": 6,
+          "cachedInputTokens": 4,
+          "cacheWriteTokens": 0,
+          "totalTokens": 33
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.00003540000000000001,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_native_activity",
+      "providerMethod": "queue_update"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-message:3:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:3:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Tool f"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:3:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "ailure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-message:3:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Tool failure was observed."
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "usage.reported",
+    "itemId": "turn-1:pi-usage:76a90d2f32d2ab6a1966cd522a394b45a81c456cde87c69f75dcd950ed568421",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "76a90d2f32d2ab6a1966cd522a394b45a81c456cde87c69f75dcd950ed568421",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 13,
+        "outputTokens": 3,
+        "cacheReadTokens": 2,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": true,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0.000019200000000000003
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-usage:76a90d2f32d2ab6a1966cd522a394b45a81c456cde87c69f75dcd950ed568421",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "7502df8c6e80f5959e065e9c50ddb83f4c3796ed4e731e23c8a4121fc70d0cea",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 36,
+          "outputTokens": 9,
+          "cachedInputTokens": 6,
+          "cacheWriteTokens": 0,
+          "totalTokens": 51
+        },
+        "runDelta": {
+          "inputTokens": 36,
+          "outputTokens": 9,
+          "cachedInputTokens": 6,
+          "cacheWriteTokens": 0,
+          "totalTokens": 51
+        },
+        "runDeltaComplete": true,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0.00005460000000000001,
+        "costProvenance": "catalog_estimate",
+        "costComplete": true
+      }
+    }
+  }
+]

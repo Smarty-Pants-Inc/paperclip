@@ -1,0 +1,94 @@
+[
+  {
+    "turnId": "turn-1",
+    "eventType": "item.started",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": ""
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.delta",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "unknown",
+      "text": "Tool f"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "harness.diagnostic",
+    "payload": {
+      "code": "pi_native_activity",
+      "providerMethod": "queue_update"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.failed",
+    "itemId": "turn-1:pi-message:1:block:0",
+    "payload": {
+      "kind": "agentMessage",
+      "channel": "final",
+      "text": "Tool f",
+      "message": "Request was aborted"
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "usage.reported",
+    "itemId": "turn-1:pi-usage:7d8d683ec293bc3cc5c526fdbfac00cdf4440b9a65ae2d5c2b437614958bc2e8",
+    "payload": {
+      "provider": "pi_rpc",
+      "model": "neutral/vendor-model-not-in-bundled-catalog",
+      "providerRequestId": "7d8d683ec293bc3cc5c526fdbfac00cdf4440b9a65ae2d5c2b437614958bc2e8",
+      "runDeltaAvailable": true,
+      "runDelta": {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      },
+      "childUsage": "unknown",
+      "accountingComplete": false,
+      "costProvenance": "catalog_estimate",
+      "estimatedCostUsd": 0
+    }
+  },
+  {
+    "turnId": "turn-1",
+    "eventType": "item.completed",
+    "itemId": "turn-1:pi-usage:7d8d683ec293bc3cc5c526fdbfac00cdf4440b9a65ae2d5c2b437614958bc2e8",
+    "payload": {
+      "kind": "usage",
+      "usage": {
+        "receiptId": "554ad71b98ef70b971d4c5582c8313e2ecce51c3ba0967eca2cc7eace5831029",
+        "scope": "assistant_message",
+        "source": "pi_message_usage",
+        "total": {
+          "inputTokens": 0,
+          "outputTokens": 0,
+          "cachedInputTokens": 0,
+          "cacheWriteTokens": 0,
+          "totalTokens": 0
+        },
+        "runDelta": {
+          "inputTokens": 0,
+          "outputTokens": 0,
+          "cachedInputTokens": 0,
+          "cacheWriteTokens": 0,
+          "totalTokens": 0
+        },
+        "runDeltaComplete": false,
+        "childUsage": "unknown",
+        "estimatedCostUsd": 0,
+        "costProvenance": "catalog_estimate",
+        "costComplete": false
+      }
+    }
+  }
+]

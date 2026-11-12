@@ -1,0 +1,15 @@
+{
+  "runtimePackage": "@earendil-works/pi-coding-agent",
+  "runtimeVersion": "1.5.2",
+  "reportedVersion": "1.5.2",
+  "cliSha256": "8189b66abc4f9f431dbb70941dcba690d76d040de1fbfff212886be35a53639d",
+  "capturedAt": "2026-11-12T05:24:25.938Z",
+  "evidenceLevel": "real_dependency_with_controlled_peer",
+  "modelPeer": "synthetic loopback OpenAI chat completions",
+  "nativeTools": "real Pi bash tool; finite printf and exit 7",
+  "rpcRecords": 79,
+  "modelRequests": 5,
+  "childExitCode": 0,
+  "childSignal": null,
+  "noLiveProviderCalls": true
+}

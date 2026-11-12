@@ -1,0 +1,283 @@
+import { createHash } from "node:crypto";
+import type { PrpEvent } from "../../protocol/replay-contract.js";
+import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
+
+export interface PiProjectedEvent {
+  eventType: PrpEvent["eventType"];
+  itemId?: string;
+  payload: Record<string, unknown>;
+}
+interface Block { id: string; kind: string; text: string; terminal: boolean }
+interface Tool { id: string; name: string; args?: unknown; input: string; terminal: boolean; started: boolean }
+const MAX_RECORD_BYTES = 256 * 1024;
+const MAX_TEXT_BYTES = 64 * 1024;
+const MAX_IDENTITIES = 1024;
+const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+const text = (value: unknown): string => typeof value === "string" ? value : "";
+const nativeId = (value: unknown): string | undefined => typeof value === "string" && value.length > 0 ? `s:${value}` : typeof value === "number" && Number.isSafeInteger(value) ? `n:${value}` : undefined;
+const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+function boundedText(value: string): string {
+  if (Buffer.byteLength(value) > MAX_TEXT_BYTES) throw new Error("pi_projection_text_limit");
+  return value;
+}
+/** Same sensitive-parent rule as codex-boundaries.ts:364-385, before flattening. */
+function displayValue(value: unknown, depth = 0): unknown {
+  if (depth > 32) throw new Error("pi_projection_depth_limit");
+  if (typeof value === "string") return redactProviderDiagnostic(value);
+  if (Array.isArray(value)) return value.map(entry => displayValue(entry, depth + 1));
+  if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key,
+    /token|secret|password|api.?key|authorization|credential|thinkingSignature|thoughtSignature/i.test(key) && !/^(?:totalTokens|inputTokens|outputTokens|cachedInputTokens|cacheWriteTokens|tokensBefore|estimatedTokensAfter)$/u.test(key) ? "[REDACTED]" : displayValue(entry, depth + 1),
+  ]));
+  return value;
+}
+function contentText(value: unknown): string {
+  return boundedText((Array.isArray(value) ? value : []).map(block => record(block)).filter(block => block.type === "text").map(block => text(block.text)).join("\n"));
+}
+
+/**
+ * One projector per admitted Runner turn, not per socket read or low-level Pi
+ * assistant turn. Pi 1.5.2 docs/json.md is the wire authority. Mirrors native
+ * Codex canonical items (codex-session-notifications.ts:614-747); no UI fork.
+ *
+ * The transport owns bounded UTF-8/JSONL decoding, run/session fencing, replay
+ * cursors and terminal authority. In particular, agent_end is NOT settlement.
+ * No display event authorizes completion, artifact registration or delegation.
+ */
+export function createPiEventProjector(options: { turnId: string; includeThinking?: boolean }): { project(value: unknown): PiProjectedEvent[] } {
+  if (!options.turnId || options.turnId.length > 240) throw new Error("pi_projection_turn_id_invalid");
+  const prefix = options.turnId.length <= 120 ? options.turnId : `pi-turn-${digest(options.turnId)}`;
+  let ordinal = 0;
+  let messageId: string | undefined;
+  let blocks = new Map<number, Block>();
+  const tools = new Map<string, Tool>();
+  const receipts = new Map<string, string>();
+  const totals: Record<string, number> = {};
+  let usageComplete = true;
+  let estimatedCostUsd: number | undefined;
+  let providerReportedCostUsd: number | undefined;
+  let costComplete = true;
+  let identityCount = 0;
+  let diagnosticCount = 0;
+  let compactionCount = 0;
+  let childUsageUnknown = false;
+  const diagnostic = (type: string, code = "pi_unknown_event"): PiProjectedEvent[] => {
+    // Never copy arbitrary native payloads, extension text or paths to diagnostics.
+    if (diagnosticCount > 16) return [];
+    const suppressed = diagnosticCount++ === 16;
+    return [{ eventType: "harness.diagnostic", payload: { code: suppressed ? "pi_diagnostics_suppressed" : code, providerMethod: suppressed ? "suppressed" : type.slice(0, 160) } }];
+  };
+  const emit = (eventType: PiProjectedEvent["eventType"], itemId: string, payload: Record<string, unknown>): PiProjectedEvent => ({ eventType, itemId, payload });
+  const identity = () => { if (++identityCount > MAX_IDENTITIES) throw new Error("pi_projection_identity_limit"); };
+  const ensureMessage = () => messageId ??= `${prefix}:pi-message:${++ordinal}`;
+  const blockFor = (index: number, kind: string): Block => {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= MAX_IDENTITIES) throw new Error("pi_projection_content_index_invalid");
+    let block = blocks.get(index);
+    if (!block) { identity(); block = { id: `${ensureMessage()}:block:${index}`, kind, text: "", terminal: false }; blocks.set(index, block); }
+    if (block.kind !== kind) throw new Error("pi_projection_content_kind_changed");
+    return block;
+  };
+  const toolFor = (idValue: unknown, name: unknown): Tool => {
+    const key = nativeId(idValue);
+    if (key === undefined) throw new Error("pi_projection_tool_id_missing");
+    let tool = tools.get(key);
+    if (!tool) { identity(); tool = { id: `${prefix}:pi-tool:${digest(key)}`, name: text(name), input: "", terminal: false, started: false }; tools.set(key, tool); }
+    if (typeof name === "string" && name) {
+      if (name.length > 240) throw new Error("pi_projection_tool_name_limit");
+      if (tool.name && tool.name !== name) throw new Error("pi_projection_tool_name_changed");
+      tool.name = name;
+    }
+    return tool;
+  };
+  const toolPayload = (tool: Tool): Record<string, unknown> => ({ kind: tool.name === "bash" ? "commandExecution" : "tool", toolName: tool.name, ...(tool.input ? { input: tool.input } : {}), item: { type: "tool_use", id: tool.id, name: tool.name, ...(tool.args === undefined ? {} : { input: tool.args, arguments: tool.args }) } });
+  const startTool = (tool: Tool, output: PiProjectedEvent[]) => {
+    if (!tool.started) { tool.started = true; output.push(emit("item.started", tool.id, toolPayload(tool))); }
+  };
+  const argumentsFor = (tool: Tool, args: unknown) => {
+    if (args === undefined) throw new Error("pi_projection_tool_arguments_missing");
+    tool.input = boundedText(JSON.stringify(args)); tool.args = structuredClone(args);
+  };
+  const usageFor = (message: Record<string, unknown>, key: string, output: PiProjectedEvent[]) => {
+    if (message.usage === undefined) { if (message.role === "assistant") { usageComplete = false; costComplete = false; } return; }
+    const usage = record(message.usage);
+    const names = { input: "inputTokens", output: "outputTokens", cacheRead: "cachedInputTokens", cacheWrite: "cacheWriteTokens" };
+    const counts: Record<string, number> = {};
+    for (const [native, normalized] of Object.entries(names)) {
+      const value = usage[native];
+      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) counts[normalized] = value;
+      else usageComplete = false;
+    }
+    // Native Pi input excludes cache; preserve totalTokens separately rather
+    // than borrowing Codex's provider-specific inclusive-input semantics.
+    const total = usage.totalTokens;
+    if (typeof total === "number" && Number.isSafeInteger(total) && total >= 0) counts.totalTokens = total;
+    else if (Object.keys(counts).length === 4) {
+      const sum = Object.values(counts).reduce((sum, value) => sum + value, 0);
+      if (!Number.isSafeInteger(sum)) throw new Error("pi_projection_usage_overflow");
+      counts.totalTokens = sum;
+    }
+    for (const [name, count] of Object.entries(counts)) {
+      const sum = (totals[name] ?? 0) + count;
+      if (!Number.isSafeInteger(sum)) throw new Error("pi_projection_usage_overflow");
+      totals[name] = sum;
+    }
+    const cost = record(usage.cost).total;
+    let costProvenance = "unknown";
+    if (typeof cost === "number" && Number.isFinite(cost) && cost >= 0) {
+      if (record(usage.cost).totalFromProvider === true) { providerReportedCostUsd = (providerReportedCostUsd ?? 0) + cost; costProvenance = "provider_reported"; }
+      else { estimatedCostUsd = (estimatedCostUsd ?? 0) + cost; costProvenance = "catalog_estimate"; }
+      if (!Number.isFinite(estimatedCostUsd ?? 0) || !Number.isFinite(providerReportedCostUsd ?? 0)) throw new Error("pi_projection_cost_overflow");
+    } else costComplete = false;
+    const receiptItemId = `${prefix}:pi-usage:${digest(key)}`;
+    // App native task chat folds per-receipt runDelta, not accumulated totals
+    // (native-run-events.ts:1364-1405). Catalog prices are NOT provider billing.
+    output.push(emit("usage.reported", receiptItemId, {
+      provider: "pi_rpc", model: message.model ?? null, providerRequestId: digest(key),
+      runDeltaAvailable: Object.keys(counts).length >= 5,
+      runDelta: { ...(counts.inputTokens === undefined ? {} : { inputTokens: counts.inputTokens }), ...(counts.outputTokens === undefined ? {} : { outputTokens: counts.outputTokens }), ...(counts.cachedInputTokens === undefined ? {} : { cacheReadTokens: counts.cachedInputTokens }), ...(counts.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: counts.cacheWriteTokens }), ...(record(usage.cost).totalFromProvider === true && typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { providerCostUsd: cost } : {}) },
+      childUsage: "unknown", accountingComplete: usageComplete && !childUsageUnknown,
+      costProvenance, ...(costProvenance === "catalog_estimate" ? { estimatedCostUsd: cost } : {}),
+    }));
+    output.push(emit("item.completed", receiptItemId, {
+      kind: "usage", usage: { receiptId: digest(receiptItemId), scope: message.role === "toolResult" ? "nested_tool_message" : "assistant_message", source: "pi_message_usage",
+        total: { ...totals }, runDelta: { ...totals }, runDeltaComplete: usageComplete && !childUsageUnknown, childUsage: "unknown",
+        ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }), ...(providerReportedCostUsd === undefined ? {} : { providerReportedCostUsd }), costProvenance, costComplete,
+      },
+    }));
+  };
+  const projectTool = (event: Record<string, unknown>, output: PiProjectedEvent[]) => {
+    const tool = toolFor(event.toolCallId, event.toolName);
+    if (tool.name === "subagent") { childUsageUnknown = true; usageComplete = false; costComplete = false; }
+    if (tool.terminal) return;
+    if (event.args !== undefined) argumentsFor(tool, event.args);
+    startTool(tool, output);
+    const end = event.type === "tool_execution_end";
+    const result = record(end ? event.result : event.partialResult);
+    const body = contentText(result.content);
+    const failed = event.isError === true;
+    const duration = typeof event.durationMs === "number" && Number.isSafeInteger(event.durationMs) && event.durationMs >= 0 ? event.durationMs : null;
+    if (end) tool.terminal = true;
+    output.push(emit(end ? failed ? "item.failed" : "item.completed" : "item.delta", tool.id, { ...toolPayload(tool), ...(end ? { text: body, output: body } : body ? { output: body } : {}), ...(failed ? { message: body || "Pi tool execution failed." } : {}), ...(duration === null ? {} : { durationMs: duration }) }));
+    output.push(emit(end ? "tool.execution.completed" : event.type === "tool_execution_start" ? "tool.execution.started" : "tool.execution.progressed", tool.id, {
+      schema: "paperclip.tool.execution.v1", executionId: tool.id,
+      transport: tool.name === "bash" ? "process" : "dynamic", operation: tool.name === "bash" ? "execute" : "unknown", name: (tool.name === "bash" ? text(record(tool.args).command) : tool.name) || tool.name || null,
+      target: null, namespace: null, readOnly: null, status: end ? failed ? "failed" : "completed" : "running", durationMs: duration, exitCode: Number.isSafeInteger(record(result.structuredContent).exit_code) ? record(result.structuredContent).exit_code : null,
+      progress: null, output: body || null, outputBytes: Buffer.byteLength(body), outputTruncated: record(result.structuredContent).truncated === true, outputDigest: body ? `sha256:${digest(body)}` : null,
+    }));
+  };
+  return { project(value: unknown): PiProjectedEvent[] {
+    // Reject, don't silently approve a truncated tool input/final receipt.
+    const serialized = JSON.stringify(value);
+    if (!serialized || Buffer.byteLength(serialized) > MAX_RECORD_BYTES) throw new Error("pi_projection_record_limit");
+    const event = record(displayValue(value));
+    const output: PiProjectedEvent[] = [];
+    if (event.type === "message_start" && record(event.message).role === "assistant") {
+      messageId = `${prefix}:pi-message:${++ordinal}`;
+      blocks = new Map();
+    } else if (event.type === "message_update") {
+      const update = record(event.assistantMessageEvent);
+      const type = text(update.type);
+      if (["text_start", "text_delta", "text_end", "thinking_start", "thinking_delta", "thinking_end"].includes(type)) {
+        const thinking = type.startsWith("thinking_");
+        if (thinking && options.includeThinking !== true) return [];
+        const kind = thinking ? "reasoning" : "agentMessage";
+        const index = update.contentIndex;
+        if (typeof index !== "number") throw new Error("pi_projection_content_index_invalid");
+        const existing = blocks.has(index);
+        const block = blockFor(index, kind);
+        if (block.terminal) return [];
+        const payload = { kind, channel: thinking ? "detail" : "unknown" };
+        if (!existing) output.push(emit("item.started", block.id, { ...payload, text: "" }));
+        if (type.endsWith("_delta")) {
+          const delta = boundedText(text(update.delta));
+          block.text = boundedText(block.text + delta);
+          if (delta) output.push(emit("item.delta", block.id, { ...payload, text: delta }));
+        } else if (type.endsWith("_end")) {
+          block.text = boundedText(text(update.content));
+          // The block-end snapshot is not a delta. message_end publishes its
+          // authoritative final content/status without duplicating streamed text.
+        }
+      } else if (["toolcall_start", "toolcall_delta", "toolcall_end"].includes(type)) {
+        if (type === "toolcall_start") startTool(toolFor(update.id, update.toolName), output);
+        else if (type === "toolcall_end") {
+          const call = record(update.toolCall); const tool = toolFor(call.id, call.name);
+          argumentsFor(tool, call.arguments); startTool(tool, output);
+          output.push(emit("item.delta", tool.id, toolPayload(tool)));
+        }
+        // Argument fragments are not executable arguments. The terminal native
+        // toolCall and tool_execution_start carry exact complete input.
+      } else if (!["start", "done", "error"].includes(type)) output.push(...diagnostic(`message_update.${type}`));
+      // start/done/error are provider-stream wrappers; authoritative lifecycle
+      // and accounting come from message_start/message_end, never twice.
+    } else if (event.type === "message_end") {
+      const message = record(event.message);
+      if (message.role === "assistant") {
+        if (nativeId(message.responseId) === undefined && (typeof message.timestamp !== "number" || !Number.isFinite(message.timestamp) || !text(message.provider) || !text(message.model))) throw new Error("pi_projection_receipt_identity_missing");
+        const receiptKey = `assistant:${JSON.stringify([message.provider, message.model, nativeId(message.responseId) ?? message.timestamp])}`;
+        const fingerprint = digest(JSON.stringify(message));
+        const previous = receipts.get(receiptKey);
+        if (previous !== undefined) { if (previous !== fingerprint) throw new Error("pi_projection_conflicting_receipt"); return []; }
+        identity(); receipts.set(receiptKey, fingerprint);
+        const failed = message.stopReason === "error" || message.stopReason === "aborted";
+        if (failed) { usageComplete = false; costComplete = false; }
+        const content = Array.isArray(message.content) ? message.content : [];
+        for (const [index, entry] of content.entries()) {
+          const part = record(entry);
+          if (part.type === "toolCall") {
+            const tool = toolFor(part.id, part.name); argumentsFor(tool, part.arguments); startTool(tool, output);
+            if (!tool.terminal) output.push(emit("item.delta", tool.id, toolPayload(tool)));
+          } else if (part.type === "text" || (part.type === "thinking" && options.includeThinking === true && part.redacted !== true)) {
+            const kind = part.type === "thinking" ? "reasoning" : "agentMessage";
+            const block = blockFor(index, kind);
+            if (block.terminal) continue;
+            block.text = boundedText(text(kind === "reasoning" ? part.thinking : part.text)); block.terminal = true;
+            output.push(emit(failed ? "item.failed" : "item.completed", block.id, { kind, channel: kind === "reasoning" ? "detail" : message.stopReason === "toolUse" ? "progress" : "final", text: block.text,
+              ...(failed ? { message: boundedText(text(message.errorMessage) || `Pi ${message.stopReason}`) } : {}),
+            }));
+          }
+        }
+        let omittedBlock = false;
+        for (const block of blocks.values()) if (!block.terminal) {
+          omittedBlock = true; block.terminal = true;
+          output.push(emit("item.failed", block.id, { kind: block.kind, text: "", message: boundedText(text(message.errorMessage) || "Pi final receipt omitted a streamed block.") }));
+        }
+        if (failed && !omittedBlock && !content.some(part => record(part).type === "text")) {
+          output.push(emit("item.failed", `${ensureMessage()}:failure`, { kind: "agentMessage", message: boundedText(text(message.errorMessage) || `Pi ${message.stopReason}`) }));
+        }
+        usageFor(message, receiptKey, output);
+        messageId = undefined; blocks = new Map();
+      } else if (message.role === "toolResult") {
+        projectTool({ type: "tool_execution_end", toolCallId: message.toolCallId, toolName: message.toolName, result: message, isError: message.isError, durationMs: message.durationMs }, output);
+        if (message.usage !== undefined) {
+          const id = nativeId(message.toolCallId);
+          if (id === undefined) throw new Error("pi_projection_tool_id_missing");
+          const key = `tool:${id}`;
+          const fingerprint = digest(JSON.stringify(message.usage));
+          if (!receipts.has(key)) { identity(); receipts.set(key, fingerprint); usageFor(message, key, output); }
+          else if (receipts.get(key) !== fingerprint) throw new Error("pi_projection_conflicting_receipt");
+        }
+      }
+    } else if (["compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"].includes(text(event.type))) {
+      // Summarization can spend outside assistant-message receipts (native
+      // json.md:128-180). Do not claim complete accounting for an unqualified
+      // capability. The integrator may qualify its native receipt path later.
+      usageComplete = false; costComplete = false;
+      output.push(emit("item.completed", `${prefix}:pi-usage:unaccounted-summary`, { kind: "usage", usage: { source: "pi_summarization_unaccounted", total: { ...totals }, runDelta: { ...totals }, runDeltaComplete: false, costComplete: false, childUsage: "unknown" } }));
+      const result = record(event.result);
+      if (event.type === "compaction_end" && event.aborted !== true && event.errorMessage === undefined && event.result !== undefined) {
+        const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+        output.push(emit("context.compacted", `${prefix}:pi-compaction:${++compactionCount}`, { schema: "paperclip.context.compacted.v1", compactionId: `${prefix}:pi-compaction:${compactionCount}`, reason: event.reason === "manual" ? "manual" : ["threshold", "overflow"].includes(text(event.reason)) ? "context_window" : "unknown", preTokens: count(result.tokensBefore), postTokens: count(result.estimatedTokensAfter), sameSession: true }));
+      } else output.push(...diagnostic(text(event.type), "pi_summarization_activity"));
+    } else if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(text(event.type))) {
+      projectTool(event, output);
+    } else if (event.type === "extension_ui_request") {
+      // Driver must durably bridge or send {type:extension_ui_response,id,
+      // cancelled:true} for select/confirm/input/editor. This is not an answer.
+      output.push(...diagnostic(`extension_ui_request.${text(event.method)}`, ["select", "confirm", "input", "editor"].includes(text(event.method)) ? "pi_extension_ui_requires_response" : "pi_extension_ui_notice"));
+    } else if (["queue_update", "entry_appended", "session_info_changed", "thinking_level_changed", "auto_retry_start", "auto_retry_end", "bash_execution_update", "extension_error"].includes(text(event.type))) {
+      output.push(...diagnostic(text(event.type), "pi_native_activity"));
+    } else if (!["response", "session", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end", "message_start", "extension_ui_response"].includes(text(event.type))) {
+      output.push(...diagnostic(text(event.type)));
+    }
+    return output;
+  } };
+}

@@ -188,7 +188,8 @@ function upsertItem(
   existing.status = status;
   if (event.eventType === "item.delta") {
     existing.text += text;
-  } else if (text.length > 0) {
+  } else if (text.length > 0 || ((event.eventType === "item.completed" || event.eventType === "item.failed") && typeof payload.text === "string")) {
+    // An explicit final empty body replaces a partial; omitted text does not.
     existing.text = text;
   }
 }
