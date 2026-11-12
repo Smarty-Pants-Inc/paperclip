@@ -291,6 +291,8 @@ interface PiTurnState extends PiEventOrigin {
   projector: ReturnType<typeof createPiEventProjector>;
   lastText: string;
   hasAssistantReceipt: boolean;
+  /** Low-level agent_end is a continuation boundary, not prompt settlement. */
+  agentEnded: boolean;
   failed: boolean;
   settled: boolean;
 }
@@ -543,7 +545,7 @@ export class PiRpcHarnessSession implements HarnessSession {
           await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
         } catch (error) { await this.#fenceFailure(error); throw error; }
       }
-      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, failed: false, settled: false };
+      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, agentEnded: false, failed: false, settled: false };
       this.#activeTurn = turn;
       this.#streamTurn = null;
       this.#emit("turn.started", { status: "inProgress" }, turn);
@@ -782,7 +784,10 @@ export class PiRpcHarnessSession implements HarnessSession {
       return;
     }
     if (event.type === "agent_start") {
-      if (!this.#admitted || !this.#activeTurn || this.#agentTurn) {
+      // Pi 1.5.2 rpc.md/json.md: retries, overflow recovery and queued
+      // continuations can start another low-level run before agent_settled.
+      // Only an observed agent_end within this admitted prompt permits it.
+      if (!this.#admitted || !this.#activeTurn || (this.#agentTurn && !this.#activeTurn.agentEnded)) {
         this.#callbacks?.fence();
         this.#failure = new Error("Pi started work without an admitted prompt");
         this.#admitted = false;
@@ -790,7 +795,10 @@ export class PiRpcHarnessSession implements HarnessSession {
         else await this.#revokeBinding();
         this.#emit("session.failed", { code: "pi_unrequested_agent_start" });
         void this.close().catch(() => undefined);
-      } else this.#agentTurn = this.#activeTurn;
+      } else {
+        this.#agentTurn = this.#activeTurn;
+        this.#activeTurn.agentEnded = false;
+      }
       return;
     }
     const keys = piRecordIdentityKeys(event);
@@ -839,7 +847,9 @@ export class PiRpcHarnessSession implements HarnessSession {
       const text = assistantText(message.content);
       if (text) turn.lastText = text;
       turn.hasAssistantReceipt ||= Boolean(text) || isRecord(message.usage);
-      if (message.stopReason === "error" || message.stopReason === "aborted") turn.failed = true;
+      // A successful retry supersedes the transient attempt's failure. An
+      // exhausted retry keeps the final failed receipt until settlement.
+      turn.failed = message.stopReason === "error" || message.stopReason === "aborted";
       if (this.#streamTurn === turn) this.#streamTurn = null;
       // Bind full native tool IDs before execution callbacks can arrive.
       for (const part of Array.isArray(message.content) ? message.content : []) {
@@ -849,6 +859,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (event.type === "message_update") {
       if (update.type === "toolcall_start") this.#remember(piToolIdentityKeys(update.id), turn);
       if (update.type === "toolcall_end") this.#remember(piToolIdentityKeys(record(update.toolCall).id), turn);
+    }
+    if (event.type === "agent_end") {
+      turn.agentEnded = true;
+      if (this.#streamTurn === turn) this.#streamTurn = null;
     }
     try {
       for (const mapped of turn.projector.project(event)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
