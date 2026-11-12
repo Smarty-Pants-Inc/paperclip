@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { directPiProviderConfiguration, startPiProviderLoopback, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
+import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
+import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type {
   HarnessDriver,
@@ -20,19 +22,21 @@ export interface PiRpcDriverOptions {
   completionFeedback?: unknown;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   dynamicTools?: readonly Readonly<Record<string, unknown>>[];
-  dynamicToolHandler?: (call: { tool: string; callId: string; threadId: string; turnId: string; arguments: unknown }) => Promise<unknown>;
+  dynamicToolHandler?: (call: { tool: string; callId: string; threadId: string; runId: string; turnId: string; arguments: unknown }) => Promise<unknown>;
   systemInstructions?: string;
   runtimeContext?: unknown;
   permissionMode?: string;
   taskEnvelope?: unknown;
   conversationMode?: string;
   isolateProcessGroup?: boolean;
+  /** Native selection. The existing proxy's piThinkingLevel is normalized here only. */
+  piRpcThinkingLevel?: PiNativeThinkingLevel;
   piThinkingLevel?: string;
   commandFd?: number;
   commandLifecycle?: { beforeSpawn(): void; afterSpawn(): void; afterExit(): void };
   /** Pi executable, defaulting to `pi`. */
   command?: string;
-  /** Optional model in Pi's provider/model form. */
+  /** Explicit exact provider/model, required when opening a session. */
   model?: string;
   /** Root for provider session JSONL files. */
   runtimeDirectory: string;
@@ -98,6 +102,12 @@ export class PiRpcDriver implements HarnessDriver {
     const credentialMode = environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker";
     if (credentialMode !== "broker" && credentialMode !== "env") throw new Error("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
     delete environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE;
+    const config = resolvePiNativeConfig({
+      provider: "pi_rpc",
+      model: this.#options.model,
+      piRpcThinkingLevel: this.#options.piRpcThinkingLevel ?? this.#options.piThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
+    });
+    if (config.piRpcThinkingLevel === undefined) throw new PiNativeAdmissionError("pi_thinking_required", "Pi RPC requires an explicit thinking effort before admission.");
     let closeProvider: (() => Promise<void>) | undefined;
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
       const agentHome = environment.PI_CODING_AGENT_DIR ?? join(directory, "agent");
@@ -133,20 +143,18 @@ export class PiRpcDriver implements HarnessDriver {
     let transport: PiRpcTransport | undefined;
     try {
       transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
-      const response = await withAbort(
-        withTimeout(transport.request("get_state"), this.#options.startupTimeoutMs ?? 10_000, "Pi RPC startup timed out"),
-        input.signal,
-      );
-      const state = record(response.data);
-      const providerSessionId = stringValue(state.sessionId);
-      const actualSessionFile = stringValue(state.sessionFile) ?? sessionFile;
-      if (!providerSessionId) throw new Error("Pi RPC get_state omitted the session id");
+      // --session loads an existing file too: no saved selection bypasses live
+      // admission. The broker/models.json bootstrap above remains first.
+      const identity = await admitPiRpcSession(piAdmissionPort(transport, this.#options.startupTimeoutMs), config, input.signal);
       return new PiRpcHarnessSession({
         transport,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
-        providerSessionId,
-        sessionFile: actualSessionFile,
+        providerSessionId: identity.providerSessionId,
+        sessionFile,
+        config,
+        systemInstructions: this.#options.systemInstructions,
+        admissionTimeoutMs: this.#options.startupTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
@@ -170,6 +178,24 @@ interface PiSessionState {
   runnerInstanceId: string;
   now: () => Date;
   closeProvider?: () => Promise<void>;
+  config: PiNativeConfig;
+  systemInstructions?: string;
+  admissionTimeoutMs?: number;
+}
+
+function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
+  return { request: async ({ type, ...params }, signal) => {
+    const response = await withAbort(withTimeout(transport.request(type, params), timeoutMs, "Pi RPC admission timed out"), signal);
+    return response.data;
+  } };
+}
+
+interface PiTurnState extends PiEventOrigin {
+  projector: ReturnType<typeof createPiEventProjector>;
+  lastText: string;
+  hasAssistantReceipt: boolean;
+  failed: boolean;
+  settled: boolean;
 }
 
 class EventQueue implements AsyncIterable<PrpEvent> {
@@ -212,7 +238,7 @@ class EventQueue implements AsyncIterable<PrpEvent> {
 
 export class PiRpcHarnessSession implements HarnessSession {
   readonly #transport: PiRpcTransport;
-  readonly #runId: string;
+  #runId: string;
   readonly #normalizedSessionId: string;
   readonly #providerSessionId: string;
   readonly #sessionFile: string;
@@ -222,12 +248,19 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #closeProvider?: () => Promise<void>;
   readonly #events = new EventQueue();
   #sourceSequence = 0;
-  #activeTurnId: string | null = null;
-  #lastText = "";
-  #lastUsage: Record<string, unknown> | null = null;
-  #usageEmitted = false;
+  readonly #config: PiNativeConfig;
+  readonly #configInstructions?: string;
+  readonly #admissionTimeoutMs?: number;
+  // Values retain the originating turn/projector after settlement and attach.
+  // Ambiguous reused native identities are tombstoned, never rebound.
+  readonly #owners = new Map<string, PiTurnState | null>();
+  #operation: Promise<void> = Promise.resolve();
+  #activeTurn: PiTurnState | null = null;
+  #agentTurn: PiTurnState | null = null;
+  #streamTurn: PiTurnState | null = null;
+  #admitted = true;
+  #failure: Error | null = null;
   #closed = false;
-  #turnSettled = false;
 
   constructor(state: PiSessionState) {
     this.#transport = state.transport;
@@ -239,6 +272,9 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#runnerInstanceId = state.runnerInstanceId;
     this.#now = state.now;
     this.#closeProvider = state.closeProvider;
+    this.#config = state.config;
+    this.#configInstructions = state.systemInstructions;
+    this.#admissionTimeoutMs = state.admissionTimeoutMs;
     void this.#pump();
   }
 
@@ -250,35 +286,77 @@ export class PiRpcHarnessSession implements HarnessSession {
     return this.#events;
   }
 
-  async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
+  async attachRun(input: Parameters<NonNullable<HarnessSession["attachRun"]>>[0] & {
+    signal?: AbortSignal;
+    baseInstructions?: string;
+    dynamicTools?: readonly Readonly<Record<string, unknown>>[];
+    runtimeContext?: unknown;
+  }): Promise<void> {
+    return this.#serialize(async () => {
+      if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
+      // Per-run instruction/tool binding is a separate, receipt-gated layer.
+      // Do not claim that this admission-only slice applied a changed context.
+      if ((input.baseInstructions !== undefined && input.baseInstructions !== this.#configInstructions)
+        || input.dynamicTools !== undefined || input.runtimeContext !== undefined) {
+        throw new Error("Pi RPC run context refresh requires a provider bind receipt");
+      }
+      await this.#admit(input.signal);
+      this.#runId = input.runId;
+    });
+  }
+
+  /** Runner's post-claim hook; shared HarnessSession has no claim contract. */
+  async revalidateAfterClaim(input: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.#serialize(() => this.#admit(input.signal));
+  }
+
+  /** Reconnected authority cannot spend a previous native acknowledgment. */
+  async reconnect(input: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.#serialize(() => this.#admit(input.signal));
+  }
+
+  #serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.#operation.then(operation);
+    this.#operation = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  async #admit(signal?: AbortSignal): Promise<void> {
     if (this.#closed) throw new Error("Pi RPC session is closed");
-    if (this.#activeTurnId) throw new Error("Pi RPC session already has an active turn");
-    const turnId = `pi-turn-${randomUUID()}`;
-    this.#activeTurnId = turnId;
-    this.#lastText = "";
-    this.#lastUsage = null;
-    this.#usageEmitted = false;
-    this.#turnSettled = false;
-    this.#emit("turn.started", { status: "inProgress" }, turnId);
-    try {
-      const response = await this.#transport.request("prompt", { message: input.message.text });
-      const disposition = stringValue(record(response.data).disposition);
-      if (disposition !== "started") {
-        throw new Error(`Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
+    if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
+    this.#admitted = false;
+    const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
+    if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
+    if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
+    this.#admitted = true;
+  }
+
+  async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
+    return this.#serialize(async () => {
+      if (this.#closed) throw new Error("Pi RPC session is closed");
+      if (this.#failure) throw this.#failure;
+      if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
+      if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
+      const origin = { runId: this.#runId, turnId: `pi-turn-${randomUUID()}` };
+      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, failed: false, settled: false };
+      this.#activeTurn = turn;
+      this.#streamTurn = null;
+      this.#emit("turn.started", { status: "inProgress" }, turn);
+      try {
+        const response = await this.#transport.request("prompt", { message: input.message.text });
+        const disposition = stringValue(record(response.data).disposition);
+        if (disposition !== "started") throw new Error(`Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
+      } catch (error) {
+        this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } });
+        throw error;
       }
-    } catch (error) {
-      if (this.#activeTurnId === turnId) {
-        this.#emit("turn.failed", { status: "failed", error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } }, turnId);
-        this.#activeTurnId = null;
-      }
-      throw error;
-    }
-    return { turnId };
+      return { turnId: turn.turnId };
+    });
   }
 
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
-    if (input.turnId && input.turnId !== this.#activeTurnId) return;
-    if (!this.#activeTurnId) return;
+    if (input.turnId && input.turnId !== this.#activeTurn?.turnId) return;
+    if (!this.#activeTurn) return;
     await this.#transport.request("abort");
   }
 
@@ -297,7 +375,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       providerSessionId: this.#providerSessionId,
       runId: this.#runId,
       normalizedSessionId: this.#normalizedSessionId,
-      activeTurnId: this.#activeTurnId,
+      activeTurnId: this.#activeTurn?.turnId ?? null,
       lastSourceSequence: this.#sourceSequence,
       workingDirectory: this.#workingDirectory,
       sessionFile: this.#sessionFile,
@@ -324,105 +402,116 @@ export class PiRpcHarnessSession implements HarnessSession {
     } catch (error) {
       if (!this.#closed) {
         this.#emit("session.failed", { code: "pi_rpc_transport_failed", message: error instanceof Error ? error.message : String(error) });
-        if (this.#activeTurnId) this.#finishTurn("failed", { error: { code: "pi_rpc_transport_failed" } });
+        this.#failure = error instanceof Error ? error : new Error(String(error));
+        this.#admitted = false;
+        if (this.#activeTurn) this.#finishTurn(this.#activeTurn, "failed", { error: { code: "pi_rpc_transport_failed" } });
         this.#events.close(error instanceof Error ? error : new Error(String(error)));
+        await this.close().catch(() => undefined);
       }
     }
   }
 
-  #consume(record: PiRpcRecord): void {
-    if (record.type === "process_exit") {
-      if (this.#activeTurnId) this.#finishTurn("failed", { error: { code: "pi_process_exited", codeValue: record.code, signal: record.signal } });
-      else this.#emit("session.failed", { code: "pi_process_exited", exitCode: record.code, signal: record.signal });
+  #consume(event: PiRpcRecord): void {
+    if (event.type === "process_exit" || event.type === "transport_error") {
+      const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
+      this.#failure = new Error(code);
+      this.#admitted = false;
+      if (this.#activeTurn) this.#finishTurn(this.#activeTurn, "failed", { error: { code } });
+      else this.#emit("session.failed", { code });
       this.#events.close();
       return;
     }
-    if (record.type === "transport_error") {
-      this.#emit("session.failed", { code: "pi_rpc_transport_failed", message: record.message });
-      if (this.#activeTurnId) this.#finishTurn("failed", { error: { code: "pi_rpc_transport_failed" } });
-      this.#events.close();
+    if (event.type === "agent_start") {
+      if (!this.#admitted || !this.#activeTurn || this.#agentTurn) {
+        this.#failure = new Error("Pi started work without an admitted prompt");
+        this.#admitted = false;
+        this.#emit("session.failed", { code: "pi_unrequested_agent_start" });
+        if (this.#activeTurn) this.#finishTurn(this.#activeTurn, "failed", { error: { code: "pi_unrequested_agent_start" } });
+        void this.close().catch(() => undefined);
+      } else this.#agentTurn = this.#activeTurn;
       return;
     }
-    const turnId = this.#activeTurnId;
-    if (!turnId) return;
-    switch (record.type) {
-      case "agent_start":
-      case "turn_start":
-        // The turn is announced synchronously before prompt is sent, so a fast
-        // provider event cannot race past an event subscriber.
-        break;
-      case "message_update": {
-        const update = record.assistantMessageEvent;
-        if (isRecord(update)) {
-          if (update.type === "text_delta" && typeof update.delta === "string") this.#lastText += update.delta;
-          for (const mapped of mapPiRpcRecord(record, turnId)) this.#emit(mapped.eventType, mapped.payload, mapped.turnId, mapped.itemId);
-          if (isRecord(record.usage)) this.#lastUsage = record.usage;
-        }
-        break;
+    const keys = piRecordIdentityKeys(event);
+    let turn: PiTurnState | null = null;
+    let known = false;
+    for (const key of keys) {
+      if (!this.#owners.has(key)) continue;
+      const owner = this.#owners.get(key)!;
+      if (!owner || (turn && turn !== owner)) return; // ambiguous: never guess
+      turn = owner;
+      known = true;
+    }
+    if (event.type === "message_start" && record(event.message).role === "assistant") {
+      // A new native message may be announced only within the prompt's captured
+      // agent lifecycle. Later callbacks use this binding, not active run state.
+      turn ??= keys.length > 0 && !known ? this.#agentTurn : null;
+      if (!turn || turn.settled) return;
+      this.#remember(keys, turn);
+      this.#streamTurn = turn;
+    } else if (!turn && keys.length === 0) {
+      // Pi's actual RPC deltas have no message ID. Their sole valid owner is
+      // the message_start stream scope, cleared at message_end/settlement.
+      if (event.type === "message_update") turn = this.#streamTurn;
+      else if (!["tool_execution_start", "tool_execution_update", "tool_execution_end", "message_end"].includes(String(event.type))) turn = this.#agentTurn;
+    }
+    if (!turn) return;
+    this.#remember(keys, turn);
+    const update = record(event.assistantMessageEvent);
+    if (event.type === "message_update" && update.type === "text_delta" && typeof update.delta === "string") turn.lastText += update.delta;
+    const message = record(event.message);
+    if (event.type === "message_end" && message.role === "assistant") {
+      const text = assistantText(message.content);
+      if (text) turn.lastText = text;
+      turn.hasAssistantReceipt ||= Boolean(text) || isRecord(message.usage);
+      if (message.stopReason === "error" || message.stopReason === "aborted") turn.failed = true;
+      if (this.#streamTurn === turn) this.#streamTurn = null;
+      // Bind full native tool IDs before execution callbacks can arrive.
+      for (const part of Array.isArray(message.content) ? message.content : []) {
+        if (isRecord(part) && part.type === "toolCall") this.#remember(piToolIdentityKeys(part.id), turn);
       }
-      case "message_end": {
-        const message = record.message;
-        if (isRecord(message) && message.role === "assistant") {
-          const text = assistantText(message.content);
-          if (text) this.#lastText = text;
-          if (isRecord(message.usage)) this.#lastUsage = message.usage;
-        }
-        break;
-      }
-      case "tool_execution_start":
-      case "tool_execution_end":
-        for (const mapped of mapPiRpcRecord(record, turnId)) this.#emit(mapped.eventType, mapped.payload, mapped.turnId, mapped.itemId);
-        break;
-      case "turn_end": {
-        const message = isRecord(record.message) ? record.message : {};
-        if (message.role === "assistant") {
-          const text = assistantText(message.content);
-          if (text) this.#lastText = text;
-          if (isRecord(message.usage)) this.#lastUsage = message.usage;
-        }
-        for (const mapped of mapPiRpcRecord({ ...record, message }, turnId)) {
-          this.#emit(mapped.eventType, mapped.payload, mapped.turnId, mapped.itemId);
-          if (mapped.payload.kind === "usage") this.#usageEmitted = true;
-        }
-        break;
-      }
-      case "agent_settled":
-        if (record.aborted === true) this.#finishTurn("cancelled", { piAgentSettled: true });
-        else if (this.#lastUsage || this.#lastText) this.#finishTurn("completed", { piAgentSettled: true, ...(this.#lastUsage ? { usage: this.#lastUsage } : {}) });
-        else this.#finishTurn("failed", { piAgentSettled: true, error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } });
-        break;
-      case "extension_error":
-        this.#emit("harness.diagnostic", { code: "pi_extension_error", message: stringValue(record.error) ?? "Pi extension error" }, turnId);
-        break;
-      default:
-        break;
+    }
+    if (event.type === "message_update") {
+      if (update.type === "toolcall_start") this.#remember(piToolIdentityKeys(update.id), turn);
+      if (update.type === "toolcall_end") this.#remember(piToolIdentityKeys(record(update.toolCall).id), turn);
+    }
+    for (const mapped of turn.projector.project(event)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
+    if (event.type === "agent_settled") {
+      const empty = !turn.lastText && !turn.hasAssistantReceipt;
+      const status = event.aborted === true ? "cancelled" : turn.failed || empty ? "failed" : "completed";
+      this.#finishTurn(turn, status, { piAgentSettled: true, ...(empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
     }
   }
 
-  #finishTurn(status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): void {
-    const turnId = this.#activeTurnId;
-    if (!turnId || this.#turnSettled) return;
-    this.#turnSettled = true;
-    if (this.#lastUsage && !this.#usageEmitted) {
-      this.#emit("item.completed", { kind: "usage", usage: { runDelta: usageDelta(this.#lastUsage), runDeltaComplete: true } }, turnId, "usage");
-      this.#usageEmitted = true;
+  #remember(keys: string[], turn: PiTurnState): void {
+    for (const key of keys) {
+      if (!this.#owners.has(key)) {
+        if (this.#owners.size >= 4096) throw new Error("Pi RPC native identity limit exceeded");
+        this.#owners.set(key, turn);
+      } else if (this.#owners.get(key) !== turn) this.#owners.set(key, null);
     }
+  }
+
+  #finishTurn(turn: PiTurnState, status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): void {
+    if (turn.settled) return;
+    turn.settled = true;
     const eventType = status === "completed" ? "turn.completed" : status === "cancelled" ? "turn.cancelled" : "turn.failed";
-    this.#emit(eventType, { status, ...extra }, turnId);
-    this.#activeTurnId = null;
+    this.#emit(eventType, { status, ...extra }, turn);
+    if (this.#activeTurn === turn) this.#activeTurn = null;
+    if (this.#agentTurn === turn) this.#agentTurn = null;
+    if (this.#streamTurn === turn) this.#streamTurn = null;
   }
 
-  #emit(eventType: PrpEvent["eventType"], payload: Record<string, unknown>, turnId?: string, itemId?: string): void {
+  #emit(eventType: PrpEvent["eventType"], payload: Record<string, unknown>, origin: { runId: string; turnId?: string } = { runId: this.#runId }, itemId?: string): void {
     const sourceSeq = ++this.#sourceSequence;
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1",
-      sourceEventId: `${this.#runnerInstanceId}:${this.#runId}:${sourceSeq}`,
+      sourceEventId: `${this.#runnerInstanceId}:${origin.runId}:${sourceSeq}`,
       sourceSeq,
       sourceInstanceId: this.#runnerInstanceId,
       sourceKind: "runner",
-      runId: this.#runId,
+      runId: origin.runId,
       normalizedSessionId: this.#normalizedSessionId,
-      ...(turnId ? { turnId } : {}),
+      ...(origin.turnId ? { turnId: origin.turnId } : {}),
       ...(itemId ? { itemId } : {}),
       eventType,
       schemaVersion: 1,
@@ -432,11 +521,37 @@ export class PiRpcHarnessSession implements HarnessSession {
     };
     if (!this.#events.push(event)) {
       this.#events.close(new Error("Pi RPC PRP event queue exceeded its limit"));
-      void this.#transport.close().catch(() => undefined);
+      void this.close().catch(() => undefined);
     }
   }
 }
 
+function piNativeIdentity(value: unknown): string | null {
+  if (typeof value === "string" && value.length > 0 && value.length <= 4096) return `s:${value}`;
+  if (typeof value === "number" && Number.isSafeInteger(value)) return `n:${value}`;
+  return null;
+}
+
+function piToolIdentityKeys(value: unknown): string[] {
+  const key = piNativeIdentity(value);
+  return key === null ? [] : [`tool:${key}`];
+}
+
+function piRecordIdentityKeys(event: PiRpcRecord): string[] {
+  const message = record(event.message);
+  const keys: string[] = [];
+  for (const value of [event.messageId, event.responseId, message.id, message.responseId]) {
+    const key = piNativeIdentity(value);
+    if (key !== null) keys.push(`message:${key}`);
+  }
+  if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
+    keys.push(`stamp:${JSON.stringify([message.role, message.provider, message.model, message.timestamp])}`);
+  }
+  keys.push(...piToolIdentityKeys(event.toolCallId ?? message.toolCallId));
+  return [...new Set(keys)];
+}
+
+/** Legacy test oracle only. Production uses the retained L4 event projector. */
 export function mapPiRpcRecord(record: PiRpcRecord, turnId: string): Array<{ eventType: PrpEvent["eventType"]; payload: Record<string, unknown>; turnId: string; itemId?: string }> {
   if (record.type === "message_update" && isRecord(record.assistantMessageEvent)) {
     const update = record.assistantMessageEvent;
