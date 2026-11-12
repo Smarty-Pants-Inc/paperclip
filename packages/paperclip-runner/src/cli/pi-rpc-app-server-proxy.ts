@@ -501,11 +501,25 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         activeTurnId: null,
         lastSourceSequence: 0,
       };
-      const recovered = await driver.recoverSession(snapshot, { signal: new AbortController().signal });
-      if (!recovered.recovered || !recovered.session) {
-        throw new Error(recovered.reason ?? "Pi RPC session recovery failed");
+      let recovered: Awaited<ReturnType<NonNullable<HarnessDriver["recoverSession"]>>> | null = null;
+      try {
+        recovered = await driver.recoverSession(snapshot, { signal: new AbortController().signal });
+      } catch (error) {
+        // The box was replaced and its transcript wasn't restored: continue in
+        // a fresh Pi conversation under the SAME conversation id rather than
+        // failing every later message. Say so in the run log. A file that
+        // exists but is invalid (pi_session_file_invalid) is still refused.
+        if ((error as { code?: unknown } | null)?.code !== "pi_session_file_missing") throw error;
+        process.stderr.write("[paperclip-runner] pi_session_history_missing: the saved Pi conversation file is not on this box; starting a fresh Pi conversation for the same conversation id\n");
       }
-      opened = recovered.session;
+      if (recovered) {
+        if (!recovered.recovered || !recovered.session) {
+          throw new Error(recovered.reason ?? "Pi RPC session recovery failed");
+        }
+        opened = recovered.session;
+      } else {
+        opened = await driver.openSession({ runId: activeRunId, normalizedSessionId, workingDirectory: cwd });
+      }
     } else {
       opened = await driver.openSession({
         runId: activeRunId,
