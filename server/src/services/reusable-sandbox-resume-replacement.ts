@@ -8,6 +8,8 @@ import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js"
 import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-harness-backup-storage.js";
 import { findPluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
+import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
+import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 
 /**
  * Total time one run spends resuming a preserved reusable sandbox, including
@@ -103,6 +105,37 @@ export async function reusableSandboxReplacementIsSafe(input: {
   return true;
 }
 
+/** A compatible configuration change drains only after its owner is terminal
+ * and the state needed by the next allocation is verifiable. Projectless chats
+ * have no project workspace to checkpoint, but still require their F7 backup. */
+export async function reusableSandboxConfigurationChangeIsSafe(input: {
+  db: Db;
+  lease: EnvironmentLease;
+  companyId: string;
+  heartbeatRunId: string | null;
+  executionWorkspaceId: string | null;
+  adapterType: string | null | undefined;
+}): Promise<boolean> {
+  const { db, lease } = input;
+  if (!input.heartbeatRunId || !lease.heartbeatRunId || !lease.providerLeaseId || lease.companyId !== input.companyId
+    || !["released", "retained"].includes(lease.status)) return false;
+  const [owner] = await db.select({ status: heartbeatRuns.status, nativeSessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId)));
+  if (!owner || !["succeeded", "failed", "cancelled", "interrupted", "timed_out"].includes(owner.status)) return false;
+  const scope = lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined;
+  const native = input.adapterType === "paperclip_runner" || scope?.adapterType === "paperclip_runner";
+  const checkpointed = input.executionWorkspaceId
+    ? await reusableSandboxReplacementIsSafe({ ...input, cause: undefined })
+    : lease.executionWorkspaceId === null && Boolean(lease.issueId) && (!native
+      || await verifyRecoverableNativeHarnessBackup({ db, companyId: input.companyId,
+        stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId }));
+  if (!checkpointed || !native) return checkpointed;
+  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId);
+  if (!stamp || owner.nativeSessionId && owner.nativeSessionId !== stamp.normalizedSessionId) return false;
+  return !await nativeHarnessBackupHasLaterProviderWork(db, { companyId: input.companyId,
+    currentRunId: input.heartbeatRunId, normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt });
+}
+
 /**
  * Retire a preserved lease after its replacement lease is recorded. The old
  * sandbox is not destroyed here: a provider that cannot start it may also be
@@ -115,6 +148,7 @@ export async function retireReplacedReusableSandboxLease(input: {
   lease: EnvironmentLease;
   companyId: string;
   heartbeatRunId: string;
+  reason?: "compatible_environment_change";
 }): Promise<boolean> {
   const { db, lease } = input;
   if (!lease.providerLeaseId) return false;
@@ -122,7 +156,7 @@ export async function retireReplacedReusableSandboxLease(input: {
   const [claimed] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
     status: "pending_cleanup",
     cleanupStatus: "failed",
-    failureReason: REUSABLE_SANDBOX_RESUME_REPLACED_REASON,
+    failureReason: input.reason ?? REUSABLE_SANDBOX_RESUME_REPLACED_REASON,
     releasedAt: now,
     lastUsedAt: now,
     updatedAt: now,
@@ -131,6 +165,14 @@ export async function retireReplacedReusableSandboxLease(input: {
     eq(environmentLeases.companyId, input.companyId),
     eq(environmentLeases.providerLeaseId, lease.providerLeaseId!),
     inArray(environmentLeases.status, ["released", "retained"]),
+    ...(input.reason === "compatible_environment_change" ? [
+      eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!),
+      sql`${environmentLeases.metadata} = ${JSON.stringify(lease.metadata)}::jsonb`,
+      sql`NOT EXISTS (SELECT 1 FROM ${environmentLeases} AS live_source
+        WHERE live_source.company_id = ${input.companyId}
+          AND live_source.provider_lease_id = ${lease.providerLeaseId}
+          AND live_source.status = 'active' AND live_source.id <> ${lease.id})`,
+    ] : []),
     sql`coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') != 'true'`,
     sql`NOT EXISTS (
       SELECT 1 FROM ${heartbeatRuns}

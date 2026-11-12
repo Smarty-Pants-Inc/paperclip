@@ -178,7 +178,7 @@ export interface SandboxLeaseAcquisition {
   outcome: "created" | "resumed" | "replacement";
   providerLeaseId: string;
   previousProviderLeaseId?: string;
-  reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed";
+  reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed" | "compatible_environment_change";
 }
 
 export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {

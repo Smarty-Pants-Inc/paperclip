@@ -80,6 +80,15 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
   // Provider work recorded after the checkpoint means the destroyed sandbox
   // held newer state than this backup. Restoring would silently rewind it.
+  if (await nativeHarnessBackupHasLaterProviderWork(db, { ...input, completedAt: stamp.completedAt })) return false;
+  return !idleSource || await supersedeIdleWarmSource(db, lease, input);
+}
+
+/** Shared by backup restore and compatible environment draining: a valid old
+ * archive is not a checkpoint of provider work that happened after it. */
+export async function nativeHarnessBackupHasLaterProviderWork(db: Db, input: {
+  companyId: string; currentRunId: string; normalizedSessionId: string; completedAt: string;
+}): Promise<boolean> {
   const later = await db.select({ runId: heartbeatRunEvents.runId }).from(heartbeatRunEvents)
     .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, heartbeatRunEvents.runId))
     .where(and(
@@ -88,10 +97,9 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
       eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId),
       ne(heartbeatRuns.id, input.currentRunId),
       inArray(heartbeatRunEvents.eventType, [...NATIVE_PROVIDER_DURABLE_EVENT_TYPES]),
-      gt(heartbeatRunEvents.createdAt, new Date(stamp.completedAt)),
+      gt(heartbeatRunEvents.createdAt, new Date(input.completedAt)),
     )).limit(1);
-  if (later.length) return false;
-  return !idleSource || await supersedeIdleWarmSource(db, lease, input);
+  return later.length > 0;
 }
 
 export const SUPERSEDED_REUSABLE_SANDBOX_KEY = "reusableSandboxLeaseSuperseded";

@@ -153,6 +153,17 @@ describe("resolveEnvironmentExecutionTarget", () => {
     });
   });
 
+  it("preserves a compatible environment rollover acquisition for native backup recovery", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox", config: { provider: "test-provider" } });
+    const acquisition = { outcome: "replacement", providerLeaseId: "new-allocation",
+      previousProviderLeaseId: "old-allocation", reason: "compatible_environment_change" };
+    const target = await resolveEnvironmentExecutionTarget({ db: {} as never, companyId: "company",
+      adapterType: "paperclip_runner", environment: { id: "env", driver: "sandbox", config: { provider: "test-provider" } },
+      leaseId: "lease", leaseMetadata: {}, environmentRuntime: null,
+      lease: { providerLeaseId: "new-allocation", metadata: { sandboxLeaseAcquisition: acquisition } } as never });
+    expect(target).toMatchObject({ kind: "remote", transport: "sandbox", sandboxLeaseAcquisition: acquisition });
+  });
+
   it("keeps sandbox targets on bridge mode even when lease metadata includes a Paperclip API URL", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",
