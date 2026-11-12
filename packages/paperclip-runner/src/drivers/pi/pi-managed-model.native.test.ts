@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,13 @@ import { PiRpcDriver, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 const binary = process.env.PI_TEST_BINARY;
 const output = process.env.PI_MANAGED_MODEL_OUT;
 const hash = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+const source = fileURLToPath(new URL("./pi-managed-model.ts", import.meta.url));
+function processIdentity(pid: number | undefined) {
+  if (process.platform !== "linux" || pid === undefined) return undefined;
+  const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  return { pid, pgid: Number(fields[2]), start: fields[19], stat };
+}
 async function bounded<T>(promise: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("native managed model proof deadline")), 15000); })]); }
@@ -34,13 +41,13 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
   const extension = fileURLToPath(new URL("./extension/index.ts", import.meta.url));
   const version = JSON.parse(await readFile(join(dirname(dirname(dirname(binary!))), "package.json"), "utf8")).version;
   expect(version).toBe("1.5.2");
-  const report: Record<string, any> = { root, version, binary, binarySha256: hash(binary!), extension, extensionSha256: hash(extension), cases: [], catalog: matches, status: "running" };
+  const report: Record<string, any> = { root, version, binary, binarySha256: hash(binary!), source, sourceSha256: hash(source), extension, extensionSha256: hash(extension), cases: [], catalog: matches, status: "running" };
   const cases = [
     { name: "catalog-uncapped", id: "claude-opus-5-5", snapshot: {}, thinking: "max", effective: "max", contextWindow: 1000000, maxTokens: 128000 },
     { name: "cross-provider-cap", id: "claude-opus-5-5", snapshot: { providers: { "cliproxyapi-anthropic": { api: "anthropic-messages", baseUrl: "http://127.0.0.1:2", apiKey: "fixture-not-a-key", models: [{ id: "claude-opus-5-5", thinkingLevelMap: { max: null } }] } } }, thinking: "max", effective: "xhigh", contextWindow: 1000000, maxTokens: 128000 },
     { name: "config-limit-override", id: "claude-opus-5-5", snapshot: { providers: { "cliproxyapi-anthropic": { models: [{ id: "claude-opus-5-5", contextWindow: 333333, maxTokens: 64000 }] } } }, thinking: "max", effective: "max", contextWindow: 333333, maxTokens: 64000 },
     { name: "managed-entry-precedence", id: "claude-opus-5-5", snapshot: { providers: { paperclip: { baseUrl: "http://127.0.0.1:2", apiKey: "must-be-replaced", models: [{ id: "claude-opus-5-5", contextWindow: 444444, thinkingLevelMap: { max: null } }] }, "cliproxyapi-anthropic": { models: [{ id: "claude-opus-5-5", contextWindow: 555555 }] } } }, thinking: "max", effective: "xhigh", contextWindow: 444444, maxTokens: 128000 },
-    { name: "unknown-defaults", id: "unknown-pi-managed-proof", snapshot: {}, thinking: "off", effective: "off", contextWindow: 128000, maxTokens: 8192 },
+    { name: "unknown-defaults", id: "unknown-pi-managed-proof", snapshot: {}, thinking: "xhigh", effective: "xhigh", contextWindow: 128000, maxTokens: 8192 },
   ] as const;
   try {
     for (const item of cases) {
@@ -72,12 +79,12 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
       const events: unknown[] = [];
       const collected = (async () => { for await (const event of native.events()) events.push(event); })();
       let second: Awaited<ReturnType<typeof createPiProviderBinding>> | undefined;
-      const proof: Record<string, any> = { name: item.name, requestedThinking: item.thinking, expectedThinking: item.effective, metadata, diagnostics, pid: native.pid, disk: disk.providers.paperclip, directory, status: "running" };
+      const proof: Record<string, any> = { name: item.name, requestedThinking: item.thinking, expectedThinking: item.effective, metadata, diagnostics, pid: native.pid, nativeIdentity: processIdentity(native.pid), disk: disk.providers.paperclip, directory, status: "running" };
       report.cases.push(proof);
       try {
         const state = (await bounded(native.request("get_state"))).data as any;
         proof.first = state;
-        expect(state.model).toMatchObject({ id: item.id, provider: "paperclip", contextWindow: item.contextWindow, maxTokens: item.maxTokens, reasoning: item.name !== "unknown-defaults" });
+        expect(state.model).toMatchObject({ id: item.id, provider: "paperclip", contextWindow: item.contextWindow, maxTokens: item.maxTokens, reasoning: true });
         expect(state.thinkingLevel).toBe(item.effective);
         expect(state.model.baseUrl).toBe(first.provider.baseUrl);
         // Rotate only the capability; the exact resolved descriptor must survive.
@@ -96,6 +103,8 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
         await second?.close(); await first.close();
         expect(native.exited).toBe(true);
         proof.exit = native.exitInfo;
+        proof.nativePidAbsent = process.platform === "linux" && native.pid !== undefined ? !existsSync(`/proc/${native.pid}`) : undefined;
+        if (process.platform === "linux") expect(proof.nativePidAbsent).toBe(true);
         await writeFile(join(output!, `${item.name}-records.json`), JSON.stringify(events, null, 2));
         await writeFile(join(output!, `${item.name}-proof.json`), JSON.stringify(proof, null, 2));
       }
@@ -105,12 +114,15 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
   finally { await writeFile(join(output!, "report.json"), JSON.stringify(report, null, 2)); }
 }, 120000);
 
-it.skipIf(!binary || !output)("the real native driver retains the resolved snapshot across a settled turn and attach", async () => {
+it.skipIf(!binary || !output).each([
+  { name: "catalog", id: "claude-opus-5-5", snapshot: { providers: { "cliproxyapi-anthropic": { baseUrl: "http://127.0.0.1:2", apiKey: "never-route-here", api: "anthropic-messages", models: [{ id: "claude-opus-5-5", thinkingLevelMap: { max: null } }] } } }, contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { max: null, xhigh: "xhigh" } },
+  { name: "unknown", id: "unknown-pi-managed-driver-proof", snapshot: {}, contextWindow: 128000, maxTokens: 8192, thinkingLevelMap: { xhigh: "xhigh" } },
+])("the real native driver retains $name xhigh capabilities across a settled turn and attach", async item => {
   const root = await mkdtemp(join(tmpdir(), "pi-driver-managed-proof-"));
   const agent = join(root, "agent"), workspace = join(root, "workspace");
   await mkdir(agent); await mkdir(workspace); await mkdir(output!, { recursive: true });
-  // The source is ONLY the other provider, exactly like the agent-home snapshot.
-  await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { "cliproxyapi-anthropic": { baseUrl: "http://127.0.0.1:2", apiKey: "never-route-here", api: "anthropic-messages", models: [{ id: "claude-opus-5-5", thinkingLevelMap: { max: null } }] } } }));
+  // Known metadata comes ONLY from the other provider; unknown has no entry.
+  await writeFile(join(agent, "models.json"), JSON.stringify(item.snapshot));
   const requests: unknown[] = [];
   const peer = createServer((req, res) => {
     let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; });
@@ -124,22 +136,25 @@ it.skipIf(!binary || !output)("the real native driver retains the resolved snaps
   await new Promise<void>(done => peer.listen(0, "127.0.0.1", done));
   const address = peer.address(); if (!address || typeof address === "string") throw new Error("local proof peer failed");
   let native: PiRpcTransport | undefined, session: PiRpcHarnessSession | undefined;
-  const proof: Record<string, any> = { root, evidenceLevel: "real_dependency_with_controlled_loopback_peer", upstreamRequests: requests, status: "running" };
+  const proof: Record<string, any> = { root, source, sourceSha256: hash(source), binary, binarySha256: hash(binary!), version: JSON.parse(await readFile(join(dirname(dirname(dirname(binary!))), "package.json"), "utf8")).version,
+    evidenceLevel: "real_dependency_with_controlled_loopback_peer", upstreamRequests: requests, status: "running" };
   try {
-    session = await new PiRpcDriver({ command: binary!, model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "xhigh", runtimeDirectory: join(root, "sessions"), startupTimeoutMs: 15000,
+    expect(proof.version).toBe("1.5.2");
+    session = await new PiRpcDriver({ command: binary!, model: `paperclip/${item.id}`, piRpcThinkingLevel: "xhigh", runtimeDirectory: join(root, "sessions"), startupTimeoutMs: 15000,
       environment: { PATH: process.env.PATH, HOME: root, PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
-      transportFactory: options => { native = new PiRpcTransport(options); return native; },
+      transportFactory: options => { native = new PiRpcTransport(options); proof.nativeIdentity = processIdentity(native.pid); return native; },
     }).openSession({ runId: "first", normalizedSessionId: "managed-driver-proof", workingDirectory: workspace }) as PiRpcHarnessSession;
     const pid = session.processPid(); proof.pid = pid;
     proof.first = (await bounded(native!.request("get_state"))).data;
     proof.disk = JSON.parse(await readFile(join(agent, "models.json"), "utf8"));
-    expect(proof.disk.providers.paperclip.models[0]).toMatchObject({ contextWindow: 1000000, maxTokens: 128000, reasoning: true, thinkingLevelMap: { max: null, xhigh: "xhigh" } });
+    expect((proof.first as any).thinkingLevel).toBe("xhigh");
+    expect(proof.disk.providers.paperclip.models[0]).toMatchObject({ contextWindow: item.contextWindow, maxTokens: item.maxTokens, reasoning: true, thinkingLevelMap: item.thinkingLevelMap });
     const events = session.events()[Symbol.asyncIterator]();
     proof.events = [];
     for (const runId of ["first", "warm"]) {
       if (runId === "warm") await session.attachRun({ runId });
       const state = (await bounded(native!.request("get_state"))).data as any;
-      expect(state.model).toMatchObject({ provider: "paperclip", id: "claude-opus-5-5", contextWindow: 1000000, maxTokens: 128000, reasoning: true, thinkingLevelMap: { max: null, xhigh: "xhigh" } });
+      expect(state.model).toMatchObject({ provider: "paperclip", id: item.id, contextWindow: item.contextWindow, maxTokens: item.maxTokens, reasoning: true, thinkingLevelMap: item.thinkingLevelMap });
       expect(state.thinkingLevel).toBe("xhigh");
       expect(session.processPid()).toBe(pid);
       if (runId === "warm") proof.warm = state;
@@ -158,8 +173,11 @@ it.skipIf(!binary || !output)("the real native driver retains the resolved snaps
   finally {
     await session?.close();
     peer.closeAllConnections(); await new Promise<void>(done => peer.close(() => done()));
-    proof.childExited = native?.exited; expect(native?.exited).toBe(true);
-    await writeFile(join(output!, "driver-proof.json"), JSON.stringify(proof, null, 2));
+    proof.childExited = native?.exited; proof.exit = native?.exitInfo;
+    proof.nativePidAbsent = process.platform === "linux" && native?.pid !== undefined ? !existsSync(`/proc/${native.pid}`) : undefined;
+    await writeFile(join(output!, `driver-${item.name}-proof.json`), JSON.stringify(proof, null, 2));
+    expect(native?.exited).toBe(true);
+    if (process.platform === "linux") expect(proof.nativePidAbsent).toBe(true);
   }
 }, 60000);
 

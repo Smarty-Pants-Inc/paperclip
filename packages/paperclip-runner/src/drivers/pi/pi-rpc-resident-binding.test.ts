@@ -149,10 +149,10 @@ describe("resident Pi model binding", () => {
     expect(f.ipc.some(command => command.type === "stop_children")).toBe(false);
     expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
   });
-  it.each(["xhigh", "max"] as const)("does not invent capabilities from requested %s on initial bind or resident rebind", async level => {
+  it.each(["xhigh", "max"] as const)("restores unknown-model fallback capabilities for requested %s on initial bind and resident rebind", async level => {
     const f = await fixture({ piRpcThinkingLevel: level });
     const models = JSON.parse(await readFile(join(f.launch.env!.PI_CODING_AGENT_DIR!, "models.json"), "utf8"));
-    const expected = { id: "faux", contextWindow: 128000, maxTokens: 8192, reasoning: false };
+    const expected = { id: "faux", contextWindow: 128000, maxTokens: 8192, reasoning: true, thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
     expect(models.providers.paperclip.models).toEqual([expected]);
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
