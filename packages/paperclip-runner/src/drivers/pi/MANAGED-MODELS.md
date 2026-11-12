@@ -1,17 +1,23 @@
 # Native Pi managed model metadata
 
 The native driver resolves `paperclip/<id>` capabilities before it creates the
-first broker and writes the agent home's `models.json`. The source file is the
-snapshot in `PI_CODING_AGENT_DIR`, not a controller home or an ambient credential
-store.
+first broker and writes the agent home's `models.json`. It captures the runner's
+original Pi config path before overriding `PI_CODING_AGENT_DIR` for the child.
 
 Resolution order:
 
-1. An exact-id entry in `providers.paperclip.models` in that snapshot.
-2. Otherwise, an exact-id entry on another provider in the same file, in file
-   order. This supports snapshots whose connection is named, for example,
-   `cliproxyapi-anthropic` rather than `paperclip`.
-3. Missing capabilities come from the selected Pi 1.5.2 installation's bundled
+1. The agent home's snapshot: an exact-id entry in `providers.paperclip.models`,
+   otherwise an exact-id entry on another provider in the same file, in file
+   order. This supports connections named, for example, `cliproxyapi-anthropic`.
+2. Missing capability fields and thinking-map keys come from the original user's
+   `models.json`: the runner's inherited `PI_CODING_AGENT_DIR`, if set, otherwise
+   its original `HOME/.pi/agent` (with `os.homedir()` as the HOME fallback). The
+   same exact-id/provider precedence applies within this file. This optional
+   source is read-only; missing, unreadable, oversized or invalid user config is
+   skipped with one bounded diagnostic, not a startup refusal. Agent-snapshot
+   validation remains strict. Routing, authentication and other user settings
+   are never imported into the managed home.
+3. Remaining capabilities come from the selected Pi 1.5.2 installation's bundled
    `@earendil-works/pi-ai/providers/all` catalog. All exact-id matches must agree
    on context window, output limit and reasoning support. A thinking-level map
    key is inherited only when every match agrees on that key; snapshot map keys
@@ -56,5 +62,11 @@ pnpm exec vitest run src/drivers/pi/pi-managed-model.native.test.ts
 
 It checks real `get_state` before any model reset and after a private warm bind,
 snapshot caps, catalog limits, explicit overrides, unknown defaults, and two
-settled turns through the real native driver. The last leg uses a local
-loopback protocol peer, not an upstream account or a simulated Pi runtime.
+settled turns through the real native driver. It also reproduces the original
+HOME-only layout with no runner `PI_CODING_AGENT_DIR`: the cap exists only under
+`HOME/.pi/agent/models.json`, with a separate managed agent home. A launch hook
+adds `--thinking max` to observe Pi's first state before admission; the driver
+requests the supported effective effort (`xhigh` with the cap, `max` without).
+Both cases retain their capabilities after warm attach/rebind and leave the
+user file unchanged. Driver turns use a local loopback protocol peer, not an
+upstream account or a simulated Pi runtime.
