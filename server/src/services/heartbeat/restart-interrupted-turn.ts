@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import type { NativeRestartRecoveryClaim } from "../native-runtime/native-restart-recovery.js";
 import { isUserCommentContinuationReason } from "../explicit-native-continuation.js";
 import { requestTaskRetry } from "../task-retry.js";
@@ -36,8 +37,57 @@ export function isProvenTurnSettlement(event: { eventType: string; payload: unkn
     asRecord(asRecord(payload.prpEvent).payload).providerTerminalObserved !== false;
 }
 
+async function provenRunnerExit(db: Db, run: { companyId: string; id: string }) {
+  const [refusal] = await db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    eq(heartbeatRunEvents.eventType, "native.remote_runner_recovery_failed"),
+  )).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+  const proof = asRecord(asRecord(refusal?.payload).remoteRunnerRecovery);
+  return proof.stage === "process_verification" && proof.reason === "process_not_running" ? proof : null;
+}
+
+export const INTERRUPTED_TURN_OUTCOME_UNKNOWN_EVENT = "native.interrupted_turn_outcome_unknown";
+
+async function recordUnknownTurnOutcome(db: Db, run: { companyId: string; id: string; agentId: string },
+  lastTurn: { eventType: string; payload: unknown }, runnerExit: Record<string, unknown>) {
+  const [recorded] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+    eq(heartbeatRunEvents.eventType, INTERRUPTED_TURN_OUTCOME_UNKNOWN_EVENT))).limit(1);
+  if (recorded) return;
+  const payload = asRecord(lastTurn.payload);
+  const turnId = asRecord(payload.prpEvent).turnId ?? payload.turnId;
+  await appendHeartbeatRunEvent(db, { companyId: run.companyId, runId: run.id, agentId: run.agentId,
+    eventType: INTERRUPTED_TURN_OUTCOME_UNKNOWN_EVENT, stream: "system", level: "warn",
+    message: "The Runner stopped during a provider turn, so the turn's outcome is unknown. It is not replayed; a fresh session continues from the saved work.",
+    payload: { turnId: typeof turnId === "string" ? turnId : null, lastTurnEvent: lastTurn.eventType, replayed: false,
+      runnerExit: { stage: runnerExit.stage, reason: runnerExit.reason,
+        ...(typeof runnerExit.runnerLifecycle === "string" ? { runnerLifecycle: runnerExit.runnerLifecycle } : {}) } } });
+}
+
 /** Automatic continuation is requested at most once per chain of runs. */
 export const RESTART_RETRY_KEY_PREFIX = "restart-interrupted-turn:";
+
+const MAX_RETRY_CHAIN = 32;
+
+async function chainUsedAutomaticRetry(db: Db, run: { companyId: string; id: string; retryOfRunId: string | null;
+  contextSnapshot: Record<string, unknown> | null }) {
+  const visited = new Set<string>();
+  let current: typeof run | undefined = run;
+  while (current && !visited.has(current.id) && visited.size < MAX_RETRY_CHAIN) {
+    visited.add(current.id);
+    const retryId = current.contextSnapshot?.taskRetryRequestId;
+    if (typeof retryId === "string") {
+      const [receipt] = await db.select({ key: agentWakeupRequests.idempotencyKey }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, run.companyId), sql`${agentWakeupRequests.id}::text = ${retryId}`));
+      if (receipt?.key?.startsWith(`task-retry:${RESTART_RETRY_KEY_PREFIX}`)) return true;
+    }
+    if (!current.retryOfRunId) return false;
+    [current] = await db.select({ companyId: heartbeatRuns.companyId, id: heartbeatRuns.id, retryOfRunId: heartbeatRuns.retryOfRunId,
+      contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, current.retryOfRunId)));
+  }
+  return visited.size >= MAX_RETRY_CHAIN;
+}
 
 type Outcome = { requested: true; requestId: string } | { requested: false; reason: string };
 
@@ -46,9 +96,12 @@ type Outcome = { requested: true; requestId: string } | { requested: false; reas
  * native run. When it fails because the original runner or sandbox is gone,
  * request the same Retry a user would click, once and idempotently per run,
  * under the requesting user's authority. Only when the run's user input was not
- * yet acted on, or its last provider turn is settled; an in-flight turn's
- * outcome is unknown, so it keeps the visible Retry. Admission keeps every gate,
- * including stop proof and saved-work recovery before the next turn.
+ * yet acted on, its last provider turn is settled, or the Runner process is
+ * proven gone; an in-flight turn's outcome is then unknown and recorded, and the
+ * Retry's fresh session never replays it. Pi's lost-turn refusal stays closed.
+ * A system wake continues only when it was an automatic retry of owed work
+ * whose Runner is proven gone, under the run's responsible user. Admission keeps
+ * every gate, including stop proof and saved-work recovery before the next turn.
  */
 export async function requestRestartInterruptedTurnRetry(db: Db, claim: NativeRestartRecoveryClaim): Promise<Outcome> {
   if (claim.kind !== "reattach_remote_runner") return { requested: false, reason: "not_reattachment" };
@@ -67,15 +120,28 @@ export async function requestInterruptedNativeTurnRetry(db: Db, runId: string): 
       eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
       inArray(heartbeatRunEvents.eventType, [...TURN_STARTED_EVENTS, ...TURN_SETTLED_EVENTS]),
     )).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
-  if (lastTurn && !isProvenTurnSettlement(lastTurn)) return { requested: false, reason: "provider_turn_unsettled" };
+  const runnerExit = await provenRunnerExit(db, run);
+  const unknownTurn = lastTurn && !isProvenTurnSettlement(lastTurn) ? lastTurn : null;
+  const provider = asRecord(asRecord(run.runnerProfileJson?.nativeExecutionInput).provider);
+  // Process exit is not proof that a lost Pi turn can be restored or replayed.
+  // Keep the fork's Pi refusal until explicit session recovery is qualified.
+  const pi = provider.kind === "pi_rpc" || (provider.kind === "acpx" && provider.agent === "pi");
+  if (unknownTurn && (!runnerExit || pi)) return { requested: false, reason: "provider_turn_unsettled" };
   const [wake] = await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
     eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.runId, run.id)));
-  const actorId = wake?.requestedByActorType === "user" ? wake.requestedByActorId : null;
+  const userActorId = wake?.requestedByActorType === "user" ? wake.requestedByActorId : null;
   const reason = typeof context.wakeReason === "string" ? context.wakeReason : wake?.reason;
-  // System wakes keep their policy: only a new user turn continues them.
-  if (!actorId) return { requested: false, reason: "not_user_request" };
-  if (reason === "task_retry") {
+  let actorId = userActorId;
+  if (!actorId) {
+    // Preserve the fork's system-wake policy except for this proven lost
+    // automatic retry of already owed work. Do not import a no-turn shortcut.
+    const owedRedelivery = run.retryOfRunId !== null && runnerExit !== null;
+    if (!wake || reason === "task_retry" || !run.responsibleUserId || !owedRedelivery)
+      return { requested: false, reason: "not_user_request" };
+    if (await chainUsedAutomaticRetry(db, run)) return { requested: false, reason: "automatic_retry_used" };
+    actorId = run.responsibleUserId;
+  } else if (reason === "task_retry") {
     // A Retry this hook already requested gets no second automatic attempt.
     const retryId = typeof context.taskRetryRequestId === "string" ? context.taskRetryRequestId : null;
     const [receipt] = retryId ? await db.select({ key: agentWakeupRequests.idempotencyKey }).from(agentWakeupRequests).where(and(
@@ -96,6 +162,7 @@ export async function requestInterruptedNativeTurnRetry(db: Db, runId: string): 
     .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
   if (!issue || issue.assigneeAgentId !== run.agentId || ["done", "cancelled"].includes(issue.status))
     return { requested: false, reason: "task_changed" };
+  if (unknownTurn && runnerExit) await recordUnknownTurnOutcome(db, run, unknownTurn, runnerExit);
   try {
     const receipt = await requestTaskRetry({ db, companyId: run.companyId, issueId, actorId,
       actorSource: actorId === "local-board" ? "local_implicit" : "session",
