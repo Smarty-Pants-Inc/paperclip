@@ -149,4 +149,5 @@ export { SAFE_ERROR_CAUSE_PATTERN, safeErrorCauseCode } from "./control-plane/sa
 
 export { PiRpcDriver, type PiRpcDriverOptions } from "./drivers/pi/pi-rpc-driver.js";
 export { createPiNativeSessionBackend } from "./backends/pi-native-backend.js";
-export { QUALIFIED_PI_RPC_PROFILE, parsePiRpcProfile, type NativePiRpcProfileSnapshot } from "./drivers/pi/qualified-profile.js";
+export { QUALIFIED_PI_RPC_PROFILE, parsePiRpcProfile, PI_THINKING_LEVELS, type PiThinkingLevel, type NativePiRpcProfileSnapshot } from "./drivers/pi/qualified-profile.js";
+

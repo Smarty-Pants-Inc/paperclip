@@ -124,7 +124,7 @@ export interface NativeAcpxProfileSnapshot {
 export type NativePiThinkingLevel = PiThinkingLevel;
 
 export type NativeProviderConfig =
-  | { kind: "pi_rpc"; model: string; profile: NativePiRpcProfileSnapshot; piThinkingLevel?: NativePiThinkingLevel }
+  | { kind: "pi_rpc"; model: string; profile: NativePiRpcProfileSnapshot; piRpcThinkingLevel?: NativePiThinkingLevel }
   | { kind: "cursor_cloud"; model: string; cursorCloud: NativeCursorCloudConfig }
   | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
   | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
@@ -585,12 +585,12 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     && provider.kind !== "aws_agentcore"
     && provider.kind !== "acpx"
   ) {
-    throw new NativeExecutionInputError("input.provider.kind must be cursor_cloud, codex, opencode, pi, claude_managed, aws_agentcore, or acpx");
+    throw new NativeExecutionInputError("input.provider.kind must be cursor_cloud, codex, opencode, pi_rpc, claude_managed, aws_agentcore, or acpx");
   }
   exactKeys(
     provider,
     provider.kind === "pi_rpc"
-      ? ["kind", "model", "profile", "piThinkingLevel"]
+      ? ["kind", "model", "profile", "piRpcThinkingLevel"]
       : provider.kind === "cursor_cloud"
       ? ["kind", "model", "cursorCloud"]
       : provider.kind === "claude_managed"
@@ -625,11 +625,11 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   }
   let parsedProvider: NativeProviderConfigV9 | NativeProviderConfig | NativeProviderConfigV5;
   if (provider.kind === "pi_rpc") {
-    if (provider.piThinkingLevel !== undefined && (typeof provider.piThinkingLevel !== "string" || !PI_THINKING_LEVELS.includes(provider.piThinkingLevel as PiThinkingLevel))) {
+    if (provider.piRpcThinkingLevel !== undefined && (typeof provider.piRpcThinkingLevel !== "string" || !PI_THINKING_LEVELS.includes(provider.piRpcThinkingLevel as PiThinkingLevel))) {
       throw new NativeExecutionInputError("Native Pi thinking level is unsupported");
     }
     parsedProvider = { kind: "pi_rpc", model: providerModel!, profile: parsePiRpcProfile(provider.profile),
-      ...(provider.piThinkingLevel === undefined ? {} : { piThinkingLevel: provider.piThinkingLevel as NativePiThinkingLevel }) };
+      ...(provider.piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel: provider.piRpcThinkingLevel as NativePiThinkingLevel }) };
   } else if (provider.kind === "cursor_cloud") {
     if (!isV5 || !providerModel || providerModel.length > 240 || /[\x00-\x1f\x7f]/.test(providerModel) || lifecyclePolicy.mode !== "per_turn") {
       throw new NativeExecutionInputError("Cursor Cloud requires a model and per-turn lifecycle in a v5 or later input");

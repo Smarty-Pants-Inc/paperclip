@@ -1,3 +1,4 @@
+import { PI_THINKING_LEVELS, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { nativeTaskConstraints } from "../backends/runtime-context.js";
 import { createHash } from "node:crypto";
 import { QUALIFIED_ACPX_PROFILES } from "../drivers/acpx/qualified-profiles.js";
@@ -928,4 +929,11 @@ describe("native Pi RPC registration", () => {
       })).toThrow();
     }
   });
+});
+
+it.each(PI_THINKING_LEVELS)("preserves native piRpcThinkingLevel=%s without aliasing", level => {
+  const native = { ...input, session: { ...input.session, driverKind: "pi_rpc" },
+    provider: { kind: "pi_rpc", model: "managed/my-model", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: level } };
+  expect(parseNativeExecutionInput(native).provider).toEqual(native.provider);
+  expect(() => parseNativeExecutionInput({ ...native, provider: { ...native.provider, piThinkingLevel: level } })).toThrow();
 });
