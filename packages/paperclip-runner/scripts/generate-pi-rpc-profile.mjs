@@ -2,15 +2,16 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PI_DISTRIBUTION_CLOSURE_SHA256 } from "../src/drivers/acpx/pi-closure-pins.ts";
-import { PI_NODE_VERSION } from "../src/drivers/acpx/pi-node-pins.ts";
 
-// Same upstream-only closure attestation as acpx-release-attestations.mjs:67-79.
-// The native identity is distinct: no ACPX version or pi-acp transport.
+// Native-only release: source-owned npm integrity lock plus complete Linux/x64 closure.
+// ACPX Pi declarations and runtime helper are intentionally untouched.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = async path => JSON.parse(await readFile(resolve(root, path), "utf8"));
 const declaration = await read("pi-rpc-profile.json");
-const lock = await read("scripts/pi-distribution/package-lock.json");
+const lock = await read("scripts/pi-rpc-distribution/package-lock.json");
+const distribution = await read("pi-rpc-distribution.json");
+const lockSha256 = `sha256:${createHash("sha256").update(await readFile(resolve(root, "scripts/pi-rpc-distribution/package-lock.json"))).digest("hex")}`;
+if (distribution.lockSha256 !== lockSha256 || lock.packages["node_modules/pi-acp"] || declaration.providerKind !== "pi_rpc") throw new Error("Native Pi distribution must be separately pinned without pi-acp");
 if (declaration.driverKind !== "pi_rpc" || declaration.protocolVersion !== 1
   || declaration.profileVersion !== 1 || declaration.runtimePackage !== "@earendil-works/pi-coding-agent"
   || lock.packages[`node_modules/${declaration.runtimePackage}`]?.version !== declaration.runtimeVersion) {
@@ -19,7 +20,7 @@ if (declaration.driverKind !== "pi_rpc" || declaration.protocolVersion !== 1
 const canonical = value => value && typeof value === "object"
   ? Array.isArray(value) ? value.map(canonical) : Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]))
   : value;
-const release = { ...declaration, nodeVersion: PI_NODE_VERSION, closure: PI_DISTRIBUTION_CLOSURE_SHA256 };
+const release = { ...declaration, distribution };
 const commandDigest = `sha256:${createHash("sha256").update(JSON.stringify(canonical(release))).digest("hex")}`;
 const profile = { ...declaration, commandDigest };
 const outputs = {

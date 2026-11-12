@@ -201,7 +201,7 @@
           {
             "properties": {
               "provider": {
-                "const": "pi"
+                "const": "pi_rpc"
               },
               "driver": {
                 "const": "pi_rpc"
@@ -214,7 +214,7 @@
                 "const": "acpx"
               },
               "agent": {
-                "const": "pi"
+                "const": "pi_rpc"
               },
               "piThinkingLevel": {
                 "enum": [
@@ -374,7 +374,7 @@
         {
           "properties": {
             "provider": {
-              "const": "pi"
+              "const": "pi_rpc"
             },
             "driver": {
               "const": "pi_rpc"

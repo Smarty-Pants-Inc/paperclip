@@ -247,7 +247,7 @@ fn warm_attachment_keeps_provider(
         return false;
     }
     current == next
-        || (current.is_some() && next.is_some() && matches!(provider, "codex" | "opencode" | "pi"))
+        || (current.is_some() && next.is_some() && matches!(provider, "codex" | "opencode" | "pi_rpc"))
 }
 
 /// Run-scoped identity a retained OpenCode proxy needs on each turn/start: its
@@ -608,11 +608,11 @@ impl CodexProviderConfig {
             (self.provider.as_str(), self.driver.as_str()),
             ("codex", "codex_app_server")
                 | ("opencode", "opencode_server")
-                | ("pi", "pi_rpc")
+                | ("pi_rpc", "pi_rpc")
                 | ("cursor_cloud", "cursor_cloud_api")
         ) {
             return Err(LocalRunnerError::invalid(
-                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, pi/pi_rpc, or cursor_cloud/cursor_cloud_api",
+                "runner facade provider/driver pair must be codex/codex_app_server, opencode/opencode_server, pi_rpc/pi_rpc, or cursor_cloud/cursor_cloud_api",
             ));
         }
         if self.provider_version.trim().is_empty() || self.provider_version.len() > 120 {
@@ -620,7 +620,7 @@ impl CodexProviderConfig {
                 "Codex providerVersion is empty or oversized",
             ));
         }
-        if self.provider == "pi" {
+        if self.provider == "pi_rpc" {
             let expected: Value =
                 serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON)
                     .map_err(|_| LocalRunnerError::invalid("invalid compiled Pi profile"))?;
@@ -638,7 +638,7 @@ impl CodexProviderConfig {
             }
         } else if self.profile.is_some() {
             return Err(LocalRunnerError::invalid(
-                "native Pi profile is only supported by pi/pi_rpc",
+                "native Pi profile is only supported by pi_rpc/pi_rpc",
             ));
         }
         if self.provider == "opencode" && self.provider_version != QUALIFIED_OPENCODE_VERSION {
@@ -1189,7 +1189,7 @@ impl CodexProvider {
         ];
         let provider_environment_keys = match config.provider.as_str() {
             "opencode" => OPENCODE_PROVIDER_ENVIRONMENT_KEYS,
-            "pi" => PI_RPC_PROVIDER_ENVIRONMENT_KEYS,
+            "pi_rpc" => PI_RPC_PROVIDER_ENVIRONMENT_KEYS,
             "cursor_cloud" => CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS,
             _ => CODEX_PROVIDER_ENVIRONMENT_KEYS,
         };
@@ -1281,7 +1281,7 @@ impl CodexProvider {
                     CODEX_APP_SERVER_MAX_FRAME_BYTES,
                     &environment_keys,
                 )
-            } else if config.provider == "pi" {
+            } else if config.provider == "pi_rpc" {
                 let profile = local_launch_profile.ok_or_else(|| {
                     LocalRunnerError::invalid(
                         "Pi runner startup omitted its qualified launch profile",
@@ -1452,7 +1452,7 @@ impl CodexProvider {
             } else {
                 params_object.insert("permissions".to_owned(), json!(provider.permission_profile));
             }
-            if matches!(config.provider.as_str(), "opencode" | "pi" | "cursor_cloud") {
+            if matches!(config.provider.as_str(), "opencode" | "pi_rpc" | "cursor_cloud") {
                 if let Some(mode) = &config.conversation_mode {
                     params_object.insert("conversationMode".to_owned(), json!(mode));
                 }
@@ -2231,7 +2231,7 @@ impl CodexProvider {
             .expect("Codex turn parameters are an object");
         // The retained proxy's launch environment belongs to its first run.
         // Only runnerd's rotated authority supplies the current run identity.
-        if matches!(self.config.provider.as_str(), "opencode" | "pi") {
+        if matches!(self.config.provider.as_str(), "opencode" | "pi_rpc") {
             for (key, value) in
                 opencode_turn_identity_params(run_id, self.completion_contract.as_ref())
             {

@@ -10,6 +10,7 @@
     "profileVersion",
     "runtimePackage",
     "runtimeVersion",
+    "providerKind",
     "commandDigest"
   ],
   "properties": {
@@ -31,8 +32,11 @@
     "runtimeVersion": {
       "const": "1.5.2"
     },
+    "providerKind": {
+      "const": "pi_rpc"
+    },
     "commandDigest": {
-      "const": "sha256:5cf3a2f9016073a363d3f8139559cdc8e59770483dfee7ebb99f02be7e92e893"
+      "const": "sha256:73974de85a6796cdfc939237aa2bee3cb255d018beadea81bfeada7aae1137fc"
     }
   }
 }

@@ -4721,6 +4721,9 @@ export function spawnRunner(options: {
   cursorCloudLaunchProfile?: {
     command: string; commandSha256: string; proxyScript: string; proxyScriptSha256: string;
   };
+  piLaunchProfile?: {
+    command: string; commandSha256: string; proxyScript: string; proxyScriptSha256: string; executable: string; executableSha256: string;
+  };
   opencodeLaunchProfile?: {
     command: string;
     commandSha256: string;
@@ -4815,6 +4818,14 @@ export function spawnRunner(options: {
       "--cursor-cloud-proxy-command-sha256", options.cursorCloudLaunchProfile.commandSha256,
       "--cursor-cloud-proxy-script", options.cursorCloudLaunchProfile.proxyScript,
       "--cursor-cloud-proxy-script-sha256", options.cursorCloudLaunchProfile.proxyScriptSha256,
+    ] : []),
+    ...(options.piLaunchProfile ? [
+      "--pi-proxy-command", options.piLaunchProfile.command,
+      "--pi-proxy-command-sha256", options.piLaunchProfile.commandSha256,
+      "--pi-proxy-script", options.piLaunchProfile.proxyScript,
+      "--pi-proxy-script-sha256", options.piLaunchProfile.proxyScriptSha256,
+      "--pi-executable", options.piLaunchProfile.executable,
+      "--pi-executable-sha256", options.piLaunchProfile.executableSha256,
     ] : []),
     ...(options.opencodeLaunchProfile
       ? [

@@ -497,7 +497,7 @@ fn local_process_definitely_gone(_id: u32, _group: bool) -> bool {
 fn facade_provider_name(provider: &str) -> &'static str {
     match provider {
         "opencode" => "OpenCode",
-        "pi" => "Pi",
+        "pi_rpc" => "Pi",
         "cursor_cloud" => "Cursor Cloud",
         _ => "Codex",
     }
@@ -2105,7 +2105,7 @@ impl CodexCommandExecutor {
         &self,
         config: &CodexProviderConfig,
     ) -> Result<Option<String>, DurableRunnerError> {
-        if config.provider != "pi" {
+        if config.provider != "pi_rpc" {
             return Ok(None);
         }
         let profile = self.pi_launch_profile.as_ref().ok_or_else(|| {
@@ -2347,7 +2347,7 @@ impl CodexCommandExecutor {
             .state
             .clone()
             .ok_or_else(|| DurableRunnerError::invalid("provider startup state missing"))?;
-        let profile = if state.config.provider == "pi" {
+        let profile = if state.config.provider == "pi_rpc" {
             self.pi_launch_profile.clone()
         } else {
             self.opencode_launch_profile.clone()
@@ -5792,7 +5792,7 @@ impl CodexCommandExecutor {
                                 "prompt": prompt,
                                 "input": question_set,
                                 "origin": {
-                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
+                                    "adapter": match state.config.provider.as_str() { "opencode" => "opencode-server", "pi_rpc" => "pi-rpc", "cursor_cloud" => "cursor-cloud-api", _ => "codex-app-server" },
                                     "provider": state.config.provider,
                                     "method": "item/tool/requestUserInput",
                                 },

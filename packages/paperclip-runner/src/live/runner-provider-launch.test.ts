@@ -1,3 +1,4 @@
+import { QUALIFIED_PI_RPC_PROFILE, PI_THINKING_LEVELS } from "../drivers/pi/qualified-profile.js";
 import { describe, expect, it } from "vitest";
 import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, runnerLaunchSettingsMatch, validatePreparedRunnerLaunch,
   runnerProviderLaunchRequirements, type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
@@ -195,5 +196,22 @@ describe("built-in provider launch preparation", () => {
       expect(() => validatePreparedRunnerLaunch(selected, prepared(cwd)))
         .toThrow("runner_prepared_launch_working_directory_invalid");
     }
+  });
+});
+
+// Trust boundary: prevent native Pi falling through the Codex or ACPX launch path.
+describe("native Pi qualified launch", () => {
+  it.each(PI_THINKING_LEVELS)("preserves native thinking %s without ACPX defaults", level => {
+    const requested = runnerProviderLaunchRequirements({ provider: "pi_rpc", piThinkingLevel: level }, requirements.identity,
+      { model: "managed/my-model" }, null, "Native instructions");
+    const launch = createRunnerProviderLaunch(requested, { ...environment, piProxyPath: "/runtime/pi-proxy.cjs" });
+    expect(launch).toMatchObject({ kind: "pi_rpc", driver: "pi_rpc", driverKind: "pi_rpc", providerVersion: "1.5.2",
+      profile: QUALIFIED_PI_RPC_PROFILE, command: "/runtime/node", args: ["/runtime/pi-proxy.cjs"],
+      model: "managed/my-model", piThinkingLevel: level, cwd: "/execution/workspace" });
+    expect(launch).not.toHaveProperty("agent");
+    expect(launch).not.toHaveProperty("sidecarCommand");
+    const prepared = { configurationId: "native-pi", requirementsDigest: runnerLaunchRequirementsDigest(requested), provider: launch };
+    expect(() => validatePreparedRunnerLaunch(requested, prepared)).not.toThrow();
+    expect(() => validatePreparedRunnerLaunch(requested, { ...prepared, provider: { ...launch, piThinkingLevel: "silently-aliased" } })).toThrow();
   });
 });

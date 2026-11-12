@@ -1537,7 +1537,7 @@ export interface CapabilityRunnerdProcessEvidence {
   agentProcessStartedAt: string | null;
   providerDriver: string | null;
   /** Effective native mode, populated only from the admitted Pi identity. */
-  piThinkingLevel?: "off" | "low" | "high" | "max";
+  piThinkingLevel?: import("../contracts/native-execution.js").NativePiThinkingLevel;
   claudeEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;
@@ -1559,7 +1559,7 @@ export interface CapabilityRunnerdProcessEvidence {
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
   observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
-  provider?: "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
+  provider?: "pi_rpc" | "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
   observeCredentials?: boolean;
   onCredentialsUpdated?: (event: PrpEvent) => Promise<void>;
   onAccountingEvent?: (event: PrpEvent) => Promise<void>;
@@ -1636,6 +1636,12 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   disableCodexWebSearch?: boolean;
   /** Controller-visible Codex home used only to seed the isolated runner home. */
   sourceCodexHome?: string | null;
+  piCommand?: string;
+  piCommandSha256?: string;
+  piProxyPath?: string;
+  piProxySha256?: string;
+  piRuntimeDirectory?: string;
+  piProfile?: import("../drivers/pi/qualified-profile.js").NativePiRpcProfileSnapshot;
   opencodeCommand?: string;
   /** SHA-256 verified by the provider-pack authority before runner startup. */
   opencodeCommandSha256?: string;
@@ -3404,7 +3410,7 @@ async function settleRetainedRunnerdSessionOwned(
 }
 
 type BuildOwnedCliArtifact =
-  "acpx-runtime-sidecar.cjs" | "opencode-app-server-proxy.cjs" | "cursor-cloud-app-server-proxy.cjs";
+  "pi-rpc-app-server-proxy.cjs" | "acpx-runtime-sidecar.cjs" | "opencode-app-server-proxy.cjs" | "cursor-cloud-app-server-proxy.cjs";
 
 function buildOwnedCliArtifactCandidates(
   artifact: BuildOwnedCliArtifact,
@@ -3589,6 +3595,19 @@ function acpxRunnerLaunchProfile(
   };
 }
 
+function piRunnerLaunchProfile(options: CapabilityRunnerdCodexTransportOptions, nodeCommand: string, proxyPath: string) {
+  const executable = options.piCommand;
+  if (!executable) throw new Error("runner_native_pi_executable_required: select the qualified Pi distribution executable");
+  const remote = options.runnerFilesystemRoot !== undefined;
+  const digest = (label: string, path: string, configured?: string) => {
+    if (remote && !configured?.startsWith("sha256:")) throw new Error(`runner_remote_provider_artifact_incompatible: ${label} has no provider-pack digest`);
+    return configured ?? `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+  };
+  return { command: nodeCommand, commandSha256: digest("Pi Node", nodeCommand, options.providerNodeCommandSha256),
+    proxyScript: proxyPath, proxyScriptSha256: digest("Pi proxy", proxyPath, options.piProxySha256),
+    executable, executableSha256: digest("Pi executable", executable, options.piCommandSha256) };
+}
+
 function opencodeRunnerLaunchProfile(
   options: CapabilityRunnerdCodexTransportOptions,
   command: string,
@@ -3736,6 +3755,13 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
       selected[name] = env[name];
     }
     return selected;
+  }
+  if (input.provider === "pi_rpc") {
+    const selected = createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env;
+    return { ...selected, ...Object.fromEntries(PI_SIDECAR_PROVIDER_ROUTE_NAMES.flatMap(name => {
+      const value = input.options.environment?.[name]; return value === undefined ? [] : [[name, value]];
+    })), PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
+      PAPERCLIP_PI_THINKING_LEVEL: input.options.piThinkingLevel ?? "low", ...commonIdentity };
   }
   if (input.provider === "opencode") {
     return {
@@ -4231,10 +4257,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       runnerExitCode: null,
       runnerSignal: null,
       childEnvironmentKeys: Object.keys(
-        options.provider === "acpx"
+        options.provider === "acpx" || options.provider === "pi_rpc"
           ? createSanitizedAcpxSpawnInput(
               options.environment,
-              options.acpxAgent ?? "codex",
+              options.provider === "pi_rpc" ? "pi" : options.acpxAgent ?? "codex",
             ).env
           : options.provider === "opencode"
             ? createSanitizedOpenCodeRunnerEnvironment(options.environment)
@@ -5866,6 +5892,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ));
     const providerNodeCommand =
       this.options.providerNodeCommand ?? process.execPath;
+    const piProxyPath = provider === "pi_rpc"
+      ? this.options.piProxyPath ?? resolveBuildOwnedCliArtifact("pi-rpc-app-server-proxy.cjs") : undefined;
+    const runnerPiLaunchProfile = provider === "pi_rpc"
+      ? piRunnerLaunchProfile(this.options, providerNodeCommand, piProxyPath!) : undefined;
     const cursorCloudProxyPath = provider === "cursor_cloud"
       ? this.options.cursorCloudProxyPath ?? resolveBuildOwnedCliArtifact("cursor-cloud-app-server-proxy.cjs") : undefined;
     const runnerCursorCloudLaunchProfile = cursorCloudProxyPath ? {
@@ -5902,11 +5932,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         : undefined;
     if (
       this.options.runnerFilesystemRoot &&
-      (provider === "opencode" || provider === "acpx")
+      (provider === "opencode" || provider === "acpx" || provider === "pi_rpc")
     ) {
       const providerPaths = [
         ["provider Node", providerNodeCommand],
-        ...(provider === "opencode"
+        ...(provider === "pi_rpc"
+          ? [["Pi proxy", piProxyPath!], ["Pi executable", this.options.piCommand!]] as const
+          : provider === "opencode"
           ? [["OpenCode proxy", opencodeProxyPath], ["OpenCode executable", opencodeExecutable!]] as const
           : [["ACPX sidecar", acpxSidecarPath]] as const),
       ] as const;
@@ -5924,6 +5956,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         throw new Error(
           "runner_remote_provider_artifact_incompatible: remote JS provider omitted its provider-pack Node executable",
         );
+      }
+      if (provider === "pi_rpc" && (!this.options.piProxyPath || !this.options.piCommand)) {
+        throw new Error("runner_remote_provider_artifact_incompatible: remote native Pi omitted its packaged proxy or executable");
       }
       if (provider === "opencode" && !this.options.opencodeProxyPath) {
         throw new Error(
@@ -5963,10 +5998,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ), {
         options: this.options, root: this.#root, cwd: String(params.cwd ?? tmpdir()),
         codexHome, providerNodeCommand, codexCommand: effectiveCodexCommand,
-        opencodeProxyPath, acpxSidecarPath, cursorCloudProxyPath,
+        opencodeProxyPath, acpxSidecarPath, cursorCloudProxyPath, piProxyPath,
       }),
     };
-    return { runAttachTemplate, runnerAcpxLaunchProfile, runnerOpenCodeLaunchProfile, runnerCursorCloudLaunchProfile,
+    return { runAttachTemplate, runnerAcpxLaunchProfile, runnerOpenCodeLaunchProfile, runnerPiLaunchProfile, runnerCursorCloudLaunchProfile,
       environment: withRunnerdProviderTrace(
         createCapabilityRunnerdProviderEnvironment({
           provider,
@@ -6602,6 +6637,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ));
     const providerNodeCommand =
       this.options.providerNodeCommand ?? process.execPath;
+    const piProxyPath = provider === "pi_rpc"
+      ? this.options.piProxyPath ?? resolveBuildOwnedCliArtifact("pi-rpc-app-server-proxy.cjs") : undefined;
+    const runnerPiLaunchProfile = provider === "pi_rpc"
+      ? piRunnerLaunchProfile(this.options, providerNodeCommand, piProxyPath!) : undefined;
     const cursorCloudProxyPath = provider === "cursor_cloud"
       ? this.options.cursorCloudProxyPath ?? resolveBuildOwnedCliArtifact("cursor-cloud-app-server-proxy.cjs") : undefined;
     const runnerCursorCloudLaunchProfile = cursorCloudProxyPath ? {
