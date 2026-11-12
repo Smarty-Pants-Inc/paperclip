@@ -46,13 +46,22 @@ export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunch
       "trusted Pi runner-owned executable binding is unavailable; refusing ambient PATH or PAPERCLIP_PI_RPC_COMMAND fallback",
     );
     try {
-      const metadata = lstatSync(executablePath);
       const uid = process.getuid?.();
-      const bytes = readFileSync(executablePath);
+      // A preinstalled pack is root-owned and immutable (the snapshot's
+      // /opt/paperclip-runner/provider-pack, reached through the runner's
+      // staged link). Trust a file owned by this user OR root, never group- or
+      // world-writable, in a directory with the same property, at its real path.
+      const trustedOwner = (owner: number) => uid !== undefined && (owner === uid || owner === 0);
+      const trustedFile = (path: string) => {
+        const real = realpathSync(path);
+        const metadata = lstatSync(real), directory = lstatSync(dirname(real));
+        if (!metadata.isFile() || metadata.nlink !== 1 || (metadata.mode & 0o022) !== 0 || !trustedOwner(metadata.uid)
+          || !directory.isDirectory() || (directory.mode & 0o022) !== 0 || !trustedOwner(directory.uid)) throw unavailable();
+        return real;
+      };
+      const realExecutable = trustedFile(executablePath);
+      const bytes = readFileSync(realExecutable);
       const verifiedBytes = readFileSync(command);
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
-        || (metadata.mode & 0o022) !== 0 || uid === undefined || metadata.uid !== uid
-        || realpathSync(executablePath) !== executablePath) throw unavailable();
       if (createHash("sha256").update(bytes).digest("hex") !== createHash("sha256").update(verifiedBytes).digest("hex")) {
         throw unavailable();
       }
@@ -65,15 +74,12 @@ export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunch
         const proxyPath = args[5]!;
         if (!proxyMatch || !Number.isInteger(proxyFd) || proxyFd < 3 || proxyFd > 255
           || proxyFd === commandFd || !isAbsolute(proxyPath)) throw unavailable();
-        const proxyMetadata = lstatSync(proxyPath);
-        if (!proxyMetadata.isFile() || proxyMetadata.isSymbolicLink() || proxyMetadata.nlink !== 1
-          || (proxyMetadata.mode & 0o022) !== 0 || proxyMetadata.uid !== uid
-          || realpathSync(proxyPath) !== proxyPath) throw unavailable();
-        if (createHash("sha256").update(readFileSync(proxyPath)).digest("hex")
+        const realProxy = trustedFile(proxyPath);
+        if (createHash("sha256").update(readFileSync(realProxy)).digest("hex")
           !== createHash("sha256").update(readFileSync(proxyDescriptor)).digest("hex")) throw unavailable();
-        return { command: executablePath, trustedProxyEntrypointUrl: pathToFileURL(proxyPath).href };
+        return { command: realExecutable, trustedProxyEntrypointUrl: pathToFileURL(realProxy).href };
       }
-      return { command: executablePath };
+      return { command: realExecutable };
     } catch {
       throw unavailable();
     }
