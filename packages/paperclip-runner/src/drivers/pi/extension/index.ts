@@ -5,7 +5,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createSubagentLifecycle, registerSubagentBridge, type SubagentEventBus } from "./subagents/index.js";
-import { installSubagentSeam } from "./subagents/seam.js";
+import { installSubagentSeam, installUnboundChildParent } from "./subagents/seam.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -121,6 +121,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   let config: PiBindingConfig = structuredClone(options.initial);
   let prepared: Readonly<Origin> | null = null, admitted: Readonly<Origin> | null = null, running: Readonly<Origin> | null = null;
   let commandBusy = false, closed = false, failed = false, fenceVersion = 0;
+  let offUnboundParent: (() => void) | undefined;
   let pendingDialogs = 0;
   let registeredProvider: string | undefined;
   const registeredTools = new Map<string, PiDynamicTool>();
@@ -327,6 +328,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     updateTools(config); authority.bind(config);
     if (options.initial.turnId) prepared = authority.beginTurn({ epoch: config.epoch, runId: config.runId, turnId: options.initial.turnId });
     active = publicState;
+    offUnboundParent = installUnboundChildParent({ capture: () => authority.capture(), accept: origin => !closed && authority.accept(origin) });
     server = createServer(socket => {
       socket.on("error", () => undefined);
       if (sockets.size >= 8 || closed) { socket.destroy(); return; }
@@ -353,6 +355,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   async function close() {
     if (closing) return closing;
     closed = true; fence();
+    offUnboundParent?.();
     for (const aborter of aborters.keys()) aborter.abort();
     closing = (async () => {
       for (const socket of sockets) socket.destroy();

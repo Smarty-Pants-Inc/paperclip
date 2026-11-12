@@ -28,10 +28,9 @@ describe("F085 per-leaf explicit selection (trust boundary)", () => {
     }
   });
 
-  it("validates Claude ceiling against the effective child not the parent", () => {
-    // No parent argument exists: neither a non-Claude parent nor a Claude parent can change policy.
-    expect(() => validateChildSelection(selection("anthropic/claude-test:max"), catalog)).toThrow(/Claude.*xhigh/i);
-    expect(() => validateChildSelection(selection("alias/reviewer:max"), catalog)).toThrow(/Claude.*xhigh/i);
+  it("passes configured effort through for Claude, aliases and other physical models", () => {
+    expect(validateChildSelection(selection("anthropic/claude-test:max"), catalog)).toMatchObject({ effort: "max", effectiveModel: "anthropic/claude-test" });
+    expect(validateChildSelection(selection("alias/reviewer:max"), catalog)).toMatchObject({ effort: "max", effectiveModel: "gateway/claude-test" });
     expect(validateChildSelection(selection("neutral/reasoner:max"), catalog)).toMatchObject({ effort: "max", effectiveModel: "neutral/reasoner" });
     expect(validateChildSelection(selection("anthropic/claude-test:xhigh"), catalog)).toMatchObject({ effort: "xhigh" });
     expect(() => validateChildSelection(selection("unknown/model:high"), catalog)).toThrow(/physical|catalog/i);
