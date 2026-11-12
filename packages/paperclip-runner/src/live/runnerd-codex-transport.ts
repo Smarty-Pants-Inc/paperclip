@@ -601,6 +601,11 @@ function retargetRunAttachPayload(
       provider.runtimeContext = structuredClone(runtimeContext);
     }
     payload.provider = provider;
+  } else if (provider.kind === "pi_rpc" && currentInstructions !== undefined) {
+    // Warm native Pi keeps its process, not the previous run's instruction grant.
+    provider.instructions = currentInstructions.text;
+    provider.runtimeContext = structuredClone(runtimeContext === undefined ? currentInstructions.context : runtimeContext);
+    payload.provider = provider;
   } else if (provider.kind === "cursor_cloud" && currentInstructions !== undefined) {
     provider.instructions = currentInstructions.context && runtimeContext !== undefined
       ? retargetComposedInstructions(currentInstructions.text, currentInstructions.context, runtimeContext)
