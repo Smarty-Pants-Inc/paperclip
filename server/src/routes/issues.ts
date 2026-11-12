@@ -17766,8 +17766,32 @@ export function issueRoutes(
     "/issues/:id/queued-comments/:commentId/steer",
     validate(queuedCommentSteeringTargetSchema),
     async (req, res) => {
-      assertBoard(req);
-      if (!req.actor.userId) throw forbidden("Board user context required");
+      if (req.actor.type === "agent") {
+        const id = req.params.id as string;
+        const actorAgentId = req.actor.agentId;
+        const authorizationIssue = await svc.getById(id);
+        if (
+          !authorizationIssue ||
+          authorizationIssue.companyId !== req.actor.companyId ||
+          !authorizationIssue.assigneeAgentId ||
+          !actorAgentId ||
+          actorAgentId === authorizationIssue.assigneeAgentId
+        ) return assertBoard(req);
+        const [assignee, manager] = await Promise.all([
+          db.select({ reportsTo: agents.reportsTo }).from(agents).where(and(
+            eq(agents.id, authorizationIssue.assigneeAgentId),
+            eq(agents.companyId, authorizationIssue.companyId),
+          )).limit(1).then(rows => rows[0] ?? null),
+          db.select({ id: agents.id }).from(agents).where(and(
+            eq(agents.id, actorAgentId),
+            eq(agents.companyId, authorizationIssue.companyId),
+          )).limit(1).then(rows => rows[0] ?? null),
+        ]);
+        if (!assignee || !manager || assignee.reportsTo !== manager.id) return assertBoard(req);
+      } else {
+        assertBoard(req);
+        if (!req.actor.userId) throw forbidden("Board user context required");
+      }
       const id = req.params.id as string;
       const commentId = req.params.commentId as string;
       const issue = await getAccessibleResource(
@@ -17784,6 +17808,7 @@ export function issueRoutes(
       const responseWake = await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.id, req.body.queueId), eq(agentWakeupRequests.companyId, issue.companyId),
       )).then(rows => rows[0]);
+      if (req.actor.type === "agent" && responseWake && queuedInteractionId(responseWake.payload)) assertBoard(req);
       const response = responseWake ? await readQueuedInteractionResponse(db, issue.companyId, issue.id, responseWake.payload) : null;
       if (responseWake) await recheckQueuedCommentInteractionDelivery(db, {
         companyId: issue.companyId, issueId: issue.id, agentId: responseWake.agentId,
@@ -17831,6 +17856,7 @@ export function issueRoutes(
             .for("update")
             .limit(1)
             .then((rows) => rows[0] ?? null);
+          if (req.actor.type === "agent" && retryWake && queuedInteractionId(retryWake.payload)) assertBoard(req);
           const retryRun =
             retryWake && readObject(retryWake.payload).issueId === issue.id
               ? await tx
@@ -17882,6 +17908,7 @@ export function issueRoutes(
             targetRunId: req.body.targetRunId,
             lockRun: false,
           });
+          if (req.actor.type === "agent" && queuedInteractionId(locked.wake.payload)) assertBoard(req);
           if (!locked.activeRun) {
             throw conflict("The queued message targets a stale run", {
               code: "queued_comment_stale_target",

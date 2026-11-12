@@ -2042,6 +2042,107 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     return identity!;
   }
 
+  it("lets an assignee's direct manager steer a plain comment on the active run", async () => {
+    const seeded = await seedQueue();
+    const managerId = randomUUID();
+    await db.insert(agents).values({
+      id: managerId,
+      companyId: seeded.companyId,
+      name: "Direct manager",
+      role: "manager",
+      adapterType: "paperclip_runner",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, seeded.agentId));
+    const managerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: managerRunId,
+      companyId: seeded.companyId,
+      agentId: managerId,
+      invocationSource: "assignment",
+      status: "running",
+      runtimeMode: "native",
+      contextSnapshot: { issueId: randomUUID() },
+    });
+    const manager = app(seeded.companyId, "manager", { agentId: managerId, runId: managerRunId });
+    const queue = await request(manager).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+    steerNativeSessionMock.mockResolvedValueOnce({ turnId: "manager-turn" });
+
+    const steered = await request(manager)
+      .post(`/api/issues/${seeded.issueId}/queued-comments/${seeded.commentIds[0]}/steer`)
+      .send({ queueId: seeded.wakeId, targetRunId: seeded.runId, revision: queue.body.revision });
+
+    expect(steered.status, JSON.stringify(steered.body)).toBe(200);
+    expect(steerNativeSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      runId: seeded.runId,
+      message: "First queued message",
+      correlationId: seeded.commentIds[0],
+    }));
+    expect(steered.body).toMatchObject({ targetRunId: seeded.runId });
+    expect(steered.body.entries.map((entry: any) => entry.comment.id)).toEqual([seeded.commentIds[1]]);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seeded.companyId));
+    expect(runs).toHaveLength(2);
+    expect(runs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: seeded.runId, status: "running" }),
+      expect.objectContaining({ id: managerRunId, status: "running" }),
+    ]));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(issue.executionRunId).toBe(seeded.runId);
+  });
+
+  it.each(["non-manager", "grand-manager", "another-company", "assignee"] as const)(
+    "keeps %s agents on the board-only denial for steering",
+    async callerKind => {
+      const seeded = await seedQueue();
+      const grandManagerId = randomUUID();
+      const managerId = randomUUID();
+      await db.insert(agents).values([
+        { id: grandManagerId, companyId: seeded.companyId, name: "Grand manager", role: "manager" },
+        { id: managerId, companyId: seeded.companyId, name: "Direct manager", role: "manager", reportsTo: grandManagerId },
+      ]);
+      await db.update(agents).set({ reportsTo: managerId }).where(eq(agents.id, seeded.agentId));
+      let callerId: string;
+      let callerCompanyId = seeded.companyId;
+      if (callerKind === "grand-manager") callerId = grandManagerId;
+      else if (callerKind === "assignee") callerId = seeded.agentId;
+      else if (callerKind === "another-company") {
+        callerCompanyId = randomUUID();
+        await db.insert(companies).values({
+          id: callerCompanyId,
+          name: "Other Queue Test Company",
+          issuePrefix: "OTH",
+          requireBoardApprovalForNewAgents: false,
+        });
+        callerId = randomUUID();
+        await db.insert(agents).values({
+          id: callerId, companyId: callerCompanyId, name: "Other-company agent", role: "manager",
+        });
+      } else {
+        callerId = randomUUID();
+        await db.insert(agents).values({
+          id: callerId, companyId: seeded.companyId, name: "Non-manager", role: "engineer",
+        });
+      }
+      const caller = app(callerCompanyId, "agent-caller", { agentId: callerId, runId: randomUUID() });
+      const boardQueue = await request(app(seeded.companyId)).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      const steeringCallCount = steerNativeSessionMock.mock.calls.length;
+
+      const denied = await request(caller)
+        .post(`/api/issues/${seeded.issueId}/queued-comments/${seeded.commentIds[0]}/steer`)
+        .send({ queueId: seeded.wakeId, targetRunId: seeded.runId, revision: boardQueue.body.revision })
+        .expect(403);
+
+      expect(denied.body).toMatchObject({
+        error: "Board access required",
+        code: "board_access_required",
+        remediation: expect.stringContaining("this denial is final"),
+      });
+      expect(steerNativeSessionMock).toHaveLength(steeringCallCount);
+    },
+  );
+
   it("writes the identity acceptance, the wake payload, the run acknowledgement, and the activity row on a successful steering transaction", async () => {
     const seeded = await seedQueue();
     await seedDispatchIdentity(seeded);
