@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { open, readdir, readlink, stat } from "node:fs/promises";
+import { createReadStream, type BigIntStats } from "node:fs";
+import { lstat, open, readdir, readlink, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 // File hashing and archive commands on a run path must not block the event
@@ -42,6 +42,35 @@ export async function cachedFileSha256(path: string): Promise<string> {
 /** Test seam: forget every cached digest. */
 export function clearCachedFileSha256(): void {
   digestCache.clear();
+}
+
+/** Metadata-only invalidation for a verified immutable artifact. Walk directory
+ * entries too: a root mtime cannot detect a changed dependency several levels
+ * below it. ctime catches same-size writes even if mtime is restored. Tree
+ * symlinks are not followed (matching the tree digest); a file artifact's target
+ * is followed (matching file hashing). No provider file contents are read. */
+export async function artifactMetadataFingerprint(path: string, tree: boolean): Promise<string> {
+  const hash = createHash("sha256");
+  const record = (metadata: BigIntStats) => {
+    hash.update([metadata.dev, metadata.ino, metadata.mode, metadata.nlink, metadata.size,
+      metadata.mtimeNs, metadata.ctimeNs].join(":"));
+    hash.update("\n");
+  };
+  const visit = async (entryPath: string, descend: boolean): Promise<void> => {
+    hash.update(`${entryPath}\0`);
+    const metadata = await lstat(entryPath, { bigint: true });
+    record(metadata);
+    if (descend && metadata.isDirectory()) {
+      for (const name of (await readdir(entryPath)).sort()) await visit(join(entryPath, name), true);
+    }
+  };
+  await visit(path, false);
+  // Top-level artifacts may be package-manager shims/symlinks.
+  record(await stat(path, { bigint: true }));
+  if (tree) {
+    for (const name of (await readdir(path)).sort()) await visit(join(path, name), true);
+  }
+  return hash.digest("hex");
 }
 
 const HEADER_BYTES = 64 * 1024;

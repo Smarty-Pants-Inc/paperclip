@@ -154,7 +154,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { lstat, readFile, readdir, readlink } from "node:fs/promises";
+import { lstat, readFile, readdir, readlink, realpath as providerPackRealpath, stat as providerPackStat } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES, loadNativeRunnerCheckpoint, loadNativeRunnerCheckpointHeader, loadNativeUnclaimedBootstrapCheckpoint, nativeRunnerCheckpointPersistence, nativeRunnerCheckpointRegistration, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
@@ -326,6 +326,7 @@ import {
   execFileBuffered,
   sha256DirectoryTreeStreamed,
   sha256FileStreamed,
+  artifactMetadataFingerprint,
 } from "./off-loop-file-work.js";
 import {
   NativeRunnerOwnershipUnverifiedError,
@@ -13467,27 +13468,89 @@ export function readRemoteProviderPackManifest(packRoot: string): RemoteProvider
   return readRemoteProviderPackIdentity(packRoot, true);
 }
 
-/**
- * `readRemoteProviderPackManifest` for a run path: the same checks in the same
- * order, but the controller files are hashed by streaming, off the event loop.
- */
-export async function verifyRemoteProviderPackManifest(packRoot: string): Promise<RemoteProviderPackManifest> {
-  const checks = providerPackIdentityChecks(packRoot, true);
-  let step = checks.next();
-  while (!step.done) {
-    const request = step.value;
-    const digest = request.kind === "file"
-      ? await sha256FileStreamed(request.path)
-      : await sha256DirectoryTreeStreamed(request.path, unsupportedProviderDistEntry);
-    step = checks.next(digest);
+type VerifiedProviderPack = {
+  manifest: RemoteProviderPackManifest;
+  requests: ProviderPackHashRequest[];
+  metadata: string;
+};
+const verifiedProviderPacks = new Map<string, Promise<VerifiedProviderPack>>();
+const VERIFIED_PROVIDER_PACK_LIMIT = 32;
+
+async function providerPackMetadata(requests: ProviderPackHashRequest[]): Promise<string> {
+  const metadata: string[] = [];
+  for (const request of requests) metadata.push(await artifactMetadataFingerprint(request.path, request.kind === "tree"));
+  return JSON.stringify(metadata);
+}
+
+/** Run-path verification of a build-owned pack. Successful content verification
+ * is shared by local launch and controller-source upload within this process.
+ * Root/manifest replacement, provider selection and deep artifact metadata
+ * changes invalidate it. Failures never survive in the memo. */
+export async function verifyRemoteProviderPackManifest(packRoot: string, provider?: PackProvider): Promise<RemoteProviderPackManifest> {
+  // Preserve manifest validation and its bounded diagnostic errors on every hit.
+  const identity = readRemoteProviderPackIdentity(packRoot, false);
+  const root = await providerPackRealpath(packRoot);
+  const manifestMetadata = async () => {
+    const metadata = await providerPackStat(resolve(root, "provider-pack.json"), { bigint: true });
+    const rootMetadata = await providerPackStat(root, { bigint: true });
+    return [rootMetadata.dev, rootMetadata.ino, metadata.dev, metadata.ino, metadata.size,
+      metadata.mtimeNs, metadata.ctimeNs].join(":");
+  };
+  const generation = await manifestMetadata();
+  const selection = provider?.kind === "acpx" ? [provider.kind, provider.agent] : [provider?.kind ?? "all"];
+  const key = JSON.stringify([root, identity.digest, generation, selection]);
+  const cached = verifiedProviderPacks.get(key);
+  if (cached) {
+    const verified = await cached;
+    if (await providerPackMetadata(verified.requests) === verified.metadata && await manifestMetadata() === generation) {
+      return structuredClone(verified.manifest);
+    }
+    if (verifiedProviderPacks.get(key) === cached) verifiedProviderPacks.delete(key);
   }
-  return step.value;
+  // Recheck after asynchronous metadata work so concurrent callers coalesce.
+  const pending = verifiedProviderPacks.get(key);
+  if (pending && pending !== cached) return structuredClone((await pending).manifest);
+  const verification = (async (): Promise<VerifiedProviderPack> => {
+    const checks = providerPackIdentityChecks(root, true, provider);
+    const requests: ProviderPackHashRequest[] = [];
+    const before: string[] = [];
+    const digests = new Map<string, string>();
+    let step = checks.next();
+    while (!step.done) {
+      const request = step.value;
+      const requestKey = JSON.stringify(request);
+      let digest = digests.get(requestKey);
+      if (digest === undefined) {
+        requests.push(request);
+        before.push(await artifactMetadataFingerprint(request.path, request.kind === "tree"));
+        digest = request.kind === "file"
+          ? await sha256FileStreamed(request.path)
+          : await sha256DirectoryTreeStreamed(request.path, unsupportedProviderDistEntry);
+        digests.set(requestKey, digest);
+      }
+      step = checks.next(digest);
+    }
+    const metadata = JSON.stringify(before);
+    if (step.value.digest !== identity.digest || await manifestMetadata() !== generation
+      || await providerPackMetadata(requests) !== metadata) {
+      throw new Error("runner_remote_provider_artifact_incompatible: provider pack changed during verification");
+    }
+    return { manifest: step.value, requests, metadata };
+  })();
+  verifiedProviderPacks.set(key, verification);
+  if (verifiedProviderPacks.size > VERIFIED_PROVIDER_PACK_LIMIT) verifiedProviderPacks.delete(verifiedProviderPacks.keys().next().value!);
+  try {
+    return structuredClone((await verification).manifest);
+  } catch (error) {
+    if (verifiedProviderPacks.get(key) === verification) verifiedProviderPacks.delete(key);
+    throw error;
+  }
 }
 
 /** Local native Pi uses the same qualified, hash-verified artifacts as a pack launch. */
 export async function resolveLocalPiLaunchArtifacts(configuredRoot?: string | null) {
   const packRoot = configuredRoot?.trim() || dirname(bundledRemoteProviderPackManifestPath());
-  const manifest = await verifyRemoteProviderPackManifest(packRoot);
+  const manifest = await verifyRemoteProviderPackManifest(packRoot, { kind: "pi_rpc" });
   const { artifacts, target, nativeProviders } = manifest.payload;
   if (target.platform !== process.platform || target.architecture !== process.arch
     || !nativeProviders?.pi_rpc || !artifacts.piRpcExecutable || !artifacts.piRpcProxy) {
@@ -13530,6 +13593,7 @@ function readRemoteProviderPackIdentity(packRoot: string, verifyControllerFiles:
 function* providerPackIdentityChecks(
   packRoot: string,
   verifyControllerFiles: boolean,
+  selectedProvider?: PackProvider,
 ): Generator<ProviderPackHashRequest, RemoteProviderPackManifest, string> {
   let manifest: RemoteProviderPackManifest;
   try {
@@ -13640,6 +13704,18 @@ function* providerPackIdentityChecks(
       "runner_remote_provider_artifact_incompatible: provider dist tree digest mismatch",
     );
   }
+  const nativePi = payload.nativeProviders?.pi_rpc;
+  if (selectedProvider?.kind === "pi_rpc" && !nativePi) {
+    throw new Error("runner_remote_provider_artifact_incompatible: native provider pi_rpc is missing");
+  }
+  if (nativePi) {
+    const nativePath = providerPackRelativePath(nativePi.path, "native Pi assets");
+    if (nativePath !== `provider-assets/pi_rpc/${payload.target.platform}-${payload.target.architecture}`
+      || !/^sha256:[a-f0-9]{64}$/.test(nativePi.sha256)
+      || (verifyControllerFiles && (yield { kind: "tree", path: resolve(packRoot, nativePath) }) !== nativePi.sha256)) {
+      throw new Error("runner_remote_provider_artifact_incompatible: native Pi asset tree digest mismatch");
+    }
+  }
   for (const [inventory, candidates] of [["providers", payload.providers], ["candidateProviders", payload.candidateProviders]] as const) {
     if (candidates === undefined) continue;
     const allowedProviders: readonly string[] = inventory === "providers" ? REMOTE_PROVIDER_PACK_PROVIDERS : REMOTE_PROVIDER_PACK_CANDIDATES;
@@ -13693,7 +13769,8 @@ function* providerPackIdentityChecks(
           throw new Error("runner_remote_provider_artifact_incompatible: Kimi profile or closure does not match this release");
         }
       }
-      if (verifyControllerFiles && (yield { kind: "tree", path: resolve(packRoot, candidatePath) }) !== candidate.sha256) {
+      if (verifyControllerFiles && (!selectedProvider || selectedProvider.kind === "acpx" && selectedProvider.agent === provider)
+        && (yield { kind: "tree", path: resolve(packRoot, candidatePath) }) !== candidate.sha256) {
         throw new Error("runner_remote_provider_artifact_incompatible: candidate asset tree digest mismatch");
       }
     }
@@ -14028,7 +14105,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
         targetPath: stagedRemoteProviderPackRoot,
         reuseRoots: preinstalledProviderPackRoots,
         trace: input.trace,
-        verifyDirectory: async (sourceRoot) => { await verifyRemoteProviderPackManifest(sourceRoot); },
+        verifyDirectory: async (sourceRoot) => { await verifyRemoteProviderPackManifest(sourceRoot, input.provider); },
         stageDirectory: (sourceRoot) => stageRemoteRunnerDirectory({
           target: remoteTarget,
           runner: remoteCommandRunner,

@@ -254,6 +254,31 @@ async function nativePiFixture() {
 }
 
 describe("native Pi remote provider pack verification", () => {
+  it("hashes only the selected provider and candidate on every cold remote admission", async () => {
+    const fixture = await nativePiFixture();
+    try {
+      const path = "provider-assets/pi/linux-x64";
+      await mkdir(join(fixture.root, path), { recursive: true });
+      await writeFile(join(fixture.root, path, "dependency"), "original");
+      const pi = { path, sha256: fixtureTreeDigest({ dependency: "original" }) };
+      fixture.pack.payload.providers = { pi };
+      fixture.pack.payload.candidateProviders = { pi: { ...pi, sha256: sha("bad candidate identity") } };
+      await fixture.seal();
+      await writeFile(join(fixture.root, path, "dependency"), "tampered");
+      await expect(verifyRemoteProviderPack(fixture.input)).resolves.toEqual(fixture.pack);
+      await expect(verifyRemoteProviderPack({ ...fixture.input, provider: { kind: "acpx", agent: "pi" } })).rejects.toThrow("candidate asset tree digest mismatch");
+      await writeFile(join(fixture.root, path, "dependency"), "original");
+      // Both inventories must be checked; a candidate cannot mask a provider.
+      await expect(verifyRemoteProviderPack({ ...fixture.input, provider: { kind: "acpx", agent: "pi" } })).rejects.toThrow("candidate asset tree digest mismatch");
+      fixture.pack.payload.candidateProviders = { pi };
+      await fixture.seal();
+      await expect(verifyRemoteProviderPack({ ...fixture.input, provider: { kind: "acpx", agent: "pi" } })).resolves.toEqual(fixture.pack);
+      await writeFile(join(fixture.root, "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-ai/package.json"), "tampered native Pi");
+      // No cross-sandbox success memo: the next call must read native Pi again.
+      await expect(verifyRemoteProviderPack(fixture.input)).rejects.toThrow("native Pi asset tree digest mismatch");
+    } finally { await fixture.cleanup(); }
+  });
+
   it("verifies the declared native Pi proxy, executable and closure over the remote runner", async () => {
     const fixture = await nativePiFixture();
     try {

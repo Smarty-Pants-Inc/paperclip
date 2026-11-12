@@ -123,7 +123,7 @@ import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 import type { AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
 import { acknowledgedNativeStopExecutionHasStopped, isAcknowledgedNativeStop } from "../acknowledged-native-stop.js";
 import { admittedNativeProviderPack, nativeProviderPackAdmissionPending, rememberAdmittedNativeProviderPack } from "./native-provider-pack-admission.js";
-import { canonicalProviderPackJson } from "./remote-provider-pack-verification.js";
+import { canonicalProviderPackJson, canonicalProviderPackDigestJson } from "./remote-provider-pack-verification.js";
 import * as providerPackAdmission from "./native-provider-pack-admission.js";
 import * as providerArtifactStorage from "./native-provider-artifacts.js";
 import * as providerArtifactCapture from "./native-provider-artifact-capture.js";
@@ -132,6 +132,7 @@ import * as nativeCredentialStores from "./native-credential-store.js";
 import * as managedCredentialWriteback from "../managed-ai-credential-writeback.js";
 import { completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import * as nativeExecutionDriver from "./native-runner-execution-driver.js";
+import * as offLoopFileWork from "./off-loop-file-work.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -467,6 +468,7 @@ import {
   verifyRemoteRunnerOrSettledExit,
   readRemoteProviderPackManifest,
   verifyRemoteProviderPackManifest,
+  resolveLocalPiLaunchArtifacts,
   prepareRemoteProviderPackOnTarget,
   resolveRemoteProviderPackSource,
   readBundledRemoteProviderPackManifest,
@@ -15854,6 +15856,61 @@ describe("runnerd provider runtime wiring", () => {
     expect(close).toHaveBeenCalledTimes(timing === "during-close" ? 1 : 0);
     expect(state.copyBackCodexAuth).not.toHaveBeenCalled();
     await expect(readFile(authPath, "utf8")).resolves.toBe(auth);
+  });
+
+  // Keep: real artifact trust boundary and the recorded 60-100s per-run pack
+  // rehash incident. Backend creation exercises the actual local launch path.
+  it("native Pi launches hash only the selected provider once per immutable pack", async () => {
+    const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+    const { packRoot, manifest } = await nativePiProviderPackFixture(join(isolatedStateDirectory, "memo-pi-pack"));
+    const piPath = "provider-assets/pi/linux-x64";
+    await mkdir(join(packRoot, piPath), { recursive: true });
+    await writeFile(join(packRoot, piPath, "unused-runtime"), "other provider");
+    const pi = { path: piPath, sha256: sha256DirectoryTree(join(packRoot, piPath)), version: "test",
+      profileDigest: `sha256:${nativeSha256("profile")}`, closureDigest: `sha256:${nativeSha256("closure")}`, qualification: "qualified" };
+    Object.assign(manifest.payload, { providers: { pi }, candidateProviders: { pi } });
+    manifest.digest = `sha256:${createHash("sha256").update(canonicalProviderPackDigestJson(manifest.payload)).digest("hex")}`;
+    await writeFile(join(packRoot, "provider-pack.json"), JSON.stringify(manifest));
+    const hashTree = vi.spyOn(offLoopFileWork, "sha256DirectoryTreeStreamed");
+    onTestFinished(() => hashTree.mockRestore());
+    const launch = async (suffix: string) => {
+      const current = { ...scopedNativeExecution(`memo-pi-${suffix}`),
+        provider: { kind: "pi_rpc", model: "paperclip/faux", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" },
+      } as unknown as NativeExecutionInput;
+      await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "memo-controller",
+        runnerEnvironment: {}, runnerRemoteProviderPackPath: packRoot });
+    };
+    await launch("first");
+    expect(hashTree.mock.calls.map(call => call[0])).toEqual([
+      join(packRoot, "dist"), join(packRoot, manifest.payload.nativeProviders.pi_rpc.path),
+    ]);
+    await launch("second");
+    expect(hashTree).toHaveBeenCalledTimes(2);
+    // The remote upload's controller-source path shares this exact verification.
+    await verifyRemoteProviderPackManifest(packRoot, { kind: "pi_rpc" });
+    expect(hashTree).toHaveBeenCalledTimes(2);
+  });
+
+  it("coalesces concurrent native Pi verifications and retries a failed verification closed", async () => {
+    const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+    const { packRoot, manifest } = await nativePiProviderPackFixture(join(isolatedStateDirectory, "memo-pi-retry"));
+    const hashTree = vi.spyOn(offLoopFileWork, "sha256DirectoryTreeStreamed");
+    onTestFinished(() => hashTree.mockRestore());
+    const nativeFile = join(packRoot, manifest.payload.nativeProviders.pi_rpc.path, "tampered-dependency");
+    await writeFile(nativeFile, "substitute runtime dependency");
+    await expect(resolveLocalPiLaunchArtifacts(packRoot)).rejects.toThrow("asset tree digest mismatch");
+    await rm(nativeFile);
+    hashTree.mockClear();
+    const [first, second] = await Promise.all([resolveLocalPiLaunchArtifacts(packRoot), resolveLocalPiLaunchArtifacts(packRoot)]);
+    expect(second).toEqual(first);
+    expect(hashTree).toHaveBeenCalledTimes(2);
+    const oldCount = hashTree.mock.calls.length;
+    manifest.payload.runnerSourceRevision = "2".repeat(40);
+    manifest.digest = `sha256:${createHash("sha256").update(canonicalProviderPackDigestJson(manifest.payload)).digest("hex")}`;
+    await writeFile(join(packRoot, "provider-pack.json"), JSON.stringify(manifest));
+    const replaced = await resolveLocalPiLaunchArtifacts(packRoot);
+    expect(replaced.providerPackAuthorityDigest).toBe(manifest.digest);
+    expect(hashTree).toHaveBeenCalledTimes(oldCount + 2);
   });
 
   it.each(["low", "xhigh", "max"] as const)("native Pi transport preserves exact model and thinking %s", async piRpcThinkingLevel => {
