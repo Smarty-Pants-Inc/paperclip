@@ -57,6 +57,8 @@ export interface PiRpcDriverOptions {
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
   startupTimeoutMs?: number;
+  /** Dynamic tools have their own end-to-end deadline (protocol maximum: 60 s). */
+  dynamicToolTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
@@ -171,7 +173,7 @@ export class PiRpcDriver implements HarnessDriver {
           callbacks = new PiHostCallbacks(input.normalizedSessionId, this.#options.dynamicToolHandler);
           const toolSocketPath = join(privateDirectory, "tool.sock");
           // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
-          await callbacks.listen(toolSocketPath, this.#options.startupTimeoutMs);
+          await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
           const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools, toolSocketPath };
           if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
           resident = { directory: privateDirectory, socketPath, environment: { ...environment }, epoch: 1, context,
@@ -939,7 +941,7 @@ class PiHostCallbacks {
   readonly #waiters = new Map<string, Set<() => void>>();
   constructor(sessionId: string, handler: PiRpcDriverOptions["dynamicToolHandler"]) { this.#sessionId = sessionId; this.#handler = handler; }
   setNativeSessionId(id: string): void { if (this.#nativeSessionId !== null) throw new Error("Pi callback identity already assigned"); this.#nativeSessionId = id; }
-  async listen(socketPath: string, timeoutMs = 5000): Promise<void> {
+  async listen(socketPath: string, timeoutMs = 60000): Promise<void> {
     this.#server = await startPiCallbackServer({ socketPath, sessionId: this.#sessionId, authority: this.authority, timeoutMs,
       waitForAnnouncement: (call, signal) => this.#wait(call, signal),
       handleTool: async (call, signal) => {
