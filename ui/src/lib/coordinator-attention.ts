@@ -2,6 +2,8 @@ import type { AttentionItem, DecisionHistoryItem } from "@paperclipai/shared";
 import { queryKeys } from "./queryKeys";
 
 export const coordinatorAttentionQueryKey = (companyId: string) => [...queryKeys.attention(companyId), "coordinator", "pending"] as const;
+/** Inbox also needs hidden rows; never share that response with the active-only feed. */
+export const coordinatorAttentionInboxQueryKey = (companyId: string) => [...coordinatorAttentionQueryKey(companyId), "with-dismissed"] as const;
 export const coordinatorAttentionSummaryQueryKey = (companyId: string) => [...queryKeys.attention(companyId), "coordinator", "summary"] as const;
 export const coordinatorAttentionTasksQueryKey = (companyId: string) => [...queryKeys.attention(companyId), "coordinator", "tasks"] as const;
 

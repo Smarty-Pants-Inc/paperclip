@@ -31,6 +31,7 @@ import {
   sourceMeta,
 } from "../lib/attention";
 import { cn, relativeTime } from "../lib/utils";
+import { reappearLabel, SNOOZE_PRESETS } from "../lib/attention-snooze";
 import { DecisionTriageStrip } from "./DecisionTriageStrip";
 import { InteractionAudienceLine } from "./InteractionAudienceLine";
 import { StatusGlyph } from "./StatusGlyph";
@@ -52,30 +53,11 @@ import { DecisionResolver } from "./DecisionResolver";
 import { StalledReviewActions } from "./StalledReviewActions";
 import { readIssueReviewPolicyMetadata } from "../lib/review-policy";
 
-const HOUR_MS = 60 * 60 * 1000;
-const DAY_MS = 24 * HOUR_MS;
-
 // Decision-action buttons: a comfortable tap target when the row is narrow
 // (h-9 / text-sm), shrinking back to the dense pill (h-6 / text-xs) once the
 // row's own container is wide enough (`@xl` ≈ 576px). Container-query driven so
 // the row also reflows correctly inside narrow side panels, not just on phones.
 const ACTION_BTN = "h-9 gap-1.5 px-3 text-sm @xl:h-6 @xl:gap-1 @xl:px-2 @xl:text-xs";
-
-/** Tomorrow at 9am local time. */
-function tomorrowMorningIso(): string {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  d.setHours(9, 0, 0, 0);
-  return d.toISOString();
-}
-
-/** Snooze presets, resolved to a future ISO timestamp at click time. */
-const SNOOZE_PRESETS: ReadonlyArray<{ label: string; resolve: () => string }> = [
-  { label: "1 hour", resolve: () => new Date(Date.now() + HOUR_MS).toISOString() },
-  { label: "4 hours", resolve: () => new Date(Date.now() + 4 * HOUR_MS).toISOString() },
-  { label: "Tomorrow morning", resolve: tomorrowMorningIso },
-  { label: "Next week", resolve: () => new Date(Date.now() + 7 * DAY_MS).toISOString() },
-];
 
 interface AttentionQueueRowProps {
   item: AttentionItem;
@@ -728,18 +710,6 @@ function decideByProvenance(item: AttentionItem): string | null {
   if (!attribution) return null;
   if (attribution.type === "agent") return attribution.agentName ?? "an agent";
   return "you";
-}
-
-/** Compact "when does this snooze end" label, e.g. `in 2h`, `in 3d`. */
-function reappearLabel(snoozedUntil: string): string {
-  const diffMs = new Date(snoozedUntil).getTime() - Date.now();
-  if (!Number.isFinite(diffMs) || diffMs <= 0) return "soon";
-  const diffMin = Math.round(diffMs / 60000);
-  if (diffMin < 60) return `in ${diffMin}m`;
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `in ${diffHr}h`;
-  const diffDay = Math.round(diffHr / 24);
-  return `in ${diffDay}d`;
 }
 
 /**
