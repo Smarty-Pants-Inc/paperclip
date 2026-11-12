@@ -188,7 +188,7 @@ function fixtureTreeDigest(files: Record<string, string>): string {
   const records: string[] = [];
   const visit = (prefix: string) => {
     const children = [...new Set(Object.keys(files).filter(path => path.startsWith(prefix))
-      .map(path => path.slice(prefix.length).split("/")[0]))].sort((a, b) => a.localeCompare(b));
+      .map(path => path.slice(prefix.length).split("/")[0]))].sort();
     for (const child of children) {
       const path = `${prefix}${child}`;
       if (path in files) records.push(`file\0${path}\0${sha(files[path])}\n`);
@@ -199,7 +199,7 @@ function fixtureTreeDigest(files: Record<string, string>): string {
   return sha(records.join(""));
 }
 
-async function nativePiFixture() {
+async function nativePiFixture(extraFiles: Record<string, string> = {}) {
   const root = await mkdtemp(join(tmpdir(), "native-pi-pack-verification-"));
   const pack = manifest("a") as NativePiPack;
   Object.assign(pack.payload.pins, { acpx: "0.22.0", claudeAcp: "0.73.0", codexAcp: "1.6.2" });
@@ -209,6 +209,7 @@ async function nativePiFixture() {
   const files: Record<string, string> = {
     [pack.payload.artifacts.nodeCommand.path]: `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
     [pack.payload.artifacts.opencodeCommand.path]: `#!/bin/sh\nprintf '%s\n' '${pack.payload.pins.opencode}'\n`,
+    ...extraFiles,
     [proxyPath]: "// native Pi RPC proxy\n",
     [executablePath]: "// independently pinned native Pi CLI\n",
     [`${nativePath}/runtime/node_modules/@earendil-works/pi-ai/package.json`]: '{"version":"1.5.2"}\n',
@@ -254,6 +255,24 @@ async function nativePiFixture() {
 }
 
 describe("native Pi remote provider pack verification", () => {
+  it.each(["en_US.UTF-8", "sv_SE.UTF-8"])("verifies code-unit tree digests for dist, native Pi and selected provider under %s", async locale => {
+    const selectedPath = "provider-assets/pi/linux-x64";
+    const files = Object.fromEntries(["dist/order", "provider-assets/pi_rpc/linux-x64/order", selectedPath]
+      .flatMap(prefix => ["a_b", "aB", "Z"].map(name => [`${prefix}/${name}`, name])));
+    const fixture = await nativePiFixture(files);
+    try {
+      const candidate = { path: selectedPath, sha256: fixtureTreeDigest({ a_b: "a_b", aB: "aB", Z: "Z" }) };
+      fixture.pack.payload.providers = { pi: candidate };
+      fixture.pack.payload.candidateProviders = { pi: candidate };
+      await fixture.seal();
+      // The remote command is a new Node process with this locale, not an
+      // in-process comparison that happens to share the builder's ICU default.
+      vi.stubEnv("LC_ALL", locale);
+      vi.stubEnv("LANG", locale);
+      await expect(verifyRemoteProviderPack({ ...fixture.input, provider: { kind: "acpx", agent: "pi" } })).resolves.toEqual(fixture.pack);
+    } finally { vi.unstubAllEnvs(); await fixture.cleanup(); }
+  });
+
   it("hashes only the selected provider and candidate on every cold remote admission", async () => {
     const fixture = await nativePiFixture();
     try {

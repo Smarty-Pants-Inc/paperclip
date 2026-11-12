@@ -110,7 +110,7 @@ export async function sha256DirectoryTreeStreamed(
   const hash = createHash("sha256");
   const visit = async (directory: string, prefix = ""): Promise<void> => {
     const entries = (await readdir(directory, { withFileTypes: true })).sort(
-      (left, right) => left.name.localeCompare(right.name),
+      (left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0,
     );
     for (const entry of entries) {
       const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
