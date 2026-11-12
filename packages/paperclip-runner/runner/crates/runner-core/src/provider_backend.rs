@@ -9510,6 +9510,38 @@ done
         }
     }
 
+    // F5: a mandatory native usage receipt is accounting, never an answer.
+    // Keep beside B6 so the downstream guard retains the same failure code.
+    #[test]
+    fn pi_rpc_usage_only_terminal_does_not_fabricate_a_successful_answer() {
+        let mut state = pi_rpc_result_state();
+        let usage = normalize_provider_notification(
+            &mut state,
+            "thread/tokenUsage/updated",
+            &json!({
+                "threadId": "native",
+                "turnId": "empty-with-mandatory-usage",
+                "tokenUsage": {
+                    "total": {"inputTokens": 11, "outputTokens": 1, "totalTokens": 12},
+                    "last": {"inputTokens": 11, "outputTokens": 1, "totalTokens": 12}
+                }
+            }),
+        )
+        .unwrap();
+        assert!(usage
+            .iter()
+            .any(|event| event.event_type == "usage.reported"));
+        assert!(state.last_agent_message.is_none());
+        assert!(state.active_provider_result_fingerprint.is_none());
+
+        let events = terminal_events(&state, "turn.completed", None);
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "run.result.proposed"));
+        assert_eq!(events[0].payload["code"], "opencode_empty_response");
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+    }
+
     #[test]
     fn pi_rpc_normal_terminal_preserves_the_successful_answer() {
         let mut state = pi_rpc_result_state();

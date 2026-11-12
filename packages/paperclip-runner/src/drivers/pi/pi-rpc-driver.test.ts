@@ -271,6 +271,32 @@ describe("Pi canonical SDK dialogs", () => {
     } finally { await f.close(); }
   });
 
+  it("preserves an accepted dialog wait without fabricating an assistant answer (F5)", async () => {
+    const f = await dialogFixture();
+    try {
+      f.transport.send({ type: "extension_ui_request", id: "wait", method: "input", title: "Your answer?" });
+      const message = { role: "assistant", responseId: "empty-wait", timestamp: 1, provider: "paperclip", model: "faux", content: [], usage: {}, stopReason: "stop" };
+      f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message });
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "turn.completed")).toBe(true));
+      expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(true);
+      expect(f.events.some(e => e.payload.kind === "agentMessage" && String(e.payload.text ?? "").trim())).toBe(false);
+    } finally { await f.close(); }
+  });
+
+  it("does not treat a refused dialog as an accepted wait (F5)", async () => {
+    const f = await dialogFixture();
+    try {
+      f.transport.send({ type: "extension_ui_request", id: "refused", method: "input" });
+      const message = { role: "assistant", responseId: "empty-refused", timestamp: 1, provider: "paperclip", model: "faux", content: [], usage: {}, stopReason: "stop" };
+      f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message });
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "turn.failed")).toBe(true));
+      expect(f.events.find(e => e.eventType === "turn.failed")?.payload).toMatchObject({ error: { code: "opencode_empty_response" } });
+      expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(false);
+    } finally { await f.close(); }
+  });
+
   it("captures queued old SDK UI before settlement; late answers cannot borrow the warm run", async () => {
     const f = await dialogFixture();
     try {
@@ -435,7 +461,7 @@ describe("PiRpcDriver P0 regressions", () => {
       const turn = await f.session.startTurn({ message: { role: "user", text: "one long real prompt" } });
       f.transport.send({ type: "agent_start" });
       for (let i = 0; i < 1400; i++) {
-        const message = { role: "assistant", provider: "neutral", model: "model", id: `native-id-${i}`, responseId: `response-${i}`, timestamp: i + 1, content: [], stopReason: "stop", usage: {} };
+        const message = { role: "assistant", provider: "neutral", model: "model", id: `native-id-${i}`, responseId: `response-${i}`, timestamp: i + 1, content: i === 1399 ? [{ type: "text", text: "finished the long prompt" }] : [], stopReason: "stop", usage: {} };
         f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message });
       }
       f.transport.send({ type: "agent_end", messages: [], willRetry: false }); f.transport.send({ type: "agent_settled", aborted: false });

@@ -55,6 +55,66 @@ function sendMessage(transport: OutputLimitTransport, message: PiRpcRecord) {
   transport.send({ type: "message_end", message });
 }
 
+// B6 guards the Rust consumer; F5 must also reject at the real TS pump/facade.
+// Keep reason: usage is accounting, not an answer across this trust boundary.
+describe("B6/F5 empty Pi completion with mandatory usage", () => {
+  it.each([
+    ["empty", []], ["empty text block", text("")], ["whitespace", text(" \t\n")],
+    ["thinking only", [{ type: "thinking", thinking: "private reasoning" }]],
+  ])("rejects %s despite a native usage receipt", async (_name, content) => {
+    const f = await fixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "answer" } });
+      f.transport.send({ type: "agent_start" });
+      const message = receipt("stop", content as unknown[]);
+      expect(message.usage).toBeDefined();
+      sendMessage(f.transport, message);
+      f.transport.send({ type: "agent_end" });
+      await flush();
+      expect(terminals(f.events)).toEqual([]);
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await flush();
+      expect(terminals(f.events)).toMatchObject([{ eventType: "turn.failed", turnId: turn.turnId,
+        payload: { status: "failed", piAgentSettled: true, error: { code: "opencode_empty_response", recoverable: false } } }]);
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+      expect(f.transport.closed).toBe(false);
+      for (const event of f.events) expect(validatePrpEvent(event).ok).toBe(true);
+    } finally { await f.close(); }
+  });
+
+  it("does not let an earlier receipt or transient delta hide an empty final answer", async () => {
+    const f = await fixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "answer" } });
+      f.transport.send({ type: "agent_start" });
+      sendMessage(f.transport, receipt("stop", text("earlier progress"), 1));
+      const message = receipt("stop", [], 2);
+      f.transport.send({ type: "message_start", message });
+      f.transport.send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "discarded" } });
+      f.transport.send({ type: "message_end", message });
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await flush();
+      expect(terminals(f.events)).toMatchObject([{ eventType: "turn.failed", payload: { error: { code: "opencode_empty_response" } } }]);
+    } finally { await f.close(); }
+  });
+
+  it.each(["paperclip_finish", "paperclip_block"])("preserves a tool-only %s followed by an empty usage receipt", async name => {
+    const f = await fixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "work" } });
+      f.transport.send({ type: "agent_start" });
+      sendMessage(f.transport, receipt("toolUse", [{ type: "toolCall", id: "finish", name, arguments: {} }], 1));
+      f.transport.send({ type: "tool_execution_start", toolCallId: "finish", toolName: name, args: {} });
+      f.transport.send({ type: "tool_execution_end", toolCallId: "finish", toolName: name, result: { content: [], details: {}, isError: false }, isError: false });
+      sendMessage(f.transport, receipt("stop", [], 2));
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await flush();
+      expect(terminals(f.events)).toMatchObject([{ eventType: "turn.completed" }]);
+      expect(f.events.some(event => event.payload.kind === "agentMessage" && String(event.payload.text ?? "").trim())).toBe(false);
+    } finally { await f.close(); }
+  });
+});
+
 describe("K2 final Pi output limit is not successful completion", () => {
   it.each([
     ["empty", []], ["empty text block", text("")], ["whitespace", text(" \t\n")],
