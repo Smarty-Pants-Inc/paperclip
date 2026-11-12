@@ -154,9 +154,12 @@ describe("live host Pi C2 authority", () => {
     gate.resolve(); await stopping; expect(f.transport.closed).toBe(true);
     await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.cancelled" && event.turnId === turn.turnId)).toBe(true));
   });
-  it("retires idle sessions on interrupt but ignores a stale turn-specific stop", async () => {
+  it("ignores idle or stale interrupts, but physically retires an active turn", async () => {
     const f = await fixture(); const turn = await f.start(); await f.session.interrupt({ turnId: "old-turn" }); expect(f.transport.closed).toBe(false); await f.settle();
-    await f.session.interrupt(); expect(f.transport.closed).toBe(true); expect(f.ipc.some(command => command.type === "stop_children")).toBe(true); expect(turn.turnId).toBe(f.initial.turnId);
+    await f.session.interrupt(); expect(f.transport.closed).toBe(false);
+    expect(f.ipc.some(command => command.type === "stop_children")).toBe(false); expect(turn.turnId).toBe(f.initial.turnId);
+    const next = await f.start(); await f.session.interrupt({ turnId: turn.turnId }); expect(f.transport.closed).toBe(false);
+    await f.session.interrupt({ turnId: next.turnId }); expect(f.transport.closed).toBe(true); expect(f.ipc.some(command => command.type === "stop_children")).toBe(true);
   });
   it("accepts a UI request attributed by a previously captured native message owner", async () => {
     const f = await fixture(); await f.start(); const message = { role: "assistant", id: "native-message", provider: "paperclip", model: "faux", timestamp: 1, content: [] };

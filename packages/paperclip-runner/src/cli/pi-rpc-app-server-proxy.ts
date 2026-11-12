@@ -478,7 +478,17 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     piNativeAdmission = (opened as PiRpcProxySession & { piNativeAdmission?(): Record<string, unknown> }).piNativeAdmission?.();
     if (!options.createDriver && !piNativeAdmission) throw new Error("Native Pi omitted admitted model/thinking metadata");
     if (piNativeAdmission) activeModel = String(piNativeAdmission.model);
-    eventPump = pumpEvents(opened);
+    eventPump = pumpEvents(opened).finally(() => {
+      // Stop/failure physically retires Pi. Never advertise that dead thread on
+      // the next thread/start, and never clear a newer session's authority.
+      if (session === opened) {
+        session = null;
+        activeTurnId = null;
+        piNativeAdmission = undefined;
+        announcedTurnIds.clear();
+        for (const key of Object.keys(usageTotals)) delete usageTotals[key];
+      }
+    });
     void eventPump.catch((error) => {
       log(`[pi_rpc] fatal proxy event pump error: ${error instanceof Error ? error.message : String(error)}\n`);
       send({ method: "warning", params: { threadId: opened.ids().driverSessionId, message: error instanceof Error ? error.message : String(error) } });

@@ -625,7 +625,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
-    if (input.turnId && input.turnId !== this.#activeTurn?.turnId) return;
+    if (!this.#activeTurn || (input.turnId && input.turnId !== this.#activeTurn.turnId)) return;
     // Stop is a physical retirement, not a reusable prompt cancellation.
     this.#callbacks?.fence();
     this.#admitted = false;
