@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -71,6 +71,63 @@ for (const parallel of [false, true]) test(`isolated forks retain fresh state wi
       if (!parallel) assert.deepEqual(workers.map((worker) => worker.name), order);
       for (const key of ['pid', 'home', 'config', 'instance']) assert.equal(new Set(workers.map((worker) => worker[key])).size, 2, key);
     }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+// Regression: abandoned wrapper roots exhausted ryzen4's /tmp inodes. Exercise
+// the actual wrapper boundary, including collection failures before the run.
+for (const [name, keep, failure] of [
+  ["successful run", "", ""],
+  ["failed run", "", "run"],
+  ["failed collection", "", "list"],
+  ["explicit keep", "1", ""],
+  ["keep after failure", "1", "run"],
+  ["keep=0 still cleans up", "0", ""],
+]) test(`wrapper temp roots honor TMPDIR and cleanup policy: ${name}`, { skip: process.platform === "win32" }, () => {
+  const directory = realpathSync(mkdtempSync(path.join(os.tmpdir(), "pc-root-proof-")));
+  const parent = path.join(directory, "tmp");
+  const receipt = path.join(directory, "root.json");
+  const fakePnpm = path.join(directory, "pnpm");
+  mkdirSync(parent);
+  try {
+    writeFileSync(fakePnpm, `#!${process.execPath}
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const root = path.dirname(process.env.PAPERCLIP_HOME);
+      fs.writeFileSync(${JSON.stringify(receipt)}, JSON.stringify({
+        root, home: process.env.PAPERCLIP_HOME, tmpdir: process.env.TMPDIR,
+        homeExists: fs.statSync(process.env.PAPERCLIP_HOME).isDirectory(),
+        tmpExists: fs.statSync(process.env.TMPDIR).isDirectory(),
+      }));
+      // Leave nested content behind to require recursive cleanup.
+      fs.writeFileSync(path.join(process.env.TMPDIR, 'fixture'), 'temporary');
+      if (process.argv.includes('list')) process.exit(7);
+      process.exit(${failure === "run" ? 7 : 0});
+    `);
+    chmodSync(fakePnpm, 0o755);
+    const env = { ...process.env, TMPDIR: parent,
+      PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+      PAPERCLIP_TEST_KEEP_TMP: keep, PAPERCLIP_CI_PROFILE: "false" };
+    for (const key of Object.keys(env)) {
+      if (key.endsWith("_TEST_DATABASE_URL")) delete env[key];
+    }
+    delete env.PAPERCLIP_CI_TEST_SELECTION;
+    delete env.PAPERCLIP_CI_SELECTION_HASH;
+    const result = spawnSync(process.execPath, [path.join(root, "scripts/run-vitest-stable.mjs"),
+      "--mode", "general", "--group", failure === "list" ? "general-chat" : "general-workspaces-c"], {
+      cwd: root, encoding: "utf8", timeout: 30_000, env,
+    });
+    assert.equal(result.status, failure ? 1 : 0, `${result.error ?? ""}\n${result.stdout}\n${result.stderr}`);
+    const observed = JSON.parse(readFileSync(receipt, "utf8"));
+    assert.equal(path.dirname(observed.root), parent, "root must be created under TMPDIR");
+    assert.match(path.basename(observed.root), /^pv-/);
+    assert.equal(observed.home, path.join(observed.root, "h"));
+    assert.equal(observed.tmpdir, path.join(observed.root, "t"));
+    assert.ok(observed.homeExists && observed.tmpExists, "root must exist while the child runs");
+    assert.equal(existsSync(observed.root), keep === "1", "only KEEP_TMP=1 retains the root");
+    assert.deepEqual(readdirSync(parent), keep === "1" ? [path.basename(observed.root)] : []);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
