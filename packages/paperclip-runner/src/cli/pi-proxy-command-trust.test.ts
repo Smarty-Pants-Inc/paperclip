@@ -37,6 +37,10 @@ describe.skipIf(process.platform !== "linux")("Pi executable and proxy owner tru
       contents.set(path!, Buffer.from(bytes!)); contents.set(fd!, Buffer.from(bytes!));
       canonicalPaths.set(path!, path!);
     }
+    // Parent directories of the real files: root-owned, not group/world-writable.
+    for (const directory of ["/pack", "/pack/cli", "/opt/pack", "/opt/pack/cli"]) {
+      metadata.set(directory, Object.assign(new Stats(), { mode: 0o040755, uid: 0, nlink: 2 }));
+    }
     vi.mocked(lstatSync).mockImplementation(((path) => {
       const result = metadata.get(String(path));
       if (!result) throw new Error("missing fixture metadata");
@@ -89,11 +93,31 @@ describe.skipIf(process.platform !== "linux")("Pi executable and proxy owner tru
         if (defect === "symlink") stat.mode = 0o120755;
         if (defect === "directory") stat.mode = 0o040755;
         if (defect === "hardlink") stat.nlink = 2;
-        if (defect === "noncanonical") canonicalPaths.set(path, `/elsewhere${path}`);
+        if (defect === "noncanonical") canonicalPaths.set(path, `/elsewhere${path}`); // real target untrusted/missing
         if (defect === "different bytes") contents.set(path, Buffer.from("not the sealed descriptor bytes"));
         expect(() => trustedPiLaunchBinding(args)).toThrow(/binding is unavailable/);
       },
     );
+  });
+
+  it("accepts a preinstalled root-owned pack reached through the runner's staged symlink, spawning the real path", () => {
+    for (const [path, real] of [[executable, "/opt/pack/pi"], [proxy, "/opt/pack/cli/pi-rpc-app-server-proxy.cjs"]] as const) {
+      canonicalPaths.set(path, real);
+      metadata.set(real, Object.assign(new Stats(), { mode: 0o100755, uid: 0, nlink: 1 }));
+      contents.set(real, contents.get(path)!);
+    }
+    expect(trustedPiLaunchBinding(args)).toEqual({
+      command: "/opt/pack/pi",
+      trustedProxyEntrypointUrl: pathToFileURL("/opt/pack/cli/pi-rpc-app-server-proxy.cjs").href,
+    });
+  });
+
+  it.each(["group writable", "other writable", "foreign owner"])("rejects a real file whose directory is %s", defect => {
+    const directory = metadata.get("/pack")!;
+    if (defect === "group writable") directory.mode |= 0o020;
+    if (defect === "other writable") directory.mode |= 0o002;
+    if (defect === "foreign owner") directory.uid = runtimeUid + 1;
+    expect(() => trustedPiLaunchBinding(args)).toThrow(/binding is unavailable/);
   });
 
   it("requires a known runtime uid even for root-owned files", () => {
