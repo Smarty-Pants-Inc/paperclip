@@ -7,7 +7,7 @@ import { createServer, type Socket } from "node:net";
 import { basename, dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
-  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, dispatchPiToolCall,
+  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, dispatchPiToolCall,
   validSocketPath, validatePiToolCallReceipt, validatePiToolCallRequest,
   type PiToolCallReceipt, type PiToolCallRequest, type PiToolResult, type RunAuthority,
 } from "./pi-bind-protocol.js";
@@ -69,7 +69,7 @@ async function waitForStream(
  */
 export async function startPiCallbackServer(options: PiCallbackServerOptions): Promise<PiCallbackServer> {
   const { socketPath, sessionId, authority, waitForAnnouncement, handleTool } = options;
-  const timeoutMs = options.timeoutMs ?? PI_BIND_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? 60000;
   if (!validSocketPath(socketPath) || resolve(socketPath) !== socketPath
     || typeof sessionId !== "string" || !sessionId.length || Buffer.byteLength(sessionId) > 256 || /[\u0000-\u001f]/u.test(sessionId)
     || typeof waitForAnnouncement !== "function" || typeof handleTool !== "function"
