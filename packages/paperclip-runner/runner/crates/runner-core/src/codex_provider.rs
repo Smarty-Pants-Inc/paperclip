@@ -4351,6 +4351,12 @@ fn verified_native_facade_launch(
         args.push(VerifiedProcessArgument::Literal(
             profile.executable.path.to_string_lossy().into_owned(),
         ));
+        args.push(VerifiedProcessArgument::Literal(
+            "--paperclip-pi-proxy-path".to_owned(),
+        ));
+        args.push(VerifiedProcessArgument::Literal(
+            profile.proxy_script.path.to_string_lossy().into_owned(),
+        ));
     }
     Ok(VerifiedProcessLaunch::new(command, args))
 }
@@ -6223,6 +6229,54 @@ done
 
     #[test]
     #[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
+    fn verified_pi_proxy_preserves_executable_metadata_and_original_resource_path() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-pi-resource-launch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let command = directory.join("node");
+        let proxy = directory.join("proxy.cjs");
+        let executable = directory.join("pi.js");
+        fs::write(&command, b"qualified node").unwrap();
+        fs::write(&proxy, b"module.exports = {};\n").unwrap();
+        fs::write(&executable, b"qualified pi").unwrap();
+        let profile = OpenCodeLaunchProfile {
+            command: qualified_artifact(&command),
+            proxy_script: qualified_artifact(&proxy),
+            executable: qualified_artifact(&executable),
+        };
+
+        let launch = verified_native_facade_launch(
+            &profile,
+            "Pi",
+            "--paperclip-trusted-pi-executable",
+            true,
+        )
+        .unwrap();
+        // A CommonJS snapshot's __filename is its descriptor, not this resource root.
+        // Keep descriptor execution and pass the original path only as Pi metadata.
+        assert!(matches!(
+            launch.arguments(),
+            [
+                VerifiedProcessArgument::CommonJsArtifact(_),
+                VerifiedProcessArgument::Literal(trusted_flag),
+                VerifiedProcessArgument::ExecutableArtifact(_),
+                VerifiedProcessArgument::Literal(executable_flag),
+                VerifiedProcessArgument::Literal(executable_path),
+                VerifiedProcessArgument::Literal(proxy_flag),
+                VerifiedProcessArgument::Literal(proxy_path),
+            ] if trusted_flag == "--paperclip-trusted-pi-executable"
+                && executable_flag == "--paperclip-pi-executable-path"
+                && executable_path == executable.to_str().unwrap()
+                && proxy_flag == "--paperclip-pi-proxy-path"
+                && proxy_path == proxy.to_str().unwrap()
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
     fn verified_opencode_proxy_executes_the_descriptor_safe_commonjs_bundle() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6246,6 +6300,7 @@ done
         };
 
         let launch = verified_opencode_launch(&profile).unwrap();
+        assert_eq!(launch.arguments().len(), 3, "Pi resource metadata is Pi-only");
         assert!(matches!(
             launch.arguments().first(),
             Some(VerifiedProcessArgument::CommonJsArtifact(_))
