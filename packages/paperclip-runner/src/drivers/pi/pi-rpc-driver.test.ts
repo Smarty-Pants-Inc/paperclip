@@ -219,6 +219,36 @@ describe("PiRpcDriver", () => {
       expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
     } finally { await f.close(); }
   });
+  it("projects a late outstanding tool terminal once on its old run without reviving work", async () => {
+    const f = await failureFixture();
+    try {
+      const old = await f.session.startTurn({ message: { role: "user", text: "old" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-pending", toolName: "bash", args: { command: "old" } });
+      auditFinal(f.transport, 1); await flushFailure();
+      const itemId = f.events.find(event => event.turnId === old.turnId && event.eventType === "item.started")?.itemId;
+      await f.session.attachRun!({ runId: "run-new" });
+      const current = await f.session.startTurn({ message: { role: "user", text: "new" } });
+      f.transport.send({ type: "agent_start" });
+      // Reusing the retired ID cannot announce work for the new prompt.
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-pending", toolName: "bash", args: { command: "new" } });
+      const terminal = { type: "tool_execution_end", toolCallId: "old-pending", toolName: "bash", result: { content: [{ type: "text", text: "late old final" }] } };
+      f.transport.send({ ...terminal, messageId: "unknown-extra-owner" });
+      f.transport.send({ ...terminal, toolName: "read" }); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).toContain("pending tools");
+      expect(f.events.some(event => event.payload.output === "late old final")).toBe(false);
+      f.transport.send(terminal); f.transport.send(terminal); await flushFailure();
+      expect(f.events.filter(event => event.eventType === "item.completed" && event.payload.output === "late old final")).toMatchObject([{ runId: "run-old", turnId: old.turnId, itemId }]);
+      expect(f.events.filter(event => event.eventType === "tool.execution.completed" && event.payload.output === "late old final")).toHaveLength(1);
+      expect(f.events.some(event => event.turnId === current.turnId && /^(item\.|tool\.execution\.)/.test(event.eventType))).toBe(false);
+      expect((await f.session.parkReady!()).reasons).not.toContain("pending tools");
+      auditFinal(f.transport, 2); await flushFailure();
+      expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed", runId: "run-new", turnId: current.turnId });
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+
   it("opens a partial runtime context without granting an agent-files home", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-home-partial-"));
     const transport = new FailureTransport();

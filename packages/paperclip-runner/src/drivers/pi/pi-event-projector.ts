@@ -96,9 +96,10 @@ function toolControlRecord(event: Record<string, unknown>): Record<string, unkno
  * No display event authorizes completion, artifact registration or delegation.
  *
  * The driver supplies the admitted origin and releases this projector at turn
- * settlement. Delayed callbacks are refused by compact ownership tombstones,
- * never by borrowing the next turn's projector. Every output carries its
- * captured origin; native event payloads cannot select ownership.
+ * settlement. Ownership tombstones refuse delayed callbacks, except that the
+ * driver may project an outstanding tool's final receipt with a fresh projector
+ * and its captured old origin. It never borrows the next turn's projector.
+ * Every output carries its captured origin; native payloads cannot select it.
  */
 export function createPiEventProjector(options: PiEventOrigin & { includeThinking?: boolean }): { project(value: unknown): PiProjectedEvent[] } {
   if (typeof options.runId !== "string" || !options.runId || options.runId.length > 240) throw new Error("pi_projection_run_id_invalid");

@@ -13,6 +13,7 @@ import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { piHostInstructionSegment } from "./extension/index.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
+import { PiIdentityTombstones } from "./pi-identity-tombstones.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type {
@@ -381,10 +382,11 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
   readonly #promptTimeoutMs?: number;
-  // Active identities alone own a turn/projector. Settlement replaces values
-  // with compact hash-key tombstones: late/reused IDs still cannot authorize
-  // new work, but completed projectors and their display bodies are released.
+  // Only active identities retain a projector. Fixed-memory tombstones prevent
+  // old/reused IDs from binding to a later turn, without a growing warm history.
+  // Outstanding native tools separately retain only their original IDs/name.
   readonly #owners = new Map<string, PiTurnState | null>();
+  readonly #retiredIdentities = new PiIdentityTombstones();
   #activeIdentityCount = 0;
   #identityLimited = false;
   #operation: Promise<void> = Promise.resolve();
@@ -839,7 +841,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     const acceptance = this.#promptAcceptance;
     // A known old receipt already has an owner; prompt disposition must not
     // discard it or make it borrow the pending input's origin.
-    const knownOwner = acceptance && piRecordIdentityKeys(event).some(key => this.#owners.has(key));
+    const knownOwner = acceptance && piRecordIdentityKeys(event).some(key => this.#owners.has(key) || this.#retiredIdentities.has(key));
     if (acceptance && !knownOwner && event.type !== "process_exit" && event.type !== "transport_error" && !(await acceptance)) return;
     if (event.type === "process_exit" || event.type === "transport_error") {
       const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
@@ -886,7 +888,23 @@ export class PiRpcHarnessSession implements HarnessSession {
         const owner = this.#owners.get(key);
         return toolKeys.includes(key) || (owner?.runId === pending.runId && owner.turnId === pending.turnId);
       });
-      if (unambiguous && (event.toolName === undefined || pending.toolName === event.toolName)) this.#pendingNativeTools.delete(event.toolCallId);
+      if (unambiguous && (event.toolName === undefined || pending.toolName === event.toolName)) {
+        this.#pendingNativeTools.delete(event.toolCallId);
+        if (pending.runId !== this.#activeTurn?.runId || pending.turnId !== this.#activeTurn?.turnId) {
+          // Settlement released the original projector, not this outstanding
+          // tool's captured attribution. Its exact final receipt is display
+          // only: never remember IDs, announce execution, or revive authority.
+          // A fresh projector preserves canonical item IDs without retaining
+          // old arguments/text/usage. Only terminal outputs may cross this path.
+          try {
+            const projector = createPiEventProjector(pending);
+            for (const mapped of projector.project({ ...event, toolName: pending.toolName, args: undefined })) {
+              if (["item.completed", "item.failed", "tool.execution.completed"].includes(mapped.eventType)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
+            }
+          } catch { /* A malformed stale display receipt cannot fail a new turn. */ }
+          return;
+        }
+      }
     }
     let turn: PiTurnState | null = null;
     if (event.type === "extension_ui_request") {
@@ -895,7 +913,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
     let known = false;
     for (const key of keys) {
-      if (!this.#owners.has(key)) continue;
+      if (!this.#owners.has(key)) {
+        if (this.#retiredIdentities.has(key)) return;
+        continue;
+      }
       const owner = this.#owners.get(key)!;
       if (!owner || (turn && turn !== owner)) return; // ambiguous: never guess
       turn = owner;
@@ -921,7 +942,12 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (!turn) return;
     if (!this.#remember(keys, turn)) return;
     if (event.type === "tool_execution_start" && !turn.settled) {
-      if (typeof event.toolCallId === "string") this.#pendingNativeTools.set(event.toolCallId, { runId: turn.runId, turnId: turn.turnId, toolName: typeof event.toolName === "string" ? event.toolName : undefined });
+      if (typeof event.toolCallId === "string") {
+        // These are genuine unresolved park blockers, not settled history. Do
+        // not forget a blocker (or grow forever) if Pi never sends its receipt.
+        if (!this.#pendingNativeTools.has(event.toolCallId) && this.#pendingNativeTools.size >= 65_536) throw new Error("Pi unresolved native tool limit exceeded");
+        this.#pendingNativeTools.set(event.toolCallId, { runId: turn.runId, turnId: turn.turnId, toolName: typeof event.toolName === "string" ? event.toolName : undefined });
+      }
       const captured = this.#callbacks?.authority.capture();
       if (captured && captured.runId === turn.runId && captured.turnId === turn.turnId) this.#callbacks?.announce(event, captured);
     }
@@ -962,6 +988,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   #remember(keys: string[], turn: PiTurnState): boolean {
     for (const key of keys) {
       if (!this.#owners.has(key)) {
+        if (this.#retiredIdentities.has(key)) return false;
         // This is a per-prompt display budget, NOT a warm-session fuse. All
         // provenance/session/effect gates remain unchanged. Budget exhaustion
         // drops only the unrouteable display record with an explicit marker.
@@ -985,7 +1012,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     const captured = this.#callbacks?.authority.capture();
     if (captured?.runId === turn.runId && captured.turnId === turn.turnId) this.#callbacks?.fence();
     for (const [id, dialog] of this.#dialogs) if (dialog.turn === turn) this.#dialogs.delete(id);
-    for (const [key, owner] of this.#owners) if (owner === turn) this.#owners.set(key, null);
+    for (const [key, owner] of this.#owners) if (owner === turn || owner === null) {
+      this.#retiredIdentities.add(key);
+      this.#owners.delete(key);
+    }
     this.#activeIdentityCount = 0; this.#identityLimited = false;
     if (this.#resident) this.#admitted = false;
     if (this.#agentTurn === turn) this.#agentTurn = null;
