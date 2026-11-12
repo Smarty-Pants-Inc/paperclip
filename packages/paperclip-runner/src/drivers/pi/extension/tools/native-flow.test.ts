@@ -58,7 +58,7 @@ async function nativeFlow(scenario: "mcp" | "guard", verify: (result: { root: st
   if (scenario === "guard") source += `${process.env.PI_NATIVE_SEED_NO_GUARD ? "" : "guard(pi, () => []);"}\npi.registerTool({name:"fixture_output",label:"Fixture",description:"120 KiB deterministic fixture",parameters:{type:"object",properties:{}},execute:async()=>({content:[{type:"text",text:readFileSync(${JSON.stringify(fixturePath)},"utf8")}],details:{}})});\n`;
   source += `pi.on("tool_call", (event) => { appendFileSync(${JSON.stringify(hookPath)}, JSON.stringify({event,tools:pi.getAllTools().map(({name,sourceInfo,namespace})=>({name,sourceInfo,namespace}))})+"\\n"); });\n}`;
   await writeFile(extension, source);
-  const launchToolSelectors = scenario === "mcp" ? ["read", "codemode"] : ["read", "fixture_output"];
+  const launchToolSelectors = scenario === "mcp" ? ["read", "codemode", ...(process.env.PI_NATIVE_SEED_DIRECT_MCP ? ["mcp__*"] : [])] : ["read", "fixture_output"];
   const argv = [join(runtimeRoot!, "dist", "cli.js"), "--mode", "rpc", "--provider", "controlled", "--model", "native-proof", "--thinking", "off", "--tools", launchToolSelectors.join(","), "--extension", extension, "--session-dir", sessionRoot, "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve", "--offline"];
   const child = spawn(process.execPath, argv, { cwd: workspace, env: { HOME: root, TMPDIR: root, PATH: process.env.PATH ?? "/usr/bin:/bin", PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", SMARTY_ALPHA: "0", LANG: "C.UTF-8" }, stdio: ["pipe", "pipe", "pipe"] });
   const exited = once(child, "close"); let stderr = "", buffer = "", sequence = 0;
