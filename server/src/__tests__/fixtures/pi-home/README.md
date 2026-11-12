@@ -66,6 +66,11 @@ The builder needs Python 3.12+, npm and public registry access. Every dependency
 is pinned by version and integrity in the committed locks; lifecycle scripts
 are disabled for fixture-only npm installs (not the official provider pack).
 The generated SHA256SUMS includes settings, public packages and dependencies.
+The preparation helper writes a capability-only `paperclip/faux` model entry to
+its per-test COPY: reasoning enabled, xhigh mapping, 128000 context and 8192
+output tokens. This declares the loopback scripted model, which is not in Pi's
+catalog; the production unknown-model reasoning:false default stays unchanged.
+It adds no route, API key or provider credential and never changes the fixture.
 
 To qualify **all** legs with an authorized, externally provisioned home, set
 `PAPERCLIP_PI_E2E_HOME_FIXTURE=/absolute/fixture`. Its layout must contain
