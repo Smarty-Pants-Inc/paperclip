@@ -3459,7 +3459,27 @@ impl CodexProvider {
                 }
                 let (provider_request_id, question_set, option_labels) =
                     if method == OPENCODE_RUNTIME_REQUEST_METHOD {
-                        opencode_question_set(&params)?
+                        match opencode_question_set(&params) {
+                            Ok(mapping) => mapping,
+                            Err(error) => {
+                                // Keep the strict envelope/authority validator. Like
+                                // malformed tool calls, invalid params reject only
+                                // this RPC, before any pending state is admitted.
+                                let message = error.to_string();
+                                let _ = self.send_courtesy_response(&json!({
+                                    "id": rpc_id,
+                                    "error": {"code": -32602, "message": message},
+                                }));
+                                return Ok(Some(CodexProviderEvent::Notification {
+                                    method: "warning".to_owned(),
+                                    params: json!({
+                                        "code": "provider_runtime_request_refused",
+                                        "message": message,
+                                        "providerMethod": method,
+                                    }),
+                                }));
+                            }
+                        }
                     } else if method == "mcpServer/elicitation/request" {
                         let servers = self
                             ._stdio_mcp
@@ -5655,6 +5675,73 @@ done
             provider.shutdown().unwrap();
         }
     }
+    #[cfg(unix)]
+    #[test]
+    fn malformed_runtime_envelope_refusals_preserve_state_and_accept_fresh_requests() {
+        fn queue(provider: &mut CodexProvider, message: Value) {
+            provider.pending_message_bytes += json_size(&message, "fixture").unwrap();
+            provider.pending_messages.push_back(BufferedProviderMessage {
+                value: message,
+                trace_frame_id: None,
+            });
+        }
+        let valid = json!({"request": {
+            "schema":"paperclip.runtime_request.v2", "requestKind":"runtime",
+            "requestId":"valid-question", "type":"input", "status":"pending",
+            "prompt":"Choose.", "turnId":"active-turn",
+            "origin":{"adapter":"opencode-server","provider":"opencode","method":"question.asked"},
+            "input":{"schema":"paperclip.question_set.v1","questions":[{
+                "id":"target","prompt":"Choose.","required":true,"answerMode":"single_select",
+                "options":[{"id":"yes","label":"Yes"}]
+            }]}
+        }});
+        for case in ["pi-origin", "unknown-field", "invalid-schema", "invalid-input"] {
+            let mut provider = completion_tail_provider();
+            provider.active_provider_turn_id = Some("active-turn".to_owned());
+            provider.completed_turn_authority = None;
+            let accepted_params = valid.clone();
+            queue(&mut provider, json!({"id":"existing-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":accepted_params}));
+            assert!(matches!(provider.poll().unwrap(), Some(CodexProviderEvent::RuntimeRequest { .. })));
+            let pending = provider.pending_runtime_requests.clone();
+            let bytes = provider.pending_runtime_request_bytes;
+            let sequence = provider.next_runtime_request_sequence;
+            let tool_pending = provider.pending_tool_requests.clone();
+            let tool_bytes = provider.pending_tool_request_bytes;
+            let active_turn = provider.active_provider_turn_id.clone();
+            let mut invalid = valid.clone();
+            match case {
+                "pi-origin" => invalid["request"]["origin"] = json!({"adapter":"pi-rpc","provider":"pi_rpc","method":"extension_ui_request"}),
+                "unknown-field" => invalid["request"]["unexpected"] = json!(true),
+                "invalid-schema" => invalid["request"]["schema"] = json!("not-runtime-v2"),
+                "invalid-input" => invalid["request"]["input"] = json!({}),
+                _ => unreachable!(),
+            }
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&frames);
+            provider.sent_frame_observer = Some(Box::new(move |frame| recorded.lock().unwrap().push(frame.clone())));
+            queue(&mut provider, json!({"id":"invalid-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":invalid}));
+            assert!(matches!(provider.poll().expect("invalid envelope must not escape poll"),
+                Some(CodexProviderEvent::Notification { method, params })
+                    if method == "warning" && params["code"] == "provider_runtime_request_refused"), "{case}");
+            assert_eq!(provider.pending_runtime_requests, pending, "{case}");
+            assert_eq!(provider.pending_runtime_request_bytes, bytes, "{case}");
+            assert_eq!(provider.next_runtime_request_sequence, sequence, "{case}");
+            assert_eq!(provider.pending_tool_requests, tool_pending, "{case}");
+            assert_eq!(provider.pending_tool_request_bytes, tool_bytes, "{case}");
+            assert_eq!(provider.active_provider_turn_id, active_turn, "{case}");
+            assert!(!provider.quarantined, "{case}");
+            assert_eq!(frames.lock().unwrap().len(), 1, "{case}");
+            assert_eq!(frames.lock().unwrap()[0]["id"], "invalid-rpc", "{case}");
+            assert_eq!(frames.lock().unwrap()[0]["error"]["code"], -32602, "{case}");
+            // A new strict OpenCode request still uses the normal admission path.
+            queue(&mut provider, json!({"id":"fresh-rpc","method":OPENCODE_RUNTIME_REQUEST_METHOD,"params":valid}));
+            assert!(matches!(provider.poll().unwrap(), Some(CodexProviderEvent::RuntimeRequest { .. })), "{case}");
+            assert_eq!(provider.pending_runtime_requests.len(), pending.len() + 1, "{case}");
+            assert_eq!(provider.next_runtime_request_sequence, sequence + 1, "{case}");
+            provider.shutdown().unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn fenced_tool_rejection_keeps_identity_and_real_delivery_strict() {
