@@ -112,6 +112,11 @@ pub struct StdioMcpSession {
     pub entries: Vec<(String, PathBuf)>,
 }
 impl StdioMcpSession {
+    #[cfg(test)]
+    pub(crate) fn test_fixture(directory: PathBuf, entries: Vec<(String, PathBuf)>) -> Self {
+        Self { directory, entries }
+    }
+
     #[cfg(unix)]
     pub fn create() -> McpResult<Option<Self>> {
         let bindings = assigned_bindings()?;

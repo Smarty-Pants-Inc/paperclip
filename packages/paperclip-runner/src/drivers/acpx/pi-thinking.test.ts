@@ -19,9 +19,24 @@ function opened(expected: "off" | "low" | "high" | "max", initial: string = expe
 
 describe("Pi thinking native mode admission", () => {
   it.each([
-    "cliproxyapi-anthropic/claude-opus-5-5", "cliproxyapi/Claude-opus-5-5", "custom/CLAUDE-sonnet",
-    "custom-ANTHROPIC/model", "cliproxyapi/gpt-6-astra", "custom/gemini", undefined, "",
-  ] as const)("passes through all levels for model %s", modelId => {
+    ["cliproxyapi-anthropic/claude-opus-5-5", "max"],
+    ["cliproxyapi/Claude-opus-5-5", "max"],
+    ["custom/CLAUDE-sonnet", "max"],
+    ["custom-ANTHROPIC/model", "max"],
+    ["cliproxyapi-anthropic/claude-fable-5-2", "max"],
+    ["cliproxyapi/gpt-6.1-sol", "max"],
+    ["cliproxyapi/gpt-6-luna", "max"],
+    ["cliproxyapi/gpt-6-astra", "max"],
+    ["custom/GPT-6-astra", "max"],
+    ["custom-ANTHROPIC/gpt-6-astra", "max"],
+    ["cliproxyapi/gpt-6-claude", "max"],
+    ["custom/gemini", "max"],
+    ["claude-provider/not-claude", "max"],
+    [undefined, "max"],
+    ["", "max"],
+    ["cliproxyapi/some-new-model", "max"],
+    ["gemini-3", "max"],
+  ] as const)("passes explicit levels unchanged and admits model %s (max=%s)", (modelId, _maxNative) => {
     for (const level of ["off", "low", "high", "max"] as const) {
       const native = level;
       expect(piNativeThinkingValue(level, modelId)).toBe(native);
@@ -60,6 +75,21 @@ describe("Pi thinking native mode admission", () => {
     guard("outbound", { id: 0, method: "session/load", params: { sessionId: "native" } });
     guard("inbound", { id: 0, result: session("max") });
     admission.assertReady();
+  });
+  it("rejects xhigh as a native setter or acknowledgement for explicit max", () => {
+    const setter = opened("max", "high");
+    expect(() => setter.guard("outbound", { id: 2, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: "xhigh" } })).toThrow(/selected mode/);
+    const echo = opened("max", "high");
+    echo.guard("outbound", { id: 2, method: "session/set_config_option", params: { sessionId: "native", configId: "thought_level", value: "max" } });
+    expect(() => echo.guard("inbound", { id: 2, result: { configOptions: config("xhigh") } })).toThrow(/did not apply/);
+    expect(echo.admission.assertReady).toThrow();
+  });
+  it("rejects a restored native xhigh when explicit max was requested", () => {
+    const admission = createPiThinkingAdmission("max", { restoring: true, modelId: claudeModel });
+    const guard = admission.createGuard();
+    guard("outbound", { id: 0, method: "session/load", params: { sessionId: "native" } });
+    expect(() => guard("inbound", { id: 0, result: session("xhigh") })).toThrow(/drifted/);
+    expect(admission.assertReady).toThrow();
   });
   it.each(["medium", "high"])("allows initial %s/model-selection updates but requires a correlated low setter before prompting", initial => {
     const { admission, guard } = opened("low", initial);

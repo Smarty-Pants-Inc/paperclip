@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 mod assigned_tool_validation;
 #[path = "support/codex_human_input_validation.rs"]
 mod human_input_validation;
+#[path = "support/codex_tail_drain.rs"]
+mod tail_drain;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 static RECEIPT_LIMIT_TEST_LOCK: Mutex<()> = Mutex::new(());

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { bindContent, sendPiBindRequest, sendPiToolRequest, validateBindingConfig, type PiBindCommand } from "./pi-bind-protocol.js";
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
-import { PiRpcTransport, type PiRpcExtensionUiResponseInput, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { PiRpcCommandError, PiRpcTransport, type PiRpcExtensionUiResponseInput, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 
 // Keep reason: revocable model capabilities, receipt admission, and callback refusal
@@ -37,15 +37,18 @@ class FakeTransport {
   mismatch = false;
   effortMismatch = false;
   thinkingLevel = "off";
+  promptDisposition = "started";
+  rejectPrompt = false;
   #records: PiRpcRecord[] = [];
   #wake?: (value: IteratorResult<PiRpcRecord>) => void;
   async request(type: string, _params: PiRpcRecord = {}): Promise<PiRpcRecord> {
     await this.ready; this.commands.push(type); this.order.push(type);
+    if (type === "prompt" && this.rejectPrompt) throw new PiRpcCommandError(type, { success: false, error: "rejected before acceptance" });
     const model = { provider: "paperclip", id: this.mismatch ? "wrong" : "faux" };
     return { success: true, data: type === "get_state" ? { sessionId: "native-session", model, thinkingLevel: this.effortMismatch ? "high" : this.thinkingLevel, isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "get_available_models" ? { models: [{ ...model, name: "Fixture", api: "openai-completions" }] }
       : type === "set_model" ? model : type === "get_available_thinking_levels" ? { levels: [this.thinkingLevel] }
-      : type === "prompt" ? { disposition: "started" } : undefined };
+      : type === "prompt" ? { disposition: this.promptDisposition } : undefined };
   }
   async sendExtensionUiResponse(input: PiRpcExtensionUiResponseInput): Promise<void> {
     if (this.closed || this.exited) throw new Error("Pi RPC transport is closed");
@@ -183,12 +186,38 @@ describe("resident Pi model binding", () => {
     const bind = f.ipc.find(command => command.type === "bind");
     expect(bind).toMatchObject({ tools: initial.tools.slice().reverse() });
   });
+  it.each(["handled", "queued", "started", "rejected"])("keeps the resident session after %s prompt disposition and scopes settlement to that turn (K4)", async disposition => {
+    const f = await fixture();
+    f.transport.promptDisposition = disposition;
+    f.transport.rejectPrompt = disposition === "rejected";
+    if (disposition === "rejected") {
+      await expect(f.session.startTurn({ message: { role: "user", text: "rejected" } })).rejects.toThrow("rejected before acceptance");
+      expect(f.events.filter(event => event.eventType === "turn.failed")).toHaveLength(1);
+    } else {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "one" } });
+      if (disposition === "handled") {
+        expect(f.events.filter(event => event.eventType === "turn.completed")).toMatchObject([
+          { turnId: turn.turnId, payload: { outcome: "handled", modelOutput: false } },
+        ]);
+        expect(f.events.some(event => event.eventType.startsWith("item."))).toBe(false);
+      } else {
+        expect(f.events.some(event => event.eventType === "turn.completed")).toBe(false);
+        await finish(f);
+      }
+    }
+    expect(f.transport.closed).toBe(false);
+    expect((await f.session.snapshot()).binding?.preparedTurnId).toBeNull();
+    f.transport.promptDisposition = "started"; f.transport.rejectPrompt = false;
+    await f.session.startTurn({ message: { role: "user", text: "next" } }); await finish(f, 2);
+    expect(f.ipc.filter(command => command.type === "bind")).toHaveLength(1);
+    expect(f.ipc.filter(command => command.type === "begin_turn")).toHaveLength(1);
+    expect(f.ipc.some(command => command.type === "stop_children")).toBe(false);
+    expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+  });
   it.each(["xhigh", "max"] as const)("carries only admitted %s metadata through initial bind and resident rebind", async level => {
     const f = await fixture({ piRpcThinkingLevel: level });
     const models = JSON.parse(await readFile(join(f.launch.env!.PI_CODING_AGENT_DIR!, "models.json"), "utf8"));
-    const expected = { id: "faux", reasoning: true, thinkingLevelMap: Object.fromEntries(
-      ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => [value, value === level ? value : null]),
-    ) };
+    const expected = { id: "faux", contextWindow: 128000, maxTokens: 8192, reasoning: true, thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
     expect(models.providers.paperclip.models).toEqual([expected]);
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });

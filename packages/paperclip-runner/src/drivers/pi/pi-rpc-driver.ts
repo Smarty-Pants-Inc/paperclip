@@ -3,21 +3,24 @@ import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink, writeFile } from 
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
 import { PI_BIND_MAX_FRAME_BYTES, RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
-import { mergedPiModelsJson } from "./pi-models-merge.js";
+import { loadPiBuiltinModelCatalog, mergedPiModelsJson, readPiModelsSnapshot } from "./pi-models-merge.js";
+import { configuredPiManagedModelSources, resolvePiManagedModel, type PiManagedModel } from "./pi-managed-model.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { configurePiNativeMcp } from "./pi-native-mcp.js";
 import { piHostInstructionSegment, verifiedPiChildBridgePath } from "./extension/index.js";
 import { piRpcUserInput } from "./pi-user-input.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
-import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
-import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { piTurnImageInput } from "./pi-turn-images.js";
+import { PiIdentityTombstones } from "./pi-identity-tombstones.js";
+import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
+import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
+import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -62,6 +65,8 @@ export interface PiRpcDriverOptions {
   startupTimeoutMs?: number;
   /** Dynamic tools have their own end-to-end deadline (protocol maximum: 60 s). */
   dynamicToolTimeoutMs?: number;
+  /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
+  promptTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
   /** Private-channel adapter; receipts are independently validated by the driver. */
@@ -120,6 +125,9 @@ export class PiRpcDriver implements HarnessDriver {
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
+    // Capture the runner's original Pi home before selecting the managed home.
+    const originalPiModelsFile = join(process.env.PI_CODING_AGENT_DIR
+      ?? join(environment.HOME ?? process.env.HOME ?? homedir(), ".pi", "agent"), "models.json");
     // Environment paths may still name a controller-side copy. Only the
     // authenticated runtime-context grant can select a provider-local home.
     delete environment.AGENT_HOME;
@@ -162,10 +170,14 @@ export class PiRpcDriver implements HarnessDriver {
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
       await mkdir(agentHome, { recursive: true, mode: 0o700 });
       environment.PI_CODING_AGENT_DIR = agentHome;
+      const modelsFile = join(agentHome, "models.json");
+      const modelConfiguration = resolvePiManagedModel(await configuredPiManagedModelSources(await readPiModelsSnapshot(modelsFile),
+        this.#options.model.slice("paperclip/".length), originalPiModelsFile === modelsFile ? undefined : originalPiModelsFile),
+      await loadPiBuiltinModelCatalog(this.#options.command ?? "pi", environment));
       if (credentialMode === "broker") {
         // Broker/models.json is the FIRST bind. INITIAL contains no provider
         // capability and prepares exactly one preallocated host turn, without IPC.
-        const provider = await createPiProviderBinding({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel });
+        const provider = await createPiProviderBinding({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
         closeProvider = provider.close;
         let privateDirectory: string | undefined;
         try {
@@ -181,7 +193,7 @@ export class PiRpcDriver implements HarnessDriver {
           await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
           const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools, toolSocketPath };
           if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
-          resident = { directory: privateDirectory, socketPath, environment: { ...environment }, epoch: 1, context,
+          resident = { directory: privateDirectory, socketPath, environment: { ...environment }, modelConfiguration, epoch: 1, context,
             binding: { origin, close: provider.close, initial: true }, toolSocketPath };
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
@@ -201,7 +213,7 @@ export class PiRpcDriver implements HarnessDriver {
         }
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
       } else {
-        const provider = directPiProviderConfiguration({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel });
+        const provider = directPiProviderConfiguration({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
         await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json));
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
         environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
@@ -237,6 +249,7 @@ export class PiRpcDriver implements HarnessDriver {
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
         providerSessionId: identity.providerSessionId,
+        identity,
         sessionFile,
         config,
         piMetadata,
@@ -246,6 +259,7 @@ export class PiRpcDriver implements HarnessDriver {
         instructionFile,
         instructionBoundary,
         admissionTimeoutMs: this.#options.startupTimeoutMs,
+        promptTimeoutMs: this.#options.promptTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
@@ -274,6 +288,7 @@ interface PiRunContext {
   diagnostics: Array<{ code: string; message: string }>;
 }
 interface PiResidentState {
+  modelConfiguration: PiManagedModel;
   directory: string;
   socketPath: string;
   environment: NodeJS.ProcessEnv;
@@ -296,6 +311,7 @@ interface PiSessionState {
   callbacks?: PiHostCallbacks;
   config: PiNativeConfig;
   piMetadata: Record<string, unknown>;
+  identity: PiNativeAdmittedIdentity;
   systemInstructions?: string;
   initialContext: PiRunContext;
   agentHome: string;
@@ -303,6 +319,7 @@ interface PiSessionState {
   instructionBoundary: string;
   bindRequest: typeof sendPiBindRequest;
   admissionTimeoutMs?: number;
+  promptTimeoutMs?: number;
 }
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
@@ -317,7 +334,11 @@ interface PiTurnState extends PiEventOrigin {
   lastText: string;
   hasAssistantReceipt: boolean;
   lastErrorMessage?: string;
+  /** Low-level agent_end is a continuation boundary, not prompt settlement. */
+  agentEnded: boolean;
   failed: boolean;
+  /** Latest receipt only; native recovery can replace it before settlement. */
+  lastAssistantStopReason?: string | null;
   settled: boolean;
 }
 
@@ -378,10 +399,14 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #closeProvider?: () => Promise<void>;
   readonly #resident?: PiResidentState;
   readonly #callbacks?: PiHostCallbacks;
-  readonly #dialogs = new Map<string, { id: string | number; method: string; origin: Readonly<Origin>; turn: PiTurnState; diagnosticOrigin: Record<string, unknown>; resolving: boolean }>();
+  readonly #dialogs = new Map<string, { id: string | number; dialog: PiRuntimeDialog; origin: Readonly<Origin>; turn: PiTurnState; diagnosticOrigin: Record<string, unknown>; expiresAt?: number; resolving: boolean }>();
   readonly #dialogIds = new Set<string>();
-  readonly #pendingNativeTools = new Map<string, PiTurnState>();
+  // Park blockers outlive settlement, but need no retained projector/display.
+  readonly #pendingNativeTools = new Map<string, { runId: string; turnId: string; toolName: string | undefined }>();
   #pendingInput = 0;
+  // Prompt acceptance gates lifecycle ownership, not transport/error delivery.
+  // A handled prompt retains a false gate while independent extension work drains.
+  #promptAcceptance: Promise<boolean> | null = null;
   #cleanupFailure: Error | null = null;
   readonly #bindRequest: typeof sendPiBindRequest;
   #closing?: Promise<void>;
@@ -390,14 +415,21 @@ export class PiRpcHarnessSession implements HarnessSession {
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
   readonly #piMetadata: Record<string, unknown>;
+  #identity: PiNativeAdmittedIdentity;
+  #thinkingLoweringReported = false;
   #initialContext: PiRunContext;
   readonly #agentHome: string;
   readonly #instructionFile: string;
   readonly #instructionBoundary: string;
   readonly #admissionTimeoutMs?: number;
-  // Values retain the originating turn/projector after settlement and attach.
-  // Ambiguous reused native identities are tombstoned, never rebound.
+  readonly #promptTimeoutMs?: number;
+  // Only active identities retain a projector. Fixed-memory tombstones prevent
+  // old/reused IDs from binding to a later turn, without a growing warm history.
+  // Outstanding native tools separately retain only their original IDs/name.
   readonly #owners = new Map<string, PiTurnState | null>();
+  readonly #retiredIdentities = new PiIdentityTombstones();
+  #activeIdentityCount = 0;
+  #identityLimited = false;
   #operation: Promise<void> = Promise.resolve();
   #activeTurn: PiTurnState | null = null;
   #agentTurn: PiTurnState | null = null;
@@ -421,19 +453,22 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#callbacks?.setNativeSessionId(state.providerSessionId);
     this.#bindRequest = state.bindRequest;
     this.#config = state.config;
+    this.#identity = state.identity;
     this.#initialContext = state.initialContext;
     this.#agentHome = state.agentHome;
     this.#instructionFile = state.instructionFile;
     this.#instructionBoundary = state.instructionBoundary;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     this.#piMetadata = state.piMetadata;
-    this.#emit("session.started", { context: { model: state.config.model, piRpcThinkingLevel: state.config.piRpcThinkingLevel, piMetadata: state.piMetadata } });
+    this.#promptTimeoutMs = state.promptTimeoutMs;
+    this.#emit("session.started", { context: this.#effectiveContext() });
+    this.#recordAdmission(state.identity);
     for (const diagnostic of state.initialContext.diagnostics) this.#emit("harness.diagnostic", diagnostic);
     void this.#pump();
   }
 
   piNativeAdmission(): Record<string, unknown> {
-    return structuredClone({ ...this.#config, providerSessionId: this.#providerSessionId, piMetadata: this.#piMetadata });
+    return structuredClone({ ...this.#config, ...this.#effectiveContext(), providerSessionId: this.#providerSessionId });
   }
 
   ids(): ReturnType<HarnessSession["ids"]> {
@@ -497,6 +532,19 @@ export class PiRpcHarnessSession implements HarnessSession {
     return result;
   }
 
+  #effectiveContext(): Record<string, unknown> {
+    return { model: this.#identity.model, piRpcThinkingLevel: this.#identity.piRpcThinkingLevel, piMetadata: this.#piMetadata };
+  }
+
+  #recordAdmission(identity: PiNativeAdmittedIdentity): void {
+    this.#identity = identity;
+    if (identity.diagnostic && !this.#thinkingLoweringReported) {
+      this.#thinkingLoweringReported = true;
+      const { requested, effective } = identity.diagnostic;
+      this.#emit("harness.diagnostic", { ...identity.diagnostic, message: `pi_thinking_lowered_by_config ${JSON.stringify({ requested, effective })}` });
+    }
+  }
+
   async #admit(signal?: AbortSignal): Promise<void> {
     if (this.#closed) throw new Error("Pi RPC session is closed");
     if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
@@ -505,6 +553,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
       if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
       if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
+      this.#recordAdmission(identity);
       this.#admitted = true;
     } catch (error) {
       if (this.#resident) await this.#fenceFailure(error);
@@ -520,7 +569,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     try {
       await this.#revokeBinding();
       signal?.throwIfAborted();
-      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel });
+      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel, modelConfiguration: resident.modelConfiguration });
       const origin = { epoch: resident.epoch + 1, runId, turnId: `pi-turn-${randomUUID()}` };
       resident.binding = { origin, close: broker.close, initial: false };
       const request = { schema: 1, type: "bind", nonce: randomUUID(), sessionId: this.#normalizedSessionId,
@@ -586,6 +635,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       // Every prompt, including direct-env and first hello, re-proves selection.
       // A failed attach/claim must still be recovered by an explicit admission;
       // startTurn may not silently revive a cancelled or rejected authority.
+      // The re-admission below also proves idle after handled input before
+      // replacing its discard gate with a new prompt owner.
       if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
       else {
         if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
@@ -598,21 +649,53 @@ export class PiRpcHarnessSession implements HarnessSession {
           await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
         } catch (error) { await this.#fenceFailure(error); throw error; }
       }
-      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, failed: false, settled: false };
+      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, agentEnded: false, failed: false, settled: false };
       this.#activeTurn = turn;
       this.#streamTurn = null;
-      this.#emit("turn.started", { status: "inProgress" }, turn);
+      this.#emit("turn.started", { status: "inProgress", context: this.#effectiveContext() }, turn);
+      let settleAcceptance!: (consume: boolean) => void;
+      const acceptance = new Promise<boolean>(resolve => { settleAcceptance = resolve; });
+      this.#promptAcceptance = acceptance;
+      const releaseAcceptance = (consume: boolean, retain = false) => {
+        settleAcceptance(consume);
+        if (!retain && this.#promptAcceptance === acceptance) this.#promptAcceptance = null;
+      };
       try {
         // Host authority is independent from extension authority and activated
         // only by this host prompt, never attach/bind or callback arrival.
         if (binding) this.#callbacks?.activate(binding.origin, this.#resident!.context.toolNames);
         this.#pendingInput++;
-        const response = await this.#transport.request("prompt", message).finally(() => { this.#pendingInput--; });
+        const response = await this.#transport.request("prompt", message, { timeoutMs: this.#promptTimeoutMs }).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
-        if (disposition !== "started") throw new PiNativeAdmissionError("pi_prompt_rejected", `Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
+        if (disposition === "handled") {
+          // Valid consumption without a model run: there will be no owned
+          // agent_settled, and extension-started work must not borrow this turn.
+          try { await this.#finishTurn(turn, "completed", { outcome: "handled", modelOutput: false }); }
+          catch (cleanup) { await this.#fenceFailure(cleanup); throw cleanup; }
+          releaseAcceptance(false, true);
+        } else if (disposition === "started" || disposition === "queued") releaseAcceptance(true);
+        else throw new Error(`Pi RPC prompt returned an invalid disposition (${disposition ?? "missing"})`);
       } catch (error) {
-        await this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } });
-        if (this.#resident) await this.#fenceFailure(error);
+        const unknown = error instanceof PiRpcRequestTimeoutError && error.command === "prompt";
+        // On a lost ACK, let the captured lifecycle drain before inspecting Pi.
+        // A genuine rejection/handled result never assigns those events a turn.
+        releaseAcceptance(unknown);
+        if (unknown) {
+          // A lost ACK is not a rejection. Keep the sole input owner while
+          // inspecting Pi; never submit the prompt a second time.
+          if (await this.#reconcilePrompt(turn)) return { turnId: turn.turnId };
+          this.#callbacks?.fence();
+          this.#admitted = false;
+          const failure = new Error(error.message, { cause: error });
+          const detail = { code: "pi_prompt_deadline_exceeded", message: failure.message, acceptance: "unknown", recoverable: false };
+          try { await this.#finishTurn(turn, "failed", { error: detail }); }
+          finally { await this.#fenceFailure(failure); }
+          throw failure;
+        }
+        try { await this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } }); }
+        catch (cleanup) { await this.#fenceFailure(cleanup); throw cleanup; }
+        // A pre-acceptance prompt error belongs to this input, not the resident
+        // session. Normal turn finalization revokes its capability for rebind.
         throw error;
       }
       return { turnId: turn.turnId };
@@ -640,6 +723,23 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#closed || turn.settled || this.#activeTurn !== turn) throw new HarnessOperationAlreadyTerminalError("steering");
     // Acceptance is not consumption. The native user message is projected only
     // when Pi emits it; agent_settled remains the single turn-terminal authority.
+  }
+
+  async #reconcilePrompt(turn: PiTurnState): Promise<boolean> {
+    // Fast completion can precede both the ACK and its deadline. The captured
+    // terminal already proves this input was consumed, even if Pi is now idle.
+    if (turn.settled) return !this.#closed && !this.#failure;
+    try {
+      const response = await this.#transport.request("get_state", {}, {
+        timeoutMs: Math.min(this.#admissionTimeoutMs ?? 5000, this.#promptTimeoutMs ?? 30_000),
+      });
+      const state = record(response.data);
+      if (this.#closed || this.#failure) return false;
+      return turn.settled || (this.#activeTurn === turn && this.#agentTurn === turn
+        && state.sessionId === this.#providerSessionId && state.isStreaming === true);
+    } catch {
+      return turn.settled && !this.#closed && !this.#failure;
+    }
   }
 
   async interrupt(input: Parameters<NonNullable<HarnessSession["interrupt"]>>[0] = {}): Promise<void> {
@@ -687,32 +787,49 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#dialogIds.has(requestId)) return;
     if (this.#dialogIds.size >= 4096) throw new Error("Pi UI identity limit exceeded");
     this.#dialogIds.add(requestId);
+    let dialog: PiRuntimeDialog;
+    try {
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}(?![\s\S])/.test(requestId)) throw new Error("Invalid Pi UI identity");
+      dialog = normalizePiRuntimeDialog(event);
+    } catch {
+      await this.#transport.sendExtensionUiResponse({ id, cancelled: true });
+      this.#emit("harness.diagnostic", { code: "pi_runtime_dialog_refused" });
+      return;
+    }
+    // No await precedes validation + capture of a valid frame. The sole pump
+    // consumes native stdout FIFO: old UI precedes old agent_settled; settlement
+    // fences and removes its dialogs before warm admission/new agent_start.
+    const captured = this.#callbacks?.authority.capture();
     let turn: PiTurnState | null = null;
     let origin: Readonly<Origin> | null = null;
     if (Object.hasOwn(event, "origin")) {
-      if (validateOrigin(event.origin) && this.#callbacks?.authority.accept(event.origin)) {
+      if (captured && validateOrigin(event.origin) && this.#callbacks?.authority.accept(event.origin)) {
         const active = this.#activeTurn;
-        if (active?.runId === event.origin.runId && active.turnId === event.origin.turnId) { turn = active; origin = Object.freeze({ ...event.origin }); }
+        if (active?.runId === captured.runId && active.turnId === captured.turnId) { turn = active; origin = captured; }
       }
       // Explicit old/unknown attribution NEVER falls back to the current run.
     } else if (keys.length > 0 && keys.every(key => this.#owners.has(key))) {
       const owners = keys.map(key => this.#owners.get(key));
       if (owners[0] && owners.every(owner => owner === owners[0])) {
-        const captured = this.#callbacks?.authority.capture();
         if (captured && captured.runId === owners[0].runId && captured.turnId === owners[0].turnId) { turn = owners[0]; origin = captured; }
       }
+    } else if (keys.length === 0) {
+      // The unmodified SDK emits no origin/message/tool fields for ctx.ui.
+      // Bind only inside the already admitted native agent lifecycle, using
+      // the host's captured epoch, never provider-supplied controller IDs.
+      const active = this.#agentTurn;
+      if (this.#admitted && this.#providerSessionId && captured && active === this.#activeTurn && active?.runId === captured.runId && active.turnId === captured.turnId) { turn = active; origin = captured; }
     }
     if (turn && keys.length > 0 && !keys.every(key => this.#owners.get(key) === turn)) { turn = null; origin = null; }
     if (!turn || turn.settled || !origin) {
-      // Anonymous native RPC UI has no provable origin. Cancel fail-closed;
-      // this is cancellation only, never an answer or a runtime capability.
+      // Idle, unknown and stale UI never borrows the current run. Cancellation
+      // uses Pi's method-specific default, never an answer or capability.
       await this.#transport.sendExtensionUiResponse({ id, cancelled: true });
       return;
     }
-    const method = String(event.method);
-    const diagnosticOrigin = Object.freeze({ adapter: "pi_rpc", provider: "pi", method: `extension_ui_request.${method}`, ...origin });
-    this.#dialogs.set(requestId, { id, method, turn, origin, diagnosticOrigin, resolving: false });
-    this.#emit("runtime_request.created", { request: { requestId, requestKind: method === "confirm" ? "elicitation" : "user_input", method: `extension_ui_request.${method}`, turnId: turn.turnId, itemId: `pi-ui-${requestId}`, status: "pending", prompt: typeof event.title === "string" ? event.title : "Pi requests input", details: structuredClone(event), origin: diagnosticOrigin } }, turn);
+    const diagnosticOrigin = PI_RUNTIME_DIALOG_ORIGIN;
+    this.#dialogs.set(requestId, { id, dialog, turn, origin, diagnosticOrigin, ...(dialog.timeout ? { expiresAt: this.#now().getTime() + dialog.timeout } : {}), resolving: false });
+    this.#emit("runtime_request.created", { request: { schema: "paperclip.runtime_request.v2", requestId, requestKind: "runtime", type: "input", turnId: turn.turnId, itemId: `pi-ui-${createHash("sha256").update(requestId).digest("hex")}`, status: "pending", prompt: dialog.input.questions[0]!.prompt, input: dialog.input, origin: diagnosticOrigin } }, turn);
   }
 
   async resolveRuntimeRequest(input: Parameters<NonNullable<HarnessSession["resolveRuntimeRequest"]>>[0] & { runId?: string; origin?: unknown }): Promise<void> {
@@ -721,23 +838,14 @@ export class PiRpcHarnessSession implements HarnessSession {
     const dialog = this.#dialogs.get(requestId);
     const valid = () => dialog && !this.#closed && !this.#failure && !dialog.turn.settled
       && runId === dialog.origin.runId && turnId === dialog.origin.turnId
-      && sameJson(origin, dialog.diagnosticOrigin) && this.#callbacks?.authority.accept(dialog.origin);
+      && sameJson(origin, dialog.diagnosticOrigin) && (dialog.expiresAt === undefined || this.#now().getTime() < dialog.expiresAt)
+      && this.#callbacks?.authority.accept(dialog.origin);
     if (!dialog || dialog.resolving || !valid()) throw new Error("Pi UI resolution refused");
     const resolution = structuredClone(input.resolution);
+    // Invalid answers remain pending and never consume a native Promise.
+    const response = piRuntimeDialogReply(dialog.dialog, dialog.id, resolution);
     dialog.resolving = true;
     try {
-      const response: { id: string | number; value?: string; confirmed?: boolean; cancelled?: true } = { id: dialog.id };
-      if (resolution.action === "cancel" || resolution.action === "decline") response.cancelled = true;
-      else if (dialog.method === "confirm" && ["accept", "accept_for_session"].includes(resolution.action)) response.confirmed = true;
-      else if (resolution.action === "submit") {
-        const content = record(record(resolution).content);
-        const answers = record(record(resolution).answers);
-        const values = Object.values(answers).flatMap(value => Array.isArray(record(value).answers) ? record(value).answers as unknown[] : []);
-        if (dialog.method === "confirm" && typeof content.confirmed === "boolean") response.confirmed = content.confirmed;
-        else if (typeof content.value === "string") response.value = content.value;
-        else if (values.length === 1 && typeof values[0] === "string") response.value = values[0];
-        else throw new Error("Pi UI resolution refused");
-      } else throw new Error("Pi UI resolution refused");
       await Promise.resolve();
       if (!valid()) throw new Error("Pi UI resolution refused");
       await this.#transport.sendExtensionUiResponse(response);
@@ -759,7 +867,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     return this.#transport.exited;
   }
 
-  async snapshot(): Promise<PersistedHarnessSession & { sessionFile: string; binding?: { epoch: number; socketPath: string; preparedTurnId: string | null } }> {
+  async snapshot(): Promise<PersistedHarnessSession & { sessionFile: string; piRpcThinkingLevel?: PiNativeThinkingLevel; binding?: { epoch: number; socketPath: string; preparedTurnId: string | null } }> {
     return {
       driverKind: "pi_rpc",
       driverSessionId: this.#providerSessionId,
@@ -770,6 +878,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       lastSourceSequence: this.#sourceSequence,
       workingDirectory: this.#workingDirectory,
       sessionFile: this.#sessionFile,
+      piRpcThinkingLevel: this.#identity.piRpcThinkingLevel,
       ...(this.#resident ? { binding: { epoch: this.#resident.epoch, socketPath: this.#resident.socketPath, preparedTurnId: this.#resident.binding?.origin.turnId ?? null } } : {}),
     };
   }
@@ -806,6 +915,8 @@ export class PiRpcHarnessSession implements HarnessSession {
           : { status: "cancelled", reason: "session_closed" }, turn);
       }
       this.#activeTurn = this.#agentTurn = this.#streamTurn = null;
+      this.#owners.clear(); this.#pendingNativeTools.clear();
+      this.#activeIdentityCount = 0;
       this.#events.close();
       if (failures.length) throw this.#cleanupFailure ?? new AggregateError(failures, "Pi cleanup failed");
     })();
@@ -851,6 +962,11 @@ export class PiRpcHarnessSession implements HarnessSession {
         message: typeof event.error === "string" ? event.error.slice(0, 2048) : "Extension startup failed" });
       return;
     }
+    const acceptance = this.#promptAcceptance;
+    // A known old receipt already has an owner; prompt disposition must not
+    // discard it or make it borrow the pending input's origin.
+    const knownOwner = acceptance && piRecordIdentityKeys(event).some(key => this.#owners.has(key) || this.#retiredIdentities.has(key));
+    if (acceptance && !knownOwner && event.type !== "process_exit" && event.type !== "transport_error" && !(await acceptance)) return;
     if (event.type === "process_exit" || event.type === "transport_error") {
       const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
       this.#callbacks?.fence();
@@ -868,7 +984,10 @@ export class PiRpcHarnessSession implements HarnessSession {
       return;
     }
     if (event.type === "agent_start") {
-      if (!this.#admitted || !this.#activeTurn || this.#agentTurn) {
+      // Pi 1.5.2 rpc.md/json.md: retries, overflow recovery and queued
+      // continuations can start another low-level run before agent_settled.
+      // Only an observed agent_end within this admitted prompt permits it.
+      if (!this.#admitted || !this.#activeTurn || (this.#agentTurn && !this.#activeTurn.agentEnded)) {
         this.#callbacks?.fence();
         this.#failure = new Error("Pi started work without an admitted prompt");
         this.#admitted = false;
@@ -876,10 +995,41 @@ export class PiRpcHarnessSession implements HarnessSession {
         else await this.#revokeBinding();
         this.#emit("session.failed", { code: "pi_unrequested_agent_start" });
         void this.close().catch(() => undefined);
-      } else this.#agentTurn = this.#activeTurn;
+      } else {
+        this.#agentTurn = this.#activeTurn;
+        this.#activeTurn.agentEnded = false;
+      }
       return;
     }
     const keys = piRecordIdentityKeys(event);
+    // A delayed terminal can clear its captured park blocker without reviving
+    // a settled projector. Conflicting/unknown extra identities cannot clear
+    // it: retain the same fail-closed provenance rule as event projection.
+    if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
+      const pending = this.#pendingNativeTools.get(event.toolCallId);
+      const toolKeys = piToolIdentityKeys(event.toolCallId);
+      const unambiguous = pending && keys.every(key => {
+        const owner = this.#owners.get(key);
+        return toolKeys.includes(key) || (owner?.runId === pending.runId && owner.turnId === pending.turnId);
+      });
+      if (unambiguous && (event.toolName === undefined || pending.toolName === event.toolName)) {
+        this.#pendingNativeTools.delete(event.toolCallId);
+        if (pending.runId !== this.#activeTurn?.runId || pending.turnId !== this.#activeTurn?.turnId) {
+          // Settlement released the original projector, not this outstanding
+          // tool's captured attribution. Its exact final receipt is display
+          // only: never remember IDs, announce execution, or revive authority.
+          // A fresh projector preserves canonical item IDs without retaining
+          // old arguments/text/usage. Only terminal outputs may cross this path.
+          try {
+            const projector = createPiEventProjector(pending);
+            for (const mapped of projector.project({ ...event, toolName: pending.toolName, args: undefined })) {
+              if (["item.completed", "item.failed", "tool.execution.completed"].includes(mapped.eventType)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
+            }
+          } catch { /* A malformed stale display receipt cannot fail a new turn. */ }
+          return;
+        }
+      }
+    }
     let turn: PiTurnState | null = null;
     if (event.type === "extension_ui_request") {
       await this.#captureUi(event, keys);
@@ -887,7 +1037,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
     let known = false;
     for (const key of keys) {
-      if (!this.#owners.has(key)) continue;
+      if (!this.#owners.has(key)) {
+        if (this.#retiredIdentities.has(key)) return;
+        continue;
+      }
       const owner = this.#owners.get(key)!;
       if (!owner || (turn && turn !== owner)) return; // ambiguous: never guess
       turn = owner;
@@ -911,13 +1064,17 @@ export class PiRpcHarnessSession implements HarnessSession {
       else if (!["tool_execution_start", "tool_execution_update", "tool_execution_end", "message_end"].includes(String(event.type))) turn = this.#agentTurn;
     }
     if (!turn) return;
-    this.#remember(keys, turn);
+    if (!this.#remember(keys, turn)) return;
     if (event.type === "tool_execution_start" && !turn.settled) {
-      if (typeof event.toolCallId === "string") this.#pendingNativeTools.set(event.toolCallId, turn);
+      if (typeof event.toolCallId === "string") {
+        // These are genuine unresolved park blockers, not settled history. Do
+        // not forget a blocker (or grow forever) if Pi never sends its receipt.
+        if (!this.#pendingNativeTools.has(event.toolCallId) && this.#pendingNativeTools.size >= 65_536) throw new Error("Pi unresolved native tool limit exceeded");
+        this.#pendingNativeTools.set(event.toolCallId, { runId: turn.runId, turnId: turn.turnId, toolName: typeof event.toolName === "string" ? event.toolName : undefined });
+      }
       const captured = this.#callbacks?.authority.capture();
       if (captured && captured.runId === turn.runId && captured.turnId === turn.turnId) this.#callbacks?.announce(event, captured);
     }
-    if (event.type === "tool_execution_end" && typeof event.toolCallId === "string" && this.#pendingNativeTools.get(event.toolCallId) === turn) this.#pendingNativeTools.delete(event.toolCallId);
     const update = record(event.assistantMessageEvent);
     if (event.type === "message_update" && update.type === "text_delta" && typeof update.delta === "string") turn.lastText += update.delta;
     const message = record(event.message);
@@ -925,8 +1082,11 @@ export class PiRpcHarnessSession implements HarnessSession {
       const text = assistantText(message.content);
       if (text) turn.lastText = text;
       turn.hasAssistantReceipt ||= Boolean(text) || isRecord(message.usage);
-      if (message.stopReason === "error" || message.stopReason === "aborted") turn.failed = true;
-      if (typeof message.errorMessage === "string" && message.errorMessage) turn.lastErrorMessage = message.errorMessage;
+      turn.lastErrorMessage = typeof message.errorMessage === "string" && message.errorMessage ? message.errorMessage : undefined;
+      turn.lastAssistantStopReason = stringValue(message.stopReason);
+      // A successful retry supersedes the transient attempt's failure. An
+      // exhausted retry keeps the final failed receipt until settlement.
+      turn.failed = message.stopReason === "error" || message.stopReason === "aborted";
       if (this.#streamTurn === turn) this.#streamTurn = null;
       // Bind full native tool IDs before execution callbacks can arrive.
       for (const part of Array.isArray(message.content) ? message.content : []) {
@@ -937,23 +1097,43 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (update.type === "toolcall_start") this.#remember(piToolIdentityKeys(update.id), turn);
       if (update.type === "toolcall_end") this.#remember(piToolIdentityKeys(record(update.toolCall).id), turn);
     }
+    if (event.type === "agent_end") {
+      turn.agentEnded = true;
+      if (this.#streamTurn === turn) this.#streamTurn = null;
+    }
     try {
       for (const mapped of turn.projector.project(event)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
     } catch (error) { throw new PiProjectionFailure(turn, error); }
     if (event.type === "agent_settled") {
       const empty = !turn.lastText && !turn.hasAssistantReceipt;
-      const status = event.aborted === true ? "cancelled" : turn.failed || empty ? "failed" : "completed";
-      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(status === "failed" && turn.lastErrorMessage ? { error: { code: "pi_provider_error", message: turn.lastErrorMessage } } : empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
+      // A length receipt is incomplete even with text/mandatory usage. Judge
+      // only the final receipt, after Pi has exhausted native recovery.
+      const truncated = turn.lastAssistantStopReason === "length";
+      const status = event.aborted === true ? "cancelled" : turn.failed || truncated || empty ? "failed" : "completed";
+      const error = truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
+        : turn.failed && turn.lastErrorMessage ? { code: "pi_provider_error", message: turn.lastErrorMessage }
+        : empty ? { code: "pi_empty_turn", message: "Pi settled without an assistant response." } : undefined;
+      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
     }
   }
 
-  #remember(keys: string[], turn: PiTurnState): void {
+  #remember(keys: string[], turn: PiTurnState): boolean {
     for (const key of keys) {
       if (!this.#owners.has(key)) {
-        if (this.#owners.size >= 4096) throw new Error("Pi RPC native identity limit exceeded");
+        if (this.#retiredIdentities.has(key)) return false;
+        // This is a per-prompt display budget, NOT a warm-session fuse. All
+        // provenance/session/effect gates remain unchanged. Budget exhaustion
+        // drops only the unrouteable display record with an explicit marker.
+        if (this.#activeIdentityCount >= 65_536) {
+          if (!this.#identityLimited) this.#emit("harness.diagnostic", { code: "pi_native_identity_projection_limit", message: "[Pi projection truncated]: turn identity budget reached." }, turn);
+          this.#identityLimited = true;
+          return false;
+        }
         this.#owners.set(key, turn);
+        this.#activeIdentityCount++;
       } else if (this.#owners.get(key) !== turn) this.#owners.set(key, null);
     }
+    return true;
   }
 
   async #finishTurn(turn: PiTurnState, status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): Promise<void> {
@@ -964,6 +1144,11 @@ export class PiRpcHarnessSession implements HarnessSession {
     const captured = this.#callbacks?.authority.capture();
     if (captured?.runId === turn.runId && captured.turnId === turn.turnId) this.#callbacks?.fence();
     for (const [id, dialog] of this.#dialogs) if (dialog.turn === turn) this.#dialogs.delete(id);
+    for (const [key, owner] of this.#owners) if (owner === turn || owner === null) {
+      this.#retiredIdentities.add(key);
+      this.#owners.delete(key);
+    }
+    this.#activeIdentityCount = 0; this.#identityLimited = false;
     if (this.#resident) this.#admitted = false;
     if (this.#agentTurn === turn) this.#agentTurn = null;
     if (this.#streamTurn === turn) this.#streamTurn = null;
@@ -1116,7 +1301,7 @@ async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPa
 }
 
 function piNativeIdentity(value: unknown): string | null {
-  if (typeof value === "string" && value.length > 0 && value.length <= 4096) return `s:${value}`;
+  if (typeof value === "string" && value.length > 0 && value.length <= 4096) return `s:${createHash("sha256").update(value).digest("hex")}`;
   if (typeof value === "number" && Number.isSafeInteger(value)) return `n:${value}`;
   return null;
 }
@@ -1134,7 +1319,7 @@ function piRecordIdentityKeys(event: PiRpcRecord): string[] {
     if (key !== null) keys.push(`message:${key}`);
   }
   if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
-    keys.push(`stamp:${JSON.stringify([message.role, message.provider, message.model, message.timestamp])}`);
+    keys.push(`stamp:${createHash("sha256").update(JSON.stringify([message.role, message.provider, message.model, message.timestamp])).digest("hex")}`);
   }
   keys.push(...piToolIdentityKeys(event.toolCallId ?? message.toolCallId));
   return [...new Set(keys)];

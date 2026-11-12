@@ -2,23 +2,24 @@ import { startProviderLoopbackBroker, type LoopbackRouteAdapter, type LoopbackUp
 import { chatLoopbackAdapter } from "../provider-loopback/chat.js";
 import { messagesLoopbackAdapter } from "../provider-loopback/messages.js";
 import { responsesLoopbackAdapter } from "../provider-loopback/responses.js";
-import type { PiBindModel } from "../pi/pi-bind-protocol.js";
+import type { PiManagedModel } from "../pi/pi-managed-model.js";
+import type { PiBindProvider } from "../pi/pi-bind-protocol.js";
 import { PI_NATIVE_THINKING_LEVELS, type PiNativeThinkingLevel } from "../pi/pi-native-config.js";
 
-type PiManagedModel = Pick<PiBindModel, "id" | "reasoning" | "thinkingLevelMap">;
-
-function managedModel(model: string, thinkingLevel?: PiNativeThinkingLevel): PiManagedModel {
-  // The native caller supplies a level already admitted against the selected
-  // connection. Do not advertise any other capability. Pi docs/models-configuration.md:
-  // reasoning defaults false; a null thinkingLevelMap entry is unsupported.
-  if (thinkingLevel === undefined || thinkingLevel === "off") return { id: model };
-  if (!PI_NATIVE_THINKING_LEVELS.includes(thinkingLevel)) throw new Error("Pi managed model thinking level is invalid");
-  return { id: model, reasoning: true, thinkingLevelMap: Object.fromEntries(
-    PI_NATIVE_THINKING_LEVELS.map(level => [level, level === thinkingLevel ? level : null]),
-  ) };
+function managedModel(model: string, thinkingLevel?: PiNativeThinkingLevel, configuration?: PiManagedModel): PiManagedModel {
+  if (thinkingLevel !== undefined && !PI_NATIVE_THINKING_LEVELS.includes(thinkingLevel)) throw new Error("Pi managed model thinking level is invalid");
+  if (configuration && configuration.id !== model) throw new Error("Pi managed model configuration id mismatch");
+  // Effort is a request, not a capability declaration. Only snapshot/catalog
+  // metadata may describe support; Pi owns normalization of the requested level.
+  return { id: model,
+    ...(configuration?.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
+    ...(configuration?.contextWindow === undefined ? {} : { contextWindow: configuration.contextWindow }),
+    ...(configuration?.maxTokens === undefined ? {} : { maxTokens: configuration.maxTokens }),
+    ...(configuration?.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: structuredClone(configuration.thinkingLevelMap) }),
+  };
 }
 
-const PI_MANAGED_PROVIDER_PROTOCOLS: Readonly<Record<string, { adapter: LoopbackRouteAdapter; api: string }>> = {
+const PI_MANAGED_PROVIDER_PROTOCOLS: Readonly<Record<string, { adapter: LoopbackRouteAdapter; api: PiBindProvider["api"] }>> = {
   chat: { adapter: chatLoopbackAdapter, api: "openai-completions" },
   messages: { adapter: messagesLoopbackAdapter, api: "anthropic-messages" },
   responses: { adapter: responsesLoopbackAdapter, api: "openai-responses" },
@@ -49,13 +50,14 @@ export async function createPiProviderBinding(input: {
   environment: NodeJS.ProcessEnv;
   /** Native Pi only: requested level already admitted against its connection. */
   thinkingLevel?: PiNativeThinkingLevel;
+  modelConfiguration?: PiManagedModel;
   onSensitiveValues?(values: readonly string[]): void;
-}): Promise<{ provider: { name: "paperclip"; api: string; baseUrl: string; apiKey: string; models: [PiManagedModel] }; close(): Promise<void> }> {
+}): Promise<{ provider: { name: "paperclip"; api: PiBindProvider["api"]; baseUrl: string; apiKey: string; models: [PiManagedModel] }; close(): Promise<void> }> {
   const protocol = input.environment.PAPERCLIP_AI_PROVIDER_PROTOCOL ?? "";
   const route = Object.hasOwn(PI_MANAGED_PROVIDER_PROTOCOLS, protocol) ? PI_MANAGED_PROVIDER_PROTOCOLS[protocol] : undefined;
   if (!route) throw new Error("Pi managed provider protocol is unsupported");
   const connection = piProviderConnection(input.model, input.environment);
-  const model = managedModel(connection.model, input.thinkingLevel);
+  const model = managedModel(connection.model, input.thinkingLevel, input.modelConfiguration);
   const broker = await startProviderLoopbackBroker({ adapter: route.adapter, baseUrl: connection.baseUrl, key: connection.key, auth: connection.auth, environment: input.environment });
   try {
     input.onSensitiveValues?.([broker.token, ...(connection.key ? [connection.key] : [])]);
@@ -70,13 +72,13 @@ export async function createPiProviderBinding(input: {
 }
 
 /** Development-only direct-key configuration for the native Pi RPC fallback. */
-export function directPiProviderConfiguration(input: { model: string; environment: NodeJS.ProcessEnv; thinkingLevel?: PiNativeThinkingLevel }): { json: string; key: string } {
+export function directPiProviderConfiguration(input: { model: string; environment: NodeJS.ProcessEnv; thinkingLevel?: PiNativeThinkingLevel; modelConfiguration?: PiManagedModel }): { json: string; key: string } {
   const protocol = input.environment.PAPERCLIP_AI_PROVIDER_PROTOCOL ?? "";
   const route = Object.hasOwn(PI_MANAGED_PROVIDER_PROTOCOLS, protocol) ? PI_MANAGED_PROVIDER_PROTOCOLS[protocol] : undefined;
   if (!route) throw new Error("Pi managed provider protocol is unsupported");
   const connection = piProviderConnection(input.model, input.environment);
   return { json: piProviderJson({ baseUrl: connection.baseUrl, api: route.api, apiKey: connection.key, model: connection.model,
-    modelConfiguration: managedModel(connection.model, input.thinkingLevel) }), key: connection.key };
+    modelConfiguration: managedModel(connection.model, input.thinkingLevel, input.modelConfiguration) }), key: connection.key };
 }
 
 function piProviderConnection(modelName: string, environment: NodeJS.ProcessEnv): { model: string; baseUrl: string; auth: LoopbackUpstreamAuth; key: string } {

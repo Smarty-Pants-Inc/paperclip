@@ -14,6 +14,19 @@ export function checkNativeHomeEnvironment(env: NativeHomeEnvironment): void {
   if (env.PI_OFFLINE !== "1" || env.PI_SKIP_VERSION_CHECK !== "1") fail("pi_home_environment_invalid", "Native Pi requires PI_OFFLINE=1 and PI_SKIP_VERSION_CHECK=1.");
   if (env.PI_SUBAGENTS_COMPONENT_UI !== undefined) fail("pi_home_rpc_components_forbidden", "PI_SUBAGENTS_COMPONENT_UI must remain unset in RPC mode.");
 }
+/** Validate file declarations; exact live model/effort readback remains admitPiRpcSession's job. */
+export function assertNativeModels(config: unknown): void {
+  const providers = object(object(config).providers ?? {});
+  for (const provider of Object.values(providers)) {
+    const definition = object(provider), models = definition.models ?? [];
+    if (!Array.isArray(models)) fail("pi_home_models_invalid", "Native models must be an array.");
+    for (const model of models) {
+      const m = object(model);
+      if (typeof m.id !== "string") fail("pi_home_models_invalid", "Native model ID is missing.");
+    }
+    object(definition.modelOverrides ?? {});
+  }
+}
 export interface RequiredNativePackage {
   role: "tool-context-guard" | "tool-cap" | "pi-subagents";
   root: string;
@@ -56,11 +69,13 @@ export async function admitNativeHome(input: NativeHomeAdmissionInput): Promise<
   if (tool.path && (await realpath(tool.path) !== tool.path || !isWithin(subagentsRoot, tool.path) || !body.entries.some(entry => entry.kind === "file" && entry.resolvedPath === tool.path))) fail("pi_home_subagent_provenance", "The subagent tool entry is not backed by admitted package bytes.");
   const modelFile = await realpath(resolve(body.agentDir, "models.json"));
   const modelEntry = body.entries.find(entry => entry.kind === "file" && entry.resolvedPath === modelFile);
-  if (!modelEntry) fail("pi_home_models_invalid", "Native models.json is not backed by the admitted manifest.");
+  if (!modelEntry) fail("pi_home_models_invalid", "Native models.json is required for admission.");
   const bytes = await readFile(modelFile, { signal: input.signal });
   if (sha256(bytes) !== modelEntry.sha256) fail("pi_home_models_drift", "Native model bytes changed after manifest collection.");
-  try { object(JSON.parse(bytes.toString("utf8"))); }
-  catch { return fail("pi_home_models_invalid", "Native models configuration is not a valid JSON object."); }
+  let config: unknown;
+  try { config = JSON.parse(bytes.toString("utf8")); }
+  catch { return fail("pi_home_models_invalid", "Native models configuration is not valid JSON."); }
+  assertNativeModels(config);
   // Model-family effort policy belongs to the admitted Pi configuration, not this driver.
   input.signal?.throwIfAborted();
   return { digest };

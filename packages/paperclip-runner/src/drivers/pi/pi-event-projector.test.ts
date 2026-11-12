@@ -77,17 +77,18 @@ describe("large native tool output projection (synthetic incident regression)", 
       expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
     }
   });
-  it("rejects oversized native inputs without silently truncating executable arguments", () => {
+  it("P0-1 bounds oversized argument records without mutating executable arguments", () => {
     const args = { command: "\"\\\n".repeat(300000), nested: { enabled: true, count: 3 } };
     const input = { type: "tool_execution_start", toolCallId: "typed", toolName: "bash", args };
     const serialized = JSON.stringify(input);
     const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
-    expect(() => projector.project(input)).toThrow(/pi_projection_record_limit/);
+    const events = projector.project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "bash", input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
     expect(JSON.stringify(input)).toBe(serialized);
-    projector.project({ ...input, args: { command: "echo ordinary" } });
-    expect(() => projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "other", result: {} })).toThrow(/name_changed/);
-    expect(() => projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))).toThrow(/pi_projection_record_limit/);
-    expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).toThrow(/pi_projection_record_limit/);
+    expect(projector.project({ type: "tool_execution_end", toolCallId: "typed", toolName: "bash", result: {} })[0].eventType).toBe("item.completed");
+    expect(projector.project(final({ content: [{ type: "text", text: "semantic".repeat(100000) }] }))[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") } });
+    expect(() => projector.project({ type: "message_end", message: { role: "toolResult", toolCallId: "receipt", toolName: "bash", content: [], usage: { opaque: "receipt".repeat(100000) } } })).not.toThrow();
   });
   it("projects an accumulated >4MiB tool update without copying full native output", () => {
     const input = { type: "tool_execution_update", toolCallId: "streamed", toolName: "bash", partialResult: { content: [{ type: "text", text: "x".repeat(4 * 1024 * 1024 + 1) }] } };
@@ -129,6 +130,123 @@ describe("large native tool output projection (synthetic incident regression)", 
   });
 });
 
+// Keep reason: reproduced audit A P0-4; long real turns must outlive display caches.
+describe("P0-4 turn-local projection state", () => {
+  it("projects 1100 completed tools and suppresses late duplicates after eviction", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    let first: Record<string, unknown> | undefined;
+    for (let i = 0; i < 1100; i++) {
+      const toolCallId = `read-${i}`;
+      projector.project({ type: "tool_execution_start", toolCallId, toolName: "read", args: { path: `${i}` } });
+      const done = { type: "tool_execution_end", toolCallId, toolName: "read", result: { content: [{ type: "text", text: "ok" }] }, isError: false };
+      if (!i) first = done;
+      expect(projector.project(done).map(event => event.eventType)).toEqual(["item.completed", "tool.execution.completed"]);
+    }
+    expect(projector.project(first)).toEqual([]);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
+  it("degrades only the overflow item with 1025 simultaneously active tools", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    let overflow: PiProjectedEvent[] = [];
+    for (let i = 0; i <= 1024; i++) overflow = projector.project({ type: "tool_execution_start", toolCallId: `open-${i}`, toolName: "read", args: { path: `${i}` } });
+    expect(overflow.find(event => event.eventType === "harness.diagnostic")?.payload.code).toBe("pi_active_tool_projection_limit");
+    const terminal = projector.project({ type: "tool_execution_end", toolCallId: "open-1024", toolName: "read", result: { content: [{ type: "text", text: "ok" }] } });
+    expect(terminal.find(event => event.eventType === "tool.execution.completed")).toMatchObject({ itemId: overflow[0]?.itemId, payload: { status: "completed", name: "read" } });
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
+  it("marks accounting incomplete instead of failing when the 65536-receipt display cache fills", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    for (let i = 0; i < 65_536; i++) projector.project(final({ responseId: `receipt-${i}`, timestamp: i, content: [], usage }));
+    const overflow = projector.project(final({ responseId: "overflow", usage }));
+    expect(overflow.find(event => event.eventType === "harness.diagnostic")?.payload.code).toBe("pi_receipt_projection_limit");
+    expect(overflow.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({ runDeltaComplete: false, costComplete: false });
+    expect(overflow.some(event => event.eventType === "item.completed" && event.payload.text === "final")).toBe(true);
+    expect(projector.project(final({ responseId: "receipt-0", timestamp: 0, content: [], usage }))).toEqual([]);
+  }, 20_000);
+  it("deduplicates more than 4096 native receipts without retaining receipt bodies", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    let first: unknown;
+    for (let i = 0; i < 4200; i++) {
+      const receipt = final({ responseId: `receipt-${i}`, timestamp: i, content: [], usage });
+      if (!i) first = receipt;
+      expect(projector.project(receipt).filter(event => event.eventType === "usage.reported")).toHaveLength(1);
+    }
+    expect(projector.project(first)).toEqual([]);
+    expect(projector.project(final({ responseId: "last" }))[0].eventType).toBe("item.completed");
+  });
+});
+
+// Keep reason: reproduced audit A P0-1, including an ordinary completed run's summary.
+describe("P0-1 large records are display-only", () => {
+  const results = Array.from({ length: 6 }, (_, i) => ({ role: "toolResult", toolCallId: `read-${i}`, toolName: "read", content: [{ type: "text", text: "x".repeat(50_000) }] }));
+  it.each([
+    { type: "agent_end", messages: results, willRetry: false },
+    { type: "turn_end", message: final().message, toolResults: results },
+    { type: "message_start", message: { ...results[0], content: [{ type: "image", data: "A".repeat(300_000), mimeType: "image/png" }] } },
+    { type: "message_end", message: { role: "user", timestamp: 1, content: [{ type: "text", text: "x".repeat(300_000) }] } },
+    { type: "message_start", message: { role: "system", content: "x".repeat(300_000) } },
+  ])("ignores unneeded bodies in oversized $type without breaking the next projection", input => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const before = JSON.stringify(input);
+    // K4 adds consumed user receipts; they must be bounded, not discarded.
+    const projected = projector.project(input);
+    if (input.type === "message_end" && input.message?.role === "user") {
+      expect(projected).toMatchObject([{ eventType: "item.completed", payload: { kind: "userMessage", text: expect.stringContaining("[Pi projection truncated]") } }]);
+      expect(Buffer.byteLength(JSON.stringify(projected))).toBeLessThan(256 * 1024);
+    } else expect(projected).toEqual([]);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+    expect(JSON.stringify(input)).toBe(before);
+  });
+  it.each(["message_end", "tool_execution_end"])("omits a 300KB image in %s but keeps identity and completion", type => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const started = projector.project({ type: "tool_execution_start", toolCallId: "image", toolName: "read", args: { path: "shot.png" } });
+    const result = { role: "toolResult", toolCallId: "image", toolName: "read", content: [{ type: "text", text: "Read image file [image/png]" }, { type: "image", data: "A".repeat(300_000), mimeType: "image/png" }] };
+    const input = type === "message_end" ? { type, message: result } : { type, toolCallId: "image", toolName: "read", result, isError: false };
+    const before = JSON.stringify(input);
+    const events = projector.project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.completed", itemId: started[0].itemId, payload: { toolName: "read", output: expect.stringContaining("[Pi image omitted from projection]") }, debug: { piProjection: { truncated: true } } });
+    expect(events.at(-1)?.payload.status).toBe("completed");
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    expect(JSON.stringify(events)).not.toContain("A".repeat(1000));
+    expect(JSON.stringify(input)).toBe(before);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
+});
+
+// Keep reason: reproduced audit A P0-3; display limits must not kill native work.
+describe("P0-3 bounded display text and arguments", () => {
+  it.each(["toolcall_end", "tool_execution_start"])("previews 70KB write arguments from %s and retains tool completion", type => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const args = { path: "big.txt", content: "y".repeat(70_000) };
+    const input = type === "toolcall_end" ? update(type, { toolCall: { id: "write-large", name: "write", arguments: args } })
+      : { type, toolCallId: "write-large", toolName: "write", args };
+    const before = JSON.stringify(input);
+    const events = projector.project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.started", payload: { toolName: "write", input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
+    const end = projector.project({ type: "tool_execution_end", toolCallId: "write-large", toolName: "write", result: { content: [{ type: "text", text: "ok" }] } });
+    expect(end[0]).toMatchObject({ eventType: "item.completed", itemId: events[0].itemId, payload: { toolName: "write", output: "ok" } });
+    expect(JSON.stringify(input)).toBe(before);
+  });
+  it.each(["x", "🌍\\\"\n"])("previews oversized assistant final text without losing terminal status (%j)", alphabet => {
+    const input = final({ content: [{ type: "text", text: alphabet.repeat(70_000 / alphabet.length) }] });
+    const before = JSON.stringify(input);
+    const events = createPiEventProjector({ runId: "run", turnId: "turn" }).project(input);
+    expect(events[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+    expect(Buffer.byteLength(JSON.stringify(envelope(events[0], 0)))).toBeLessThan(256 * 1024);
+    expect(JSON.stringify(input)).toBe(before);
+  });
+  it("bounds cumulative streamed text and emits the truncation marker only once", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    const events = Array.from({ length: 100 }, () => projector.project(update("text_delta", { delta: "x".repeat(2000) }))).flat();
+    const streamed = events.filter(event => event.eventType === "item.delta").map(event => event.payload.text).join("");
+    expect(streamed).toContain("[Pi projection truncated]");
+    expect(streamed.match(/\[Pi projection truncated\]/g)).toHaveLength(1);
+    expect(Buffer.byteLength(JSON.stringify(streamed))).toBeLessThanOrEqual(64 * 1024);
+    expect(projector.project(final({ content: [{ type: "text", text: "x".repeat(200_000) }] }))[0]).toMatchObject({ eventType: "item.completed", payload: { text: expect.stringContaining("[Pi projection truncated]") } });
+  });
+});
+
 describe("synthetic boundary cases (not claimed as native capture)", () => {
   it("projects distinct queued user messages with the same native timestamp once under their captured origin", () => {
     const origin = { runId: "original-run", turnId: "original-turn" };
@@ -147,16 +265,21 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
     projector.project(update("text_delta", { delta: "part" }));
     expect(projector.project(update("text_end", { content: "part" }))).toEqual([]);
     const emitted = projector.project(final({ content: [{ type: "text", text: "authoritative" }] }));
-    expect(emitted).toMatchObject([{ eventType: "item.completed", itemId: "t:pi-message:1:block:0", payload: { text: "authoritative", channel: "final" } }]);
+    expect(emitted).toMatchObject([
+      { eventType: "item.completed", itemId: "t:pi-message:1:block:0", payload: { text: "authoritative", channel: "final" } },
+      { eventType: "usage.reported", payload: { runDeltaAvailable: false, accountingComplete: false } },
+    ]);
     expect(projector.project(final({ content: [{ type: "text", text: "authoritative" }] }))).toEqual([]);
   });
   it("supports final-only text and keeps reasoning separate without signatures", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t", includeThinking: true });
     const events = projector.project(final({ content: [{ type: "thinking", thinking: "reason", thinkingSignature: "private-signature" }, { type: "text", text: "answer" }] }));
-    expect(events.map(event => event.payload.kind)).toEqual(["reasoning", "agentMessage"]);
+    expect(events.filter(event => event.eventType === "item.completed").map(event => event.payload.kind)).toEqual(["reasoning", "agentMessage"]);
     expect(events[0].payload.channel).toBe("detail");
     expect(JSON.stringify(events)).not.toContain("signature");
-    expect(createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ content: [{ type: "thinking", thinking: "private" }] }))).toEqual([]);
+    expect(createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ content: [{ type: "thinking", thinking: "private" }] }))).toMatchObject([
+      { eventType: "usage.reported", payload: { runDeltaAvailable: false, accountingComplete: false } },
+    ]);
   });
   it("supports interleaved block indexes, including zero, without merging their text", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t", includeThinking: true });
@@ -172,7 +295,10 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
   });
   it("does not replace absent usage/cost with zero or call partial totals complete", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
-    expect(projector.project(final()).some(event => event.payload.kind === "usage")).toBe(false);
+    const missing = projector.project(final());
+    expect(missing.some(event => event.payload.kind === "usage")).toBe(false);
+    expect(missing.find(event => event.eventType === "usage.reported")?.payload).toMatchObject({ runDeltaAvailable: false, runDelta: {}, accountingComplete: false });
+    expect(validatePrpEvent(envelope(missing.at(-1)!, 0))).toMatchObject({ ok: true });
     const events = projector.project(final({ responseId: "reply-2", timestamp: 2, usage: { input: 4 } }));
     expect(events.at(-1)?.payload.usage).toMatchObject({ total: { inputTokens: 4 }, runDeltaComplete: false, costProvenance: "unknown", costComplete: false });
     expect(JSON.stringify(events)).not.toContain("estimatedCostUsd");
@@ -242,7 +368,10 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
     const partial = projector.project(update("text_delta", { delta: "unconfirmed partial" }));
     const events = projector.project(final({ stopReason, content: [] }));
-    expect(events).toMatchObject([{ eventType: "item.failed", itemId: partial[0].itemId, payload: { text: "" } }]);
+    expect(events).toMatchObject([
+      { eventType: "item.failed", itemId: partial[0].itemId, payload: { text: "" } },
+      { eventType: "usage.reported", payload: { runDeltaAvailable: false, accountingComplete: false } },
+    ]);
   });
   it.each(["error", "aborted"])("retains native %s as item failure, never turn settlement", stopReason => {
     const events = createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ stopReason, errorMessage: "native failure" }));
@@ -258,13 +387,12 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
   it("rejects deep objects and non-numeric indexes rather than coercing identity", () => {
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(update("text_delta", { contentIndex: "0", delta: "wrong index" }))).toThrow(/index_invalid/);
     let deep: unknown = "leaf"; for (let index = 0; index < 40; index++) deep = { next: deep };
-    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "unknown", deep })).toThrow(/depth_limit/);
+    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "tool_execution_start", toolCallId: "deep", toolName: "read", args: deep })).toThrow(/depth_limit/);
   });
   it("rejects missing IDs, changed receipts and bounds instead of silently approving truncation", () => {
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "tool_execution_start", toolName: "bash" })).toThrow(/id_missing/);
     expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ responseId: undefined, timestamp: undefined }))).toThrow(/identity_missing/);
-    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(update("text_delta", { delta: "x".repeat(65537) }))).toThrow(/text_limit/);
-    expect(() => createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "unknown", body: "x".repeat(262145) })).toThrow(/record_limit/);
+    expect(createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project({ type: "unknown", body: "x".repeat(262145) })[0]).toMatchObject({ eventType: "harness.diagnostic", payload: { code: "pi_unknown_event" } });
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" }); projector.project(final());
     expect(() => projector.project(final({ content: [] }))).toThrow(/conflicting_receipt/);
   });

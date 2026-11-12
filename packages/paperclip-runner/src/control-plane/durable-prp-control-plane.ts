@@ -4957,8 +4957,9 @@ export function spawnRunner(options: {
     // the complete value before a byte reaches disk. Raw process output is
     // intentionally discarded below; these files are only the runner-owned
     // restart-survivable diagnostic channel.
-    // Keep every earlier generation's diagnostics: a relaunch must never
-    // erase the only evidence of why the previous runnerd exited.
+    // Rotate before clearing the local placeholders. runnerd also rotates at
+    // write time (including remote launches); it skips these empty placeholders,
+    // so a prior generation is archived only once, not once per layer.
     rotatePriorDiagnostic(stdoutPath);
     rotatePriorDiagnostic(stderrPath);
     atomicPrivateWrite(stdoutPath, "");

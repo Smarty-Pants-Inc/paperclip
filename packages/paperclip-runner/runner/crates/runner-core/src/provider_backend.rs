@@ -32,7 +32,8 @@ use crate::provider_bridge::{
 };
 use crate::provider_events::{
     codex_context_usage, normalize_codex_notification, normalize_codex_notification_in,
-    normalized_codex_terminal_event_type, with_terminal_outcome, NormalizedProviderEvent,
+    normalize_pi_notification_in, normalized_codex_terminal_event_type, with_terminal_outcome,
+    NormalizedProviderEvent, MAX_PI_FINAL_TEXT_CHARS,
 };
 use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
 
@@ -832,12 +833,15 @@ fn normalize_provider_notification(
         return Ok(events);
     }
     if method != "paperclip/runResult" {
-        return Ok(
+        let events = if state.config.provider == "pi_rpc" {
+            normalize_pi_notification_in(method, params, Some(&state.config.cwd))
+        } else {
             normalize_codex_notification_in(method, params, Some(&state.config.cwd))
-                .into_iter()
-                .map(|event| relabel_provider_event(event, &state.config.provider))
-                .collect(),
-        );
+        };
+        return Ok(events
+            .into_iter()
+            .map(|event| relabel_provider_event(event, &state.config.provider))
+            .collect());
     }
     let (result, fingerprint, disposition) = validate_proxy_run_result(state, params)?;
     match (
@@ -915,14 +919,14 @@ fn terminal_events(
     let Some(contract) = state.completion_contract.as_ref() else {
         return Vec::new();
     };
-    let empty_opencode_completion = state.config.provider == "opencode"
+    let empty_facade_completion = matches!(state.config.provider.as_str(), "opencode" | "pi_rpc")
         && event_type == "turn.completed"
         && state.active_provider_result_fingerprint.is_none()
         && state
             .last_agent_message
             .as_deref()
             .is_none_or(|text| text.trim().is_empty());
-    if rejected_completion || empty_opencode_completion {
+    if rejected_completion || empty_facade_completion {
         return vec![
             NormalizedProviderEvent {
                 event_type: "session.failed".to_owned(),
@@ -931,9 +935,9 @@ fn terminal_events(
                     "provider": state.config.provider,
                     "code": if rejected_completion { "semantic_completion_rejected" } else { "opencode_empty_response" },
                     "message": if rejected_completion {
-                        "The turn ended without correcting its rejected completion report."
+                        "The turn ended without correcting its rejected completion report.".to_owned()
                     } else {
-                        "OpenCode ended without a final answer or an accepted completion report."
+                        format!("{} ended without a final answer or an accepted completion report.", facade_provider_name(&state.config.provider))
                     },
                     "recoverable": false,
                 }),
@@ -980,6 +984,11 @@ fn terminal_events(
             format!("The {provider_name} run failed before it completed.")
         }
     });
+    let summary = if provider == "pi_rpc" {
+        summary.chars().take(MAX_PI_FINAL_TEXT_CHARS).collect()
+    } else {
+        summary
+    };
     let evidence_ref = format!("provider:{provider}:agent-message");
     let criteria = contract
         .criterion_ids
@@ -3585,6 +3594,33 @@ impl CodexCommandExecutor {
         })
     }
 
+    // A readiness drain is fail-closed for reuse, but must not discard the
+    // completed run or turn a provider-local tail failure into a runner exit.
+    // The caller saves this diagnostic with the terminal (or park refusal)
+    // before retiring the unsafe provider process.
+    fn retain_completed_accounting_tail_for_poll(&mut self) -> Result<bool, DurableRunnerError> {
+        let Err(error) = self.retain_completed_accounting_tail() else {
+            return Ok(true);
+        };
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider has not been prepared"))?;
+        state.lifecycle = "reconciliation_required".to_owned();
+        state.push_terminal_event(NormalizedProviderEvent {
+            event_type: "harness.diagnostic".to_owned(),
+            priority: EventPriority::P0,
+            payload: sanitize_value(&json!({
+                "provider": state.config.provider,
+                "code": "provider_completed_tail_drain_failed",
+                "severity": "warning",
+                "message": error.to_string().chars().take(2048).collect::<String>(),
+            })),
+        })?;
+        self.unsaved_frame_state.set(true);
+        Ok(false)
+    }
+
     fn attach_run(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
         self.retain_completed_accounting_tail()?;
         let mut next_state = self
@@ -5728,9 +5764,10 @@ impl CodexCommandExecutor {
                         .state
                         .as_ref()
                         .is_some_and(|state| goal_continues_after_turn(state, goal_remains_active));
-                    if terminal_event_type.as_deref() == Some("turn.completed") && !run_continues {
-                        self.retain_completed_accounting_tail()?;
-                    }
+                    let tail_drain_failed = terminal_event_type.as_deref()
+                        == Some("turn.completed")
+                        && !run_continues
+                        && !self.retain_completed_accounting_tail_for_poll()?;
                     let working_now = self
                         .provider
                         .as_ref()
@@ -5913,6 +5950,13 @@ impl CodexCommandExecutor {
                     } else {
                         self.unsaved_frame_state.set(true);
                     }
+                    if tail_drain_failed {
+                        // The terminal and warning are durable before cleanup.
+                        // Do not poll a broken reader again on the next loop.
+                        if let Some(mut provider) = self.provider.take() {
+                            let _ = provider.shutdown();
+                        }
+                    }
                     if reconciliation_required {
                         break;
                     }
@@ -6073,7 +6117,13 @@ impl CommandExecutor for CodexCommandExecutor {
         {
             return Ok(false);
         }
-        self.retain_completed_accounting_tail()?;
+        if !self.retain_completed_accounting_tail_for_poll()? {
+            self.save_state()?;
+            if let Some(mut provider) = self.provider.take() {
+                let _ = provider.shutdown();
+            }
+            return Ok(false);
+        }
         let state = self
             .state
             .as_ref()
@@ -8798,6 +8848,113 @@ done
         .contains("reserved for verified provider proxies"));
     }
 
+    // B7: the real Pi proxy carries `channel` beside `item`, not in `item.phase`.
+    // Keep these boundary checks: misclassification silently cuts the user's reply.
+    #[test]
+    fn b7_pi_final_channel_preserves_a_5000_character_answer() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        let answer = "x".repeat(5_000);
+        let events = normalize_provider_notification(
+            &mut state,
+            "item/completed",
+            &json!({"threadId": "thread-1", "turnId": "turn-1", "channel": "final",
+                "item": {"id": "pi-message", "type": "agentMessage", "text": answer}}),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "item.completed");
+        assert_eq!(events[0].payload["provider"], "pi_rpc");
+        assert_eq!(events[0].payload["channel"], "final");
+        assert_eq!(events[0].payload["text"], answer);
+        assert!(events[0].payload.get("providerPhase").is_none());
+
+        state.last_agent_message = Some(answer.clone());
+        let terminal = terminal_events(&state, "turn.completed", None);
+        assert_eq!(terminal[0].event_type, "run.result.proposed");
+        assert_eq!(terminal[0].payload["summary"], answer);
+    }
+
+    #[test]
+    fn b7_pi_final_channel_is_bounded_at_12000_characters() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        for length in [12_000, 12_001, 33_000] {
+            let answer = "🦀".repeat(length);
+            let events = normalize_provider_notification(
+                &mut state,
+                "item/completed",
+                &json!({"channel": "final", "item": {
+                    "id": "pi-message", "type": "agentMessage", "text": answer}}),
+            )
+            .unwrap();
+            assert_eq!(events[0].payload["channel"], "final");
+            let text = events[0].payload["text"].as_str().unwrap();
+            assert_eq!(text.chars().count(), 12_000, "input length {length}");
+            assert_eq!(text, "🦀".repeat(12_000));
+        }
+    }
+
+    #[test]
+    fn b7_pi_synthesized_summary_is_bounded_at_12000_characters() {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        for length in [5_000, 12_000, 12_001, 33_000] {
+            let answer = "🦀".repeat(length);
+            state.last_agent_message = Some(answer);
+            let events = terminal_events(&state, "turn.completed", None);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            let summary = events[0].payload["summary"].as_str().unwrap();
+            assert_eq!(summary.chars().count(), length.min(12_000));
+            assert_eq!(summary, "🦀".repeat(length.min(12_000)));
+        }
+    }
+
+    #[test]
+    fn b7_channel_override_is_pi_only_and_progress_stays_bounded() {
+        for provider in ["codex", "opencode", "cursor_cloud", "pi_rpc"] {
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+            for channel in ["final", "progress"] {
+                if provider == "pi_rpc" && channel == "final" {
+                    continue;
+                }
+                let params = json!({"channel": channel, "item": {
+                    "id": "message", "type": "agentMessage", "text": "x".repeat(5_000)}});
+                let expected = normalize_codex_notification_in(
+                    "item/completed",
+                    &params,
+                    Some(&state.config.cwd),
+                )
+                .into_iter()
+                .map(|event| relabel_provider_event(event, provider))
+                .collect::<Vec<_>>();
+                let actual =
+                    normalize_provider_notification(&mut state, "item/completed", &params).unwrap();
+                assert_eq!(actual, expected, "{provider} {channel}");
+                assert_eq!(actual[0].payload["channel"], "progress");
+                assert_eq!(
+                    actual[0].payload["text"].as_str().unwrap().chars().count(),
+                    4_000
+                );
+            }
+            // Other providers keep their existing explicit phase semantics and 32K cap.
+            if provider != "pi_rpc" {
+                let answer = "x".repeat(13_000);
+                let events = normalize_provider_notification(
+                    &mut state,
+                    "item/completed",
+                    &json!({"channel": "progress", "item": {"id": "final", "type": "agentMessage",
+                        "phase": "final_answer", "text": answer}}),
+                )
+                .unwrap();
+                assert_eq!(events[0].payload["channel"], "final");
+                assert_eq!(events[0].payload["providerPhase"], "final_answer");
+                assert_eq!(events[0].payload["text"], answer);
+            }
+        }
+    }
+
     #[test]
     fn opencode_terminal_fallback_uses_its_actual_provider_identity() {
         let mut state = CodexProviderState::new(
@@ -8852,6 +9009,128 @@ done
             assert_eq!(events[0].event_type, "session.failed");
             assert_eq!(events[0].payload["code"], "opencode_empty_response");
             assert_eq!(events[1].payload["runTerminalState"], "failed");
+        }
+    }
+
+    fn pi_rpc_result_state() -> CodexProviderState {
+        let mut state = opencode_result_state();
+        state.config.provider = "pi_rpc".to_owned();
+        state.config.driver = "pi_rpc".to_owned();
+        state.config.provider_version = crate::generated_pi_rpc_profile::PI_RPC_VERSION.to_owned();
+        state.config.profile = Some(
+            serde_json::from_str(crate::generated_pi_rpc_profile::PI_RPC_PROFILE_JSON).unwrap(),
+        );
+        state
+    }
+
+    // B6: provider completion is a trust boundary; an empty turn must not
+    // manufacture a successful result for the controller.
+    #[test]
+    fn pi_rpc_empty_terminal_does_not_fabricate_a_successful_answer() {
+        for message in [None, Some(String::new()), Some(" \t\n".to_owned())] {
+            let mut state = pi_rpc_result_state();
+            state.last_agent_message = message;
+
+            let events = terminal_events(&state, "turn.completed", None);
+
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "session.failed");
+            assert_eq!(events[0].payload["provider"], "pi_rpc");
+            assert_eq!(events[0].payload["code"], "opencode_empty_response");
+            assert_eq!(
+                events[0].payload["message"],
+                "Pi ended without a final answer or an accepted completion report."
+            );
+            assert_eq!(events[0].payload["recoverable"], false);
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["provider"], "pi_rpc");
+            assert_eq!(events[1].payload["turnTerminalState"], "failed");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+            assert_eq!(events[1].payload["reportedWorkDisposition"], "needs_review");
+        }
+    }
+
+    #[test]
+    fn pi_rpc_normal_terminal_preserves_the_successful_answer() {
+        let mut state = pi_rpc_result_state();
+        state.last_agent_message = Some("The actual final answer.".to_owned());
+
+        let events = terminal_events(&state, "turn.completed", None);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(events[0].payload["summary"], "The actual final answer.");
+        assert_eq!(events[0].payload["reportedWorkDisposition"], "done");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            true
+        );
+        assert_eq!(
+            events[0].payload["evidence"][0]["ref"],
+            "provider:pi_rpc:agent-message"
+        );
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["provider"], "pi_rpc");
+        assert_eq!(events[1].payload["runTerminalState"], "succeeded");
+    }
+
+    // K2: the Pi facade emits turn/failed only after agent_settled when its
+    // final receipt is length-limited. Feed that terminal into B6's completion
+    // path: mandatory usage or partial text must not turn it back into success.
+    #[test]
+    fn pi_rpc_truncated_terminal_does_not_promote_a_partial_answer() {
+        for message in [None, Some("The answer was cut off mid-".to_owned())] {
+            let mut state = pi_rpc_result_state();
+            state.last_agent_message = message;
+
+            let events = terminal_events(&state, "turn.failed", None);
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            assert_eq!(
+                events[0].payload["completionClaim"]["objectiveSatisfied"],
+                false
+            );
+            assert_eq!(events[0].payload["reportedWorkDisposition"], "needs_review");
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["provider"], "pi_rpc");
+            assert_eq!(events[1].payload["turnTerminalState"], "failed");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+        }
+    }
+
+    #[test]
+    fn pi_rpc_empty_interrupted_terminal_remains_cancelled() {
+        let state = pi_rpc_result_state();
+
+        let events = terminal_events(&state, "turn.interrupted", None);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "run.result.proposed");
+        assert_eq!(
+            events[0].payload["completionClaim"]["objectiveSatisfied"],
+            false
+        );
+        assert_eq!(events[1].event_type, "run.terminal");
+        assert_eq!(events[1].payload["turnTerminalState"], "interrupted");
+        assert_eq!(events[1].payload["runTerminalState"], "cancelled");
+    }
+
+    #[test]
+    fn other_provider_empty_terminal_behavior_is_unchanged() {
+        for (provider, expected_terminal) in [("codex", "succeeded"), ("cursor_cloud", "failed")] {
+            let mut state = opencode_result_state();
+            state.config.provider = provider.to_owned();
+
+            let events = terminal_events(&state, "turn.completed", None);
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["runTerminalState"], expected_terminal);
         }
     }
 

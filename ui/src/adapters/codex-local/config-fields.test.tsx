@@ -135,13 +135,14 @@ describe("Paperclip Runner Codex configuration", () => {
       expect([...field.options].map(option => option.value)).toEqual(["off", "low", "high", "max"]);
     });
   });
-  it("narrows native Pi choices to the selected row and Claude cap", async () => {
+  it.each([false, true])("narrows native Pi choices only to catalog/config capabilities (max supported: %s)", async supportsMax => {
+    const thinkingLevels = ["off", "medium", "xhigh", ...(supportsMax ? ["max"] : [])];
     await renderMarkup(<TooltipProvider><CodexLocalConfigFields mode="edit" isCreate={false} adapterType="paperclip_runner" values={null} set={null}
       config={{ provider: "pi_rpc", model: "paperclip/claude-custom", piRpcThinkingLevel: "xhigh" }}
       eff={(_group, _field, original) => original} mark={() => undefined}
-      models={[{ id: "paperclip/claude-custom", label: "Claude", thinkingLevels: ["off", "medium", "xhigh", "max"] }]} hideInstructionsFile /></TooltipProvider>, undefined, container => {
+      models={[{ id: "paperclip/claude-custom", label: "Claude", thinkingLevels }]} hideInstructionsFile /></TooltipProvider>, undefined, container => {
       const field = container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]')!;
-      expect([...field.options].map(option => option.value)).toEqual(["", "off", "medium", "xhigh"]);
+      expect([...field.options].map(option => option.value)).toEqual(["", ...thinkingLevels]);
     });
   });
   it.each(["", "--sandbox,read-only"])("shows actual automatic Legacy policy and preserves the explicit toggle (%s)", async (extraArgs) => {

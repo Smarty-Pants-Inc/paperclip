@@ -197,6 +197,9 @@ describe("immutable Pi 1.5.2 recordings through the production Pi facade JSONL b
     expect(frames.find(frame => frame.id === 1)).toMatchObject({ result: { thread: { id: "pi-session" } } });
     const notifications = frames.filter(frame => typeof frame.method === "string");
     let outputIndex = 0;
+    const totalUsage: Record<string, number> = {};
+    const turnUsage = new Map<string, Record<string, number>>();
+    const incompleteTurns = new Set<string>();
     for (const event of projectedWithTerminals) {
       expect(event.runId, `${name} ${event.eventType} captured run`).toBe("pi-capture");
       expect(event.turnId, `${name} ${event.eventType} captured turn`).toMatch(/^turn-/);
@@ -204,6 +207,14 @@ describe("immutable Pi 1.5.2 recordings through the production Pi facade JSONL b
       if (event.eventType === "context.compacted") {
         // This Runner-internal marker has no Pi RPC notification equivalent.
         continue;
+      }
+      if (payload.kind === "usage" && isRecord(payload.usage) && payload.usage.runDeltaComplete === false && !incompleteTurns.has(event.turnId)) {
+        incompleteTurns.add(event.turnId);
+        const invalidation = notifications[outputIndex++];
+        expect(invalidation).toMatchObject({ method: "thread/tokenUsage/updated", params: {
+          turnId: event.turnId, tokenUsage: { total: totalUsage }, runDeltaAvailable: false,
+        } });
+        expect((invalidation!.params as Record<string, unknown>).tokenUsage).not.toHaveProperty("last");
       }
       const frame = notifications[outputIndex++];
       expect(frame, `${name} ${event.eventType} has its native facade frame`).toBeDefined();
@@ -250,16 +261,28 @@ describe("immutable Pi 1.5.2 recordings through the production Pi facade JSONL b
           },
         });
       } else if (event.eventType === "usage.reported") {
+        const lastUsage = turnUsage.get(event.turnId) ?? {};
+        turnUsage.set(event.turnId, lastUsage);
+        for (const [key, value] of Object.entries(isRecord(payload.runDelta) ? payload.runDelta : {})) {
+          if (typeof value === "number") {
+            totalUsage[key] = (totalUsage[key] ?? 0) + value;
+            lastUsage[key] = (lastUsage[key] ?? 0) + value;
+          }
+        }
+        if (payload.runDeltaAvailable !== true || payload.accountingComplete === false) incompleteTurns.add(event.turnId);
+        const complete = !incompleteTurns.has(event.turnId);
         expect(frame).toMatchObject({
           method: "thread/tokenUsage/updated",
           params: {
             threadId: "pi-session", turnId: event.turnId,
-            cumulative: isRecord(payload.cumulative) ? payload.cumulative : {},
-            runDelta: isRecord(payload.runDelta) ? payload.runDelta : {},
-            runDeltaAvailable: payload.runDeltaAvailable === true,
+            tokenUsage: { total: totalUsage, ...(complete ? { last: lastUsage } : {}) },
+            cumulative: totalUsage,
+            runDelta: lastUsage,
+            runDeltaAvailable: complete,
             ...(payload.context === undefined ? {} : { context: isRecord(payload.context) ? payload.context : {} }),
           },
         });
+        if (!complete) expect(params.tokenUsage).not.toHaveProperty("last");
       } else if (event.eventType === "harness.diagnostic") {
         expect(frame).toMatchObject({
           method: "warning",

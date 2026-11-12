@@ -14622,8 +14622,13 @@ export const REMOTE_RUNNER_AUTHORITY_ARCHIVE_SCRIPT =
   'elif test -f "$1" && test ! -L "$1" && test -f "$3" && test ! -L "$3" && command -v cmp >/dev/null 2>&1 && cmp -s "$1" "$3"; then rm -f -- "$1"; ' +
   'else exit 1; fi; base64 < "$3"';
 
+// Runner-owned diagnostics are bounded/redacted and rotate inside runnerd. Keep
+// process/exec stderr separately: the detached parent sends it to /dev/null, and
+// redirecting to runnerd.stderr.log would race runnerd's atomic file replacement.
+// The launch nonce + child PID names a private file; noclobber refuses reuse or
+// a planted symlink. Nothing deletes diagnostics from an earlier generation.
 export const REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT =
-  'set -eu; identity_path=$1; identity_nonce=$2; runner_instance_id=$3; diagnostics_directory=$4; shift 4; umask 077; test ! -L "$diagnostics_directory"; if test -e "$diagnostics_directory"; then test -d "$diagnostics_directory"; else mkdir -p -- "$diagnostics_directory"; fi; chmod 0700 "$diagnostics_directory"; started_at=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"); pid=$$; process_fingerprint=""; if ' +
+  'set -eu; identity_path=$1; identity_nonce=$2; runner_instance_id=$3; diagnostics_directory=$4; shift 4; umask 077; test ! -L "$diagnostics_directory"; if test -e "$diagnostics_directory"; then test -d "$diagnostics_directory"; else mkdir -p -- "$diagnostics_directory"; fi; chmod 0700 "$diagnostics_directory"; set -C; exec 2> "$diagnostics_directory/runnerd.launch-stderr.${identity_nonce}.$$.log"; set +C; started_at=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"); pid=$$; process_fingerprint=""; if ' +
   REMOTE_RUNNER_PROCESS_FINGERPRINT_SCRIPT +
   '; then :; else process_fingerprint=""; fi; identity_tmp="${identity_path}.tmp.$$"; printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "$identity_nonce" "$$" "$started_at" "$runner_instance_id" "$process_fingerprint" > "$identity_tmp"; chmod 0600 "$identity_tmp"; mv -f -- "$identity_tmp" "$identity_path"; exec "$@"';
 
@@ -18027,7 +18032,22 @@ async function createRunnerdBackendWithinSessionClaim(
     recoverSession: async (snapshot, options) => {
       cursorCloudRuntime?.register({ cleanupOnly: true });
       try {
-        const result = backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
+        // Pi's process-scoped facade has no thread/resume. After the prior
+        // owner passed the ordinary terminal/suspended authority checks, a
+        // cold open of the same normalized id loads Pi's own session file.
+        // This also covers idle eviction and a new wake after server restart;
+        // same-run recovery and remote providers retain their existing path.
+        const piFile = resolve(root, "pi", `${nativeSessionKey(input.execution)}.jsonl`);
+        const piFileStat = input.execution.provider.kind === "pi_rpc" ? lstatSync(piFile, { throwIfNoEntry: false }) : undefined;
+        const reopenPi = input.execution.provider.kind === "pi_rpc" && !remoteTarget && !input.restartRecovery
+          && durableIdentity && durableIdentity.runId !== input.execution.binding.runId
+          && snapshot.identity.sessionId === nativeSessionKey(input.execution)
+          && isSafeNativeStateDirectory(resolve(root, "pi"))
+          && piFileStat?.isFile() && piFileStat.size > 0;
+        const result = reopenPi
+          ? { recovered: true, session: await backend.openSession({ identity: snapshot.identity,
+              workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }) }
+          : backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();

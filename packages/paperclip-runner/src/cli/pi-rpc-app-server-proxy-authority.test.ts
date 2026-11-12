@@ -170,7 +170,7 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
   });
 
   it.each([
-    "call_x|fc_y", "call_x|fc_z", "call_x_fc_y|fc_z", "_leading", "with space",
+    "nativecaller/1", "call_x|fc_y", "call_x|fc_z", "call_x_fc_y|fc_z", "_leading", "with space",
     "unicode-π", "x".repeat(161), "valid-with-trailing-newline\n", "pi_tool_", "pi_tool_native",
   ])("uses the full stable digest for native %j, preserving the exact callback and full receipt", async (nativeId) => {
     const h = await setup();
@@ -186,7 +186,8 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
     await expect(pending).resolves.toEqual({ toolCallId: nativeId, result });
     expect(frame.params).toMatchObject({ threadId: "pi-session", turnId: "turn-1", tool: "read_context", arguments: captured.arguments });
     expect(frame.params?.callId).toMatch(boundedId);
-    expect(frame.params?.callId).toBe(alias(nativeId));
+    expect(frame.params?.callId).toBe("pi_tool_" + createHash("sha256").update("paperclip.pi.tool-call-id\0")
+      .update(JSON.stringify(["v1", h.session.runId, h.session.nativeSessionId, input.callId])).digest("hex"));
     expect(String(frame.params?.callId)).toMatch(/^pi_tool_[a-f0-9]{64}$/);
     expect(frame.params?.callId).not.toBe(nativeId);
     expect(input).toEqual(captured);
@@ -203,7 +204,7 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
   });
 
   it("is restart-stable for the same actual native session despite different RPC counters, turns and host bootstrap IDs", async () => {
-    const nativeId = "call_restart|fc_restart";
+    const nativeId = "nativecaller/1";
     const first = await setup({ normalizedSessionId: "host-first" });
     const pending = first.invoke(call("run-1", "turn-before-restart", nativeId));
     const frame = await first.nextController("item/tool/call");
@@ -226,9 +227,9 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
   });
 
   it.each([
-    { runId: "run-2", nativeSessionId: "pi-session", nativeId: "call_x|fc_y" },
-    { runId: "run-1", nativeSessionId: "other-native-session", nativeId: "call_x|fc_y" },
-    { runId: "run-1", nativeSessionId: "pi-session", nativeId: "call_x|fc_z" },
+    { runId: "run-2", nativeSessionId: "pi-session", nativeId: "nativecaller/1" },
+    { runId: "run-1", nativeSessionId: "other-native-session", nativeId: "nativecaller/1" },
+    { runId: "run-1", nativeSessionId: "pi-session", nativeId: "nativecaller/2" },
   ])("separates the stable tuple dimension $runId/$nativeSessionId/$nativeId", async (keys) => {
     const h = await setup(keys);
     const pending = h.invoke(call(keys.runId, "turn-1", keys.nativeId));
@@ -236,7 +237,7 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
     h.respond(frame, receipt("independent origin"));
     await pending;
     expect(frame.params?.callId).toBe(alias(keys.nativeId, keys.runId, keys.nativeSessionId));
-    expect(frame.params?.callId).not.toBe(alias("call_x|fc_y"));
+    expect(frame.params?.callId).not.toBe(alias("nativecaller/1"));
   });
 
   it("JSON-frames the tuple instead of ambiguously concatenating run and native session", async () => {
@@ -365,7 +366,7 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
     h.sink.backpressured = true;
     await h.request("thread/read");
     const controller = new AbortController();
-    const outcome = h.invoke({ ...call("run-1", "turn-1", "call_queued|fc_queued"), signal: controller.signal })
+    const outcome = h.invoke({ ...call("run-1", "turn-1", "nativecaller/1"), signal: controller.signal })
       .then(() => undefined, (error: Error) => error);
     expect(h.proxy.queuedOutputFrames).toBe(1);
     expect(h.controllerFrames("item/tool/call")).toEqual([]);
@@ -399,9 +400,9 @@ describe("Pi RPC proxy stateless controller tool identity", () => {
   });
 
   it.each([
-    { ...call("run-1", "turn-1", "call_x|fc_y"), runId: undefined },
-    { ...call("run-1", "turn-1", "call_x|fc_y"), turnId: undefined },
-    call("old-run", "old-turn", "call_x|fc_y"),
+    { ...call("run-1", "turn-1", "nativecaller/1"), runId: undefined },
+    { ...call("run-1", "turn-1", "nativecaller/1"), turnId: undefined },
+    call("old-run", "old-turn", "nativecaller/1"),
   ])("does not guess current origin to normalize an unbound/stale native call: %j", async (input) => {
     const h = await setup();
     await h.request("turn/start", { input: [{ type: "text", text: "work" }] });
@@ -483,9 +484,9 @@ describe("Pi RPC proxy captured run authority", () => {
     ]);
   });
 
-  it("does not let an in-flight callback return after its session closes", async () => {
+  it.each(["call-1", "nativecaller/1"])("does not let in-flight callback %j return after its session closes", async (nativeId) => {
     const h = await setup();
-    const outcome = h.invoke(call()).then(() => undefined, (error: Error) => error);
+    const outcome = h.invoke(call("run-1", "turn-1", nativeId)).then(() => undefined, (error: Error) => error);
     const frame = await h.nextController("item/tool/call");
     await h.request("thread/close");
     h.respond(frame, { text: "late" });

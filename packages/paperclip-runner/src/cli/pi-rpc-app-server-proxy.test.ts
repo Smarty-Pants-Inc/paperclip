@@ -189,12 +189,16 @@ describe("Pi RPC app-server facade proxy", () => {
       session.push("usage.reported", { cumulative, runDelta: { inputTokens: 999 }, runDeltaAvailable: false }, "new-turn", undefined, "run-2");
       await waitFor(() => sink.decoded().some(frame => frame.method === "thread/tokenUsage/updated"));
       const frames = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
-      expect(frames).toHaveLength(1);
-      expect(frames[0]).toMatchObject({ params: { threadId: "pi-session", turnId: "new-turn", tokenUsage: { total: cumulative } } });
-      const params = frames[0].params as Record<string, unknown>;
+      // F6: old-run receipts remain visible under their captured turn, never
+      // dropped or relabelled as the warm run. Missing receipt identity cannot
+      // make an old measurement authoritative for complete accounting.
+      expect(frames).toHaveLength(2);
+      expect(frames[0]).toMatchObject({ params: { threadId: "pi-session", turnId: "old-turn", model: "stale-model", runDeltaAvailable: false } });
+      expect((frames[0].params as Record<string, unknown>).tokenUsage).not.toHaveProperty("last");
+      expect(frames[1]).toMatchObject({ params: { threadId: "pi-session", turnId: "new-turn", tokenUsage: { total: cumulative } } });
+      const params = frames[1].params as Record<string, unknown>;
       expect(params.tokenUsage).not.toHaveProperty("last");
       expect(params).not.toHaveProperty("model");
-      expect(JSON.stringify(frames)).not.toContain("stale-model");
     } finally { await proxy.close(); }
   });
 
@@ -217,26 +221,170 @@ describe("Pi RPC app-server facade proxy", () => {
       }
       const usage = sink.decoded().filter(f => f.method === "thread/tokenUsage/updated");
       expect(usage).toHaveLength(4);
-      for (const [index, frame] of usage.entries()) expect(frame).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 * (index + 1), outputTokens: 3 * (index + 1), cacheReadTokens: 2 * (index + 1) }, last: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 } } } });
-      expect(usage.reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
+      for (const [index, frame] of usage.entries()) expect(frame).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 * (index + 1), outputTokens: 3 * (index + 1), cacheReadTokens: 2 * (index + 1) }, last: { inputTokens: 11 * (index % 2 + 1), outputTokens: 3 * (index % 2 + 1), cacheReadTokens: 2 * (index % 2 + 1) } } } });
+      // `last` is a turn snapshot, not another delta to sum on every update.
+      expect([usage[1], usage[3]].reduce((sum, frame) => sum + ((frame.params as any).tokenUsage.last.inputTokens), 0)).toBe(44);
     } finally { await proxy.close(); }
   });
-  // Keep reason: incident439 lost the actionable cause at the facade/Rust wire
-  // boundary. A stale diagnostic must not poison a later current-run failure.
-  it("forwards session failure cause to the receiver, rejects stale origin, then accepts a legitimate current failure", async () => {
+  // Keep reason: harness-comparison gap #4 corrupts persisted spend at the
+  // native Pi -> facade -> Rust total/last contract boundary.
+  it("deduplicates re-sent message usage at the facade, including after another turn", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 120, "thread/start", { model: "neutral/model" });
+      const payload = { providerRequestId: "receipt-1", runDelta: { inputTokens: 11, outputTokens: 0 }, runDeltaAvailable: true, accountingComplete: true };
+      session.push("usage.reported", payload, "turn-a", "usage-1");
+      session.push("usage.reported", { ...payload, runDelta: { outputTokens: 0, inputTokens: 11 } }, "turn-a", "usage-1");
+      session.push("usage.reported", { ...payload, providerRequestId: "receipt-2" }, "turn-b", "usage-2");
+      session.push("usage.reported", payload, "turn-a", "usage-1");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const usage = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
+      expect(usage).toHaveLength(2);
+      expect(usage[0]).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 }, last: { inputTokens: 11 } } } });
+      expect(usage[1]).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 22 }, last: { inputTokens: 11 } } } });
+    } finally { await proxy.close(); }
+  });
+
+  it("reconciles T1-T4 turn snapshots to the sum of native Pi message receipts", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    const turns = [[11, 11], [3, 7], [5], [2, 4, 8]];
+    let sessionInput = 0;
+    try {
+      await request(proxy, sink, 130, "thread/start", { model: "neutral/model" });
+      for (const [index, messages] of turns.entries()) {
+        const runId = index < 2 ? "run-1" : "run-2";
+        if (index === 2) await request(proxy, sink, 131, "run.attach", { runId });
+        const turnId = `T${index + 1}`;
+        const projector = createPiEventProjector({ runId, turnId });
+        let turnInput = 0;
+        for (const [message, input] of messages.entries()) {
+          const events = projector.project({ type: "message_end", message: {
+            role: "assistant", provider: "neutral", model: "model", responseId: `${turnId}-${message}`,
+            stopReason: "stop", content: [], usage: { input, output: input, cacheRead: 1, cacheWrite: 2 },
+          } });
+          for (const event of events.filter(event => event.eventType === "usage.reported")) session.push(event.eventType, event.payload, event.turnId, event.itemId, runId);
+          sessionInput += input; turnInput += input;
+          await new Promise<void>(resolve => setImmediate(resolve));
+          const latest = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1)!;
+          expect(latest).toMatchObject({ params: { turnId, tokenUsage: {
+            total: { inputTokens: sessionInput, outputTokens: sessionInput },
+            last: { inputTokens: turnInput, outputTokens: turnInput, cacheReadTokens: message + 1, cacheWriteTokens: 2 * (message + 1) },
+          } } });
+        }
+      }
+      const finals = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated")
+        .filter((frame, index, all) => (all[index + 1]?.params as any)?.turnId !== (frame.params as any).turnId);
+      expect(finals.map(frame => (frame.params as any).tokenUsage.last.inputTokens)).toEqual(turns.map(messages => messages.reduce((sum, value) => sum + value, 0)));
+      expect((finals.at(-1)!.params as any).tokenUsage.total.inputTokens).toBe(51);
+    } finally { await proxy.close(); }
+  });
+
+  it.each(["first", "last"])("does not label a turn complete when its %s message lacks usage", async missing => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 140, "thread/start", { model: "neutral/model" });
+      const projector = createPiEventProjector({ runId: "run-1", turnId: "incomplete" });
+      for (const [index, hasUsage] of (missing === "first" ? [false, true] : [true, false]).entries()) {
+        const events = projector.project({ type: "message_end", message: {
+          role: "assistant", provider: "neutral", model: "model", responseId: `message-${index}`, stopReason: "stop", content: [],
+          ...(hasUsage ? { usage: { input: 11, output: 0, cacheRead: 0, cacheWrite: 0 } } : {}),
+        } });
+        for (const event of events) session.push(event.eventType, event.payload, event.turnId, event.itemId);
+      }
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const latest = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1)!;
+      expect(latest).toMatchObject({ params: { tokenUsage: { total: { inputTokens: 11 } }, runDeltaAvailable: false } });
+      // Rust uses the presence of tokenUsage.last as runDeltaAvailable. A
+      // top-level accountingComplete:false alone does not survive normalization.
+      expect((latest.params as any).tokenUsage).not.toHaveProperty("last");
+    } finally { await proxy.close(); }
+  });
+
+  it("preserves explicit incomplete accounting even when the message has all token fields", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 150, "thread/start", { model: "neutral/model" });
+      session.push("usage.reported", { providerRequestId: "partial", runDelta: { inputTokens: 11 }, runDeltaAvailable: true, accountingComplete: false }, "partial", "partial");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const latest = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1)!;
+      expect(latest).toMatchObject({ params: { runDeltaAvailable: false, tokenUsage: { total: { inputTokens: 11 } } } });
+      expect((latest.params as any).tokenUsage).not.toHaveProperty("last");
+    } finally { await proxy.close(); }
+  });
+
+  // Keep reason: the Pi/Rust facade boundary must retain non-zero accounting.
+  // Run usage is computed after this wire boundary in runner-core's
+  // provider_events.rs (normalize_codex_notification reads total/last into
+  // usage.reported); these TypeScript proxy/driver tests do not run Rust.
+  it("emits Pi usage.reported as thread/tokenUsage/updated with non-zero total and last", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 110, "thread/start", { model: "neutral/model" });
+      const cumulative = { inputTokens: 24, outputTokens: 6, totalTokens: 30 };
+      const runDelta = { inputTokens: 12, outputTokens: 3, totalTokens: 15 };
+      session.push("usage.reported", { cumulative, runDelta, runDeltaAvailable: true }, "usage-turn");
+      await waitFor(() => sink.decoded().some(frame => frame.method === "thread/tokenUsage/updated"));
+      const frames = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
+      expect(frames).toEqual([{
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: "pi-session", turnId: "usage-turn",
+          tokenUsage: { total: cumulative, last: runDelta },
+          cumulative, runDelta, runDeltaAvailable: true,
+        },
+      }]);
+    } finally { await proxy.close(); }
+  });
+
+  // Keep reason: incident439 lost the actionable cause at the facade/Rust wire
+  // boundary. Forward captured IDs; the receiver owns run/turn attribution.
+  it.each([
+    ["inactive run", "run-1"],
+    ["inactive turn", "run-2"],
+  ])("forwards session failure cause and every terminal event for an %s", async (_origin, runId) => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), {
+      async attachRun() {},
+      async startTurn() { return { turnId: "current-turn" }; },
+    });
     const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
     try {
       await request(proxy, sink, 80, "thread/start", { model: "neutral/model" });
       await request(proxy, sink, 81, "run.attach", { runId: "run-2" });
-      session.push("session.failed", { code: "pi_rpc_transport_failed", message: "OLD_ECONNREFUSED" }, "old-turn", undefined, "run-1");
-      session.push("turn.failed", { error: { code: "pi_rpc_transport_failed", message: "OLD_CONTINUATION" } }, "old-turn", undefined, "run-1");
+      await request(proxy, sink, 82, "turn/start", { input: [{ type: "text", text: "work" }] });
+      session.push("session.failed", { code: "pi_rpc_transport_failed", message: "CAPTURED_ECONNREFUSED" }, "old-turn", undefined, runId);
+      const terminalTypes = ["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"];
+      for (const eventType of terminalTypes) {
+        session.push(eventType, { error: { code: "pi_rpc_transport_failed", message: "CAPTURED_CONTINUATION" } }, "old-turn", undefined, runId);
+      }
       session.push("session.failed", { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" }, undefined, undefined, "run-2");
-      await new Promise<void>(resolve => setImmediate(resolve));
-      expect(sink.frames.join("")).not.toContain("OLD_ECONNREFUSED");
-      expect(sink.frames.join("")).not.toContain("OLD_CONTINUATION");
-      expect(sink.decoded().find(frame => frame.method === "error")).toMatchObject({ params: { threadId: "pi-session", message: "CURRENT_ECONNREFUSED", error: { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" } } });
+      await waitFor(() => sink.decoded().some(frame => frame.method === "error"
+        && (frame.params as Record<string, unknown>).message === "CURRENT_ECONNREFUSED"));
+      expect(sink.decoded().filter(frame => frame.method === "error")).toEqual([
+        { method: "error", params: { threadId: "pi-session", turnId: "old-turn", message: "CAPTURED_ECONNREFUSED", error: { code: "pi_rpc_transport_failed", message: "CAPTURED_ECONNREFUSED" }, willRetry: false } },
+        { method: "error", params: { threadId: "pi-session", message: "CURRENT_ECONNREFUSED", error: { code: "pi_rpc_transport_failed", message: "CURRENT_ECONNREFUSED" }, willRetry: false } },
+      ]);
+      expect(sink.decoded().filter(frame => terminalTypes.some(type => frame.method === type.replace(".", "/"))))
+        .toEqual(terminalTypes.map(type => ({
+          method: type.replace(".", "/"),
+          params: { threadId: "pi-session", turnId: "old-turn", turn: {
+            id: "old-turn", status: type.slice("turn.".length),
+            ...(type === "turn.failed" ? { error: { code: "pi_rpc_transport_failed", message: "CAPTURED_CONTINUATION" } } : {}),
+          } },
+        })));
+      expect(await request(proxy, sink, 83, "thread/read")).toMatchObject({
+        result: { thread: { turns: [{ id: "current-turn", status: "inProgress" }] } },
+      });
     } finally { await proxy.close(); }
   });
 

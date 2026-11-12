@@ -38,7 +38,7 @@ const probe = (driver: Pick<HarnessDriver, "openSession">, overrides: Partial<Pa
 describe("ordinary native Pi setup hello through the run's configured driver", () => {
   it("opens the original target, subscribes before start, observes response + terminal and retires", async () => {
     const value = stub();
-    await expect(probe(value.driver)).resolves.toEqual({ provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: config.model, providerSessionId: "native-session", helloProbePassed: true });
+    await expect(probe(value.driver)).resolves.toEqual({ provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: config.model, providerSessionId: "native-session", piRpcThinkingLevel: "off", helloProbePassed: true });
     expect(value.openSession).toHaveBeenCalledWith(expect.objectContaining({ runId: "probe-run", normalizedSessionId: "probe-session", workingDirectory: "/prepared/selected-remote-target", signal: expect.any(AbortSignal) }));
     expect(value.startTurn).toHaveBeenCalledOnce();
     expect(value.startTurn.mock.calls[0]).toEqual([{ message: { role: "user", text: "Respond only with hello. Do not use tools or inspect files." }, model: config.model, piRpcThinkingLevel: config.piRpcThinkingLevel }]);
@@ -72,10 +72,15 @@ describe("ordinary native Pi setup hello through the run's configured driver", (
     await expect(probe(value.driver)).rejects.toThrow(/model\/session/);
     expect(value.startTurn).not.toHaveBeenCalled(); expect(value.close).toHaveBeenCalledOnce();
   });
-  it.each([undefined, "high"])("requires the selected thinking level in the admitted identity (%s)", async piRpcThinkingLevel => {
+  it.each([undefined, null, "ultra", "high"])("requires a valid non-escalated thinking level in the admitted identity (%s)", async piRpcThinkingLevel => {
     const value = stub({ first: event("session.started", { context: { model: config.model, piRpcThinkingLevel } }) });
     await expect(probe(value.driver)).rejects.toThrow(/thinking/);
     expect(value.startTurn).not.toHaveBeenCalled(); expect(value.close).toHaveBeenCalledOnce();
+  });
+  it("accepts and reports the driver's admitted config-lowered thinking level", async () => {
+    const value = stub({ first: event("session.started", { context: { model: config.model, piRpcThinkingLevel: "xhigh" } }) });
+    await expect(probe(value.driver, { config: { ...config, piRpcThinkingLevel: "max" } })).resolves.toMatchObject({ helloProbePassed: true, piRpcThinkingLevel: "xhigh" });
+    expect(value.startTurn).toHaveBeenCalledOnce(); expect(value.close).toHaveBeenCalledOnce();
   });
   it("requires the native session ID, not merely a driver/display identity", async () => {
     const value = stub({ ids: { driverSessionId: "driver-only" } });

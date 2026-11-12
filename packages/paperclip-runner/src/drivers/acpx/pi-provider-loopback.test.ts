@@ -30,15 +30,19 @@ async function binding(model = "paperclip/vendor/model") {
 }
 
 describe("Pi managed provider loopback", () => {
-  it.each(["low", "xhigh", "max"] as const)("projects only the already-admitted native Pi thinking level %s", async thinkingLevel => {
-    const metadata = { id: "vendor/model", reasoning: true, thinkingLevelMap: Object.fromEntries(
-      ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => [level, level === thinkingLevel ? level : null]),
-    ) };
-    const binding = await createPiProviderBinding({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel });
+  it.each(["low", "xhigh", "max"] as const)("passes native config capabilities unchanged, independently of requested effort %s", async thinkingLevel => {
+    const metadata = { id: "vendor/model", reasoning: true, contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { max: null } };
+    const binding = await createPiProviderBinding({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel, modelConfiguration: metadata });
     cleanups.push(binding.close);
     expect(binding.provider.models).toEqual([metadata]);
-    const direct = directPiProviderConfiguration({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel });
+    const direct = directPiProviderConfiguration({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel, modelConfiguration: metadata });
     expect(JSON.parse(direct.json).providers.paperclip.models).toEqual([metadata]);
+  });
+
+  it("never invents a requested-level-only capability map", async () => {
+    const binding = await createPiProviderBinding({ model: "paperclip/vendor/model", environment: environment("http://127.0.0.1:1"), thinkingLevel: "max" });
+    cleanups.push(binding.close);
+    expect(binding.provider.models).toEqual([{ id: "vendor/model" }]);
   });
 
   it("keeps ACPX Pi models.json byte-identical without the explicit native option", async () => {

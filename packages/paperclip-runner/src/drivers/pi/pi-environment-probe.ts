@@ -1,5 +1,5 @@
 import type { HarnessDriver, HarnessSession } from "../../contracts/harness-driver.js";
-import { PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig } from "./pi-native-config.js";
+import { isPiThinkingLevelAtMost, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeConfig, type PiNativeThinkingLevel } from "./pi-native-config.js";
 
 export class PiEnvironmentProbeCleanupError extends Error {
   readonly code = "pi_probe_cleanup_unconfirmed";
@@ -27,6 +27,7 @@ interface PiProbeObservation {
   runId: string;
   normalizedSessionId: string;
   signal: AbortSignal;
+  onAdmission?: (context: Record<string, unknown>) => void;
 }
 
 /** Read-only native admission. No prompt and no retirement claim. */
@@ -42,7 +43,8 @@ export async function admitPiProbeSession(options: PiProbeObservation) {
     if (first.done || event.eventType !== "session.started" || event.runId !== options.runId || event.normalizedSessionId !== options.normalizedSessionId || context.model !== config.model) {
       throw new PiNativeAdmissionError("pi_probe_model_mismatch", "Pi hello probe returned a missing or mismatched admitted model/session.");
     }
-    if (config.piRpcThinkingLevel !== undefined && context.piRpcThinkingLevel !== config.piRpcThinkingLevel) throw new PiNativeAdmissionError("pi_probe_thinking_mismatch", "Pi hello probe did not acknowledge the selected thinking level.");
+    if (config.piRpcThinkingLevel !== undefined && !isPiThinkingLevelAtMost(context.piRpcThinkingLevel, config.piRpcThinkingLevel)) throw new PiNativeAdmissionError("pi_probe_thinking_mismatch", "Pi hello probe reported missing, invalid, or higher than requested thinking.");
+    options.onAdmission?.(context);
 
   return { providerSessionId, events, context };
 }
@@ -95,7 +97,7 @@ export async function probePiNativeEnvironment(options: {
   signal?: AbortSignal;
   timeoutMs?: number;
   cleanupTimeoutMs?: number;
-}): Promise<{ provider: "pi_rpc"; providerDriver: "pi_rpc"; effectiveModel: string; providerSessionId: string; helloProbePassed: true }> {
+}): Promise<{ provider: "pi_rpc"; providerDriver: "pi_rpc"; effectiveModel: string; providerSessionId: string; piRpcThinkingLevel?: PiNativeThinkingLevel; helloProbePassed: true }> {
   const config = resolvePiNativeConfig(options.config);
   const controller = new AbortController();
   const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
@@ -104,6 +106,7 @@ export async function probePiNativeEnvironment(options: {
   let operationError: unknown;
   let passed = false;
   let providerSessionId = "";
+  let piRpcThinkingLevel: PiNativeThinkingLevel | undefined;
   // Keep the original opening operation so cancellation cannot orphan a late
   // session; cleanup joins it before claiming that the environment is retired.
   const opening = Promise.resolve().then(() => {
@@ -113,7 +116,11 @@ export async function probePiNativeEnvironment(options: {
   try {
     await untilAbort(opening, signal);
     const active = session!;
-    providerSessionId = await observePiNativeHello({ ...options, session: active, config, signal });
+    providerSessionId = await observePiNativeHello({ ...options, session: active, config, signal,
+      onAdmission: context => {
+        if (config.piRpcThinkingLevel !== undefined) piRpcThinkingLevel = context.piRpcThinkingLevel as PiNativeThinkingLevel;
+      },
+    });
     passed = true;
   } catch (error) { operationError = error; }
   finally {
@@ -141,5 +148,5 @@ export async function probePiNativeEnvironment(options: {
   }
   if (operationError !== undefined) throw operationError;
   if (!passed) throw new Error("Pi hello probe did not complete.");
-  return { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: config.model, providerSessionId, helloProbePassed: true };
+  return { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: config.model, providerSessionId, ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }), helloProbePassed: true };
 }

@@ -6,6 +6,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createSubagentLifecycle, registerSubagentBridge, type SubagentEventBus } from "./subagents/index.js";
 import { installSubagentSeam, installUnboundChildParent } from "./subagents/seam.js";
+import { piManagedModelRegistration } from "../pi-managed-model.js";
+import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -216,12 +218,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     if (registeredProvider) pi.unregisterProvider(registeredProvider);
     pi.registerProvider(provider.name, {
       api: provider.api, apiKey: provider.apiKey, baseUrl: provider.baseUrl, authHeader: true,
-      models: provider.models.map(model => ({
-        id: model.id, name: model.name ?? model.id, reasoning: model.reasoning ?? false, input: model.input ?? ["text"],
-        cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: model.contextWindow ?? 128000, maxTokens: model.maxTokens ?? 8192,
-        ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
-      })),
+      models: provider.models.map(piManagedModelRegistration),
     });
     registeredProvider = provider.name;
     const id = candidate.model.slice(provider.name.length + 1);
@@ -230,7 +227,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
       if (!model || !await deadline(() => pi.setModel!(model))) throw new Error(PI_BIND_ERROR);
     } else if (ctx?.model?.provider !== provider.name || ctx.model.id !== id) throw new Error(PI_BIND_ERROR);
     pi.setThinkingLevel?.(candidate.thinkingLevel);
-    if (pi.getThinkingLevel && pi.getThinkingLevel() !== candidate.thinkingLevel) throw new Error(PI_BIND_ERROR);
+    if (pi.getThinkingLevel && !isPiThinkingLevelAtMost(pi.getThinkingLevel(), candidate.thinkingLevel)) throw new Error(PI_BIND_ERROR);
   }
   async function parkReady(): Promise<ParkReadyResult> {
     const reasons: string[] = [];
@@ -384,7 +381,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     // Do NOT acquire current authority here. Consume only the immutable input-admitted snapshot.
     if (!admitted || !authority.accept(admitted) || running || closed || failed
       || `${context.model?.provider}/${context.model?.id}` !== config.model
-      || (pi.getThinkingLevel && pi.getThinkingLevel() !== config.thinkingLevel)) {
+      || (pi.getThinkingLevel && !isPiThinkingLevelAtMost(pi.getThinkingLevel(), config.thinkingLevel))) {
       fence(); context.abort(); throw new Error("Pi turn authority refused");
     }
     running = admitted; admitted = null;

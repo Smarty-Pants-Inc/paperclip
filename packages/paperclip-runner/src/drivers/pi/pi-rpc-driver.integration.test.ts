@@ -91,6 +91,7 @@ describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
       const pidBeforeTurn1 = session.processPid();
       const sessionId = session.ids().providerSessionId;
       const iterator = session.events()[Symbol.asyncIterator]();
+      expect((await iterator.next()).value).toMatchObject({ eventType: "session.started", payload: { context: { model: "paperclip/faux", piRpcThinkingLevel: "off" } } });
       const measurements: Array<{ turn: number; firstEventMs: number; completedMs: number }> = [];
       let pidAfterTurn1: number | null = null;
       let pidAfterTurn2: number | null = null;

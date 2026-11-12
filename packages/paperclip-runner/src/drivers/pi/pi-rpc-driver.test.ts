@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,9 @@ import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
 import { createPiRpcAppServerProxy } from "../../cli/pi-rpc-app-server-proxy.js";
 import * as piTurnImages from "./pi-turn-images.js";
+import { bindContent, type PiBindCommand } from "./pi-bind-protocol.js";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import { questionSetSchema, requestSchema } from "../../protocol/generated/schema-bundle.js";
 
 // Keep reason: recorded large-output incident439 and failure attribution across
 // resident runs. Drive the real session pump rather than a projector surrogate.
@@ -20,13 +23,18 @@ class FailureTransport {
   queue: PiRpcRecord[] = [];
   failure?: Error;
   requests: Array<{ type: string; input?: PiRpcRecord }> = [];
+  ui: PiRpcRecord[] = [];
+  async sendExtensionUiResponse(response: PiRpcRecord) { this.ui.push(structuredClone(response)); }
+  promptDisposition = "started";
+  onPrompt?: () => void;
   async request(type: string, input?: PiRpcRecord) {
     this.requests.push({ type, input });
+    if (type === "prompt") this.onPrompt?.();
     return { data: type === "get_state" ? { sessionId: "native-session", model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "set_model" ? { provider: "neutral", id: "model" }
       : type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
       : type === "get_available_thinking_levels" ? { levels: ["high"] }
-      : type === "prompt" ? { disposition: "started" } : type === "steer" ? { disposition: "queued" } : undefined };
+      : type === "prompt" ? { disposition: this.promptDisposition } : type === "steer" ? { disposition: "queued" } : undefined };
   }
   send(value: PiRpcRecord) { this.queue.push(value); this.wake?.(); }
   fail(error: Error) { this.failure = error; this.wake?.(); }
@@ -48,7 +56,7 @@ async function failureFixture(capture = true) {
     .openSession({ runId: "run-old", normalizedSessionId: "normalized", workingDirectory: root });
   const events: PrpEvent[] = [];
   const drained = capture ? (async () => { try { for await (const event of session.events()) events.push(event); } catch { /* terminal message must precede iterator rejection */ } })() : Promise.resolve();
-  return { session, transport, events, async close() { await session.close(); await drained; await rm(root, { recursive: true, force: true }); } };
+  return { session, transport, events, async close() { await session.close({ reason: "unit cleanup" }); await drained; await rm(root, { recursive: true, force: true }); } };
 }
 
 async function inputProxyFixture() {
@@ -210,6 +218,350 @@ describe("PiRpcDriver", () => {
       try { expect(launched?.AGENT_HOME).toBeUndefined(); } finally { await session.close(); }
     } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
   });
+});
+
+async function dialogFixture() {
+  const root = await mkdtemp(join(tmpdir(), "pi-dialog-"));
+  const transport = new class extends FailureTransport {
+    override async request(type: string) {
+      return { data: type === "get_state" ? { sessionId: "native-dialog", model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+        : type === "set_model" ? { provider: "paperclip", id: "faux" }
+        : type === "get_available_models" ? { models: [{ provider: "paperclip", id: "faux", contextWindow: 200000 }] }
+        : type === "get_available_thinking_levels" ? { levels: ["off"] }
+        : type === "prompt" ? { disposition: "started" } : undefined };
+    }
+  }();
+  const session = await new PiRpcDriver({ runtimeDirectory: join(root, "runtime"), model: "paperclip/faux", piRpcThinkingLevel: "off",
+    environment: { PI_CODING_AGENT_DIR: join(root, "agent"), PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+    transportFactory: () => transport as unknown as PiRpcTransport,
+    bindRequest: (async (_path: string, command: PiBindCommand) => command.type === "bind"
+      ? { schema: 1, type: "bind", nonce: command.nonce, sessionId: command.sessionId, epoch: command.epoch, runId: command.runId, provider: command.provider.name, model: command.model, thinkingLevel: command.thinkingLevel, ...bindContent(command) }
+      : command.type === "stop_children" ? { ...command, settled: [], uncertain: [] } : { ...command, ack: true }) as never,
+  }).openSession({ runId: "run-dialog", normalizedSessionId: "dialog", workingDirectory: root });
+  const events: PrpEvent[] = [];
+  const drained = (async () => { for await (const event of session.events()) events.push(event); })();
+  const turn = await session.startTurn({ message: { role: "user", text: "ask" } });
+  transport.send({ type: "agent_start" }); await flushFailure();
+  return { root, transport, session, events, turn, async close() { await session.close({ reason: "unit cleanup" }); await drained; await rm(root, { recursive: true, force: true }); } };
+}
+
+describe("Pi canonical SDK dialogs", () => {
+  it.each([
+    { method: "select", fields: { options: ["Alpha", "Beta"] }, answer: { selectedOptionIds: ["option-2"] }, reply: { value: "Beta" } },
+    { method: "confirm", fields: { message: "Continue?" }, answer: { selectedOptionIds: ["no"] }, reply: { confirmed: false } },
+    { method: "input", fields: { placeholder: "Type here" }, answer: { text: "hello\nworld" }, reply: { value: "hello\nworld" } },
+    { method: "editor", fields: { prefill: "old\ntext" }, answer: { text: "new\ntext\n" }, reply: { value: "new\ntext\n" } },
+  ])("normalizes genuine unannotated SDK $method and returns its exact native reply", async ({ method, fields, answer, reply }) => {
+    const f = await dialogFixture();
+    try {
+      f.transport.send({ type: "extension_ui_request", id: "sdk-id", method, title: "Choose", ...fields });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(true), { timeout: 500 });
+      const request = f.events.find(e => e.eventType === "runtime_request.created")!.payload.request as Record<string, any>;
+      expect(request).toMatchObject({ schema: "paperclip.runtime_request.v2", requestKind: "runtime", type: "input", origin: { adapter: "pi-rpc", provider: "pi_rpc", method: "extension_ui_request" } });
+      expect(Object.keys(request.origin).sort()).toEqual(["adapter", "method", "provider"]);
+      const ajv = new Ajv2020({ strict: true, strictRequired: false });
+      ajv.addSchema(questionSetSchema);
+      const validate = ajv.compile(requestSchema); expect(validate(request), JSON.stringify(validate.errors)).toBe(true);
+      expect(ajv.compile(questionSetSchema)(request.input)).toBe(true);
+      if (method === "editor") expect(request.input.questions[0].initialText).toBe("old\ntext");
+      await f.session.resolveRuntimeRequest!({ requestId: request.requestId, turnId: f.turn.turnId, runId: "run-dialog", origin: request.origin,
+        resolution: { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: answer } } } } as never);
+      expect(f.transport.ui).toEqual([{ id: "sdk-id", ...reply }]);
+      expect(f.events.some(e => e.eventType === "runtime_request.resolved")).toBe(true);
+    } finally { await f.close(); }
+  });
+
+  it("captures queued old SDK UI before settlement; late answers cannot borrow the warm run", async () => {
+    const f = await dialogFixture();
+    try {
+      // Queue without yielding: native FIFO is UI -> old settlement. The
+      // downstream controller may consume the saved UI only after warm attach.
+      f.transport.send({ type: "extension_ui_request", id: "old-sdk", method: "input", title: "Old?" });
+      const message = { role: "assistant", id: "old-done", responseId: "old-receipt", timestamp: 1, provider: "paperclip", model: "faux", content: [{ type: "text", text: "done" }], usage: {}, stopReason: "stop" };
+      f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message }); f.transport.send({ type: "agent_settled" });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "turn.completed")).toBe(true));
+      const oldEvent = f.events.find(e => e.eventType === "runtime_request.created")!;
+      expect(oldEvent).toMatchObject({ runId: "run-dialog", turnId: f.turn.turnId });
+      const old = oldEvent.payload.request as Record<string, any>;
+      const answer = { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { text: "late" } } } };
+      f.transport.send({ type: "extension_ui_request", id: "idle-sdk", method: "input", title: "Idle?" });
+      await vi.waitFor(() => expect(f.transport.ui).toContainEqual({ id: "idle-sdk", cancelled: true }));
+      await f.session.attachRun!({ runId: "run-new" });
+      const next = await f.session.startTurn({ message: { role: "user", text: "new" } }); f.transport.send({ type: "agent_start" }); await flushFailure();
+      const writes = f.transport.ui.length;
+      for (const runId of ["run-dialog", "run-new"]) await expect(f.session.resolveRuntimeRequest!({ requestId: old.requestId, runId, turnId: runId === "run-dialog" ? f.turn.turnId : next.turnId, origin: old.origin, resolution: answer } as never)).rejects.toThrow();
+      expect(f.transport.ui).toHaveLength(writes);
+      // Old explicit attribution never falls through into the new lifecycle.
+      f.transport.send({ type: "extension_ui_request", id: "forged-sdk", method: "input", title: "Forged?", origin: { epoch: 1, runId: "run-dialog", turnId: f.turn.turnId } });
+      f.transport.send({ type: "extension_ui_request", id: "new-sdk", method: "input", title: "New?" });
+      await vi.waitFor(() => expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(2));
+      const current = f.events.filter(e => e.eventType === "runtime_request.created")[1]!;
+      expect(current).toMatchObject({ runId: "run-new", turnId: next.turnId });
+      const request = current.payload.request as Record<string, any>;
+      await f.session.resolveRuntimeRequest!({ requestId: request.requestId, runId: "run-new", turnId: next.turnId, origin: request.origin, resolution: answer } as never);
+      expect(f.transport.ui).toContainEqual({ id: "new-sdk", value: "late" }); expect(f.transport.ui).toContainEqual({ id: "forged-sdk", cancelled: true });
+      expect(f.transport.ui.some(value => value.id === "old-sdk")).toBe(false);
+    } finally { await f.close(); }
+  });
+
+  it("keeps malformed frames, unknown choices, duplicate IDs and cross-run answers fail-closed", async () => {
+    const f = await dialogFixture();
+    try {
+      for (const [id, fields] of Object.entries({ blank: { method: "input" }, badOptions: { method: "select", title: "Choose", options: [42] }, noMessage: { method: "confirm", title: "Confirm" }, badPrefill: { method: "editor", title: "Edit", prefill: {} } })) f.transport.send({ type: "extension_ui_request", id, ...fields });
+      await vi.waitFor(() => expect(f.transport.ui).toHaveLength(4)); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toEqual([]);
+      f.transport.send({ type: "extension_ui_request", id: "choice", method: "select", title: "Choose", options: ["Same", "Same"] });
+      await vi.waitFor(() => expect(f.events.some(e => e.eventType === "runtime_request.created")).toBe(true));
+      const request = f.events.find(e => e.eventType === "runtime_request.created")!.payload.request as Record<string, any>;
+      const input = { requestId: request.requestId, turnId: f.turn.turnId, runId: "run-dialog", origin: request.origin };
+      for (const response of [
+        { schema: "paperclip.question_response.v1", answers: { value: { selectedOptionIds: ["not-offered"] } } },
+        { schema: "paperclip.question_response.v1", answers: { value: { selectedOptionIds: ["option-1", "option-2"] } } },
+        { schema: "paperclip.question_response.v1", answers: { value: { text: "Same" } } },
+        { schema: "paperclip.question_response.v1", answers: { unexpected: { text: "bad" } } },
+      ]) await expect(f.session.resolveRuntimeRequest!({ ...input, resolution: { action: "submit", response } } as never)).rejects.toThrow();
+      expect(f.transport.ui).toHaveLength(4);
+      const resolution = { action: "submit", response: { schema: "paperclip.question_response.v1", answers: { value: { selectedOptionIds: ["option-2"] } } } };
+      await expect(f.session.resolveRuntimeRequest!({ ...input, runId: "wrong", resolution } as never)).rejects.toThrow();
+      await f.session.resolveRuntimeRequest!({ ...input, resolution } as never); expect(f.transport.ui).toContainEqual({ id: "choice", value: "Same" });
+      f.transport.send({ type: "extension_ui_request", id: "choice", method: "select", title: "Changed", options: ["Malicious"] }); await flushFailure();
+      await expect(f.session.resolveRuntimeRequest!({ ...input, resolution } as never)).rejects.toThrow(); expect(f.transport.ui).toHaveLength(5); expect(f.events.filter(e => e.eventType === "runtime_request.created")).toHaveLength(1);
+    } finally { await f.close(); }
+  });
+});
+
+// Audit A's transport inputs, through the real session pump.
+function auditToolRound(transport: FailureTransport, id: string, stamp: number, args: unknown = { path: "a" }, output = "ok") {
+  const message = { role: "assistant", provider: "neutral", model: "model", timestamp: stamp, responseId: `response-${stamp}`, stopReason: "toolUse", content: [{ type: "toolCall", id, name: "read", arguments: args }] };
+  const result = { role: "toolResult", toolCallId: id, toolName: "read", timestamp: stamp + 1, content: [{ type: "text", text: output }], isError: false };
+  transport.send({ type: "message_start", message: { ...message, responseId: undefined, content: [] } });
+  transport.send({ type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: message.content[0] } });
+  transport.send({ type: "message_end", message });
+  transport.send({ type: "tool_execution_start", toolCallId: id, toolName: "read", args });
+  transport.send({ type: "tool_execution_end", toolCallId: id, toolName: "read", result, isError: false });
+  transport.send({ type: "message_start", message: result });
+  transport.send({ type: "message_end", message: result });
+  transport.send({ type: "turn_end", message, toolResults: [result] });
+  return [message, result];
+}
+function auditFinal(transport: FailureTransport, stamp: number, messages: unknown[] = []) {
+  const message = { role: "assistant", provider: "neutral", model: "model", timestamp: stamp, responseId: `response-${stamp}`, stopReason: "stop", content: [{ type: "text", text: "done" }] };
+  transport.send({ type: "message_start", message: { ...message, responseId: undefined, content: [] } });
+  transport.send({ type: "message_end", message });
+  transport.send({ type: "agent_end", messages: [...messages, message], willRetry: false });
+  transport.send({ type: "agent_settled", aborted: false });
+}
+
+describe("PiRpcDriver P0 regressions", () => {
+  it("P0-3 completes a 70KB write and the next prompt without closing Pi", async () => {
+    const f = await failureFixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "write a large file" } });
+      f.transport.send({ type: "agent_start" });
+      auditFinal(f.transport, 100, auditToolRound(f.transport, "large-write", 1, { path: "big.txt", content: "y".repeat(70_000) }));
+      await flushFailure();
+      expect(f.events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType)).toEqual(["turn.started", "turn.completed"]);
+      expect(f.transport.closed).toBe(false);
+      await f.session.startTurn({ message: { role: "user", text: "continue" } });
+      f.transport.send({ type: "agent_start" }); auditFinal(f.transport, 200); await flushFailure();
+      expect(f.events.filter(event => event.eventType === "turn.completed")).toHaveLength(2);
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+    } finally { await f.close(); }
+  // Real-sized homogeneous argument previews exercise diagnostic redaction too.
+  }, 30_000);
+  it("P0-1 completes six 50KB reads despite agent_end carrying all results", async () => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "read six files" } });
+      f.transport.send({ type: "agent_start" });
+      const messages = Array.from({ length: 6 }, (_, i) => auditToolRound(f.transport, `read-${i}`, i * 10 + 1, { path: `f${i}` }, "x".repeat(50_000))).flat();
+      auditFinal(f.transport, 100, messages); await flushFailure();
+      expect(f.events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType)).toEqual(["turn.started", "turn.completed"]);
+      expect(f.events.at(-1)).toMatchObject({ turnId: turn.turnId, payload: { status: "completed" } });
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  }, 30_000);
+  it("P0-1 completes after a 300KB image tool result without closing Pi", async () => {
+    const f = await failureFixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "read an image" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "image", toolName: "read", args: { path: "shot.png" } });
+      const result = { role: "toolResult", toolCallId: "image", toolName: "read", timestamp: 1, content: [{ type: "image", data: "A".repeat(300_000), mimeType: "image/png" }] };
+      f.transport.send({ type: "tool_execution_end", toolCallId: "image", toolName: "read", result, isError: false });
+      f.transport.send({ type: "message_start", message: result }); f.transport.send({ type: "message_end", message: result });
+      auditFinal(f.transport, 100, [result]); await flushFailure();
+      expect(f.events.filter(event => event.eventType.startsWith("turn.")).map(event => event.eventType)).toEqual(["turn.started", "turn.completed"]);
+      expect(f.events.some(event => event.eventType === "tool.execution.completed" && event.payload.status === "completed")).toBe(true);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+  it.each([true, false])("P0-2 replays Pi 1.5.2 auto-retry inside the admitted prompt (success=%s)", async success => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "retry a transient failure" } });
+      const records: PiRpcRecord[] = (await readFile(new URL("../../../test-fixtures/pi-rpc/retry-1.5.2.jsonl", import.meta.url), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(records.filter(record => record.type === "agent_start")).toHaveLength(2);
+      for (const event of records.slice(records.findIndex(record => record.type === "agent_start"))) {
+        if (event.type === "response") continue;
+        if (!success && event.type === "message_end" && (event.message as Record<string, unknown>)?.stopReason === "stop") {
+          f.transport.send({ ...event, message: { ...(event.message as Record<string, unknown>), stopReason: "error", errorMessage: "500 exhausted retries" } });
+        } else if (!success && event.type === "auto_retry_end") f.transport.send({ ...event, success: false, finalError: "500 exhausted retries" });
+        else f.transport.send(event);
+      }
+      await flushFailure();
+      expect(f.events.filter(event => /^(turn\.(completed|failed|cancelled)|session\.failed)$/.test(event.eventType))).toMatchObject([{ eventType: success ? "turn.completed" : "turn.failed", turnId: turn.turnId }]);
+      expect(f.transport.closed).toBe(false);
+      await f.session.startTurn({ message: { role: "user", text: "next prompt" } });
+      f.transport.send({ type: "agent_start" }); auditFinal(f.transport, 999); await flushFailure();
+      expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed" });
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+  it.each([false, true])("P0-2 still refuses unrequested agent_start (active duplicate=%s)", async active => {
+    const f = await failureFixture();
+    try {
+      if (active) {
+        await f.session.startTurn({ message: { role: "user", text: "one prompt only" } });
+        f.transport.send({ type: "agent_start" });
+      } else f.transport.send({ type: "auto_retry_start", attempt: 1 });
+      f.transport.send({ type: "agent_start" }); await flushFailure();
+      expect(f.events.find(event => event.eventType === "session.failed")?.payload.code).toBe("pi_unrequested_agent_start");
+      expect(f.transport.closed).toBe(true);
+    } finally { await f.close(); }
+  });
+  it("P0-4 admits 1400 assistant receipts inside one long prompt", async () => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "one long real prompt" } });
+      f.transport.send({ type: "agent_start" });
+      for (let i = 0; i < 1400; i++) {
+        const message = { role: "assistant", provider: "neutral", model: "model", id: `native-id-${i}`, responseId: `response-${i}`, timestamp: i + 1, content: [], stopReason: "stop", usage: {} };
+        f.transport.send({ type: "message_start", message }); f.transport.send({ type: "message_end", message });
+      }
+      f.transport.send({ type: "agent_end", messages: [], willRetry: false }); f.transport.send({ type: "agent_settled", aborted: false });
+      await flushFailure();
+      expect(f.events.filter(event => /^(turn\.(completed|failed)|session\.failed)$/.test(event.eventType))).toMatchObject([{ eventType: "turn.completed", turnId: turn.turnId }]);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  }, 30_000);
+  it("P0-4 releases identities across 2100 settled turns on the same warm Pi", async () => {
+    const f = await failureFixture();
+    try {
+      for (let i = 0; i < 2100; i++) {
+        const turn = await f.session.startTurn({ message: { role: "user", text: `prompt ${i}` } });
+        f.transport.send({ type: "agent_start" }); auditFinal(f.transport, i + 1); await flushFailure();
+        expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed", turnId: turn.turnId });
+        expect(f.transport.closed).toBe(false);
+      }
+      expect(f.events.filter(event => event.eventType === "turn.completed")).toHaveLength(2100);
+    } finally { await f.close(); }
+  }, 30_000);
+  it("P0-4 retains an unfinished tool's park blocker and rejects mixed-owner completion", async () => {
+    const f = await failureFixture();
+    try {
+      await f.session.startTurn({ message: { role: "user", text: "old" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-pending", toolName: "read", args: { path: "a" } });
+      auditFinal(f.transport, 1); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).toContain("pending tools");
+      await f.session.startTurn({ message: { role: "user", text: "new" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "message_start", message: { role: "assistant", id: "new-message" } }); await flushFailure();
+      f.transport.send({ type: "tool_execution_end", toolCallId: "old-pending", messageId: "new-message", toolName: "read", result: {} }); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).toContain("pending tools");
+      f.transport.send({ type: "tool_execution_end", toolCallId: "old-pending", toolName: "read", result: {} }); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).not.toContain("pending tools");
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+});
+
+// Merge regression: K1 must supersede transient failure without losing K2 length classification.
+describe("merged K1/K2 final assistant classification", () => {
+  it.each([
+    ["error", "stop", "completed"],
+    ["error", "length", "failed"],
+    ["length", "stop", "completed"],
+    ["stop", "length", "failed"],
+    ["stop", "error", "failed"],
+    ["error", "aborted", "failed"],
+  ] as const)("uses only %s -> %s at settlement (%s, K1/K2)", async (first, last, status) => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "retry without a failure latch" } });
+      for (const [index, stopReason] of [first, last].entries()) {
+        const message = { role: "assistant", provider: "paperclip", model: "faux", timestamp: index + 1,
+          responseId: `attempt-${index}`, content: [{ type: "text", text: `attempt ${index}: ${stopReason}` }], usage: {}, stopReason };
+        f.transport.send({ type: "agent_start" });
+        f.transport.send({ type: "message_start", message });
+        f.transport.send({ type: "message_end", message });
+        f.transport.send({ type: "agent_end", messages: [message], willRetry: index === 0 });
+        await flushFailure();
+        expect(f.events.filter(event => /^turn\.(completed|failed|cancelled)$/.test(event.eventType))).toEqual([]);
+      }
+      f.transport.send({ type: "agent_settled", aborted: false }); await flushFailure();
+      const terminals = f.events.filter(event => /^turn\.(completed|failed|cancelled)$/.test(event.eventType));
+      expect(terminals).toHaveLength(1);
+      expect(terminals[0]).toMatchObject({ eventType: `turn.${status}`, turnId: turn.turnId });
+      if (last === "length") expect(terminals[0]?.payload).toMatchObject({ error: { code: "pi_output_truncated", recoverable: false } });
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+});
+
+describe("PiRpcDriver", () => {
+  it.each([true, false])("keeps known old receipts on their original turn while handled input owns no new work (before ACK=%s, K4)", async beforeAck => {
+    const f = await failureFixture();
+    try {
+      const old = await f.session.startTurn({ message: { role: "user", text: "old" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-tool", toolName: "bash", args: { command: "old" } });
+      f.transport.send({ type: "message_start", message: { role: "assistant", id: "old-message" } });
+      f.transport.send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "old" } });
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await flushFailure();
+      const receipt = () => f.transport.send({ type: "tool_execution_end", toolCallId: "old-tool", toolName: "bash", result: { content: [{ type: "text", text: "late old receipt" }] } });
+      f.transport.promptDisposition = "handled";
+      if (beforeAck) f.transport.onPrompt = receipt;
+      const handled = await f.session.startTurn({ message: { role: "user", text: "/handled" } });
+      if (!beforeAck) receipt();
+      await flushFailure();
+      expect(f.events.find(event => event.eventType === "item.completed" && event.payload.output === "late old receipt")).toMatchObject({ turnId: old.turnId, runId: "run-old" });
+      expect(f.events.some(event => event.turnId === handled.turnId && event.eventType.startsWith("item."))).toBe(false);
+      expect(f.events.find(event => event.turnId === handled.turnId && event.eventType === "turn.completed")?.payload).toMatchObject({ outcome: "handled", modelOutput: false });
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+    } finally { await f.close(); }
+  });
+  it("projects a late outstanding tool terminal once on its old run without reviving work", async () => {
+    const f = await failureFixture();
+    try {
+      const old = await f.session.startTurn({ message: { role: "user", text: "old" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-pending", toolName: "bash", args: { command: "old" } });
+      auditFinal(f.transport, 1); await flushFailure();
+      const itemId = f.events.find(event => event.turnId === old.turnId && event.eventType === "item.started")?.itemId;
+      await f.session.attachRun!({ runId: "run-new" });
+      const current = await f.session.startTurn({ message: { role: "user", text: "new" } });
+      f.transport.send({ type: "agent_start" });
+      // Reusing the retired ID cannot announce work for the new prompt.
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-pending", toolName: "bash", args: { command: "new" } });
+      const terminal = { type: "tool_execution_end", toolCallId: "old-pending", toolName: "bash", result: { content: [{ type: "text", text: "late old final" }] } };
+      f.transport.send({ ...terminal, messageId: "unknown-extra-owner" });
+      f.transport.send({ ...terminal, toolName: "read" }); await flushFailure();
+      expect((await f.session.parkReady!()).reasons).toContain("pending tools");
+      expect(f.events.some(event => event.payload.output === "late old final")).toBe(false);
+      f.transport.send(terminal); f.transport.send(terminal); await flushFailure();
+      expect(f.events.filter(event => event.eventType === "item.completed" && event.payload.output === "late old final")).toMatchObject([{ runId: "run-old", turnId: old.turnId, itemId }]);
+      expect(f.events.filter(event => event.eventType === "tool.execution.completed" && event.payload.output === "late old final")).toHaveLength(1);
+      expect(f.events.some(event => event.turnId === current.turnId && /^(item\.|tool\.execution\.)/.test(event.eventType))).toBe(false);
+      expect((await f.session.parkReady!()).reasons).not.toContain("pending tools");
+      auditFinal(f.transport, 2); await flushFailure();
+      expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed", runId: "run-new", turnId: current.turnId });
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
 
   it("opens a partial runtime context without granting an agent-files home", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-home-partial-"));
@@ -225,7 +577,7 @@ describe("PiRpcDriver", () => {
         expect(launched).toBeDefined();
         expect(launched?.AGENT_HOME).toBeUndefined();
         expect(launched?.PAPERCLIP_PI_AGENT_HOME).toBeUndefined();
-      } finally { await session.close(); }
+      } finally { await session.close({ reason: "unit cleanup" }); }
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -252,7 +604,7 @@ describe("PiRpcDriver", () => {
           const expected = mode === "registered" || mode === "controller-path" ? home : undefined;
           expect(launched?.AGENT_HOME).toBe(expected);
           expect(launched?.PAPERCLIP_PI_AGENT_HOME).toBe(expected);
-        } finally { await session.close(); }
+        } finally { await session.close({ reason: "unit cleanup" }); }
       }
     } finally { await rm(root, { recursive: true, force: true }); }
   });
@@ -297,7 +649,7 @@ describe("PiRpcDriver", () => {
     } finally { await f.close(); }
   });
 
-  it.each([true, false])("keeps a projector failure's captured origin (old continuation fails=%s)", async oldFails => {
+  it.each([true, false])("P0-4 refuses stale callbacks after releasing the completed projector (stale=%s)", async oldFails => {
     const f = await failureFixture();
     try {
       const old = await f.session.startTurn({ message: { role: "user", text: "old" } });
@@ -315,8 +667,14 @@ describe("PiRpcDriver", () => {
       f.transport.send({ type: "tool_execution_end", toolCallId: oldFails ? "old-tool" : "current-tool", toolName: "read", result: { content: [{ type: "text", text: "conflicting native tool name" }] } });
       await flushFailure();
       const failure = f.events.find(event => event.eventType === "session.failed");
-      expect(failure).toMatchObject({ runId: oldFails ? "run-old" : "run-new", turnId: oldFails ? old.turnId : current.turnId, payload: { code: "pi_rpc_transport_failed", message: "pi_projection_tool_name_changed" } });
-      if (oldFails) expect(f.events.some(event => event.eventType === "turn.failed" && event.turnId === current.turnId)).toBe(false);
+      if (oldFails) {
+        expect(failure).toBeUndefined();
+        expect(f.events.some(event => event.turnId === current.turnId && event.payload.output === "late old")).toBe(false);
+        auditFinal(f.transport, 777); await flushFailure();
+        expect(f.events.at(-1)).toMatchObject({ eventType: "turn.completed", runId: "run-new", turnId: current.turnId });
+        expect(f.transport.closed).toBe(false);
+      } else expect(failure).toMatchObject({ runId: "run-new", turnId: current.turnId, payload: { code: "pi_rpc_transport_failed", message: "pi_projection_tool_name_changed" } });
+      expect(f.events.some(event => event.turnId === old.turnId && event.eventType === "turn.completed")).toBe(true);
     } finally { await f.close(); }
   });
 

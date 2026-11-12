@@ -85,6 +85,22 @@ fn persist_runner_diagnostic(directory: &Path, message: &str) -> io::Result<()> 
             file.write_all(contents.as_bytes())?;
             file.sync_all()?;
             drop(file);
+            // Both local spawnRunner and remote shell launches use this writer.
+            // Preserve every non-empty generation before publishing the new one;
+            // UUIDs avoid collisions even for repeated writes in one process.
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {
+                    let archive = directory.join(format!(
+                        "runnerd.stderr.{}.{}.log",
+                        process_id,
+                        uuid::Uuid::new_v4()
+                    ));
+                    fs::rename(&destination, archive)?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             fs::rename(&temporary, &destination)
         })();
         if write_result.is_err() {
@@ -1070,6 +1086,9 @@ mod tests {
             0o600
         );
 
+        // The local launcher may have already rotated the prior generation and
+        // left an empty placeholder: the writer must not create a second archive.
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         fs::remove_dir_all(directory).expect("remove diagnostic test directory");
     }
 }

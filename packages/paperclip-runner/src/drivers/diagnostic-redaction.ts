@@ -1,6 +1,6 @@
 /** Redact diagnostic text without importing the provider process or its credentials. */
 export function redactProviderDiagnostic(message: string): string {
-  return message
+  const sanitized = message
     .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
     .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
@@ -12,9 +12,14 @@ export function redactProviderDiagnostic(message: string): string {
       } catch {
         return match;
       }
-    })
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
-    .replace(
+    });
+  // A long ordinary tool-output word otherwise causes a quadratic failed
+  // scheme search. The literal is required by the same regex, so this guard
+  // changes no redaction result and keeps bounded Pi display previews cheap.
+  const urls = sanitized.includes("://")
+    ? sanitized.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, "$1[REDACTED]@")
+    : sanitized;
+  return urls.replace(
       /([?&](?:api[_-]?key|token|secret|password)=)[^&#\s]+/gi,
       "$1[REDACTED]",
     )

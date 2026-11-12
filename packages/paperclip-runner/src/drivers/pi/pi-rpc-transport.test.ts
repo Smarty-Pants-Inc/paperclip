@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createPiEventProjector } from "./pi-event-projector.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { realpathSync } from "node:fs";
@@ -10,6 +10,15 @@ import { fileURLToPath } from "node:url";
 const ownedPaths = ["./extension/index.ts", "./extension/subagents/child-bridge.ts"].map(path => realpathSync(fileURLToPath(new URL(path, import.meta.url))));
 
 const spawnNode = process.execPath;
+
+async function deadlineTestWatchdog<T>(promise: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("test watchdog: request remained pending")), 600);
+    })]);
+  } finally { clearTimeout(timer); }
+}
 
 function transport(script: string, options: Partial<PiRpcTransportOptions> = {}): PiRpcTransport {
   return new PiRpcTransport({ command: spawnNode, args: ["-e", script], cwd: process.cwd(), shutdownTimeoutMs: 250, killTimeoutMs: 250, fatalSessionStartExtensionPaths: ownedPaths, ...options });
@@ -56,7 +65,7 @@ async function queuedRecords(child: PiRpcTransport): Promise<PiRpcRecord[]> {
 }
 
 describe("PiRpcTransport large tool output and lagging consumers", () => {
-  it("retains an oversized control input for projector rejection before a safe same-ID update", async () => {
+  it("retains an oversized control input for bounded projection before a safe same-ID update", async () => {
     const child = emittingTransport(`${updateScript}
       await emit({ ...update("same", "first"), args: { input: "x".repeat(300000) } });
       await emit({ ...update("same", "second"), args: { input: "safe" } });
@@ -64,8 +73,10 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
     try {
       const records = await queuedRecords(child);
       const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
-      expect(() => projector.project(records[0])).toThrow("pi_projection_record_limit");
-      expect(records[0]).toMatchObject({ args: { input: "x".repeat(300000) } });
+      const projected = projector.project(records[0]);
+      expect(projected[0]).toMatchObject({ eventType: "item.started", payload: { input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+      expect(projector.project(records[1]).some(event => event.payload.output === "second")).toBe(true);
+      expect(records.slice(0, 2).map(record => ((record.partialResult as PiRpcRecord).content as Array<{ text: string }>)[0].text)).toEqual(["first", "second"]);
       expect(records[1]).toMatchObject({ args: { input: "safe" } });
     } finally { await child.close(); }
   });
@@ -247,6 +258,55 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
 });
 
 describe("PiRpcTransport", () => {
+  // Keep reason: K3 is a recorded real catch; deadlines must remove pending IDs
+  // without replaying possibly accepted input or blocking behind stdin drain.
+  it("defaults command deadlines to 30 seconds and deletes the unanswered request", async () => {
+    const child = transport(`process.stdin.resume(); process.stdin.on("end", () => process.exit(0));`);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let failure: unknown;
+      const pending = child.request("prompt", { message: "once" }).catch(error => { failure = error; });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(failure).toMatchObject({ name: "PiRpcRequestTimeoutError", command: "prompt", timeoutMs: 30_000 });
+      await pending;
+    } finally { vi.useRealTimers(); await child.close(); }
+  });
+
+  it("expires a backpressured command instead of waiting forever for stdin drain", async () => {
+    const child = new PiRpcTransport({ command: spawnNode,
+      args: ["-e", `process.stdin.pause(); setInterval(() => {}, 1000);`], cwd: process.cwd(),
+      requestTimeoutMs: 40, shutdownTimeoutMs: 30, killTimeoutMs: 30 });
+    const start = performance.now();
+    try {
+      await expect(deadlineTestWatchdog(child.request("prompt", { message: "x".repeat(1024 * 1024) }))).rejects.toMatchObject({ name: "PiRpcRequestTimeoutError", command: "prompt", timeoutMs: 40 });
+      expect(performance.now() - start).toBeLessThan(500);
+    } finally { await child.close(); }
+  });
+
+  it("does not reuse a timed-out ID or confuse a late ACK with a later request", async () => {
+    const child = new PiRpcTransport({ command: spawnNode, args: ["-e", `
+      const readline = require("node:readline");
+      let old;
+      readline.createInterface({ input: process.stdin }).on("line", line => {
+        const request = JSON.parse(line);
+        if (request.type === "ready") {
+          process.stdout.write(JSON.stringify({ type: "response", id: request.id, command: request.type, success: true }) + "\\n"); return;
+        }
+        if (request.type === "prompt") { old = request; return; }
+        process.stdout.write(JSON.stringify({ type: "response", id: old.id, command: "prompt", success: true, data: { late: true } }) + "\\n");
+        process.stdout.write(JSON.stringify({ type: "response", id: request.id, command: request.type, success: true, data: { request, old } }) + "\\n");
+      }).on("close", () => process.exit(0));
+    `], cwd: process.cwd(), requestTimeoutMs: 50 });
+    try {
+      // Warm the real child before measuring the ACK deadline, not Node startup.
+      await child.request("ready", {}, { timeoutMs: 1000 });
+      await expect(deadlineTestWatchdog(child.request("prompt", { message: "once" }))).rejects.toMatchObject({ command: "prompt", timeoutMs: 50 });
+      const response = await child.request("get_state", {}, { timeoutMs: 1000 });
+      expect(response).toMatchObject({ data: { request: { type: "get_state", id: "paperclip-pi-3" }, old: { type: "prompt", id: "paperclip-pi-2" } } });
+      expect((await child.events()[Symbol.asyncIterator]().next()).value).toMatchObject({ type: "response", data: { late: true } });
+    } finally { await child.close(); }
+  });
+
   it("correlates out-of-order responses and reconstructs partial JSONL records", async () => {
     const child = transport(`
       let input = "";
