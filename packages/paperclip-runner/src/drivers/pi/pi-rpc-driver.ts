@@ -292,6 +292,8 @@ interface PiTurnState extends PiEventOrigin {
   lastText: string;
   hasAssistantReceipt: boolean;
   failed: boolean;
+  /** Latest receipt only; native recovery can replace it before settlement. */
+  lastAssistantStopReason?: string | null;
   settled: boolean;
 }
 
@@ -839,6 +841,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       const text = assistantText(message.content);
       if (text) turn.lastText = text;
       turn.hasAssistantReceipt ||= Boolean(text) || isRecord(message.usage);
+      turn.lastAssistantStopReason = stringValue(message.stopReason);
       if (message.stopReason === "error" || message.stopReason === "aborted") turn.failed = true;
       if (this.#streamTurn === turn) this.#streamTurn = null;
       // Bind full native tool IDs before execution callbacks can arrive.
@@ -855,8 +858,13 @@ export class PiRpcHarnessSession implements HarnessSession {
     } catch (error) { throw new PiProjectionFailure(turn, error); }
     if (event.type === "agent_settled") {
       const empty = !turn.lastText && !turn.hasAssistantReceipt;
-      const status = event.aborted === true ? "cancelled" : turn.failed || empty ? "failed" : "completed";
-      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
+      // A length receipt is incomplete even with text/mandatory usage. Judge
+      // only the final receipt, after Pi has exhausted native recovery.
+      const truncated = turn.lastAssistantStopReason === "length";
+      const status = event.aborted === true ? "cancelled" : turn.failed || truncated || empty ? "failed" : "completed";
+      const error = truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
+        : empty ? { code: "pi_empty_turn", message: "Pi settled without an assistant response." } : undefined;
+      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
     }
   }
 
