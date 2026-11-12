@@ -13407,6 +13407,26 @@ export async function verifyRemoteProviderPackManifest(packRoot: string): Promis
   return step.value;
 }
 
+/** Local native Pi uses the same qualified, hash-verified artifacts as a pack launch. */
+export async function resolveLocalPiLaunchArtifacts(configuredRoot?: string | null) {
+  const packRoot = configuredRoot?.trim() || dirname(bundledRemoteProviderPackManifestPath());
+  const manifest = await verifyRemoteProviderPackManifest(packRoot);
+  const { artifacts, target, nativeProviders } = manifest.payload;
+  if (target.platform !== process.platform || target.architecture !== process.arch
+    || !nativeProviders?.pi_rpc || !artifacts.piRpcExecutable || !artifacts.piRpcProxy) {
+    throw new Error("runner_native_pi_artifact_incompatible: select a qualified Pi provider pack for the local platform");
+  }
+  return {
+    providerNodeCommand: join(packRoot, artifacts.nodeCommand.path),
+    providerNodeCommandSha256: artifacts.nodeCommand.sha256,
+    piCommand: join(packRoot, artifacts.piRpcExecutable.path),
+    piCommandSha256: artifacts.piRpcExecutable.sha256,
+    piProxyPath: join(packRoot, artifacts.piRpcProxy.path),
+    piProxySha256: artifacts.piRpcProxy.sha256,
+    providerPackAuthorityDigest: manifest.digest,
+  };
+}
+
 export function readBundledRemoteProviderPackManifest(manifestPath = bundledRemoteProviderPackManifestPath(), target: "linux-x64" | "linux-arm64" = "linux-x64"): RemoteProviderPackManifest {
   const manifest = readRemoteProviderPackIdentity(dirname(manifestPath), false);
   if (`${manifest.payload.target.platform}-${manifest.payload.target.architecture}` !== target) {
@@ -15766,6 +15786,8 @@ async function createRunnerdBackendWithinSessionClaim(
   }));
   const configuredProviderPackRoot =
     input.runnerRemoteProviderPackPath?.trim() || remotePiCompanion?.providerPack || bundledClaudeRoot || null;
+  const localPiLaunchArtifacts = !remoteTarget && input.execution.provider.kind === "pi_rpc"
+    ? await resolveLocalPiLaunchArtifacts(configuredProviderPackRoot) : null;
   const useBundledRemoteImageAssets =
     (requiresRemoteProviderPack && !configuredProviderPackRoot &&
       (input.execution.provider.kind === "opencode" || input.execution.provider.kind === "pi_rpc" || remoteClaude)) ||
@@ -17281,6 +17303,7 @@ async function createRunnerdBackendWithinSessionClaim(
                   : input.execution.provider.kind === "acpx"
                     ? "acpx"
                     : undefined,
+        ...(localPiLaunchArtifacts ?? {}),
         ...(input.execution.provider.kind === "pi_rpc" ? {
           piRpcThinkingLevel: input.execution.provider.piRpcThinkingLevel,
           piRuntimeDirectory: posix.join(remoteRunnerFilesystemRoot ?? root, "pi"),

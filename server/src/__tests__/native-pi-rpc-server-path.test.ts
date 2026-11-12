@@ -250,11 +250,21 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
     const execution = executionFor(saved);
     expect(execution.provider).toMatchObject({ kind: "pi_rpc", model: piConfig.model, piRpcThinkingLevel: "xhigh" });
     expect(execution.session.driverKind).toBe("pi_rpc");
-    await createRunnerdBackend({ db: launchDb(), execution, runnerInstanceId: "server-path-local", runnerExecutionTarget: { kind: "local" } });
+    const { packRoot, manifest } = await providerPack();
+    await createRunnerdBackend({ db: launchDb(), execution, runnerInstanceId: "server-path-local", runnerExecutionTarget: { kind: "local" }, runnerRemoteProviderPackPath: packRoot });
     const launch = capturedLaunch();
     expect.soft(launch.provider, "native Pi must not default to the Codex transport").toBe("pi_rpc");
     expect.soft(launch.piRpcThinkingLevel, "exact native Pi thinking must reach runnerd").toBe("xhigh");
     expect(launch.lifecyclePolicy).toEqual({ mode: "warm", idleTimeoutMs: 60_000 });
+    for (const [pathKey, digestKey, artifact] of [
+      ["providerNodeCommand", "providerNodeCommandSha256", manifest.payload.artifacts.nodeCommand],
+      ["piCommand", "piCommandSha256", manifest.payload.artifacts.piRpcExecutable],
+      ["piProxyPath", "piProxySha256", manifest.payload.artifacts.piRpcProxy],
+    ] as const) {
+      expect.soft(launch[pathKey], `local ${pathKey} must use the verified provider pack`).toBe(join(packRoot, artifact.path));
+      expect.soft(launch[digestKey]).toBe(artifact.sha256);
+    }
+    expect(launch.providerPackAuthorityDigest).toBe(manifest.digest);
     expect(launch).not.toHaveProperty("piThinkingLevel");
     expect(launch).not.toHaveProperty("acpxAgent");
   });
