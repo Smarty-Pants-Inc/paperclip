@@ -17,3 +17,59 @@ jobs:
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
     uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+
+  pi_rpc_closure:
+    name: Native Pi RPC closure
+    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci' || github.event.label.name == 'full-ci'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Select native Pi RPC closure changes
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Compare the tested merge tree to its first parent, not a stale PR base.
+          # No rename detection: moving an input away must still select the check.
+          changed="$(git diff --name-only --no-renames HEAD^1 HEAD -- \
+            packages/paperclip-runner/scripts/pi-rpc-distribution/ \
+            packages/paperclip-runner/pi-rpc-distribution.json \
+            packages/paperclip-runner/scripts/materialize-pi-rpc-distribution.mjs \
+            packages/paperclip-runner/src/drivers/pi/pi-rpc-installation.ts \
+            packages/paperclip-runner/src/drivers/pi/generated-distribution.ts)"
+          if [[ -n "$changed" ]]; then
+            echo 'closure=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'closure=false' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.changes.outputs.closure == 'true'
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        if: steps.changes.outputs.closure == 'true'
+        env:
+          NPM_CONFIG_AUDIT: "false"
+          NPM_CONFIG_FUND: "false"
+          NPM_CONFIG_UPDATE_NOTIFIER: "false"
+        with:
+          version: 9.15.4
+          run_install: false
+      - name: Install dependencies
+        if: steps.changes.outputs.closure == 'true'
+        run: pnpm install --frozen-lockfile
+      - name: Materialize and verify the native Pi RPC closure
+        if: steps.changes.outputs.closure == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm --filter @paperclipai/paperclip-runner build:typescript
+          closure_root="$(mktemp -d "$RUNNER_TEMP/pi-rpc-closure.XXXXXX")"
+          trap 'rm -rf -- "$closure_root"' EXIT
+          # --check alone trusts the source pin; a real npm tree detects pin drift.
+          node packages/paperclip-runner/scripts/materialize-pi-rpc-distribution.mjs "$closure_root/distribution"
+          pnpm --filter @paperclipai/paperclip-runner check:pi-rpc-profile
