@@ -1,3 +1,4 @@
+import { PI_CONVERSATION_KEY } from "../native-runtime/pi-conversation-record.js";
 import { retainCurrentWorkspaceSource } from "../workspace-source-lock.js";
 import { localWorkspaceSourcePaths } from "../execution-workspace-source-roots.js";
 import { effectiveProjectWorkspacePolicy } from "../project-workspace-provider.js";
@@ -2118,6 +2119,7 @@ const SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY =
 
 const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
   SESSION_AI_CREDENTIAL_IDENTITY_KEY,
+  PI_CONVERSATION_KEY,
   SESSION_CONFIGURED_MODEL_KEY,
   SESSION_CONFIG_FINGERPRINT_KEY,
   SESSION_CONFIG_FINGERPRINT_VERSION_KEY,
