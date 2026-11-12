@@ -17117,8 +17117,13 @@ async function createRunnerdBackendWithinSessionClaim(
         PAPERCLIP_WORKSPACE_CWD: input.execution.workspace.cwd,
       };
   if (input.execution.provider.kind === "pi_rpc") {
-    // Pi state belongs to this runner session, never the controller account.
-    effectiveRunnerEnvironment.PI_CODING_AGENT_DIR = posix.join(remoteRunnerFilesystemRoot ?? root, "pi-agent");
+    // buildNativeProviderEnvironment excludes PI_CODING_AGENT_DIR from host
+    // inheritance. Only the resolved agent env may select a configured home;
+    // an ambient controller home must never replace session-owned Pi state.
+    const configuredPiAgentDir = runnerEnvironment?.PI_CODING_AGENT_DIR;
+    effectiveRunnerEnvironment.PI_CODING_AGENT_DIR = configuredPiAgentDir && posix.isAbsolute(configuredPiAgentDir)
+      ? configuredPiAgentDir
+      : posix.join(remoteRunnerFilesystemRoot ?? root, "pi-agent");
   }
   const archiveContinuityState = async (previous?: PersistedNativeSession) => {
     if (hasRetainedWarmTransitionEvidence(root)) {

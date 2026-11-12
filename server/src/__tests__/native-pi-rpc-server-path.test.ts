@@ -9,7 +9,7 @@ import { activityLog, budgetReservations, heartbeatRuns, heartbeatRunEvents, iss
 import type { PrpEvent } from "../vendor/paperclip-runner/index.js";
 import type { AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
 import { FakeCodexTransport } from "../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.js";
-import { canonicalNativeRuntimeContextDigest, PI_RPC_DISTRIBUTION, QUALIFIED_ACPX_PROFILES, QUALIFIED_PI_RPC_PROFILE } from "@paperclipai/paperclip-runner";
+import { canonicalNativeRuntimeContextDigest, configuredEnvironmentProjection, PI_RPC_DISTRIBUTION, QUALIFIED_ACPX_PROFILES, QUALIFIED_PI_RPC_PROFILE } from "@paperclipai/paperclip-runner";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { resolvePaperclipRunnerNativeProviderInput, resolvePaperclipRunnerProviderProfile } from "../services/native-runtime/provider-profile.js";
@@ -127,7 +127,7 @@ vi.mock("../services/native-runtime/paperclip-control-plane-port.js", async impo
   } };
 });
 
-import { createRunnerdBackend, executePaperclipNativeSession, sha256DirectoryTree } from "../services/native-runtime/native-session-executor.js";
+import { buildNativeProviderEnvironment, createRunnerdBackend, executePaperclipNativeSession, sha256DirectoryTree } from "../services/native-runtime/native-session-executor.js";
 
 const agentId = "11111111-1111-4111-8111-111111111111";
 const companyId = "10000000-0000-4000-8000-000000000001";
@@ -165,7 +165,7 @@ async function createApp() {
 }
 
 // Existing route harness's explicit loopback listener and deterministic close.
-async function patchSavedPi() {
+async function patchSavedPi(config: Record<string, unknown> = piConfig) {
   const app = await createApp();
   const { createServer } = await vi.importActual<typeof import("node:http")>("node:http");
   const server = createServer(app);
@@ -174,7 +174,7 @@ async function patchSavedPi() {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Expected loopback TCP listener");
     const response = await request(`http://127.0.0.1:${address.port}`).patch(`/api/agents/${agentId}`)
-      .send({ adapterType: "paperclip_runner", adapterConfig: piConfig });
+      .send({ adapterType: "paperclip_runner", adapterConfig: config });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
     const saved = await mocks.getAgent();
     expect(saved).toMatchObject({ adapterType: "paperclip_runner", adapterConfig: piConfig, runtimeConfig: { aiConnection: binding } });
@@ -354,6 +354,56 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
       "server must verify the selected pack on the sandbox before launch").toBe(true);
     expect(launch.externallySandboxed).toBe(true);
     expect(launch.lifecyclePolicy).toEqual({ mode: "warm", idleTimeoutMs: 60_000 });
+  });
+
+  // Keep reason: recorded image-1 incident: overwriting the configured Pi home
+  // hid installed extensions, MCP and model clamps. Exercise PATCH validation,
+  // real plain-env normalization/resolution, and the heartbeat env construction.
+  it.each(["local", "remote sandbox"].flatMap(target => [
+    { source: "agent absolute", agentDir: "/home/user/.pi/agent", ambient: "/controller/.pi/agent" },
+    { source: "ambient only", agentDir: undefined, ambient: "/controller/.pi/agent" },
+    { source: "unset", agentDir: undefined, ambient: undefined },
+    { source: "agent relative", agentDir: ".pi/agent", ambient: "/controller/.pi/agent" },
+    { source: "agent empty", agentDir: "", ambient: "/controller/.pi/agent" },
+  ].map(scenario => ({ target, ...scenario }))))("Pi agent directory: $target / $source", async ({ target, source, agentDir, ambient }) => {
+    vi.stubEnv("PI_CODING_AGENT_DIR", ambient);
+    const { secretService } = await vi.importActual<typeof import("../services/secrets.js")>("../services/secrets.js");
+    const secretsSvc = secretService(launchDb());
+    mocks.normalizeSecrets.mockImplementationOnce((company, config) =>
+      secretsSvc.normalizeAdapterConfigForPersistence(company, config, { adapterType: "paperclip_runner" }));
+    const saved = await patchSavedPi({ ...piConfig, env: agentDir === undefined ? {} : { PI_CODING_AGENT_DIR: agentDir } });
+    const { resolveExecutionRunAdapterConfig } = await import("../services/heartbeat/run-preparation.js");
+    const { resolvedConfig, configuredTaskEnvironment } = await resolveExecutionRunAdapterConfig({
+      companyId, agentId, adapterType: "paperclip_runner", executionRunConfig: saved.adapterConfig, projectEnv: null, secretsSvc,
+    });
+    const adapterEnv = resolvedConfig.env as NodeJS.ProcessEnv;
+    const runnerEnvironment = {
+      ...configuredEnvironmentProjection(configuredTaskEnvironment),
+      ...buildNativeProviderEnvironment(adapterEnv, process.env, root),
+    };
+    // The reserved manifest omits this key; the resolved adapter env must not.
+    expect(runnerEnvironment.PI_CODING_AGENT_DIR).toBe(agentDir);
+    const execution = executionFor(saved);
+    const { packRoot } = await providerPack();
+    const execute = vi.fn(async (command: { args?: string[] }) => ({
+      exitCode: 0, signal: null, timedOut: false, stderr: "",
+      stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+        durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+      }) : command.args?.[0] === "--version" ? "1.18.34\n" : "",
+    }));
+    await createRunnerdBackend({ db: launchDb(), execution, runnerInstanceId: "pi-agent-home", runnerEnvironment,
+      runnerRemoteProviderPackPath: packRoot,
+      ...(target === "remote sandbox" ? {
+        runnerIngressAuthorized: true, runnerRemoteBinaryPath: mocks.runnerBinary,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "environment", leaseId: "lease",
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn: vi.fn(async () => undefined) } } as never,
+      } : { runnerExecutionTarget: { kind: "local" as const } }),
+    });
+    const launch = capturedLaunch();
+    expect(launch.environment?.PI_CODING_AGENT_DIR).toBe(source === "agent absolute"
+      ? agentDir : posix.join(launch.runnerFilesystemRoot ?? launch.stateDirectory!, "pi-agent"));
+    expect(runnerEnvironment.PI_CODING_AGENT_DIR).toBe(agentDir);
   });
 
   it("case 3 ACPX Pi control: keeps ACPX Pi and its legacy thinking/permission launch options unchanged", async () => {
