@@ -17,11 +17,14 @@ class FailureTransport {
   wake?: () => void;
   queue: PiRpcRecord[] = [];
   failure?: Error;
+  promptDisposition = "started";
+  onPrompt?: () => void;
   async request(type: string) {
+    if (type === "prompt") this.onPrompt?.();
     return { data: type === "get_state" ? { sessionId: "native-session", model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "set_model" ? { provider: "neutral", id: "model" }
       : type === "get_available_thinking_levels" ? { levels: ["high"] }
-      : type === "prompt" ? { disposition: "started" } : undefined };
+      : type === "prompt" ? { disposition: this.promptDisposition } : undefined };
   }
   send(value: PiRpcRecord) { this.queue.push(value); this.wake?.(); }
   fail(error: Error) { this.failure = error; this.wake?.(); }
@@ -47,6 +50,28 @@ async function failureFixture(capture = true) {
 }
 
 describe("PiRpcDriver", () => {
+  it.each([true, false])("keeps known old receipts on their original turn while handled input owns no new work (before ACK=%s, K4)", async beforeAck => {
+    const f = await failureFixture();
+    try {
+      const old = await f.session.startTurn({ message: { role: "user", text: "old" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "old-tool", toolName: "bash", args: { command: "old" } });
+      f.transport.send({ type: "message_start", message: { role: "assistant", id: "old-message" } });
+      f.transport.send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "old" } });
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await flushFailure();
+      const receipt = () => f.transport.send({ type: "tool_execution_end", toolCallId: "old-tool", toolName: "bash", result: { content: [{ type: "text", text: "late old receipt" }] } });
+      f.transport.promptDisposition = "handled";
+      if (beforeAck) f.transport.onPrompt = receipt;
+      const handled = await f.session.startTurn({ message: { role: "user", text: "/handled" } });
+      if (!beforeAck) receipt();
+      await flushFailure();
+      expect(f.events.find(event => event.eventType === "item.completed" && event.payload.output === "late old receipt")).toMatchObject({ turnId: old.turnId, runId: "run-old" });
+      expect(f.events.some(event => event.turnId === handled.turnId && event.eventType.startsWith("item."))).toBe(false);
+      expect(f.events.find(event => event.turnId === handled.turnId && event.eventType === "turn.completed")?.payload).toMatchObject({ outcome: "handled", modelOutput: false });
+      expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
+    } finally { await f.close(); }
+  });
   it("opens a partial runtime context without granting an agent-files home", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-home-partial-"));
     const transport = new FailureTransport();

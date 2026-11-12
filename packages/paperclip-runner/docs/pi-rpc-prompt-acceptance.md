@@ -4,6 +4,30 @@ Pi's command response reports acceptance, not model completion. The runner reads
 session events continuously, including while the prompt response is outstanding.
 See the [Pi 1.5.2 RPC lifecycle](https://github.com/earendil-works/pi/blob/v1.5.2/packages/coding-agent/docs/rpc.md#run-lifecycle).
 
+## Prompt dispositions
+
+- `started`: Pi accepted this input to start work. Wait for the captured run's
+  `agent_settled`, not merely `agent_end`.
+- `queued`: Pi accepted the input into its run queue. Keep the host turn active
+  through the corresponding lifecycle and settlement; queuing is not rejection
+  or completion. The driver does not add a steering or follow-up API.
+- `handled`: An extension command or input handler consumed the input. Complete
+  the host turn immediately with `outcome: "handled"` and `modelOutput: false`.
+  Do not wait for `agent_settled`, fabricate assistant output or usage, or retire
+  the resident session. Model work independently started by an extension does not
+  belong to this turn, even if its events arrive before the prompt response.
+
+The prompt response gates event ownership. For `handled`, unowned extension
+activity is discarded until fresh idle admission before another prompt. A real
+pre-acceptance error fails only its turn (`pi_prompt_rejected`); ordinary turn
+finalization revokes any per-turn capability, and the resident child may rebind
+for the next input. A cleanup failure or transport failure remains a separate
+reason to retire the child.
+
+See [Pi's prompt command contract](https://github.com/earendil-works/pi/blob/v1.5.2/packages/coding-agent/docs/rpc-commands.md#prompt).
+Disposition, independent-extension ownership and same-resident reuse regressions
+are in `pi-rpc-prompt.test.ts` and `pi-rpc-resident-binding.test.ts`.
+
 ## Lost acknowledgments
 
 `PiRpcTransport` gives commands a 30-second client response deadline. Set
