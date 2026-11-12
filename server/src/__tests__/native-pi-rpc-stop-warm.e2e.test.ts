@@ -10,6 +10,7 @@ import { eq } from "drizzle-orm";
 import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests } from "@paperclipai/db";
 import { expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
 import { prepareNativePiHomeProof, readNativePiHomeProof, assertNativePiHomeProof } from "./helpers/native-pi-home-load-proof.js";
 
 // Explicit-only real process/user flow; faux model, real HTTP route/DB/runner/Pi.
@@ -65,6 +66,7 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
   const requests: Array<{ path: string; model: unknown; lastMessage: unknown; tools: string[] }> = [];
   const packVerificationCommands: Array<Record<string, unknown>> = [];
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
+  let helloProbeRequests = 0;
   let replyCount = 0;
   let modelServer: Server | undefined, http: Server | undefined;
   let app: Awaited<ReturnType<typeof import("../app.js").createApp>> | undefined;
@@ -142,7 +144,11 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
       req.on("data", (chunk: string) => { body += chunk; });
       req.on("end", () => {
         if (new URL(req.url ?? "", "http://127.0.0.1").pathname !== "/v1/messages") { res.writeHead(404).end(); return; }
-        const parsed = JSON.parse(body), useTool = requests.length === 0;
+        const parsed = JSON.parse(body);
+        if (respondToNativePiHello(parsed, res, "messages")) {
+          helloProbeRequests++; stage("faux model answered setup hello", { helloProbeRequests }); return;
+        }
+        const useTool = requests.length === 0;
         requests.push({ path: req.url!, model: parsed.model, lastMessage: parsed.messages?.at(-1),
           tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? "") });
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -243,13 +249,15 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
       runtimeConfig: { aiConnection: binding, heartbeat: { enabled: false, wakeOnDemand: true } },
     }, 201);
     agentId = agent.id;
-    // Model hq's existing-ready agent BEFORE the production PATCH. A genuinely
-    // fresh agent needs the parked C5 native setup hello; this fixture does not
-    // claim that onboarding works and does not modify a product lifecycle gate.
-    await db.update(agents).set({ lifecycleState: "ready", status: "idle", lifecycleHolds: [],
-      lifecycleOperation: null, lifecycleError: null, lifecycleVersion: agent.lifecycleVersion + 1,
-    }).where(eq(agents.id, agentId));
-    stage("fixture: existing ready agent", { agentId, freshAgentVerificationCovered: false, reason: "C5 native setup hello is parked" });
+    // Hire verification is asynchronous. Join the real managed hello before
+    // PATCH or business turns; never force ready over a still-running verifier.
+    await waitFor("managed native Pi hire verified", async () => {
+      const [current] = await db!.select().from(agents).where(eq(agents.id, agentId));
+      if (current?.lifecycleError) throw new Error(`Native Pi hire verification failed: ${JSON.stringify(current.lifecycleError)}`);
+      return current?.lifecycleState === "ready" ? current : null;
+    });
+    expect(helloProbeRequests, "managed hire made a real native hello model request").toBeGreaterThan(0);
+    stage("native Pi hire verified", { agentId, helloProbeRequests });
     const patched = await api("PATCH", `/agents/${agentId}`, {
       adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", cwd: workspace, model: "paperclip/faux", lifecycleMode: "warm", piRpcThinkingLevel: thinking, env: adapterEnv },
       runtimeConfig: { aiConnection: binding, heartbeat: { enabled: false, wakeOnDemand: true } },

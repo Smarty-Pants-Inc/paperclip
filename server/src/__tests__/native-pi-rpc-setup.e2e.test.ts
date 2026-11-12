@@ -14,6 +14,7 @@ vi.mock("../services/ai-connections.js", async original => ({ ...await original<
 afterEach(() => { vi.clearAllMocks(); });
 import { requireServerAdapter } from "../adapters/index.js";
 import { assertHarnessTestPassed } from "../services/agent-harness-verification.js";
+import { isNativePiHelloRequest, respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
 
 // Keep: the 1b double-prime fresh-agent incident fell through to OpenCode.
 // Real registry -> setup -> runnerd -> Pi RPC -> controlled loopback model.
@@ -37,11 +38,7 @@ it.skipIf(!enabled).each([
         res.end(JSON.stringify({ error: { message: status === 401 ? "Authentication required" : "Model unavailable", type: status === 401 ? "authentication_error" : "model_not_found" } }));
         return;
       }
-      res.writeHead(200, { "content-type": "text/event-stream" });
-      for (const chunk of [{ choices: [{ index: 0, delta: { content: "hello" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } }]) {
-        res.write(`data: ${JSON.stringify({ id: "pi-setup-hello", object: "chat.completion.chunk", ...chunk })}\n\n`);
-      }
-      res.end("data: [DONE]\n\n");
+      if (!respondToNativePiHello(requests.at(-1), res, "chat")) res.writeHead(500).end("Expected the native Pi hello prompt");
     });
   });
   await new Promise<void>(resolve => peer.listen(0, "127.0.0.1", resolve));
@@ -54,6 +51,7 @@ it.skipIf(!enabled).each([
       } } });
     console.log("native Pi setup proof", JSON.stringify({ status, result, requests: requests.length }));
     expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every(isNativePiHelloRequest), "every setup model call uses the exact hello prompt").toBe(true);
     expect(result.checks[0].code).toBe(check);
     if (failure) expect(() => assertHarnessTestPassed(result)).toThrow(expect.objectContaining({ code: failure }));
     else expect(() => assertHarnessTestPassed(result)).not.toThrow();
@@ -84,16 +82,7 @@ it.skipIf(!enabled).each([
         res.end(JSON.stringify({ type: "error", error: { message: status === 401 ? "Authentication required" : "Model unavailable", type: status === 401 ? "authentication_error" : "not_found_error" } }));
         return;
       }
-      res.writeHead(200, { "content-type": "text/event-stream" });
-      for (const event of [
-        { type: "message_start", message: { id: "managed-pi-hello", type: "message", role: "assistant", model: "faux", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 3, output_tokens: 0 } } },
-        { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hello" } },
-        { type: "content_block_stop", index: 0 },
-        { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } },
-        { type: "message_stop" },
-      ]) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-      res.end();
+      if (!respondToNativePiHello(requests.at(-1)?.body, res, "messages")) res.writeHead(500).end("Expected the native Pi hello prompt");
     });
   });
   await new Promise<void>(resolve => peer.listen(0, "127.0.0.1", resolve));
@@ -121,6 +110,7 @@ it.skipIf(!enabled).each([
       { companyId: input.companyId, adapterType: input.adapterType, config: managed.config }, binding, managed, input.agentId));
     console.log("managed native Pi setup proof", JSON.stringify({ status, result, requests: requests.length }));
     expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every(request => isNativePiHelloRequest(request.body)), "every managed setup call uses the exact hello prompt").toBe(true);
     expect(requests.every(request => request.url === "/v1/messages?beta=true" && request.authorization === `Bearer ${credential}` && request.body.model === "faux")).toBe(true);
     expect(result.checks[0].code).toBe(check);
     expect(accounts.markAuthenticationFailed).toHaveBeenCalledTimes(status === 401 ? 1 : 0);
