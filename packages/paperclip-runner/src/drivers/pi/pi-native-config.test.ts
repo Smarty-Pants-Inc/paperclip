@@ -35,7 +35,7 @@ describe("native Pi configuration and admission (playbook 6.1/6.2)", () => {
   it.each([
     { sessionId: "s", model: { provider: "neutral", id: "other" }, thinkingLevel: "high" },
     { sessionId: "s", model: { provider: "other", id: model.id }, thinkingLevel: "high" },
-    { sessionId: "s", model, thinkingLevel: "low" },
+    { sessionId: "s", model, thinkingLevel: "xhigh" },
     { sessionId: "s", thinkingLevel: "high" },
     { model, thinkingLevel: "high" },
   ])("rejects missing or changed effective identity before prompt", async effective => {
