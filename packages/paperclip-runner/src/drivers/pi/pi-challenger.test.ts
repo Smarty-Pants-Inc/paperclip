@@ -24,13 +24,14 @@ describe("binding challenger admission corrections", () => {
     } }, resolvePiNativeConfig(selection))).resolves.toMatchObject({ piRpcThinkingLevel: "high" });
     expect(commands).toEqual(["get_state", "set_model", "get_available_thinking_levels", "set_thinking_level", "get_state"]);
   });
-  it("refuses unsupported thinking before setting it", async () => {
+  it("requests valid thinking but refuses an effective level absent from availability", async () => {
     const commands: string[] = [];
     await expect(admitPiRpcSession({ request: async command => {
       commands.push(command.type);
       return command.type === "get_state" ? state : command.type === "set_model" ? model : { levels: ["off"] };
     } }, resolvePiNativeConfig(selection))).rejects.toThrow(/thinking/);
-    expect(commands).not.toContain("set_thinking_level");
+    expect(commands).toContain("set_thinking_level");
+    expect(commands).not.toContain("prompt");
   });
   it("refuses active or queued work at attach/claim", async () => {
     for (const live of [{ isStreaming: true }, { isCompacting: true }, { pendingMessageCount: 1 }]) {
