@@ -7,7 +7,7 @@ export interface PiBuiltinModelCatalog {
   getBuiltinProviders(): string[];
   getBuiltinModels(provider: string): Array<{ id: string; contextWindow: number; maxTokens: number; reasoning: boolean; thinkingLevelMap?: PiBindModel["thinkingLevelMap"] }>;
 }
-export const PI_MANAGED_MODEL_DEFAULTS = { contextWindow: 128000, maxTokens: 8192, reasoning: false } as const;
+export const PI_MANAGED_MODEL_DEFAULTS = { contextWindow: 128000, maxTokens: 8192, reasoning: true } as const;
 const fields = ["thinkingLevelMap", "contextWindow", "maxTokens", "reasoning"] as const;
 const levels: PiThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 function record(value: unknown): Record<string, unknown> {
@@ -83,6 +83,8 @@ export function resolvePiManagedModel(model: PiManagedModel, catalog?: PiBuiltin
   // Catalog providers may differ on some levels. Inherit a mapped level only
   // when every exact-id match agrees on it; explicit snapshot caps win per key.
   const thinkingLevelMap: PiBindModel["thinkingLevelMap"] = {};
+  // Preserve pre-catalog thinking support only for unresolved fallback fields.
+  if (!agreed && !complete) for (const level of levels) thinkingLevelMap[level] = level;
   if (agreed) for (const level of levels) {
     const mapped = first.thinkingLevelMap?.[level];
     if (mapped !== undefined && matches.every(candidate => candidate.thinkingLevelMap?.[level] === mapped)) thinkingLevelMap[level] = mapped;
