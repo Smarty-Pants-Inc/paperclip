@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { copyFile, mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -10,10 +10,14 @@ const binary = process.env.PI_TEST_BINARY;
 const integration = Boolean(binary);
 const servers: Server[] = [];
 
-async function fakeOpenAiServer(): Promise<{ server: Server; url: string; requests: string[] }> {
+async function fakeOpenAiServer(requiredKey?: string): Promise<{ server: Server; url: string; requests: string[] }> {
   let sequence = 0;
   const requests: string[] = [];
   const server = createServer((request, response) => {
+    if (requiredKey && request.headers.authorization !== `Bearer ${requiredKey}`) {
+      response.writeHead(401).end();
+      return;
+    }
     let body = "";
     request.setEncoding("utf8");
     request.on("data", (chunk: string) => { body += chunk; });
@@ -40,29 +44,44 @@ afterEach(async () => {
 });
 
 describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
+  it("fails closed on unknown credential modes before spawning Pi", async () => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-pi-rpc-mode-"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const driver = new PiRpcDriver({
+      runtimeDirectory: join(root, "sessions"),
+      environment: { PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "unexpected" },
+      transportFactory: () => { throw new Error("Pi must not spawn in an unknown credential mode"); },
+    });
+    try {
+      await expect(driver.openSession({ runId: "mode-test", normalizedSessionId: "mode-test", workingDirectory: workspace }))
+        .rejects.toThrow("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("keeps one Pi child and provider session alive across two completed turns", async () => {
-    const { url, requests } = await fakeOpenAiServer();
+    const realKey = "managed-provider-key-canary";
+    const { url, requests } = await fakeOpenAiServer(realKey);
     const root = await mkdtemp(join(tmpdir(), "paperclip-pi-rpc-proof-"));
     const workspace = join(root, "workspace");
     const agentDirectory = join(root, "pi-agent");
     await mkdir(workspace);
     await mkdir(agentDirectory);
-    await writeFile(join(agentDirectory, "models.json"), JSON.stringify({
-      "$schema": "https://pi.dev/schemas/models.schema.json",
-      providers: {
-        localFaux: {
-          baseUrl: url,
-          api: "openai-completions",
-          apiKey: "local-only-not-a-real-model-key",
-          models: [{ id: "faux", name: "local faux", contextWindow: 8192, maxTokens: 256 }],
-        },
-      },
-    }));
+
     const driver = new PiRpcDriver({
       command: binary!,
-      model: "localFaux/faux",
+      model: "paperclip/faux",
       runtimeDirectory: join(root, "sessions"),
-      environment: { PI_CODING_AGENT_DIR: agentDirectory, PI_OFFLINE: "1" },
+      environment: {
+        PI_CODING_AGENT_DIR: agentDirectory,
+        PI_OFFLINE: "1",
+        PAPERCLIP_AI_PROVIDER_URL: url,
+        PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat",
+        PAPERCLIP_AI_PROVIDER_AUTH: "bearer",
+        PAPERCLIP_AI_PROVIDER_KEY: realKey,
+      },
       shutdownTimeoutMs: 1000,
     });
     let session: PiRpcHarnessSession | null = null;
@@ -109,6 +128,19 @@ describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
       expect(snapshot.providerSessionId).toBe(sessionId);
       expect(snapshot.sessionFile).toBeTruthy();
       expect((await stat(snapshot.sessionFile)).size).toBeGreaterThan(0);
+      const modelsPath = join(agentDirectory, "models.json");
+      const modelsText = await readFile(modelsPath, "utf8");
+      expect(modelsText).not.toContain(realKey);
+      const models = JSON.parse(modelsText) as { providers: { paperclip: { baseUrl: string; apiKey: string } } };
+      expect(models.providers.paperclip.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:/u);
+      expect(models.providers.paperclip.apiKey).not.toBe(realKey);
+      const secretSurfaces = [
+        await readFile(`/proc/${pidBeforeTurn1}/cmdline`, "utf8"),
+        await readFile(`/proc/${pidBeforeTurn1}/environ`, "utf8"),
+        modelsText,
+        await readFile(snapshot.sessionFile, "utf8"),
+      ];
+      expect(secretSurfaces.filter(surface => surface.includes(realKey))).toEqual([]);
       const sessionCopyPath = process.env.PI_SESSION_COPY_PATH;
       if (sessionCopyPath) await copyFile(snapshot.sessionFile, sessionCopyPath);
       const proof = {
@@ -126,8 +158,19 @@ describe.skipIf(!integration)("PiRpcDriver local faux-provider proof", () => {
       if (proofPath) await writeFile(proofPath, `${JSON.stringify(proof, null, 2)}\n`);
       expect(proof.samePid).toBe(true);
     } finally {
+      const modelsPath = join(agentDirectory, "models.json");
+      let provider: { baseUrl: string; apiKey: string } | undefined;
+      try { provider = (JSON.parse(await readFile(modelsPath, "utf8")) as { providers: { paperclip: { baseUrl: string; apiKey: string } } }).providers.paperclip; } catch { /* startup may fail before configuration */ }
       await session?.close();
       expect(session?.processExited()).toBe(true);
+      if (provider) {
+        const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
+          body: JSON.stringify({ model: "faux", messages: [] }),
+        });
+        expect(response.status).toBe(401);
+      }
       await rm(root, { recursive: true, force: true });
     }
   }, 30_000);
