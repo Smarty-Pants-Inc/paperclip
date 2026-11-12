@@ -7,6 +7,8 @@ export interface PiRpcTransportOptions {
   args?: readonly string[];
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  commandFd?: number;
+  commandLifecycle?: { beforeSpawn(): void; afterSpawn(): void; afterExit(): void };
   maxRecordBytes?: number;
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
@@ -83,12 +85,22 @@ export class PiRpcTransport {
     this.#maxRecordBytes = options.maxRecordBytes ?? 4 * 1024 * 1024;
     this.#shutdownTimeoutMs = boundedTimeout(options.shutdownTimeoutMs, 1500);
     this.#killTimeoutMs = boundedTimeout(options.killTimeoutMs, 750);
+    const stdio: Array<"pipe" | "ignore" | number> = ["pipe", "pipe", "pipe"];
+    if (options.commandFd !== undefined) {
+      if (!Number.isInteger(options.commandFd) || options.commandFd < 3 || options.commandFd > 255) {
+        throw new Error("Pi executable descriptor is outside the allowed range");
+      }
+      while (stdio.length <= options.commandFd) stdio.push("ignore");
+      stdio[options.commandFd] = options.commandFd;
+    }
+    options.commandLifecycle?.beforeSpawn();
     this.#child = spawn(options.command, [...(options.args ?? [])], {
       cwd: options.cwd,
       env: options.env ?? process.env,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio,
       windowsHide: true,
-    });
+    }) as ChildProcessWithoutNullStreams;
+    options.commandLifecycle?.afterSpawn();
     let resolveExit!: (value: { code: number | null; signal: NodeJS.Signals | null }) => void;
     this.#exit = new Promise((resolve) => { resolveExit = resolve; });
     this.#child.once("exit", (code, signal) => {
@@ -96,6 +108,7 @@ export class PiRpcTransport {
       this.#exitInfo = { code, signal };
     });
     this.#child.once("close", (code, signal) => {
+      options.commandLifecycle?.afterExit();
       this.#streamsClosed = true;
       const info = this.#exitInfo ?? { code, signal };
       const terminal: PiRpcRecord = { type: "process_exit", ...info };

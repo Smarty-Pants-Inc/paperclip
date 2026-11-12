@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import {
-  chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync,
-  readSync, rmdirSync, unlinkSync, writeSync,
+  chmodSync, closeSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync,
+  readSync, realpathSync, rmdirSync, unlinkSync, writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute } from "node:path";
 
@@ -29,11 +30,31 @@ export function withoutAmbientPiCommand(environment: NodeJS.ProcessEnv): NodeJS.
  * fallback; the macOS lifecycle keeps the verified inode bound across spawn.
  */
 export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunchBinding {
-  const command = args.length === 2 && args[0] === TRUSTED_PI_EXECUTABLE_ARG ? args[1]! : "";
+  const command = (args.length === 2 || (args.length === 4 && args[2] === "--paperclip-pi-executable-path"))
+    && args[0] === TRUSTED_PI_EXECUTABLE_ARG ? args[1]! : "";
   const matched = process.platform === "linux" ? command.match(/^\/proc\/self\/fd\/(\d+)$/) : null;
   const commandFd = Number(matched?.[1]);
-  if (matched && Number.isInteger(commandFd) && commandFd >= 3 && commandFd <= 255) {
-    return { command, commandFd };
+  const executablePath = args.length === 4 && args[2] === "--paperclip-pi-executable-path" ? args[3]! : "";
+  if (matched && Number.isInteger(commandFd) && commandFd >= 3 && commandFd <= 255
+    && isAbsolute(executablePath)) {
+    const unavailable = () => new Error(
+      "trusted Pi runner-owned executable binding is unavailable; refusing ambient PATH or PAPERCLIP_PI_RPC_COMMAND fallback",
+    );
+    try {
+      const metadata = lstatSync(executablePath);
+      const uid = process.getuid?.();
+      const bytes = readFileSync(executablePath);
+      const verifiedBytes = readFileSync(command);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
+        || (metadata.mode & 0o022) !== 0 || uid === undefined || metadata.uid !== uid
+        || realpathSync(executablePath) !== executablePath) throw unavailable();
+      if (createHash("sha256").update(bytes).digest("hex") !== createHash("sha256").update(verifiedBytes).digest("hex")) {
+        throw unavailable();
+      }
+      return { command: executablePath };
+    } catch {
+      throw unavailable();
+    }
   }
 
   const unavailable = () => new Error(
