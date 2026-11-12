@@ -309,7 +309,7 @@ function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAd
 interface PiTurnState extends PiEventOrigin {
   projector: ReturnType<typeof createPiEventProjector>;
   lastText: string;
-  hasAssistantReceipt: boolean;
+  hasToolCalls: boolean;
   /** Low-level agent_end is a continuation boundary, not prompt settlement. */
   agentEnded: boolean;
   failed: boolean;
@@ -598,7 +598,7 @@ export class PiRpcHarnessSession implements HarnessSession {
           await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
         } catch (error) { await this.#fenceFailure(error); throw error; }
       }
-      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, agentEnded: false, failed: false, settled: false };
+      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasToolCalls: false, agentEnded: false, failed: false, settled: false };
       this.#activeTurn = turn;
       this.#streamTurn = null;
       this.#emit("turn.started", { status: "inProgress", context: this.#effectiveContext() }, turn);
@@ -984,6 +984,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (!turn) return;
     if (!this.#remember(keys, turn)) return;
     if (event.type === "tool_execution_start" && !turn.settled) {
+      turn.hasToolCalls = true;
       if (typeof event.toolCallId === "string") {
         // These are genuine unresolved park blockers, not settled history. Do
         // not forget a blocker (or grow forever) if Pi never sends its receipt.
@@ -998,8 +999,9 @@ export class PiRpcHarnessSession implements HarnessSession {
     const message = record(event.message);
     if (event.type === "message_end" && message.role === "assistant") {
       const text = assistantText(message.content);
-      if (text) turn.lastText = text;
-      turn.hasAssistantReceipt ||= Boolean(text) || isRecord(message.usage);
+      // The final receipt supersedes streamed/earlier text. Mandatory usage is
+      // accounting only, never proof of an answer or accepted completion.
+      turn.lastText = text;
       turn.lastAssistantStopReason = stringValue(message.stopReason);
       // A successful retry supersedes the transient attempt's failure. An
       // exhausted retry keeps the final failed receipt until settlement.
@@ -1007,7 +1009,10 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (this.#streamTurn === turn) this.#streamTurn = null;
       // Bind full native tool IDs before execution callbacks can arrive.
       for (const part of Array.isArray(message.content) ? message.content : []) {
-        if (isRecord(part) && part.type === "toolCall") this.#remember(piToolIdentityKeys(part.id), turn);
+        if (isRecord(part) && part.type === "toolCall") {
+          turn.hasToolCalls = true;
+          this.#remember(piToolIdentityKeys(part.id), turn);
+        }
       }
     }
     if (event.type === "message_update") {
@@ -1022,13 +1027,17 @@ export class PiRpcHarnessSession implements HarnessSession {
       for (const mapped of turn.projector.project(event)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
     } catch (error) { throw new PiProjectionFailure(turn, error); }
     if (event.type === "agent_settled") {
-      const empty = !turn.lastText && !turn.hasAssistantReceipt;
+      // A captured, still-pending dialog is an accepted wait, not an answer.
+      // Tool-only semantic finish/block turns likewise need no fabricated text.
+      const waiting = [...this.#dialogs.values()].some(dialog => dialog.turn === turn
+        && (dialog.expiresAt === undefined || this.#now().getTime() < dialog.expiresAt));
+      const empty = !turn.lastText.trim() && !turn.hasToolCalls && !waiting;
       // A length receipt is incomplete even with text/mandatory usage. Judge
       // only the final receipt, after Pi has exhausted native recovery.
       const truncated = turn.lastAssistantStopReason === "length";
       const status = event.aborted === true ? "cancelled" : turn.failed || truncated || empty ? "failed" : "completed";
       const error = truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
-        : empty ? { code: "pi_empty_turn", message: "Pi settled without an assistant response." } : undefined;
+        : empty ? { code: "opencode_empty_response", message: "Pi ended without a final answer or an accepted completion report.", recoverable: false } : undefined;
       await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
     }
   }
