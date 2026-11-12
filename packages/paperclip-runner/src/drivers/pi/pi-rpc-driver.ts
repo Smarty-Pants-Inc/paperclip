@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
@@ -115,11 +115,12 @@ export class PiRpcDriver implements HarnessDriver {
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
-    // Only the controller-registered instruction copy may become AGENT_HOME.
-    // Preserve its exact runner environment spelling; ambient/caller paths
-    // without the matching current-run grant confer no filesystem authority.
-    const instructionRoot = record(record(record(this.#options.runtimeContext).instructions).workingCopy).rootPath;
-    if (typeof instructionRoot !== "string" || !instructionRoot || environment.AGENT_HOME !== instructionRoot) delete environment.AGENT_HOME;
+    // The server's explicit runner environment is authoritative. Its real
+    // agent home may differ from the materialized instruction working copy.
+    if (environment.AGENT_HOME !== undefined && (!isAbsolute(environment.AGENT_HOME)
+      || !(await stat(environment.AGENT_HOME).catch(() => null))?.isDirectory())) {
+      throw new Error("AGENT_HOME must be an absolute existing directory");
+    }
     const credentialMode = environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker";
     if (credentialMode !== "broker" && credentialMode !== "env") throw new Error("PAPERCLIP_PI_RPC_CREDENTIAL_MODE must be broker|env");
     delete environment.PAPERCLIP_PI_RPC_CREDENTIAL_MODE;

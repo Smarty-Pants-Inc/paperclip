@@ -6,6 +6,7 @@ import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { createPiSteerRecordingPeer } from "../../test-support/pi-rpc-steer-peer.js";
 import type { HarnessDriver, HarnessSession } from "../contracts/harness-driver.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
+import { createPiEventProjector } from "../drivers/pi/pi-event-projector.js";
 import {
   createPiRpcAppServerProxy,
   parsePiThinkingLevel,
@@ -153,6 +154,74 @@ async function request(
 }
 
 describe("Pi RPC app-server facade proxy", () => {
+  // Keep reason: real Pi 1.5.2 -> Rust lost 14/8 usage at this wire boundary.
+  // provider_events.rs:1146-1171 reads tokenUsage.total/last (not cumulative/runDelta).
+  it.each([false, true])("maps exact receipt totals and deltas for Rust, including warm model metadata (%s)", async warm => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 100, "thread/start", { model: "not-receipt/model" });
+      if (warm) await request(proxy, sink, 101, "run.attach", { runId: "run-2" });
+      const cumulative = { inputTokens: warm ? 114 : 14, outputTokens: warm ? 58 : 8, cacheReadTokens: 6, cacheWriteTokens: 2, requests: 2, providerCostUsd: 0.03 };
+      const runDelta = { inputTokens: 14, outputTokens: 8, cacheReadTokens: 3, cacheWriteTokens: 1, requests: 1, providerCostUsd: 0.01 };
+      const payload = { provider: "pi_rpc", model: "receipt/actual-model", providerRequestId: "receipt-request", cumulative, runDelta, runDeltaAvailable: true, costProvenance: "provider_reported" };
+      session.push("usage.reported", payload, "receipt-turn", undefined, warm ? "run-2" : "run-1");
+      await waitFor(() => sink.decoded().some(frame => frame.method === "thread/tokenUsage/updated"));
+      expect(sink.decoded().find(frame => frame.method === "thread/tokenUsage/updated")).toEqual({
+        method: "thread/tokenUsage/updated",
+        params: { ...payload, threadId: "pi-session", turnId: "receipt-turn", tokenUsage: { total: cumulative, last: runDelta } },
+      });
+    } finally { await proxy.close(); }
+  });
+
+  it("passes actual Pi projector receipts without inventing totals, model or provider billing", async () => {
+    const sink = new FakeSink();
+    const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 110, "thread/start", { model: "not-receipt/model" });
+      const projector = createPiEventProjector({ runId: "run-1", turnId: "native-turn" });
+      for (const responseId of ["native-1", "native-2"]) {
+        for (const event of projector.project({ type: "message_end", message: {
+          role: "assistant", responseId, timestamp: responseId === "native-1" ? 1 : 2,
+          stopReason: "stop", content: [{ type: "text", text: responseId }],
+          usage: { input: 7, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: { total: 0.02 } },
+        } })) if (event.eventType === "usage.reported") session.push(event.eventType, event.payload, event.turnId, event.itemId);
+      }
+      await waitFor(() => sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").length === 2);
+      const frames = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
+      for (const frame of frames) expect(frame).toMatchObject({ params: {
+        threadId: "pi-session", turnId: "native-turn", provider: "pi_rpc", model: null,
+        providerRequestId: expect.any(String), costProvenance: "catalog_estimate", estimatedCostUsd: 0.02,
+        tokenUsage: { total: {}, last: { inputTokens: 7, outputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+      } });
+      expect(JSON.stringify(frames)).not.toContain("providerCostUsd");
+      expect(JSON.stringify(frames)).not.toContain("not-receipt/model");
+    } finally { await proxy.close(); }
+  });
+
+  it("omits unavailable deltas after cancellation and never attributes old-run usage to a warm run", async () => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    try {
+      await request(proxy, sink, 120, "thread/start", { model: "not-receipt/model" });
+      await request(proxy, sink, 121, "turn/interrupt", { turnId: "old-turn" });
+      await request(proxy, sink, 122, "run.attach", { runId: "run-2" });
+      session.push("usage.reported", { model: "stale-model", runDeltaAvailable: true, runDelta: { inputTokens: 999 } }, "old-turn");
+      const cumulative = { inputTokens: 114, outputTokens: 58 };
+      session.push("usage.reported", { cumulative, runDelta: { inputTokens: 999 }, runDeltaAvailable: false }, "new-turn", undefined, "run-2");
+      await waitFor(() => sink.decoded().some(frame => frame.method === "thread/tokenUsage/updated"));
+      const frames = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated");
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toMatchObject({ params: { threadId: "pi-session", turnId: "new-turn", tokenUsage: { total: cumulative } } });
+      const params = frames[0].params as Record<string, unknown>;
+      expect(params.tokenUsage).not.toHaveProperty("last");
+      expect(params).not.toHaveProperty("model");
+      expect(JSON.stringify(frames)).not.toContain("stale-model");
+    } finally { await proxy.close(); }
+  });
   // Keep reason: incident439 lost the actionable cause at the facade/Rust wire
   // boundary. A stale diagnostic must not poison a later current-run failure.
   it("forwards session failure cause to the receiver, rejects stale origin, then accepts a legitimate current failure", async () => {

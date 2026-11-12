@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 
 export type PiRpcRecord = Record<string, unknown>;
 
@@ -47,15 +48,19 @@ class AsyncRecordQueue implements AsyncIterable<PiRpcRecord> {
     if (this.#closed) return false;
     const updateId = record.type === "tool_execution_update"
       && typeof record.toolCallId === "string" && record.toolCallId.length > 0 ? record.toolCallId : null;
-    // Only pending partial snapshots are replaceable. Every other record is an
-    // ordering barrier, including tool completion, turn boundaries and errors.
+    // Only display snapshots with identical control/input fields are replaceable.
+    // State changes and all other records are ordering barriers.
     if (updateId === null) this.#pendingUpdates.clear();
     else {
       const previous = this.#pendingUpdates.get(updateId);
       if (previous) {
-        this.#records[this.#records.indexOf(previous)] = record;
-        this.#pendingUpdates.set(updateId, record);
-        return true;
+        const { partialResult: _previousDisplay, ...previousState } = previous;
+        const { partialResult: _display, ...state } = record;
+        if (isDeepStrictEqual(previousState, state)) {
+          previous.partialResult = record.partialResult;
+          return true;
+        }
+        this.#pendingUpdates.clear();
       }
     }
     const waiter = this.#waiters.shift();
