@@ -17,8 +17,8 @@ export function canonicalProviderPackDigestJson(value: unknown): string {
 
 export function canonicalProviderPackJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalProviderPackJson).join(",")}]`;
-  if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalProviderPackJson(entry)}`).join(",")}}`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalProviderPackJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
   return JSON.stringify(value) ?? "null";
 }
 

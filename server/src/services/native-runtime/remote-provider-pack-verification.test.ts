@@ -234,7 +234,7 @@ async function nativePiFixture() {
   pack.payload.nativeProviders = { pi_rpc: { version: "1.5.2", profileDigest: sha("native-pi-profile"),
     closureDigest: sha("native-pi-closure"), path: nativePath, sha256: fixtureTreeDigest(subtree(nativePath)) } };
   const seal = async () => {
-    pack.digest = sha(canonicalProviderPackJson(pack.payload));
+    pack.digest = sha(canonicalProviderPackDigestJson(pack.payload));
     await writeFile(join(root, "provider-pack.json"), JSON.stringify(pack));
   };
   await seal();
@@ -360,6 +360,28 @@ describe("provider pack manifest digest canonicalization", () => {
     const payload = { pins: { node: "22" }, piRpcProfileDigest: "sha256:" + "a".repeat(64), nativeProviders: { pi_rpc: { piRpcProxy: { path: "p", sha256: "b" } } }, Zeta: 1, alpha: [ { B: 1, a: 2 } ] };
     expect(canonicalProviderPackDigestJson(payload)).toBe(builder(payload));
     expect(canonicalProviderPackDigestJson(payload).indexOf('"piRpcProfileDigest"')).toBeLessThan(canonicalProviderPackDigestJson(payload).indexOf('"pins"'));
-    expect(canonicalProviderPackJson(payload)).not.toBe(builder(payload));
+    expect(canonicalProviderPackJson(payload)).toBe(builder(payload));
   });
+});
+
+
+it("verifies real native Pi producer keys with code-unit canonical ordering", async () => {
+  const fixture = await nativePiFixture();
+  try {
+    Object.assign(fixture.pack.payload, { piRpcProfileDigest: sha("native-profile") });
+    fixture.pack.payload.pins.piRpc = "1.5.2";
+    await fixture.seal();
+    await expect(verifyRemoteProviderPack(fixture.input)).resolves.toEqual(fixture.pack);
+  } finally { await fixture.cleanup(); }
+});
+
+
+it("canonicalizes comparison keys recursively in code-unit order without localeCompare", () => {
+  const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => { throw new Error("locale-dependent comparison"); });
+  try {
+    const payload = { pins: { z: 0, A: 1 }, piRpcProfileDigest: "profile", nativeProviders: { pi_rpc: { path: "native" } }, array: [{ z: 1, A: 2 }] };
+    const expected = '{"array":[{"A":2,"z":1}],"nativeProviders":{"pi_rpc":{"path":"native"}},"piRpcProfileDigest":"profile","pins":{"A":1,"z":0}}';
+    expect(canonicalProviderPackJson(payload)).toBe(expected);
+    expect(canonicalProviderPackDigestJson(payload)).toBe(expected);
+  } finally { localeCompare.mockRestore(); }
 });
