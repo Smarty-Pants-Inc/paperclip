@@ -7,7 +7,6 @@ import { configuredPiNativeExtensions } from "./pi-extension-snapshot.js";
 import { configuredEnvironmentKeys } from "../../configured-environment.js";
 import { COPILOT_SYSTEM_INSTRUCTIONS_FILE } from "./copilot-profile.js";
 import { preparedHarnessHome, preconfiguredHomeEnvironment, usesPreconfiguredHome } from "../preconfigured-home.js";
-import { randomBytes } from "node:crypto";
 import {
   constants,
   fstatSync,
@@ -22,9 +21,7 @@ import {
   open,
   readFile,
   realpath,
-  rename,
   stat,
-  unlink,
   type FileHandle,
 } from "node:fs/promises";
 import {
@@ -38,6 +35,7 @@ import {
 
 import { createSanitizedAcpxSpawnInput } from "./environment.js";
 import { cursorInstructionBinding } from "./cursor-instructions.js";
+import { writePrivateFile } from "../private-file.js";
 import { claudePaperclipPermissionRules } from "./permission-policy.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 import {
@@ -46,7 +44,6 @@ import {
 } from "./recovery-identity.js";
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
-const PRIVATE_FILE_MODE = 0o600;
 const MAX_SANDBOX_ENVIRONMENT_BYTES = 512 * 1024;
 const MAX_WORKSPACE_RECORD_BYTES = 64 * 1024;
 
@@ -729,45 +726,6 @@ export async function refreshCopilotSystemInstructions(
     join(sandbox.agentHomeDirectory, COPILOT_SYSTEM_INSTRUCTIONS_FILE),
     `${instructions}\n`,
   );
-}
-
-async function writePrivateFile(
-  filePath: string,
-  value: string,
-): Promise<void> {
-  const bytes = Buffer.from(value, "utf8");
-  if (bytes.length < 1 || bytes.length > 64 * 1024) {
-    throw new Error("ACPX sandbox file exceeds its bounded size");
-  }
-  const temporaryPath = `${filePath}.tmp-${randomBytes(12).toString("hex")}`;
-  let handle: FileHandle;
-  try {
-    handle = await open(
-      temporaryPath,
-      constants.O_WRONLY |
-        constants.O_CREAT |
-        constants.O_EXCL |
-        (constants.O_NOFOLLOW ?? 0),
-      PRIVATE_FILE_MODE,
-    );
-  } catch {
-    throw new Error("ACPX sandbox file could not be opened without links");
-  }
-  try {
-    const metadata = await handle.stat();
-    if (!metadata.isFile()) throw new Error("ACPX sandbox path is not a file");
-    await handle.chmod(PRIVATE_FILE_MODE);
-    await handle.writeFile(bytes);
-    await handle.sync();
-    await handle.close();
-    await rename(temporaryPath, filePath);
-    await syncDirectory(dirname(filePath));
-    return;
-  } finally {
-    bytes.fill(0);
-    await handle.close().catch(() => undefined);
-    await unlink(temporaryPath).catch(() => undefined);
-  }
 }
 
 async function syncDirectory(directory: string): Promise<void> {
