@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { authorizedToolSetForProvider, createRunnerdCodexTransport, defaultCapabilityRunnerdBinary } from "./runnerd-codex-transport.js";
 import type { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
+import type { NativeRunRuntimeGrant } from "../contracts/runtime-context.js";
 
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const digest = (path: string) => `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
@@ -22,8 +23,10 @@ it.skipIf(process.platform !== "linux")("stages Pi tool replacements and publish
   await writeFile(proxy, `
 const readline = require("node:readline");
 const send = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const fs = require("node:fs");
 readline.createInterface({ input: process.stdin }).on("line", line => {
   const message = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(join(root, "facade-requests.jsonl"))}, JSON.stringify(message) + "\\n");
   if (message.id === undefined) return;
   let result = {};
   if (message.method === "initialize") result = { user: { sessionId: "pi_rpc" }, serverInfo: { name: "fixture", version: "1" } };
@@ -70,9 +73,10 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   const first = tools("first_run_context");
   const rejected = tools("must_not_be_published");
   const replacement = tools("read_proof_context");
-  const attach = (runId: string, dynamicTools?: ReturnType<typeof tools>) => bundle.transport.attachRun!({
+  const attach = (runId: string, dynamicTools?: ReturnType<typeof tools>, currentRunGrant?: NativeRunRuntimeGrant) => bundle.transport.attachRun!({
     runId, turnId: `turn-${runId}`, itemId: `item-${runId}`,
     ...(dynamicTools === undefined ? {} : { dynamicTools }),
+    ...(currentRunGrant === undefined ? {} : { currentRunGrant }),
   });
   try {
     await bundle.transport.request("thread/start", { cwd: root, model: "localFaux/faux", baseInstructions: "unchanged instructions", dynamicTools: first });
@@ -89,6 +93,15 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       expect(record(payload.provider).model).toBe("localFaux/faux");
       expect(record(payload.provider).instructions).toBe("unchanged instructions");
     }
+    await attach("fresh-grant", undefined, { instructions: "SECOND admitted instructions", runtimeContext: null });
+    expect(record(payloads[4]!.provider)).toMatchObject({ kind: "pi_rpc", instructions: "SECOND admitted instructions", runtimeContext: null });
+    await attach("no-new-grant");
+    expect(record(payloads[5]!.provider).instructions).toBe("SECOND admitted instructions");
+    const requests = readFileSync(join(root, "facade-requests.jsonl"), "utf8").trim().split("\n").map(line => record(JSON.parse(line)));
+    const attached = requests.filter(frame => frame.method === "run.attach");
+    expect(record(attached.at(-2)!.params).baseInstructions).toContain("SECOND admitted instructions");
+    expect(record(attached.at(-1)!.params).baseInstructions).toContain("SECOND admitted instructions");
+    expect(record(attached.at(-2)!.params).baseInstructions).not.toContain("unchanged instructions");
   } finally {
     await bundle.transport.close();
     await bundle.retireProbeResources?.(5_000);
