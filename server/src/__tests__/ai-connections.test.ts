@@ -78,6 +78,17 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it.each(["messages", "responses", "chat"] as const)("admits native Pi fixed gateway bindings using authoritative %s metadata", async protocol => {
+    const provider = protocol === "messages" ? "anthropic" : "openai";
+    const model = "paperclip/claude-opus-5-5";
+    const saved = await service.save(companyId, "alice", { provider, method: "api_key", ownership: "shared", name: `Native Pi ${protocol} gateway`, allAgents: true, agentIds: [],
+      routing: { kind: "gateway", protocol, auth: "bearer", baseUrl: "https://gateway.example/v1", models: [{ id: model }] } }, "fixture-native-pi-key");
+    const selected = { provider, method: "api_key", mode: "shared", ...saved } as const;
+    const admission = service.select({ companyId, userId: "alice", agentId, adapterType: "paperclip_runner", runnerProvider: "pi_rpc", model, binding: selected });
+    if (protocol === "chat") await expect(admission).rejects.toMatchObject({ status: 422, details: { code: "ai_connection_incompatible" } });
+    else await expect(admission).resolves.toMatchObject({ connection: { id: saved.connectionId }, grant: { id: saved.grantId } });
+  });
+
   it.each([
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: false },
     { provider: "openrouter", envKey: "OPENROUTER_API_KEY", routed: true },

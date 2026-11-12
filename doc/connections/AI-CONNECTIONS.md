@@ -113,6 +113,15 @@ the selected connection owns its provider routing.
 Changing those separately may make a binding incompatible; saving then requires
 a compatible choice. Agent configuration cannot grant access to another account.
 
+For native Pi (`paperclip_runner` with provider `pi_rpc`), a fixed API-key
+binding is identity only. Admission checks the selected connection's authoritative
+metadata before opening credentials. Gateway routing supports Messages and
+Responses protocols; `paperclip/` is Pi's managed custom-provider prefix, not the
+credential provider. Agent settings and bulk edits use the matching connection
+and grant's routing metadata for compatibility feedback. Without loaded routing
+metadata, they retain the binding-only warning. Legacy `pi_local` and ACPX/Pi
+compatibility behavior is unchanged.
+
 Agent account choices and legacy-adoption confirmations show the sign-in method,
 personal or company-shared scope, and available account or owner identity beside
 the connection name. Accounts with the same provider name can be distinguished

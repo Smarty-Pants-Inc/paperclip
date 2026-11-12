@@ -210,6 +210,39 @@ it.each(["pi_local", "pi_rpc", "pi_runtime"].flatMap(adapterType =>
   expect(choice?.getAttribute("aria-disabled")).not.toBe("true");
 });
 
+it.each([
+  ["pi_rpc", "messages", false],
+  ["pi_rpc", "responses", false],
+  ["pi_rpc", "chat", true],
+  ["pi_local", "messages", true],
+  ["pi_runtime", "messages", true], // ACPX/Pi retains its current warning.
+] as const)("checks the saved %s gateway's %s routing (warning: %s)", async (adapterType, protocol, warning) => {
+  const saved = account({
+    provider: "anthropic", method: "api_key", name: "Paul's Smarty gateway (per-agent key)",
+    ownership: "shared", ownerUserId: undefined, isDefault: false, status: "connected",
+    routing: { kind: "gateway", protocol, baseUrl: "https://gateway.example/v1", auth: "bearer", models: [{ id: "paperclip/claude-opus-5-5" }] },
+  });
+  mocks.list.mockResolvedValue({ currentUserId: "owner", connections: [saved], canManageConnections: true });
+  flushSync(() => root.render(<QueryClientProvider client={client}>
+    <AiConnectionField companyId="company" agentId="agent" agentName="Paul's Smarty" adapterType={adapterType} model="paperclip/claude-opus-5-5"
+      value={{ provider: "anthropic", method: "api_key", mode: "shared", connectionId: saved.id, grantId: saved.grantId }} onChange={onChange} />
+  </QueryClientProvider>));
+  await settle();
+  expect(container.textContent?.includes("does not support the current harness")).toBe(warning);
+});
+
+it.each(["missing", "wrong-grant", "unrouted"])("keeps the binding-only warning when gateway metadata is %s", async kind => {
+  const saved = account({ provider: "anthropic", method: "api_key", status: "connected", ownership: "shared",
+    routing: kind === "unrouted" ? undefined : { kind: "gateway", protocol: "messages", baseUrl: "https://gateway.example/v1", auth: "bearer", models: [] } });
+  mocks.list.mockResolvedValue({ currentUserId: "owner", connections: kind === "missing" ? [] : [saved], canManageConnections: true });
+  flushSync(() => root.render(<QueryClientProvider client={client}>
+    <AiConnectionField companyId="company" agentId="agent" agentName="Paul's Smarty" adapterType="pi_rpc" model="paperclip/claude-opus-5-5"
+      value={{ provider: "anthropic", method: "api_key", mode: "shared", connectionId: saved.id, grantId: kind === "wrong-grant" ? "other-grant" : saved.grantId }} onChange={onChange} />
+  </QueryClientProvider>));
+  await settle();
+  expect(container.textContent).toContain("does not support the current harness");
+});
+
 it("keeps loaded connections usable when a refetch fails during an outage", async () => {
   await mount([account()]);
   expect(document.body.textContent).toContain("Reconnect account");
