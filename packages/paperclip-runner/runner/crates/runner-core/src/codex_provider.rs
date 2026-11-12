@@ -1299,6 +1299,7 @@ impl CodexProvider {
                     profile,
                     "Pi",
                     "--paperclip-trusted-pi-executable",
+                    true,
                 )?;
                 observe(ProviderStartupObservation::SpawnStarting)?;
                 SupervisedProcess::spawn_verified_with_environment_keys(
@@ -4231,13 +4232,14 @@ impl CodexProvider {
 fn verified_opencode_launch(
     profile: &OpenCodeLaunchProfile,
 ) -> Result<VerifiedProcessLaunch, LocalRunnerError> {
-    verified_native_facade_launch(profile, "OpenCode", TRUSTED_OPENCODE_EXECUTABLE_ARG)
+    verified_native_facade_launch(profile, "OpenCode", TRUSTED_OPENCODE_EXECUTABLE_ARG, false)
 }
 
 fn verified_native_facade_launch(
     profile: &OpenCodeLaunchProfile,
     provider: &str,
     executable_arg: &str,
+    include_executable_path: bool,
 ) -> Result<VerifiedProcessLaunch, LocalRunnerError> {
     let command = verify_launch_artifact(&profile.command, &format!("{provider} proxy command"))
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
@@ -4256,11 +4258,19 @@ fn verified_native_facade_launch(
         // descriptor loader flags.
         VerifiedProcessArgument::Artifact(proxy)
     };
-    let args = vec![
+    let mut args = vec![
         proxy,
         VerifiedProcessArgument::Literal(executable_arg.to_owned()),
         VerifiedProcessArgument::ExecutableArtifact(executable),
     ];
+    if include_executable_path {
+        args.push(VerifiedProcessArgument::Literal(
+            "--paperclip-pi-executable-path".to_owned(),
+        ));
+        args.push(VerifiedProcessArgument::Literal(
+            profile.executable.path.to_string_lossy().into_owned(),
+        ));
+    }
     Ok(VerifiedProcessLaunch::new(command, args))
 }
 

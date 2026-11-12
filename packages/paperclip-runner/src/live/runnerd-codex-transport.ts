@@ -3760,7 +3760,8 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     const selected = createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env;
     return { ...selected, ...Object.fromEntries(PI_SIDECAR_PROVIDER_ROUTE_NAMES.flatMap(name => {
       const value = input.options.environment?.[name]; return value === undefined ? [] : [[name, value]];
-    })), PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
+    })), ...(input.options.environment?.PI_CODING_AGENT_DIR ? { PI_CODING_AGENT_DIR: input.options.environment.PI_CODING_AGENT_DIR } : {}),
+      PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
       PAPERCLIP_PI_THINKING_LEVEL: input.options.piThinkingLevel ?? "low", ...commonIdentity };
   }
   if (input.provider === "opencode") {
@@ -6204,6 +6205,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       runnerDigest: runnerArtifact.digest,
       acpxLaunchProfile: prepared.runnerAcpxLaunchProfile,
       opencodeLaunchProfile: prepared.runnerOpenCodeLaunchProfile,
+      piLaunchProfile: prepared.runnerPiLaunchProfile,
       cursorCloudLaunchProfile: prepared.runnerCursorCloudLaunchProfile,
       environment: prepared.environment,
       diagnosticsDirectory: resolve(this.#root, "diagnostics"),
@@ -7067,6 +7069,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           runnerDigest: runnerArtifact.digest,
           acpxLaunchProfile: runnerAcpxLaunchProfile,
           opencodeLaunchProfile: runnerOpenCodeLaunchProfile,
+          piLaunchProfile: runnerPiLaunchProfile,
           cursorCloudLaunchProfile: runnerCursorCloudLaunchProfile,
           environment: this.options.prepareLaunch ? {} : withRunnerdProviderTrace(
             createCapabilityRunnerdProviderEnvironment({
