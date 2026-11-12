@@ -3039,6 +3039,34 @@ describe("remote provider pack manifest", () => {
         manifest: selectedPack.manifest });
       expect(syncIn).toHaveBeenCalledTimes(mode === "uploaded" || mode === "failed-final" ? 1 : 0);
     }
+    // Two actual installer invocations model consecutive warm turns: the
+    // executor-local providerPackVerified flag cannot retain this success.
+    const memoFullVerify = vi.fn();
+    const memoProbe = vi.fn();
+    const memoTrace = vi.fn();
+    const memoRunner = { execute: vi.fn(async (command: { command: string; args?: string[] }) => {
+      const script = command.args?.[1] ?? "";
+      let stdout = "";
+      if (script.includes("paperclip-provider-pack-fingerprint-v1")) {
+        memoProbe();
+        stdout = ["/opt/paperclip-runner/provider-pack", "installer-boot", "1000",
+          "1:10:1:4096:0:41ed:1", "1:11:1:1024:0:81a4:1", "a".repeat(64)].join("\n") + "\n";
+      } else if (script.includes("paperclip-provider-pack-immutable-v1")) stdout = "immutable\n";
+      else if (command.args?.[0] === "-e") memoFullVerify();
+      else if (command.args?.[0] === "--version") stdout = "1.18.34\n";
+      return { pid: null, startedAt: null, exitCode: 0, timedOut: false, signal: null, stdout, stderr: "" };
+    }) };
+    const memoTarget = { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: "/workspace", runner: memoRunner,
+      environmentId: randomUUID(), leaseId: randomUUID(), providerKey: "fixture",
+      sandboxLeaseAcquisition: { outcome: "resumed" as const, providerLeaseId: randomUUID() } };
+    const memoTraceRecorder = createNativeRunTrace({ runId: randomUUID(), onEvent: memoTrace });
+    for (let turn = 0; turn < 2; turn++) await expect(prepareRemoteProviderPackOnTarget({
+      target: memoTarget, runner: memoRunner, configuredProviderPackRoot: root,
+      manifest: selectedPack.manifest, trace: memoTraceRecorder,
+    })).resolves.toMatchObject({ source: "staged" });
+    expect(memoFullVerify).toHaveBeenCalledOnce();
+    expect(memoProbe).toHaveBeenCalledTimes(3); // cold before/after + one warm probe
+    expect(memoTrace.mock.calls.some(([event]) => event.payload?.span === "provider_pack.verify_memo_hit")).toBe(true);
     const cursorPath = "provider-assets/cursor/linux-x64";
     await mkdir(join(root, cursorPath), { recursive: true });
     await writeFile(join(root, cursorPath, "runtime"), "pinned Cursor runtime");
