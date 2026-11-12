@@ -130,6 +130,52 @@ describe("large native tool output projection (synthetic incident regression)", 
   });
 });
 
+// Keep reason: reproduced audit A P0-4; long real turns must outlive display caches.
+describe("P0-4 turn-local projection state", () => {
+  it("projects 1100 completed tools and suppresses late duplicates after eviction", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    let first: Record<string, unknown> | undefined;
+    for (let i = 0; i < 1100; i++) {
+      const toolCallId = `read-${i}`;
+      projector.project({ type: "tool_execution_start", toolCallId, toolName: "read", args: { path: `${i}` } });
+      const done = { type: "tool_execution_end", toolCallId, toolName: "read", result: { content: [{ type: "text", text: "ok" }] }, isError: false };
+      if (!i) first = done;
+      expect(projector.project(done).map(event => event.eventType)).toEqual(["item.completed", "tool.execution.completed"]);
+    }
+    expect(projector.project(first)).toEqual([]);
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
+  it("degrades only the overflow item with 1025 simultaneously active tools", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    let overflow: PiProjectedEvent[] = [];
+    for (let i = 0; i <= 1024; i++) overflow = projector.project({ type: "tool_execution_start", toolCallId: `open-${i}`, toolName: "read", args: { path: `${i}` } });
+    expect(overflow.find(event => event.eventType === "harness.diagnostic")?.payload.code).toBe("pi_active_tool_projection_limit");
+    const terminal = projector.project({ type: "tool_execution_end", toolCallId: "open-1024", toolName: "read", result: { content: [{ type: "text", text: "ok" }] } });
+    expect(terminal.find(event => event.eventType === "tool.execution.completed")).toMatchObject({ itemId: overflow[0]?.itemId, payload: { status: "completed", name: "read" } });
+    expect(projector.project(final())[0].eventType).toBe("item.completed");
+  });
+  it("marks accounting incomplete instead of failing when the 65536-receipt display cache fills", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    for (let i = 0; i < 65_536; i++) projector.project(final({ responseId: `receipt-${i}`, timestamp: i, content: [], usage }));
+    const overflow = projector.project(final({ responseId: "overflow", usage }));
+    expect(overflow.find(event => event.eventType === "harness.diagnostic")?.payload.code).toBe("pi_receipt_projection_limit");
+    expect(overflow.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({ runDeltaComplete: false, costComplete: false });
+    expect(overflow.some(event => event.eventType === "item.completed" && event.payload.text === "final")).toBe(true);
+    expect(projector.project(final({ responseId: "receipt-0", timestamp: 0, content: [], usage }))).toEqual([]);
+  }, 20_000);
+  it("deduplicates more than 4096 native receipts without retaining receipt bodies", () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
+    let first: unknown;
+    for (let i = 0; i < 4200; i++) {
+      const receipt = final({ responseId: `receipt-${i}`, timestamp: i, content: [], usage });
+      if (!i) first = receipt;
+      expect(projector.project(receipt).filter(event => event.eventType === "usage.reported")).toHaveLength(1);
+    }
+    expect(projector.project(first)).toEqual([]);
+    expect(projector.project(final({ responseId: "last" }))[0].eventType).toBe("item.completed");
+  });
+});
+
 // Keep reason: reproduced audit A P0-1, including an ordinary completed run's summary.
 describe("P0-1 large records are display-only", () => {
   const results = Array.from({ length: 6 }, (_, i) => ({ role: "toolResult", toolCallId: `read-${i}`, toolName: "read", content: [{ type: "text", text: "x".repeat(50_000) }] }));
