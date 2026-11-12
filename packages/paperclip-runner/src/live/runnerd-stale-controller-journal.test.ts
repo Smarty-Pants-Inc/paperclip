@@ -50,9 +50,11 @@ it.each(["stale", "current"] as const)("a follow-up controller on the predecesso
     const outcome = await follower.transport.request("thread/read", {})
       .then(() => "resumed", (error: unknown) => String(error));
     if (journal === "stale") {
+      // #20946 remains nonfatal; #20928 repairs the journal before launch, not by killing this Runner.
       expect(outcome).toContain('"code":"controller_sequence_mismatch"');
       expect(outcome).not.toMatch(/runnerd exited/);
       expect(follower.evidence().runnerExited).toBe(false);
+      expect(follower.transport.runnerExitConfirmed?.()).toBe(false);
       const after = JSON.parse(await readFile(join(root, "runner", "runner-state.json"), "utf8")) as { lastControllerCommandSeq: number };
       expect(after.lastControllerCommandSeq).toBe(closed.commands.length);
     } else {

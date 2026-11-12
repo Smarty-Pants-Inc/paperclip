@@ -810,6 +810,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         reason: redactCodexDiagnostic(String(error)),
         ...(failureClass ? { failureClass } : {}),
         ...(resumeStateUnavailable ? { resumeStateUnavailable: true as const } : {}),
+        ...(transport.runnerExitConfirmed?.() === true ? { runnerExitConfirmed: true as const } : {}),
       };
     } finally {
       cancellation.detach();
