@@ -15859,6 +15859,7 @@ async function createRunnerdBackendWithinSessionClaim(
         }) : undefined,
       }),
       warmTaskVersion: description.warmTaskVersion,
+      githubCredentialBrokerVersion: description.githubCredentialBrokerVersion,
       releaseResumeVersion: description.releaseResumeVersion,
       authorityRunId: description.releaseResumeVersion === 1 ? input.execution.binding.runId : undefined,
       releasedSource: input.remoteWarmRecovery?.releasedSource,
