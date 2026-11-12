@@ -1300,6 +1300,42 @@ exit 23
 });
 
 describe("remote runner process supervision", () => {
+  it("waits for delayed identity publication with exactly one remote readiness invocation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-event-readiness-"));
+    const marker = join(root, "identity");
+    const ok = { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+    let nonce = "", reads = 0, publication: Promise<void> | undefined;
+    const execute = vi.fn(async (request: { command: string; args?: string[] }) => {
+      const label = request.args?.[2];
+      if (label === "paperclip-runner-launch") { nonce = request.args![4]!; return ok; }
+      if (label === "paperclip-runner-process-identity") {
+        reads++;
+        publication ??= new Promise<void>(resolve => setTimeout(resolve, 500)).then(async () => {
+          await writeFile(`${marker}.tmp`, `${nonce}\n4321\n2026-11-12T22:12:00.000Z\nrunner-event\n`);
+          await rename(`${marker}.tmp`, marker);
+        });
+        return await new Promise<typeof ok>(resolve => execFile(request.command, request.args ?? [], { timeout: 3000 },
+          (error, stdout, stderr) => resolve({ ...ok, stdout, stderr, exitCode: error ? 1 : 0 })));
+      }
+      return { ...ok, exitCode: label === "paperclip-runner-monitor" ? 45 : 1 };
+    });
+    const handle = createRemoteRunnerProcessLauncher({
+      target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: root },
+      runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: marker,
+      stateDirectory: root, diagnosticsDirectory: join(root, "diagnostics"), runnerInstanceId: "runner-event",
+    })({ command: "/runtime/runnerd", args: [], cwd: root, environment: {} });
+    try {
+      await handle.completion;
+      expect(handle.child.pid).toBe(4321);
+      expect(reads).toBe(1);
+      expect(handle.isExitConfirmed?.()).toBe(true);
+    } finally {
+      await publication;
+      await handle.completion.catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["staging", "dispatch trace"])("retains cancellation during %s without a launch RPC", async (boundary) => {
     let enter!: () => void;
     let release!: () => void;
