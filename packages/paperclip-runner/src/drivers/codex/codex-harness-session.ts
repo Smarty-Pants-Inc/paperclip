@@ -488,6 +488,11 @@ export class CodexHarnessSession
         ...(reason ? { reason: boundedText(reason) } : {}),
       });
       if (this.activeTurnId !== turnId) {
+        // Pi's abort ladder waits for native settlement before replying, so its
+        // captured turn terminal can reach this pump before the RPC response.
+        // That is successful cleanup, not a lost race that quarantines the
+        // still-healthy resident during a durable human-input wait.
+        if (this.driverKind === "pi_rpc" && this.activeTurnId === null && this.terminalTurns.has(turnId)) return;
         throw new HarnessOperationAlreadyTerminalError("interruption");
       }
       this.emit(
