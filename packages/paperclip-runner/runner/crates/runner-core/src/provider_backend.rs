@@ -8667,6 +8667,31 @@ done
         assert_eq!(events[1].payload["runTerminalState"], "succeeded");
     }
 
+    // K2: the Pi facade emits turn/failed only after agent_settled when its
+    // final receipt is length-limited. Feed that terminal into B6's completion
+    // path: mandatory usage or partial text must not turn it back into success.
+    #[test]
+    fn pi_rpc_truncated_terminal_does_not_promote_a_partial_answer() {
+        for message in [None, Some("The answer was cut off mid-".to_owned())] {
+            let mut state = pi_rpc_result_state();
+            state.last_agent_message = message;
+
+            let events = terminal_events(&state, "turn.failed", None);
+
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].event_type, "run.result.proposed");
+            assert_eq!(
+                events[0].payload["completionClaim"]["objectiveSatisfied"],
+                false
+            );
+            assert_eq!(events[0].payload["reportedWorkDisposition"], "needs_review");
+            assert_eq!(events[1].event_type, "run.terminal");
+            assert_eq!(events[1].payload["provider"], "pi_rpc");
+            assert_eq!(events[1].payload["turnTerminalState"], "failed");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+        }
+    }
+
     #[test]
     fn pi_rpc_empty_interrupted_terminal_remains_cancelled() {
         let state = pi_rpc_result_state();
