@@ -41,6 +41,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
 `, { mode: 0o600 });
   const payloads: Record<string, unknown>[] = [];
   const catalogs: Record<string, unknown>[] = [];
+  const queuedCommands: { commandId: string; type: string }[] = [];
   let core: DurablePrpControlPlane | undefined;
   let rejectNext = false;
   const bundle = createRunnerdCodexTransport({
@@ -55,7 +56,13 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     controlPlaneRegistration: async authority => {
       if (!core) {
         core = authority;
-        const queue = authority.queueCommand.bind(authority);
+        const untrackedQueue = authority.queueCommand.bind(authority);
+        const queue: typeof untrackedQueue = (...args) => {
+          const command = untrackedQueue(...args);
+          queuedCommands.push({ commandId: command.commandId, type: command.type });
+          if (queuedCommands.length > 12) queuedCommands.shift();
+          return command;
+        };
         vi.spyOn(authority, "queueCommand").mockImplementation((type, payload = {}, id, immediate) => {
           if (type !== "run.attach") return queue(type, payload, id, immediate);
           payloads.push(structuredClone(payload));
@@ -79,6 +86,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     ...(dynamicTools === undefined ? {} : { dynamicTools }),
     ...(currentRunGrant === undefined ? {} : { currentRunGrant }),
   });
+  let primaryError: unknown;
   try {
     await bundle.transport.request("thread/start", { cwd: root, model: "localFaux/faux", baseInstructions: "unchanged instructions", dynamicTools: first });
     rejectNext = true;
@@ -103,11 +111,40 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     expect(record(attached.at(-2)!.params).baseInstructions).toContain("SECOND admitted instructions");
     expect(record(attached.at(-1)!.params).baseInstructions).toContain("SECOND admitted instructions");
     expect(record(attached.at(-2)!.params).baseInstructions).not.toContain("unchanged instructions");
+  } catch (error) {
+    primaryError = error;
+    throw error;
   } finally {
-    await bundle.transport.close();
-    await bundle.retireProbeResources?.(5_000);
-    await writeFile(join(root, "attach-payloads.json"), `${JSON.stringify(payloads, null, 2)}\n`);
-    // Evidence roots are retained, including native command journals.
+    const cleanupErrors: unknown[] = [];
+    try {
+      await bundle.transport.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+      // A close failure used to hide the first failed operation. Print only
+      // bounded command outcomes (not launch payloads) so CI exposes the
+      // runner's session.open / runner.suspend rejection reason.
+      const diagnostic = JSON.stringify({
+        root, primaryError: String(primaryError).slice(0, 2_048),
+        commands: queuedCommands.map(command => {
+          const outcome = core?.commandOutcome(command.commandId);
+          return { ...command, status: outcome?.status ?? "rotated", result: JSON.stringify(outcome?.result ?? null).slice(0, 2_048) };
+        }),
+      });
+      console.error(`[pi-attach teardown] ${diagnostic}`);
+      try { await writeFile(join(root, "teardown-diagnostic.json"), `${diagnostic}\n`); }
+      catch (error) { cleanupErrors.push(error); }
+    }
+    try { await bundle.retireProbeResources?.(5_000); }
+    catch (error) { cleanupErrors.push(error); }
+    try { await writeFile(join(root, "attach-payloads.json"), `${JSON.stringify(payloads, null, 2)}\n`); }
+    catch (error) { cleanupErrors.push(error); }
+    // Retain evidence even when close fails, and never replace the primary
+    // failure with a later cleanup error.
+    if (cleanupErrors.length > 0) {
+      const errors = primaryError === undefined ? cleanupErrors : [primaryError, ...cleanupErrors];
+      if (errors.length === 1) throw errors[0];
+      throw new AggregateError(errors, "Pi attach probe and teardown failed", { cause: errors[0] });
+    }
   }
 }, 40_000);
 
