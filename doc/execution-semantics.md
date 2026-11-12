@@ -3857,9 +3857,17 @@ when Stop found no live controller. The worker retains the exact prepared source
 and obtains independent provider-stop evidence through normal recovery. It does
 not convert the no-op acknowledgement into a dispatched interrupt receipt or
 permission to continue the cancelled turn.
-Terminal release of a warm (`keep_running`) run that is not successful stops and
-retains its reusable sandbox. This release can finish before the preservation
-worker sees a terminal coordinator. A released reusable lease with a confirmed
+Terminal release preserves a selected warm (`keep_running`) reusable sandbox
+for ordinary adapter failure, native session interruption, or completed cancellation,
+as well as success. The failed provider session is still retired; retaining its
+allocation does not grant permission to continue that session. Reuse follows the
+existing handoff and idle timeout, including provider revalidation on acquisition.
+Integrity/replay conflicts, ambiguous restart recovery, reconciliation-required
+or quarantined cleanup, unknown failure codes, unexported workspace work, and
+explicit stop/destroy decisions retain their existing stop/defer fences. Existing
+operator Stop acknowledgement and execution-ownership checks are unchanged.
+A required stop can finish before the preservation worker sees a terminal
+coordinator. A released reusable lease with a confirmed
 stop-and-retain receipt for the same run, lease and allocation therefore
 remains a preservation source. The worker records it as file recovery work and
 keeps its release status, policy and receipts. It dispatches no second stop and

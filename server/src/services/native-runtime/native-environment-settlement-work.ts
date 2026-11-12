@@ -1,6 +1,7 @@
 import { and, asc, eq, exists, gt, inArray, isNotNull, isNull, lte, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
+import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { nextRunLeaseReleaseAt, pendingRunLeaseReleaseCondition } from "../environment-lease-release-state.js";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
@@ -11,14 +12,16 @@ import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js"
 import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
 import { settleStoppedObservedWorkspace } from "./native-observed-workspace-preservation.js";
 
-type Run = Pick<typeof heartbeatRuns.$inferSelect, "runnerProfileJson" | "resultJson">;
+type Run = Pick<typeof heartbeatRuns.$inferSelect, "runnerProfileJson" | "resultJson">
+  & Partial<Pick<typeof heartbeatRuns.$inferSelect, "status" | "errorCode">>;
 export function nativeEnvironmentSettlementDisposition(run: Run, succeeded: boolean): ProviderResourceDisposition {
   const reference = readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync);
   const saved = run.runnerProfileJson?.nativeResourceDisposition;
   const disposition = reference?.resourceDisposition
     ?? (saved === "keep_running" || saved === "stop_and_retain" || saved === "destroy" ? saved : "stop_and_retain");
-  return succeeded && (!run.resultJson?.workspaceExportRetry || disposition === "destroy")
-    ? disposition : "stop_and_retain";
+  if (run.resultJson?.workspaceExportRetry && (!succeeded || disposition !== "destroy")) return "stop_and_retain";
+  if (!succeeded && (disposition !== "keep_running" || reference?.state === "prepared")) return "stop_and_retain";
+  return providerResourceDispositionForTerminalRun(disposition, run.status ?? (succeeded ? "succeeded" : "failed"), run.errorCode)!;
 }
 
 type Entry = { id: string; companyId: string; issueId: string; dueAt: number };
@@ -32,6 +35,7 @@ export function nativeEnvironmentSettlementWork(db: Db, settle: (input: Settleme
     && (!scope.issueId || item.issueId === scope.issueId) && (!scope.runId || item.id === scope.runId);
   function candidates(scope?: NativeEnvironmentSettlementScope, after?: string) {
     return db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+      status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
       issueId: nativeRunFinalizations.issueId, phase: nativeRunFinalizations.phase,
       runnerProfileJson: sql<Run["runnerProfileJson"]>`case when ${heartbeatRuns.runnerProfileJson} is null then null
         else jsonb_build_object('nativeWorkspaceSync', ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync',

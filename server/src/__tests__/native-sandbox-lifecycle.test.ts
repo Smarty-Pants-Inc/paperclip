@@ -101,21 +101,33 @@ describe("paperclip_runner sandbox lifecycle", () => {
     ).toBeNull();
   });
 
-  it("keeps a warm sandbox only after a successful turn", () => {
+  it("keeps a selected warm sandbox after ordinary terminal outcomes", () => {
     expect(
       providerResourceDispositionForTerminalRun("keep_running", "succeeded"),
     ).toBe("keep_running");
     expect(
-      providerResourceDispositionForTerminalRun("keep_running", "failed"),
-    ).toBe("stop_and_retain");
+      providerResourceDispositionForTerminalRun("keep_running", "failed", "adapter_failed"),
+    ).toBe("keep_running");
     expect(
       providerResourceDispositionForTerminalRun("keep_running", "cancelled"),
-    ).toBe("stop_and_retain");
+    ).toBe("keep_running");
     expect(
       providerResourceDispositionForTerminalRun("keep_running", "timed_out"),
     ).toBe("stop_and_retain");
-    expect(providerResourceDispositionForTerminalRun("destroy", "failed")).toBe(
-      "destroy",
-    );
+    expect(providerResourceDispositionForTerminalRun("keep_running", "interrupted")).toBe("keep_running");
+    expect(providerResourceDispositionForTerminalRun("keep_running", "failed", "native_session_interrupted")).toBe("keep_running");
+    expect(providerResourceDispositionForTerminalRun("destroy", "failed")).toBe("destroy");
+    expect(providerResourceDispositionForTerminalRun("stop_and_retain", "failed", "adapter_failed")).toBe("stop_and_retain");
+  });
+
+  it.each(["native_restart_recovery_blocked", "native_continuation_requires_reconciliation",
+    "native_event_replay_conflict", "native_session_cleanup_quarantined", "lease_released_before_terminal", "unknown_failure"])(
+    "does not earn warm retention for an untrusted or unclassified failure: %s", errorCode => {
+      expect(providerResourceDispositionForTerminalRun("keep_running", "failed", errorCode)).toBe("stop_and_retain");
+    },
+  );
+
+  it.each(["running", "queued", "scheduled_retry", null, undefined])("does not retain an unsettled turn: %s", status => {
+    expect(providerResourceDispositionForTerminalRun("keep_running", status)).toBe("stop_and_retain");
   });
 });

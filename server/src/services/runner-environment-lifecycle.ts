@@ -1,7 +1,31 @@
 import { resolvePaperclipRunnerIdleTimeoutMs } from "@paperclipai/adapter-utils";
 import type { Environment } from "@paperclipai/shared";
+import type { ProviderResourceDisposition } from "./environment-runtime.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "./native-runtime/native-runner-recovery-contract.js";
 import { defaultsRemoteSandboxRunToWarm, resolveWarmProviderSelection } from "./native-runtime/native-warm-capability.js";
+
+/** A failed provider session must retire, but an ordinary failed turn does not
+ * taint its sandbox. Keep only the already-admitted warm/reusable policy; never
+ * upgrade an explicit stop/destroy decision. Unknown failures remain fail-closed.
+ * Workspace preservation and unverified execution ownership keep their own fences.
+ */
+export function providerResourceDispositionForTerminalRun(
+  desired: ProviderResourceDisposition | undefined,
+  status: string | null | undefined,
+  errorCode?: string | null,
+): ProviderResourceDisposition | undefined {
+  if (desired !== "keep_running") return desired;
+  if (status === "succeeded") return desired;
+  if (!["failed", "cancelled", "interrupted"].includes(status ?? "")) return "stop_and_retain";
+  // These are ordinary run outcomes, not integrity/reconciliation failures.
+  // In particular, native_restart_recovery_blocked, replay conflicts and
+  // quarantined cleanup retain their existing stop policy.
+  if (errorCode && !["adapter_failed", "adapter_error", "native_session_interrupted",
+    "native_retry_cancelled", "cancelled"].includes(errorCode)) {
+    return "stop_and_retain";
+  }
+  return desired;
+}
 
 /** Facts the remote-sandbox warm default needs beyond the configuration. */
 export interface RunnerLifecycleDefaultContext {

@@ -4003,9 +4003,9 @@ export function heartbeatService(
             },
           );
         }
-        // Warm retention is earned only by a fully successful turn. A failed,
-        // cancelled, or timed-out run stops the reusable sandbox so the next
-        // acquisition must revalidate and explicitly resume it.
+        // Provider-session retirement is independent of sandbox retention.
+        // Ordinary terminal failures keep selected warm policy; explicit unsafe
+        // workspace/cleanup dispositions and untrusted failure classes still stop.
         nativeOwnershipHeld =
           nativeOwnershipHeld ||
           Boolean(latestRun && isNativeRunnerOwnershipHeld(latestRun));
@@ -4013,6 +4013,7 @@ export function heartbeatService(
           providerResourceDispositionForTerminalRun(
             providerResourceDispositionForRun,
             latestRun?.status,
+            latestRun?.errorCode,
           );
         if (
           !nativeSessionResumeScheduled &&

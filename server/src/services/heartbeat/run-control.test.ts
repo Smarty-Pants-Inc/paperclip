@@ -121,7 +121,7 @@ describe("heartbeat run-control module boundary", () => {
     const deps = callbacks(database.db);
     deps.getRunCleanupState.mockResolvedValue({ status: "failed", runtimeMode: "legacy" } as Run);
     await createHeartbeatRunControl(database.db, deps).releaseEnvironmentLeasesForRun({ runId: "failed", companyId: "company", agentId: "agent", status: "succeeded", providerResourceDisposition: "keep_running" });
-    expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: "failed", status: "failed", providerResourceDisposition: "stop_and_retain" }));
+    expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledWith(expect.objectContaining({ heartbeatRunId: "failed", status: "failed", providerResourceDisposition: "keep_running" }));
     expect(database.access).not.toHaveBeenCalled();
   });
 

@@ -1,3 +1,5 @@
+import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
+export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
@@ -219,14 +221,6 @@ export function leaseReleaseStatusForRunStatus(
   return status === "failed" || status === "timed_out" ? "failed" : "released";
 }
 
-export function providerResourceDispositionForTerminalRun(
-  desired: ProviderResourceDisposition | undefined,
-  status: string | null | undefined,
-): ProviderResourceDisposition | undefined {
-  if (desired !== "keep_running") return desired;
-  return status === "succeeded" ? desired : "stop_and_retain";
-}
-
 export async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -395,11 +389,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (cancelledRun) leaseOwnerRun = cancelledRun;
     if (leaseOwnerRun && isNativeRunnerOwnershipHeld(leaseOwnerRun)) return;
     // Recovery can finish workspace copy-back outside the executor's finally.
-    // Successful copy-back does not earn warm retention for a failed turn.
+    // Preserve selected warm policy for ordinary terminal outcomes, but use the
+    // durable failure classification rather than the caller's stale outcome.
     const status = leaseOwnerRun?.status ?? input.status;
     let providerResourceDisposition = providerResourceDispositionForTerminalRun(
       input.providerResourceDisposition,
       status,
+      leaseOwnerRun?.errorCode,
     );
     if (cancelledRun?.runtimeMode === "native" && status === "cancelled"
       && readNativeWorkspaceSyncReference(cancelledRun.runnerProfileJson?.nativeWorkspaceSync)?.state === "prepared"
