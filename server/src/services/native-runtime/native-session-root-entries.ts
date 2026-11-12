@@ -16,6 +16,9 @@ export const NATIVE_CONTINUITY_STATE_ENTRIES: readonly string[] = [
   "opencode",
   "acpx",
   "pi-agent",
+  // Pi's conversation file survives authority-epoch rotation, but not a real
+  // continuity break (which intentionally replaces the logical session).
+  "pi",
   "failover-backups",
   "provider-pack-authority.json",
   "provider-artifacts",

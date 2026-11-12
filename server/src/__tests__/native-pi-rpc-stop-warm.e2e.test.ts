@@ -332,7 +332,9 @@ it.skipIf(!enabled)(`Stop mid-bash retires the resident, then a NEW wake succeed
     expect(replacement, "new wake creates a healthy resident").toBeDefined();
     expect(replacement.piPid).not.toBe(pid.piPid);
     expect(replacement.runnerPid).not.toBe(pid.runnerPid);
-    expect(final.nativeSessionId, "Stop is not same-session/PID continuation on this head").not.toBe(stopped.nativeSessionId);
+    // Stop keeps Pi's conversation: a fresh process cold-opens the SAME session file
+    // (org 11-12 18:58Z; native-pi-rpc-stop-continue.e2e.test.ts proves the history recall).
+    expect(final.nativeSessionId, "Stop keeps the same Pi session").toBe(stopped.nativeSessionId);
     // After replacement succeeds, ordinary warm policy still works. This catches
     // a poisoned session/agent after Stop without claiming Stop itself is warm.
     await api("POST", `/issues/${issueId}/comments`, { body: "Another normal turn: reply with the next local faux token, no tool." }, 201);

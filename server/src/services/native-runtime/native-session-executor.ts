@@ -17758,7 +17758,22 @@ async function createRunnerdBackendWithinSessionClaim(
     recoverSession: async (snapshot, options) => {
       cursorCloudRuntime?.register({ cleanupOnly: true });
       try {
-        const result = backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
+        // Pi's process-scoped facade has no thread/resume. After the prior
+        // owner passed the ordinary terminal/suspended authority checks, a
+        // cold open of the same normalized id loads Pi's own session file.
+        // This also covers idle eviction and a new wake after server restart;
+        // same-run recovery and remote providers retain their existing path.
+        const piFile = resolve(root, "pi", `${nativeSessionKey(input.execution)}.jsonl`);
+        const piFileStat = input.execution.provider.kind === "pi_rpc" ? lstatSync(piFile, { throwIfNoEntry: false }) : undefined;
+        const reopenPi = input.execution.provider.kind === "pi_rpc" && !remoteTarget && !input.restartRecovery
+          && durableIdentity && durableIdentity.runId !== input.execution.binding.runId
+          && snapshot.identity.sessionId === nativeSessionKey(input.execution)
+          && isSafeNativeStateDirectory(resolve(root, "pi"))
+          && piFileStat?.isFile() && piFileStat.size > 0;
+        const result = reopenPi
+          ? { recovered: true, session: await backend.openSession({ identity: snapshot.identity,
+              workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }) }
+          : backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();

@@ -586,6 +586,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         ? {
             taskKey,
             adapterType: agent.adapterType,
+            ...(nativeExecution.provider.kind === "pi_rpc" ? { providerKind: "pi_rpc" as const } : {}),
             sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(
               { ...runtimeSessionParamsForAdapter, cwd: executionWorkspace.cwd },
               configuredModel,
