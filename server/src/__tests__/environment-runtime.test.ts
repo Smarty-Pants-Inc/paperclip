@@ -4739,6 +4739,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       heartbeatRunId: selectedRunId, persistedExecutionWorkspace: null,
     });
     const first = await acquire();
+    // Preparation proofs must follow only the retained physical allocation;
+    // the compatible-config drain must not bless them for its replacement.
+    const launcherPreparation = { key: "a".repeat(64), leaseId: first.lease.id, layout: { PATH: "/wrappers" } };
+    const realizationPreparation = { key: "b".repeat(64), leaseId: first.lease.id, cwd: "/workspace",
+      realization: { mode: "copy", authoritativeRoot: "/workspace", leaseId: first.lease.id } };
+    first.lease = (await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata,
+      anonymousGitHubLaunchers: launcherPreparation, nativeWorkspaceRealizationPreparation: realizationPreparation }))!;
     const admittedFingerprint = (first.lease.metadata?.reusableSandboxLease as any).leaseFingerprint;
     if (state.startsWith("legacy")) {
       const scope = { ...(first.lease.metadata?.reusableSandboxLease as Record<string, unknown>) };
@@ -4765,6 +4772,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     // admitted allocation rather than losing the next message or its history.
     const noCheckpoint = await acquire(changed, nextRunId);
     expect(noCheckpoint.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
+    expect(noCheckpoint.lease.metadata?.anonymousGitHubLaunchers).toEqual({ ...launcherPreparation, leaseId: noCheckpoint.lease.id });
+    expect(noCheckpoint.lease.metadata?.nativeWorkspaceRealizationPreparation).toEqual({ ...realizationPreparation,
+      leaseId: noCheckpoint.lease.id, realization: { ...realizationPreparation.realization, leaseId: noCheckpoint.lease.id } });
     expect(calls).not.toContain("environmentDestroyLease");
 
     const backupBase = await mkdtemp(path.join(os.tmpdir(), "compatible-source-backup-"));
@@ -4839,6 +4849,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       }
       const replacement = await acquire(changed, retryRunId);
       expect(replacement.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
+      expect(replacement.lease.metadata?.anonymousGitHubLaunchers).toBeUndefined();
+      expect(replacement.lease.metadata?.nativeWorkspaceRealizationPreparation).toBeUndefined();
       expect(replacement.lease.metadata).toMatchObject({ from: "snapshot-b", nativeHarnessBackup: stamp,
         sandboxLeaseAcquisition: { outcome: "replacement", reason: "compatible_environment_change", previousProviderLeaseId: first.lease.providerLeaseId } });
       // Recording the replacement (with the backup) precedes retirement.
