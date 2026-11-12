@@ -107,6 +107,39 @@ These operations do not copy credentials, resolved configuration, or provider
 payloads into the operation record. A lost provider reply can still leave the
 resource ID unknown.
 
+## Compatible changes on reusable sandboxes
+
+Reusable sandbox scopes retain the full configuration fingerprint and a separate
+allocation-identity fingerprint. Only scalar boot-source keys (`from`, `snapshot`,
+`image`, `rootfs`), sizing keys (`cpu`, `memory`, `disk`, `gpu`, `size`, `shape`),
+explicit timing keys (`timeoutMs`, `bridgeRequestTimeoutMs`, `livenessTimeoutMs`,
+`ttlMinutes`, `autoStopInterval`, `autoArchiveInterval`, `autoDeleteInterval`,
+`runnerIdleTimeoutMs`), and scalar `resources.{cpu,memory,disk,gpu}` may drain to
+the next allocation. Objects under these names, unknown fields, provider/plugin
+identity, account, region, endpoints, mounts, environment and credential/secret
+scope changes remain identity changes and keep the existing mismatch behavior.
+
+A compatible change does not relabel the running allocation as the new image.
+Reuse, provider resume, and the stored scope keep its admitted creation settings
+while the owning run is nonterminal or its required checkpoint is unavailable.
+An old valid backup is insufficient when later durable provider events exist.
+Once the owner settles, workspace safety checks pass and native harness backup
+verification covers the latest provider work, acquisition creates and attaches
+the new-config lease with the backup and an explicit
+`compatible_environment_change` replacement receipt **before** retiring the old
+allocation. Failure to create the replacement leaves the source intact.
+Existing cleanup claims/retries own a failed retirement; no new worker or timer
+is introduced. Pre-upgrade full fingerprints are checked against reconstructed
+admitted settings under the current security context, never accepted by a
+compatible-key-only comparison.
+
+The PostgreSQL runtime regression covers active and released warm leases, old
+scope migration, serving the next message on the original image, absent/stale
+checkpoints, replacement creation failure, eventual new-image adoption with F7
+backup propagation, and incompatible account/region/mount or object-valued
+creation-setting changes. This is local lifecycle proof with a controlled provider, not a live
+Boat/Pi conversation acceptance result.
+
 ## Legacy deferred orphan buffers
 
 Runtimes that hold an unwritten orphan register their flusher in a registry scoped

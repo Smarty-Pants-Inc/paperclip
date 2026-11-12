@@ -98,7 +98,8 @@ function sandboxLeaseAcquisitionFromMetadata(
     reason !== "not_found" &&
     reason !== "expired" &&
     reason !== "identity_mismatch" &&
-    reason !== "resume_failed"
+    reason !== "resume_failed" &&
+    reason !== "compatible_environment_change"
   ) return null;
   return {
     outcome: candidate.outcome,
