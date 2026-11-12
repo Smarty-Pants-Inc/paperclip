@@ -51,7 +51,7 @@ export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunch
       const bytes = readFileSync(executablePath);
       const verifiedBytes = readFileSync(command);
       if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
-        || (metadata.mode & 0o022) !== 0 || uid === undefined || metadata.uid !== uid
+        || (metadata.mode & 0o022) !== 0 || uid === undefined || (metadata.uid !== uid && metadata.uid !== 0)
         || realpathSync(executablePath) !== executablePath) throw unavailable();
       if (createHash("sha256").update(bytes).digest("hex") !== createHash("sha256").update(verifiedBytes).digest("hex")) {
         throw unavailable();
@@ -67,7 +67,7 @@ export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunch
           || proxyFd === commandFd || !isAbsolute(proxyPath)) throw unavailable();
         const proxyMetadata = lstatSync(proxyPath);
         if (!proxyMetadata.isFile() || proxyMetadata.isSymbolicLink() || proxyMetadata.nlink !== 1
-          || (proxyMetadata.mode & 0o022) !== 0 || proxyMetadata.uid !== uid
+          || (proxyMetadata.mode & 0o022) !== 0 || (proxyMetadata.uid !== uid && proxyMetadata.uid !== 0)
           || realpathSync(proxyPath) !== proxyPath) throw unavailable();
         if (createHash("sha256").update(readFileSync(proxyPath)).digest("hex")
           !== createHash("sha256").update(readFileSync(proxyDescriptor)).digest("hex")) throw unavailable();
