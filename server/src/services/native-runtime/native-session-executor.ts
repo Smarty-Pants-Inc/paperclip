@@ -10217,6 +10217,17 @@ async function executePaperclipNativeSessionWithinScope(
   }
 }
 
+const NATIVE_ATTEMPT_PROVIDER_KINDS: ReadonlySet<string> = new Set([
+  "cursor_cloud", "codex", "opencode", "claude_managed", "aws_agentcore", "acpx", "pi_rpc",
+]);
+
+/** The provider gate at the start of a native attempt (pi_rpc launches through runnerd like ACPX). */
+export function isNativeAttemptProviderSupported(execution: Pick<NativeExecutionInput, "provider" | "schema">): boolean {
+  return NATIVE_ATTEMPT_PROVIDER_KINDS.has(execution.provider.kind)
+    || execution.schema === "paperclip.native-execution-input.v6"
+    || execution.schema === "paperclip.native-execution-input.v8";
+}
+
 async function executePaperclipNativeSessionAttempt(
   input: Parameters<typeof executePaperclipNativeSession>[0],
   prepareAfterClaim?: () => Promise<Parameters<typeof executePaperclipNativeSession>[0]>,
@@ -10253,16 +10264,7 @@ async function executePaperclipNativeSessionAttempt(
   const redactIdentityText = (text: string) => redactSensitiveText(
     identityRedactor.chunk("diagnostic", text) + identityRedactor.finish("diagnostic"),
   );
-  if (
-    input.execution.provider.kind !== "cursor_cloud" &&
-    input.execution.provider.kind !== "codex" &&
-    input.execution.provider.kind !== "opencode" &&
-    input.execution.provider.kind !== "claude_managed" &&
-    input.execution.provider.kind !== "aws_agentcore" &&
-    input.execution.provider.kind !== "acpx" &&
-    input.execution.schema !== "paperclip.native-execution-input.v6" &&
-    input.execution.schema !== "paperclip.native-execution-input.v8"
-  ) {
+  if (!isNativeAttemptProviderSupported(input.execution)) {
     throw new Error("paperclip_runner_provider_unsupported");
   }
   if (

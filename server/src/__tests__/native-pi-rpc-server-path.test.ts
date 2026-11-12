@@ -320,3 +320,14 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
     expect(launch.piProxyPath).toBeUndefined();
   });
 });
+
+describe("native attempt provider gate", () => {
+  it("admits native Pi RPC at the start of a native attempt, like ACPX and Codex", async () => {
+    const { isNativeAttemptProviderSupported } = await import("../services/native-runtime/native-session-executor.js");
+    const schema = "paperclip.native-execution-input.v9" as never;
+    for (const kind of ["pi_rpc", "acpx", "codex", "opencode"]) {
+      expect(isNativeAttemptProviderSupported({ schema, provider: { kind } as never }), kind).toBe(true);
+    }
+    expect(isNativeAttemptProviderSupported({ schema, provider: { kind: "unknown_provider" } as never })).toBe(false);
+  });
+});
