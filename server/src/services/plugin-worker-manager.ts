@@ -81,6 +81,12 @@ import { traceparentFromContextToken } from "../instrumentation.js";
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 
 /**
+ * Boat sandbox sync measured 33–36 s, exceeding the ordinary 30 s RPC default.
+ * Allow 180 s for environment sync, with headroom for larger workspaces.
+ */
+const DEFAULT_ENVIRONMENT_SYNC_RPC_TIMEOUT_MS = 180_000;
+
+/**
  * Upper bound for the *default* RPC timeout path (15 minutes). Explicit
  * caller-supplied timeouts are not subject to this cap: execute-class RPCs such
  * as `environmentExecute` run entire sandboxed agent sessions in one call and
@@ -390,6 +396,7 @@ export function formatWorkerFailureMessage(message: string, stderrExcerpt: strin
 export function resolveRpcCallTimeoutMs(
   explicitTimeoutMs: number | undefined,
   defaultTimeoutMs: number,
+  method?: HostToWorkerMethodName,
 ): number {
   if (
     explicitTimeoutMs !== undefined &&
@@ -398,7 +405,10 @@ export function resolveRpcCallTimeoutMs(
   ) {
     return Math.min(Math.max(Math.trunc(explicitTimeoutMs), 1), MAX_NODE_TIMER_TIMEOUT_MS);
   }
-  return Math.min(defaultTimeoutMs, MAX_RPC_TIMEOUT_MS);
+  const methodDefaultTimeoutMs = method === "environmentSyncIn" || method === "environmentSyncOut"
+    ? Math.max(defaultTimeoutMs, DEFAULT_ENVIRONMENT_SYNC_RPC_TIMEOUT_MS)
+    : defaultTimeoutMs;
+  return Math.min(methodDefaultTimeoutMs, MAX_RPC_TIMEOUT_MS);
 }
 
 /**
@@ -3673,7 +3683,7 @@ export function createPluginWorkerHandle(
             onStartupWorkChanged?.();
           } });
       }
-      const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
+      const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs, method);
       const invocationScope = deriveInvocationScope(method, params);
       const invocation = invocationScope ? registerInvocation(invocationScope) : null;
       if (invocation && startupContextId) activeInvocations.get(invocation.id)!.startupContextId = startupContextId;

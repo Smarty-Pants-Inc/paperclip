@@ -105,6 +105,25 @@ describe("resolveRpcCallTimeoutMs", () => {
   const MAX_NODE_TIMER_TIMEOUT_MS = 2_147_483_647;
   const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 
+  // Recorded catch: Boat workspace sync measured 33–36 s and exceeded the
+  // worker's 30 s default. Keep this fast regression at the timeout policy boundary.
+  it.each(["environmentSyncIn", "environmentSyncOut"] as const)(
+    "gives %s a 180-second default with headroom for large workspaces",
+    (method) => {
+      expect(resolveRpcCallTimeoutMs(undefined, DEFAULT_RPC_TIMEOUT_MS, method)).toBe(180_000);
+      expect(resolveRpcCallTimeoutMs(Number.NaN, DEFAULT_RPC_TIMEOUT_MS, method)).toBe(180_000);
+      expect(resolveRpcCallTimeoutMs(undefined, 300_000, method)).toBe(300_000);
+      expect(resolveRpcCallTimeoutMs(1_234, DEFAULT_RPC_TIMEOUT_MS, method)).toBe(1_234);
+    },
+  );
+
+  it.each(["health", "environmentAcquireLease", "environmentExecute", "environmentReleaseLease"] as const)(
+    "keeps the 30-second default for %s",
+    (method) => {
+      expect(resolveRpcCallTimeoutMs(undefined, DEFAULT_RPC_TIMEOUT_MS, method)).toBe(30_000);
+    },
+  );
+
   it("honors an explicit timeout above the 15-minute default ceiling", () => {
     // The sandbox environment driver requests ~4h + 30s buffer for
     // environmentExecute; this must not be clamped to 15 minutes.
@@ -147,6 +166,34 @@ describe("resolveRpcCallTimeoutMs", () => {
       expect(resolveRpcCallTimeoutMs(bad, DEFAULT_RPC_TIMEOUT_MS)).toBe(DEFAULT_RPC_TIMEOUT_MS);
     }
     expect(resolveRpcCallTimeoutMs(Number.NaN, 24 * 60 * 60 * 1_000)).toBe(MAX_RPC_TIMEOUT_MS);
+  });
+});
+
+describe("plugin worker method-specific RPC defaults", () => {
+  it.each([
+    { method: "environmentSyncIn", expectedTimeoutMs: 180_000 },
+    { method: "environmentSyncOut", expectedTimeoutMs: 180_000 },
+    { method: "health", expectedTimeoutMs: 30_000 },
+  ] as const)("dispatches $method with its method-specific default", async ({ method, expectedTimeoutMs }) => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1, hostHandlers: {},
+    });
+    try {
+      await handle.start();
+      const timer = vi.spyOn(globalThis, "setTimeout");
+      try {
+        // The fixture rejects sync methods, but dispatch still arms the real
+        // host RPC timer before receiving that response.
+        if (method === "health") await handle.call(method, {} as never);
+        else await expect(handle.call(method, {} as never)).rejects.toThrow(`Unhandled method: ${method}`);
+        expect(timer).toHaveBeenCalledWith(expect.any(Function), expectedTimeoutMs);
+      } finally {
+        timer.mockRestore();
+      }
+    } finally {
+      await handle.stop();
+    }
   });
 });
 
