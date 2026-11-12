@@ -3331,7 +3331,7 @@ impl CodexCommandExecutor {
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&temporary, &path)?;
+            crate::durable::replace_file_from_temporary(&temporary, &path)?;
             #[cfg(unix)]
             File::open(&self.state_dir)?.sync_all()?;
             Ok(())
