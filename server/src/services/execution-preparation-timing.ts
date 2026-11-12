@@ -38,7 +38,8 @@ type PreparationPhase = "environment_selection" | "execution_configuration" | "s
   | "assigned_mcp" | "tool_authority" | "companion_selection" | "runner_binary"
   | "github_stop" | "coordinator_release" | "instruction_checkpoint"
   | "instruction_changes" | "warm_release" | "instruction_collection"
-  | "attachment_staging" | "warm_restore" | "span_persistence" | "state_migration";
+  | "attachment_staging" | "warm_restore" | "span_persistence" | "state_migration"
+  | "accounting_history" | "usage_delivery" | "instruction_rehydrate" | "review_binding";
 
 export type ExecutionPhase =
   | "skills.inventory" | "skills.inventory.wait" | "skills.inventory.bundled" | "skills.inventory.releases"

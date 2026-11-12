@@ -3007,7 +3007,7 @@ describe("remote provider pack manifest", () => {
     // Both execution and setup Test consume this same normal installer. Reuse
     // the complete controller fixture here instead of inventing a thin pack.
     const selectedPack = resolveRemoteProviderPackSource(root);
-    for (const mode of ["staged", "preinstalled", "uploaded", "failed-final", "missing-transport"] as const) {
+    for (const mode of ["staged", "preinstalled", "snapshot", "snapshot-mismatch", "uploaded", "failed-final", "missing-transport"] as const) {
       let transferred = false;
       const syncIn = vi.fn(async (operations: { files: { sourcePath?: string; targetPath: string; kind: string }[] }[]) => {
         expect(operations[0]?.files[0]).toMatchObject({ sourcePath: root,
@@ -3024,7 +3024,9 @@ describe("remote provider pack manifest", () => {
         const valid = mode === "staged" || mode === "preinstalled" && packRoot === "/opt/paperclip-runner/provider-pack"
           || transferred && mode !== "failed-final";
         return { pid: null, startedAt: null, exitCode: verification && !valid ? 1 : 0, timedOut: false, signal: null,
-          stdout: command.args?.[0] === "--version" ? "1.18.34\n"
+          stdout: (mode === "snapshot" || mode === "snapshot-mismatch") && command.args?.includes("paperclip-snapshot-pack")
+            ? Buffer.from(JSON.stringify({ ...selectedPack.manifest, ...(mode === "snapshot-mismatch" ? { digest: `sha256:${"0".repeat(64)}` } : {}), snapshotNote: "publisher metadata outside the digest" })).toString("base64")
+            : command.args?.[0] === "--version" ? "1.18.34\n"
             : command.args?.some(value => value.includes("for candidate in")) ? "/opt/paperclip-runner/provider-pack\n" : "",
           stderr: verification && !valid ? "manifest mismatch" : "" };
       });
@@ -3035,9 +3037,9 @@ describe("remote provider pack manifest", () => {
       });
       if (mode === "failed-final") await expect(preparation).rejects.toThrow("provider pack verification");
       else if (mode === "missing-transport") await expect(preparation).rejects.toThrow("transport cannot stage a provider pack");
-      else await expect(preparation).resolves.toMatchObject({ source: mode, root: "/workspace/.paperclip-runtime/paperclip-runner/provider-pack",
+      else await expect(preparation).resolves.toMatchObject({ source: mode === "snapshot" ? "preinstalled" : mode === "snapshot-mismatch" ? "uploaded" : mode, root: "/workspace/.paperclip-runtime/paperclip-runner/provider-pack",
         manifest: selectedPack.manifest });
-      expect(syncIn).toHaveBeenCalledTimes(mode === "uploaded" || mode === "failed-final" ? 1 : 0);
+      expect(syncIn).toHaveBeenCalledTimes(mode === "uploaded" || mode === "snapshot-mismatch" || mode === "failed-final" ? 1 : 0);
     }
     const cursorPath = "provider-assets/cursor/linux-x64";
     await mkdir(join(root, cursorPath), { recursive: true });
@@ -16693,13 +16695,54 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
-  it.each((["codex", "opencode"] as const).flatMap(provider =>
+  // Keep reason: real admission entry, independent remote read barriers. Never
+  // dispatch or release session ownership while either startup read is pending.
+  it("overlaps cold Pi environment discovery with exact snapshot pack selection and drains both on failure", async () => {
+    const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+    const { packRoot, manifest } = await nativePiProviderPackFixture(join(isolatedStateDirectory, "parallel-pi-snapshot"));
+    const current = { ...execution, provider: { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE },
+      session: { ...execution.session, driverKind: "pi_rpc" } } as NativeExecutionInputV1;
+    let releaseEnvironment!: () => void;
+    let releaseSnapshot!: () => void;
+    const environmentGate = new Promise<void>(resolve => { releaseEnvironment = resolve; });
+    const snapshotGate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
+    const execute = vi.fn(async (request: { args?: string[] }) => {
+      if (!request.args?.includes("paperclip-snapshot-pack")) throw new Error("unexpected remote operation");
+      await snapshotGate;
+      return { exitCode: 0, signal: null, timedOut: false, stdout: Buffer.from(JSON.stringify(manifest)).toString("base64"), stderr: "" };
+    });
+    const prepareRunnerEnvironment = vi.fn(async () => { await environmentGate; throw new Error("discovery failed"); });
+    const onTraceEvent = vi.fn(async (_event: AdapterRuntimeEvent) => undefined);
+    const startupTrace = createNativeRunTrace({ runId: current.binding.runId, onEvent: onTraceEvent });
+    let settled = false;
+    const preparation = createRunnerdBackend({ db: leaseDb(current), execution: current,
+      runnerInstanceId: "runner-cold-pi-parallel", runnerRemoteProviderPackPath: packRoot, prepareRunnerEnvironment, trace: startupTrace,
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "daytona",
+        leaseId: "lease-cold-pi-parallel", remoteCwd: "/workspace", runner: { execute, allowConcurrentSyncOperations: true } } as never,
+    }).then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+    try {
+      await vi.waitFor(() => expect(prepareRunnerEnvironment).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+      releaseEnvironment();
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      releaseSnapshot();
+      expect(await preparation).toMatchObject({ error: { message: "discovery failed" } });
+      const spans = onTraceEvent.mock.calls.map(([event]) => event.payload?.span);
+      expect(spans).toEqual(expect.arrayContaining(["native.controller.wake_binding", "native.controller.review_binding", "provider_pack.snapshot_select"]));
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(state.execute).not.toHaveBeenCalled();
+    } finally { releaseEnvironment(); releaseSnapshot(); await preparation; await startupTrace.finish("failed"); }
+  });
+
+  it.each((["codex", "opencode", "pi_rpc"] as const).flatMap(provider =>
     (["github", "assigned"] as const).map(failure => ({ provider, failure })),
   ))("cleans run-owned access after overlapping $provider executor failure: $failure", async ({ provider, failure }) => {
     const current = {
       ...execution,
-      provider: provider === "codex" ? execution.provider : { kind: "opencode", model: null },
-      session: { ...execution.session, driverKind: provider === "codex" ? "codex_app_server" : "opencode_server" },
+      provider: provider === "codex" ? execution.provider : provider === "pi_rpc"
+        ? { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE } : { kind: "opencode", model: null },
+      session: { ...execution.session, driverKind: provider === "codex" ? "codex_app_server" : provider === "pi_rpc" ? "pi_rpc" : "opencode_server" },
     } as NativeExecutionInputV1;
     const issueService = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
       update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })),
@@ -16736,7 +16779,7 @@ describe("runnerd provider runtime wiring", () => {
       runnerExecutionTarget: {
         kind: "remote", transport: "sandbox", providerKey: "daytona",
         leaseId: "lease-overlap-cleanup", remoteCwd: "/home/daytona/paperclip-workspace",
-        runner: { execute: vi.fn() },
+        runner: { execute: vi.fn(), allowConcurrentSyncOperations: true },
       } as never,
     }).then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
     try {

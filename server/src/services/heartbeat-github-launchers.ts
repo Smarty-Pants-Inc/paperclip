@@ -1,6 +1,20 @@
 import { createHash } from "node:crypto";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
-import { cleanupGitHubOperationLaunchers, prepareGitHubOperationLaunchers } from "@paperclipai/adapter-utils/execution-target";
+import { cleanupGitHubOperationLaunchers, prepareGitHubOperationLaunchers, prepareGitHubExecutionEnvironment } from "@paperclipai/adapter-utils/execution-target";
+
+/** Delay only managed, read-only context discovery on concurrent direct runners.
+ * The callback returns derived keys, never an old PATH or credential snapshot. */
+export async function prepareHeartbeatGitHubEnvironment(input: Parameters<typeof prepareGitHubExecutionEnvironment>[0] & { defer: boolean }) {
+  const remote = input.target?.kind === "remote" && input.target.transport === "sandbox" ? input.target : null;
+  if (!input.defer || input.hostCredentials || !remote?.runner || remote.runnerTask || remote.runner.allowConcurrentSyncOperations !== true) {
+    return { env: await prepareGitHubExecutionEnvironment(input), prepare: undefined };
+  }
+  return {
+    env: { ...input.env, PAPERCLIP_GIT_METADATA_ROOTS: "[]", PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
+      PAPERCLIP_GITHUB_AUTH_MODE: "managed", PAPERCLIP_RUNNER_NETWORK_ACCESS: input.networkAccess ? "enabled" : "disabled" },
+    prepare: () => prepareGitHubExecutionEnvironment({ ...input, env: {} }),
+  };
+}
 
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 
