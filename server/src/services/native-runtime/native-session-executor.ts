@@ -270,6 +270,7 @@ import {
   renderNativeRunnerStagedAttachmentPrompt,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
+import { createPiConversationRecoveryPolicy, piSessionFileFailureCode, type PiSessionFileFailureCode } from "./pi-conversation-recovery.js";
 import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { clearRunProviderStateUnsaved, markAcceptedRunProviderStateUnsaved } from "./native-provider-state-unsaved.js";
 import { verifyRetainedMaintenanceNoLaunch } from "./native-maintenance-no-launch.js";
@@ -8465,6 +8466,9 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING ||
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_UNREAD ||
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_CHANGED_AFTER_READ ||
+    sourceFailureCode === "pi_session_file_invalid" ||
+    sourceFailureCode === "pi_session_file_missing" ||
+    sourceFailureCode === "pi_conversation_replacement_refused" ||
     sourceFailureCode === "pi_conversation_identity_missing" ||
     sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
@@ -8565,6 +8569,8 @@ function runnerClosedTurnStartSession(error: unknown, depth = 0): boolean {
 export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
+  | PiSessionFileFailureCode
+  | "pi_conversation_replacement_refused"
   | "pi_conversation_identity_missing"
   | "native_permission_declined"
   | "native_provider_terminal_failed"
@@ -8604,6 +8610,9 @@ export function nativeSessionFailureSourceCode(
   | "runner_ingress_acquisition_failed"
   | "local_runtime_api_listener_unavailable"
   | "native_session_interrupted" {
+  const piFileFailure = piSessionFileFailureCode(error);
+  if (piFileFailure) return piFileFailure;
+  if (error instanceof Error && error.message.startsWith("pi_conversation_replacement_refused:")) return "pi_conversation_replacement_refused";
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
@@ -15097,6 +15106,7 @@ export async function createRunnerdBackend(input: {
   runnerRemoteProviderPackPath?: string | null;
   trace?: NativeRunTrace;
   toolTrace?: NativeToolTrace;
+  onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onDiagnosticLease?: (lease: NativeDiagnosticLease) => void;
   stopTaskForReassignment?: (target: { companyId: string; issueId: string; agentId: string; runId: string | null }) => Promise<void>;
@@ -17284,7 +17294,7 @@ async function createRunnerdBackendWithinSessionClaim(
       await synchronizeCredentials();
     } : undefined,
   })) : null;
-  const backend = createNativeSessionBackend(runnerExecution, {
+  const rawBackend = createNativeSessionBackend(runnerExecution, {
     retainedSystemInstructions,
     runnerInstanceId:
       retainedTransition?.runnerInstanceId ?? input.runnerInstanceId,
@@ -17648,6 +17658,16 @@ async function createRunnerdBackendWithinSessionClaim(
       return antigravityCredential?.home ? bindAntigravityTransportRetirement(bundle) : bundle.transport;
     },
   });
+  const piRecovery = input.execution.provider.kind === "pi_rpc" ? createPiConversationRecoveryPolicy({
+    ...input.execution.binding, sessionId: nativeSessionKey(input.execution), onEvent: input.onEvent,
+    issuesSvc: issueService(input.db),
+  }) : null;
+  const backend: NativeSessionBackend = piRecovery ? {
+    preparedTaskConstraints: rawBackend.preparedTaskConstraints,
+    descriptor: () => rawBackend.descriptor(),
+    openSession: openInput => piRecovery.open(() => rawBackend.openSession(openInput)),
+    ...(rawBackend.recoverSession ? { recoverSession: (snapshot, options) => piRecovery.recover(() => rawBackend.recoverSession!(snapshot, options)) } : {}),
+  } : rawBackend;
   const boundManagedSessions = new WeakSet<NativeSession>();
   const wrapManagedSession = (session: NativeSession): NativeSession => {
     credentialUpdates?.bindSession(session);
@@ -17787,6 +17807,7 @@ async function createRunnerdBackendWithinSessionClaim(
       } catch (error) { cursorCloudRuntime?.unregister(); throw error; }
     },
     openReplacementSession: async (sessionInput, previous) => {
+      await piRecovery?.beforeReplacement();
       const reattachClaim = input.restartRecovery?.kind === "reattach_remote_runner" ? input.restartRecovery : null;
       if (!reattachClaim && input.remoteWarmRecovery) {
         throw new Error("native_runner_replacement_requires_fresh_launch");

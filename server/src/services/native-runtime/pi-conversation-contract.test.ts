@@ -47,4 +47,10 @@ describe("Pi conversation identity is not a checkpoint/config generation (data s
     current.session.normalizedSessionId = undefined as unknown as string;
     expect(() => nativeSessionKey(current)).toThrow("pi_conversation_identity_missing");
   });
+  it("maps typed corrupt-file failures to a permanent named refusal", () => {
+    const failure = Object.assign(new Error("wrong id"), { code: "pi_session_file_invalid" });
+    const code = nativeSessionFailureSourceCode(failure);
+    expect(code).toBe("pi_session_file_invalid");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toMatchObject({ phase: "terminal_failure", failureCode: "pi_session_file_invalid", nextAttemptAt: null });
+  });
 });
