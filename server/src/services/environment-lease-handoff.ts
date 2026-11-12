@@ -73,3 +73,39 @@ export function retiredReusableLeasePredecessors(current: Lease, history: Lease[
   }
   return Object.hasOwn(successor.metadata ?? {}, incomingKey) ? null : result;
 }
+
+/** Carry only successful, token-free preparation receipts after a validated
+ * same-allocation handoff/reacquisition. Never use providerLeaseId alone as
+ * authority: unrelated rows and a recreated allocation must prepare normally.
+ */
+export function carryReusableLeasePreparation(previous: Binding, current: Binding) {
+  const metadata = { ...current.metadata };
+  if (!previous.providerLeaseId || previous.providerLeaseId !== current.providerLeaseId ||
+      previous.provider !== current.provider || previous.companyId !== current.companyId ||
+      previous.environmentId !== current.environmentId || previous.issueId !== current.issueId ||
+      previous.executionWorkspaceId !== current.executionWorkspaceId ||
+      typeof previous.metadata?.agentId !== "string" || !previous.metadata.agentId ||
+      previous.metadata.agentId !== current.metadata?.agentId) return metadata;
+  for (const name of ["anonymousGitHubLaunchers", "nativeWorkspaceRealizationPreparation"]) {
+    const raw = previous.metadata?.[name];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const receipt = raw as Record<string, unknown>;
+    if (receipt.leaseId !== previous.id || typeof receipt.key !== "string" ||
+        !/^[a-f0-9]{64}$/.test(receipt.key)) continue;
+    if (name === "nativeWorkspaceRealizationPreparation") {
+      const rawRealization = receipt.realization;
+      if (!rawRealization || typeof rawRealization !== "object" || Array.isArray(rawRealization)) continue;
+      const realization = { ...rawRealization } as Record<string, unknown>;
+      if (realization.leaseId !== undefined && realization.leaseId !== previous.id) continue;
+      if (realization.leaseId === previous.id) realization.leaseId = current.id;
+      // The provider's fresh metadata takes precedence over a cached layout.
+      if (metadata.workspaceRealization !== undefined &&
+          JSON.stringify(metadata.workspaceRealization) !== JSON.stringify(realization)) continue;
+      metadata.workspaceRealization = realization;
+      metadata[name] = { ...receipt, leaseId: current.id, realization };
+    } else {
+      metadata[name] = { ...receipt, leaseId: current.id };
+    }
+  }
+  return metadata;
+}

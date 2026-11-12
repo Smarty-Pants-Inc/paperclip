@@ -9,6 +9,7 @@ type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 const LAYOUT_KEYS = ["PATH", "ZDOTDIR", "BASH_ENV", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR"] as const;
 export interface AnonymousGitHubLauncherReceipt {
   key: string;
+  leaseId: string;
   layout: Record<string, string>;
 }
 
@@ -63,15 +64,15 @@ export async function prepareHeartbeatGitHubLaunchers(
     && lease.providerLeaseId && input.target?.kind === "remote" && input.target.leaseId === lease.id
     && (!lease.expiresAt || new Date(lease.expiresAt).getTime() > Date.now());
   const key = eligible ? createHash("sha256").update(JSON.stringify({
-    version: 1, launcher: githubLauncherSource(), staging: prepareGitHubOperationLaunchers.toString(),
-    agentId: input.agentId, companyId: lease.companyId, leaseId: lease.id,
+    version: 2, launcher: githubLauncherSource(), staging: prepareGitHubOperationLaunchers.toString(),
+    agentId: input.agentId, companyId: lease.companyId,
     providerLeaseId: lease.providerLeaseId, environmentId: lease.environmentId,
     configuration: input.preparation!.configuration, cwd: input.cwd,
     remoteCwd: input.target?.kind === "remote" ? input.target.remoteCwd : null,
     path: env.PATH ?? "",
   })).digest("hex") : null;
   const saved = lease?.metadata?.anonymousGitHubLaunchers as Partial<AnonymousGitHubLauncherReceipt> | undefined;
-  if (key && saved?.key === key && saved.layout && LAYOUT_KEYS.every(name => typeof saved.layout![name] === "string")) {
+  if (key && saved?.key === key && saved.leaseId === lease?.id && saved.layout && LAYOUT_KEYS.every(name => typeof saved.layout![name] === "string")) {
     return { env: { ...env, ...Object.fromEntries(LAYOUT_KEYS.map(name => [name, saved.layout![name]!])) }, cleanupLocation: null };
   }
   try {
@@ -83,7 +84,7 @@ export async function prepareHeartbeatGitHubLaunchers(
     }
     const prepared = await prepareLaunchers({ ...location, cwd: input.cwd, env });
     if (key && LAYOUT_KEYS.every(name => typeof prepared[name] === "string")) {
-      const receipt = { key, layout: Object.fromEntries(LAYOUT_KEYS.map(name => [name, prepared[name]!])) };
+      const receipt = { key, leaseId: lease!.id, layout: Object.fromEntries(LAYOUT_KEYS.map(name => [name, prepared[name]!])) };
       await input.preparation!.save(receipt);
       lease!.metadata = { ...lease!.metadata, anonymousGitHubLaunchers: receipt };
     }

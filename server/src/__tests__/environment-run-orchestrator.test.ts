@@ -1,3 +1,4 @@
+import { carryReusableLeasePreparation } from "../services/environment-lease-handoff.js";
 import { RetainedSandboxAbsentError } from "../services/retained-sandbox-absent-error.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -657,6 +658,13 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockUpdateLeaseMetadata).toHaveBeenCalledTimes(1);
     expect(second.executionTarget).toEqual(first.executionTarget);
     expect(second.workspaceRealization).toEqual(first.workspaceRealization);
+    const successor = { ...second.lease, id: "lease-successor", heartbeatRunId: "run-successor" };
+    type HandoffBinding = Parameters<typeof carryReusableLeasePreparation>[0];
+    successor.metadata = carryReusableLeasePreparation(second.lease as unknown as HandoffBinding,
+      successor as unknown as HandoffBinding);
+    await orchestrator.realizeForRun({ ...input, heartbeatRunId: "run-successor", lease: successor });
+    expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledTimes(1);
     environment.config = { changed: true };
     const changed = await orchestrator.realizeForRun({ ...input, heartbeatRunId: "run-3", lease: second.lease });
     expect(runtime.realizeWorkspace).toHaveBeenCalledTimes(2);

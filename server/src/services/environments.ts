@@ -1,4 +1,4 @@
-import { createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
+import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { clearRemoteWorkspaceLocationForReleasedLease } from "./remote-workspace-snapshot-retention.js";
 import { notifyNativeEnvironmentSettlement } from "./native-environment-settlement-notifications.js";
@@ -1658,13 +1658,14 @@ export function environmentService(db: Db) {
                   );
                 }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });
-                values.metadata = { ...values.metadata, reusableLeasePredecessor: handoff };
+                values.metadata = { ...carryReusableLeasePreparation(retired[0]!, { ...values, id: replacementLeaseId! }),
+                  reusableLeasePredecessor: handoff };
                 await tx.update(environmentLeases).set({ metadata: {
                   ...retired[0]!.metadata, reusableLeaseSuccessor: handoff,
                 } }).where(eq(environmentLeases.id, retired[0]!.id));
               }
               if (input.reusesReusableLeaseId) {
-                const [previous] = await tx.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+                const [previous] = await tx.select().from(environmentLeases)
                   .where(and(eq(environmentLeases.id, input.reusesReusableLeaseId), eq(environmentLeases.companyId, input.companyId))).for("update");
                 const reacquired = await tx
                   .update(environmentLeases)
@@ -1676,7 +1677,9 @@ export function environmentService(db: Db) {
                     failureReason: null,
                     cleanupStatus: null,
                     metadata: withEnvironmentLeaseController(
-                      preserveReusableLeaseHandoff(previous?.metadata ?? null, withoutCleanupVerification(input.metadata))),
+                      preserveReusableLeaseHandoff(previous?.metadata ?? null, previous
+                        ? carryReusableLeasePreparation(previous, { ...values, id: input.reusesReusableLeaseId! })
+                        : withoutCleanupVerification(input.metadata))),
                     updatedAt: now,
                   })
                   .where(

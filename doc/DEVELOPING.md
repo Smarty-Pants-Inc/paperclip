@@ -5334,3 +5334,11 @@ Stop/admission checks still run; this receipt is not proof of workspace file
 contents. Old releases without the optional receipt realize normally.
 
 Focused coverage: `pnpm exec vitest run server/src/__tests__/environment-run-orchestrator.test.ts`.
+
+Ordinary native warm turns rotate the run-owned database lease row while keeping
+one provider allocation. Successful token-free preparation receipts survive only
+that existing, transactionally validated reusable-lease handoff (or exact-row
+reacquisition). Their logical owner and cached realization owner are rebound to
+the successor; content/configuration keys still have to match at use time. A new
+allocation, unrelated row, agent/task/scope change, expired lease or missing receipt
+performs preparation normally. No bearer tokens are copied into lease metadata.

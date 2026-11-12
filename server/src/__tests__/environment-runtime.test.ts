@@ -1355,6 +1355,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(first.lease.metadata?.reusableSandboxLease).toMatchObject({
       projectlessIssueId: issueId, executionWorkspaceId: null, agentId: seeded.agentId,
     });
+    const receipt = { key: "a".repeat(64), leaseId: first.lease.id, layout: { PATH: "/wrappers" } };
+    const realizationReceipt = { key: "b".repeat(64), leaseId: first.lease.id, cwd: "/workspace",
+      realization: { mode: "copy", authoritativeRoot: "/workspace", leaseId: first.lease.id } };
+    await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata,
+      anonymousGitHubLaunchers: receipt, nativeWorkspaceRealizationPreparation: realizationReceipt });
     await runtimeWithPlugin.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain");
     const nextRunId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -1378,6 +1383,16 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const shouldResume = scenario === "same task";
     expect(next.lease.providerLeaseId).toBe(shouldResume ? "projectless-1" : "projectless-2");
     expect(acquisitions).toBe(shouldResume ? 1 : 2);
+    expect(next.lease.id).not.toBe(first.lease.id);
+    if (shouldResume) {
+      expect(next.lease.metadata?.anonymousGitHubLaunchers).toEqual({ ...receipt, leaseId: next.lease.id });
+      expect(next.lease.metadata?.nativeWorkspaceRealizationPreparation).toEqual({ ...realizationReceipt,
+        leaseId: next.lease.id, realization: { ...realizationReceipt.realization, leaseId: next.lease.id } });
+      expect(next.lease.metadata?.workspaceRealization).toMatchObject({ leaseId: next.lease.id });
+    } else {
+      expect(next.lease.metadata?.anonymousGitHubLaunchers).toBeUndefined();
+      expect(next.lease.metadata?.nativeWorkspaceRealizationPreparation).toBeUndefined();
+    }
     expect(call.mock.calls.filter((entry) => entry[1] === "environmentResumeLease")).toHaveLength(shouldResume ? 1 : 0);
   });
 

@@ -588,14 +588,15 @@ export function environmentRunOrchestrator(
       && lease.companyId === companyId && lease.environmentId === environment.id
       && typeof lease.metadata?.agentId === "string" && lease.metadata.agentId.length > 0
       && (!lease.expiresAt || new Date(lease.expiresAt).getTime() > Date.now())
-      ? createHash("sha256").update(JSON.stringify({ version: 1,
-          leaseId: lease.id, providerLeaseId: lease.providerLeaseId, companyId,
+      ? createHash("sha256").update(JSON.stringify({ version: 2,
+          providerLeaseId: lease.providerLeaseId, companyId,
           agentId: lease.metadata?.agentId, environmentId: environment.id, config: environment.config,
           provider: lease.provider, remoteCwd: lease.metadata?.remoteCwd ?? null,
           request: { ...workspaceRealizationRequest, heartbeatRunId: undefined },
         })).digest("hex") : null;
     const priorPreparation = parseObject(lease.metadata?.nativeWorkspaceRealizationPreparation);
     const reusePreparation = preparationKey !== null && priorPreparation.key === preparationKey
+      && priorPreparation.leaseId === lease.id
       && typeof priorPreparation.cwd === "string" && priorPreparation.cwd.length > 0
       && Object.keys(parseObject(priorPreparation.realization)).length > 0;
     if (reusePreparation) {
@@ -708,7 +709,7 @@ export function environmentRunOrchestrator(
         ...(lease.metadata ?? {}),
         workspaceRealization,
         ...(preparationKey ? { nativeWorkspaceRealizationPreparation: {
-          key: preparationKey, cwd: realizedCwd, realization: workspaceRealization,
+          key: preparationKey, leaseId: lease.id, cwd: realizedCwd, realization: workspaceRealization,
         } } : {}),
       };
       const updatedLease = await environmentsSvc.updateLeaseMetadata(lease.id, nextLeaseMetadata);
