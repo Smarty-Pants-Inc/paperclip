@@ -34,7 +34,7 @@ describe("F085 per-leaf explicit selection (trust boundary)", () => {
     expect(validateChildSelection(selection("neutral/reasoner:max"), catalog)).toMatchObject({ effort: "max", effectiveModel: "neutral/reasoner" });
     expect(validateChildSelection(selection("anthropic/claude-test:xhigh"), catalog)).toMatchObject({ effort: "xhigh" });
     expect(() => validateChildSelection(selection("unknown/model:high"), catalog)).toThrow(/physical|catalog/i);
-    expect(() => validateChildSelection(selection(), () => ({ provider: "n", id: "m", family: "other", thinkingLevels: ["high"] }))).toThrow(/support/i);
+    expect(validateChildSelection(selection(), () => ({ provider: "n", id: "m", thinkingLevels: ["high"] }))).toMatchObject({ effort: "max", model: "neutral/reasoner:max", effectiveModel: "n/m" });
   });
 
   it("does not accept ignored thinking or stale parent environment as an ACK", () => {
@@ -43,11 +43,21 @@ describe("F085 per-leaf explicit selection (trust boundary)", () => {
     const state = { sessionId: "child-session", model: { provider: "neutral", id: "reasoner" }, thinkingLevel: "max" };
     expect(acknowledgeChildSelection(admitted, state)).toMatchObject({ childSessionId: "child-session", effectiveModel: "neutral/reasoner", effort: "max" });
     for (const mismatch of [
-      { ...state, thinkingLevel: "high" },
+      { ...state, thinkingLevel: "unsupported" },
+      { ...state, thinkingLevel: undefined },
       { ...state, model: { provider: "parent", id: "reasoner" } },
       { ...state, sessionId: "" },
       { ...state, model: undefined },
     ]) expect(() => acknowledgeChildSelection(admitted, mismatch)).toThrow(/child|effective/i);
+  });
+
+  it("leaves unsupported effort to Pi and records requested versus SDK-effective effort", () => {
+    const admitted = validateChildSelection(selection("anthropic/claude-test:max"), () => ({ provider: "anthropic", id: "claude-test", thinkingLevels: ["high", "xhigh"] }));
+    expect(admitted).toMatchObject({ model: "anthropic/claude-test:max", effort: "max" });
+    expect(acknowledgeChildSelection(admitted, { sessionId: "configured-child", model: { provider: "anthropic", id: "claude-test" }, thinkingLevel: "xhigh" })).toEqual({ childSessionId: "configured-child", effectiveModel: "anthropic/claude-test", requestedEffort: "max", effort: "xhigh" });
+    for (const effort of PI_NATIVE_THINKING_LEVELS) {
+      expect(acknowledgeChildSelection(admitted, { sessionId: "configured-child", model: { provider: "anthropic", id: "claude-test" }, thinkingLevel: effort })).toMatchObject({ requestedEffort: "max", effort });
+    }
   });
 
   it("preserves exact nested and tagged model IDs using shared native config validation", () => {

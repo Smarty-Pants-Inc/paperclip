@@ -3,8 +3,7 @@ import { PI_NATIVE_THINKING_LEVELS, PiNativeAdmissionError, resolvePiNativeConfi
 export interface ChildPhysicalModel {
   readonly provider: string;
   readonly id: string;
-  /** Authoritative physical family, including aliases. Unknown routing is not admission. */
-  readonly family: "claude" | "other";
+  /** Catalog metadata only; Pi owns supported-level resolution and clamping. */
   readonly thinkingLevels: readonly PiNativeThinkingLevel[];
 }
 export type ChildModelCatalog = (qualifiedModel: string) => ChildPhysicalModel | undefined;
@@ -23,6 +22,8 @@ export interface ChildSelection {
   readonly requestedModel: string;
   readonly effectiveModel: string;
   readonly effort: PiNativeThinkingLevel;
+  /** Evidence only: an unsupported request is still passed unchanged to Pi. */
+  readonly requestedEffortSupported: boolean;
 }
 export function childAdmissionError(code: string, message: string): never {
   throw new PiNativeAdmissionError(`pi_child_${code}`, message);
@@ -61,20 +62,23 @@ export function validateChildSelection(value: unknown, catalog: ChildModelCatalo
   if (suffix < 0 || !PI_NATIVE_THINKING_LEVELS.includes(effort)) childAdmissionError("selection_invalid", "Child model requires an explicit provider/id:level using a native Pi thinking level.");
   const requestedModel = resolvePiNativeConfig({ provider: "pi_rpc", model: model.slice(0, suffix), piRpcThinkingLevel: effort }).model;
   const physical = catalog(requestedModel);
-  if (!physical || !physical.provider || !physical.id || !["claude", "other"].includes(physical.family)) childAdmissionError("physical_model_unknown", "Child catalog must resolve an authoritative physical model before admission.");
+  if (!physical || !physical.provider || !physical.id) childAdmissionError("physical_model_unknown", "Child catalog must resolve an authoritative physical model before admission.");
   const effectiveModel = `${physical.provider}/${physical.id}`;
-  if (!physical.thinkingLevels.includes(effort)) childAdmissionError("thinking_unsupported", "Effective child model does not support the selected effort.");
-  return Object.freeze({ selectionId, roleId, roleDigest, paretoRevision, paretoChoice, complexity, rationale, budget, model, requestedModel, effectiveModel, effort });
+  // Preserve the request unchanged. Pi applies the model catalog's level mapping.
+  return Object.freeze({ selectionId, roleId, roleDigest, paretoRevision, paretoChoice, complexity, rationale, budget, model, requestedModel, effectiveModel, effort, requestedEffortSupported: physical.thinkingLevels.includes(effort) });
 }
 export interface ChildSelectionAck {
   readonly childSessionId: string;
   readonly effectiveModel: string;
+  readonly requestedEffort: PiNativeThinkingLevel;
+  /** SDK-effective effort, which may differ after Pi's catalog clamp. */
   readonly effort: PiNativeThinkingLevel;
 }
 /** SDK readback (ctx.model + pi.getThinkingLevel), not a synthetic child RPC get_state. */
 export function acknowledgeChildSelection(selection: ChildSelection, state: unknown): ChildSelectionAck {
   const input = object(state), model = object(input.model);
   if (typeof input.sessionId !== "string" || !input.sessionId.trim()) childAdmissionError("identity_missing", "Child session identity is missing from SDK readback.");
-  if (`${model.provider}/${model.id}` !== selection.effectiveModel || input.thinkingLevel !== selection.effort) childAdmissionError("effective_mismatch", "Child effective model/effort differs from the explicit selection; no prompt is admitted.");
-  return Object.freeze({ childSessionId: input.sessionId, effectiveModel: selection.effectiveModel, effort: selection.effort });
+  if (`${model.provider}/${model.id}` !== selection.effectiveModel || !PI_NATIVE_THINKING_LEVELS.includes(input.thinkingLevel as PiNativeThinkingLevel)
+      || (selection.requestedEffortSupported && input.thinkingLevel !== selection.effort)) childAdmissionError("effective_mismatch", "Child effective SDK readback requires the selected model and native effort (unchanged when catalog-supported); no prompt is admitted.");
+  return Object.freeze({ childSessionId: input.sessionId, effectiveModel: selection.effectiveModel, requestedEffort: selection.effort, effort: input.thinkingLevel as PiNativeThinkingLevel });
 }
