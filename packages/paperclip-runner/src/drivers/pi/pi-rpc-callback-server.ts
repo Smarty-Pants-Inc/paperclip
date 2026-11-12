@@ -21,15 +21,21 @@ export interface PiCallbackServerOptions {
   waitForAnnouncement: (call: PiToolCallRequest, signal: AbortSignal) => Promise<void>;
   /** Must honor cancellation before effects, as required by dispatchPiToolCall. */
   handleTool: (call: PiToolCallRequest, signal: AbortSignal) => Promise<PiToolResult>;
-  /** One end-to-end deadline, including reading and waiting for the native stream. */
+  /** Separate read/announcement/result deadlines; host execution gets a fresh budget.
+   * Waiting for a dispatch slot never consumes the host execution deadline. */
   timeoutMs?: number;
 }
 export interface PiCallbackServer {
-  /** Open, bounded socket lifecycles, including incomplete requests and result writes. */
+  /** Open socket lifecycles, including backpressured peers and result writes. */
   pendingCount(): number;
   close(): Promise<void>;
 }
-const MAX_CLIENTS = 8;
+const MAX_ACTIVE_TOOLS = 8;
+const MAX_ACTIVE_CONTROLS = 1;
+const MAX_READERS = 8;
+const MAX_QUEUED = 128;
+// Lifecycle tools must remain usable while ordinary tool round trips are busy.
+const CONTROL_TOOLS = new Set(["paperclip_finish", "paperclip_block"]);
 const REFUSAL = `${JSON.stringify({ error: PI_BIND_ERROR })}\n`;
 function refused(): Error { return new Error(PI_BIND_ERROR); }
 function sameInode(a: BigIntStats, b: BigIntStats): boolean { return a.dev === b.dev && a.ino === b.ino; }
@@ -80,23 +86,66 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
   let bindPath = "";
   let ready = false, closed = false;
   let closing: Promise<void> | undefined;
-  const pending = new Map<Socket, AbortController>();
-  const server = createServer(socket => {
+  type Job = { control: boolean; run: () => Promise<void> };
+  type Client = { controller: AbortController; startReading: () => boolean };
+  const pending = new Map<Socket, Client>();
+  const queue: Job[] = [];
+  let readers = 0, activeTools = 0, activeControls = 0;
+  function drain() {
+    if (closed) return;
+    // Controls have their own slot, so even eight slow ordinary calls cannot
+    // block finish. FIFO is preserved within each class.
+    for (let i = 0; i < queue.length;) {
+      const job = queue[i]!;
+      if (job.control ? activeControls >= MAX_ACTIVE_CONTROLS : activeTools >= MAX_ACTIVE_TOOLS) { ++i; continue; }
+      queue.splice(i, 1);
+      if (job.control) ++activeControls; else ++activeTools;
+      void job.run().finally(() => {
+        if (job.control) --activeControls; else --activeTools;
+        drain();
+      });
+    }
+    // Reserve queue capacity before reading. Excess peers stay paused: stream
+    // backpressure, not a destroyed ninth socket. Only eight frame buffers and
+    // at most 128 parsed waiting calls are retained, independent of burst size.
+    for (const client of pending.values()) {
+      if (readers >= MAX_READERS || queue.length + readers >= MAX_QUEUED) break;
+      client.startReading();
+    }
+  }
+  const server = createServer({ pauseOnConnect: true }, socket => {
     socket.on("error", () => {});
-    if (!ready || closed || pending.size >= MAX_CLIENTS) { socket.destroy(); return; }
-    const controller = new AbortController(); pending.set(socket, controller);
-    const deadline = performance.now() + timeoutMs;
-    // At most one 1 MiB backing buffer per client, even for one-byte input chunks.
-    let buffer: Buffer | undefined, bytes = 0, handled = false, replied = false;
-    const reply = (frame: string, reject = false) => {
+    if (!ready || closed) { socket.destroy(); return; }
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let deadline = Infinity;
+    // At most one 1 MiB backing buffer per reader, even for one-byte chunks.
+    let buffer: Buffer | undefined, bytes = 0, reading = false, handled = false, replied = false;
+    let queued: Job | undefined;
+    const stopReading = () => { if (reading) { reading = false; --readers; } };
+    const armDeadline = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { if (replied) socket.destroy(); else reject(); }, timeoutMs);
+    };
+    const reply = (frame: string, rejectCall = false) => {
       if (replied || socket.destroyed) return;
-      replied = true; buffer = undefined;
-      if (reject) controller.abort();
+      replied = true; buffer = undefined; stopReading();
+      if (queued) { const i = queue.indexOf(queued); if (i >= 0) queue.splice(i, 1); queued = undefined; }
+      if (rejectCall) controller.abort();
+      armDeadline(); // Bound a stalled result write independently of queue time.
       socket.end(frame, () => socket.destroy());
+      drain();
     };
     const reject = () => reply(REFUSAL, true);
-    const timer = setTimeout(() => { if (replied) socket.destroy(); else reject(); }, timeoutMs);
-    socket.once("close", () => { clearTimeout(timer); pending.delete(socket); controller.abort(); buffer = undefined; });
+    pending.set(socket, { controller, startReading: () => {
+      if (reading || handled || replied || socket.destroyed) return false;
+      reading = true; ++readers; armDeadline(); socket.resume(); return true;
+    } });
+    socket.once("close", () => {
+      clearTimeout(timer); pending.delete(socket); stopReading(); controller.abort(); buffer = undefined;
+      if (queued) { const i = queue.indexOf(queued); if (i >= 0) queue.splice(i, 1); queued = undefined; }
+      drain();
+    });
     socket.once("end", () => { if (!replied) reject(); });
 
     async function dispatch(call: PiToolCallRequest) {
@@ -109,18 +158,19 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
         signal = AbortSignal.any([controller.signal, turnSignal]);
         signal.addEventListener("abort", reject, { once: true });
         signal.throwIfAborted();
+        armDeadline(); // Announcement wait is bounded, but is not host execution.
         await waitForStream(waitForAnnouncement, call, signal);
         signal.throwIfAborted();
         if (!authority.accept(call.origin)) throw refused();
-        const remaining = Math.floor(deadline - performance.now());
-        if (remaining < 1) throw refused();
+        deadline = performance.now() + timeoutMs;
+        armDeadline();
         // Keep the identical deeply immutable snapshot at both consumer boundaries.
         // The helper still performs atomic once-only consume, cancellation and result gates.
         const result = await dispatchPiToolCall(authority, call, (_captured, toolSignal) => {
           toolSignal.throwIfAborted();
           if (performance.now() >= deadline) throw refused();
           return handleTool(call, toolSignal);
-        }, { signal, timeoutMs: remaining });
+        }, { signal, timeoutMs });
         const receipt: PiToolCallReceipt = {
           schema: 1, type: "tool_result", nonce: call.nonce, sessionId: call.sessionId,
           origin: call.origin, toolCallId: call.toolCallId, result,
@@ -144,16 +194,32 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
       buffer ??= Buffer.allocUnsafe(PI_BIND_MAX_FRAME_BYTES);
       chunk.copy(buffer, bytes - chunk.length);
       if (newline < 0) return;
-      handled = true;
+      handled = true; stopReading(); clearTimeout(timer);
       try {
         const frame = buffer.subarray(0, bytes); buffer = undefined;
         if (!isUtf8(frame)) throw refused();
         const request: unknown = JSON.parse(frame.subarray(0, frame.length - 1).toString("utf8"));
         if (!validatePiToolCallRequest(request)) throw refused();
         const captured = freezeCall(request);
-        void dispatch(captured);
+        // Fence queued work immediately on settlement; do not consume its native
+        // announcement or start its host deadline until a slot is available.
+        if (captured.sessionId !== sessionId || !authority.accept(captured.origin)) throw refused();
+        const turnSignal = authority.signalFor(captured.origin);
+        if (!turnSignal) throw refused();
+        const queuedSignal = AbortSignal.any([controller.signal, turnSignal]);
+        const abort = () => reject();
+        queuedSignal.addEventListener("abort", abort, { once: true });
+        socket.once("close", () => queuedSignal.removeEventListener("abort", abort));
+        queuedSignal.throwIfAborted();
+        queued = { control: CONTROL_TOOLS.has(captured.tool), run: async () => {
+          queued = undefined;
+          await dispatch(captured);
+        } };
+        queue.push(queued);
+        drain();
       } catch { reject(); }
     });
+    drain();
   });
 
   function close(): Promise<void> {
@@ -162,7 +228,7 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
     // Publish the idempotent close promise before aborting consumers (which can reenter).
     let resolveClose!: () => void, rejectClose!: (error: Error) => void;
     closing = new Promise<void>((resolvePromise, rejectPromise) => { resolveClose = resolvePromise; rejectClose = rejectPromise; });
-    const drained = Promise.all([...pending].map(([socket, controller]) => new Promise<void>(resolveSocket => {
+    const drained = Promise.all([...pending].map(([socket, { controller }]) => new Promise<void>(resolveSocket => {
       socket.once("close", resolveSocket); controller.abort(); socket.destroy();
     })));
     let failed = false;
