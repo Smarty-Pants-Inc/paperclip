@@ -74,12 +74,12 @@ const PI_CAPABILITIES: NativeSessionCapabilities = {
   read: false,
   reconciliation: false,
   usage: true,
-  dynamicTools: false,
+  dynamicTools: true,
   runtimeRequestResolution: false,
   runtimeRequestHandoff: false,
   goals: false,
   threadLineage: false,
-  unsupported: ["resume", "queuedFollowUp", "structuredResult", "runtimeRequests", "dynamicTools", "goals", "threadLineage"],
+  unsupported: ["resume", "queuedFollowUp", "structuredResult", "runtimeRequests", "goals", "threadLineage"],
 };
 
 export class PiRpcDriver implements HarnessDriver {
