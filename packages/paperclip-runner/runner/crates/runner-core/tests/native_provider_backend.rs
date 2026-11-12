@@ -2275,8 +2275,10 @@ fn rejects_a_mutable_opencode_command_outside_the_runner_launch_profile() {
 #[test]
 #[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
 fn restart_lost_local_facade_turn_records_a_recoverable_cause() {
-    // Native Pi and OpenCode restart locally with runnerd, unlike Cursor Cloud.
-    for provider in ["opencode", "pi_rpc"] {
+    // OpenCode restarts locally with runnerd, unlike Cursor Cloud. Native Pi is
+    // excluded until its restore (thread/resume) is implemented and proven:
+    // 1b' (e2ee9d91) deliberately keeps pi_rpc's lost turn non-continuable.
+    for provider in ["opencode"] {
         let directory = temporary_directory(&format!("{provider}-restart-lost-turn"));
         let mut config = opencode_config(&directory);
         let proxy_script = directory.join("qualified-opencode-proxy-script");
