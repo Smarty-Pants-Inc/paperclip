@@ -39,6 +39,8 @@ export interface PiRpcDriverOptions {
   piRpcThinkingLevel?: PiNativeThinkingLevel;
   piThinkingLevel?: string;
   commandFd?: number;
+  /** Proxy resource URL admitted by the runner-owned descriptor binding. */
+  trustedProxyEntrypointUrl?: string;
   commandLifecycle?: { beforeSpawn(): void; afterSpawn(): void; afterExit(): void };
   /** Pi executable, defaulting to `pi`. */
   command?: string;
@@ -149,7 +151,7 @@ export class PiRpcDriver implements HarnessDriver {
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
           await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json));
-          const extension = await resolveOwnedPiExtension(import.meta.url);
+          const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
           args.push("--extension", extension);
           environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
           environment.PAPERCLIP_PI_BIND_INITIAL = JSON.stringify(initial);

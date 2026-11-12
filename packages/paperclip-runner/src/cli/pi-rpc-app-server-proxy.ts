@@ -48,6 +48,7 @@ export interface PiRpcDriverLaunchConfig {
   model: string;
   command: string;
   commandFd?: number;
+  trustedProxyEntrypointUrl?: string;
   commandLifecycle?: {
     beforeSpawn(): void;
     afterSpawn(): void;
@@ -336,6 +337,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       model,
       command: launchBinding?.command ?? "",
       ...(launchBinding?.commandFd === undefined ? {} : { commandFd: launchBinding.commandFd }),
+      ...(launchBinding?.trustedProxyEntrypointUrl === undefined ? {} : { trustedProxyEntrypointUrl: launchBinding.trustedProxyEntrypointUrl }),
       ...(launchBinding?.commandLifecycle === undefined ? {} : { commandLifecycle: launchBinding.commandLifecycle }),
       runtimeDirectory: options.createDriver && !environment.PAPERCLIP_PI_RUNTIME_DIR?.trim()
         ? cwd
