@@ -18,10 +18,13 @@ import { PiIdentityTombstones } from "./pi-identity-tombstones.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
+import { piSessionFileInvalid, verifyPiSessionFile } from "./pi-session-file.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
   HarnessSession,
+  HarnessSessionRecoveryOptions,
+  HarnessSessionRecoveryResult,
   OpenHarnessSessionInput,
   PersistedHarnessSession,
 } from "../../contracts/harness-driver.js";
@@ -71,7 +74,7 @@ export interface PiRpcDriverOptions {
 }
 
 const PI_CAPABILITIES: NativeSessionCapabilities = {
-  resume: false,
+  resume: true,
   typedEvents: true,
   providerTranscriptStreaming: true,
   steering: false,
@@ -86,7 +89,7 @@ const PI_CAPABILITIES: NativeSessionCapabilities = {
   runtimeRequestHandoff: false,
   goals: false,
   threadLineage: false,
-  unsupported: ["resume", "steering", "queuedFollowUp", "structuredResult", "runtimeRequests", "goals", "threadLineage"],
+  unsupported: ["steering", "queuedFollowUp", "structuredResult", "runtimeRequests", "goals", "threadLineage"],
 };
 
 export class PiRpcDriver implements HarnessDriver {
@@ -107,7 +110,24 @@ export class PiRpcDriver implements HarnessDriver {
     };
   }
 
+  async recoverSession(snapshot: PersistedHarnessSession, options: HarnessSessionRecoveryOptions): Promise<HarnessSessionRecoveryResult> {
+    options.signal.throwIfAborted();
+    if (snapshot.driverKind !== "pi_rpc" || !snapshot.runId || !snapshot.normalizedSessionId
+      || !snapshot.driverSessionId || !snapshot.workingDirectory
+      || (snapshot.providerSessionId != null && snapshot.providerSessionId !== snapshot.driverSessionId)) throw piSessionFileInvalid();
+    const cwd = await realpath(snapshot.workingDirectory).catch(() => { throw piSessionFileInvalid(); });
+    const sessionFile = await verifyPiSessionFile({ snapshot, runtimeDirectory: this.#options.runtimeDirectory,
+      filename: `${safeSessionName(snapshot.normalizedSessionId)}.jsonl`, workingDirectory: cwd, signal: options.signal });
+    const session = await this.#open({ runId: snapshot.runId, normalizedSessionId: snapshot.normalizedSessionId,
+      workingDirectory: cwd, signal: options.signal }, { snapshot, sessionFile });
+    return { recovered: true, session };
+  }
+
   async openSession(input: OpenHarnessSessionInput): Promise<HarnessSession> {
+    return this.#open(input);
+  }
+
+  async #open(input: OpenHarnessSessionInput, recovery?: { snapshot: PersistedHarnessSession; sessionFile: string }): Promise<HarnessSession> {
     if (input.signal?.aborted) throw input.signal.reason ?? new Error("Pi RPC session startup aborted");
     if (this.#options.toolSocketPath !== undefined) throw new Error("Pi semantic callbacks require the live guarded host bridge");
     const cwd = await realpath(input.workingDirectory);
@@ -118,7 +138,7 @@ export class PiRpcDriver implements HarnessDriver {
     });
     await chmod(directory, 0o700);
     const filename = `${safeSessionName(input.normalizedSessionId)}.jsonl`;
-    const sessionFile = join(directory, filename);
+    const sessionFile = recovery?.sessionFile ?? join(directory, filename);
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}) };
@@ -224,12 +244,20 @@ export class PiRpcDriver implements HarnessDriver {
       transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
       // --session loads an existing file too: no saved selection bypasses live
       // admission. The broker/models.json bootstrap above remains first.
-      const identity = await admitPiRpcSession(piAdmissionPort(transport, this.#options.startupTimeoutMs), config, input.signal);
+      const port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
+      if (recovery) {
+        // Check native readback before model/config mutation, not just the argv.
+        const live = record(await port.request({ type: "get_state" }, input.signal));
+        if (live.sessionId !== recovery.snapshot.driverSessionId || live.sessionFile !== sessionFile) throw piSessionFileInvalid();
+      }
+      const identity = await admitPiRpcSession(port, config, input.signal);
+      if (recovery && identity.providerSessionId !== recovery.snapshot.driverSessionId) throw piSessionFileInvalid();
       return new PiRpcHarnessSession({
         transport,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
         providerSessionId: identity.providerSessionId,
+        sourceSequence: recovery?.snapshot.lastSourceSequence,
         identity,
         sessionFile,
         config,
@@ -280,6 +308,7 @@ interface PiSessionState {
   runId: string;
   normalizedSessionId: string;
   providerSessionId: string;
+  sourceSequence?: number;
   sessionFile: string;
   workingDirectory: string;
   runnerInstanceId: string;
@@ -418,6 +447,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#runId = state.runId;
     this.#normalizedSessionId = state.normalizedSessionId;
     this.#providerSessionId = state.providerSessionId;
+    this.#sourceSequence = state.sourceSequence ?? 0;
     this.#sessionFile = state.sessionFile;
     this.#workingDirectory = state.workingDirectory;
     this.#runnerInstanceId = state.runnerInstanceId;

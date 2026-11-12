@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createPiEventProjector } from "../drivers/pi/pi-event-projector.js";
 import type { HarnessDriver, HarnessSession } from "../contracts/harness-driver.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
@@ -111,6 +111,35 @@ class FakeSession {
     this.#waiter = undefined;
   }
 }
+
+it("thread/resume passes the saved native identity and execution-host cwd to driver recovery", async () => {
+  const sink = new FakeSink(); const session = new FakeSession();
+  const driver = makeDriver(session);
+  driver.openSession = vi.fn(driver.openSession);
+  driver.recoverSession = vi.fn(async () => ({ recovered: true, session: session as unknown as HarnessSession }));
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_RUN_ID: "run-new", PAPERCLIP_NORMALIZED_SESSION_ID: "conversation" }, createDriver: () => driver });
+  try {
+    proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: session.id, cwd: "/workspace/remote-agent", model: "neutral/model" } }));
+    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 1)).toBe(true));
+    expect(sink.decoded().find(frame => frame.id === 1)).toMatchObject({ result: { thread: { id: session.id } } });
+    expect(driver.openSession).not.toHaveBeenCalled();
+    expect(driver.recoverSession).toHaveBeenCalledWith(expect.objectContaining({ driverKind: "pi_rpc", driverSessionId: session.id,
+      providerSessionId: session.id, runId: "run-new", normalizedSessionId: "conversation", workingDirectory: "/workspace/remote-agent" }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  } finally { await proxy.close(); }
+});
+
+it.each(["pi_session_file_missing", "pi_session_file_invalid"])("thread/resume preserves typed refusal %s without fresh-open fallback", async code => {
+  const sink = new FakeSink(); const driver = makeDriver(new FakeSession());
+  driver.openSession = vi.fn(driver.openSession);
+  driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("Saved Pi history could not be loaded"), { code }); });
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => driver });
+  try {
+    proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: "native-id", cwd: "/workspace", model: "neutral/model" } }));
+    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 1)).toBe(true));
+    expect(sink.decoded().find(frame => frame.id === 1)).toMatchObject({ error: { code: -32000, data: { code } } });
+    expect(driver.openSession).not.toHaveBeenCalled();
+  } finally { await proxy.close(); }
+});
 
 function makeDriver(session: FakeSession): HarnessDriver {
   return {

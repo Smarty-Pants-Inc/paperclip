@@ -485,13 +485,19 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     let opened: PiRpcProxySession;
     if (resume) {
       const threadId = text(params.threadId);
-      if (!threadId || !driver.recoverSession) throw new Error("Pi RPC session recovery is unavailable");
+      if (!threadId) throw new Error("Pi RPC thread/resume requires the saved native session id");
+      if (!driver.recoverSession) throw new Error("Pi RPC driver does not implement session recovery");
+      // The conversation's file is named by the server-owned normalized id; a
+      // thread id is Pi's own session id and never names the file.
+      const normalizedSessionId = environment.PAPERCLIP_NORMALIZED_SESSION_ID;
+      if (!normalizedSessionId) throw new Error("Pi RPC thread/resume requires PAPERCLIP_NORMALIZED_SESSION_ID");
       const snapshot: PersistedHarnessSession = {
         driverKind: "pi_rpc",
+        workingDirectory: cwd,
         driverSessionId: threadId,
         providerSessionId: threadId,
         runId: activeRunId,
-        normalizedSessionId: environment.PAPERCLIP_NORMALIZED_SESSION_ID ?? threadId,
+        normalizedSessionId,
         activeTurnId: null,
         lastSourceSequence: 0,
       };
@@ -627,7 +633,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     if (message.method === "initialize" || message.method === "thread/start" || message.method === "thread/resume") {
       bootstrapFailure ??= normalized;
     }
-    send({ id: message.id, error: { code: -32000, message: normalized.message } });
+    const code = (normalized as Error & { code?: unknown }).code;
+    send({ id: message.id, error: { code: -32000, message: normalized.message,
+      ...(code === "pi_session_file_missing" || code === "pi_session_file_invalid" ? { data: { code } } : {}) } });
   }
 
   function acceptLine(line: string): void {
