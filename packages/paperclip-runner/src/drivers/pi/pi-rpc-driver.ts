@@ -1,12 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
-import { RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
+import { PI_BIND_MAX_FRAME_BYTES, RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
@@ -182,8 +182,13 @@ export class PiRpcDriver implements HarnessDriver {
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
           await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json));
+          const initialJson = JSON.stringify(initial);
+          if (Buffer.byteLength(initialJson) > PI_BIND_MAX_FRAME_BYTES) throw new Error("Pi initial binding exceeds its private frame limit");
+          const initialFile = join(privateDirectory, "initial.json");
+          await writeFile(initialFile, initialJson, { mode: 0o600, flag: "wx" });
           environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
-          environment.PAPERCLIP_PI_BIND_INITIAL = JSON.stringify(initial);
+          delete environment.PAPERCLIP_PI_BIND_INITIAL;
+          environment.PAPERCLIP_PI_BIND_INITIAL_FILE = initialFile;
         } catch (error) {
           await callbacks?.close();
           await provider.close();
@@ -1084,6 +1089,7 @@ function bindingContext(baseInstructions: string, tools: readonly Readonly<Recor
 async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPath" | "directory">): Promise<void> {
   // Only this allocation's private IPC endpoint/root; NEVER delete session JSONL.
   await unlink(resident.socketPath).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+  await unlink(join(resident.directory, "initial.json")).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
   await rmdir(resident.directory).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
 }
 

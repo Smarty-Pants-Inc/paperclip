@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { createServer as httpServer, type Server as HttpServer } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
@@ -119,13 +120,28 @@ async function revoked(provider: { baseUrl: string; apiKey: string }) {
 }
 
 describe("resident Pi model binding", () => {
+  it("boots a 200 KiB binding through a private file instead of an E2BIG environment entry", async () => {
+    const large = { ...tool("large"), inputSchema: { type: "object", properties: { body: { type: "string", description: "x".repeat(200 * 1024) } } } };
+    const f = await fixture({ dynamicTools: [large] });
+    const path = f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE;
+    expect(path).toBe(join(dirname(f.launch.env!.PAPERCLIP_PI_BIND_SOCKET!), "initial.json"));
+    expect(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL).toBeUndefined();
+    expect((await stat(path!)).mode & 0o777).toBe(0o600);
+    const initial = JSON.parse(await readFile(path!, "utf8"));
+    expect(initial.tools).toEqual([large]);
+    const child = spawnSync(process.execPath, ["-e", "process.exit(0)"], { env: f.launch.env });
+    expect(child.error).toBeUndefined(); expect(child.status).toBe(0);
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.close();
+    await expect(stat(path!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
   it("normalizes dynamic tools independently and maps native aliases back to controller names", async () => {
     const original = { name: "issues.create", description: "Create\n\tissue", inputSchema: { properties: {} } };
     const handler = vi.fn(async (_call: { tool: string }) => ({ content: [{ type: "text", text: "created" }], details: {} }));
     const f = await fixture({ dynamicTools: [original, { name: "empty", description: "", inputSchema: { type: "object" } },
       { name: "long", description: "😀".repeat(3000), inputSchema: { type: "object" } },
       { name: "bad", description: "bad", inputSchema: null }], dynamicToolHandler: handler });
-    const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     expect(validateBindingConfig(initial)).toBe(true);
     expect(initial.tools).toHaveLength(3);
     expect(initial.tools[0]).toMatchObject({ description: "Create issue", inputSchema: { type: "object", properties: {} } });
@@ -149,7 +165,7 @@ describe("resident Pi model binding", () => {
   });
   it("keeps 128 usable tools and diagnoses an oversized catalog instead of rejecting the binding", async () => {
     const f = await fixture({ dynamicTools: Array.from({ length: 129 }, (_, i) => tool(`tool_${i}`)) });
-    const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     expect(initial.tools).toHaveLength(128);
     expect(initial.tools.at(-1).name).toBe("tool_127");
     await vi.waitFor(() => expect(f.events.some(event => event.eventType === "harness.diagnostic" && event.payload.code === "pi_dynamic_tool_limit")).toBe(true));
@@ -159,7 +175,7 @@ describe("resident Pi model binding", () => {
     const circular: Record<string, unknown> = {}; circular.self = circular;
     const tools = [tool("issues.create"), tool("issues_create"), tool("9/other"), { ...tool("circular"), inputSchema: circular }];
     const f = await fixture({ dynamicTools: tools });
-    const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     expect(initial.tools).toHaveLength(3);
     expect(new Set(initial.tools.map((entry: { name: string }) => entry.name)).size).toBe(3);
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
@@ -186,7 +202,7 @@ describe("resident Pi model binding", () => {
     const instructionFile = f.launch.args![f.launch.args!.indexOf("--append-system-prompt") + 1]!;
     expect((await stat(instructionFile)).mode & 0o777).toBe(0o600);
     expect(await readFile(instructionFile, "utf8")).toContain("initial π");
-    const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     expect(initial).toMatchObject({ schema: 1, sessionId: "host-session", epoch: 1, runId: "run-a", model: "paperclip/faux", thinkingLevel: "off", tools: [tool("old_tool")] });
     expect(initial.instructions).toContain("initial π"); expect(initial.instructions).toContain('"revision":1');
     expect(JSON.stringify(initial)).not.toContain("upstream-binding-canary");
@@ -198,7 +214,7 @@ describe("resident Pi model binding", () => {
     await finish(f);
   });
   it("keeps INITIAL for initial/same-context attach and post-claim admission, without bind/begin IPC", async () => {
-    const f = await fixture(); const initial = JSON.parse(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL!);
+    const f = await fixture(); const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     await f.session.attachRun({ runId: "run-a", baseInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 } });
     await f.session.revalidateAfterClaim();
     expect((await f.session.snapshot()).binding).toMatchObject({ epoch: 1, preparedTurnId: initial.turnId });

@@ -119,9 +119,11 @@ type InitialAuthority = { schema: 1; sessionId: string; epoch: number; runId: st
 function initialAuthority(pid: number): InitialAuthority {
   // Never print or retain /proc environ. Select this one nonsecret entry, then
   // immediately discard every field except the authority allowlist below.
-  const entry = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").find(value => value.startsWith("PAPERCLIP_PI_BIND_INITIAL="));
-  if (!entry) throw new Error("actual Pi has no INITIAL authority");
-  const value = record(JSON.parse(entry.slice("PAPERCLIP_PI_BIND_INITIAL=".length)));
+  const entries = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
+  const file = entries.find(value => value.startsWith("PAPERCLIP_PI_BIND_INITIAL_FILE="));
+  const entry = entries.find(value => value.startsWith("PAPERCLIP_PI_BIND_INITIAL="));
+  if (!file && !entry) throw new Error("actual Pi has no INITIAL authority");
+  const value = record(JSON.parse(file ? readFileSync(file.slice("PAPERCLIP_PI_BIND_INITIAL_FILE=".length), "utf8") : entry!.slice("PAPERCLIP_PI_BIND_INITIAL=".length)));
   if (value.schema !== 1 || !validateOrigin(value) || typeof value.sessionId !== "string" || typeof value.toolSocketPath !== "string") throw new Error("actual Pi INITIAL authority is incomplete");
   return { schema: 1, sessionId: value.sessionId, epoch: value.epoch, runId: value.runId, turnId: value.turnId, toolSocketPath: value.toolSocketPath };
 }
