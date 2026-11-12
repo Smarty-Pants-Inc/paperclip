@@ -905,6 +905,28 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { pluginId, companyId, agentId, environment, runId, executionWorkspaceId, reusableLease };
   }
 
+  // Regression: cold workspace/instructions sync must not inherit the 30 s plugin RPC default.
+  it.each((["syncIn", "syncOut"] as const).flatMap(method => [
+    { timeoutMs: null, expectedRpcTimeoutMs: 120_000 },
+    { timeoutMs: 1234, expectedRpcTimeoutMs: 120_000 },
+    { timeoutMs: 300_000, expectedRpcTimeoutMs: 330_000 },
+  ].map(budget => ({ method, ...budget }))))("applies the sync RPC timeout floor for $method (configured $timeoutMs)", async ({ method, timeoutMs, expectedRpcTimeoutMs }) => {
+    const seeded = await seedReusablePluginSandboxLease(null, { timeoutMs });
+    const call = vi.fn(async (..._args: unknown[]) => ({ operations: [] }));
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: vi.fn(() => true), call,
+      getWorker: vi.fn(() => ({ supportedMethods: ["environmentSyncIn", "environmentSyncOut"] })),
+    } as unknown as PluginWorkerManager });
+
+    await runtime[method]({ environment: seeded.environment, lease: seeded.reusableLease, operations: [] });
+
+    expect(call).toHaveBeenCalledExactlyOnceWith(seeded.pluginId,
+      method === "syncIn" ? "environmentSyncIn" : "environmentSyncOut",
+      expect.objectContaining({ operations: [] }), expectedRpcTimeoutMs);
+    expect(call.mock.calls[0]?.[2]).not.toHaveProperty("minimumTimeoutMs");
+    expect((await environmentService(db).getById(seeded.environment.id))?.config).toEqual(seeded.environment.config);
+  });
+
   it.each((["syncIn", "syncOut"] as const).flatMap(method =>
     [1234, 1_200_000].map(timeoutMs => ({ method, timeoutMs }))))("uses a per-call $method deadline (configured $timeoutMs) for the provider and its RPC without changing settings", async ({ method, timeoutMs }) => {
     const seeded = await seedReusablePluginSandboxLease(null, { timeoutMs });

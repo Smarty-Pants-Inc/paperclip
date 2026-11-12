@@ -780,6 +780,8 @@ export type ProviderResourceDisposition =
   | "stop_and_retain"
   | "destroy";
 
+const ENVIRONMENT_SYNC_RPC_MIN_TIMEOUT_MS = 120_000;
+
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS = 5_000;
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS = 100;
 
@@ -1604,10 +1606,11 @@ function createSandboxEnvironmentDriver(
       provider: providerKey,
     });
     const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
-    const rpcTimeoutMs = input.minimumTimeoutMs === undefined
+    const configuredRpcTimeoutMs = input.minimumTimeoutMs === undefined
       ? resolvePluginSandboxRpcTimeoutMs(sanitizedConfig)
       : Math.max(resolvePluginSandboxRpcTimeoutMs(sanitizedConfig) ?? 0,
         resolvePluginSandboxRpcTimeoutMs({ ...sanitizedConfig, timeoutMs: input.minimumTimeoutMs }) ?? 0);
+    const rpcTimeoutMs = Math.max(configuredRpcTimeoutMs ?? 0, ENVIRONMENT_SYNC_RPC_MIN_TIMEOUT_MS);
     return await pluginWorkerManager.call(pluginId, method, {
       driverKey: providerKey,
       companyId: input.lease.companyId,
