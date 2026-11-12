@@ -120,10 +120,10 @@ vi.mock("../services/native-runtime/paperclip-control-plane-port.js", async impo
     normalizeReplayPayload(payload: unknown) { return payload; }
     async appendEvent(event: PrpEvent) {
       mocks.events.push(event);
-      await this.options.onCommittedEvent?.(event, ++this.cursor);
+      await this.options?.onCommittedEvent?.(event, ++this.cursor);
       return { cursor: this.cursor, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
     }
-    async completeRun() { await this.options.onResultCommitted?.(); }
+    async completeRun() { await this.options?.onResultCommitted?.(); }
   } };
 });
 
@@ -476,8 +476,8 @@ describe("native Pi RPC complete executor attempts", () => {
         override async request(method: string, params: Record<string, unknown>) {
           const response = await super.request(method, params);
           if (method === "thread/start" || method === "thread/resume") {
-            return { ...response, model: piConfig.model, cwd: options.workingDirectory,
-              thread: { ...(response.thread as object), cwd: options.workingDirectory } };
+            return { ...response, model: piConfig.model, cwd: options.resumeWorkingDirectory,
+              thread: { ...(response.thread as object), cwd: options.resumeWorkingDirectory } };
           }
           if (method === "turn/start") {
             const usage = rehydrateRunnerdUsageNotification({ provider: "pi_rpc", runDeltaAvailable: true,
