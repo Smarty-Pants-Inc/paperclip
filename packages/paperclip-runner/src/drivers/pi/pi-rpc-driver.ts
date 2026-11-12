@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, realpath, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { directPiProviderConfiguration, startPiProviderLoopback, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
+import { fileURLToPath } from "node:url";
+import { createPiProviderBinding, directPiProviderConfiguration, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
+import { sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool } from "./pi-bind-protocol.js";
 import { writePrivateFile } from "../private-file.js";
 import { mergedPiModelsJson } from "./pi-models-merge.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
@@ -25,6 +27,8 @@ export interface PiRpcDriverOptions {
   dynamicToolHandler?: (call: { tool: string; callId: string; threadId: string; runId: string; turnId: string; arguments: unknown }) => Promise<unknown>;
   systemInstructions?: string;
   runtimeContext?: unknown;
+  /** Reserved for the live guarded callback bridge; no semantic dispatch here yet. */
+  toolSocketPath?: string;
   permissionMode?: string;
   taskEnvelope?: unknown;
   conversationMode?: string;
@@ -47,6 +51,8 @@ export interface PiRpcDriverOptions {
   startupTimeoutMs?: number;
   now?: () => Date;
   transportFactory?: (options: PiRpcTransportOptions) => PiRpcTransport;
+  /** Private-channel adapter; receipts are independently validated by the driver. */
+  bindRequest?: typeof sendPiBindRequest;
 }
 
 const PI_CAPABILITIES: NativeSessionCapabilities = {
@@ -88,12 +94,14 @@ export class PiRpcDriver implements HarnessDriver {
 
   async openSession(input: OpenHarnessSessionInput): Promise<HarnessSession> {
     if (input.signal?.aborted) throw input.signal.reason ?? new Error("Pi RPC session startup aborted");
+    if (this.#options.toolSocketPath !== undefined) throw new Error("Pi semantic callbacks require the live guarded host bridge");
     const cwd = await realpath(input.workingDirectory);
     if (!(await stat(cwd)).isDirectory()) throw new Error("Pi RPC working directory is not a directory");
     const directory = await realpath(this.#options.runtimeDirectory).catch(async () => {
       await mkdir(this.#options.runtimeDirectory, { recursive: true, mode: 0o700 });
       return realpath(this.#options.runtimeDirectory);
     });
+    await chmod(directory, 0o700);
     const filename = `${safeSessionName(input.normalizedSessionId)}.jsonl`;
     const sessionFile = join(directory, filename);
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"];
@@ -109,17 +117,39 @@ export class PiRpcDriver implements HarnessDriver {
     });
     if (config.piRpcThinkingLevel === undefined) throw new PiNativeAdmissionError("pi_thinking_required", "Pi RPC requires an explicit thinking effort before admission.");
     let closeProvider: (() => Promise<void>) | undefined;
+    let resident: PiResidentState | undefined;
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
       const agentHome = environment.PI_CODING_AGENT_DIR ?? join(directory, "agent");
       await mkdir(agentHome, { recursive: true, mode: 0o700 });
       environment.PI_CODING_AGENT_DIR = agentHome;
       if (credentialMode === "broker") {
-        const provider = await startPiProviderLoopback({ model: this.#options.model, environment });
+        // Broker/models.json is the FIRST bind. INITIAL contains no provider
+        // capability and prepares exactly one preallocated host turn, without IPC.
+        const provider = await createPiProviderBinding({ model: this.#options.model, environment });
         closeProvider = provider.close;
+        let privateDirectory: string | undefined;
         try {
-          await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json));
+          privateDirectory = await mkdtemp("/tmp/pcpi-");
+          await chmod(privateDirectory, 0o700);
+          const socketPath = join(privateDirectory, "bind.sock");
+          const origin = { epoch: 1, runId: input.runId, turnId: `pi-turn-${randomUUID()}` };
+          const context = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
+          const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools,
+            ...(this.#options.toolSocketPath !== undefined ? { toolSocketPath: this.#options.toolSocketPath } : {}) };
+          if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
+          resident = { directory: privateDirectory, socketPath, environment: { ...environment }, epoch: 1, context,
+            binding: { origin, close: provider.close, initial: true }, toolSocketPath: this.#options.toolSocketPath };
+          const { name, ...configuration } = provider.provider;
+          const json = JSON.stringify({ providers: { [name]: configuration } });
+          await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json));
+          const extension = await realpath(fileURLToPath(new URL("./extension/index.js", import.meta.url)))
+            .catch(() => realpath(fileURLToPath(new URL("./extension/index.ts", import.meta.url))));
+          args.push("--extension", extension);
+          environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
+          environment.PAPERCLIP_PI_BIND_INITIAL = JSON.stringify(initial);
         } catch (error) {
           await provider.close();
+          if (privateDirectory) await cleanPiPrivateDirectory({ directory: privateDirectory, socketPath: join(privateDirectory, "bind.sock") });
           throw error;
         }
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
@@ -154,20 +184,39 @@ export class PiRpcDriver implements HarnessDriver {
         sessionFile,
         config,
         systemInstructions: this.#options.systemInstructions,
+        initialContext: bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext),
         admissionTimeoutMs: this.#options.startupTimeoutMs,
         workingDirectory: cwd,
         runnerInstanceId: this.#options.runnerInstanceId ?? `paperclip-pi-${input.runId}`,
         now: this.#options.now ?? (() => new Date()),
-        closeProvider,
+        closeProvider: resident ? undefined : closeProvider,
+        resident,
+        bindRequest: this.#options.bindRequest ?? sendPiBindRequest,
       });
     } catch (error) {
       await transport?.close().catch(() => undefined);
       await closeProvider?.().catch(() => undefined);
+      if (resident) await cleanPiPrivateDirectory(resident).catch(() => undefined);
       throw error;
     }
   }
 }
 
+interface PiRunContext {
+  baseInstructions: string;
+  runtimeContext: unknown;
+  instructions: string;
+  tools: PiDynamicTool[];
+}
+interface PiResidentState {
+  directory: string;
+  socketPath: string;
+  environment: NodeJS.ProcessEnv;
+  epoch: number;
+  context: PiRunContext;
+  toolSocketPath?: string;
+  binding: { origin: Origin; close(): Promise<void>; initial: boolean } | null;
+}
 interface PiSessionState {
   transport: PiRpcTransport;
   runId: string;
@@ -178,8 +227,11 @@ interface PiSessionState {
   runnerInstanceId: string;
   now: () => Date;
   closeProvider?: () => Promise<void>;
+  resident?: PiResidentState;
   config: PiNativeConfig;
   systemInstructions?: string;
+  initialContext: PiRunContext;
+  bindRequest: typeof sendPiBindRequest;
   admissionTimeoutMs?: number;
 }
 
@@ -246,10 +298,14 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #runnerInstanceId: string;
   readonly #now: () => Date;
   readonly #closeProvider?: () => Promise<void>;
+  readonly #resident?: PiResidentState;
+  readonly #bindRequest: typeof sendPiBindRequest;
+  #closing?: Promise<void>;
+  #providerRevocation: Promise<void> = Promise.resolve();
   readonly #events = new EventQueue();
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
-  readonly #configInstructions?: string;
+  readonly #initialContext: PiRunContext;
   readonly #admissionTimeoutMs?: number;
   // Values retain the originating turn/projector after settlement and attach.
   // Ambiguous reused native identities are tombstoned, never rebound.
@@ -272,8 +328,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#runnerInstanceId = state.runnerInstanceId;
     this.#now = state.now;
     this.#closeProvider = state.closeProvider;
+    this.#resident = state.resident;
+    this.#bindRequest = state.bindRequest;
     this.#config = state.config;
-    this.#configInstructions = state.systemInstructions;
+    this.#initialContext = state.initialContext;
     this.#admissionTimeoutMs = state.admissionTimeoutMs;
     void this.#pump();
   }
@@ -294,13 +352,27 @@ export class PiRpcHarnessSession implements HarnessSession {
   }): Promise<void> {
     return this.#serialize(async () => {
       if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
-      // Per-run instruction/tool binding is a separate, receipt-gated layer.
-      // Do not claim that this admission-only slice applied a changed context.
-      if ((input.baseInstructions !== undefined && input.baseInstructions !== this.#configInstructions)
-        || input.dynamicTools !== undefined || input.runtimeContext !== undefined) {
-        throw new Error("Pi RPC run context refresh requires a provider bind receipt");
+      if (this.#resident) {
+        const previous = this.#resident.context;
+        const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
+          input.dynamicTools !== undefined ? input.dynamicTools : previous.tools,
+          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
+        // The proxy sends attach before every turn, including the bootstrap and
+        // same-run post-claim admission. Do not consume INITIAL or rotate twice.
+        if (this.#resident.binding) {
+          if (input.runId !== this.#runId || JSON.stringify(context) !== JSON.stringify(previous)) throw new Error("Pi prepared binding context cannot change before its turn");
+          await this.#admit(input.signal);
+        } else await this.#prepareBinding(input.runId, context, input.signal);
+      } else {
+        // Direct env/native providers retain their existing behavior. They do
+        // not gain a managed broker secrecy or dynamic-refresh guarantee.
+        const previous = this.#initialContext;
+        const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
+          input.dynamicTools !== undefined ? input.dynamicTools : previous.tools,
+          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext);
+        if (JSON.stringify(context) !== JSON.stringify(previous)) throw new Error("Pi RPC run context refresh requires a provider bind receipt");
+        await this.#admit(input.signal);
       }
-      await this.#admit(input.signal);
       this.#runId = input.runId;
     });
   }
@@ -325,19 +397,79 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#closed) throw new Error("Pi RPC session is closed");
     if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
     this.#admitted = false;
-    const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
-    if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
+    try {
+      const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
+      if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
+      if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
+      this.#admitted = true;
+    } catch (error) {
+      if (this.#resident) await this.#fenceFailure(error);
+      throw error;
+    }
+  }
+
+  async #prepareBinding(runId: string, context: PiRunContext, signal?: AbortSignal): Promise<void> {
+    const resident = this.#resident!;
     if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
-    this.#admitted = true;
+    if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
+    this.#admitted = false;
+    try {
+      await this.#revokeBinding();
+      signal?.throwIfAborted();
+      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment });
+      const origin = { epoch: resident.epoch + 1, runId, turnId: `pi-turn-${randomUUID()}` };
+      resident.binding = { origin, close: broker.close, initial: false };
+      const request = { schema: 1, type: "bind", nonce: randomUUID(), sessionId: this.#normalizedSessionId,
+        expectedPriorEpoch: resident.epoch, epoch: origin.epoch, runId, provider: broker.provider,
+        model: this.#config.model, thinkingLevel: this.#config.piRpcThinkingLevel!, instructions: context.instructions, tools: context.tools,
+        ...(resident.toolSocketPath !== undefined ? { toolSocketPath: resident.toolSocketPath } : {}) };
+      if (!validateBindRequest(request)) throw new Error("Pi binding configuration rejected");
+      // sendPiBindRequest validates exact nonce/session/epoch/content receipts.
+      // Never retry a lost ACK: its native state is uncertain, so retire it.
+      await this.#sendBind(request, signal);
+      resident.epoch = origin.epoch;
+      await this.#admit(signal);
+      resident.context = context;
+    } catch (error) {
+      await this.#fenceFailure(error);
+      throw error;
+    }
+  }
+
+  async #sendBind<C extends PiBindCommand>(request: C, signal?: AbortSignal): Promise<PiBindResponse<C>> {
+    const timeoutMs = this.#admissionTimeoutMs ?? 5000;
+    const receipt = await withAbort(withTimeout(this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal }), timeoutMs, "Pi private receipt timed out"), signal);
+    if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
+    return receipt;
+  }
+
+  async #revokeBinding(): Promise<void> {
+    const binding = this.#resident?.binding;
+    if (this.#resident) this.#resident.binding = null;
+    if (binding) this.#providerRevocation = withTimeout(binding.close(), 5000, "Pi broker revocation timed out");
+    await this.#providerRevocation;
+  }
+
+  async #fenceFailure(error: unknown): Promise<void> {
+    this.#admitted = false;
+    this.#failure = error instanceof Error ? error : new Error(String(error));
+    await this.close();
   }
 
   async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
     return this.#serialize(async () => {
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
-      if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
       if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
-      const origin = { runId: this.#runId, turnId: `pi-turn-${randomUUID()}` };
+      if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
+      if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
+      const binding = this.#resident?.binding;
+      const origin = binding?.origin ?? { runId: this.#runId, turnId: `pi-turn-${randomUUID()}` };
+      if (binding && !binding.initial) {
+        try {
+          await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
+        } catch (error) { await this.#fenceFailure(error); throw error; }
+      }
       const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasAssistantReceipt: false, failed: false, settled: false };
       this.#activeTurn = turn;
       this.#streamTurn = null;
@@ -347,7 +479,8 @@ export class PiRpcHarnessSession implements HarnessSession {
         const disposition = stringValue(record(response.data).disposition);
         if (disposition !== "started") throw new Error(`Pi RPC prompt did not start an agent run (disposition=${disposition ?? "missing"})`);
       } catch (error) {
-        this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } });
+        await this.#finishTurn(turn, "failed", { error: { code: "pi_prompt_rejected", message: error instanceof Error ? error.message : String(error), recoverable: false } });
+        if (this.#resident) await this.#fenceFailure(error);
         throw error;
       }
       return { turnId: turn.turnId };
@@ -368,7 +501,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     return this.#transport.exited;
   }
 
-  async snapshot(): Promise<PersistedHarnessSession & { sessionFile: string }> {
+  async snapshot(): Promise<PersistedHarnessSession & { sessionFile: string; binding?: { epoch: number; socketPath: string; preparedTurnId: string | null } }> {
     return {
       driverKind: "pi_rpc",
       driverSessionId: this.#providerSessionId,
@@ -379,54 +512,69 @@ export class PiRpcHarnessSession implements HarnessSession {
       lastSourceSequence: this.#sourceSequence,
       workingDirectory: this.#workingDirectory,
       sessionFile: this.#sessionFile,
+      ...(this.#resident ? { binding: { epoch: this.#resident.epoch, socketPath: this.#resident.socketPath, preparedTurnId: this.#resident.binding?.origin.turnId ?? null } } : {}),
     };
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return;
+    if (this.#closing) return this.#closing;
     this.#closed = true;
-    try {
-      await this.#transport.close();
-    } finally {
-      try { await this.#closeProvider?.(); }
-      finally { this.#events.close(); }
-    }
+    this.#admitted = false;
+    this.#closing = (async () => {
+      try { await this.#revokeBinding(); }
+      finally {
+        try { await this.#transport.close(); }
+        finally {
+          try { await this.#closeProvider?.(); }
+          finally {
+            try { if (this.#resident) await cleanPiPrivateDirectory(this.#resident); }
+            finally { this.#events.close(); }
+          }
+        }
+      }
+    })();
+    return this.#closing;
   }
 
   async #pump(): Promise<void> {
     try {
       for await (const record of this.#transport.events()) {
         if (this.#closed) break;
-        this.#consume(record);
+        await this.#consume(record);
       }
     } catch (error) {
       if (!this.#closed) {
-        this.#emit("session.failed", { code: "pi_rpc_transport_failed", message: error instanceof Error ? error.message : String(error) });
         this.#failure = error instanceof Error ? error : new Error(String(error));
         this.#admitted = false;
-        if (this.#activeTurn) this.#finishTurn(this.#activeTurn, "failed", { error: { code: "pi_rpc_transport_failed" } });
+        if (this.#activeTurn) await this.#finishTurn(this.#activeTurn, "failed", { error: { code: "pi_rpc_transport_failed" } });
+        else await this.#revokeBinding();
+        this.#emit("session.failed", { code: "pi_rpc_transport_failed", message: error instanceof Error ? error.message : String(error) });
         this.#events.close(error instanceof Error ? error : new Error(String(error)));
         await this.close().catch(() => undefined);
       }
     }
   }
 
-  #consume(event: PiRpcRecord): void {
+  async #consume(event: PiRpcRecord): Promise<void> {
     if (event.type === "process_exit" || event.type === "transport_error") {
       const code = event.type === "process_exit" ? "pi_process_exited" : "pi_rpc_transport_failed";
       this.#failure = new Error(code);
       this.#admitted = false;
-      if (this.#activeTurn) this.#finishTurn(this.#activeTurn, "failed", { error: { code } });
-      else this.#emit("session.failed", { code });
-      this.#events.close();
+      if (this.#activeTurn) await this.#finishTurn(this.#activeTurn, "failed", { error: { code } });
+      else {
+        await this.#revokeBinding();
+        this.#emit("session.failed", { code });
+      }
+      await this.close();
       return;
     }
     if (event.type === "agent_start") {
       if (!this.#admitted || !this.#activeTurn || this.#agentTurn) {
         this.#failure = new Error("Pi started work without an admitted prompt");
         this.#admitted = false;
+        if (this.#activeTurn) await this.#finishTurn(this.#activeTurn, "failed", { error: { code: "pi_unrequested_agent_start" } });
+        else await this.#revokeBinding();
         this.#emit("session.failed", { code: "pi_unrequested_agent_start" });
-        if (this.#activeTurn) this.#finishTurn(this.#activeTurn, "failed", { error: { code: "pi_unrequested_agent_start" } });
         void this.close().catch(() => undefined);
       } else this.#agentTurn = this.#activeTurn;
       return;
@@ -478,7 +626,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (event.type === "agent_settled") {
       const empty = !turn.lastText && !turn.hasAssistantReceipt;
       const status = event.aborted === true ? "cancelled" : turn.failed || empty ? "failed" : "completed";
-      this.#finishTurn(turn, status, { piAgentSettled: true, ...(empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
+      await this.#finishTurn(turn, status, { piAgentSettled: true, ...(empty && status === "failed" ? { error: { code: "pi_empty_turn", message: "Pi settled without an assistant response." } } : {}) });
     }
   }
 
@@ -491,14 +639,18 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  #finishTurn(turn: PiTurnState, status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): void {
+  async #finishTurn(turn: PiTurnState, status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): Promise<void> {
     if (turn.settled) return;
     turn.settled = true;
-    const eventType = status === "completed" ? "turn.completed" : status === "cancelled" ? "turn.cancelled" : "turn.failed";
-    this.#emit(eventType, { status, ...extra }, turn);
-    if (this.#activeTurn === turn) this.#activeTurn = null;
+    // Fence host authority synchronously; native extension fences on the same
+    // agent_settled boundary. Do not publish a terminal until revocation finishes.
+    if (this.#resident) this.#admitted = false;
     if (this.#agentTurn === turn) this.#agentTurn = null;
     if (this.#streamTurn === turn) this.#streamTurn = null;
+    if (this.#resident) await this.#revokeBinding();
+    if (this.#activeTurn === turn) this.#activeTurn = null;
+    const eventType = status === "completed" ? "turn.completed" : status === "cancelled" ? "turn.cancelled" : "turn.failed";
+    this.#emit(eventType, { status, ...extra }, turn);
   }
 
   #emit(eventType: PrpEvent["eventType"], payload: Record<string, unknown>, origin: { runId: string; turnId?: string } = { runId: this.#runId }, itemId?: string): void {
@@ -524,6 +676,24 @@ export class PiRpcHarnessSession implements HarnessSession {
       void this.close().catch(() => undefined);
     }
   }
+}
+
+function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[], runtimeContext: unknown): PiRunContext {
+  if (typeof baseInstructions !== "string" || !Array.isArray(tools)) throw new Error("Pi binding context rejected");
+  // Freeze serializable context NOW. Never hash one object then look it up again
+  // from a mutable caller when the request is eventually admitted.
+  const contextJson = runtimeContext === undefined ? undefined : JSON.stringify(runtimeContext);
+  if (runtimeContext !== undefined && contextJson === undefined) throw new Error("Pi runtime context is not serializable");
+  const frozenContext: unknown = contextJson === undefined ? undefined : JSON.parse(contextJson);
+  const normalizedTools = JSON.parse(JSON.stringify(tools.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })))) as PiDynamicTool[];
+  return { baseInstructions, runtimeContext: frozenContext,
+    instructions: contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`, tools: normalizedTools };
+}
+
+async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPath" | "directory">): Promise<void> {
+  // Only this allocation's private IPC endpoint/root; NEVER delete session JSONL.
+  await unlink(resident.socketPath).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+  await rmdir(resident.directory).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
 }
 
 function piNativeIdentity(value: unknown): string | null {
