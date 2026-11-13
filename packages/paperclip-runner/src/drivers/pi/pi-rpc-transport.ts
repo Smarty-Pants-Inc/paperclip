@@ -132,6 +132,7 @@ export class PiRpcTransport {
   #buffer = Buffer.alloc(0);
   #nextId = 0;
   #closed = false;
+  #closing?: Promise<void>;
   #exited = false;
   #streamsClosed = false;
   #exitInfo: { code: number | null; signal: NodeJS.Signals | null } | null = null;
@@ -317,8 +318,15 @@ export class PiRpcTransport {
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return this.#exit.then(() => undefined);
+    if (this.#closing) return this.#closing;
     this.#closed = true;
+    this.#closing = this.#closeProcessGroup();
+    try { await this.#closing; }
+    catch (error) { this.#closing = undefined; throw error; }
+  }
+
+  async #closeProcessGroup(): Promise<void> {
+    // Process exit does not discharge a failed group/descendant cleanup.
     this.#captureDescendants();
     if (!this.#exited) this.#child.stdin.end();
     if (await settledWithin(this.#exit, this.#shutdownTimeoutMs)) {

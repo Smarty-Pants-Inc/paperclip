@@ -478,7 +478,10 @@ export class PiRpcHarnessSession implements HarnessSession {
   #cleanupFailure: Error | null = null;
   readonly #bindRequest: typeof sendPiBindRequest;
   #closing?: Promise<void>;
-  #providerRevocation: Promise<void> = Promise.resolve();
+  #cleanupSteps?: Set<() => Promise<void> | void>;
+  #childrenCleaned = false;
+  #providerRevocation?: Promise<void>;
+  #revokingBinding: PiResidentState["binding"] = null;
   readonly #events = new EventQueue();
   #sourceSequence = 0;
   readonly #config: PiNativeConfig;
@@ -679,10 +682,18 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async #revokeBinding(): Promise<void> {
-    const binding = this.#resident?.binding;
-    if (this.#resident) this.#resident.binding = null;
-    if (binding) this.#providerRevocation = withTimeout(binding.close(), 5000, "Pi broker revocation timed out");
-    await this.#providerRevocation;
+    if (!this.#providerRevocation) {
+      const binding = this.#revokingBinding ?? this.#resident?.binding;
+      if (!binding) return;
+      if (this.#resident) this.#resident.binding = null;
+      this.#revokingBinding = binding;
+      // Retain the capability until revocation succeeds. A timed-out operation
+      // is still owned, not started twice; a rejected operation can be retried.
+      this.#providerRevocation = Promise.resolve().then(() => binding.close())
+        .then(() => { this.#revokingBinding = null; })
+        .finally(() => { this.#providerRevocation = undefined; });
+    }
+    await withTimeout(this.#providerRevocation, 5000, "Pi broker revocation timed out");
   }
 
   async #fenceFailure(error: unknown): Promise<void> {
@@ -1067,6 +1078,17 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#clearTurnIdleTimer();
     this.#turnIdleRecovery?.settle(false);
     this.#dialogs.clear();
+    // Successful steps need not be repeated (or recreate ENOENT failures).
+    // Only an in-flight or successful close is memoized, never a rejection.
+    this.#cleanupSteps ??= new Set([
+      () => this.#callbacks?.close(), () => this.#transport.close(), () => this.#closeProvider?.(),
+      async () => {
+        if (!this.#resident) return;
+        if (!this.#transport.exited) throw new Error("Pi private IPC still owned by a live process");
+        await cleanPiPrivateDirectory(this.#resident);
+      },
+      () => unlink(this.#instructionFile).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }),
+    ]);
     this.#closing = (async () => {
       const failures: unknown[] = [];
       // Revoke the model capability immediately too, without waiting for child
@@ -1074,16 +1096,29 @@ export class PiRpcHarnessSession implements HarnessSession {
       const revocation = this.#revokeBinding().then(() => ({ ok: true as const }), error => ({ ok: false as const, error }));
       // Fence synchronously, then await child cleanup while private IPC still
       // exists. A lost/uncertain receipt must not turn into void success.
-      if (this.#resident && !this.#transport.exited) {
-        try {
+      if (this.#resident && !this.#childrenCleaned) {
+        if (this.#transport.exited) {
+          // Lost IPC after verified exit is benign; an explicit uncertain child
+          // receipt is not. Physical process/group cleanup is still owed below.
+          if (this.#cleanupFailure) failures.push(this.#cleanupFailure);
+          else this.#childrenCleaned = true;
+        } else try {
           const receipt = await this.#sendBind({ schema: 1, type: "stop_children", nonce: randomUUID(), sessionId: this.#normalizedSessionId });
-          if (receipt.uncertain.length) throw new Error("Pi child cleanup uncertain");
-        } catch (error) { this.#cleanupFailure = new Error("Pi child cleanup uncertain"); failures.push(error); }
+          if (receipt.uncertain.length) {
+            this.#cleanupFailure = new Error("Pi child cleanup uncertain");
+            throw this.#cleanupFailure;
+          }
+          this.#childrenCleaned = true;
+          this.#cleanupFailure = null;
+        } catch (error) {
+          if (this.#cleanupFailure || !this.#transport.exited) failures.push(error);
+          else this.#childrenCleaned = true;
+        }
       }
       const revoked = await revocation;
       if (!revoked.ok) failures.push(revoked.error);
-      for (const cleanup of [() => this.#callbacks?.close(), () => this.#transport.close(), () => this.#closeProvider?.(), () => this.#resident ? cleanPiPrivateDirectory(this.#resident) : undefined, () => unlink(this.#instructionFile)]) {
-        try { await cleanup(); } catch (error) { failures.push(error); }
+      for (const cleanup of this.#cleanupSteps!) {
+        try { await cleanup(); this.#cleanupSteps!.delete(cleanup); } catch (error) { failures.push(error); }
       }
       const turn = this.#activeTurn;
       if (turn && !turn.settled) {
@@ -1098,7 +1133,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       this.#events.close();
       if (failures.length) throw this.#cleanupFailure ?? new AggregateError(failures, "Pi cleanup failed");
     })();
-    return this.#closing;
+    try { await this.#closing; }
+    catch (error) { this.#closing = undefined; throw error; }
   }
 
   #clearTurnIdleTimer(): void {
