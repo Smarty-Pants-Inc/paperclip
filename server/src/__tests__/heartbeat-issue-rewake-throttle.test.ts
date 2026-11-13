@@ -400,6 +400,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       expect(await latestWakeRequest(agentId)).toMatchObject({
         reason: "issue_status_changed",
         payload: expect.objectContaining({ continuationKind }),
+
       });
     },
   );

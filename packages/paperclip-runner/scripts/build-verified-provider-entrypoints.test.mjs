@@ -149,12 +149,10 @@ for (const defect of ["missing-file", "wrong-sha", "missing-manifest", "wrong-pa
 }
 
 // Package-layout regression runs in the existing verified-entrypoint test lane.
+// Kimi layout suites are selected directly by test:typescript:prep; do not
+// import them here or they register twice in that required run.
 import "./provision-pi-package.test.mjs";
 
-import "./materialize-kimi-distribution.test.mjs";
-import "./provision-kimi-package.test.mjs";
-import "./patch-kimi-runtime.test.mjs";
-import "./kimi-metadata-probe.test.mjs";
 import "./antigravity-provisioner-layout.test.mjs";
 import "./materialize-antigravity-distribution.test.mjs";
 import "./probe-antigravity-metadata.test.mjs";

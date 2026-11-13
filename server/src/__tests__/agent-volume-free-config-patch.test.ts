@@ -7,6 +7,7 @@ import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { activityLog, agents, builtInManagedResources, companies, companyMemberships, createDb, environments } from "@paperclipai/db";
+
 import { agentRoutes } from "../routes/agents.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -39,6 +40,7 @@ describePostgres("volume-free agent configuration patch", () => {
   function serveAs(companyId: string, source: "local_implicit" | "session" = "local_implicit") {
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source, userId, companyIds: [companyId] }; next(); });
+
     app.use("/api", agentRoutes(db));
     app.use((error: { status?: number; message: string }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
       res.status(error.status ?? 500).json({ error: error.message });

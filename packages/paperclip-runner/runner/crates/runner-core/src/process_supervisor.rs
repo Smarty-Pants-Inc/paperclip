@@ -1139,6 +1139,15 @@ impl SupervisedProcess {
             // Node proxy/sidecar and its provider descendants.
             "NODE_COMPILE_CACHE",
             "NODE_DISABLE_COMPILE_CACHE",
+            // Certificate-trust names flow to every supervised process so
+            // execution-side injected values survive the cleared environment.
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "GIT_SSL_CAINFO",
+            "NODE_EXTRA_CA_CERTS",
+            "DENO_CERT",
+            "REQUESTS_CA_BUNDLE",
+            "CURL_CA_BUNDLE",
         ]
         .into_iter()
         .chain(additional_environment_keys.iter().copied())

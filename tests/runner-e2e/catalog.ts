@@ -2194,6 +2194,7 @@ export function buildRunnerMatrix(
 ): MatrixExecution[] {
   return suites.flatMap((suite) => {
     const excludedExecutionIds = new Set(suite.excludedExecutionIds ?? []);
+    const definitionHash = suiteDefinitionHash(suite);
     return suite.profiles.flatMap((profile) =>
       suite.environments
         .filter((environment) =>
@@ -2207,7 +2208,7 @@ export function buildRunnerMatrix(
               return {
                 id: `${suite.id}.${profile.id}.${environment.id}.${task.id}`,
                 suite,
-                suiteDefinitionHash: suiteDefinitionHash(suite),
+                suiteDefinitionHash: definitionHash,
                 profile,
                 environment: selectedEnvironment,
                 task: suite.id === "confirmation-replies" && profile.id === "runner-codex" && environment.id === "daytona" && task.id === "task-card-accept"

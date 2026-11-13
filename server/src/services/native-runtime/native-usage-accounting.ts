@@ -76,6 +76,7 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
   const sequences = new Map<string, number>();
   let currentTurn: string | undefined;
   let summaryUsageUnknown = false;
+  let providerRequestId: string | undefined;
   const terminalTypes = ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"];
   const snapshot = () => {
     if (turns.size === 0) return { usage: null, turnId: undefined, complete: false };
@@ -107,7 +108,8 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
     return { usage: { runDelta, accountingCostIncomplete: costIncomplete, ...(usageLost ? { accountingUsageLost: true } : {}),
       ...(summaryUsageUnknown ? { summaryUsage: "unknown" } : {}),
       ...([...turns.values()].some(turn => turn.incomplete) ? { accountingUsageIncomplete: true } : {}),
-      ...(retainCost ? { accountingCostUsdExact: `${cost / 1_000_000_000n}.${String(cost % 1_000_000_000n).padStart(9, "0")}` } : {}) },
+      ...(retainCost ? { accountingCostUsdExact: `${cost / 1_000_000_000n}.${String(cost % 1_000_000_000n).padStart(9, "0")}` } : {}),
+      ...(providerRequestId ? { providerRequestId } : {}) },
       // A turn closed as lost still names the terminal turn the executor must match.
       turnId: current && (normalizeNativeUsage(current.usage) || (current.lost && current.terminal)) ? currentTurn : undefined, complete };
   };
@@ -151,6 +153,8 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
         const usage = record(payload.usage);
         summaryUsageUnknown ||= usage.summaryUsage === "unknown";
         if (usage.summaryUsage === "unknown") turn.summaryUnknown = true;
+        if (!providerRequestId && typeof usage.providerRequestId === "string" && usage.providerRequestId)
+          providerRequestId = usage.providerRequestId.slice(0, 250);
         const measured = Object.hasOwn(usage, "runDelta")
           ? { runDelta: record(usage.runDelta), runDeltaComplete: usage.runDeltaComplete } : null;
         if (normalizeNativeUsage(measured)) {

@@ -6,6 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "./execution-blocker.js";
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
 import { writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
+import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("execution blocker PostgreSQL read projection", () => {
@@ -84,6 +85,20 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     expect(blocker!.nextAction).toBe(`Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`);
     expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toMatch(/^A person can use Retry on this task/);
     expect(EXECUTION_BLOCKER_PERSON_RETRY_ACTION).toContain("Agents cannot retry it for them.");
+  });
+
+  it("shows plain wording and Retry for a finalization deadline saved by the previous release", async () => {
+    const previousReleaseText = "Inspect the failed run and verify its provider has stopped. Reconcile any uncertain external action before explicitly continuing this task.";
+    const f = await fixture({ runtimeMode: "native", errorCode: "execution_finalization_deadline_exceeded",
+      error: previousReleaseText, nextAction: previousReleaseText });
+    await db.update(issueRecoveryActions).set({ cause: "execution_finalization_deadline_exceeded", ownerType: "board",
+      nextAction: previousReleaseText }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+
+    expect(blocker).toMatchObject({ canRetry: true, runError: EXECUTION_FINALIZATION_DEADLINE_MESSAGE,
+      nextAction: `${EXECUTION_FINALIZATION_DEADLINE_MESSAGE} ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
+    expect(JSON.stringify(blocker)).not.toMatch(/Inspect the failed run|verify its provider|Reconcile any uncertain/);
   });
 
   it("retains the claimed adapter and startup receipts for a cancelled pre-provider run", async () => {
