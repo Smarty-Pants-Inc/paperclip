@@ -29,7 +29,7 @@ import { prepareRemoteOpenCodeArtifacts, type OpenCodeLaunchArtifacts } from "./
 import { prepareRuntimeContextSource, rehydratePinnedInstructionAsset } from "./runtime-context.js";
 import { createNativeUsageDelivery } from "./native-usage-delivery.js";
 import { createNativeRecoveryUsageDelivery } from "./native-recovery-usage-delivery.js";
-import { createNativeTurnAccounting, NATIVE_LOST_TURN_USAGE_EVIDENCE, nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage, usesNativeUsageDelivery, isNativeUsageAccountingEvent, isNativeUsageDeliveryEvent } from "./native-usage-accounting.js";
+import { createNativeTurnAccounting, nativeUsageLowerBoundEvidence, nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage, usesNativeUsageDelivery, isNativeUsageAccountingEvent, isNativeUsageDeliveryEvent } from "./native-usage-accounting.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 export { nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage } from "./native-usage-accounting.js";
 import { measureRunnerOperation, recordRunnerTimingReceipt } from "./runner-operation-timing.js";
@@ -11111,7 +11111,7 @@ async function executePaperclipNativeSessionAttempt(
     const checkpoint: AdapterUsageCheckpoint = { usage: accountingUsage, ...billing, complete, usageBasis: "per_run", costUsdExact,
       model: input.execution.provider.model ?? "unknown", costUsd: accountingCost ?? null, costStatus,
       ...(usage?.accountingUsageLost === true ? { pricingProvenance: { source: accountingCost != null || costUsdExact ? "provider_reported" as const : "unknown" as const,
-        version: "accounting-receipt/v1", evidence: NATIVE_LOST_TURN_USAGE_EVIDENCE } } : {}) };
+        version: "accounting-receipt/v1", evidence: nativeUsageLowerBoundEvidence(usage) } } : {}) };
     if (input.onUsage) await input.onUsage(checkpoint);
     else {
       fallbackUsageRecorder ??= createRunUsageRecorder(input.db, { companyId: input.execution.binding.companyId,
@@ -13511,6 +13511,9 @@ async function executePaperclipNativeSessionAttempt(
       ? input.execution.provider.kind === "aws_agentcore" ? "estimated" : undefined
       : "unpriced",
     usageComplete: nativeAccountingComplete,
+    ...(native.usage?.accountingUsageLost === true ? { pricingProvenance: {
+      source: typeof native.usage.accountingCostUsdExact === "string" ? "provider_reported" as const : "unknown" as const,
+      version: "accounting-receipt/v1", evidence: nativeUsageLowerBoundEvidence(native.usage) } } : {}),
     usageBasis: "per_run",
     nativeFinalization: finalization,
   };

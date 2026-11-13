@@ -868,6 +868,10 @@ pub(crate) fn normalize_pi_usage_notification(params: &Value) -> Vec<NormalizedP
         if params.get("childUsage").and_then(Value::as_str) == Some("unknown") {
             event.payload["childUsage"] = json!("unknown");
         }
+        if params.get("summaryUsage").and_then(Value::as_str) == Some("unknown") {
+            event.payload["summaryUsage"] = json!("unknown");
+            event.payload["accountingUsageLost"] = json!(true);
+        }
     }
     events
 }
@@ -3828,6 +3832,24 @@ mod tests {
         assert_eq!(usage[0].payload["runDeltaAvailable"], false);
         assert_eq!(usage[0].payload["runDelta"]["inputTokens"], 0);
         assert_eq!(usage[0].priority, EventPriority::P0);
+    }
+
+    #[test]
+    fn pi_usage_preserves_unknown_summary_lower_bound() {
+        let events = normalize_pi_usage_notification(&json!({
+            "tokenUsage": {"total": {"inputTokens": 18, "outputTokens": 8},
+                "last": {"inputTokens": 18, "outputTokens": 8}},
+            "summaryUsage": "unknown", "accountingUsageLost": true,
+        }));
+        assert_eq!(events[0].payload["runDeltaAvailable"], true);
+        assert_eq!(events[0].payload["runDelta"]["inputTokens"], 18);
+        assert_eq!(events[0].payload["summaryUsage"], "unknown");
+        assert_eq!(events[0].payload["accountingUsageLost"], true);
+        let normal = normalize_pi_usage_notification(&json!({"tokenUsage": {
+            "total": {"inputTokens": 18}, "last": {"inputTokens": 18}
+        }}));
+        assert!(normal[0].payload.get("summaryUsage").is_none());
+        assert!(normal[0].payload.get("accountingUsageLost").is_none());
     }
 
     #[test]

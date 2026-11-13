@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { createPiEventProjector } from "../../vendor/paperclip-runner/testing.js";
 import { QUALIFIED_PI_RPC_PROFILE, type PrpEvent } from "../../vendor/paperclip-runner/index.js";
-import { createNativeTurnAccounting, nativeUsageCostUsd, normalizeNativeUsage, usesNativeUsageDelivery } from "./native-usage-accounting.js";
+import { createNativeTurnAccounting, NATIVE_SUMMARY_USAGE_EVIDENCE, nativeUsageCostUsd, nativeUsageLowerBoundEvidence, normalizeNativeUsage, usesNativeUsageDelivery } from "./native-usage-accounting.js";
 
 const provider = { kind: "opencode" as const, model: "test-model" };
 const event = (sourceSeq: number, eventType: string, turnId = "turn-1", payload: Record<string, unknown> = {}) => ({
@@ -81,7 +81,8 @@ describe("native turn accounting", () => {
       expect(snapshot.complete).toBe(true);
       expect(snapshot.turnId).toBe("turn-1");
       expect(normalizeNativeUsage(snapshot.usage)).toMatchObject({ inputTokens: 14, outputTokens: 8 });
-      expect(snapshot.usage).toMatchObject({ accountingUsageLost: true, accountingCostIncomplete: true });
+      expect(snapshot.usage).toMatchObject({ summaryUsage: "unknown", accountingUsageLost: true, accountingCostIncomplete: true });
+      expect(nativeUsageLowerBoundEvidence(snapshot.usage!)).toBe(NATIVE_SUMMARY_USAGE_EVIDENCE);
       history.forEach(value => accounting.observe(value));
       expect(accounting.snapshot()).toEqual(snapshot);
     },
@@ -104,7 +105,8 @@ describe("native turn accounting", () => {
       expect(snapshot.complete).toBe(true);
       expect(snapshot.turnId).toBe("turn-1");
       expect(normalizeNativeUsage(snapshot.usage)).toMatchObject({ inputTokens: 14, outputTokens: 8 });
-      expect(snapshot.usage).toMatchObject({ accountingUsageLost: true, accountingCostIncomplete: true });
+      expect(snapshot.usage).toMatchObject({ summaryUsage: "unknown", accountingUsageLost: true, accountingCostIncomplete: true });
+      expect(nativeUsageLowerBoundEvidence(snapshot.usage!)).toBe(NATIVE_SUMMARY_USAGE_EVIDENCE);
     },
   );
 
@@ -132,6 +134,21 @@ describe("native turn accounting", () => {
     accounting.observe(event(8, "item.completed", "turn-2", { kind: "usage", usage: { runDelta: {}, runDeltaComplete: false } }));
     expect(accounting.snapshot().complete).toBe(false);
     expect(normalizeNativeUsage(accounting.snapshot().usage)).toMatchObject({ inputTokens: 14, outputTokens: 8 });
+  });
+
+  it("retains summary provenance from a measured receipt through a later unmarked turn", () => {
+    const accounting = createNativeTurnAccounting(provider);
+    const measured = { runDeltaComplete: true, runDelta: { inputTokens: 14, outputTokens: 8 } };
+    [event(1, "turn.started"), event(2, "item.completed", "turn-1", { kind: "usage", usage: {
+      ...measured, summaryUsage: "unknown", accountingUsageLost: true,
+    } }), event(3, "turn.completed"), event(4, "turn.started", "turn-2"),
+      event(5, "item.completed", "turn-2", { kind: "usage", usage: measured }),
+      event(6, "turn.completed", "turn-2")].forEach(value => accounting.observe(value));
+    const snapshot = accounting.snapshot();
+    expect(snapshot.complete).toBe(true);
+    expect(normalizeNativeUsage(snapshot.usage)).toMatchObject({ inputTokens: 28, outputTokens: 16 });
+    expect(snapshot.usage).toMatchObject({ summaryUsage: "unknown", accountingUsageLost: true, accountingCostIncomplete: true });
+    expect(nativeUsageLowerBoundEvidence(snapshot.usage!)).toBe(NATIVE_SUMMARY_USAGE_EVIDENCE);
   });
 
   it.each([false, true])("replays real-session usage through the projector and accounting (ends on summary: %s)", endsOnSummary => {
