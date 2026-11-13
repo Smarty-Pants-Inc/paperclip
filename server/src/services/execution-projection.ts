@@ -18,7 +18,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
-import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
+import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotices } from "./native-runtime/pi-session-recovery-notice.js";
 import { readTaskDrain } from "./task-admission.js";
 import { getStartupRecoveryState } from "../startup-recovery-state.js";

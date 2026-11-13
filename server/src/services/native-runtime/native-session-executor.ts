@@ -7408,7 +7408,8 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
 }
 
 /** The banner text for a conversation held behind an unfinished predecessor. */
-export const HELD_PREDECESSOR_NOTICE = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
+export { HELD_PREDECESSOR_NOTICE };
 // The refusals that hold a conversation behind its unfinished predecessor:
 // the prior-owner fences (including the legacy migration fence), the
 // retained-sandbox binding, a prior session whose

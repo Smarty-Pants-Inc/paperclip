@@ -19,7 +19,7 @@ import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-run
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
-import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
+import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "./native-runtime/pi-session-recovery-notice.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
