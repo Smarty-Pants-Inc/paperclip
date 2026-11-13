@@ -8,9 +8,18 @@ vi.mock("@paperclipai/adapter-utils/acpx-engine/startup-timing",()=>({
  getActiveStepContext:()=>mocks.parent?{parentContext:mocks.parent}:null,
  runWithRuntimeParent:(_parent:unknown,work:()=>unknown)=>work(),
 }));
-import { measureRunnerOperation, recordRunnerTimingReceipt } from "./runner-operation-timing.js";
+import { measureRunnerOperation, recordRunnerTimingReceipt, runWithRunnerOperationRecorder } from "./runner-operation-timing.js";
 afterEach(()=>{vi.unstubAllEnvs();mocks.spans=[];mocks.parent=undefined;});
 describe("Runner operation ownership",()=>{
+ it("records attach without OTLP, preserves rejection, and isolates diagnostic failures",async()=>{
+  vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT","");
+  const rows:any[]=[];const error=Error("operation failed");
+  await expect(runWithRunnerOperationRecorder(row=>rows.push(row),()=>measureRunnerOperation("runner.transport.attach",async()=>{throw error;}))).rejects.toBe(error);
+  expect(rows).toHaveLength(1);expect(rows[0]).toMatchObject({name:"runner.transport.attach",outcome:"failed"});
+  expect(rows[0].endedAtMs).toBeGreaterThanOrEqual(rows[0].startedAtMs);
+  expect(await runWithRunnerOperationRecorder(()=>{throw Error("diagnostic failed");},()=>measureRunnerOperation("runner.transport.attach",async()=>42))).toBe(42);
+  expect(mocks.spans).toEqual([]);
+ });
  it("does no tracer work when disabled and preserves the operation",async()=>{
   vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT","");mocks.parent={run:"a"};let count=0;
   expect(await measureRunnerOperation("runner.transport.resume",async()=>++count)).toBe(1);

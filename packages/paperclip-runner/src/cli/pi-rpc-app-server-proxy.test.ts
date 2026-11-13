@@ -119,6 +119,27 @@ class FakeSession {
   }
 }
 
+it("forwards Pi RPC timings through the existing sanitized performance notification", async () => {
+  const sink = new FakeSink(); const session = new FakeSession();
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_RUN_ID: "run-1" }, createDriver: () => makeDriver(session) });
+  try {
+    proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/start", params: { cwd: process.cwd(), model: "neutral/model" } }));
+    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 1)).toBe(true));
+    const now = Date.now();
+    session.push("harness.diagnostic", { code: "provider_performance_spans", spans: [
+      { name: "runner.pi.admission.get_state", startedAtMs: now - 5, endedAtMs: now, secret: "private" },
+      { name: "untrusted", startedAtMs: now - 5, endedAtMs: now },
+    ] });
+    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.method === "paperclip/providerPerformance")).toBe(true));
+    const frame = sink.decoded().find(frame => frame.method === "paperclip/providerPerformance")!;
+    expect(frame.params).toMatchObject({ threadId: session.id, spans: [
+      { name: "runner.pi.admission.get_state", startedAtMs: now - 5, endedAtMs: now, outcome: "ok" },
+    ] });
+    expect(JSON.stringify(frame)).not.toContain("private");
+    expect(JSON.stringify(frame)).not.toContain("untrusted");
+  } finally { await proxy.close(); }
+});
+
 it("thread/resume passes the saved native identity and execution-host cwd to driver recovery", async () => {
   const sink = new FakeSink(); const session = new FakeSession();
   const driver = makeDriver(session);

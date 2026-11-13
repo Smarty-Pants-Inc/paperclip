@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { trace, SpanStatusCode, type Context, type Span } from "@opentelemetry/api";
 import { getActiveStepContext, runWithRuntimeParent } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 
@@ -5,8 +6,26 @@ const phases = new Set(["runner.transport.cold_start", "runner.transport.resume"
   "runner.transport.turn_start", "runner.transport.started_event", "runner.transport.command_ack", "runner.transport.registration", "runner.transport.provider_identity"]);
 const keys = new Set(["inputBytes", "toolSchemaBytes", "toolCount", "contextReused", "tokenDataAvailable"]);
 
+type RunnerOperationTiming = { name: string; startedAtMs: number; endedAtMs: number; outcome: "ok" | "failed" };
+const operationRecorders = new AsyncLocalStorage<(span: RunnerOperationTiming) => void>();
+
+/** Bind diagnostics to the current run, never the retained transport's creator. */
+export function runWithRunnerOperationRecorder<T>(record: (span: RunnerOperationTiming) => void, work: () => T): T {
+  return operationRecorders.run(record, work);
+}
+
 // Resolve the parent on every call: a retained transport belongs to several successive runs.
 export function measureRunnerOperation<T>(phase: string, work: () => Promise<T>, attributes?: Record<string, number | boolean>): Promise<T> {
+  const record = operationRecorders.getStore();
+  if (phase === "runner.transport.attach" && record) {
+    const startedAtMs = Date.now();
+    const finish = (outcome: "ok" | "failed") => {
+      try { record({ name: phase, startedAtMs, endedAtMs: Math.max(startedAtMs, Date.now()), outcome }); } catch {}
+    };
+    // The run trace records both the local row and optional OTel span. Do not
+    // open a second OTel-only span for the same attachment.
+    return Promise.resolve().then(work).then(value => { finish("ok"); return value; }, error => { finish("failed"); throw error; });
+  }
   const parent = getActiveStepContext()?.parentContext;
   if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() || !parent || !phases.has(phase)) return work();
   let operation: Promise<T> | undefined;

@@ -15,6 +15,7 @@ import { HarnessStaleTurnError } from "../contracts/harness-driver.js";
 import { parsePiUserInput } from "../drivers/pi/pi-user-input.js";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
 import { quarantineInvalidPiSessionFile } from "../drivers/pi/pi-session-file.js";
+import { parseProviderPerformanceSpans, PROVIDER_PERFORMANCE_DIAGNOSTIC } from "../contracts/provider-performance.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 import {
   openCodeProxyItemNotification,
@@ -499,6 +500,13 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           ...(event.turnId ?? activeTurnId ? { turnId: event.turnId ?? activeTurnId } : {}),
           message: payload.summary, severity: payload.severity, category: payload.category, noticeKey: payload.noticeId, details: payload.details } });
       } else if (event.eventType === "harness.diagnostic") {
+        if (payload.code === PROVIDER_PERFORMANCE_DIAGNOSTIC) {
+          send({ method: "paperclip/providerPerformance", params: {
+            threadId: opened.ids().driverSessionId, turnId: event.turnId,
+            spans: parseProviderPerformanceSpans(payload, Date.now()),
+          } });
+          continue;
+        }
         send({
           method: "warning",
           params: {

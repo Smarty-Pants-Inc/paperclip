@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
+import { parseProviderPerformanceSpans } from "../../contracts/provider-performance.js";
 
 // Keep reason: Stop is a data-safety/authority boundary. Lost abort ACK and
 // missing native settlement are cheap deterministic controls for escalation.
@@ -66,6 +67,29 @@ describe("Pi Stop abort ladder", () => {
       const next = await f.session.startTurn({ message: { role: "user", text: "continue" } });
       expect(next.turnId).not.toBe(f.turn.turnId); expect(f.transport.closed).toBe(false);
     } finally { await f.close(); }
+  });
+
+  it("records interrupt_wait only when warm attachment actually waits for Stop", async () => {
+    const f = await fixture(); let release!: () => void;
+    try {
+      f.transport.abort = async () => {
+        await new Promise<void>(resolve => { release = resolve; });
+        f.transport.send({ type: "agent_settled", aborted: true });
+      };
+      const stopping = f.session.interrupt({ turnId: f.turn.turnId });
+      await vi.waitFor(() => expect(f.transport.commands).toContain("abort"));
+      const attaching = f.session.attachRun({ runId: "run-after-stop" });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const spans = () => f.events.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
+      expect(spans().some(span => span.name === "runner.pi.interrupt_wait")).toBe(false);
+      release(); await stopping; await attaching;
+      await vi.waitFor(() => expect(f.events.some(event => event.runId === "run-after-stop"
+        && parseProviderPerformanceSpans(event.payload, Date.now()).some(span => span.name === "runner.pi.interrupt_wait"))).toBe(true));
+      const span = spans().find(span => span.name === "runner.pi.interrupt_wait")!;
+      expect(span.endedAtMs).toBeGreaterThanOrEqual(span.startedAtMs);
+      await f.session.attachRun({ runId: "run-after-stop" });
+      expect(spans().filter(span => span.name === "runner.pi.interrupt_wait")).toHaveLength(1);
+    } finally { release?.(); await f.close(); }
   });
 
   it.each(["ack", "settlement"])("retires only when the abort %s never arrives within the bound", async missing => {
