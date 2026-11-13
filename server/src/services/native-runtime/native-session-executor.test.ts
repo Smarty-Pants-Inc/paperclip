@@ -8833,7 +8833,9 @@ describe("native terminal-turn accounting", () => {
   ))("honors runner completeness for ACPX $agent ($scenario)", async ({ agent, scenario }) => {
     const { rehydrateRunnerdUsageNotification } = await import("@paperclipai/paperclip-runner/live");
     const onUsage = vi.fn(async (_receipt: import("@paperclipai/adapter-utils").AdapterUsageCheckpoint) => {});
-    const complete = ["complete_zero", "recovered"].includes(scenario);
+    // A later incomplete snapshot closes as a lower bound without revoking
+    // the preceding measured subtotal (54a1eaaa / PR #19 audit).
+    const complete = ["complete_zero", "recovered", "later_partial"].includes(scenario);
     const zero = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, providerCostUsd: 0 };
     const full = { ...zero, inputTokens: 12, outputTokens: 4 };
     const reports = scenario === "complete_zero" ? [{ runDelta: zero, runDeltaAvailable: true }]
@@ -8849,6 +8851,10 @@ describe("native terminal-turn accounting", () => {
         await observe({ eventType: "turn.completed", turnId: "turn", payload: {} } as unknown as PrpEvent);
         expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ complete }));
         if (!complete) expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ costUsd: null, costStatus: "unpriced" }));
+        if (scenario === "later_partial") expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({
+          usage: expect.objectContaining({ inputTokens: 12, outputTokens: 4 }), costStatus: "unpriced",
+          pricingProvenance: expect.objectContaining({ evidence: expect.stringContaining("lower bound") }),
+        }));
       }
       return { result: { summary: "cancelled" }, terminal: { runTerminalState: "cancelled" }, turnId: "turn",
         normalizedSessionId: "session", providerSessionId: null, driverKind: "acpx_runtime", driverVersion: "1", nativeEventCount: 2, highestContiguousSourceSeq: 2,
