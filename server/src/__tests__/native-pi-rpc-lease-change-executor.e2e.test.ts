@@ -108,6 +108,8 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected", "stop-arch
   // REG-03 differs from idle expiry: Stop leaves an in-memory warm entry,
   // then provider archival removes its processes before the next message.
   const stopArchived = resumedFrom === "stop-archived";
+  const stopDelayMs = Number(process.env.REG03_DELAY_MS ?? "0");
+  if (!Number.isSafeInteger(stopDelayMs) || stopDelayMs < 0) throw new Error("REG03_DELAY_MS must be a nonnegative safe integer");
   const startupEvents: Array<{ runId: string; event: AdapterRuntimeEvent }> = [];
   let boxState: "running" | "archived" = "running";
   expect(process.platform).toBe("linux");
@@ -431,6 +433,10 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected", "stop-arch
     let previous = first;
     const turn = async (index: number, holdForStop = false) => {
       await settle(previous);
+      if (stopArchived && !holdForStop) {
+        stage("delay after confirmed Stop before next message", { stopDelayMs });
+        await new Promise(resolve => setTimeout(resolve, stopDelayMs));
+      }
       const [comment] = await db!.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
         body: `Turn ${index}: recall the private fact from your own earlier assistant history. Do not invent it.` }).returning();
       const next = await seed(comment!.body, first.native.normalizedSessionId, comment!.id, previous.lease.id);
@@ -519,7 +525,7 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected", "stop-arch
     const epochs = resumedFrom === "connected" ? []
       : readdirSync(join(remoteSessionRoot, "authority-epochs")).filter(name => name.startsWith("epoch-"));
     await writeFile(join(root, "proof.json"), JSON.stringify({ scope: "executePaperclipNativeSession warm path; real runnerd/proxy/Pi; simulated allocation and loopback model",
-      firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs, startupEvents, stopArchived }, null, 2));
+      firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs, startupEvents, stopArchived, stopDelayMs }, null, 2));
     stage(`GREEN: three turns of the same conversation across Core's idle closes (${resumedFrom})`, { epochs });
     await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "closed-owner proof complete" });
   } catch (error) { failure = error; throw error; }
