@@ -8,7 +8,7 @@ import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/com
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { providerPackExtractionProbe } from "./provider-pack-extraction.js";
 import { providerPackTransferTimeoutMs } from "./provider-pack-transfer.js";
-import { findSandboxStoppedError } from "../sandbox-stopped-error.js";
+import { findSandboxStoppedError, isStoppedSandboxCommandRejection, isStoppedSandboxSyncRejection } from "../sandbox-stopped-error.js";
 
 type Archive = { sha256: string; bytes: number };
 type FileLayer = Archive & { path: string; mode: number; archive: Archive };
@@ -21,13 +21,13 @@ export type ProviderPackLayers = {
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const PROVIDER_PACK_VERIFY_TIMEOUT_MS = 120_000;
 
-export function providerPackSandboxStopped(error: unknown, fromSandboxCommandsApi = false): boolean {
-  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
-    const value = cause as { message?: unknown; code?: unknown; status?: unknown; statusCode?: unknown };
-    const status = value.status ?? value.statusCode;
-    const message = `${typeof value.message === "string" ? value.message : String(cause)} ${typeof value.code === "string" ? value.code : ""}`;
-    if ((fromSandboxCommandsApi && status === 404) || (status === 409 && /stopped/i.test(message))
-      || /(?:sandbox .* (?:is )?stopped|is stopped|SANDBOX_(?:STOPPED|NOT_RUNNING))/i.test(message)) return true;
+export function providerPackSandboxStopped(error: unknown, providerLeaseId?: string | null, fromSandboxCommandsApi = false): boolean {
+  if (!providerLeaseId) return false;
+  const rejected = fromSandboxCommandsApi ? isStoppedSandboxCommandRejection : isStoppedSandboxSyncRejection;
+  const seen = new Set<unknown>();
+  for (let cause = error; cause instanceof Error && !seen.has(cause) && seen.size < 8; cause = cause.cause) {
+    if (rejected(cause, providerLeaseId)) return true;
+    seen.add(cause);
   }
   return false;
 }
@@ -40,9 +40,11 @@ export function providerPackTransferTimedOut(error: unknown): boolean {
   return false;
 }
 
-export function providerPackStageError(error: unknown, fromSandboxCommandsApi = false): never {
+export function providerPackStageError(error: unknown, providerLeaseId?: string | null, fromSandboxCommandsApi = false): never {
   if (findSandboxStoppedError(error)) throw error;
-  if (providerPackSandboxStopped(error, fromSandboxCommandsApi)) throw Error("runner_remote_provider_pack_sandbox_stopped");
+  if (providerPackSandboxStopped(error, providerLeaseId, fromSandboxCommandsApi)) {
+    throw new Error("runner_remote_provider_pack_sandbox_stopped", { cause: error });
+  }
   throw error;
 }
 const validArchive = (value: unknown): value is Archive => {
@@ -148,6 +150,7 @@ export function providerPackLayersArgument(archive: ProviderPackLayers, targetPa
 export async function stageProviderPackLayers(input: {
   archive: ProviderPackLayers;
   runner: CommandManagedRuntimeRunner;
+  providerLeaseId?: string | null;
   targetPath: string;
   reuseRoots: readonly string[];
   trace?: NativeRunTrace;
@@ -197,6 +200,7 @@ export async function stageProviderPackLayers(input: {
             const metadata = await file.stat(), layerHash = createHash("sha256");
             if (!metadata.isFile() || metadata.size !== layer.bytes) throw invalidArchive("size_mismatch");
             for await (const chunk of file.createReadStream({ autoClose: false, signal: verifyController.signal })) {
+              verifyTimer.refresh();
               layerHash.update(chunk); hash.update(chunk); yield chunk;
             }
             if (layerHash.digest("hex") !== layer.sha256) throw invalidArchive("sha256_mismatch");
@@ -216,9 +220,11 @@ export async function stageProviderPackLayers(input: {
         files: [{ kind: "file", sourcePath: bundlePath, targetPath: remoteArchive, mode: 0o600 }],
       }], { minimumTimeoutMs: transferTimeoutMs }));
     } catch (error) {
-      if (findSandboxStoppedError(error)) throw error;
-      if (providerPackTransferTimedOut(error)) throw Error("runner_remote_provider_pack_transfer_timeout");
-      providerPackStageError(error);
+      if (findSandboxStoppedError(error) || providerPackSandboxStopped(error, input.providerLeaseId)) {
+        providerPackStageError(error, input.providerLeaseId);
+      }
+      if (providerPackTransferTimedOut(error)) throw new Error("runner_remote_provider_pack_transfer_timeout", { cause: error });
+      throw error;
     }
     let result;
     try { result = await measure("provider_pack.archive.extract", () => runner.execute({
@@ -228,10 +234,7 @@ export async function stageProviderPackLayers(input: {
         `tar --zstd --ignore-zeros -xf ${quote(remoteArchive)} --no-same-owner --same-permissions --delay-directory-restore -C ${quote(input.targetPath)};`,
         `chmod 700 ${quote(input.targetPath)};`,
       ].join(" ")], bypassSession: true, timeoutMs: 120_000,
-    })); } catch (error) { providerPackStageError(error, true); }
-    if (providerPackSandboxStopped({ message: result.stderr })) {
-      throw Error("runner_remote_provider_pack_sandbox_stopped");
-    }
+    })); } catch (error) { providerPackStageError(error, input.providerLeaseId, true); }
     if (result.exitCode !== 0 || result.timedOut) throw Error("runner_remote_provider_archive_extract_failed");
     return true;
   } finally {

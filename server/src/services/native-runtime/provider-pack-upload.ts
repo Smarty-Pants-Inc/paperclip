@@ -21,6 +21,7 @@ export async function uploadVerifiedProviderPack(input: {
   manifest?: ProviderPackIdentity;
   signal?: AbortSignal;
   runner: CommandManagedRuntimeRunner;
+  providerLeaseId?: string | null;
   cwd: string;
   targetPath: string;
   reuseRoots: readonly string[];
@@ -81,7 +82,7 @@ export async function uploadVerifiedProviderPack(input: {
   }
   await measure("provider_pack.upload", async () => {
     if (archive && await stageProviderPackArchive({
-      archive, runner: input.runner, targetPath: input.targetPath,
+      archive, runner: input.runner, providerLeaseId: input.providerLeaseId, targetPath: input.targetPath,
       reuseRoots: input.reuseRoots, trace: input.trace,
     })) return;
     if (source.archiveOnly) throw Error("runner_remote_provider_archive_transport_unavailable");

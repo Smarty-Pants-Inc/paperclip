@@ -3504,6 +3504,18 @@ weakening archive/installed-pack verification. A larger configured provider
 budget still wins. A failed transfer remains a preparation failure, not proof
 that the owning sandbox is safe to discard.
 
+Missing-layer verification has a 120-second **inactivity** budget, renewed on
+every chunk read rather than a total wall-clock limit on a healthy large pack.
+No read progress yields `runner_remote_provider_archive_verify_timeout`; transfer
+timeouts retain `runner_remote_provider_pack_transfer_timeout`. This stream
+budget is not an end-to-end deadline for filesystem open/stat/close or cleanup.
+Staging preserves typed `SandboxStoppedError` failures. Otherwise only an
+authenticated Boat 409 refusal matching the acquired lease's exact allocation
+and command/file-sync route yields `runner_remote_provider_pack_sandbox_stopped`.
+Command stderr (even on failure), unrelated stopped-service text, and generic
+HTTP 404s never prove that the sandbox stopped. Successful extraction remains
+successful regardless of stderr.
+
 After an image rollout, use the matching immutable sandbox snapshot in the
 saved environment configuration. The documented
 [compatible configuration drain](idle-environment-cleanup.md#compatible-changes-on-reusable-sandboxes)

@@ -10,6 +10,7 @@ import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/com
 import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pack-archive.js";
 import { providerPackTransferTimeoutMs } from "./provider-pack-transfer.js";
 import { SandboxStoppedError } from "../sandbox-stopped-error.js";
+import { JsonRpcCallError } from "@paperclipai/plugin-sdk";
 import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 // @ts-expect-error Build-time script has no TypeScript declaration.
 import { createProviderPackArchive, createProviderPackLayers } from "../../../../scripts/create-provider-pack-archive.mjs";
@@ -105,7 +106,7 @@ it.each([
   expect(providerPackTransferTimeoutMs(bytes)).toBe(expected);
 });
 
-it.skipIf(!tar || !hasZstd)("maps a stopped sandbox after transfer to a stable staging error", async () => {
+it.skipIf(!tar || !hasZstd)("maps an exact-allocation stopped sandbox refusal after transfer to a stable staging error", async () => {
   const { root, archive } = await fixture();
   const targetPath = path.join(root, "stopped");
   const remote = await runner(root);
@@ -113,8 +114,9 @@ it.skipIf(!tar || !hasZstd)("maps a stopped sandbox after transfer to a stable s
     timedOut: false, stdout: "", stderr: "" }));
   remote.execute.mockResolvedValueOnce({ exitCode: 0, signal: null, pid: null, startedAt: null,
     timedOut: false, stdout: "", stderr: "" });
-  remote.execute.mockRejectedValueOnce(Object.assign(new Error("Boat 409 Sandbox is stopped"), { status: 409 }));
-  await expect(stageProviderPackArchive({ archive, runner: remote, targetPath }))
+  remote.execute.mockRejectedValueOnce(new JsonRpcCallError({ code: -32000,
+    message: "Boat POST /sandboxes/bx_1/commands failed (409): Sandbox bx_1 is stopped." }));
+  await expect(stageProviderPackArchive({ archive, runner: remote, targetPath, providerLeaseId: "bx_1" }))
     .rejects.toThrow("runner_remote_provider_pack_sandbox_stopped");
 });
 

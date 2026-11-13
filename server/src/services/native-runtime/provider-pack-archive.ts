@@ -37,6 +37,7 @@ export async function readProviderPackArchive(root: string, expectedDigest: stri
 export async function stageProviderPackArchive(input: {
   archive: NonNullable<Awaited<ReturnType<typeof readProviderPackArchive>>>;
   runner: CommandManagedRuntimeRunner;
+  providerLeaseId?: string | null;
   targetPath: string;
   trace?: NativeRunTrace;
   reuseRoots?: readonly string[];
@@ -58,9 +59,11 @@ export async function stageProviderPackArchive(input: {
       files: [{ kind: "file", sourcePath: archive.sourcePath, targetPath: archivePath, mode: 0o600 }],
     }], { minimumTimeoutMs: providerPackTransferTimeoutMs(archive.bytes) })); }
     catch (error) {
-      if (findSandboxStoppedError(error)) throw error;
-      if (providerPackTransferTimedOut(error)) throw new Error("runner_remote_provider_pack_transfer_timeout");
-      providerPackStageError(error);
+      if (findSandboxStoppedError(error) || providerPackSandboxStopped(error, input.providerLeaseId)) {
+        providerPackStageError(error, input.providerLeaseId);
+      }
+      if (providerPackTransferTimedOut(error)) throw new Error("runner_remote_provider_pack_transfer_timeout", { cause: error });
+      throw error;
     }
     let result;
     try { result = await measure("provider_pack.archive.extract", () => input.runner.execute({
@@ -75,10 +78,7 @@ export async function stageProviderPackArchive(input: {
       ].join(" ")],
       bypassSession: true,
       timeoutMs: 120_000,
-    })); } catch (error) { providerPackStageError(error, true); }
-    if (providerPackSandboxStopped({ message: result.stderr })) {
-      throw new Error("runner_remote_provider_pack_sandbox_stopped");
-    }
+    })); } catch (error) { providerPackStageError(error, input.providerLeaseId, true); }
     if (result.exitCode !== 0 || result.timedOut) throw new Error("runner_remote_provider_archive_extract_failed");
     return true;
   } finally {

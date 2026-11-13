@@ -14332,6 +14332,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
         manifest: expectedProviderPackManifest,
         signal: input.signal,
         runner: remoteCommandRunner,
+        providerLeaseId: remoteTarget.transport === "sandbox" ? remoteTarget.sandboxLeaseAcquisition?.providerLeaseId : undefined,
         cwd: remoteTarget.remoteCwd,
         targetPath: stagedRemoteProviderPackRoot,
         reuseRoots: preinstalledProviderPackRoots ?? [],
