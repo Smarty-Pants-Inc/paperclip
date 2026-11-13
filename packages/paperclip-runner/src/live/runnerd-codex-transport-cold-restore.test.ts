@@ -6,7 +6,10 @@ import { createCapabilityRunnerdCodexTransport } from "./runnerd-codex-transport
 import { isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError } from "../contracts/harness-driver.js";
 import { defaultCapabilityRunnerdBinary, fakeCodex, fakeCodexArgs } from "../../test/support/runnerd-transport.js";
 
-it.each(["restore", "refuse", "foreign-state"] as const)(
+// REG-26: "lost-*" leave the prior Runner's last state unsuspended, as a
+// provider stop under an idle warm Runner does. Only the exact proven-lost
+// identity may rotate it; an unproven or other identity keeps the refusal.
+it.each(["restore", "refuse", "foreign-state", "lost-proven", "lost-unproven", "lost-other-identity"] as const)(
   "continues a completed warm handoff through external cold-state preparation: %s",
   async (mode) => {
     const root = await mkdtemp(join(tmpdir(), "runnerd-warm-cold-restore-"));
@@ -58,6 +61,9 @@ it.each(["restore", "refuse", "foreign-state"] as const)(
             ...savedState, normalizedSessionId: "another-session",
           }));
         }
+        if (mode.startsWith("lost-")) {
+          await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify({ ...savedState, lifecycle: "ready" }));
+        }
         prepared = true;
       });
       const read = vi.fn(async () => JSON.parse(await readFile(join(root, "runner", "runner-state.json"), "utf8")));
@@ -75,6 +81,8 @@ it.each(["restore", "refuse", "foreign-state"] as const)(
         readRunnerState: read,
         prepareExternalRunnerState: prepare,
         archiveExternalRunnerState: archive,
+        ...(mode === "lost-proven" || mode === "lost-other-identity" ? { lostRunnerSource: { ...identity,
+          runId: mode === "lost-proven" ? "second-run" : "another-run", turnId: "second-turn", itemId: "second-item" } } : {}),
       });
       if (mode === "refuse") {
         await expect(resumed.transport.request("thread/read", {})).rejects.toThrow("fixture cold restore authority refused");
@@ -82,7 +90,7 @@ it.each(["restore", "refuse", "foreign-state"] as const)(
         expect(archive).not.toHaveBeenCalled();
         expect(await readFile(callsPath, "utf8")).toBe(callsBefore);
         expect(await readFile(controlPath)).toEqual(controlBytes);
-      } else if (mode === "foreign-state") {
+      } else if (mode === "foreign-state" || mode === "lost-unproven" || mode === "lost-other-identity") {
         await expect(resumed.transport.request("thread/read", {})).rejects.toThrow("native_runner_authority_rotation_requires_settled_state");
         expect(read).toHaveBeenCalled();
         expect(archive).not.toHaveBeenCalled();
@@ -96,6 +104,11 @@ it.each(["restore", "refuse", "foreign-state"] as const)(
         expect(calls.filter(call => call === "thread/resume")).toHaveLength(1);
         expect(calls.filter(call => call === "turn/start")).toHaveLength(0);
         expect(JSON.parse(await readFile(controlPath, "utf8")).identity.runId).toBe("third-run");
+        if (mode === "lost-proven") {
+          // Archived exactly as the lost Runner left it, never deleted.
+          expect(JSON.parse(await readFile(join(root, "authority-epochs", archive.mock.calls[0]![0].archiveKey,
+            "runner-state.json"), "utf8"))).toMatchObject({ lifecycle: "ready", runId: "second-run" });
+        }
         expect(await readFile(join(root, "workspace-sentinel.txt"), "utf8")).toBe(sentinel);
       }
     } finally {
