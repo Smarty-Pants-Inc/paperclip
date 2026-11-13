@@ -47,6 +47,27 @@ function invalidPiSessionRecovery(event: Pick<PrpEvent, "eventType" | "payload" 
   return { previousId: recovery.previousSessionId, preservedFile: recovery.preservedFile };
 }
 
+/** Shared typed projection for lasting history-loss boundaries, including legacy
+ * selection. Caller must hold the company-scoped issue → run → task locks and
+ * verify admission authority in this same transaction. Detail links preserve
+ * run provenance without transient run ownership in chat relevance. */
+export async function writePiSessionHistoryLossNotice(db: Db,
+  tx: Parameters<Parameters<Db["transaction"]>[0]>[0], input: {
+    companyId: string; issueId: string; runId: string; agentId: string;
+    authorizationReason: string; body: string;
+  }): Promise<boolean> {
+  const { companyId, issueId, runId, agentId, authorizationReason, body } = input;
+  const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`)).limit(1);
+  if (existing) return false;
+  await issueService(db).addComment(issueId, body, {}, { authorType: "system", presentation: {
+    kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
+  }, metadata: { version: 1, authorizationReason,
+    sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
+  return true;
+}
+
 /** Both typed history-loss receipts use one authority check, issue lock and
  * provenance-key projection. Durable replay repairs an interrupted comment;
  * later warm events or run rotation cannot duplicate a committed notice. */
@@ -76,20 +97,9 @@ export async function materializePiSessionRecoveryNotice(input: {
       eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"),
       eq(agentTaskSessions.taskKey, issueId))).for("update");
     if (readPiConversation(session?.sessionParamsJson)?.id !== event.normalizedSessionId) return false;
-    const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-      sql`${issueComments.metadata}->>'authorizationReason' = ${key}`)).limit(1);
-    if (existing) return false;
-    await issueService(db).addComment(issueId, invalid ? invalidNotice
-      : "My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.",
-      // Every history-loss reason is a lasting transcript boundary, not run
-      // status. Keep provenance in its detail link without making chat relevance
-      // hide the notice when this run completes or a later turn is admitted.
-      {}, { authorType: "system", presentation: {
-        kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
-      }, metadata: { version: 1, authorizationReason: key,
-        sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
-    return true;
+    return writePiSessionHistoryLossNotice(db, tx, { companyId, issueId, runId, agentId, authorizationReason: key,
+      body: invalid ? invalidNotice
+        : "My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one." });
   });
   if (inserted) logger.error({ companyId, agentId, issueId, runId, code,
     ...(invalid ? { preservedFile: invalid.preservedFile } : {}), normalizedSessionId: event.normalizedSessionId },
