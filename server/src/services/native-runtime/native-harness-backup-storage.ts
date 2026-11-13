@@ -32,6 +32,8 @@ type Reference = Binding & {
   schema: typeof SCHEMA; objectKey: string; sha256: string; byteSize: number;
   material: Record<string, unknown>; manifestSha256: string;
   providerArtifacts?: NativeProviderArtifactReceipt;
+  // Absent in older objects: unknown is retained, never assumed disposable.
+  piConversationEvidence?: boolean;
 };
 type Row = typeof nativeHarnessBackups.$inferSelect;
 type OfflineOwner = { kind: "offline_migration"; companyId: string; issueId: string; runId: string;
@@ -47,6 +49,13 @@ export function durableNativeHarnessStorage(): StorageService | null {
   if (loadConfig().storageProvider === "s3") return getStorageService();
   if (process.env.PAPERCLIP_EPHEMERAL_SERVER === "true") fail("durable_storage_required");
   return null;
+}
+
+/** Only an archive inventoried at capture as Pi-free is eligible for pruning.
+ * Keep older/unknown objects too: the run or the original volume may be gone. */
+export function nativeHarnessBackupIsExpirable(value: unknown): boolean {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && (value as Record<string, unknown>).piConversationEvidence === false);
 }
 
 export async function verifyRecoverableNativeHarnessBackup(input: {
@@ -223,11 +232,12 @@ export async function persistNativeHarnessBackup(input: {
   const publications: ActivityPublication[] = [];
   try {
     const archive = join(scratch, "archive"), encrypted = join(scratch, "encrypted");
-    await captureNativeHarnessArchive(input.root, archive, input.signal, input.maxArchiveBytes, providerArtifacts ? ["provider-artifacts"] : []);
+    const inventory = await captureNativeHarnessArchive(input.root, archive, input.signal, input.maxArchiveBytes, providerArtifacts ? ["provider-artifacts"] : []);
     const plaintext = await digest(archive, input.signal), iv = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", key, iv); cipher.setAAD(aad(binding));
     await pipeline(createReadStream(archive), cipher, createWriteStream(encrypted, { flags: "wx", mode: 0o600 }), { signal: input.signal });
     const ref: Reference = { schema: SCHEMA, ...binding, manifestSha256, ...(providerArtifacts ? { providerArtifacts } : {}),
+      piConversationEvidence: inventory.piConversationEvidence,
       objectKey: `${binding.companyId}/native-harness-backups/${binding.scopeDigest}/${binding.id}.pchn`,
       ...await digest(encrypted, input.signal),
       material: createLocalEncryptedCipher("write").encrypt(JSON.stringify({ schema: SCHEMA, ...binding,
@@ -435,6 +445,7 @@ export async function deleteRetiredNativeHarnessBackup(db: Db, storage: StorageS
     eq(nativeHarnessBackups.id, id), eq(nativeHarnessBackups.status, "retired")));
   if (!row) return false;
   const ref = reference(row);
+  if (!nativeHarnessBackupIsExpirable(ref)) return false;
   if (ref.providerArtifacts) await releaseRetiredNativeProviderArtifacts({ db, storage, companyId: row.companyId,
     runId: row.runId, backupId: row.id, receipt: ref.providerArtifacts, signal });
   await storage.deleteObject(ref.companyId, ref.objectKey, { allVersions: true, signal });

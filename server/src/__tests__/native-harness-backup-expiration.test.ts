@@ -405,6 +405,83 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     expect(await taskSessionCount(session.agentId)).toBe(0);
   });
 
+  // Data-safety regression: exercise the actual DB decision and recursive
+  // deletion, including crash leftovers. No deletion or storage mocks.
+  it.each(["backup", "continuity", "quarantine", "expired_backup", "retiring_backup", "expired_continuity", "expired_quarantine"])(
+    "keeps every Pi conversation byte forever when expiring %s", async kind => {
+      const session = await seedSession();
+      let source = session.current;
+      if (kind === "continuity" || kind === "expired_continuity") source = await seedArchive(session.root);
+      if (kind === "quarantine" || kind === "expired_quarantine") source = await seedQuarantine(session.scope);
+      if (kind.startsWith("expired_") || kind === "retiring_backup") {
+        const parent = kind.endsWith("backup") ? path.dirname(session.current) : path.dirname(source);
+        const leftover = path.join(parent, `${kind === "retiring_backup" ? ".retiring-" : ".expired-"}${randomUUID()}`);
+        if (source === session.current && kind === "retiring_backup") {
+          // A newer current makes settleLeftovers discard the interrupted copy.
+          await fs.cp(source, leftover, { recursive: true });
+        } else await fs.rename(source, leftover);
+        source = leftover;
+      }
+      const files = new Map([
+        [`pi/${session.sessionId}.jsonl.invalid-garbage`, process.env.PAPERCLIP_NATIVE_RETENTION_ORIGINAL
+          ? await fs.readFile(process.env.PAPERCLIP_NATIVE_RETENTION_ORIGINAL) : Buffer.from([0, 255, 10, 123])],
+        [`pi/${session.sessionId}.jsonl.invalid-foreign`, Buffer.from('{"type":"session","id":"foreign"}\n')],
+        [`pi/${session.sessionId}.jsonl`, process.env.PAPERCLIP_NATIVE_RETENTION_SESSION
+          ? await fs.readFile(process.env.PAPERCLIP_NATIVE_RETENTION_SESSION)
+          : Buffer.from('{"type":"session","id":"missing-file-era"}\n{"type":"message","text":"only copy"}\n')],
+        ["pi-agent/sessions/child/session.jsonl", Buffer.from('{"type":"session","id":"native-child"}\n')],
+      ]);
+      for (const [relative, bytes] of files) {
+        await fs.mkdir(path.dirname(path.join(source, relative)), { recursive: true });
+        await fs.writeFile(path.join(source, relative), bytes);
+      }
+      const old = new Date(now.getTime() - 10 * DAY_MS);
+      await fs.utimes(source, old, old);
+      const result = await service().tick();
+      expect(result.failed).toBe(0);
+      // Retention must not just leave the final copy in another expiring name.
+      const evidence = path.join(stateBase, "conversation-evidence");
+      const find = async (directory: string): Promise<string[]> => {
+        const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+        return (await Promise.all(entries.map(async entry => entry.isDirectory()
+          ? find(path.join(directory, entry.name)) : [path.join(directory, entry.name)]))).flat();
+      };
+      const assertBytes = async () => {
+        const retained = await find(evidence);
+        for (const [relative, bytes] of files) {
+          const copies = retained.filter(file => file.endsWith(`/${relative}`));
+          expect(copies.length, `${kind}: last durable copy of ${relative}`).toBeGreaterThan(0);
+          for (const copy of copies) expect(await fs.readFile(copy)).toEqual(bytes);
+        }
+      };
+      const proof = process.env.PAPERCLIP_NATIVE_RETENTION_EVIDENCE_DIR;
+      if (proof) {
+        await fs.mkdir(proof, { recursive: true });
+        const retained = await find(evidence);
+        await fs.writeFile(path.join(proof, `${kind}.json`), JSON.stringify({ kind, source, result,
+          sourceFilesAfter: await Promise.all([...files.keys()].map(async file => ({ file, present: await exists(path.join(source, file)) }))),
+          before: [...files].map(([file, bytes]) => ({ file, sha256: createHash("sha256").update(bytes).digest("hex") })),
+          retained: await Promise.all(retained.map(async file => ({ file,
+            sha256: createHash("sha256").update(await fs.readFile(file)).digest("hex") }))),
+        }, null, 2));
+      }
+      if (kind !== "expired_quarantine") {
+        expect(await fs.readdir(evidence)).toContain(session.scope);
+        const privateScope = await fs.lstat(path.join(evidence, session.scope));
+        expect(privateScope.mode & 0o777).toBe(0o700);
+      }
+      await assertBytes();
+      // A new service (no in-memory exemption) and a much later clock cannot
+      // prune the durable copy, even after the ordinary source has expired.
+      await nativeHarnessBackupExpirationService(db, { stateBase, now: new Date(now.getTime() + 3650 * DAY_MS),
+        isSessionBusy: () => false }).tick();
+      await assertBytes();
+      if (proof) {
+        await fs.cp(evidence, path.join(proof, kind), { recursive: true, force: false, errorOnExist: true });
+      }
+    },
+  );
+
   it("expires sessions of cancelled issues", async () => {
     const session = await seedSession({ issueStatus: "cancelled" });
     expect(await service().tick()).toMatchObject({ expired: 1 });
