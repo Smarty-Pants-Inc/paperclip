@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { assertRoutineOrigin, fail, only, record, type MailConfig } from "./config.js";
-import { cutoff, failedDelivery, isId, MAX_FAILURES, PARKED_WARNING, parseState, prune, timestamp, type MailState } from "./state.js";
+import { cutoff, failedDelivery, isId, MAX_FAILURES, parkedWarning, parseState, prune, timestamp } from "./state.js";
 
 type Context = Pick<PluginContext, "http" | "secrets"> & {
   state: Pick<PluginContext["state"], "get" | "set">;
@@ -111,13 +111,14 @@ export async function runTick(ctx: Context, companyId: string, config: MailConfi
     const key = seenKey(companyId, config.mailbox);
     const stored = parseState(await ctx.state.get(key));
     const since = cutoff(config.scanWindowDays);
-    const state: MailState = prune(stored, since);
+    const state = prune(stored, since);
     const skip = new Set([...state.seen.map(m => m.id), ...state.failures
       .filter(m => m.attempts >= MAX_FAILURES || m.nextRetryAt > Date.now()).map(m => m.id)]);
     const http = safeHttp(ctx, config, AbortSignal.timeout(240_000));
     // Finish ALL reads before any fire or pruning write. Backoff cannot block later IDs.
-    const pending = (await readMailbox(ctx, companyId, config, http, skip)).filter(m => m.internalDate > since);
-    if (stored.seen.length !== state.seen.length || stored.failures.length !== state.failures.length) await ctx.state.set(key, state);
+    const pending = (await readMailbox(ctx, companyId, config, http, skip)).filter(m => m.internalDate >= state.notBefore);
+    if (stored.notBefore !== state.notBefore || stored.seen.length !== state.seen.length ||
+        stored.failures.length !== state.failures.length) await ctx.state.set(key, state);
     if (pending.length) {
       const secret = await ctx.secrets.resolve(config.routineFireSecretRef, { companyId, configPath: "routineFireSecretRef" });
       if (!secret || /[\r\n]/.test(secret)) fail();
@@ -140,6 +141,7 @@ export async function runTick(ctx: Context, companyId: string, config: MailConfi
         await ctx.state.set(key, state);
       }
     }
-    if (state.failures.some(m => m.attempts >= MAX_FAILURES)) ctx.logger.warn(PARKED_WARNING);
+    const parked = state.failures.filter(m => m.attempts >= MAX_FAILURES);
+    if (parked.length) ctx.logger.warn(parkedWarning(parked));
   } catch { fail(); } // No provider body, error cause, URL, mail text, or secret escapes.
 }

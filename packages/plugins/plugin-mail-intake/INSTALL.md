@@ -100,6 +100,9 @@ and an absent state row. It cannot reset existing state or run during a tick.
 It performs the same complete, bounded Gmail scan as a tick and gets internalDate
 metadata before writing version-2 state. Every supplied ID must be present within
 that window; out-of-window/unknown IDs and incomplete reads fail without writing.
+The scan's window start is persisted as the epoch-ms `notBefore` floor. Each
+complete tick can advance, but never lower, that floor. Widening `scanWindowDays`
+never back-fills old mail, including IDs already pruned from state.
 An explicit empty array authorizes firing **all** incoming mail within the
 configured window at first enable; to avoid replay, supply the explicitly approved
 IDs from that same window. No automatic baseline or guessed received-time cutoff.
@@ -122,8 +125,13 @@ while receiver active (two admissions); restart/lost-KV retry (same receipt);
 KV/log/payload privacy. Check job history and actual routing separately. Then
 leave enabled only under the authorized deployment's liveness/sleep policy.
 Delivery failures retry after 2 minutes, doubling to at most 6 hours; the tenth
-failure parks the ID and emits the fixed job-health warning
-`mail intake has parked deliveries`. Later messages continue. Parked entries
-remain until their internalDate ages outside the window; inspect the receiving
-routine through its normal authorized history, not through message content in
-plugin logs. Seen and failure entries are pruned after complete scans only.
+failure parks the ID and emits the fixed-text job-health warning
+`mail intake has parked deliveries: <id>, <id>` (only validated Gmail IDs vary).
+The documented SDK `onHealth()` surface also reports `degraded` with
+`details.parked: [{id, attempts, lastFailureAt}]`; the last failure time is epoch
+ms, or `null` for legacy failures without a recorded time. These diagnostics
+survive restart and contain no subjects, senders, bodies or provider errors.
+Later messages continue. Parked entries remain until their internalDate ages
+below the monotonic floor; inspect the receiving routine through its normal
+authorized history, not through message content in plugin logs. Seen and failure
+entries are pruned after complete scans only.

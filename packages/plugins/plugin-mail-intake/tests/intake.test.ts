@@ -15,7 +15,8 @@ const config: MailConfig = {
 const access = "ACCESS_SECRET_SENTINEL", refresh = "REFRESH_SECRET_SENTINEL", bearer = "FIRE_SECRET_SENTINEL";
 const message = (id: string) => ({ id, threadId: "ff" });
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
-const state = (ids: string[] = []) => ({ version: 2, seen: ids.map(id => ({ id, internalDate: 1700000000000 })), failures: [] });
+const state = (ids: string[] = []) => ({ version: 2, notBefore: Date.now() - 7 * 86_400_000,
+  seen: ids.map(id => ({ id, internalDate: 1700000000000 })), failures: [] });
 function fixture(initial: unknown = []) {
   let saved: unknown = Array.isArray(initial) && initial.every(id => typeof id === "string" && /^[0-9a-f]{1,64}$/.test(id)) && new Set(initial).size === initial.length
     ? state(initial) : structuredClone(initial);
@@ -288,6 +289,64 @@ describe("registered job and explicit company binding", () => {
     f.ctx.config.get.mockResolvedValue({ ...config });
     f.pages.push({ messages: [message("aa"), message("bb")] });
     await f.tick(); expect(f.fires).toHaveLength(1); expect(f.saved()).toEqual(state(["aa", "bb"]));
+  });
+  it("initialization persists the scanned window floor even with an empty approved baseline", async () => {
+    const f = await worker(null);
+    const disabled = { ...config, enabled: false, scanWindowDays: 3 };
+    await f.plugin.onConfigChanged!(disabled, { companyId: company });
+    f.ctx.config.get.mockResolvedValue(disabled);
+    await f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] });
+    expect(f.saved()).toEqual({ version: 2, notBefore: Date.now() - 3 * 86_400_000, seen: [], failures: [] });
+  });
+  it("health exposes parked IDs, attempt counts and last failure times from durable state only", async () => {
+    const lastFailureAt = Date.now() - 1_000;
+    const f = await worker({ ...state(), failures: [
+      { id: "aa", internalDate: Date.now(), attempts: 10, nextRetryAt: Date.now() + 1_000, lastFailureAt },
+      { id: "bb", internalDate: Date.now(), attempts: 2, nextRetryAt: Date.now() + 1_000, lastFailureAt },
+    ] });
+    await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
+    expect(await f.plugin.onHealth?.()).toEqual({ status: "degraded", message: "mail intake has parked deliveries: aa",
+      details: { parked: [{ id: "aa", attempts: 10, lastFailureAt }] } });
+    expect(f.ctx.state.get).toHaveBeenCalledWith(seenKey(company, config.mailbox));
+    expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.secrets.resolve).not.toHaveBeenCalled();
+    expect(f.ctx.state.set).not.toHaveBeenCalled();
+    const restarted = await worker(f.saved());
+    await restarted.plugin.onConfigChanged!({ ...config }, { companyId: company });
+    expect(await restarted.plugin.onHealth?.()).toEqual(await f.plugin.onHealth?.());
+  });
+  it("a tenth delivery failure reaches warning and health with its recorded time, even when disabled", async () => {
+    const f = await worker({ ...state(), failures: [
+      { id: "aa", internalDate: Date.now(), attempts: 9, nextRetryAt: Date.now() },
+    ] });
+    const original = f.ctx.http.fetch.getMockImplementation()!;
+    f.ctx.http.fetch.mockImplementation(async (url, init) => url.endsWith("/fire") && JSON.parse(String(init?.body)).messageId === "aa"
+      ? json({ subject: access, from: refresh, body: bearer }, 400) : original(url, init));
+    await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
+    await f.tick();
+    expect(f.ctx.logger.warn.mock.calls).toEqual([["mail intake has parked deliveries: aa"]]);
+    expect(f.fires.map(fire => (fire.payload as { messageId: string }).messageId)).toEqual(["bb"]);
+    f.ctx.config.get.mockResolvedValue({ ...config, enabled: false });
+    expect(await f.plugin.onHealth?.()).toEqual({ status: "degraded", message: "mail intake has parked deliveries: aa",
+      details: { parked: [{ id: "aa", attempts: 10, lastFailureAt: Date.now() }] } });
+    expect(JSON.stringify(f.saved())).not.toContain("SECRET_SENTINEL");
+  });
+  it("health represents unknown legacy failure time explicitly rather than fabricating it", async () => {
+    const f = await worker({ ...state(), failures: [
+      { id: "aa", internalDate: Date.now(), attempts: 10, nextRetryAt: Date.now() },
+    ] });
+    await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
+    expect(await f.plugin.onHealth?.()).toMatchObject({ status: "degraded",
+      details: { parked: [{ id: "aa", attempts: 10, lastFailureAt: null }] } });
+  });
+  it("health is quiet before company binding and redacts corrupt content-bearing state", async () => {
+    const f = await worker({ ...state(), failures: [
+      { id: "aa", internalDate: Date.now(), attempts: 10, nextRetryAt: Date.now(), subject: access },
+    ] });
+    expect(await f.plugin.onHealth?.()).toEqual({ status: "ok" });
+    expect(f.ctx.config.get).not.toHaveBeenCalled(); expect(f.ctx.state.get).not.toHaveBeenCalled();
+    await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
+    expect(await f.plugin.onHealth?.()).toEqual({ status: "error", message: SAFE_ERROR });
+    expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.state.set).not.toHaveBeenCalled();
   });
   it("initialization uses the configured window and rejects IDs outside it", async () => {
     const f = await worker(null);
