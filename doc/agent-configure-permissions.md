@@ -36,17 +36,24 @@ An agent can install a connection or bind/unbind a tool profile for its current
 strict reporting descendants with direct, target-scoped `agents:configure`.
 This includes a just-hired direct report and indirect reports; no grant snapshot
 or hire-time expansion is needed. Peers, managers and other reporting subtrees
-remain forbidden even with a legacy unscoped grant or a grant naming that agent.
+remain forbidden for ordinary leads even with a legacy unscoped grant or a grant
+naming that agent. A current top-level principal (`reportsTo: null`) with an
+explicitly company-wide `agents:configure` grant (`scope: null`) can assign tools
+across reporting roots. A root's subtree-scoped or target-list grant does not
+activate that exception; neither does an ordinary lead's unscoped grant.
 Existing self-service assignments and board authority are unchanged. Connection
 and profile management grants, responsible-user authority, private-connection
 access and interaction restrictions still apply; a suggestion grant is not a
 substitute for direct configuration authority.
 
 `PUT /api/tool-connections/:connectionId/installs` replaces the complete install
-set, but authorizes only additions and removals. Retained targets need not be in
-the caller's scope. Binding a profile changes only the named recipient, not its
+set. Agent requests authorize only additions and removals. Retained targets need
+not be in the agent's scope. Binding a profile changes only the named recipient, not its
 existing recipients or the consumers of its referenced connections. Editing a
 shared connection or profile still authorizes its affected consumers as before.
+Agent install PUTs never clean up a shared app profile's legacy connection-wide
+include, even for an unchanged install list. Board and trusted internal writes
+retain that cleanup; board PUTs retain full install-consumer authorization.
 The writers recheck the current target/delta under the company reporting-tree
 lock; moving an intermediate manager revokes descendant authority atomically.
 

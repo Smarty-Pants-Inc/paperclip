@@ -22,6 +22,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
   async function appProfileForConnection(
     dbClient: Pick<Db, "select" | "insert" | "delete">,
     connection: typeof toolConnections.$inferSelect,
+    cleanupLegacyInclude: boolean,
   ) {
     const profileKey = `app:${connection.id}`;
     let [profile] = await dbClient
@@ -68,7 +69,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
     // it grants. The app wizard's catalog-entry includes are the authority for
     // action selection, so remove the legacy connection-wide include that used
     // to silently turn every installed action on.
-    await dbClient
+    if (cleanupLegacyInclude) await dbClient
       .delete(toolProfileEntries)
       .where(
         and(
@@ -293,7 +294,9 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
           );
         }
         if (requested.size > 0 && connection.connectionPurpose !== "ai") {
-          const profile = await appProfileForConnection(tx, connection);
+          const cleanupLegacyInclude = actor?.managementContext?.actor.type !== "agent"
+            && actor?.actorType !== "agent";
+          const profile = await appProfileForConnection(tx, connection, cleanupLegacyInclude);
           for (const install of additions) {
             const [binding] = await tx
               .insert(toolProfileBindings)
