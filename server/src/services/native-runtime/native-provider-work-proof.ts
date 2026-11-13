@@ -88,7 +88,8 @@ async function predecessorGenerationLost(db: ProofDb, run: Predecessor, runtime?
 }
 
 async function terminalCompleteWithoutExecutionStart(db: ProofDb, run: Predecessor): Promise<boolean> {
-  if (!run.nativeSessionId) return false;
+  // Absence of start telemetry cannot contradict a persisted process identity.
+  if (!run.nativeSessionId || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null) return false;
   const [evidence] = await db.select({
     measured: sql<boolean>`exists (select 1 from ${heartbeatRunEvents} event where event.company_id = ${run.companyId}
       and event.run_id = ${run.id} and event.event_type = 'lifecycle' and event.message = 'task.run.measured'
@@ -107,12 +108,17 @@ async function terminalCompleteWithoutExecutionStart(db: ProofDb, run: Predecess
   // absence in a truncated log is NOT proof. Do not filter controller generation:
   // an earlier run carried into this native session can own the same process.
   if (await hasNativeExecutionStartEvidence(db, run)) return false;
-  const carriedRuns = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId }).from(heartbeatRuns).where(and(
+  const carriedRuns = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+    processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
+    processStartedAt: heartbeatRuns.processStartedAt }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId), ne(heartbeatRuns.id, run.id),
     eq(heartbeatRuns.nativeIssueId, run.nativeIssueId!), eq(heartbeatRuns.nativeSessionId, run.nativeSessionId),
     // Compare in Postgres: a JS Date truncates microseconds and can exclude the
     // predecessor's own row (or an earlier carried run in that millisecond).
     sql`${heartbeatRuns.createdAt} <= (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`));
-  for (const carried of carriedRuns) if (await hasNativeExecutionStartEvidence(db, carried)) return false;
+  for (const carried of carriedRuns) {
+    if (carried.processPid !== null || carried.processGroupId !== null || carried.processStartedAt !== null
+      || await hasNativeExecutionStartEvidence(db, carried)) return false;
+  }
   return await provesNoNativeRunProviderWork(db, { companyId: run.companyId, runId: run.id });
 }

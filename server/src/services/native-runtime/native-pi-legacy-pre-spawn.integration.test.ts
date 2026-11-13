@@ -92,6 +92,25 @@ describe.skipIf(!recoveryPostgresSupport.supported)("legacy Pi setup failures th
       currentRunId: h.current.id, beforeCreatedAt: h.current.createdAt })).toBeNull();
   }, 60_000);
 
+  // Keep reason: RFL F1, real persistence on the no-checkpoint daily-work
+  // fixture. The warning is a transcript boundary, never transient run status.
+  it("keeps the no-checkpoint legacy history-loss notice typed, unowned and deduped on concurrent replay", async () => {
+    const h = await seed("SMAA-143", "claimed");
+    const conversations = await Promise.all([selectPiConversation(db, h.input), selectPiConversation(db, h.input)]);
+    expect(conversations[1]).toEqual(conversations[0]);
+    expect(await selectPiConversation(db, h.input)).toEqual(conversations[0]);
+    const notices = await h.notices();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      authorType: "system", createdByRunId: null, conversationSessionGeneration: null,
+      presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false },
+      metadata: { version: 1, authorizationReason: expect.stringContaining("legacy_binding_unverified:"),
+        sections: [{ rows: [{ type: "run_link", runId: h.current.id, agentId: h.input.agentId, title: "Fresh conversation" }] }] },
+    });
+    expect(notices[0]!.metadata?.authorizationReason).toContain(conversations[0]!.id);
+    expect(notices[0]!.metadata?.authorizationReason).toContain(h.rows[0]!.nativeSessionId);
+  }, 60_000);
+
   it.each(["conversation-generation", "issue-binding", "session-binding"] as const)("never crosses a legacy %s fence", async fence => {
     const h = await seed("SMA-43", "pre-claim");
     const source = h.rows[0]!;
@@ -130,10 +149,43 @@ describe.skipIf(!recoveryPostgresSupport.supported)("legacy Pi setup failures th
     const h = await seed(chat, "claimed"), failed = h.rows.at(-1)!;
     const [owner] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, failed.id));
     expect(owner).toMatchObject(fixture.confirmedFailedFinalization);
+    expect(failed).toMatchObject({ processPid: null, processGroupId: null, processStartedAt: null });
     expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, failed.id))).toHaveLength(0);
     expect(await db.select().from(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, failed.id))).toHaveLength(0);
     expect(await canBypassFailedNativePredecessor(db, { companyId: failed.companyId, runId: failed.id })).toBe(true);
   }, 60_000);
+
+  // Keep reason: RFL F2, contradictory persisted process identity must win
+  // over absent start telemetry at the shared P2 proof boundary.
+  it.each(["processPid", "processGroupId", "processStartedAt", "all"] as const)(
+    "P2 holds a claimed terminal-complete predecessor with recorded %s and no start events", async field => {
+      const h = await seed("SMAA-143", "claimed"), failed = h.rows.at(-1)!;
+      const identity = { processPid: 42424, processGroupId: 42424, processStartedAt: new Date() };
+      await db.update(heartbeatRuns).set(field === "all" ? identity : { [field]: identity[field] })
+        .where(eq(heartbeatRuns.id, failed.id));
+      expect(await canBypassFailedNativePredecessor(db, { companyId: failed.companyId, runId: failed.id })).toBe(false);
+      const selected = await findNativeSessionResumeRun(db, { ...h.input, normalizedSessionId: failed.nativeSessionId,
+        currentRunId: h.current.id, beforeCreatedAt: h.current.createdAt });
+      expect(selected?.id).toBe(failed.id);
+      await expect(selectPiConversation(db, h.input)).rejects.toThrow("pi_conversation_legacy_predecessor_unproven");
+      expect(await h.notices()).toHaveLength(0);
+    }, 60_000);
+
+  it.each(["processPid", "processGroupId", "processStartedAt"] as const)(
+    "P2 holds an earlier carried run with recorded %s across controller generations", async field => {
+      const h = await seed("SMAA-143", "claimed"), failed = h.rows.at(-1)!;
+      const identity = { processPid: 0, processGroupId: 0, processStartedAt: new Date(failed.createdAt) };
+      await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: failed.companyId, agentId: failed.agentId,
+        issueId: failed.nativeIssueId, nativeIssueId: failed.nativeIssueId, nativeSessionId: failed.nativeSessionId,
+        runtimeMode: "native", status: "failed", createdAt: new Date(new Date(failed.createdAt).getTime() - 1000),
+        [field]: identity[field] });
+      expect(await canBypassFailedNativePredecessor(db, { companyId: failed.companyId, runId: failed.id })).toBe(false);
+      const selected = await findNativeSessionResumeRun(db, { ...h.input, normalizedSessionId: failed.nativeSessionId,
+        currentRunId: h.current.id, beforeCreatedAt: h.current.createdAt });
+      expect(selected?.id).toBe(failed.id);
+      await expect(selectPiConversation(db, h.input)).rejects.toThrow("pi_conversation_legacy_predecessor_unproven");
+      expect(await h.notices()).toHaveLength(0);
+    }, 60_000);
 
   it.each(["process-start", "source-event", "result", "checkpoint", "truncated-log"] as const)(
     "P2 keeps the real claimed row HELD with %s", async control => {
