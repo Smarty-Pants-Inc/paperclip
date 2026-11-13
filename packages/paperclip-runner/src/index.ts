@@ -1,4 +1,5 @@
 export { PI_RPC_BUILTIN_THINKING_CATALOG } from "./drivers/pi/pi-thinking-catalog.js";
+export { PI_RECOVERY_COLD_START_INSTRUCTIONS } from "./drivers/pi/pi-recovery-cold-start.js";
 export * from "./configured-environment.js";
 export * from "./catalog/index.js";
 export { taskDocumentKeySchema } from "./protocol-actions/task-document-key-schema.js";

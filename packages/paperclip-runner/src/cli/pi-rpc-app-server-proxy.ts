@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { PI_RECOVERY_COLD_START_INSTRUCTIONS } from "../drivers/pi/pi-recovery-cold-start.js";
 import { createHash, randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { readFileSync } from "node:fs";
@@ -732,12 +733,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           // The issue thread is the record; Pi's file is only its runtime copy.
           // Reuse the Paperclip skill's cold-start read (Step 6), even if the
           // controller prepared a continuation before discovering history loss.
-          userMessage.text = [
-            "Pi recovery cold start: your saved runtime history could not be restored. This is still the same Paperclip conversation.",
-            "Before answering, call get_task_context, get_task_history, and read_document with key plan for this issue. Follow the Paperclip skill's cold-start read for any further relevant thread history. A missing plan is not a missing issue thread.",
-            "Answer from the retrieved conversation record, preserving current user direction and approval gates. Do not claim unrecovered Pi-only memory. If the issue thread cannot be read, explicitly report that failure instead of guessing its history.",
-            userMessage.text,
-          ].join("\n\n");
+          userMessage.text = `${PI_RECOVERY_COLD_START_INSTRUCTIONS}\n\n${userMessage.text}`;
         }
         if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
         if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
