@@ -1,4 +1,4 @@
-import { resolveDefaultPiRpcThinkingLevel } from "@paperclipai/adapter-utils/pi-rpc-default-thinking";
+import { resolveDefaultPiRpcThinkingLevel } from "../pi-rpc-default-thinking.js";
 import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
 import { QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import { createHash } from "node:crypto";
