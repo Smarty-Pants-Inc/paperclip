@@ -8,11 +8,15 @@ import * as codexCredentials from "@paperclipai/adapter-codex-local/server";
 const { prepareIsolatedCodexHome } = await import(new URL("../../../../packages/paperclip-runner/src/drivers/runtime-context-materializer.ts", import.meta.url).href);
 const { execute, nativeProbe, selectedRunner, selectedRemoteRunner, sshExecute, sshRunner, nativeArtifacts, remoteLauncher, registerPrp, ingressConnect } = vi.hoisted(() => ({ execute: vi.fn(), nativeProbe: vi.fn(), selectedRunner: vi.fn(), selectedRemoteRunner: vi.fn(), sshExecute: vi.fn(), sshRunner: vi.fn(), nativeArtifacts: vi.fn(), remoteLauncher: vi.fn(), registerPrp: vi.fn(), ingressConnect: vi.fn() }));
 const nativeProbeRuntimeDirectories = vi.hoisted(() => [] as string[]);
+const preparationDiagnostics = vi.hoisted(() => ({ enabled: false }));
 vi.mock("node:fs/promises", async original => {
   const filesystem = await original<typeof import("node:fs/promises")>();
   return { ...filesystem, mkdtemp: async (...args: Parameters<typeof filesystem.mkdtemp>) => {
     const directory = await filesystem.mkdtemp(...args);
-    if (typeof args[0] === "string" && args[0].endsWith("paperclip-native-setup-") && typeof directory === "string") nativeProbeRuntimeDirectories.push(directory);
+    if (typeof args[0] === "string" && args[0].endsWith("paperclip-native-setup-") && typeof directory === "string") {
+      nativeProbeRuntimeDirectories.push(directory);
+      if (preparationDiagnostics.enabled) await filesystem.writeFile(join(directory, "failed-admission.ndjson"), "opaque failed admission\n");
+    }
     return directory;
   } };
 });
@@ -23,7 +27,8 @@ vi.mock("../../realtime/runner-prp-outbound.js", () => ({ connectRunnerPrpIngres
 vi.mock("./native-codex-runner.js", () => ({ resolvePaperclipRunnerBinary: selectedRunner, resolveRemotePaperclipRunnerBinary: selectedRemoteRunner }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({ ...await original<typeof import("../../vendor/paperclip-runner/index.js")>(), probeNativeRunnerEnvironment: nativeProbe }));
 vi.mock("./native-session-executor.js", async original => ({ ...await original<typeof import("./native-session-executor.js")>(), createRemoteNativeArtifactPreparation: nativeArtifacts, createRemoteRunnerProcessLauncher: remoteLauncher,
-  syncRemoteRunnerDirectoryOut: vi.fn(async () => undefined),
+  syncRemoteRunnerDirectoryOut: vi.fn(async ({ targetPath }: { targetPath: string }) => { await mkdir(targetPath, { recursive: true, mode: 0o700 }); }),
+  resolveLocalPiLaunchArtifacts: vi.fn(async () => ({})),
   resolveRemoteProviderPackSource: () => ({ configuredRoot: "/controller/pack", manifest: { digest: "sha256:fixture" } }),
   prepareRemoteProviderPackOnTarget: vi.fn(async () => ({ root: "/boat/provider-pack", manifest: { digest: "sha256:fixture", payload: { artifacts: {
     nodeCommand: { path: "node", sha256: "node-digest" }, piRpcExecutable: { path: "pi.js", sha256: "pi-digest" }, piRpcProxy: { path: "proxy.cjs", sha256: "proxy-digest" },
@@ -31,14 +36,20 @@ vi.mock("./native-session-executor.js", async original => ({ ...await original<t
 }));
 import { assertHarnessTestPassed } from "../agent-harness-verification.js";
 import { testNativeRunnerAuthentication } from "./setup-readiness.js";
+import { syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
+import { logger } from "../../middleware/logger.js";
 const context = {
   companyId: "company", adapterType: "paperclip_runner", config: { externallySandboxed: false, env: { PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "false" } },
   executionTarget: { kind: "remote" as const, transport: "sandbox" as const, providerKey: "test", remoteCwd: "/workspace", runner: { execute: vi.fn() } },
 };
 describe("Codex selected native account verification", () => {
   const receipt = (provider: "codex", model: string | null) => ({ provider, effectiveModel: model, providerDriver: "codex_app_server", helloProbePassed: true, cleanupConfirmed: true });
-  beforeEach(() => {
+  beforeEach(async () => {
+    const state = await mkdtemp(join(tmpdir(), "setup-readiness-state-"));
     execute.mockReset(); nativeProbe.mockReset(); nativeProbeRuntimeDirectories.splice(0);
+    preparationDiagnostics.enabled = false;
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", state);
+    vi.mocked(syncRemoteRunnerDirectoryOut).mockClear();
     sshExecute.mockReset().mockResolvedValue({ exitCode: 0, timedOut: false, stdout: "", stderr: "" });
     sshRunner.mockReset().mockReturnValue({ execute: sshExecute });
     nativeArtifacts.mockReset().mockReturnValue({ prepare: vi.fn().mockResolvedValue(undefined) });
@@ -122,7 +133,8 @@ describe("Codex selected native account verification", () => {
       expect((await readdir(home)).sort()).toEqual(["account-store.json", "auth.json"]);
     } finally { readCredential.mockRestore(); await rm(home, { recursive: true, force: true }); }
   });
-  it.each(["local", "remote"])("cleans its own private root when %s credential staging fails before probe handoff", async transport => {
+  it.each(["local", "remote"])("retains raw failed-admission diagnostics when %s preparation fails before probe handoff", async transport => {
+    preparationDiagnostics.enabled = true;
     const home = await realpath(await mkdtemp(join(tmpdir(), "native-preflight-staging-")));
     const auth = '{"tokens":{"account_id":"fixture-account","access_token":"fixture-access"}}';
     try {
@@ -137,11 +149,26 @@ describe("Codex selected native account verification", () => {
       expect(sshExecute).not.toHaveBeenCalled();
       expect(nativeProbeRuntimeDirectories).toHaveLength(1);
       await expect(stat(nativeProbeRuntimeDirectories[0]!)).rejects.toMatchObject({ code: "ENOENT" });
+      const evidence = join(process.env.PAPERCLIP_RUNNER_STATE_DIR!, "conversation-evidence");
+      const [scope] = await readdir(evidence), [leaf] = await readdir(join(evidence, scope!));
+      expect(await readFile(join(evidence, scope!, leaf!, "failed-admission.ndjson"), "utf8")).toBe("opaque failed admission\n");
       expect(await readFile(join(home, "account-store.json"), "utf8")).toBe(auth);
       expect((await stat(join(home, "config.toml"))).size).toBe(1024 * 1024 + 1);
       expect(await readlink(join(home, "auth.json"))).toBe(join(home, "account-store.json"));
     } finally { await rm(home, { recursive: true, force: true }); }
   });
+  it("retains Pi failed-admission diagnostics before probe handoff", async () => {
+    preparationDiagnostics.enabled = true;
+    const config = { get piRpcThinkingLevel(): string { throw new Error("Pi admission failed before handoff"); } };
+    const result = await testNativeRunnerAuthentication({ companyId: "company", adapterType: "paperclip_runner", config }, "pi_rpc", null);
+    expect(result.status).toBe("fail");
+    expect(result.checks[0].message).toContain("Pi admission failed before handoff");
+    expect(nativeProbe).not.toHaveBeenCalled();
+    const evidence = join(process.env.PAPERCLIP_RUNNER_STATE_DIR!, "conversation-evidence");
+    const [scope] = await readdir(evidence), [leaf] = await readdir(join(evidence, scope!));
+    expect(await readFile(join(evidence, scope!, leaf!, "failed-admission.ndjson"), "utf8")).toBe("opaque failed admission\n");
+  });
+
   it.each(["host-home", "host-codex-home", "configured-home", "managed-home"] as const)("reuses the task's authorized local Codex home before isolation (%s)", async mode => {
     vi.stubEnv("HOME", "/host-home");
     vi.stubEnv("CODEX_HOME", mode === "host-home" ? "" : "/host-codex");
@@ -392,6 +419,62 @@ describe("Codex selected native account verification", () => {
     expect(sshExecute.mock.calls.some(([value]) => JSON.stringify(value).includes("company-account"))).toBe(false);
     expect(execute).not.toHaveBeenCalled();
   });
+  // Keep: sole-copy data safety. Real private runtime/evidence moves; only the
+  // provider/remote transport is doubled so failure paths need no paid model.
+  it.each(["codex", "pi_rpc"] as const)("retains %s local raw sessions after confirmed cleanup", async provider => {
+    nativeProbe.mockImplementation(async input => {
+      await writeFile(join(input.runtimeDirectory, "raw-session.ndjson"), "opaque local raw session\n");
+      await input.onCleanupConfirmed();
+      return { provider, effectiveModel: "observed-model", providerDriver: provider === "pi_rpc" ? "pi_rpc" : "codex_app_server", helloProbePassed: true };
+    });
+    expect((await testNativeRunnerAuthentication({ companyId: "company", adapterType: "paperclip_runner", config: {} }, provider, "observed-model")).status).toBe("pass");
+    const evidence = join(process.env.PAPERCLIP_RUNNER_STATE_DIR!, "conversation-evidence");
+    const [scope] = await readdir(evidence), [leaf] = await readdir(join(evidence, scope!));
+    expect(await readFile(join(evidence, scope!, leaf!, "raw-session.ndjson"), "utf8")).toBe("opaque local raw session\n");
+  });
+
+  it.each(["codex", "pi_rpc"] as const)("does not delete %s remote scratch when sync-out fails", async provider => {
+    vi.mocked(syncRemoteRunnerDirectoryOut).mockRejectedValueOnce(new Error("raw session pull failed"));
+    nativeProbe.mockImplementation(async input => {
+      const registration = await input.transportOptions.controlPlaneRegistration({});
+      await registration.release();
+      await input.onCleanupConfirmed();
+    });
+    const result = await testNativeRunnerAuthentication(sshContext, provider, null);
+    expect(result.status).toBe("fail");
+    expect(result.checks[0].message).toContain("raw session pull failed");
+    expect(sshExecute.mock.calls.some(([input]) => input.command === "rm")).toBe(false);
+    expect((await stat(nativeProbeRuntimeDirectories[0]!)).isDirectory()).toBe(true);
+  });
+
+  it.each(["codex", "pi_rpc"] as const)("retains %s remote raw sessions before removing remote scratch and logs both paths", async provider => {
+    const info = vi.spyOn(logger, "info").mockImplementation(() => undefined);
+    const bytes = "opaque remote raw session\n";
+    vi.mocked(syncRemoteRunnerDirectoryOut).mockImplementationOnce(async input => {
+      await mkdir(input.targetPath, { recursive: true, mode: 0o700 });
+      await writeFile(join(input.targetPath, "raw-session.ndjson"), bytes);
+    });
+    let remoteRoot = "";
+    nativeProbe.mockImplementation(async input => {
+      const registration = await input.transportOptions.controlPlaneRegistration({});
+      await registration.release();
+      await input.onCleanupConfirmed();
+      remoteRoot = posix.dirname(input.transportOptions.runnerFilesystemRoot);
+      return { provider, effectiveModel: "observed-model", providerDriver: provider === "pi_rpc" ? "pi_rpc" : "codex_app_server", helloProbePassed: true };
+    });
+    try {
+      expect((await testNativeRunnerAuthentication(sshContext, provider, "observed-model")).status).toBe("pass");
+      const evidence = join(process.env.PAPERCLIP_RUNNER_STATE_DIR!, "conversation-evidence");
+      const [scope] = await readdir(evidence), [leaf] = await readdir(join(evidence, scope!));
+      expect(await readFile(join(evidence, scope!, leaf!, "remote-runtime/raw-session.ndjson"), "utf8")).toBe(bytes);
+      expect(info).toHaveBeenCalledWith(expect.objectContaining({ event: "native_evidence_retained", totalBytes: Buffer.byteLength(bytes), fileCount: 1 }));
+      expect(info).toHaveBeenCalledWith({ event: "native_scratch_removed", path: remoteRoot, totalBytes: Buffer.byteLength(bytes), fileCount: 1 });
+      const retainedIndex = info.mock.calls.findIndex(([entry]) => (entry as { event?: string }).event === "native_evidence_retained");
+      const removedIndex = info.mock.calls.findIndex(([entry]) => (entry as { event?: string }).event === "native_scratch_removed");
+      expect(retainedIndex).toBeLessThan(removedIndex);
+    } finally { info.mockRestore(); }
+  });
+
   it.each(["runtime missing", "authentication failed: selected-key", "no native completion", "model mismatch"])("fails SSH native setup without a legacy fallback (%s)", async message => {
     nativeProbe.mockRejectedValue(new Error(message));
     const result = await testNativeRunnerAuthentication({ ...sshContext, config: { env: { OPENAI_API_KEY: "selected-key" } } }, "codex", "gpt-6.1-sol");
