@@ -11502,6 +11502,24 @@ describe("native warm session supervision", () => {
       expect(alarm).toHaveLength(1);
     });
 
+    // A dead Runner cannot settle its close. Its existing containment receipt
+    // (durable suspension here; Launcher's task stop for plugin tasks) still
+    // retires it; anything less refuses.
+    it.each([true, false])("accepts a failed close only with the containment receipt (runner suspended: %s)", async runnerSuspended => {
+      const unsettled = new NativeSessionCloseUnrecoverableError({ runnerSuspended, providerDrained: false }, false);
+      const { errorCode, close, events } = await run(`warm-attach-dead-runner-${runnerSuspended}`,
+        (options, session) => rejectAttach(options, session, attachFailure()),
+        runnerSuspended ? async options => ({ result: { summary: "recalled" }, terminal: { runTerminalState: "succeeded" },
+          turnId: "t", normalizedSessionId: String(options.input.session.normalizedSessionId), providerSessionId: "p",
+          driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null }) : undefined,
+        async () => { throw unsettled; });
+      expect(close).toHaveBeenCalledWith({ reason: "warm runner attach failed" });
+      expect(state.execute).toHaveBeenCalledTimes(runnerSuspended ? 3 : 2);
+      expect(events.find(event => event.eventType === "native.warm_attach.failed")?.payload).toMatchObject(runnerSuspended
+        ? { state: "warm_attach_failed_cold_fallback" } : { state: "warm_attach_failed_refused", refusal: "retire_unproven" });
+      if (!runnerSuspended) expect(errorCode).toBe("native_session_interrupted");
+    });
+
     it("leaves a Stop during attach to the Stop path", async () => {
       const { events, alarm, close } = await run("warm-attach-stopped",
         (options, session) => rejectAttach(options, session, new Error("native_session_cancelled")));
