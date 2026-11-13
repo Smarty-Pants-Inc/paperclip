@@ -15995,7 +15995,10 @@ describe("runnerd provider runtime wiring", () => {
     },
   );
 
-  it("REG-03 never reuses a proven-lost warm entry when retirement is refused", async () => {
+  it.each([
+    { name: "REG-03 never reuses a proven-lost warm entry when retirement is refused", predecessorLeaseBound: true },
+    { name: "REG-03 refuses an unbound predecessor lease without reusing the stale warm entry", predecessorLeaseBound: false },
+  ])("$name", async ({ predecessorLeaseBound }) => {
     const first = { ...scopedNativeExecution("lost-warm-held"), schema: "paperclip.native-execution-input.v5" as const,
       provider: { kind: "codex" as const, model: null, approvalPolicy: "never" as const },
       executionMode: "default" as const, planningContext: null, runtimeContext: nativeRuntimeContextFixture() };
@@ -16026,12 +16029,28 @@ describe("runnerd provider runtime wiring", () => {
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: identity.runnerInstanceId,
         useRunnerd: true, runnerExecutionTarget: target as never });
+      const nextDb = leaseDb(next), select = nextDb.select.bind(nextDb);
+      nextDb.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
+        if (table !== environmentLeases) return select(fields as never).from(table as never);
+        // F2 permits generation-loss probes only on the predecessor's own allocation.
+        const rows = predecessorLeaseBound ? [{ id: identity.environmentLeaseId, companyId: first.binding.companyId,
+          heartbeatRunId: first.binding.runId, providerLeaseId: "same-box" }] : [];
+        const query = { then: Promise.resolve(rows).then.bind(Promise.resolve(rows)), where: () => query,
+          orderBy: () => query, limit: () => query };
+        return query;
+      } })) as unknown as Db["select"];
       const onEvent = vi.fn(async (_event: AdapterRuntimeEvent) => undefined);
-      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: identity.runnerInstanceId,
-        useRunnerd: true, onEvent, runnerExecutionTarget: { ...target,
+      const onLog = vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => undefined);
+      await expect(executePaperclipNativeSession({ db: nextDb, execution: next, runnerInstanceId: identity.runnerInstanceId,
+        useRunnerd: true, onEvent, onLog, runnerExecutionTarget: { ...target,
           sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box", restarted: true } } as never }))
-        .rejects.toThrow("prior_owner_terminal_state_indeterminate; retirement_refused=");
-      expect(execute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-generation-check"))).toBe(true);
+        .rejects.toThrow(predecessorLeaseBound
+          ? "prior_owner_terminal_state_indeterminate; retirement_refused="
+          : "runner_state_identity_mismatch: prior_owner_active");
+      if (!predecessorLeaseBound) expect(onLog).toHaveBeenCalledWith("stderr",
+        expect.stringContaining("not retired: restarted_sandbox_runner_predecessor_lease_unbound"));
+      expect(execute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-generation-check")))
+        .toBe(predecessorLeaseBound);
       expect(state.execute).toHaveBeenCalledOnce();
       expect(close).not.toHaveBeenCalled();
       expect(onEvent.mock.calls).not.toContainEqual([expect.objectContaining({ eventType: "run.startup.reuse",
