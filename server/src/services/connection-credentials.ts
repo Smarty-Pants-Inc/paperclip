@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import { companySecrets, companySecretVersions, companySecretProposals, managedAgentProfiles, routineTriggers, userSecretDefinitions, type Db, type connectionGrants, type toolConnections } from "@paperclipai/db";
-import type { ToolCredentialSecretRef } from "@paperclipai/shared";
+import type { McpConnectionCredentialRef, ToolCredentialSecretRef } from "@paperclipai/shared";
 import { connectionCredentialConfigPath } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 import { secretService } from "./secrets.js";
@@ -27,11 +27,26 @@ export async function connectionSecretsUsedByOtherConsumers(db: CredentialDb, se
 
 export function connectionGrantCredentialRef(
   grant: Pick<typeof connectionGrants.$inferSelect, "credentialSecretRefs">,
-  ref: { name: string },
+  ref: { name: string; placement?: string },
 ): ToolCredentialSecretRef | undefined {
-  return grant.credentialSecretRefs.find((candidate) =>
-    candidate.configPath === ref.name || candidate.configPath === connectionCredentialConfigPath(ref),
-  );
+  const configPath = connectionCredentialConfigPath(ref);
+  // Explicit paths win. Preserve the legacy credentials.* mapping, then allow
+  // a bare header name only when this grant actually declares that header.
+  return grant.credentialSecretRefs.find((candidate) => candidate.configPath === ref.name)
+    ?? grant.credentialSecretRefs.find((candidate) => candidate.configPath === configPath)
+    ?? (ref.placement === "header" && configPath !== ref.name
+      ? grant.credentialSecretRefs.find((candidate) => candidate.configPath === `headers.${ref.name}`)
+      : undefined);
+}
+
+/** Store the same canonical paths that discovery and invocation resolve. */
+export function canonicalConnectionCredentialRefs(
+  refs: McpConnectionCredentialRef[],
+  credentialSecretRefs: ToolCredentialSecretRef[],
+): McpConnectionCredentialRef[] {
+  return refs.map((ref) => ({ ...ref, name:
+    connectionGrantCredentialRef({ credentialSecretRefs }, ref)?.configPath ?? ref.name,
+  }));
 }
 
 /** Create/replace invocation credentials in the selected identity's vault. */

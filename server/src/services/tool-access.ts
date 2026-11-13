@@ -135,7 +135,7 @@ import {
   splitRemoteUrlCredential,
 } from "./remote-url-credentials.js";
 import { secretService } from "./secrets.js";
-import { connectionCredentialConfigPath as credentialRefConfigPath, validateConnectionGrantSecretOwnership, writeConnectionCredential } from "./connection-credentials.js";
+import { canonicalConnectionCredentialRefs, connectionCredentialConfigPath as credentialRefConfigPath, validateConnectionGrantSecretOwnership, writeConnectionCredential } from "./connection-credentials.js";
 
 import type { ConfigureRailwaySsh, RailwaySshSetup } from "@paperclipai/shared";
 import { generateRailwaySshKey, RAILWAY_SSH_SECRET_PATH, validateRailwayKnownHosts } from "./railway-ssh.js";
@@ -4627,7 +4627,7 @@ export function toolAccessService(
             transportConfig: isGoogleSheetsConnectionConfig(config)
               ? config
               : (input.transportConfig ?? config),
-            credentialRefs: input.credentialRefs ?? [],
+            credentialRefs: canonicalConnectionCredentialRefs(input.credentialRefs ?? [], input.credentialSecretRefs ?? []),
             credentialSecretRefs: input.credentialSecretRefs ?? [],
             createdByAgentId:
               binding.actorType === "agent" ? binding.actorId : null,
@@ -4714,7 +4714,10 @@ export function toolAccessService(
           transportConfig: isGoogleSheetsConnectionConfig(config)
             ? config
             : (input.transportConfig ?? config),
-          credentialRefs: input.credentialRefs ?? existing.credentialRefs,
+          credentialRefs: canonicalConnectionCredentialRefs(
+            input.credentialRefs ?? existing.credentialRefs,
+            input.credentialSecretRefs ?? existing.credentialSecretRefs,
+          ),
           credentialSecretRefs:
             input.credentialSecretRefs ?? existing.credentialSecretRefs,
           credentialPolicy: input.credentialPolicy ?? existing.credentialPolicy,
