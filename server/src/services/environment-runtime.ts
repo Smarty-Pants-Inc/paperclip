@@ -52,6 +52,7 @@ import { resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
 import type { EffectiveExecutionCapabilities } from "@paperclipai/adapter-utils/execution-target";
 import { MAX_SANDBOX_SYNC_TIMEOUT_MS } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
+import { remoteCommandArgv, remoteCommandEnvironment } from "@paperclipai/adapter-utils/remote-command-environment";
 import type {
   CommandManagedDuplexChannel,
 } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -4658,7 +4659,15 @@ export function environmentRuntimeService(
       if (!driver.execute) {
         throw new Error(`Environment driver "${driver.driver}" does not support command execution.`);
       }
-      return await driver.execute(input);
+      // Never invent an env map: providers such as Boat need a private env-file
+      // directory for one, which bootstrap/probe commands do not yet have.
+      if (input.env !== undefined) {
+        return await driver.execute({ ...input, env: remoteCommandEnvironment(input.env) });
+      }
+      // Carry the policy through the existing command/args contract instead.
+      // No shell or argument reconstruction; runnerd/Pi may not exist yet.
+      const [command, ...args] = remoteCommandArgv([input.command, ...(input.args ?? [])]);
+      return await driver.execute({ ...input, command: command!, args });
     },
 
     supportsSync(input: EnvironmentDriverLeaseInput): boolean {
@@ -4720,7 +4729,7 @@ export function environmentRuntimeService(
       if (effective.duplexCommandStream !== true) {
         throw new Error(DUPLEX_CHANNEL_CAPABILITY_DENIED);
       }
-      return await driver.openDuplexChannel(input);
+      return await driver.openDuplexChannel({ ...input, command: remoteCommandArgv(input.command) });
     },
 
     async getRunnerIngressEndpoint(

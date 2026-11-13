@@ -3,6 +3,7 @@ import { createNativeAcpxDistributionSnapshot, NATIVE_ACPX_BOOTSTRAP_NAME, readN
 export type { NativeAcpxDistributionInput } from "./native-distribution-integrity.js";
 import { createHash } from "node:crypto";
 import { executableDigestCache, type ExecutableFileIdentity } from "../../executable-digest-cache.js";
+import { nodeCompileCacheEnvironment } from "../../node-compile-cache-environment.js";
 import {
   spawn as spawnChildProcess,
   type ChildProcess,
@@ -254,7 +255,7 @@ try {
   watchdog = spawn(runtimeExecutable, ["--eval", WATCHDOG_SOURCE], {
     cwd: process.cwd(),
     detached: false,
-    env: {},
+    env: ${JSON.stringify(nodeCompileCacheEnvironment(undefined))},
     shell: false,
     stdio: watchdogStdio,
     windowsHide: true,
@@ -1905,7 +1906,10 @@ export function sanitizedNodeEnvironment(
       delete sanitized[key];
     }
   }
-  return sanitized;
+  // Minimal probe envs and credential-free guardians must be safe too. This
+  // launch boundary does not verify a process-local private cache; native Pi's
+  // separate owner still may enable its verified cache.
+  return { ...sanitized, ...nodeCompileCacheEnvironment(undefined) };
 }
 
 function snapshotBootstrap(format: AcpxCommandFormat, guarded = false): string {
