@@ -19,6 +19,7 @@ import {
   issueAccessGrants,
   issues,
   nativeRunFinalizations,
+  runUsageReceipts,
   toolApplications,
   toolConnections,
   workspaceOperations,
@@ -35,6 +36,9 @@ import { authorizationService } from "../services/authorization.js";
 import { canActorReadWorkspaceOperation, getHeartbeatRunReadDecisions } from "../services/heartbeat-run-privacy.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
+import { createNativeUsageDelivery } from "../services/native-runtime/native-usage-delivery.js";
+import type { UsageReceiptEnvelope } from "../services/usage-receipts.js";
+import { QUALIFIED_PI_RPC_PROFILE, type PrpEvent } from "../vendor/paperclip-runner/index.js";
 
 const externalDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_RUN_LOG_PRIVACY_TEST_DATABASE_URL");
 const embeddedPostgresSupport = externalDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -263,6 +267,45 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     app.use(errorHandler);
     return app;
   }
+
+  it("exposes the missing Pi summary lower bound in the run API after receipt replay and another turn", async () => {
+    const f = await seedFixture(), runnerInstanceId = randomUUID();
+    const runId = f.privateRunId;
+    await db.update(heartbeatRuns).set({ runnerInstanceId, runtimeMode: "native", costAccountingPending: true })
+      .where(eq(heartbeatRuns.id, runId));
+    const input = { companyId: f.companyId, runId, runnerInstanceId,
+      provider: { kind: "pi_rpc" as const, profile: QUALIFIED_PI_RPC_PROFILE, model: "paperclip/faux", piRpcThinkingLevel: "xhigh" as const },
+      billing: { provider: "anthropic", biller: "unknown", billingType: "unknown" as const } };
+    let delivery = await createNativeUsageDelivery(db, input);
+    let sequence = 0;
+    const capture = async (eventType: string, turnId: string, payload: Record<string, unknown> = {}) => {
+      await delivery.capture({ schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "runner",
+        sourceInstanceId: runnerInstanceId, sourceEventId: `summary-${++sequence}`, sourceSeq: sequence,
+        priority: 0, runId, normalizedSessionId: "summary-session", emittedAt: new Date().toISOString(),
+        eventType, turnId, payload } as PrpEvent);
+    };
+    await capture("turn.started", "compacting");
+    await capture("usage.reported", "compacting", { runDeltaAvailable: true,
+      runDelta: { inputTokens: 11, outputTokens: 3 }, summaryUsage: "unknown", accountingUsageLost: true });
+    await capture("turn.completed", "compacting");
+    delivery = await createNativeUsageDelivery(db, input);
+    await capture("turn.started", "later");
+    await capture("usage.reported", "later", { runDeltaAvailable: true, runDelta: { inputTokens: 7, outputTokens: 5 } });
+    await capture("turn.completed", "later");
+    const receipts = await db.select().from(runUsageReceipts).where(eq(runUsageReceipts.runId, runId));
+    expect(receipts).toHaveLength(6);
+    const latest = receipts.find(receipt => receipt.sequence === sequence)!;
+    expect(latest.receiptJson.receipt).toMatchObject({ complete: true, usage: { inputTokens: 18, outputTokens: 8 },
+      pricingProvenance: { source: "unknown", evidence: expect.stringMatching(/summary.*unknown.*lower bound/i) } });
+    expect((receipts.find(receipt => receipt.sequence === 2)!.receiptJson as UsageReceiptEnvelope).producerEvent?.usage)
+      .toMatchObject({ summaryUsage: "unknown", accountingUsageLost: true });
+    const response = await request(createApp(f.companyId, f.ownerAgentId))
+      .get(`/api/heartbeat-runs/${runId}`).expect(200);
+    expect(response.body.usageJson).toMatchObject({ inputTokens: 18, outputTokens: 8,
+      accountingReceiptReady: true, costStatus: "unpriced", pricingProvenance: {
+        source: "unknown", evidence: expect.stringMatching(/summary.*unknown.*lower bound/i),
+      } });
+  });
 
   it("lists workspace operations with small run reads and checks a revoked issue grant again", async () => {
     const f = await seedFixture(), payload = "workspace-operation-saved-input🙂".repeat(25_000);

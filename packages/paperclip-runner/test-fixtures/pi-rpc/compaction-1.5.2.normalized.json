@@ -297,7 +297,8 @@
         "runDeltaComplete": false,
         "costComplete": false,
         "childUsage": "unknown",
-        "summaryUsage": "unknown"
+        "summaryUsage": "unknown",
+        "accountingUsageLost": true
       }
     }
   },
@@ -332,7 +333,8 @@
         "runDeltaComplete": false,
         "costComplete": false,
         "childUsage": "unknown",
-        "summaryUsage": "unknown"
+        "summaryUsage": "unknown",
+        "accountingUsageLost": true
       }
     }
   },

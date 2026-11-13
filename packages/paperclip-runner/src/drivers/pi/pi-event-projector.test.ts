@@ -103,10 +103,10 @@ describe("Pi compaction lifecycle and warning projection (L17)", () => {
       const expected = uninterrupted.project(message);
       expect(events.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({
         runDelta: { inputTokens: 11 + index * 7, outputTokens: 3 + index * 5, cachedInputTokens: 2 + index * 2, cacheWriteTokens: 0 },
-        runDeltaComplete: true, costComplete: true,
+        runDeltaComplete: true, costComplete: false, summaryUsage: "unknown", accountingUsageLost: true,
       });
-      expect(events.filter(event => event.eventType === "usage.reported" || event.payload.kind === "usage"))
-        .toEqual(expected.filter(event => event.eventType === "usage.reported" || event.payload.kind === "usage"));
+      expect((events.find(event => event.payload.kind === "usage")?.payload.usage as Record<string, unknown>).runDelta)
+        .toEqual((expected.find(event => event.payload.kind === "usage")?.payload.usage as Record<string, unknown>).runDelta);
       expect(events.find(event => event.eventType === "usage.reported")?.payload).toMatchObject({
         runDeltaAvailable: true, accountingComplete: true,
         runDelta: { inputTokens: 7, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 0, providerCostUsd: 0.03 },
@@ -133,7 +133,7 @@ describe("Pi compaction lifecycle and warning projection (L17)", () => {
     for (const event of events.map(envelope)) expect(validatePrpEvent(event), event.eventType).toMatchObject({ ok: true });
     const finalEvents = projector.project(final({ usage }));
     expect(finalEvents.find(event => event.payload.kind === "agentMessage")).toMatchObject({ eventType: "item.completed", payload: { text: "final" } });
-    expect(finalEvents.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({ runDeltaComplete: true, costComplete: true });
+    expect(finalEvents.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({ runDeltaComplete: true, costComplete: false, summaryUsage: "unknown" });
     const replay = [...started, ...events, ...finalEvents].map(envelope);
     const seed = createSessionSnapshotFromMetadata({
       fixtureName: "pi-compaction-warning", identity: { schema: "paperclip.prp.identity.v1", companyId: "synthetic-peer", issueId: "native-pi", runId: "run", environmentLeaseId: "loopback-only", runnerInstanceId: "capture", normalizedSessionId: "pi-session", driverSessionId: "native-session" },
@@ -481,8 +481,22 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" }); projector.project(final({ usage }));
     const events = projector.project({ type, result: { usage } });
     expect(events[0].payload.usage).toMatchObject({ source: "pi_summarization_unaccounted", total: { inputTokens: 11, totalTokens: 16 }, runDelta: {}, runDeltaComplete: false, costComplete: false, summaryUsage: "unknown" });
-    expect(projector.project(final({ responseId: "reply-2", usage })).at(-1)?.payload.usage).toMatchObject({ runDeltaComplete: true, costComplete: true });
+    expect(projector.project(final({ responseId: "reply-2", usage })).at(-1)?.payload.usage).toMatchObject({ runDeltaComplete: true, costComplete: false, summaryUsage: "unknown", accountingUsageLost: true });
   });
+  it("retains unknown summary usage on every later measured receipt", () => {
+    const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" });
+    projector.project(final({ usage }));
+    projector.project({ type: "compaction_start" });
+    projector.project({ type: "compaction_end" });
+    const events = projector.project(final({ responseId: "after-summary", usage }));
+    expect(events.find(event => event.eventType === "usage.reported")?.payload)
+      .toMatchObject({ summaryUsage: "unknown", accountingUsageLost: true, runDeltaAvailable: true });
+    expect(events.at(-1)?.payload.usage).toMatchObject({
+      summaryUsage: "unknown", accountingUsageLost: true, runDeltaComplete: true, costComplete: false,
+      total: { inputTokens: 22, outputTokens: 6 },
+    });
+  });
+
   it("does not treat default zero usage on a failed native call as complete billing", () => {
     const events = createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ stopReason: "error", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } }));
     expect(events.at(-1)?.payload.usage).toMatchObject({ total: { totalTokens: 0 }, runDeltaComplete: false, costComplete: false });

@@ -506,6 +506,31 @@ describe("Pi RPC app-server facade proxy", () => {
     } finally { await proxy.close(); }
   });
 
+  it("keeps summary usage unknown across turns but not across warm run attachment", async () => {
+    const sink = new FakeSink();
+    const session = Object.assign(new FakeSession(), { async attachRun() {} });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 125, "thread/start", { model: "neutral/model" });
+      session.push("item.completed", { kind: "usage", usage: {
+        runDelta: {}, runDeltaComplete: false, summaryUsage: "unknown",
+      } }, "turn-a", "summary", "run-1");
+      const payload = { providerRequestId: "later", runDeltaAvailable: true,
+        accountingComplete: true, runDelta: { inputTokens: 11, outputTokens: 3 } };
+      session.push("usage.reported", payload, "turn-b", "later", "run-1");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1))
+        .toMatchObject({ params: { summaryUsage: "unknown", accountingUsageLost: true,
+          tokenUsage: { last: { inputTokens: 11, outputTokens: 3 } } } });
+      await request(proxy, sink, 126, "run.attach", { runId: "run-2" });
+      session.push("usage.reported", { ...payload, providerRequestId: "new-run" }, "turn-c", "new-run", "run-2");
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const last = sink.decoded().filter(frame => frame.method === "thread/tokenUsage/updated").at(-1)!;
+      expect(last.params).not.toHaveProperty("summaryUsage");
+      expect(last.params).not.toHaveProperty("accountingUsageLost");
+    } finally { await proxy.close(); }
+  });
+
   it("reconciles T1-T4 turn snapshots to the sum of native Pi message receipts", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });
