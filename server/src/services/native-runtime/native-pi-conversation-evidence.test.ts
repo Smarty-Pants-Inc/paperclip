@@ -66,18 +66,38 @@ it("retains a renamed Pi JSONL session by its first-line header and preserves it
   expect(createHash("sha256").update(await readFile(join(f.evidence, scope, leaf!, "renamed.data"))).digest("hex")).toBe(before);
 });
 
-it("fails closed and retains bytes when a candidate first line exceeds the scan bound", async () => {
+it("cleans a non-Pi tree of ordinary readable files (binary, log, lock, empty, other JSON)", async () => {
   const f = await fixture();
   await rm(join(f.source, f.directory), { recursive: true, force: true });
-  const bytes = Buffer.alloc(4 * 1024 + 8, 0x61);
-  await writeFile(join(f.source, "opaque.bin"), bytes);
+  await writeFile(join(f.source, "opaque.bin"), Buffer.alloc(4 * 1024 + 8, 0x61));
+  await writeFile(join(f.source, "run.log"), "plain log line\nanother\n");
+  await writeFile(join(f.source, "x.lock"), "");
+  await writeFile(join(f.source, "other.json"), '{"type":"message","id":"m1"}\n');
 
   await removeNativeHarnessBackup(f.source);
 
   await expect(lstat(f.source)).rejects.toMatchObject({ code: "ENOENT" });
-  const [leaf] = await readdir(join(f.evidence, scope));
-  expect(createHash("sha256").update(await readFile(join(f.evidence, scope, leaf!, "opaque.bin"))).digest("hex"))
-    .toBe(createHash("sha256").update(bytes).digest("hex"));
+  await expect(lstat(join(f.evidence, scope))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("keeps a renamed Pi JSONL among ordinary files, and a session-prefixed first line cut by the read cap", async () => {
+  for (const bytes of [
+    Buffer.from('{"type":"session","version":3,"id":"abc123"}\n{"type":"message"}\n'),
+    Buffer.concat([Buffer.from('{"type":"session","cwd":"'), Buffer.alloc(4 * 1024 + 8, 0x61), Buffer.from('"}\n')]),
+  ]) {
+    const f = await fixture();
+    await rm(join(f.source, f.directory), { recursive: true, force: true });
+    await writeFile(join(f.source, "opaque.bin"), Buffer.alloc(64, 0x00));
+    await writeFile(join(f.source, "run.log"), "plain log line\n");
+    await writeFile(join(f.source, "renamed.data"), bytes);
+    const before = createHash("sha256").update(bytes).digest("hex");
+
+    await removeNativeHarnessBackup(f.source);
+
+    await expect(lstat(f.source)).rejects.toMatchObject({ code: "ENOENT" });
+    const [leaf] = await readdir(join(f.evidence, scope));
+    expect(createHash("sha256").update(await readFile(join(f.evidence, scope, leaf!, "renamed.data"))).digest("hex")).toBe(before);
+  }
 });
 
 it.each(["pi", "pi-agent", "acpx/conversation/pi-home", "legacy/.pi"])(
