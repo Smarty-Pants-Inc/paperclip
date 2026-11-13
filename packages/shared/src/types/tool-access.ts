@@ -1447,6 +1447,7 @@ export type ToolAccessReasonCode =
   | "deny_policy_block"
   | "deny_run_context_mismatch"
   | "deny_missing_agent"
+  | "deny_not_installed_for_agent"
   | "rate_limited";
 
 export interface ToolAccessSelector {
