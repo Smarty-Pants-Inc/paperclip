@@ -996,6 +996,7 @@ impl SupervisedProcess {
             None,
             None,
             false,
+            true,
         )
     }
 
@@ -1016,6 +1017,7 @@ impl SupervisedProcess {
             None,
             Some(cwd),
             false,
+            true,
         )
     }
 
@@ -1031,11 +1033,13 @@ impl SupervisedProcess {
             max_line_bytes,
             additional_environment_keys,
             false,
+            true,
         )
     }
 
-    /// Recover only framing rejections; real stdout I/O errors remain fatal.
-    /// Other launch paths retain the original fail-closed reader policy.
+    /// Native Pi: recover only framing rejections; real I/O errors stay fatal.
+    /// Its environment is a closed allowlist, never configured-env projection.
+    /// Other launch paths retain their reader and task-environment policies.
     pub(crate) fn spawn_verified_with_recoverable_stdout(
         launch: &VerifiedProcessLaunch,
         shutdown_grace: Duration,
@@ -1048,6 +1052,7 @@ impl SupervisedProcess {
             max_line_bytes,
             additional_environment_keys,
             true,
+            false,
         )
     }
 
@@ -1057,6 +1062,7 @@ impl SupervisedProcess {
         max_line_bytes: usize,
         additional_environment_keys: &[&str],
         recover_oversized_stdout: bool,
+        allow_configured_environment: bool,
     ) -> Result<Self, LocalRunnerError> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -1072,6 +1078,7 @@ impl SupervisedProcess {
                     .then_some(inherited.program.as_path()),
                 None,
                 recover_oversized_stdout,
+                allow_configured_environment,
             );
             #[cfg(target_os = "macos")]
             if let Ok(process) = result.as_mut() {
@@ -1090,6 +1097,7 @@ impl SupervisedProcess {
                 max_line_bytes,
                 additional_environment_keys,
                 recover_oversized_stdout,
+                allow_configured_environment,
             );
             Err(LocalRunnerError::invalid(
                 "verified process launch is supported only on Linux and macOS",
@@ -1106,6 +1114,7 @@ impl SupervisedProcess {
         verified_runtime_executable: Option<&Path>,
         cwd: Option<&Path>,
         recover_oversized_stdout: bool,
+        allow_configured_environment: bool,
     ) -> Result<Self, LocalRunnerError> {
         let mut command = Command::new(program);
         if let Some(cwd) = cwd {
@@ -1143,13 +1152,32 @@ impl SupervisedProcess {
         .into_iter()
         .chain(additional_environment_keys.iter().copied())
         {
+            if !allow_configured_environment && key.starts_with("PAPERCLIP_RUNTIME_NOTIFICATION_") {
+                continue;
+            }
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }
         }
-        crate::configured_environment::apply_configured_environment(&mut command, |key| {
-            std::env::var(key).ok()
-        })?;
+        if allow_configured_environment {
+            crate::configured_environment::apply_configured_environment(&mut command, |key| {
+                std::env::var(key).ok()
+            })?;
+        } else {
+            // Locale values are nonsecret runtime settings, unlike arbitrary task
+            // vars. Native Pi must not regain secrets through the configured marker.
+            for (key, value) in std::env::vars_os() {
+                if key.to_str().is_some_and(|key| {
+                    key.starts_with("LC_")
+                        && key.len() <= 35
+                        && key[3..]
+                            .bytes()
+                            .all(|b| b == b'_' || b.is_ascii_uppercase() || b.is_ascii_digit())
+                }) {
+                    command.env(key, value);
+                }
+            }
+        }
         if let Some(executable) = verified_runtime_executable {
             // Node reports a sealed memfd launch as `/memfd:... (deleted)` via
             // process.execPath. Give descriptor-loaded runtimes the inherited,
