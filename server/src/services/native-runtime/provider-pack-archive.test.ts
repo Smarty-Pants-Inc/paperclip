@@ -1,6 +1,7 @@
 import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { PassThrough } from "node:stream";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -8,6 +9,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pack-archive.js";
 import { providerPackTransferTimeoutMs } from "./provider-pack-transfer.js";
+import { SandboxStoppedError } from "../sandbox-stopped-error.js";
 import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 // @ts-expect-error Build-time script has no TypeScript declaration.
 import { createProviderPackArchive, createProviderPackLayers } from "../../../../scripts/create-provider-pack-archive.mjs";
@@ -101,6 +103,79 @@ it.each([
   [1024 * 1024 * 1024 * 2, 1_800_000],
 ])("bounds the provider archive transfer deadline for %i bytes", (bytes, expected) => {
   expect(providerPackTransferTimeoutMs(bytes)).toBe(expected);
+});
+
+it.skipIf(!tar || !hasZstd)("maps a stopped sandbox after transfer to a stable staging error", async () => {
+  const { root, archive } = await fixture();
+  const targetPath = path.join(root, "stopped");
+  const remote = await runner(root);
+  remote.execute.mockImplementation(async () => ({ exitCode: 0, signal: null, pid: null, startedAt: null,
+    timedOut: false, stdout: "", stderr: "" }));
+  remote.execute.mockResolvedValueOnce({ exitCode: 0, signal: null, pid: null, startedAt: null,
+    timedOut: false, stdout: "", stderr: "" });
+  remote.execute.mockRejectedValueOnce(Object.assign(new Error("Boat 409 Sandbox is stopped"), { status: 409 }));
+  await expect(stageProviderPackArchive({ archive, runner: remote, targetPath }))
+    .rejects.toThrow("runner_remote_provider_pack_sandbox_stopped");
+});
+
+it.skipIf(!tar || !hasZstd)("rethrows a typed sandbox-stopped error unchanged during transfer", async () => {
+  const { root, archive } = await fixture();
+  const remote = await runner(root);
+  const stopped = new SandboxStoppedError("still_stopped", new Error("command rejected"));
+  remote.syncIn.mockRejectedValue(stopped);
+  await expect(stageProviderPackArchive({ archive, runner: remote, targetPath: path.join(root, "typed-stopped") }))
+    .rejects.toBe(stopped);
+});
+
+it.skipIf(!tar || !hasZstd)("does not map a signed upload URL 404 to sandbox stopped", async () => {
+  const { root, archive } = await fixture();
+  const remote = await runner(root);
+  const expiredUrl = Object.assign(new Error("signed upload URL returned 404"), { status: 404 });
+  remote.syncIn.mockRejectedValue(expiredUrl);
+  await expect(stageProviderPackArchive({ archive, runner: remote, targetPath: path.join(root, "expired-upload") }))
+    .rejects.toBe(expiredUrl);
+});
+
+it.skipIf(!tar || !hasZstd)("treats a signal-killed extract as a generic extract failure", async () => {
+  const { root, archive } = await fixture();
+  const remote = await runner(root);
+  remote.execute.mockResolvedValueOnce({ exitCode: 0, signal: null, pid: null, startedAt: null,
+    timedOut: false, stdout: "", stderr: "" });
+  remote.execute.mockResolvedValueOnce({ exitCode: null, signal: "SIGKILL", pid: null, startedAt: null,
+    timedOut: false, stdout: "", stderr: "" });
+  await expect(stageProviderPackArchive({ archive, runner: remote, targetPath: path.join(root, "signal-killed") }))
+    .rejects.toThrow("runner_remote_provider_archive_extract_failed");
+});
+
+it.skipIf(!tar || !hasZstd)("maps a transfer timeout to a stable staging error", async () => {
+  const { root, archive } = await fixture();
+  const remote = await runner(root);
+  remote.syncIn.mockRejectedValue(new Error("sync timed out"));
+  await expect(stageProviderPackArchive({ archive, runner: remote, targetPath: path.join(root, "timeout") }))
+    .rejects.toThrow("runner_remote_provider_pack_transfer_timeout");
+});
+
+it.skipIf(!tar || !hasZstd)("bounds verification of missing layered archive bytes", async () => {
+  const { root, archive } = await layeredFixture();
+  const handle = await fs.open(archive.sourceRoot + "/overlay.tar.zst", "r");
+  const prototype = Object.getPrototypeOf(handle) as typeof handle;
+  await handle.close();
+  let pending: PassThrough | undefined;
+  const stream = vi.spyOn(prototype, "createReadStream").mockImplementation(options => {
+    pending = new PassThrough();
+    options?.signal?.addEventListener("abort", () => pending?.destroy(new Error("aborted")), { once: true });
+    return pending as unknown as ReturnType<typeof handle.createReadStream>;
+  });
+  const cleanupTimer = setTimeout(() => pending?.destroy(new Error("verification test cleanup")), 100);
+  const remote = {
+    syncIn: vi.fn(),
+    execute: vi.fn().mockResolvedValue({ exitCode: 0, signal: null, pid: null, startedAt: null,
+      timedOut: false, stdout: "[]", stderr: "" }),
+  };
+  try {
+    await expect(stageProviderPackArchive({ archive, runner: remote, targetPath: path.join(root, "verify"), verifyTimeoutMs: 5 }))
+      .rejects.toThrow("runner_remote_provider_archive_verify_timeout");
+  } finally { clearTimeout(cleanupTimer); stream.mockRestore(); }
 });
 
 it.skipIf(!tar || !hasZstd).each(["v1", "v2"])("gives a slow %s archive transfer the native sync deadline override", async version => {
