@@ -1,4 +1,5 @@
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { createHash } from "node:crypto";
 import { heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { NativeSession } from "../../vendor/paperclip-runner/index.js";
@@ -162,7 +163,7 @@ export async function recordNativeProviderPackAdmission(db: Db, input: Admission
       const code = nativeProviderPackAdmissionFailureCode(error);
       if (!input.waitForClaim || attempt >= NATIVE_PROVIDER_PACK_ADMISSION_ATTEMPTS
         || !code || !CONTENDED_ADMISSION_CODES.has(code)) throw error;
-      await new Promise(resolve => setTimeout(resolve, 100 * attempt));
+      await measureNativeControllerStep("admission_retry_wait", () => new Promise(resolve => setTimeout(resolve, 100 * attempt)));
     }
   }
 }
@@ -173,26 +174,26 @@ async function recordNativeProviderPackAdmissionOnce(db: Db, input: AdmissionInp
     // Bounds every lock wait below, including the run-row lock. A run-event
     // append holds that row FOR UPDATE for milliseconds; NOWAIT there lost the
     // admission and then failed the run as admission_unverified.
-    await tx.execute(sql`select set_config('lock_timeout', '1000ms', true)`);
+    await measureNativeControllerStep("admission_lock_timeout", () => tx.execute(sql`select set_config('lock_timeout', '1000ms', true)`));
     if (input.waitForClaim) {
       await assertNativeRunnerCheckpointOwner(tx, { companyId: input.identity.companyId,
         issueId: input.identity.issueId, runId: input.identity.runId, authorityRunId: input.identity.runId,
         bootId: input.claim.controllerBootId, leaseOwner: input.claim.leaseOwner,
         generation: input.claim.controllerGeneration }, false);
     }
-    const [owner] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+    const [owner] = await measureNativeControllerStep("admission_owner_lock", () => tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.runId, input.identity.runId), eq(nativeRunFinalizations.companyId, input.identity.companyId),
       eq(nativeRunFinalizations.issueId, input.identity.issueId), eq(nativeRunFinalizations.leaseOwner, input.claim.leaseOwner),
       eq(nativeRunFinalizations.attempt, input.claim.attempt), eq(nativeRunFinalizations.controllerGeneration, input.claim.controllerGeneration),
       eq(nativeRunFinalizations.controllerBootId, input.claim.controllerBootId), gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`),
       eq(nativeRunFinalizations.phase, "observed"), isNull(nativeRunFinalizations.resultId),
-    )).for("update", { noWait: true }).limit(1);
+    )).for("update", { noWait: true }).limit(1));
     if (!owner) return false;
-    const [run] = await tx.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+    const [run] = await measureNativeControllerStep("admission_run_lock", () => tx.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.identity.runId), eq(heartbeatRuns.companyId, input.identity.companyId),
       eq(heartbeatRuns.agentId, input.identity.agentId), eq(heartbeatRuns.nativeIssueId, input.identity.issueId),
       eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
-    )).for("update").limit(1);
+    )).for("update").limit(1));
     if (!run) return false;
     const current = run.profile?.nativeProviderPackAdmissionState as Record<string, unknown> | undefined;
     if (current?.schema !== "paperclip.native-provider-pack-admission-state.v1" || current.admissionEpoch !== input.admissionEpoch
@@ -205,13 +206,13 @@ async function recordNativeProviderPackAdmissionOnce(db: Db, input: AdmissionInp
     if (verified && current.state === "verified") return true;
     const patch = { ...(verified && previous == null ? { nativeProviderPackAdmission: receipt } : {}),
       nativeProviderPackAdmissionState: { ...nativeProviderPackAdmissionPending(input.admissionEpoch), state: verified ? "verified" : "unknown" } };
-    const saved = await tx.update(heartbeatRuns).set({
+    const saved = await measureNativeControllerStep("admission_write", () => tx.update(heartbeatRuns).set({
       runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb`,
       updatedAt: new Date(),
     }).where(and(eq(heartbeatRuns.id, input.identity.runId), eq(heartbeatRuns.companyId, input.identity.companyId),
       eq(heartbeatRuns.agentId, input.identity.agentId), eq(heartbeatRuns.nativeIssueId, input.identity.issueId),
       eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
-    )).returning({ id: heartbeatRuns.id });
+    )).returning({ id: heartbeatRuns.id }));
     return verified && saved.length === 1;
   });
 }

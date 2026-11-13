@@ -1,4 +1,5 @@
 import { measureRunPhase } from "../execution-preparation-timing.js";
+import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { environmentTaskOperationSchema, environmentTaskResultSchema, parseEnvironmentTaskResult, type PluginEnvironmentTaskOperation, type PluginEnvironmentTaskResult, type PluginEnvironmentTaskCredential } from "@paperclipai/plugin-sdk";
@@ -85,7 +86,7 @@ export function createPluginRunnerTaskOwner(input: {
   const call = async (operation: PluginEnvironmentTaskOperation) => {
     const phase = ({ prepare: "execution.plugin_prepare", check_project_auth: "execution.plugin_project_auth",
       submit: "execution.plugin_submit", connection: "execution.plugin_connection" } as const)[operation.kind as "prepare" | "check_project_auth" | "submit" | "connection"];
-    return parseEnvironmentTaskResult(operation, taskId, await (phase
+    return parseEnvironmentTaskResult(operation, taskId, await measureNativeControllerStep(`boat_${operation.kind}`, () => phase
       ? measureRunPhase(phase, () => input.task(operation, { expectedTaskId: taskId })) : input.task(operation, { expectedTaskId: taskId })));
   };
   let removeStartupAbort = () => {};
@@ -305,7 +306,7 @@ export function createPluginRunnerTaskOwner(input: {
               || ["runnerInstanceId", "environmentLeaseId", "normalizedSessionId"].some(key => desired[key as keyof DurableRecoveryIdentity] !== input.adoptIdentity![key as keyof DurableRecoveryIdentity])) {
               throw new Error("Plugin Runner adoption identity mismatch");
             }
-          } else await running;
+          } else await measureNativeControllerStep("runner_running", () => running);
           if (registrationReleased || signal?.aborted) throw new Error("Plugin Runner startup cancelled");
           const ingress = await endpoint();
           if (registrationReleased || signal?.aborted) throw new Error("Plugin Runner startup cancelled");
@@ -314,11 +315,11 @@ export function createPluginRunnerTaskOwner(input: {
           outbound = connectRunnerPrpIngress({ authority, endpoint: ingress });
           activeOutbound = outbound;
           void outbound.failure?.catch(rejectFailure);
-          await outbound.ready;
+          await measureNativeControllerStep("socket_ready", () => outbound!.ready);
         })();
         void activation.catch(() => undefined);
       },
-      ready: async () => { await activation; },
+      ready: async () => { await measureNativeControllerStep("ingress_activation", () => activation); },
       failure,
       checkpoint: async (settlement: "settled" | "unsettled") => {
         if (submitted) { stopRequested = true; await stopAndConfirm(); }

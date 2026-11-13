@@ -174,6 +174,49 @@ and `harness_state.launch_material` for remote state inspection and fresh launch
 material. These events retain the existing schema and carry no paths or exception strings.
 They also become native Observability spans only with an operator OTLP endpoint.
 
+## Controller warm-start wait steps
+
+The existing native `run.performance.span` path records
+`native.controller.resume.<step>` inside `runner.session.resume`, and
+`native.controller.submit.<step>` inside `runner.turn.submitted_to_started`.
+These use the same schema, `durationMs`, `wallStartedAtMs`, and `parentSpan` as
+other native run spans, with no operator endpoint required. They also use the
+existing optional native Observability export; they are not Telemetry.
+
+The controller observes its existing awaited boundaries: transport attach,
+prepare, resume, turn-start, registration, command acknowledgement and
+started-event waits (`transport_*`); lease-bound task RPCs (`boat_<operation>`,
+where operation is the validated task operation kind); ingress activation,
+socket authentication and process readiness; process-start intent; run authority
+and finalization-owner reads; coordinator and checkpoint-owner row locks;
+checkpoint transactions, reads and writes; provider-pack admission locks,
+writes and retry waits; queued input and attachment preparation; and committed
+event accounting, question/goal projections, logging and span persistence.
+The existing `native.controller.<phase>` preparation measurements remain in
+place. Environment/credential preparation completed before
+`native.session.execute` is outside the resume wrapper, not charged to it.
+A step is emitted only when that path executes; an absent step does not prove a
+zero-cost operation or an unobserved advisory lock/ingress wait.
+
+Step durations are **exclusive wall time**, not inclusive RPC elapsed time.
+Nested and concurrent observations are partitioned, giving the latest-started
+wait precedence and leaving an outer RPC's remaining time under its own name.
+Sub-millisecond steps retain a zero-duration receipt. All intervals are clipped
+to the same Runner-emitted milestones as their wrapper, even when the controller
+observes an event later or a command is still awaiting its acknowledgement.
+Consequently the step durations sum to no more than the wrapper's duration;
+unobserved time remains unattributed rather than being labelled as a DB or
+socket wait. Retained transports resolve the current attempt's timing context
+on each call, not the run that created the transport.
+
+Timestamp observation adds no awaited operation. Step rows are buffered through
+`turn.started` (or trace finish on an incomplete startup), then use the existing
+ordered deferred run-log sink. In particular, the new diagnostic writes do not
+compete for the startup DB pool before the measured turn starts. Diagnostic sink
+failures do not change operation results or errors. Only bounded step names,
+numeric timestamps/durations and outcomes are recorded: no secrets, environment
+values, prompts, provider identifiers or exception messages.
+
 ## Local runner startup sub-steps
 
 `run.performance.span` splits a local Runner startup (`runner.session.bootstrap` or
