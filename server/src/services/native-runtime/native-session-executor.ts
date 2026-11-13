@@ -5994,10 +5994,11 @@ function restartedSandboxResume(target: AdapterExecutionTarget | null | undefine
     && target.sandboxLeaseAcquisition?.outcome === "resumed" && target.sandboxLeaseAcquisition.restarted === true;
 }
 
-/** The prior Runner of a provider-restarted sandbox is lost, not live: its
- * process died with the machine and it never suspended. Return its exact
- * identity only when the ordinary finished-owner proofs pass (committed or
- * cleanly stopped result, released lease, stopped controller, settled
+/** The prior Runner of a sandbox resumed from a stopped state is lost only when
+ * its process generation is proven gone on the box (remoteRunnerGenerationLost,
+ * inside the finished-owner proofs); the resume itself proves nothing. Return
+ * its exact identity only when every proof passes (generation loss, committed
+ * or cleanly stopped result, released lease, stopped controller, settled
  * journal); authority rotation then archives its last state. */
 async function provenLostRestartedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
   : Promise<DurableRecoveryIdentity | null> {
@@ -6323,7 +6324,7 @@ async function migrateRunnerdStateRootForExecution(input: {
         && (!input.restartRecovery || input.restartRecovery.kind === "bootstrap_incomplete")) {
         if (restartedSandboxResume(input.runnerExecutionTarget)) {
           // The backend's authority rotation archives a proven-lost owner of a
-          // restarted sandbox, keeping its journal and provider files in place.
+          // resumed sandbox, keeping its journal and provider files in place.
           if (await provenLostRestartedSandboxRunner({ ...input, root: scoped })) return;
           retirementRefusal = "; retirement_refused=restarted_sandbox_owner_unproven";
         } else {
@@ -16519,9 +16520,10 @@ async function createRunnerdBackendWithinSessionClaim(
     remoteTarget?.transport === "sandbox"
       ? (remoteTarget.sandboxLeaseAcquisition ?? null)
       : null;
-  // A provider-restarted sandbox still holds its dead Runner's last,
-  // unsuspended state. Authority rotation may archive it only after the
-  // ordinary finished-owner proofs; anything unproven keeps the refusal.
+  // A sandbox resumed from a stopped state may still hold a dead Runner's last,
+  // unsuspended state. Authority rotation may archive it only after its
+  // process generation is proven gone and the ordinary finished-owner proofs
+  // pass; anything unproven keeps the refusal.
   const lostRunnerSource = !pluginTask && !input.restartRecovery && !input.remoteWarmRecovery
     ? await provenLostRestartedSandboxRunner({ db: input.db, root, execution: input.execution,
       runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })
@@ -17296,9 +17298,9 @@ async function createRunnerdBackendWithinSessionClaim(
                       const restoresRetiredSource = !provenRestart && state.incompleteReason === "unavailable"
                         && backupAvailable && remoteTarget.reusableLeaseConfigured === true
                         && await retiredSourceBackupAuthorized();
-                      // A provider-restarted sandbox keeps its proven-lost Runner's
-                      // last state for authority rotation to archive. The provider
-                      // files beside it stay in place for the same conversation.
+                      // A resumed sandbox keeps its proven-lost Runner's last state
+                      // for authority rotation to archive. The provider files beside
+                      // it stay in place for the same conversation.
                       const lostOwnerState = !provenRestart && !restoresRetiredSource && lostRunnerSource !== null
                         && state.incompleteReason === "not_suspended" && state.notSuspendedRunId === lostRunnerSource.runId;
                       if (lostOwnerState) {

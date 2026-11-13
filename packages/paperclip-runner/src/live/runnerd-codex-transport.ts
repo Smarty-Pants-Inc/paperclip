@@ -241,8 +241,8 @@ function assertSuspendedRunnerState(
   }
 }
 
-/** A suspended prior state, or the exact proven-lost Runner's last state:
- * its process died with its environment, so it can never suspend. */
+/** A suspended prior state, or the exact proven-lost Runner's last state: the
+ * controller proved its process generation gone, so it can never suspend. */
 function assertRotatableRunnerState(
   state: Record<string, unknown>,
   expected: DurableRecoveryIdentity,
