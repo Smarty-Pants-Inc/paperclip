@@ -137,6 +137,28 @@ describe("encrypted object provider trace reads under load", () => {
     return provider;
   }
 
+  it("preserves an existing local-only raw tail when the object head is empty", async () => {
+    const directory = await fs.mkdtemp(path.join(tmpdir(), "object-trace-reopen-"));
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "a".repeat(64));
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY_FILE", path.join(directory, "unused.key"));
+    try {
+      const provider = memory(),
+        store = createProviderTraceObjectStore(provider),
+        file = path.join(directory, "trace.ndjson"),
+        ref = `s3-segments-v1:company/run/${randomUUID()}.ndjson`,
+        bytes = Buffer.from('{"kind":"frame","rawBase64":"U09MRV9DT1BZX0xPQ0FMX1RBSUw="}\n');
+      await fs.writeFile(file, bytes);
+      const before = createHash("sha256").update(bytes).digest("hex");
+      await store.open(ref, file, async () => undefined);
+      await store.finish(ref);
+      const after = await fs.readFile(file);
+      expect(createHash("sha256").update(after).digest("hex")).toBe(before);
+      expect(after).toEqual(bytes);
+    } finally {
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("never sheds a finalization read while client reads are shed", async () => {
     const directory = await fs.mkdtemp(path.join(tmpdir(), "object-trace-load-"));
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "a".repeat(64));
