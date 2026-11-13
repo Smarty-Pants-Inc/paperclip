@@ -70,11 +70,8 @@ it("the driver records effective effort in readback/run events and emits only on
     await session.attachRun!({ runId: "run-2" });
     expect(await session.snapshot()).toMatchObject({ piRpcThinkingLevel: "xhigh" });
     await session.startTurn({ message: { role: "user", text: "work" } });
-    // Timing diagnostics are additive. A duplicate lowering diagnostic must
-    // still fail this assertion rather than being skipped with the timings.
-    let next = (await events.next()).value;
-    while (next?.eventType === "harness.diagnostic" && next.payload.code === "provider_performance_spans") next = (await events.next()).value;
-    expect(next).toMatchObject({ eventType: "turn.started", runId: "run-2", payload: { context: { piRpcThinkingLevel: "xhigh" } } });
+    // Neither timing nor duplicate lowering diagnostics may overtake startup.
+    expect((await events.next()).value).toMatchObject({ eventType: "turn.started", runId: "run-2", payload: { context: { piRpcThinkingLevel: "xhigh" } } });
     // Open, warm attach and pre-prompt admission each revalidate Pi's
     // effective configuration, while the lowering diagnostic stays unique.
     expect(native.commands.filter(command => command.type === "set_thinking_level")).toEqual(Array.from({ length: 3 }, () => ({ type: "set_thinking_level", level: "max" })));
