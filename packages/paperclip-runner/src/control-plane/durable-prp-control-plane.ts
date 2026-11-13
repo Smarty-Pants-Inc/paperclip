@@ -4914,10 +4914,11 @@ export function spawnRunner(options: {
     ...nodeCompileCacheEnvironment(options.stateDirectory),
   };
   // Native Pi settings are not GitHub credentials (whose legacy projection is
-  // limited to 32 entries). Rebuild only validated safe pairs for this profile.
+  // limited to 32 entries). Rebuild only validated safe pairs for this profile;
+  // keep the managed projection's GLOBAL/SYSTEM/NOSYSTEM isolation settings.
   if (options.piLaunchProfile) {
     for (const key of Object.keys(environment)) {
-      if (key.startsWith("GIT_CONFIG_")) delete environment[key];
+      if (key === "GIT_CONFIG_COUNT" || /^GIT_CONFIG_(?:KEY|VALUE)_/.test(key)) delete environment[key];
     }
     Object.assign(environment, piGitConfigEnvironment(options.environment ?? {}));
   }

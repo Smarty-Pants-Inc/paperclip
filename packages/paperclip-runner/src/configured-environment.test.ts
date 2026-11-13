@@ -1,11 +1,12 @@
 import { execFileSync } from 'node:child_process';
+import { githubBrokerEnvironment } from '@paperclipai/adapter-utils/github-launcher';
 import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, configuredEnvironmentProjection } from './configured-environment.js';
 import { describe, expect, it, vi } from 'vitest';
 import { createSanitizedCodexEnvironment } from './drivers/codex/app-server-transport.js';
 import { createIsolatedCodexAppServerArgs } from './drivers/codex/codex-security-config.js';
 import { createCapabilityRunnerdProviderEnvironment } from './live/runnerd-codex-transport.js';
 import { spawnRunner } from './control-plane/durable-prp-control-plane.js';
-import { PI_LANGFUSE_ENVIRONMENT_KEYS, piProcessEnvironment } from './drivers/pi/pi-process-environment.js';
+import { PI_LANGFUSE_ENVIRONMENT_KEYS, piProcessEnvironment, piProxyEnvironment } from './drivers/pi/pi-process-environment.js';
 
 const pages = {
   PAPERCLIP_PAGE_AWS_ACCESS_KEY_ID: 'fake-page-access-key',
@@ -21,6 +22,24 @@ function shellKeys() {
 }
 
 describe('controller-configured environment across native runner boundaries', () => {
+  // Keep reason: merged native Pi Git filtering must not erase managed credential isolation.
+  it('keeps managed Git isolation through native Pi launch when the broker clears configured safe pairs', () => {
+    const source = githubBrokerEnvironment({ PATH: '/bin', ...configuredEnvironmentProjection({ LANGFUSE_FLUSH_AT: '1' }),
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'safe.directory', GIT_CONFIG_VALUE_0: '/work/project',
+      GH_TOKEN: 'raw-gh-decoy', GITHUB_TOKEN: 'raw-github-decoy',
+    }, { url: 'http://127.0.0.1:43210', token: 'run-broker-capability' });
+    expect(source).toMatchObject({ GIT_CONFIG_COUNT: '', GIT_CONFIG_KEY_0: '', GIT_CONFIG_VALUE_0: '' });
+    let launched: NodeJS.ProcessEnv | undefined;
+    spawnRunner({ connection: { mode: 'connect', connectUrl: 'ws://127.0.0.1:43127' }, stateDirectory: '/tmp/pi-combined-env-proof', identity, ticket: 'fake-ticket', maxOutboxBytes: 262144, p0ReserveBytes: 65536, runnerVersion: '0.3.0', runnerDigest: `sha256:${'a'.repeat(64)}`, environment: source,
+      piLaunchProfile: { command: '/isolated/node', commandSha256: `sha256:${'b'.repeat(64)}`, proxyScript: '/isolated/pi-proxy.cjs', proxyScriptSha256: `sha256:${'c'.repeat(64)}`, executable: '/isolated/pi.js', executableSha256: `sha256:${'d'.repeat(64)}` },
+      processLauncher: spec => { launched = spec.environment; return { child: { pid: 42, exitCode: null, signalCode: null, kill: () => true }, completion: Promise.resolve({ code: 0, signal: null, stdout: '', stderr: '' }) }; },
+    });
+    const pi = piProcessEnvironment(piProxyEnvironment(launched!), {});
+    expect(pi).toMatchObject({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+      GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '', SSH_ASKPASS: '', SSH_AUTH_SOCK: '', LANGFUSE_FLUSH_AT: '1',
+      PAPERCLIP_GITHUB_BROKER_URL: 'http://127.0.0.1:43210', PAPERCLIP_GITHUB_BROKER_TOKEN: 'run-broker-capability' });
+    for (const name of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GH_TOKEN', 'GITHUB_TOKEN']) expect(pi).not.toHaveProperty(name);
+  });
   // Keep reason: actual native Pi launch trust boundary, not just the final filter.
   it.each([2, 33])('carries %s safe Git pairs from the native provider builder through runner spawn to real Git', (count) => {
     const pairs = [['http.https://github.com/.extraheader', 'Authorization: decoy'], ['safe.directory', '/work/project'],
