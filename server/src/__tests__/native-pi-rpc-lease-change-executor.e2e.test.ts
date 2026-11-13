@@ -299,7 +299,7 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected", "stop-arch
       return { runId, run: run!, native, execution, lease, prompt };
     };
     type Fixture = Awaited<ReturnType<typeof seed>>;
-    const executionOptions = async (fixture: Fixture, outcome: "created" | "resumed") => {
+    const executionOptions = async (fixture: Fixture, outcome: "created" | "resumed", restarted = false) => {
       const path = `/api/runner/v1/connect/${fixture.runId}`;
       previewBindings.set(path, fixture.lease.id);
       const endpoint = async (input?: { path: string }): Promise<RunnerIngressEndpoint> => {
@@ -318,8 +318,9 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected", "stop-arch
           nativeSyncIn: false, nativeSyncOut: false, persistentProcessSessions: false, incrementalSessionOutput: false,
           concurrentSyncOperations: false, duplexCommandStream: false }, getRunnerIngressEndpoint: endpoint,
         sandboxLeaseAcquisition: { outcome, providerLeaseId,
-          ...(outcome === "resumed" && (resumedFrom === "archived" || resumedFrom === "stopped")
-            ? { resumedFromState: resumedFrom, restarted: true as const } : {}) } };
+          ...(outcome === "resumed" && (restarted || resumedFrom === "stopped")
+            ? { ...(resumedFrom === "stop-archived" ? { resumedFromState: "archived" as const }
+              : resumedFrom === "archived" || resumedFrom === "stopped" ? { resumedFromState: resumedFrom } : {}), restarted: true as const } : {}) } };
       return { db: db!, execution: fixture.execution, runnerInstanceId: fixture.native.runnerInstanceId,
         durableEnvironmentLeaseId: fixture.lease.id, controllerPersistence: { bootId: controller.bootId }, runnerIngressAuthorized: true,
         runnerExecutionTarget: target, runnerRemoteBinaryPath: runnerBinary, runnerRemoteProviderPackPath: providerPack,
@@ -330,7 +331,15 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected", "stop-arch
           PI_CODING_AGENT_DIR: agentHome, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none",
           PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${modelAddress.port}`, PAPERCLIP_PROVIDER_TRACE_PATH: join(root, `${fixture.runId}.provider-trace.jsonl`) },
         onEvent: async (event: AdapterRuntimeEvent) => { startupEvents.push({ runId: fixture.runId, event }); },
-        onSpawn: async (meta: { pid: number }) => { const owned = birth(meta.pid); if (owned) { spawned.push(owned); stage("real runner spawned", owned); } else stage("transient spawn callback", meta); },
+        onSpawn: async (meta: { pid: number }) => {
+          const owned = birth(meta.pid);
+          // A launch and its attach can report the same birth. Count process
+          // generations, not callbacks; retain the exact birth identity.
+          if (owned && !spawned.some(previous => previous.pid === owned.pid
+            && previous.startTicks === owned.startTicks && previous.bootId === owned.bootId)) {
+            spawned.push(owned); stage("real runner spawned", owned);
+          } else stage(owned ? "repeated runner birth callback" : "transient spawn callback", meta);
+        },
         onLog: async (stream: "stdout" | "stderr", text: string) => { stages.push({ stream, text }); await appendFile(join(root, "native.log"), `${stream}: ${text}`); } };
     };
 
