@@ -454,6 +454,11 @@ export interface SandboxTransferProgressOptions {
 
 export const MAX_SANDBOX_SYNC_TIMEOUT_MS = 30 * 60_000;
 
+/** One second per MiB of archive bytes, plus setup time; never beyond 30 minutes. */
+export function sandboxTransferTimeoutMs(bytes: number): number {
+  return Math.min(MAX_SANDBOX_SYNC_TIMEOUT_MS, 60_000 + Math.ceil(bytes / 1024 ** 2) * 1_000);
+}
+
 export interface SandboxSyncOptions {
   minimumTimeoutMs?: number;
 }
@@ -1584,7 +1589,9 @@ export async function prepareSandboxManagedRuntime(input: {
         params.progressLabel,
         { sink: input.onRuntimeProgress, phase: params.statusPhase },
       );
-      const syncResult = await runStepSpan("workspace.transfer", () => syncIn(operations));
+      const syncResult = await runStepSpan("workspace.transfer", () => syncIn(operations, {
+        minimumTimeoutMs: sandboxTransferTimeoutMs(params.progressBytes),
+      }));
       // Prefer the transport's own byte total. It is the real count for a
       // provider that has no host tarball to stat (a referenced project rides
       // a `directory` mapping). Fall back to the caller-supplied count when
@@ -2216,7 +2223,10 @@ export async function prepareSandboxManagedRuntime(input: {
                       { sourcePath: helper, targetPath: remoteHelper, kind: "file" },
                     ] }];
                     assertSyncOperationsConfined(inbound, { sourceRoots: [tempDir], targetRoots: [runtimeRootDir] });
-                    await input.client.syncIn!(inbound);
+                    const inboundBytes = (await Promise.all(inbound.flatMap(operation =>
+                      operation.files.map(async file => (await fs.stat(file.sourcePath)).size))))
+                      .reduce((bytes, size) => bytes + size, 0);
+                    await input.client.syncIn!(inbound, { minimumTimeoutMs: sandboxTransferTimeoutMs(inboundBytes) });
                     try {
                       let captured = false;
                       try {

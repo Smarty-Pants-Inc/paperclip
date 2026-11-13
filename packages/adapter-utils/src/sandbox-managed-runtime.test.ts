@@ -23,6 +23,7 @@ import {
   prepareSandboxManagedRuntime,
   REFERENCED_SOURCE_IGNORE_FAILURE_REASONS,
   resolveReferencedSourceIgnore,
+  sandboxTransferTimeoutMs,
   type PreparedSandboxManagedRuntime,
   type ReferencedSourceIgnoreResolution,
   type SandboxManagedRuntimeAsset,
@@ -415,6 +416,18 @@ function recordingFilesystemClient(
 
 describe("sandbox managed runtime", () => {
   const cleanupDirs: string[] = [];
+
+  it.each([
+    [0, 60_000],
+    [1, 61_000],
+    [1024 ** 2, 61_000],
+    [1024 ** 2 + 1, 62_000],
+    [120 * 1024 ** 2, 180_000],
+    [150 * 1024 ** 2, 210_000],
+    [2 * 1024 ** 3, 1_800_000],
+  ])("bounds the shared sandbox transfer budget for %i bytes", (bytes, expected) => {
+    expect(sandboxTransferTimeoutMs(bytes)).toBe(expected);
+  });
 
   it.each([
     { isolation: undefined, detect: false },
@@ -1925,6 +1938,79 @@ describe("sandbox managed runtime", () => {
       // The guard fires before the offending write, so nothing landed under the runtime root.
       expect(writtenPaths.some((p) => p.endsWith("evil.txt") || p.endsWith("passwd") || p.endsWith("child.txt"))).toBe(false);
     }
+  });
+
+  // Keep: I-8g run 58d66cc6 failed in stage.workspace before provider work;
+  // real archive bytes must cross the native sync boundary with their budget.
+  it("gives a 150 MiB workspace staging archive a size-based native sync budget", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-workspace-budget-"));
+    cleanupDirs.push(root);
+    const local = path.join(root, "local"), remote = path.join(root, "remote");
+    await mkdir(local);
+    const payload = path.join(local, "large.bin");
+    await writeFile(payload, "workspace budget marker\n");
+    await fsPromises.truncate(payload, 150 * 1024 ** 2);
+    const client = makeFilesystemClient();
+    attachNativeRecordingSyncIn(client, []);
+    const transfer = client.syncIn!;
+    let archiveBytes = 0;
+    client.syncIn = vi.fn<NonNullable<SandboxManagedRuntimeClient["syncIn"]>>(async (operations, options) => {
+      archiveBytes = (await Promise.all(operations.flatMap(operation =>
+        operation.files.map(async file => (await stat(file.sourcePath)).size))))
+        .reduce((sum, bytes) => sum + bytes, 0);
+      expect(options?.minimumTimeoutMs).toBeGreaterThanOrEqual(210_000);
+      expect(options?.minimumTimeoutMs).toBe(60_000 + Math.ceil(archiveBytes / 1024 ** 2) * 1_000);
+      return transfer(operations, options);
+    });
+    await prepareSandboxManagedRuntime(sandboxRuntimeInput(sandboxSpec("workspace-budget", remote), "test", client, local));
+    expect(archiveBytes).toBeGreaterThanOrEqual(150 * 1024 ** 2);
+    expect((await stat(path.join(remote, "large.bin"))).size).toBe(150 * 1024 ** 2);
+    const file = await fsPromises.open(path.join(remote, "large.bin"), "r");
+    try {
+      const { buffer } = await file.read(Buffer.alloc(24), 0, 24, 0);
+      expect(buffer.toString()).toBe("workspace budget marker\n");
+    } finally { await file.close(); }
+  }, 30_000);
+
+  it("sizes checkpoint input files for their native sync budget and restores changed files", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-checkpoint-budget-"));
+    cleanupDirs.push(root);
+    const local = path.join(root, "local"), remote = path.join(root, "remote");
+    await mkdir(local);
+    await writeFile(path.join(local, "file.txt"), "before\n");
+    const client = makeFilesystemClient();
+    attachNativeRecordingSyncIn(client, []);
+    const transfer = client.syncIn!;
+    let checkpointBytes = 0;
+    client.syncIn = async (operations, options) => {
+      if (operations.some(operation => operation.files.some(file => file.sourcePath.endsWith("checkpoint-baseline.sqlite")))) {
+        checkpointBytes = (await Promise.all(operations.flatMap(operation =>
+          operation.files.map(async file => (await stat(file.sourcePath)).size))))
+          .reduce((sum, bytes) => sum + bytes, 0);
+        expect(options?.minimumTimeoutMs).toBe(60_000 + Math.ceil(checkpointBytes / 1024 ** 2) * 1_000);
+      }
+      return transfer(operations, options);
+    };
+    client.syncOut = async operations => {
+      const results = [];
+      for (const operation of operations) {
+        for (const file of operation.files) {
+          await mkdir(path.dirname(file.targetPath), { recursive: true });
+          await fsPromises.cp(file.sourcePath, file.targetPath, { recursive: file.kind === "directory" });
+        }
+        results.push({ operationId: operation.operationId, filesTransferred: operation.files.length, bytesTransferred: 0 });
+      }
+      return { operations: results };
+    };
+    const prepared = await prepareSandboxManagedRuntime({
+      ...sandboxRuntimeInput(sandboxSpec("checkpoint-budget", remote), "test", client, local),
+      workspaceCheckpoint: true,
+      workspaceRestoreRetryDelaysMs: [],
+    });
+    await writeFile(path.join(remote, "file.txt"), "after\n");
+    await prepared.restoreWorkspace();
+    expect(checkpointBytes).toBeGreaterThan(0);
+    expect(await readFile(path.join(local, "file.txt"), "utf8")).toBe("after\n");
   });
 
   it("routes a custom-provisioned asset through a single syncIn operation with its post-upload command (native runner → 0 direct writeFile/run)", async () => {

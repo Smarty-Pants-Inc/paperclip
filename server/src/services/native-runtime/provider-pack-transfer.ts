@@ -1,8 +1,7 @@
-import { MAX_SANDBOX_SYNC_TIMEOUT_MS } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
+import { sandboxTransferTimeoutMs } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 
 export function providerPackTransferTimeoutMs(archiveBytes: number): number {
-  return Math.min(
-    MAX_SANDBOX_SYNC_TIMEOUT_MS,
-    Math.max(300_000, 60_000 + Math.ceil(archiveBytes / (1024 * 1024)) * 1_000),
-  );
+  // Preserve provider packs' existing five-minute floor while sharing the
+  // archive-size calculation with workspace staging and capture/restore.
+  return Math.max(300_000, sandboxTransferTimeoutMs(archiveBytes));
 }

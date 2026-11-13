@@ -31,11 +31,15 @@ uses the larger of this minimum and its configured timeout. Other providers keep
 their existing behavior. The minimum is limited to 30 minutes and does not change
 sandbox lifetimes, stored settings or the timeout for other commands.
 
-The remote-workspace archive path uses the verified capture size for downloads
-and the local archive size for uploads. Large archives get one second per MiB
-plus 60 seconds, capped at 30 minutes. Small archives keep the existing provider
-timeout when that calculation is no greater than five minutes. Archive size,
-checksum, confinement and host space checks still apply.
+Workspace staging uses the total size of its prepared archives; checkpoint
+inputs use their local file sizes. The remote-workspace archive path uses the
+verified capture size for downloads and the local archive size for uploads.
+`sandboxTransferTimeoutMs(bytes)` gives these transfers one second per MiB
+(rounded up) plus 60 seconds, capped at 30 minutes. The minimum is passed even
+when it is below five minutes, so a provider's shorter default cannot truncate
+that budget. Provider-pack transfers share this calculation while retaining
+their existing five-minute floor. Archive size, checksum, confinement and host
+space checks still apply.
 
 An exact retained-sandbox resume keeps its recorded provider timeout and RPC
 overhead. It uses the normal one-minute fallback only when no timeout was

@@ -243,6 +243,37 @@ describe("remote workspace transport safety with real sandbox commands", () => {
     } finally { await captured.cleanup(); }
   });
 
+  // Keep: the 60–300 s transfer-budget gap also affects saved-workspace
+  // capture/restore; use real archive verification and sandbox commands.
+  it.each(["syncOut", "syncIn"] as const)("passes a 180 second budget for a 120 MiB archive on %s", async direction => {
+    const payload = path.join(workspace, "large.bin");
+    await fs.writeFile(payload, "remote workspace budget marker\n");
+    // Leave room for the archive's manifest while staying in the 120 MiB band.
+    const payloadBytes = 120 * 1024 ** 2 - 64 * 1024;
+    await fs.truncate(payload, payloadBytes);
+    const { remote } = target();
+    const syncOut = vi.fn(remote.runner!.syncOut!);
+    const syncIn = vi.fn(remote.runner!.syncIn!);
+    remote.runner!.syncOut = syncOut;
+    remote.runner!.syncIn = syncIn;
+    const captured = await captureRemoteWorkspaceArchive({ target: remote, remoteCwd: workspace, operationId: randomUUID() });
+    try {
+      const archiveBytes = (await fs.stat(captured.archivePath)).size;
+      expect(Math.ceil(archiveBytes / 1024 ** 2)).toBe(120);
+      const restored = path.join(scratch, "budget-restored");
+      await restoreRemoteWorkspaceDirectory({ target: remote, remoteCwd: restored,
+        archivePath: captured.archivePath, manifestDigest: captured.manifestDigest, restorationIdentity: "d".repeat(64) });
+      const transfer = direction === "syncIn" ? syncIn : syncOut;
+      expect(transfer.mock.calls[0]?.[1]).toEqual({ minimumTimeoutMs: 180_000 });
+      expect((await fs.stat(path.join(restored, "large.bin"))).size).toBe(payloadBytes);
+      const file = await fs.open(path.join(restored, "large.bin"), "r");
+      try {
+        const { buffer } = await file.read(Buffer.alloc(31), 0, 31, 0);
+        expect(buffer.toString()).toBe("remote workspace budget marker\n");
+      } finally { await file.close(); }
+    } finally { await captured.cleanup(); }
+  }, 30_000);
+
   it("times the restore's sandbox upload and extraction as separate run-log steps", async () => {
     await fs.writeFile(path.join(workspace, "saved.txt"), "saved synthetic files\n");
     const { remote, execute } = target();
