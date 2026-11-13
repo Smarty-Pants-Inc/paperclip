@@ -2,11 +2,14 @@ import { randomUUID } from "node:crypto";
 import {
   agentWakeupRequests,
   agents,
+  approvals,
   companies,
   createDb,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
@@ -122,6 +125,19 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(1);
   });
 
+  it("SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {
+    const f = await fixture();
+    const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed", error: "Native session failed" });
+    await f.boardHold("native_continuation_requires_reconciliation", id);
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(codeOf(notices[0]!)).toBe("adapter_failed");
+    const rows = (notices[0]!.metadata?.sections ?? []).flatMap(section => section.rows) as Array<{ label?: string }>;
+    expect(rows.some(row => row.label === "Recovery action")).toBe(true);
+  });
+
   it("SMAA-1370 (REG-03 on Boat): 'runnerd transport closed during provider startup', blocked by the board -> exactly one notice", async () => {
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_retry_exhausted",
@@ -172,6 +188,20 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.body).toBe(NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${comment!.id}`);
     expect(JSON.stringify(notices[0])).not.toContain("receipt missing");
+  });
+
+  it("REG-21: after a gateway key rotation the person's wake FAILED 'provider or completion contract changed', no run, blocked -> exactly one notice", async () => {
+    const f = await fixture({ status: "blocked" });
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: "Are you there?",
+      authorType: "user", authorUserId: f.userId, createdAt: new Date(Date.now() - 10_000) }).returning();
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+      reason: "issue_commented", status: "failed", error: "provider or completion contract changed", finishedAt: new Date(),
+      payload: { issueId: f.issueId, commentId: comment!.id } });
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(JSON.stringify(notices[0])).not.toContain("completion contract");
   });
 
   it("issues.ts:20740 save-to-wake: a saved person comment whose wake threw (no run, no wake) -> exactly one notice keyed on the comment", async () => {
@@ -297,6 +327,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
+  it("no false notice: a later run the message did not start (a timer run) succeeding says nothing about the message", async () => {
+    const f = await fixture();
+    await f.message();
+    await f.run({ commentId: null, status: "succeeded", wakeReason: "heartbeat_timer" });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+  });
+
   it("a later answer supersedes the notice", async () => {
     const f = await fixture();
     const commentId = await f.message();
@@ -307,6 +345,45 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.reply(success);
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
+  });
+
+  // RFL 20:42Z (b): a BLOCKED task the person is legitimately waiting on after
+  // the agent answered stays quiet, and the new blocked visit skips it.
+  // Loaded dynamically so this file also runs (RED) on a base without the module.
+  const visitedWhileBlocked = async (issueId: string) => {
+    const module = await import("./unanswered-person-message.js").catch(() => null);
+    if (!module) return null;
+    return (await db.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issueId), module.unansweredPersonMessageCondition(issues.id, issues.companyId)))).length > 0;
+  };
+
+  it("no false notice: blocked on an approval after the agent answered -> quiet, not visited", async () => {
+    const f = await fixture({ status: "blocked" });
+    const done = await f.run({ commentId: await f.message("Please deploy it."), status: "succeeded" });
+    await f.reply(done);
+    const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "deploy", requestedByAgentId: f.agentId,
+      status: "pending", payload: { summary: "Deploy to production" } }).returning();
+    await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.issueId, approvalId: approval!.id, linkedByAgentId: f.agentId });
+    expect(await visitedWhileBlocked(f.issueId)).toBe(false);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("no false notice: blocked on a question card to the person (the agent's answer is the card) -> quiet", async () => {
+    const f = await fixture({ status: "blocked" });
+    const asked = await f.run({ commentId: await f.message("Which region?"), status: "succeeded" });
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions",
+      status: "pending", createdByAgentId: f.agentId, sourceRunId: asked, addresseeUserId: f.userId,
+      payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
+        options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } as never, createdAt: f.at() });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("the blocked visit DOES include a blocked task whose person's message is unanswered", async () => {
+    const f = await fixture({ status: "blocked" });
+    await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_retry_exhausted" });
+    expect(await visitedWhileBlocked(f.issueId)).toBe(true);
   });
 
   it("the executor's standing held notice for the conversation adds no second notice", async () => {
