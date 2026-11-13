@@ -7490,8 +7490,10 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
     // from this target when the workspace moved within the same sandbox.
     let retained: { remoteCwd: string };
     try {
+      const runner = target.runner;
       retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId,
-        successorRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution), target });
+        successorRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution), target,
+        sourceRunnerGenerationLost: probe => remoteRunnerGenerationLost({ runner, ...probe }) });
     } catch (error) {
       // Clone L: a failed predecessor with no result whose Runner died with
       // its archived box has no retained state to adopt. Only a proven-gone

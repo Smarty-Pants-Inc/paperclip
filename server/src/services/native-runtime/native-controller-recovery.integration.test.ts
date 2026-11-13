@@ -47,7 +47,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     else process.env.PAPERCLIP_HOME = previousHome;
   });
 
-  async function seed() {
+  async function seed(journal: { completed?: string[]; pending?: string[] } = {}) {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue retained execution", assigneeAgentId: agentId, status: "in_progress" });
     const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId }).returning();
@@ -59,6 +59,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
       identity: { runId, normalizedSessionId: native.normalizedSessionId, runnerInstanceId: native.runnerInstanceId,
         environmentLeaseId: native.environmentLeaseId, turnId: native.turnId, itemId: native.itemId },
       expectedRunnerVersion: "discovery-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+    for (const type of journal.completed ?? []) Object.assign(core.queueCommand(type), { status: "completed", result: { status: "completed" } });
+    for (const type of journal.pending ?? []) core.queueCommand(type);
     core.setCheckpointPersistence(nativeRunnerCheckpointWriter(db, owner));
     await core.flushCheckpoint();
     await core.stop();
@@ -398,9 +400,17 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
   // The read binding grants no LOSS/retirement authority (that probe runs later).
   it.each(["clean", "missing Stop", "pending Stop", "foreign Stop", "real failure", "lease held", "recovery state",
     "missing idle receipt", "foreign idle receipt", "changed epoch", "pending request", "active turn", "missing JSONL", "invalid JSONL",
-    "escalated abort", "pending tool", "uncertain side effect", "failed turn", "open recovery", "broken handoff", "changed source"] as const)(
+    "escalated abort", "pending tool", "uncertain side effect", "failed turn", "open recovery", "broken handoff", "changed source",
+    // RFL (REG-03 at 45 s): the Stop stopped the box before Core's idle close
+    // completed its drain/suspend, so the stopped journal keeps them pending.
+    "pending maintenance, owner proven dead", "pending maintenance, owner alive", "pending maintenance, no probe",
+    "pending turn.start, owner proven dead", "pending tool result, owner proven dead"] as const)(
     "REG-03 retained clean Stop read binding: %s", async scenario => {
-    const fixture = await seed(), successorRunId = randomUUID(), originalRunId = randomUUID(), environmentId = randomUUID();
+    const journal = scenario.startsWith("pending maintenance") ? { completed: ["turn.start", "turn.interrupt"], pending: ["runner.drain", "runner.suspend"] }
+      : scenario === "pending turn.start, owner proven dead" ? { completed: ["turn.interrupt"], pending: ["turn.start", "runner.drain", "runner.suspend"] }
+      : scenario === "pending tool result, owner proven dead" ? { completed: ["turn.start", "turn.interrupt"], pending: ["semantic_tool.result", "runner.suspend"] }
+      : {};
+    const fixture = await seed(journal), successorRunId = randomUUID(), originalRunId = randomUUID(), environmentId = randomUUID();
     const providerLeaseId = randomUUID(), sourceLeaseId = randomUUID(), successorLeaseId = randomUUID();
     const remoteCwd = "/retained-workspace";
     const snapshot: PersistedNativeSession = { ...fixture.snapshot, backendKind: "runner", driverKind: "pi_rpc",
@@ -477,8 +487,23 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     });
     const target = { kind: "remote", transport: "sandbox", environmentId, leaseId: successorLeaseId, providerKey: "boat",
       remoteCwd, sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId }, runner: { execute } } as const;
-    const binding = assertNativeRetainedSandboxBinding(db, { ...fixture.scope, successorRunId, target: target as never });
-    if (scenario === "clean") {
+    const sourceRunnerGenerationLost = vi.fn(async () => scenario !== "pending maintenance, owner alive");
+    const binding = assertNativeRetainedSandboxBinding(db, { ...fixture.scope, successorRunId, target: target as never,
+      ...(scenario === "pending maintenance, no probe" ? {} : { sourceRunnerGenerationLost }) });
+    if (scenario === "pending maintenance, owner proven dead") {
+      // Only maintenance is pending and the Runner is proven dead on this box:
+      // the same conversation continues from the retained source.
+      await expect(binding).resolves.toEqual({ remoteCwd });
+      expect(sourceRunnerGenerationLost).toHaveBeenCalledTimes(1);
+      expect(sourceRunnerGenerationLost).toHaveBeenCalledWith({ remoteCwd,
+        identity: { runnerInstanceId: fixture.native.runnerInstanceId, normalizedSessionId: fixture.scope.normalizedSessionId } });
+      expect(JSON.stringify(execute.mock.calls)).toContain("verifyPiSessionFile");
+    } else if (scenario.startsWith("pending")) {
+      await expect(binding).rejects.toThrow("retained_sandbox_binding");
+      // Pending conversation state refuses before any probe: proof of death
+      // never excuses an unsettled turn or tool.
+      if (!scenario.startsWith("pending maintenance")) expect(sourceRunnerGenerationLost).not.toHaveBeenCalled();
+    } else if (scenario === "clean") {
       await expect(binding).resolves.toEqual({ remoteCwd });
       expect(execute).toHaveBeenCalledTimes(1);
       // The production Pi validator checks the existing JSONL; no process probe,

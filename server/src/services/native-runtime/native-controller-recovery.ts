@@ -156,7 +156,20 @@ type RetainedSandboxBindingInput = {
   companyId: string; issueId: string; runId: string;
   agentId?: string; successorRunId?: string; normalizedSessionId?: string;
   target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
+  /** The executor's marker probe of `target`'s box (remoteRunnerGenerationLost):
+   * true only when the named Runner's process is absent (45) or of another
+   * generation (47) on that box. */
+  sourceRunnerGenerationLost?: (probe: { remoteCwd: string; identity: Record<string, unknown> }) => Promise<boolean>;
 };
+
+/** Runner lifecycle maintenance that only the stopped source Runner itself
+ * could complete: the same lifecycle set the finished-owner fence ignores for
+ * a stopped Runner (native-session-executor.ts LOCAL_RUNNER_LIFECYCLE_COMMANDS).
+ * A Stop that stopped the box leaves Core's idle drain/suspend pending. They
+ * say nothing about the conversation, but only once that Runner's generation
+ * is proven dead on this same box. Every other pending command (turn.*, tool
+ * results, attachments, session reads) is conversation state and refuses. */
+const STOPPED_SOURCE_MAINTENANCE_COMMANDS: ReadonlySet<string> = new Set(["runner.drain", "runner.suspend", "runner.shutdown"]);
 
 /** A cancelled business run may still leave a good conversation checkpoint.
  * Compose existing lease termination/handoff and runnerd lineage evidence; do
@@ -208,9 +221,17 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
     || checkpoint.recoveryEvidence.normalizedSessionId !== normalizedSessionId) return false;
   const header = record(JSON.parse(checkpoint.records.get("header") ?? "null"));
   const identity = record(record(header.state).identity);
+  const pending = [...checkpoint.records].filter(([key]) => key.startsWith("command:"))
+    .map(([, bytes]) => record(JSON.parse(bytes))).filter(command => command.status !== "completed");
   if (identity.runId !== source.id
     || identity.runnerInstanceId !== source.runnerInstanceId || identity.normalizedSessionId !== normalizedSessionId
-    || [...checkpoint.records].some(([key, bytes]) => key.startsWith("command:") && record(JSON.parse(bytes)).status !== "completed")) return false;
+    || pending.some(command => !STOPPED_SOURCE_MAINTENANCE_COMMANDS.has(String(command.type)))) return false;
+  // Pending maintenance only: ignored only for a user-Stopped source whose
+  // Runner generation the marker probe proves dead on this same box (the
+  // binding chain above fixed the box: the successor's providerLeaseId).
+  if (pending.length > 0 && (!retainedUserStop || !input.sourceRunnerGenerationLost
+    || !await input.sourceRunnerGenerationLost({ remoteCwd: sourceLease.metadata!.remoteCwd as string,
+      identity: { runnerInstanceId: source.runnerInstanceId, normalizedSessionId } }))) return false;
   if (retainedUserStop) {
     // A warm Runner's physical lease can predate the stopped business turn.
     // Accept it only within the already verified same-sandbox handoff chain.
