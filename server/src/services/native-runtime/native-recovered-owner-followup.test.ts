@@ -231,7 +231,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   /** The prior run's released lease on this same allocation: the evidence a
    * resumed sandbox's retained binding requires. */
   async function recordPriorLeaseOnSameSandbox(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
-    followUp: Awaited<ReturnType<typeof admitFollowUp>>) {
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>, generation: "lost" | "live" = "lost") {
     await db.insert(environments).values({ id: followUp.environmentId, name: `restarted-${followUp.environmentId}`, driver: "sandbox" });
     await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
       heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
@@ -239,8 +239,15 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     // The restarted box still holds the dead Runner's last, unsuspended state.
     const deadRunnerState = Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", lifecycle: "ready",
       runId: prior.runId })).toString("base64");
+    // The box's launch marker names the prior Runner's process and start
+    // generation. "lost": that process is gone (probe exit 45); "live": the
+    // same machine came back with it still running (exit 0).
+    const marker = `nonce1\n4242\n2026-11-13T10:00:00.000Z\n${prior.native.runnerInstanceId}\nlinux:0b5e6c2a-1111-4222-8333-944455556666:12345\n`;
     followUp.remoteExecute.mockImplementation(async (request: unknown) => {
-      if (JSON.stringify(request).includes("runner-state.json")) return { exitCode: 0, timedOut: false, stdout: deadRunnerState, stderr: "" };
+      const text = JSON.stringify(request);
+      if (text.includes("paperclip-runner-generation-marker")) return { exitCode: 0, timedOut: false, stdout: marker, stderr: "" };
+      if (text.includes("paperclip-runner-generation-check")) return { exitCode: generation === "lost" ? 45 : 0, timedOut: false, stdout: "", stderr: "" };
+      if (text.includes("runner-state.json")) return { exitCode: 0, timedOut: false, stdout: deadRunnerState, stderr: "" };
       throw new Error("admission must not reach the sandbox");
     });
   }
@@ -684,8 +691,26 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toEqual([]);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
     expect(followUp.logs.join("")).not.toContain("not retired");
-    // Admission only read the box's Runner state; it changed nothing there.
-    expect(followUp.remoteExecute.mock.calls.every(([request]) => JSON.stringify(request).includes("base64 <"))).toBe(true);
+    // Admission only read the box's Runner state and probed its process
+    // generation; it changed nothing there.
+    expect(followUp.remoteExecute.mock.calls.every(([request]) =>
+      /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
+    expect(followUp.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-generation-check"))).toBe(true);
+  }, 60_000);
+
+  // RFL F1: Boat may resume the same machine with its programs running. The
+  // restarted label alone never retires an owner whose process is still live.
+  it("keeps a settled warm owner held on a restarted sandbox while its process generation is still live", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
+    const followUp = await admitFollowUp(prior);
+    await recordPriorLeaseOnSameSandbox(prior, followUp, "live");
+    expect(await followUp.start("resumed", undefined, true)).toBe(
+      "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=restarted_sandbox_owner_unproven");
+    expect(followUp.logs.join("")).toMatch(/restarted sandbox owner \S+ not retired: restarted_sandbox_runner_generation_not_lost/);
+    // As for every refused prior owner, the controller root is kept aside, not rotated.
+    expect(await quarantined()).toHaveLength(1);
+    expect(followUp.remoteExecute.mock.calls.every(([request]) =>
+      /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
   }, 60_000);
 
   // The restart proves only that the process is gone. A journal with work
