@@ -1864,7 +1864,7 @@ describe("agent permission routes", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "agent_config:update",
-      scope: { requiresChangeGrant: true },
+      scope: { targetAgentId: agentId, requiresChangeGrant: true },
     }));
     expect(mockAgentService.updateAndTransition).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();

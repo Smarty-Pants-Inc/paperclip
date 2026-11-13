@@ -1301,7 +1301,9 @@ async function getProtectedMemberReason(
     operation?: "archive" | "update";
   },
 ): Promise<string | null> {
-  if (member.principalType !== "user") return "Only human company members can be removed.";
+  if (member.principalType !== "user") return opts?.operation === "update"
+    ? "Only human company members can be updated here. Manage agent grants via PATCH /api/agents/:id/permission-grants."
+    : "Only human company members can be removed.";
   if (req.actor.type !== "board") return "Board access is required to remove members.";
   if (member.principalId === req.actor.userId) return "You cannot remove yourself.";
   const isTargetInstanceAdmin = opts?.instanceAdminUserIds

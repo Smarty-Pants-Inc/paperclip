@@ -16,7 +16,8 @@ export function agentPermissionGrantRoutes(db: Db) {
     assertBoard(req);
     const id = req.params.id as string;
     if (!isUuidLike(id)) throw badRequest("Agent ID must be a UUID");
-    const { permissionKey, enabled } = req.body;
+    const { permissionKey, enabled, scope } = req.body;
+    const scopeUpdate = scope === undefined ? {} : { scope };
     const publications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
       const agent = await tx.select({ id: agents.id, companyId: agents.companyId, status: agents.status })
@@ -43,11 +44,12 @@ export function agentPermissionGrantRoutes(db: Db) {
         }
         await tx.insert(principalPermissionGrants).values({
           companyId: agent.companyId, principalType: "agent", principalId: agent.id,
-          permissionKey, scope: null, grantedByUserId: req.actor.userId ?? null,
+          permissionKey, scope: scope ?? null, grantedByUserId: req.actor.userId ?? null,
         }).onConflictDoUpdate({
           target: [principalPermissionGrants.companyId, principalPermissionGrants.principalType,
             principalPermissionGrants.principalId, principalPermissionGrants.permissionKey],
-          set: { scope: null, grantedByUserId: req.actor.userId ?? null, updatedAt: new Date() },
+          // A legacy toggle must not silently widen an already-scoped grant.
+          set: { ...scopeUpdate, grantedByUserId: req.actor.userId ?? null, updatedAt: new Date() },
         });
       } else {
         await tx.delete(principalPermissionGrants).where(and(
@@ -60,7 +62,7 @@ export function agentPermissionGrantRoutes(db: Db) {
       await logActivity(txDb, {
         companyId: agent.companyId, actorType: "user", actorId: req.actor.userId ?? "board",
         action: "agent.permission_grant_updated", entityType: "agent", entityId: agent.id,
-        details: { permissionKey, enabled },
+        details: { permissionKey, enabled, ...scopeUpdate },
       }, publications);
       return { agentId: agent.id, companyId: agent.companyId, permissionKey, enabled };
     });

@@ -23,7 +23,10 @@ export function newStandardAgentGrantScope(
   permissionKey: PermissionKey,
   agentId: string,
 ): Record<string, unknown> | null {
-  if (permissionKey === "tasks:assign_scope") return { subtreeRootAgentId: agentId };
+  // Apply the same least-privilege default to every new standard agent,
+  // including board creates, approvals and invites. Stored grants are never backfilled.
+  if (permissionKey === "tasks:assign_scope" || permissionKey === "agents:configure"
+    || permissionKey === "agents:suggest-changes") return { subtreeRootAgentId: agentId };
   if (permissionKey === "inbox:manage") return { responsibleUserOnly: true };
   return null;
 }

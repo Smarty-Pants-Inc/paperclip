@@ -104,9 +104,22 @@ export const updateMemberPermissionsSchema = z.object({
 
 export type UpdateMemberPermissions = z.infer<typeof updateMemberPermissionsSchema>;
 
+// Keep grant writes fail-closed: authorization treats unknown scope metadata as
+// unconstrained. Only expose understood agent constraints, never arbitrary JSON.
+const agentPermissionGrantScopeSchema = z.object({
+  subtreeRootAgentId: z.string().guid().optional(),
+  agentIds: z.array(z.string().guid()).min(1).max(100).optional(),
+  allow: z.array(z.string().refine((value) => {
+    const match = /^(subtree|agent):(.+)$/.exec(value);
+    return match !== null && z.string().guid().safeParse(match[2]).success;
+  }, "Expected subtree:<agent UUID> or agent:<agent UUID>")).min(1).max(100).optional(),
+}).strict().refine((scope) => Object.keys(scope).length > 0, "Use null for an unscoped grant");
+
 export const updateAgentPermissionGrantSchema = z.object({
   permissionKey: z.enum(PERMISSION_KEYS),
   enabled: z.boolean(),
+  // Omitted: preserve an existing scope. Null: explicitly make it unscoped.
+  scope: agentPermissionGrantScopeSchema.nullable().optional(),
 }).strict();
 
 export type UpdateAgentPermissionGrant = z.infer<typeof updateAgentPermissionGrantSchema>;

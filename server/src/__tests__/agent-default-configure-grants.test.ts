@@ -44,7 +44,7 @@ describeDatabase("new agent configuration defaults", () => {
     await cleanup?.();
   });
 
-  it("grants standard new agents direct peer configuration, but keeps restricted agents narrow", async () => {
+  it("grants standard new agents only self-subtree configuration, but keeps restricted agents narrow", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -78,6 +78,10 @@ describeDatabase("new agent configuration defaults", () => {
         .toEqual({ subtreeRootAgentId: agent.id });
       expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === "inbox:manage")?.scope)
         .toEqual({ responsibleUserOnly: true });
+      for (const key of ["agents:configure", "agents:suggest-changes"]) {
+        expect(grants.find((grant) => grant.principalId === agent.id && grant.permissionKey === key)?.scope)
+          .toEqual({ subtreeRootAgentId: agent.id });
+      }
     }
     for (const agent of [lowTrust, bundled]) {
       expect(grants.filter((grant) => grant.principalId === agent.id)).toEqual([]);
@@ -92,7 +96,7 @@ describeDatabase("new agent configuration defaults", () => {
     });
 
     for (const permissionKey of expectedNewAgentGrantKeys) {
-      if (permissionKey === "tasks:assign_scope" || permissionKey === "inbox:manage") continue; // These grants require a target scope or the responsible-user inbox path.
+      if (["tasks:assign_scope", "inbox:manage", "agents:configure", "agents:suggest-changes"].includes(permissionKey)) continue; // These grants require a target scope or the responsible-user inbox path.
       expect(await accessService(db).hasPermission(companyId, "agent", standard.id, permissionKey)).toBe(true);
     }
     expect(await authorizationService(db).decidePrincipalGrant({
@@ -122,9 +126,9 @@ describeDatabase("new agent configuration defaults", () => {
       actor: { type: "agent", agentId: standard.id, companyId, source: "agent_key" },
       action: "agent_config:update",
       resource: { type: "agent", agentId: peer.id, companyId },
-      scope: { requiresChangeGrant: true },
+      scope: { targetAgentId: peer.id, requiresChangeGrant: true },
     });
-    expect(decision).toMatchObject({ allowed: true, reason: "allow_direct_change" });
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_scope" });
 
     // A later ordinary self-update must not recreate a grant removed by an operator.
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, standard.id));
@@ -206,9 +210,13 @@ describeDatabase("new agent configuration defaults", () => {
 
     const result = await createAgentLifecycle(db).approveHire(pending.id);
     expect(result?.activated).toBe(true);
-    expect((await db.select().from(principalPermissionGrants)
-      .where(eq(principalPermissionGrants.companyId, companyId)))
-      .map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+    const approvedGrants = await db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.companyId, companyId));
+    expect(approvedGrants.map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+    for (const key of ["agents:configure", "agents:suggest-changes"]) {
+      expect(approvedGrants.find(grant => grant.permissionKey === key)?.scope)
+        .toEqual({ subtreeRootAgentId: pending.id });
+    }
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(agents).where(eq(agents.companyId, companyId));
@@ -237,6 +245,10 @@ describeDatabase("new agent configuration defaults", () => {
     const grants = await db.select().from(principalPermissionGrants)
       .where(eq(principalPermissionGrants.principalId, invited.id));
     expect(grants.map((grant) => grant.permissionKey).sort()).toEqual(expectedNewAgentGrantKeys);
+    for (const key of ["agents:configure", "agents:suggest-changes"]) {
+      expect(grants.find(grant => grant.permissionKey === key)?.scope)
+        .toEqual({ subtreeRootAgentId: invited.id });
+    }
 
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.delete(companyMemberships).where(eq(companyMemberships.companyId, companyId));
