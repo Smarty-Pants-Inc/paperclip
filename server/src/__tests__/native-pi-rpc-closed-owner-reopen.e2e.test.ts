@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import https, { createServer as createHttpsServer } from "node:https";
@@ -90,7 +90,10 @@ function sessionFile(pi: Birth): string {
 // and from then on every turn on this conversation opens a fresh Runner over
 // the durable root still stamped with the closed owner's identity. Each fresh
 // open must rotate that suspended authority and continue the same Pi file.
-it.skipIf(!enabled)("a fresh open over a Runner that Core closed rotates its suspended authority and continues with history", async () => {
+// "alive" (RFL F1): the owner's close never succeeds (here: it never runs),
+// so its Runner stays live and unsuspended. A fresh open must refuse and
+// leave it untouched: never rotate or replace a live owner.
+it.skipIf(!enabled).each(["closed", "alive"] as const)("a fresh open over a Runner that Core closed rotates its suspended authority and continues with history; a live owner is never rotated (%s)", async mode => {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -347,12 +350,16 @@ it.skipIf(!enabled)("a fresh open over a Runner that Core closed rotates its sus
     await writeFile(join(root, "conversation-before-retirement.jsonl"), before);
     expect(requests).toHaveLength(1);
     expect(JSON.stringify(requests[0]!.request)).not.toContain(fact);
-    // Displacement: Core closes the idle warm Runner cleanly (it suspends).
-    await cancelThenClose(firstSession, "warm native ingress requires another session");
-    await vi.waitFor(() => {
-      expect(sameBirth(processPairs[0]!.runner)).toBe(false); expect(sameBirth(processPairs[0]!.pi)).toBe(false);
-    }, { timeout: 5000, interval: 50 });
     const remoteSessionRoot = join(stagedRuntime, "sessions", createHash("sha256").update(first.native.normalizedSessionId).digest("hex"));
+    // Displacement: Core closes the idle warm Runner cleanly (it suspends).
+    // "alive": the close never succeeds, so the owner stays live and unsuspended.
+    const liveRunnerBytes = mode === "alive" ? await readFile(join(remoteSessionRoot, "runner", "runner-state.json")) : null;
+    if (mode === "closed") {
+      await cancelThenClose(firstSession, "warm native ingress requires another session");
+      await vi.waitFor(() => {
+        expect(sameBirth(processPairs[0]!.runner)).toBe(false); expect(sameBirth(processPairs[0]!.pi)).toBe(false);
+      }, { timeout: 5000, interval: 50 });
+    }
     let previous = first, previousSnapshot = initial.snapshot;
     // One fresh open per Core close. Later turns need the executor's per-turn
     // bookkeeping (warm checkpoint file, suspended failover backup), which
@@ -375,6 +382,36 @@ it.skipIf(!enabled)("a fresh open over a Runner that Core closed rotates its sus
         recoveryState: null }).where(eq(nativeRunFinalizations.runId, previous.runId));
       leaseActive.set(previous.lease.id, false);
       await environmentsService.releaseLease(previous.lease.id, "released");
+      if (mode === "alive") {
+        expect(JSON.parse(liveRunnerBytes!.toString()).lifecycle).not.toBe("suspended");
+        const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "lease-proof-operator",
+          body: "Recall the private fact from your own earlier assistant history. Do not invent it." }).returning();
+        const next = await seed(comment!.body, first.native.normalizedSessionId, comment!.id, previous.lease.id);
+        const selected = await findNativeSessionResumeRun(db, { companyId, agentId, issueId, normalizedSessionId: first.native.normalizedSessionId,
+          currentRunId: next.runId, beforeCreatedAt: next.run.createdAt });
+        expect(selected?.id).toBe(previous.runId);
+        next.native.runnerInstanceId = selected!.runnerInstanceId!;
+        await db.update(heartbeatRuns).set({ runnerInstanceId: next.native.runnerInstanceId }).where(eq(heartbeatRuns.id, next.runId));
+        const refused = await (async () => {
+          const liveBackend = await backend(next, "resumed");
+          return liveBackend.openSession({ identity: { companyId, agentId, issueId, runId: next.runId,
+            sessionId: next.native.normalizedSessionId }, workingDirectory: remoteCwd });
+        })().then(session => { sessions.push(session); return null; }, error => String(error));
+        stage("live owner refusal", refused);
+        expect(refused, "a live, unsuspended owner is never rotated or replaced").toMatch(
+          /runner_state_identity_mismatch|native_runner_authority_rotation_requires_settled_state|native_session_supervisor_busy/);
+        expect(sameBirth(processPairs[0]!.runner)).toBe(true); expect(sameBirth(processPairs[0]!.pi)).toBe(true);
+        expect(existsSync(join(remoteSessionRoot, "authority-epochs")) ? readdirSync(join(remoteSessionRoot, "authority-epochs")) : []).toEqual([]);
+        expect((await readFile(join(remoteSessionRoot, "runner", "runner-state.json"))).equals(liveRunnerBytes!)).toBe(true);
+        expect(new Set(spawned.map(entry => entry.pid)).size, "no successor Runner was launched").toBe(1);
+        // Cleanup only: the live owner closes through its own lease.
+        leaseActive.set(previous.lease.id, true);
+        await cancelThenClose(firstSession, "live-owner proof complete");
+        await vi.waitFor(() => { expect(sameBirth(processPairs[0]!.runner)).toBe(false); }, { timeout: 15_000, interval: 50 });
+        await Promise.allSettled(pumps);
+        stage("GREEN: a live owner was neither rotated nor replaced");
+        return;
+      }
       const suspended = JSON.parse(await readFile(join(remoteSessionRoot, "runner", "runner-state.json"), "utf8"));
       expect(suspended.lifecycle, "Core's close suspended the owner").toBe("suspended");
       const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "lease-proof-operator",
