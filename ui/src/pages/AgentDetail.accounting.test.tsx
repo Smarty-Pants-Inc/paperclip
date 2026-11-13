@@ -4,12 +4,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AgentActionButtons } from "../components/AgentActionButtons";
 import type { Agent, HeartbeatRun } from "@paperclipai/shared";
 import { describe, expect, it, vi } from "vitest";
-import { RunAccountingMetrics } from "./AgentDetail";
+import { RunAccountingMetrics, RunsTab } from "./AgentDetail";
 import { CostAmount } from "../components/CostAmount";
 import { SubscriptionTokenUsage } from "../components/SubscriptionCostCard";
 import { hasUnavailableProviderAccounting } from "../lib/utils";
 
-vi.mock("@/lib/router", () => ({ useNavigate: () => vi.fn() }));
+vi.mock("@/lib/router", () => ({
+  useNavigate: () => vi.fn(),
+  Link: ({ to, children, ...props }: { to: string; children: React.ReactNode }) => <a href={to} {...props}>{children}</a>,
+}));
+vi.mock("../context/SidebarContext", () => ({ useSidebar: () => ({ isMobile: true }) }));
 vi.mock("../context/DialogContext", () => ({ useDialogActions: () => ({ openNewIssue: vi.fn() }) }));
 vi.mock("../context/ToastContext", () => ({ useToastActions: () => ({ pushToast: vi.fn() }) }));
 
@@ -37,6 +41,40 @@ describe("run accounting provenance", () => {
     const markup = renderToStaticMarkup(<RunAccountingMetrics run={run({ inputTokens, outputTokens: 0, accountingUsageLost: true })} />);
     expect(markup).toContain("Additional usage unknown");
     expect(markup).toContain(`>${inputTokens}<`);
+  });
+
+  it.each([null, 0.25])("qualifies mobile list tokens and the measured money subtotal %s", costUsd => {
+    const savedRun = { id: "4a2004cc-recorded", companyId: "company-1", agentId: "agent-1", status: "succeeded",
+      invocationSource: "on_demand", createdAt: new Date("2026-11-13T08:18:09Z"),
+      usageJson: { inputTokens: 45516, outputTokens: 991, cachedInputTokens: 402976, cacheWriteTokens: 45502,
+        provider: "anthropic", accountingUsageLost: true, costUsd, costStatus: "unpriced" },
+      resultJson: null,
+    } as unknown as HeartbeatRun;
+    const client = new QueryClient();
+    const markup = renderToStaticMarkup(<QueryClientProvider client={client}>
+      <RunsTab runs={[savedRun]} companyId={savedRun.companyId} agentId={savedRun.agentId}
+        agentRouteId={savedRun.agentId} selectedRunId={null} adapterType="paperclip_runner" adapterConfig={{ provider: "pi_rpc" }} />
+    </QueryClientProvider>);
+    client.clear();
+    expect(markup).toContain("449.5k tok");
+    if (costUsd !== null) expect(markup).toContain("$0.250");
+    expect(markup.match(/Additional usage unknown/g)).toHaveLength(1);
+    expect(markup).toContain(`/agents/${savedRun.agentId}/runs/${savedRun.id}`);
+  });
+
+  it.each([true, false])("keeps a zero-subtotal mobile run's typed uncertainty visible: %s", accountingUsageLost => {
+    const savedRun = { id: "zero-subtotal", companyId: "company-1", agentId: "agent-1", status: "succeeded",
+      invocationSource: "on_demand", createdAt: new Date(), resultJson: null,
+      usageJson: { inputTokens: 0, outputTokens: 0, accountingUsageLost,
+        pricingProvenance: { evidence: "Additional usage unknown" } },
+    } as unknown as HeartbeatRun;
+    const client = new QueryClient();
+    const markup = renderToStaticMarkup(<QueryClientProvider client={client}>
+      <RunsTab runs={[savedRun]} companyId={savedRun.companyId} agentId={savedRun.agentId}
+        agentRouteId={savedRun.agentId} selectedRunId={null} adapterType="paperclip_runner" adapterConfig={{}} />
+    </QueryClientProvider>);
+    client.clear();
+    expect(markup.includes("Additional usage unknown")).toBe(accountingUsageLost);
   });
 
   it("does not infer missing usage from an ordinary estimate or explanatory prose", () => {

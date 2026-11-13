@@ -144,8 +144,7 @@ async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): P
     const exemptFromUnpricedBlock = sql`((${finalCharge}
         and exists (select 1 from ${heartbeatRuns} lost_receipt_run where lost_receipt_run.id = ${costEvents.heartbeatRunId}
           and lost_receipt_run.company_id = ${costEvents.companyId}
-          and (lost_receipt_run.usage_json->>'accountingUsageLost' = 'true'
-            or lost_receipt_run.usage_json->>'accountingReceiptUnavailable' = 'true'
+          and (lost_receipt_run.usage_json->>'accountingReceiptUnavailable' = 'true'
             or lost_receipt_run.usage_json->>'accountingClosureTimedOut' = 'true'
             or lost_receipt_run.usage_json->>'accountingCaptureFailed' = 'true'
             or exists (select 1 from ${runUsageReceipts} lost_turn_receipt
