@@ -36,7 +36,8 @@ import type {
 import { HarnessCapabilityUnavailableError, HarnessOperationAlreadyTerminalError, HarnessStaleTurnError } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
-import { MAX_PROVIDER_PERFORMANCE_SPANS, PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
+import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
+import { piPerformanceSpanBatches } from "./pi-performance-diagnostics.js";
 
 export interface PiRpcDriverOptions {
   /** Proxy/backend integration options currently forwarded by the native factory. */
@@ -621,17 +622,23 @@ export class PiRpcHarnessSession implements HarnessSession {
       }
       this.#runId = input.runId;
       for (const diagnostic of (this.#resident?.context ?? this.#initialContext).diagnostics) this.#emit("harness.diagnostic", diagnostic);
-    }), { runId: input.runId });
+    }), { runId: input.runId }, true);
   }
 
   /** Runner's post-claim hook; shared HarnessSession has no claim contract. */
   async revalidateAfterClaim(input: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.#serialize(() => this.#validatePreparedAdmission(input.signal));
+    return this.#serialize(async () => {
+      await this.#validatePreparedAdmission(input.signal);
+      this.#flushTimings();
+    });
   }
 
   /** Reconnected authority cannot spend a previous native acknowledgment. */
   async reconnect(input: { signal?: AbortSignal } = {}): Promise<void> {
-    return this.#serialize(() => this.#admit(input.signal));
+    return this.#serialize(async () => {
+      await this.#admit(input.signal);
+      this.#flushTimings();
+    });
   }
 
   #serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -661,16 +668,16 @@ export class PiRpcHarnessSession implements HarnessSession {
       batch.spans.push(span);
     }
     for (const { origin, spans } of batches.values()) {
-      // Respect the existing reader's limit even after repeated admissions.
-      for (let offset = 0; offset < spans.length; offset += MAX_PROVIDER_PERFORMANCE_SPANS) {
-        try { this.#emit("harness.diagnostic", { code: PROVIDER_PERFORMANCE_DIAGNOSTIC,
-          spans: spans.slice(offset, offset + MAX_PROVIDER_PERFORMANCE_SPANS) }, origin); }
+      // Both limits apply per diagnostic, not per run. Splitting only on the
+      // total silently loses repeated names at the consumer's trust boundary.
+      for (const batch of piPerformanceSpanBatches(spans)) {
+        try { this.#emit("harness.diagnostic", { code: PROVIDER_PERFORMANCE_DIAGNOSTIC, spans: batch }, origin); }
         catch { /* Diagnostics must not replace the operation's result. */ }
       }
     }
   }
 
-  async #measure<T>(name: ProviderPerformancePhase, work: () => Promise<T>, origin = { runId: this.#runId }): Promise<T> {
+  async #measure<T>(name: ProviderPerformancePhase, work: () => Promise<T>, origin = { runId: this.#runId }, flushIdle = false): Promise<T> {
     const startedAtMs = Date.now();
     let outcome: "ok" | "failed" = "failed";
     const finish = (endedAtMs: number) => {
@@ -681,7 +688,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     try { const result = await work(); outcome = "ok"; return result; }
     finally {
       finish(Date.now());
-      if (outcome === "failed" && !this.#pendingTimings.size) this.#flushTimings();
+      // An external attachment can succeed indefinitely without a turn. Drain
+      // each completed admission, including its outer span, instead of retaining
+      // a resident-lifetime history. startTurn's own measurements stay deferred.
+      if ((flushIdle && !this.#activeTurn) || (outcome === "failed" && !this.#pendingTimings.size)) this.#flushTimings();
     }
   }
 
@@ -986,6 +996,8 @@ export class PiRpcHarnessSession implements HarnessSession {
             this.#admitted = false;
           } catch (error) { await this.#fenceFailure(error); throw error; }
         }
+        // Manual compaction also admits outside a host turn and may repeat.
+        this.#flushTimings();
       }
     });
   }

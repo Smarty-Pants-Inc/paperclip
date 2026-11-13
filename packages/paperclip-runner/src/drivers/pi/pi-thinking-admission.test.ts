@@ -68,9 +68,13 @@ it("the driver records effective effort in readback/run events and emits only on
     expect(diagnostic).toMatchObject({ eventType: "harness.diagnostic", payload: { code: "pi_thinking_lowered_by_config", requested: "max", effective: "xhigh" } });
     expect(JSON.stringify(diagnostic.payload).length).toBeLessThan(256);
     await session.attachRun!({ runId: "run-2" });
+    const admissionTiming = (await events.next()).value;
+    expect(admissionTiming).toMatchObject({ eventType: "harness.diagnostic", runId: "run-2", payload: { code: "provider_performance_spans" } });
+    expect(admissionTiming.turnId).toBeUndefined();
     expect(await session.snapshot()).toMatchObject({ piRpcThinkingLevel: "xhigh" });
     await session.startTurn({ message: { role: "user", text: "work" } });
-    // Neither timing nor duplicate lowering diagnostics may overtake startup.
+    // The external admission already drained; neither turn-owned timing nor a
+    // duplicate lowering diagnostic may overtake this turn's startup.
     expect((await events.next()).value).toMatchObject({ eventType: "turn.started", runId: "run-2", payload: { context: { piRpcThinkingLevel: "xhigh" } } });
     // Open, warm attach and pre-prompt admission each revalidate Pi's
     // effective configuration, while the lowering diagnostic stays unique.

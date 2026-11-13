@@ -10,7 +10,7 @@ import { bindContent, sendPiBindRequest, sendPiToolRequest, validateBindingConfi
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import { PiRpcCommandError, PiRpcTransport, type PiRpcExtensionUiResponseInput, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
-import { parseProviderPerformanceSpans } from "../../contracts/provider-performance.js";
+import { MAX_PROVIDER_PERFORMANCE_SPANS, parseProviderPerformanceSpans, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 
 // Keep reason: revocable model capabilities, receipt admission, and callback refusal
 // are trust boundaries. These tests exercise the actual driver with real brokers/IPC.
@@ -198,7 +198,9 @@ describe("resident Pi model binding", () => {
     const startedAtMs = Date.now();
     await f.session.attachRun({ runId: "run-b" });
     const turn = await f.session.startTurn({ message: { role: "user", text: "two" } });
-    expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toEqual([]);
+    const admissionDiagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
+    expect(admissionDiagnostics).toHaveLength(1);
+    expect(admissionDiagnostics[0]!.turnId).toBeUndefined();
     await finish(f, 2);
     const runEvents = f.events.filter(event => event.runId === "run-b");
     const diagnostics = runEvents.filter(event => event.eventType === "harness.diagnostic"
@@ -208,10 +210,15 @@ describe("resident Pi model binding", () => {
       JSON.stringify({ runId: "run-b", turnId: turn.turnId, diagnosticCount: diagnostics.length,
         events: runEvents.map(event => ({ eventType: event.eventType, code: event.payload.code, runId: event.runId,
           turnId: event.turnId, sourceSeq: event.sourceSeq, spanCount: parseProviderPerformanceSpans(event.payload, Date.now()).length })) }, null, 2));
-    expect(diagnostics).toHaveLength(1);
-    expect(diagnostics[0]).toMatchObject({ runId: "run-b", turnId: turn.turnId });
+    expect(diagnostics).toHaveLength(2);
+    expect(diagnostics[0]).toMatchObject({ runId: "run-b" });
+    expect(diagnostics[0]!.turnId).toBeUndefined();
+    expect(diagnostics[1]).toMatchObject({ runId: "run-b", turnId: turn.turnId });
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(7);
+    expect(parseProviderPerformanceSpans(diagnostics[1]!.payload, Date.now()).map(span => span.name))
+      .toEqual(["runner.pi.admission.get_state", "runner.pi.begin_turn", "runner.pi.prompt_to_started"]);
     expect(runEvents.indexOf(runEvents.find(event => event.eventType === "turn.started")!))
-      .toBeLessThan(runEvents.indexOf(diagnostics[0]!));
+      .toBeLessThan(runEvents.indexOf(diagnostics[1]!));
     expect(f.transport.commands.slice(commandStart)).toEqual([...admission, "get_state", "prompt"]);
     expect(spans.map(span => span.name)).toEqual(expect.arrayContaining([
       "runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn", "runner.pi.prompt_to_started",
@@ -232,9 +239,69 @@ describe("resident Pi model binding", () => {
       JSON.stringify({ runId: "run-b", turnId: turn.turnId, providerSessionId: f.session.ids().providerSessionId,
         commands: f.transport.commands.slice(commandStart), spans }, null, 2));
   });
+  // Keep reason: RFL's spanbatch review reproduced loss at the real driver /
+  // diagnostic-reader boundary after repeated admissions, and unbounded idle retention.
+  it("keeps every repeated-admission span visible through the diagnostic reader", async () => {
+    const f = await fixture();
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.attachRun({ runId: "run-b" });
+    for (let index = 0; index < 40; index++) await f.session.reconnect();
+    const turn = await f.session.startTurn({ message: { role: "user", text: "two" } });
+    await finish(f, 2);
+    const diagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
+    const emitted = diagnostics.flatMap(event => event.payload.spans as ProviderPerformanceSpan[]);
+    const visible = diagnostics.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
+    const counts = (spans: ProviderPerformanceSpan[]) => Object.fromEntries([...new Set(spans.map(span => span.name))]
+      .map(name => [name, spans.filter(span => span.name === name).length]));
+    expect(emitted).toHaveLength(210);
+    expect(emitted.length).toBeGreaterThan(MAX_PROVIDER_PERFORMANCE_SPANS);
+    expect(emitted.filter(span => span.name === "runner.pi.admission.get_state").length).toBeGreaterThan(16);
+    expect(counts(visible)).toEqual(counts(emitted));
+    expect(visible).toEqual(emitted);
+    for (const diagnostic of diagnostics) {
+      expect((diagnostic.payload.spans as ProviderPerformanceSpan[]).length).toBeLessThanOrEqual(MAX_PROVIDER_PERFORMANCE_SPANS);
+      expect(diagnostic.turnId === undefined || diagnostic.turnId === turn.turnId).toBe(true);
+    }
+    const started = f.events.findIndex(event => event.eventType === "turn.started" && event.turnId === turn.turnId);
+    expect(diagnostics.filter(event => event.turnId === turn.turnId).every(event => f.events.indexOf(event) > started)).toBe(true);
+  });
+
+  it("drains successful admissions without a turn and never accumulates a timing backlog", async () => {
+    const f = await fixture();
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.attachRun({ runId: "run-b" });
+    const expected: Record<string, number> = {
+      "runner.pi.attach": 1, "runner.pi.bind": 1,
+      "runner.pi.admission.get_state": 2, "runner.pi.admission.set_model": 1,
+      "runner.pi.admission.get_available_thinking_levels": 1, "runner.pi.admission.set_thinking_level": 1,
+    };
+    for (let index = 0; index < 100; index++) {
+      if (index % 3 === 0) { await f.session.attachRun({ runId: "run-b" }); expected["runner.pi.attach"]!++; }
+      else if (index % 3 === 1) { await f.session.revalidateAfterClaim(); expected["runner.pi.admission.get_state"]!++; }
+      else {
+        await f.session.reconnect();
+        for (const command of admission) expected[`runner.pi.admission.${command}`]!++;
+      }
+      await tick();
+      const diagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
+      const emitted = diagnostics.flatMap(event => event.payload.spans as ProviderPerformanceSpan[]);
+      const visible = diagnostics.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
+      // All completed measurements have drained at each public admission boundary:
+      // zero retained spans is stronger than merely staying below the 128-span bound.
+      expect(emitted).toHaveLength(Object.values(expected).reduce((sum, count) => sum + count, 0));
+      expect(visible).toEqual(emitted);
+      for (const [name, count] of Object.entries(expected)) expect(visible.filter(span => span.name === name)).toHaveLength(count);
+      expect(diagnostics.every(event => event.turnId === undefined)).toBe(true);
+    }
+    expect(f.events.some(event => event.runId === "run-b" && event.eventType === "turn.started")).toBe(false);
+    const count = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans").length;
+    await f.session.close(); await tick();
+    expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(count);
+  });
+
   // Keep reason: prompt rejection/handled input and failed admission can omit
   // native agent_start; diagnostics must survive these trust-boundary paths.
-  it.each(["handled", "rejected"])("flushes %s prompt timings once before its terminal without agent_start", async disposition => {
+  it.each(["handled", "rejected"])("flushes %s turn-owned timings once before its terminal without agent_start", async disposition => {
     const f = await fixture();
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
@@ -246,22 +313,28 @@ describe("resident Pi model binding", () => {
     await tick();
     const events = f.events.filter(event => event.runId === "run-b");
     const diagnostics = events.filter(event => event.payload.code === "provider_performance_spans");
-    expect(diagnostics).toHaveLength(1);
-    expect(events[0]).toMatchObject({ eventType: "turn.started" });
-    expect(diagnostics[0]).toMatchObject({ turnId: events[0]!.turnId });
+    expect(diagnostics).toHaveLength(2);
+    expect(diagnostics[0]!.turnId).toBeUndefined();
+    const turnStarted = events.find(event => event.eventType === "turn.started")!;
+    expect(turnStarted).toBeDefined();
+    expect(diagnostics[1]).toMatchObject({ turnId: turnStarted.turnId });
+    expect(events.indexOf(turnStarted)).toBeLessThan(events.indexOf(diagnostics[1]!));
     expect(events.at(-1)).toMatchObject({ eventType: disposition === "rejected" ? "turn.failed" : "turn.completed" });
-    // Warm reattach admits once; pre-prompt proof adds only get_state, not
-    // another full admission batch. No agent_start means no prompt-to-start span.
-    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(9);
+    // External admission drains seven spans; the turn's state proof and
+    // begin_turn wait until turn.started. No agent_start means no prompt-to-start span.
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(7);
+    expect(parseProviderPerformanceSpans(diagnostics[1]!.payload, Date.now())).toHaveLength(2);
     await f.session.close(); await tick();
-    expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(1);
+    expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(2);
   });
 
-  it("flushes an unused warm attachment on close with its captured run and no invented turn", async () => {
+  it("flushes an unused warm attachment immediately with its captured run and no invented turn", async () => {
     const f = await fixture();
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
-    expect(f.events.some(event => event.runId === "run-b")).toBe(false);
+    await tick();
+    expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(1);
+    expect(f.events.some(event => event.runId === "run-b" && event.eventType === "turn.started")).toBe(false);
     await f.session.close(); await tick();
     const diagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
     expect(diagnostics).toHaveLength(1);
