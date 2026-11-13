@@ -4,6 +4,7 @@ import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/com
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { invalidArchive, readProviderPackLayers, stageProviderPackLayers, verifyArchive } from "./provider-pack-layers.js";
 import { providerPackExtractionProbe } from "./provider-pack-extraction.js";
+import { providerPackTransferTimeoutMs } from "./provider-pack-transfer.js";
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
@@ -53,7 +54,7 @@ export async function stageProviderPackArchive(input: {
     await measure("provider_pack.archive.transfer", () => input.runner.syncIn!([{
       operationId: `runner-provider-archive-${randomUUID()}`,
       files: [{ kind: "file", sourcePath: archive.sourcePath, targetPath: archivePath, mode: 0o600 }],
-    }]));
+    }], { minimumTimeoutMs: providerPackTransferTimeoutMs(archive.bytes) }));
     const result = await measure("provider_pack.archive.extract", () => input.runner.execute({
       command: "sh",
       args: ["-c", [
