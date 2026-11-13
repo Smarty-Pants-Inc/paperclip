@@ -2040,6 +2040,13 @@ being refused by it. These rules
 read only `errorCode` and `runnerProfileJson.sessionCheckpoint`, so runs that
 earlier releases quarantined are shown the same way without a migration.
 
+The task card's Retry agrees with the task's execution blocker. When the card
+would offer Retry, it reads the blocker of a held workspace restore and the
+conversation's standing notice (the held-conversation notice that no later
+committed success on the same session superseded). Where the blocker refuses
+Retry, or the notice stands, the card offers no Retry, and it shows the notice's
+own text instead of the generic failure line. Both reads are batched for a list.
+
 A server restart in the middle of a host-tool callback (for example an assigned
 app tool or `connections_search`) must not cause that gate. The replacement
 controller restores the old controller's journal and asks the tool authority for
