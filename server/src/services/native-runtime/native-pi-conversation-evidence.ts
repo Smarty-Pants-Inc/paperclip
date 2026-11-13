@@ -63,13 +63,29 @@ export async function retainNativePiConversationEvidence(root: string, stateBase
   if (path.resolve(root).split(path.sep).includes(NATIVE_PI_CONVERSATION_EVIDENCE_DIRECTORY)) {
     throw new Error("native_pi_evidence_not_expirable");
   }
+  if (!stateBase && !sourceScope(root)) return false;
+  if (!await hasNativePiConversationEvidence(root)) return false;
+  return retainNativeRuntimeEvidence(root, stateBase);
+}
+
+/** Known Pi setup probes may contain only raw diagnostics (including failed
+ * admission). Their owner retains the complete tree without a history filter. */
+export async function retainNativeRuntimeEvidence(root: string, stateBase?: string): Promise<boolean> {
+  if (path.resolve(root).split(path.sep).includes(NATIVE_PI_CONVERSATION_EVIDENCE_DIRECTORY)) {
+    throw new Error("native_pi_evidence_not_expirable");
+  }
   const binding = sourceScope(root);
   const base = stateBase ?? binding?.base;
   // Upload/restore scratch trees have a verified source/object elsewhere, not
   // a controller session scope. Their cleanup is not retirement of that source.
   if (!base) return false;
   const evidence = path.join(path.resolve(base), NATIVE_PI_CONVERSATION_EVIDENCE_DIRECTORY);
-  if (!await hasNativePiConversationEvidence(root)) return false;
+  const source = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!source) return false;
+  if (!source.isDirectory() || source.isSymbolicLink()) throw new Error("native_pi_evidence_source_unsafe");
   const scope = binding?.scope ?? `unattributed-${createHash("sha256").update(path.resolve(root)).digest("hex")}`;
   await privateDirectory(evidence);
   const scoped = path.join(evidence, scope);
