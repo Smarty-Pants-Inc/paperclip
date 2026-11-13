@@ -14,6 +14,7 @@ import { completionReviewStageEntry } from "../issue-execution-policy.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { isPublishedGitHubReviewCompletionContinuation, readPublishedGitHubReviewCompletionContinuation, resolveExternalChatResponseWaitAuthorization } from "./chat-attachment-reuse.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeAddressedInteractionGrant, readNativeAddressedInteractionId } from "./native-addressed-interaction.js";
 import { assertCurrentWakeCommentsRead, NATIVE_CURRENT_WAKE_COMMENTS_CHANGED_AFTER_READ, NATIVE_CURRENT_WAKE_COMMENTS_UNREAD, resolveCurrentWakeCommentsBinding } from "./current-wake-comments.js";
 import { and, eq, inArray, notInArray } from "drizzle-orm";
 import {
@@ -112,6 +113,18 @@ export async function nativeCompletionFeedback(
       }
       throw error;
     }
+  }
+  if (readNativeAddressedInteractionId(run.contextSnapshot)
+    && (issue.assigneeAgentId !== run.agentId || issue.executionRunId !== run.id)) {
+    const grant = await getNativeAddressedInteractionGrant(db, wakeScope, { phase: "settlement" });
+    if (!grant) throw new Error("The addressed confirmation is stale or no longer authorized for this response run.");
+    if (result.continuation) throw new Error("A card response turn cannot schedule task work or another response wake.");
+    if (grant.interaction.status === "pending") {
+      if (result.reportedWorkDisposition !== "blocked" || !result.blocker || !result.summary.trim())
+        throw new Error("Resolve your addressed confirmation with call_api before finishing, or report its concrete blocker with paperclip_block. Do not complete or block the assignee's task.");
+      return "Response blocker recorded; the confirmation remains pending. The assignee's task and continuation are unchanged.";
+    }
+    return "Response turn accepted. This run recorded the addressed confirmation decision; it does not claim completion of the assignee's task or authorize downstream actions.";
   }
   if (result.reportedWorkDisposition === "yielded" && isPublishedGitHubReviewCompletionContinuation(result.continuation)) {
     const current = await readPublishedGitHubReviewCompletionContinuation({ db,

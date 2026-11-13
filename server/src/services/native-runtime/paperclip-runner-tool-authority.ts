@@ -112,6 +112,9 @@ import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { readPersistedConfirmationDecision } from "../confirmation-decision.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeAddressedInteractionGrant, addressedInteractionResponseStatus, NATIVE_ADDRESSED_INTERACTION_TOOLS, type NativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
+
+type AddressedApiResponse = { operation: { method: string; path: string }; input: RunnerApiCall; callId: string; digest: string; settlement?: boolean };
 import { childReviewOutcomes } from "./child-review-outcomes.js";
 import { logActivity, persistActivity, publishActivity } from "../activity-log.js";
 import { captureRunIdentity } from "../run-identity.js";
@@ -465,7 +468,7 @@ export class PaperclipRunnerToolAuthority {
   async recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {
     await this.#assertToolScope(call.tool);
     if (!this.binding.museRuntime) await this.binding.assertBridgeAuthority?.();
-    const context = await this.#boundContext({ tool: call.tool });
+    const context = await this.#boundContext({ tool: call.tool, allowAddressedSettlement: call.tool === "call_api" });
     const { run } = context;
     if (call.tool === GENERATE_IMAGE) {
       const input = generateImageSchema.safeParse(call.arguments);
@@ -549,6 +552,11 @@ export class PaperclipRunnerToolAuthority {
         throw error;
       }
       const { input: apiInput, operation } = validated;
+      if (context.addressedInteraction) {
+        const expected = addressedInteractionResponseStatus(context.addressedInteraction, operation, apiInput);
+        if (!expected || (context.addressedInteraction.interaction.status !== "pending" && context.addressedInteraction.interaction.status !== expected))
+          throw forbidden("Only the exact addressed response receipt is available to this run.");
+      }
       if (readOnlyApiMethod(operation.method)) return this.#recoverRead(call);
       const result = await this.#completedApiReceipt(run.resultJson?.apiToolReceipts, call.callId, apiInput);
       if (result === undefined) return null;
@@ -827,7 +835,7 @@ export class PaperclipRunnerToolAuthority {
     ) {
       throw new Error("paperclip_runner_tool_not_advertised");
     }
-    const context = await this.#boundContext({ tool: call.tool });
+    const context = await this.#boundContext({ tool: call.tool, allowAddressedSettlement: call.tool === "call_api" });
     const input = record(call.arguments);
     if (call.tool === READ_CHAT_ATTACHMENT_TOOL_NAME) {
       const scope = this.binding.chatAttachmentReadScope;
@@ -941,7 +949,15 @@ export class PaperclipRunnerToolAuthority {
           conversation: Boolean(context.issue.conversationAgentId),
           companyPrefix: call.tool === "list_projects" ? await this.#companyPagePrefix() : null });
       }
-      case "search_api": return withCompanyPagePaths(searchRunnerApi(call.arguments), await this.#companyPagePrefix());
+      case "search_api": {
+        const result = searchRunnerApi(call.arguments);
+        if (!context.addressedInteraction) return withCompanyPagePaths(result, await this.#companyPagePrefix());
+        const results = runnerApiCatalog().filter(operation => operation.method === "POST"
+          && ["/api/issues/{id}/interactions/{interactionId}/accept", "/api/issues/{id}/interactions/{interactionId}/reject"].includes(operation.path));
+        return { results, total: results.length, nextCursor: null,
+          issueId: this.binding.issueId, interactionId: context.addressedInteraction.interaction.id,
+          guidance: "Resolve only this addressed confirmation with call_api. This response turn grants no task or downstream action authority." };
+      }
       case "hire_agent": {
         return hireAgentResult(await this.#callApi(call.callId, hireAgentApiRequest(input, this.binding)), context.actor.adapterConfig?.provider);
       }
@@ -952,6 +968,12 @@ export class PaperclipRunnerToolAuthority {
         return apiToolResult(await this.#withWorkspacePageHref(await this.#callApi(call.callId, call.arguments)));
       }
       case "get_task_context": {
+        if (context.addressedInteraction) return {
+          company: { id: this.binding.companyId }, actor: redactedActor(context.actor),
+          activeTask: redactedTask(context.issue), assignedInteraction: context.addressedInteraction.interaction,
+          childTasks: [], childReviewOutcomes: [], completionContinuation: null,
+          run: { id: context.run.id, status: context.run.status, invocationSource: context.run.invocationSource },
+        };
         if (this.#apiScope(context).kind === "skill_test") return {
           company: { id: this.binding.companyId }, actor: redactedActor(context.actor),
           activeTask: redactedTask(context.issue), childTasks: [], childReviewOutcomes: [],
@@ -1204,9 +1226,14 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async #callApi(callId: string, value: unknown, options?: { dedicatedCaseTool: string; caseId?: string; receiptOnly?: true }): Promise<unknown> {
-    const bound = await this.#boundContext();
+    const bound = await this.#boundContext({ allowAddressedSettlement: true });
     const context = { ...this.binding, issueIdentifier: bound.issue.identifier, workMode: bound.issue.workMode };
     const { input, operation } = validateRunnerApiCall(value, context);
+    const addressedStatus = bound.addressedInteraction
+      ? addressedInteractionResponseStatus(bound.addressedInteraction, operation, input) : null;
+    if (bound.addressedInteraction && !addressedStatus) throw forbidden("This response run may only resolve its addressed confirmation.");
+    const addressedResponse: AddressedApiResponse | undefined = addressedStatus
+      ? { operation, input, callId, digest: toolInputDigest(input) } : undefined;
     // Only the strict dedicated case adapter may use its exact mapped route when
     // generic API discovery/calls are disabled. All route/run guards still apply.
     const dedicatedCaseRoute = options && NATIVE_CASE_OPERATIONS.has(options.dedicatedCaseTool)
@@ -1223,7 +1250,7 @@ export class PaperclipRunnerToolAuthority {
       : await caseIdForApiCapture(this.db, this.binding.companyId, operation.path, input.pathParams);
     if (this.binding.firstPartyOnly && /\/(?:workspaces|workspace-runtime|repositories|tool-gateway|tool-connections|tool-profiles|tools|connection-intents|connections|plugins)(?:\/|$)/.test(operation.path)) throw forbidden("Third-party tools through Paperclip are unavailable for this Grok Bot connection.");
     const sensitiveResponse = runnerApiSensitiveResponse(operation.method, operation.path);
-    await this.#assertDotApiFileAccess(operation.path, input);
+    await this.#assertDotApiFileAccess(operation.path, input, Boolean(addressedResponse));
     if (options?.receiptOnly) {
       assertAvailable(bound.issue.workMode);
       return this.#completedApiReceipt(bound.run.resultJson?.apiToolReceipts, callId, input);
@@ -1232,6 +1259,7 @@ export class PaperclipRunnerToolAuthority {
     if (!apiUrl) throw new Error("Paperclip API origin is unavailable");
     const token = this.#apiToken(bound);
     if (!token) throw new Error("Paperclip run authentication is unavailable");
+    let dispatchAuthorized = false;
     const execute = async () => {
       const current = await this.#boundContext();
       assertAvailable(current.issue.workMode);
@@ -1241,12 +1269,28 @@ export class PaperclipRunnerToolAuthority {
           const fresh = await this.#boundContext();
           assertAvailable(fresh.issue.workMode);
           validateRunnerApiCall(input, { ...context, workMode: fresh.issue.workMode });
+          if (addressedResponse && (!fresh.addressedInteraction
+            || addressedInteractionResponseStatus(fresh.addressedInteraction, operation, input) !== addressedStatus))
+            throw forbidden("The exact addressed confirmation is no longer pending.");
           await this.#assertDotApiFileAccess(operation.path, input);
+          dispatchAuthorized = true;
         },
+        ...(addressedResponse ? { beforeResponseCapture: async () => {
+          const fresh = await this.#boundContext({ allowAddressedSettlement: true });
+          assertAvailable(fresh.issue.workMode);
+          const grant = await getNativeAddressedInteractionGrant(this.db, this.binding, {
+            phase: "settlement", expectedStatus: addressedStatus!,
+          });
+          if (!grant || addressedInteractionResponseStatus(grant, operation, input) !== addressedStatus)
+            throw forbidden("The addressed response is no longer available for settlement.");
+          const receipt = record(record(fresh.run.resultJson?.apiToolReceipts)[toolCallKey(callId)]);
+          if (receipt.digest !== addressedResponse.digest || receipt.operationId !== operation.operationId || receipt.state !== "pending")
+            throw forbidden("The addressed response receipt is unavailable.");
+        } } : {}),
         readFile: (file) => this.#readApiFile(file),
-        ...this.#responseCaptureIo("runner.call_api", caseCaptureId),
+        ...this.#responseCaptureIo("runner.call_api", caseCaptureId, addressedResponse),
       });
-      await this.#assertDotApiFileAccess(operation.path, input);
+      await this.#assertDotApiFileAccess(operation.path, input, Boolean(addressedResponse));
       return result;
     };
     if (readOnlyApiMethod(operation.method)) return execute();
@@ -1261,7 +1305,7 @@ export class PaperclipRunnerToolAuthority {
     // Reservation and completion are DB-only and retried on 40P01/40001; the
     // HTTP dispatch between them runs once and is never replayed.
     const prior = await withTransactionRetry(this.db, () => this.db.transaction(async (tx) => {
-      const locked = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
+      const locked = await this.#lockAuthorizedMutationContext(tx as unknown as Db, addressedResponse ? { ...addressedResponse, settlement: true } : undefined);
       const resultJson = record(locked.run.resultJson);
       const receipts = record(resultJson.apiToolReceipts);
       const inherited = await priorRecoveryApiReceipt(tx as unknown as Db, { companyId: this.binding.companyId,
@@ -1276,13 +1320,28 @@ export class PaperclipRunnerToolAuthority {
       // A new call that would be rejected before dispatch must not reserve a
       // pending receipt; that would make its callId report an unknown outcome.
       assertRunnerApiDispatchable(operation, input, record(value));
+      if (addressedResponse && !await getNativeAddressedInteractionGrant(tx as unknown as Db, this.binding))
+        throw forbidden("The addressed confirmation is no longer pending.");
       if (Object.keys(receipts).length >= 512) throw badRequest("Run API mutation limit reached");
       receipts[key] = { digest, operationId: operation.operationId, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;
     }));
     if (prior) return prior.result;
-    const result = await execute();
+    const result = await execute().catch(async error => {
+      if (addressedResponse && !dispatchAuthorized) await this.db.transaction(async tx => {
+        const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, this.binding.runId),
+          eq(heartbeatRuns.companyId, this.binding.companyId), eq(heartbeatRuns.agentId, this.binding.agentId))).for("update");
+        if (!run) return;
+        const resultJson = record(run.resultJson), receipts = record(resultJson.apiToolReceipts);
+        const receipt = record(receipts[key]);
+        if (receipt.state === "pending" && receipt.digest === digest) {
+          delete receipts[key];
+          await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiToolReceipts: receipts } }).where(eq(heartbeatRuns.id, run.id));
+        }
+      });
+      throw error;
+    });
     const storedResult = provider
       ? { encryptedResult: (await provider.createSecret({ value: JSON.stringify(result) })).material }
       : { result };
@@ -1296,6 +1355,7 @@ export class PaperclipRunnerToolAuthority {
     });
     publishActivity(apiActivity.publication);
     await withTransactionRetry(this.db, () => this.db.transaction(async (tx) => {
+      if (addressedResponse) await this.#lockAuthorizedMutationContext(tx as unknown as Db, { ...addressedResponse, settlement: true });
       const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, this.binding.runId)).for("update");
       const resultJson = record(run?.resultJson);
       const receipts = record(resultJson.apiToolReceipts);
@@ -1546,12 +1606,12 @@ export class PaperclipRunnerToolAuthority {
     return fitRunnerToolResultPage({ ...response, apiOperationId: operationId });
   }
 
-  #responseCaptureIo(source: "runner.call_api" | "runner.assigned_tool", caseId?: string): Pick<RunnerApiIo, "reserveResponseCapture" | "saveResponse"> {
+  #responseCaptureIo(source: "runner.call_api" | "runner.assigned_tool", caseId?: string, addressedResponse?: AddressedApiResponse): Pick<RunnerApiIo, "reserveResponseCapture" | "saveResponse"> {
     let reservationId: string | undefined;
     let storageAttempted = false;
     return {
       reserveResponseCapture: async () => {
-        const reservation = await this.#reserveApiResponseCapture();
+        const reservation = await this.#reserveApiResponseCapture(addressedResponse);
         reservationId = reservation.id;
         return (completedBytes, cleaned) => reservation.settle(completedBytes, cleaned, storageAttempted);
       },
@@ -1602,7 +1662,7 @@ export class PaperclipRunnerToolAuthority {
     await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`runner-api-capture:${this.binding.companyId}`}, 0))`);
   }
 
-  async #reserveApiResponseCapture() {
+  async #reserveApiResponseCapture(addressedResponse?: AddressedApiResponse) {
     const release = acquireRunnerApiResponseSlot(this.binding.companyId);
     let id: string | undefined;
     let cleanupFailing = false;
@@ -1611,7 +1671,11 @@ export class PaperclipRunnerToolAuthority {
         // Only the DB reservation is retried; external eviction cleanup stays outside.
         id = await withTransactionRetry(this.db, () => this.db.transaction(async tx => {
           await this.#lockApiCaptureCompany(tx as unknown as Db);
-          const locked = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
+          const locked = await this.#lockAuthorizedMutationContext(tx as unknown as Db, addressedResponse ? { ...addressedResponse, settlement: true } : undefined);
+          if (addressedResponse) {
+            const receipt = record(record(locked.run.resultJson?.apiToolReceipts)[toolCallKey(addressedResponse.callId)]);
+            if (receipt.digest !== addressedResponse.digest || receipt.state !== "pending") throw forbidden("Response receipt unavailable");
+          }
           const resultJson = record(locked.run.resultJson);
           const used = resultJson.apiResponseCaptureBytes ?? 0;
           if (typeof used !== "number" || !Number.isSafeInteger(used) || used < 0
@@ -1684,12 +1748,12 @@ export class PaperclipRunnerToolAuthority {
     return !!output;
   }
 
-  async #assertDotApiFileAccess(path: string, input: { pathParams?: Record<string, string>; files?: RunnerApiFile[] }) {
+  async #assertDotApiFileAccess(path: string, input: { pathParams?: Record<string, string>; files?: RunnerApiFile[] }, allowAddressedSettlement = false) {
     if (this.binding.firstPartyOnly && (input.files?.length || /\/(?:attachments|assets)\/[^/]+\/content$/.test(path) || /\/file-resources\/content$/.test(path))) {
       throw forbidden("Use this Grok work session's bounded upload or download grant; direct file API access is unavailable.");
     }
     if (!this.binding.dotRuntime) return;
-    const current = await this.#boundContext();
+    const current = await this.#boundContext({ allowAddressedSettlement });
     await this.binding.assertBridgeAuthority?.();
     if (/^\/api\/attachments\/\{[^}]+\}\/content$/.test(path))
       throw forbidden("Dot must use read_task_attachment for verified contents of its current assigned task; direct attachment API downloads are disabled.");
@@ -1812,7 +1876,7 @@ export class PaperclipRunnerToolAuthority {
       ...(this.binding.museRuntime ? { authorizingUserId: this.binding.externalAuthorizingUserId } : {}) };
   }
 
-  async #boundContext(options: { includeChatWake?: boolean; tool?: string } = {}) {
+  async #boundContext(options: { includeChatWake?: boolean; tool?: string; allowAddressedSettlement?: boolean } = {}) {
     if (this.binding.museRuntime && !this.binding.externalAuthorizingUserId) throw forbidden("Muse authorizer is unavailable");
     const [row] = await this.db.select({ issue: issues, actor: agents, run: {
       id: heartbeatRuns.id,
@@ -1839,10 +1903,6 @@ export class PaperclipRunnerToolAuthority {
         eq(heartbeatRuns.agentId, this.binding.agentId),
         eq(heartbeatRuns.nativeIssueId, this.binding.issueId),
         eq(issues.companyId, this.binding.companyId),
-        ...(this.binding.nativeReview ? [] : [
-          eq(issues.assigneeAgentId, this.binding.agentId),
-          eq(issues.executionRunId, this.binding.runId),
-        ]),
         eq(agents.companyId, this.binding.companyId),
       ))
       .limit(1);
@@ -1853,6 +1913,14 @@ export class PaperclipRunnerToolAuthority {
       || ["paused", "terminated", "pending_approval", "error"].includes(row.actor.status)
     ) {
       throw new Error("paperclip_runner_tool_binding_not_authorized");
+    }
+    let addressedInteraction: NativeAddressedInteractionGrant | null = null;
+    if (!this.binding.nativeReview && (row.issue.assigneeAgentId !== this.binding.agentId || row.issue.executionRunId !== this.binding.runId)) {
+      addressedInteraction = await getNativeAddressedInteractionGrant(this.db, this.binding, {
+        phase: options.allowAddressedSettlement ? "settlement" : "pending",
+      });
+      if (!addressedInteraction || (options.tool && !NATIVE_ADDRESSED_INTERACTION_TOOLS.has(options.tool)))
+        throw new Error("paperclip_runner_tool_binding_not_authorized");
     }
     const [company] = await this.db.select().from(companies).where(eq(companies.id, this.binding.companyId));
     if (company?.status !== "active"
@@ -1879,7 +1947,7 @@ export class PaperclipRunnerToolAuthority {
       resource: { type: "issue", companyId: this.binding.companyId, issueId: row.issue.id } });
     if (!privacy.allowed) throw forbidden("The task is no longer available to this run");
     if (options.tool) assertNativeSkillTestTool(this.#apiScope(row), options.tool);
-    return row;
+    return { ...row, addressedInteraction };
   }
 
   async #resolveReview(value: unknown) {
@@ -3234,7 +3302,7 @@ export class PaperclipRunnerToolAuthority {
     return RETRYABLE_RECEIPT_OPERATIONS.has(operationId) ? withTransactionRetry(this.db, attempt) : attempt();
   }
 
-  async #lockAuthorizedMutationContext(tx: Db): Promise<{
+  async #lockAuthorizedMutationContext(tx: Db, addressedResponse?: AddressedApiResponse): Promise<{
     run: typeof heartbeatRuns.$inferSelect;
     issue: typeof issues.$inferSelect;
     actor: typeof agents.$inferSelect;
@@ -3270,8 +3338,7 @@ export class PaperclipRunnerToolAuthority {
         eq(heartbeatRuns.agentId, this.binding.agentId),
         eq(heartbeatRuns.nativeIssueId, this.binding.issueId),
         eq(issues.companyId, this.binding.companyId),
-        eq(issues.assigneeAgentId, this.binding.agentId),
-        eq(issues.executionRunId, this.binding.runId),
+        ...(addressedResponse ? [] : [eq(issues.assigneeAgentId, this.binding.agentId), eq(issues.executionRunId, this.binding.runId)]),
         eq(agents.companyId, this.binding.companyId),
       ))
       .for("update", { of: heartbeatRuns })
@@ -3284,12 +3351,20 @@ export class PaperclipRunnerToolAuthority {
       || context.run.agentId !== this.binding.agentId
       || context.run.nativeIssueId !== this.binding.issueId
       || context.issue.companyId !== this.binding.companyId
-      || context.issue.assigneeAgentId !== this.binding.agentId
-      || context.issue.executionRunId !== this.binding.runId
+      || (!addressedResponse && (context.issue.assigneeAgentId !== this.binding.agentId
+        || context.issue.executionRunId !== this.binding.runId))
       || context.actor.companyId !== this.binding.companyId
       || ["paused", "terminated", "pending_approval", "error"].includes(context.actor.status)
     ) {
       throw new Error("paperclip_runner_tool_binding_not_authorized");
+    }
+    if (addressedResponse) {
+      const grant = await getNativeAddressedInteractionGrant(tx, this.binding, {
+        phase: addressedResponse.settlement ? "settlement" : "pending",
+      });
+      const expected = grant && addressedInteractionResponseStatus(grant, addressedResponse.operation, addressedResponse.input);
+      if (!grant || !expected || (grant.interaction.status !== "pending" && grant.interaction.status !== expected))
+        throw forbidden("The exact addressed confirmation is no longer authorized.");
     }
     if (this.binding.museRuntime) {
       const decision = await authorizationService(tx).decide({

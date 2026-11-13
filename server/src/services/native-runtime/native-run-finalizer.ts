@@ -36,6 +36,7 @@ import { explainFailedRun, explainNativeTurnFailure, NATIVE_RUN_FAILED_UNEXPLAIN
 import { dismissAutomaticCompletionReviews } from "./automatic-completion-reviews.js";
 import { findSupersededExternalReviewRequests } from "./superseded-external-review-requests.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeAddressedInteractionGrant, readNativeAddressedInteractionId } from "./native-addressed-interaction.js";
 import { conversationNativeDecision, isConversation, settleConversationTurnForRun } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { COMPLETION_REVIEW_STAGE_REASON, completionReviewStageEntry } from "../issue-execution-policy.js";
@@ -1707,6 +1708,16 @@ export async function finalizeNativeRun(input: {
       companyId: run.companyId, issueId: authoritativeIssue.id, agentId: run.agentId,
       contextSnapshot: reviewContext, allowResolvedByRunId: run.id,
     }) : null;
+    const addressedParticipant = !reviewContext && readNativeAddressedInteractionId(run.contextSnapshot)
+      && (authoritativeIssue.assigneeAgentId !== run.agentId || authoritativeIssue.executionRunId !== run.id);
+    const addressedBinding = { companyId: run.companyId, issueId: authoritativeIssue.id, agentId: run.agentId, runId: run.id };
+    const addressedResolved = addressedParticipant
+      ? await getNativeAddressedInteractionGrant(input.db, addressedBinding, { phase: "resolved" }) : null;
+    const addressedPending = addressedParticipant && !addressedResolved
+      ? await getNativeAddressedInteractionGrant(input.db, addressedBinding) : null;
+    const addressedOutcome = addressedParticipant
+      ? addressedResolved ? "resolved" as const : addressedPending ? "pending" as const : "stale" as const
+      : undefined;
     const planWait = isNativePlanWaitResult(result)
       ? await readNativePlanWait(input.db, { companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id, agentId: run.agentId })
       : null;
@@ -1765,6 +1776,7 @@ export async function finalizeNativeRun(input: {
       // into a blocker; the committer rechecks that under the issue lock.
       failedTurnContinuationUsed: terminalState === "failed" && ownsProviderFailureDecision && !reviewContext
         && await isFailedTurnContinuationRun(input.db, run, authoritativeIssue.id),
+      ...(addressedOutcome ? { nativeAddressedInteractionOutcome: addressedOutcome } : {}),
       ...(reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
         : "stale" as const } : {}),
@@ -1973,6 +1985,7 @@ export async function finalizeNativeRun(input: {
         authoritativeDecision: decision.toStatus,
         finalizationPolicyVersion: decision.policyVersion,
         finalizationReasonCode: decision.reasonCode,
+        ...(addressedOutcome ? { nativeAddressedInteractionOutcome: addressedOutcome } : {}),
         // Only the locked status transaction can mint this presentation
         // proof. Never carry a runner-provided marker forward.
         externalChatReviewPresentation: record(
