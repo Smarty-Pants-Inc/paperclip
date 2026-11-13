@@ -10,7 +10,7 @@ import { eq, sql } from "drizzle-orm";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { expect, it, vi } from "vitest";
 import {
-  agents, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases,
+  agents, authUsers, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases,
   environments, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
@@ -22,6 +22,8 @@ import {
 } from "../vendor/paperclip-runner/index.js";
 import { registerLocalRuntimeApiServer } from "../runtime-api.js";
 import { environmentService } from "../services/environments.js";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
+import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { closeWarmNativeSessionsForEnvironment, executePaperclipNativeSession, cancelNativeSession } from "../services/native-runtime/native-session-executor.js";
 import { currentNativeControllerIdentity } from "../services/native-runtime/native-restart-recovery.js";
@@ -101,7 +103,12 @@ function sessionFile(pi: Birth): string {
 // "idle": the box resumes from idle (still running; the first hit).
 // "archived": the box resumes from archived (the sticky loop after a failed
 // run). Turns 2 and 3 must each continue with history.
-it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of the warm Runner, then a %s resume of the same box: later turns continue through the executor", async resumedFrom => {
+it.skipIf(!enabled).each(["idle", "archived", "stop-archived"] as const)("Core's idle close or Stop, then a %s resume of the same box: later turns continue through the executor", async resumedFrom => {
+  // REG-03 differs from idle expiry: Stop leaves an in-memory warm entry,
+  // then provider archival removes its processes before the next message.
+  const stopArchived = resumedFrom === "stop-archived";
+  const startupEvents: Array<{ runId: string; event: AdapterRuntimeEvent }> = [];
+  let boxState: "running" | "archived" = "running";
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -278,7 +285,7 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
       const execution = buildNativeExecutionInput({ companyId, agentId, runId, provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh",
         issue: { id: issueId, identifier: "PIL-1", title: issue!.title, description: null, workMode: "standard" }, taskPrompt: prompt,
         workspace: { id: workspaceId, cwd: remoteCwd, repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: native.normalizedSessionId,
-        lifecyclePolicy: { mode: "warm", idleTimeoutMs: WARM_IDLE_MS }, runtimeContext,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: stopArchived ? 300_000 : WARM_IDLE_MS }, runtimeContext,
         completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: contract!.schemaVersion, contract: contract!.contractJson as never } });
       // The native authority uses the actual acquired DB id, never the
       // executionWorkspaceId or the unrelated PRP connection lease token.
@@ -292,11 +299,15 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
     const executionOptions = async (fixture: Fixture, outcome: "created" | "resumed", restarted = false) => {
       const path = `/api/runner/v1/connect/${fixture.runId}`;
       previewBindings.set(path, fixture.lease.id);
-      const endpoint = async (): Promise<RunnerIngressEndpoint> => {
+      const endpoint = async (input?: { path: string }): Promise<RunnerIngressEndpoint> => {
         if (!leaseActive.get(fixture.lease.id)) throw new Error("retired environment lease cannot obtain ingress");
-        return { kind: "authenticated_websocket", websocketUrl: `wss://127.0.0.1:${previewAddress.port}${path}`,
+        // Honor the production resolver's requested path: warm attachment asks
+        // for the resident owner's listener, not necessarily this new run id.
+        const requestedPath = input?.path ?? path;
+        previewBindings.set(requestedPath, fixture.lease.id);
+        return { kind: "authenticated_websocket", websocketUrl: `wss://127.0.0.1:${previewAddress.port}${requestedPath}`,
           secretHeaders: [{ name: "X-Owned-Lease", value: fixture.lease.id }], generation: fixture.lease.id,
-          refresh: endpoint, close: async () => {} };
+          refresh: () => endpoint({ path: requestedPath }), close: async () => {} };
       };
       const target: AdapterExecutionTarget = { kind: "remote", transport: "sandbox", providerKey: "boat", environmentId,
         leaseId: fixture.lease.id, remoteCwd, reusableLeaseConfigured: true, runner: commandRunner(fixture.lease.id),
@@ -313,6 +324,7 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
         runnerEnvironment: { PATH: process.env.PATH, ...configuredEnvironmentProjection({ PI_OFFLINE: "1", TMPDIR: process.env.TMPDIR! }),
           PI_CODING_AGENT_DIR: agentHome, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none",
           PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${modelAddress.port}`, PAPERCLIP_PROVIDER_TRACE_PATH: join(root, `${fixture.runId}.provider-trace.jsonl`) },
+        onEvent: async (event: AdapterRuntimeEvent) => { startupEvents.push({ runId: fixture.runId, event }); },
         onSpawn: async (meta: { pid: number }) => { const owned = birth(meta.pid); if (owned) { spawned.push(owned); stage("real runner spawned", owned); } else stage("transient spawn callback", meta); },
         onLog: async (stream: "stdout" | "stderr", text: string) => { stages.push({ stream, text }); await appendFile(join(root, "native.log"), `${stream}: ${text}`); } };
     };
@@ -321,10 +333,49 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
     allocation.drivers = [{ driver: "sandbox",
       acquireRunLease: async () => { throw new Error("this proof acquires no allocation"); },
       realizeWorkspace: async () => ({ cwd: remoteCwd }),
-      releaseRunLease: async () => { throw new Error("this proof releases no allocation"); },
+      releaseRunLease: async ({ lease, cancelActiveWork }) => {
+        expect(stopArchived, "only REG-03 releases the simulated allocation").toBe(true);
+        expect(cancelActiveWork).toBe(true);
+        // Boat's plugin is not in this source tree. Simulate ONLY the provider
+        // boundary: archival preserves disk but kills exact allocation births.
+        // Do not close/suspend Core's warm entry: a VM archive cannot do that.
+        const owned = processPairs[0]!;
+        for (const child of [owned.pi, owned.runner]) if (sameBirth(child)) process.kill(child.pid, "SIGKILL");
+        await vi.waitFor(() => { expect(sameBirth(owned.runner)).toBe(false); expect(sameBirth(owned.pi)).toBe(false); }, { timeout: 15_000 });
+        boxState = "archived";
+        leaseActive.set(lease.id, false);
+        stage("provider archived the same allocation after Stop", { providerLeaseId, boxState, owned });
+        return await environmentsService.releaseLease(lease.id, "released", { cleanupStatus: "success" });
+      },
       resolveCapabilities: async () => ({ nativeSyncIn: false, nativeSyncOut: false, persistentProcessSessions: false,
         incrementalSessionOutput: false, concurrentSyncOperations: false, independentControlCommands: true,
         runnerWebSocketIngress: true, reusableLeases: true, duplexCommandStream: false }) }];
+    let stopRun: ((runId: string) => Promise<void>) | undefined;
+    if (stopArchived) {
+      // Same real board route as native-pi-rpc-stop-continue.e2e.test.ts.
+      const [{ createApp }, { createStorageService }, { createLocalDiskStorageProvider }] = await Promise.all([
+        import("../app.js"), import("../storage/service.js"), import("../storage/local-disk-provider.js"),
+      ]);
+      await db.insert(authUsers).values({ id: "local-board", name: "REG-03 Stop operator", email: "reg03@example.invalid",
+        createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+      app = await createApp(db, { uiMode: "none", serverPort: 0,
+        storageService: createStorageService(createLocalDiskStorageProvider(join(root, "storage"))),
+        deploymentMode: "local_trusted", deploymentExposure: "private", allowedHostnames: ["127.0.0.1"], bindHost: "127.0.0.1",
+        authReady: true, companyDeletionEnabled: false, instanceId: `reg03-${randomUUID()}`,
+        localPluginDir: join(root, "plugins"), managedPluginAutoInstall: [], decisionServiceOptions: { wakeOriginAgent: async () => undefined } });
+      await app.locals.bundledPluginsStartup;
+      http = createServer(app);
+      await new Promise<void>(done => http!.listen(0, "127.0.0.1", done));
+      const address = http.address(); if (!address || typeof address === "string") throw new Error("Stop listener missing");
+      const apiUrl = `http://127.0.0.1:${address.port}`;
+      vi.stubEnv("PAPERCLIP_API_URL", apiUrl);
+      stopRun = async runId => {
+        const response = await fetch(`${apiUrl}/api/heartbeat-runs/${runId}/cancel`, { method: "POST",
+          headers: { "content-type": "application/json", origin: apiUrl }, body: "{}", signal: AbortSignal.timeout(15_000) });
+        const text = await response.text(); expect(response.status, text).toBe(200);
+        expect(JSON.parse(text).status).toBe("cancelled");
+      };
+    }
     activeRunId = first.runId;
     const firstOptions = await executionOptions(first, "created");
     const firstOutcome = await executePaperclipNativeSession({ ...firstOptions, useRunnerd: true, conversationMode: true }).then(
@@ -342,6 +393,22 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
     const remoteSessionRoot = join(stagedRuntime, "sessions", createHash("sha256").update(first.native.normalizedSessionId).digest("hex"));
     // The heartbeat service settles each finished run around the executor.
     const settle = async (fixture: Fixture) => {
+      if (stopArchived) {
+        if (fixture === first) {
+          await db!.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, fixture.runId));
+          await db!.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, fixture.runId));
+          await environmentsService.releaseLease(fixture.lease.id, "released");
+        } else {
+          const [stopped] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+          expect(stopped!.status).toBe("cancelled");
+          // Product lease-release dispatcher, not a fixture-only archive call.
+          const released = await environmentRuntimeService(db!).releaseRunLeases(fixture.runId, "released",
+            (_leaseId, error) => { throw error; }, undefined, true);
+          expect(released.map(item => item.lease.providerLeaseId)).toEqual([providerLeaseId]);
+          expect(boxState).toBe("archived");
+        }
+        return;
+      }
       await db!.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, fixture.runId));
       await db!.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, fixture.runId));
       // Core's idle timer closes the warm Runner; it suspends and exits.
@@ -354,7 +421,7 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
       await environmentService(db!).releaseLease(fixture.lease.id, "released");
     };
     let previous = first;
-    const turn = async (index: number) => {
+    const turn = async (index: number, holdForStop = false) => {
       await settle(previous);
       const [comment] = await db!.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
         body: `Turn ${index}: recall the private fact from your own earlier assistant history. Do not invent it.` }).returning();
@@ -371,15 +438,50 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
         || ${JSON.stringify({ sessionCheckpoint: admission.checkpoint })}::jsonb` }).where(eq(heartbeatRuns.id, next.runId));
       // The same box resumes from idle or archived. Archived sets the restarted
       // trigger; the owner's process generation must still be proven gone.
-      const nextOptions = await executionOptions(next, "resumed", resumedFrom === "archived");
-      activeRunId = next.runId;
-      const outcome = await executePaperclipNativeSession({ ...nextOptions, useRunnerd: true, conversationMode: true }).then(
-        result => ({ result }), error => ({ error: String(error) }));
-      activeRunId = undefined;
+      const fromArchived = resumedFrom === "archived" || stopArchived && boxState === "archived";
+      const nextOptions = await executionOptions(next, "resumed", fromArchived);
+      if (stopArchived && !holdForStop) {
+        expect(boxState).toBe("archived");
+        expect(nextOptions.runnerExecutionTarget.sandboxLeaseAcquisition).toMatchObject({ outcome: "resumed", providerLeaseId, restarted: true });
+        boxState = "running";
+        stage("same thread resumes the same box from archived", { runId: next.runId, issueId, providerLeaseId });
+      }
+      activeRunId = next.runId; earlyOutcome = undefined;
+      judgeHold.active = holdForStop;
+      execution = executePaperclipNativeSession({ ...nextOptions, useRunnerd: true, conversationMode: true }).then(
+        result => (earlyOutcome = { result }), error => (earlyOutcome = { error: String(error) }));
+      if (holdForStop) {
+        await vi.waitFor(() => expect(judgeHold.inFlight === 1 || earlyOutcome !== undefined).toBe(true), { timeout: 120_000, interval: 100 });
+        if (earlyOutcome) throw new Error(`turn 1 ended before Stop: ${JSON.stringify(earlyOutcome)}`);
+        expect(requests.at(-1)).toMatchObject({ heldMidTurn: true });
+        stage("turn 1 held mid-stream before real board Stop", { runId: next.runId });
+        await stopRun!(next.runId);
+      }
+      const outcome = await execution; execution = undefined; activeRunId = undefined;
       await writeFile(join(root, `turn-${index}-outcome.json`), JSON.stringify(outcome, null, 2));
+      const reuse = startupEvents.filter(row => row.runId === next.runId && row.event.eventType === "run.startup.reuse").map(row => row.event.payload);
+      await writeFile(join(root, `turn-${index}-startup-reuse.json`), JSON.stringify(reuse, null, 2));
+      if (holdForStop) {
+        const [stopped] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
+        expect(stopped!.status).toBe("cancelled");
+        expect(record(record(stopped!.resultJson).nativeCancellation).dispatchState).toBe("acknowledged");
+        expect(sameBirth(runner), "Stop settled before allocation archival").toBe(true);
+        stage("Stop settled; warm runner still resident before archival", { outcome, runId: next.runId });
+        previous = next;
+        return { next, runnerReuse: undefined };
+      }
+      if (stopArchived) {
+        // Record and assert the actual product receipts even on the RED path.
+        for (const layer of ["runner", "provider_session"]) {
+          expect(reuse.find(payload => record(payload).layer === layer), `${layer} startup receipt`).toMatchObject({
+            layer, state: "reused", reason: "verified_reuse",
+          });
+        }
+        stage("archived resume product reuse claims", reuse);
+      }
       expect(record(outcome).error, `turn ${index}: ${JSON.stringify(outcome)}`).toBeUndefined();
       expect(record(outcome).result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: `RECALLED_${fact}` });
-      expect(requests).toHaveLength(index);
+      expect(requests).toHaveLength(stopArchived ? index + 1 : index);
       expect(requests.at(-1)).toMatchObject({ historyHasFact: true, latestPromptHasFact: false, reply: `RECALLED_${fact}` });
       expect((await readFile(originalFile)).subarray(0, before.length).equals(before)).toBe(true);
       const events = await db!.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.runId));
@@ -391,14 +493,15 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
     // The real route (I-8j, Clone L): the box is env-reused, but each next
     // acquisition gets a different lease id. Core then closes the warm owner
     // itself; nothing in this test closes it.
-    for (const index of [2, 3]) {
+    if (stopArchived) await turn(1, true);
+    for (const index of stopArchived ? [2] : [2, 3]) {
       const { next } = await turn(index);
       const leases = await db!.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, next.runId));
       expect(leases.map(lease => lease.providerLeaseId)).toEqual([providerLeaseId]);
     }
     const epochs = readdirSync(join(remoteSessionRoot, "authority-epochs")).filter(name => name.startsWith("epoch-"));
     await writeFile(join(root, "proof.json"), JSON.stringify({ scope: "executePaperclipNativeSession warm path; real runnerd/proxy/Pi; simulated allocation and loopback model",
-      firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs }, null, 2));
+      firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs, startupEvents, stopArchived }, null, 2));
     stage(`GREEN: three turns of the same conversation across Core's idle closes (${resumedFrom})`, { epochs });
     await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "closed-owner proof complete" });
   } catch (error) { failure = error; throw error; }
@@ -406,6 +509,10 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
     const errors: unknown[] = [];
     if (activeRunId && !earlyOutcome) try { await cancelNativeSession(activeRunId, "test cleanup", { db: db! }); } catch (error) { errors.push(error); }
     try { await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup" }); } catch (error) { errors.push(error); }
+    // A failed transport can strand the simulated VM's detached processes.
+    // Cleanup only this fixture's exact births, after product closure attempted.
+    for (const owned of [...processPairs.map(pair => pair.pi), ...spawned]) if (sameBirth(owned)) process.kill(owned.pid, "SIGKILL");
+    await vi.waitFor(() => { expect(spawned.some(sameBirth) || processPairs.some(pair => sameBirth(pair.pi))).toBe(false); }, { timeout: 15_000 });
     finishHeldResponse?.();
     if (execution) await execution;
     await app?.locals.paperclipShutdown?.();
@@ -424,6 +531,7 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
     try { await stopPostgres?.(); } catch (error) { errors.push(error); }
     fixtureHttpsAgent?.destroy(); https.globalAgent = previousHttpsAgent;
     setDefaultCACertificates(previousCertificates); vi.unstubAllEnvs();
+    await writeFile(join(root, "startup-events.json"), JSON.stringify(startupEvents, null, 2));
     await writeFile(join(root, "stages.json"), JSON.stringify(stages, null, 2));
     await writeFile(join(root, "commands.json"), JSON.stringify(commands, null, 2));
     await writeFile(join(root, "requests.json"), JSON.stringify(requests, null, 2));
