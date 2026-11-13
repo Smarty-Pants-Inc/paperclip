@@ -159,6 +159,9 @@ export interface TaskInterruptionPresentation {
   rejectedModel?: string;
   /** A persisted Retry admission wait, normalized to public text by the server. */
   retryWait?: { reason: string; message: string };
+  /** The visible notice that stands on this task's conversation (the same one
+   * the execution blocker reads). The card shows its text, not generic text. */
+  notice?: { code: string; text: string };
   intentId: string | null;
   responsibility: "system" | "user";
   state: "working" | "retry_scheduled" | "failed" | "waiting_for_user" | "resolved";

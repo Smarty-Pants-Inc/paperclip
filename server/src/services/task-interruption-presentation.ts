@@ -821,16 +821,31 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         agentAdapter: run.agentAdapter ?? "unknown" });
     }
   }
+  // Upstream paperclipai/paperclip b4861d5e task-interruption-presentation.ts:824-840:
+  // a card that offers Retry asks the task's execution blocker, and withholds
+  // Retry where the blocker refuses it. C9 also selects tasks whose conversation
+  // has a standing notice (getExecutionBlocker withholds Retry for it,
+  // execution-blocker.ts readUnsupersededHeldConversationNotice), and the card
+  // shows that notice's own text. One batched read; blockers only for those tasks.
   const offered = [...result].flatMap(([issueId, presentation]) => presentation?.canRetry ? [issueId] : []);
   if (offered.length) {
-    const { executionBlockerPredicate, getExecutionBlocker, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate } =
-      await import("./execution-blocker.js");
-    const held = await db.selectDistinct({ issueId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
+    const [{ executionBlockerPredicate, getExecutionBlocker, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate },
+      { readStandingRunNotices }] = await Promise.all([import("./execution-blocker.js"), import("./standing-run-notice.js")]);
+    const [held, notices] = await Promise.all([db.selectDistinct({ issueId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.sourceIssueId, offered),
-      executionBlockerPredicate(), not(restoreHoldReleasedForCurrentOwnerPredicate()), restoreHoldPredicate()));
-    for (const { issueId } of held) {
-      const blocker = await getExecutionBlocker(db, companyId, issueId);
+      executionBlockerPredicate(), not(restoreHoldReleasedForCurrentOwnerPredicate()), restoreHoldPredicate())),
+      readStandingRunNotices(db, { companyId, issueIds: offered })]);
+    for (const issueId of new Set([...held.map(row => row.issueId), ...notices.keys()])) {
       const presentation = result.get(issueId);
+      const notice = notices.get(issueId);
+      // The same standing notice the blocker reads: shown in place of generic
+      // text, and Retry only where a retry can work while it stands.
+      if (presentation && notice) {
+        presentation.notice = { code: notice.code, text: notice.text };
+        presentation.canRetry = presentation.canRetry && notice.retryCanWork;
+        if (!presentation.canRetry) delete presentation.retryAction;
+      }
+      const blocker = await getExecutionBlocker(db, companyId, issueId);
       if (!presentation || !blocker || blocker.canRetry) continue;
       presentation.canRetry = false;
       delete presentation.retryAction;

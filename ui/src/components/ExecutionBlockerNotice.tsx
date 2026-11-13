@@ -54,8 +54,15 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   if (presentation?.projectAccess && !optimistic && !takingLonger) return <TaskProjectAccessNotice
     access={presentation.projectAccess} issueId={issueId} agentName={agentName} projectName={projectName}
     canRetry={canRetry && presentation.canRetry} onRetry={onRetry} error={error} className={className} />;
-  if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span>{describeError(error).body}</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
-  if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span>Taking longer than usual…</span>{canRetry && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
+  // Every branch that renders the card's Retry obeys the task's own refusal
+  // (presentation.canRetry=false, e.g. a standing notice) as well as the
+  // person's permission, and keeps the refusal's explanation visible: a
+  // shown Retry on a connected task is accepted (doc/execution-semantics.md).
+  const retryShown = canRetry && presentation?.canRetry !== false;
+  const refusalNotice = presentation?.canRetry === false && presentation.notice
+    ? <span data-testid="task-execution-notice">{presentation.notice.text}</span> : null;
+  if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span className="min-w-0 flex-1">{describeError(error).body}{refusalNotice && <> {refusalNotice}</>}</span>{retryShown && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
+  if (takingLonger) return <div role="status" className={cn("flex items-center justify-between gap-2 text-sm text-muted-foreground", className)}><span className="min-w-0 flex-1">Taking longer than usual…{refusalNotice && <> {refusalNotice}</>}</span>{retryShown && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;
   const step = !optimistic && presentation?.responsibility === "system" && presentation.recoveryStep
     && ["working", "retry_scheduled"].includes(presentation.state) ? recoveryStepText[presentation.recoveryStep] : null;
   const seconds = Math.max(0, Math.ceil((Date.parse(presentation?.nextRetryAt ?? "") - Date.now()) / 1000));
@@ -65,6 +72,7 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
     // generic automatic-retry line while keeping the provider explanation.
     return <ProviderFailureNotice failure={presentation.providerFailure} className={className}
       actions={canRetry && presentation.canRetry ? <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button> : undefined}>
+      {presentation.notice && <p data-testid="task-execution-notice">{presentation.notice.text}</p>}
       {presentation.state === "retry_scheduled" && <p>{step ? `${step}. ${retryIn}` : "Paperclip will retry automatically."}</p>}
       {isBudgetWait(presentation) && <p data-testid="task-execution-waiting">It is waiting for the budget to allow new work. Raise the budget in Costs.</p>}
     </ProviderFailureNotice>;
@@ -130,6 +138,8 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
         <span className="min-w-0 flex-1">{presentation.state === "retry_scheduled"
           ? step ? `${step}. ${retryIn}`
             : presentation.setupFailure ? `${presentation.setupFailure.message}. ${retryIn}` : retryIn
+          // The notice that stands on the conversation says what happened and what to do.
+          : presentation.notice ? <span data-testid="task-execution-notice">{presentation.notice.text}</span>
           : presentation.retryWait ? presentation.retryWait.message
           : presentation.workspaceFailure
             ? <>Couldn’t prepare the task folders. {presentation.workspaceFailure.message}</>
