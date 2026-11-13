@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { providerPackExtractionProbe } from "./provider-pack-extraction.js";
+import { providerPackTransferTimeoutMs } from "./provider-pack-transfer.js";
 
 type Archive = { sha256: string; bytes: number };
 type FileLayer = Archive & { path: string; mode: number; archive: Archive };
@@ -175,7 +176,7 @@ export async function stageProviderPackLayers(input: {
     await measure("provider_pack.archive.transfer", () => runner.syncIn!([{
       operationId: `runner-provider-layers-${randomUUID()}`,
       files: [{ kind: "file", sourcePath: bundlePath, targetPath: remoteArchive, mode: 0o600 }],
-    }]));
+    }], { minimumTimeoutMs: providerPackTransferTimeoutMs(layers.reduce((bytes, layer) => bytes + layer.bytes, 0)) }));
     const result = await measure("provider_pack.archive.extract", () => runner.execute({
       command: "sh", args: ["-c", ["set -eu; umask 077;",
         `test ! -L ${quote(input.targetPath)}; test -d ${quote(input.targetPath)};`,
