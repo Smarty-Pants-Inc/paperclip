@@ -1319,6 +1319,10 @@ fn goal_control_event_payload(
 struct CodexProviderState {
     schema: String,
     lifecycle: String,
+    // The provider session can outlive a run. Older snapshots have no owner
+    // and keep the strict contract check until prepare or attach binds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_identity: Option<ProviderEventIdentity>,
     config: CodexProviderConfig,
     // Pi binds this run-scoped payload separately from its immutable profile.
     #[serde(default, skip_serializing_if = "Value::is_null")]
@@ -1464,6 +1468,7 @@ impl CodexProviderState {
         Self {
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "prepared".to_owned(),
+            run_identity: None,
             config,
             pi_runtime_context: Value::Null,
             pi_launch_profile_digest: None,
@@ -1508,6 +1513,23 @@ impl CodexProviderState {
             queued_events: VecDeque::new(),
             next_provider_event_seq: initial_provider_event_seq(),
         }
+    }
+
+    fn is_settled_for_run_rebinding(&self) -> bool {
+        matches!(
+            self.lifecycle.as_str(),
+            "prepared" | "session_open" | "provider_exited"
+        ) && self.active_provider_turn_id.is_none()
+            && !self.ambiguous_turn_start_pending
+            && self.startup_attempt.is_none()
+            && !self.receipt_limit_interrupt_pending
+            && self.tool_bridge.pending_calls().next().is_none()
+            && self.pending_events.is_empty()
+            && self.queued_events.is_empty()
+            && self
+                .goal
+                .as_ref()
+                .is_none_or(|goal| goal.status != "active" && !goal.working_now)
     }
 
     fn retain_cursor_cloud_terminal_delivery(
@@ -1664,6 +1686,15 @@ impl CodexProviderState {
                 .iter()
                 .any(|id| id.is_empty() || id.len() > 240)
             || self.schema != PROVIDER_STATE_SCHEMA
+            || self.run_identity.as_ref().is_some_and(|identity| {
+                identity.runner_instance_id.is_empty()
+                    || identity.runner_instance_id.len() > 512
+                    || identity.runner_instance_id.chars().any(char::is_control)
+                    || !is_stable_id(&identity.run_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&identity.normalized_session_id, SHORT_STABLE_ID_CHARS)
+                    || !is_stable_id(&identity.turn_id, DURABLE_STABLE_ID_CHARS)
+                    || !is_stable_id(&identity.item_id, DURABLE_STABLE_ID_CHARS)
+            })
             || !matches!(
                 self.lifecycle.as_str(),
                 "prepared"
@@ -2270,21 +2301,7 @@ impl CodexCommandExecutor {
     fn rebinds_settled_opencode_session(&self, state: &CodexProviderState) -> bool {
         state.opencode_release_digest.is_some()
             && state.opencode_release_digest == self.opencode_release_digest(&state.config)
-            && matches!(
-                state.lifecycle.as_str(),
-                "prepared" | "session_open" | "provider_exited"
-            )
-            && state.active_provider_turn_id.is_none()
-            && !state.ambiguous_turn_start_pending
-            && state.startup_attempt.is_none()
-            && !state.receipt_limit_interrupt_pending
-            && state.tool_bridge.pending_calls().next().is_none()
-            && state.pending_events.is_empty()
-            && state.queued_events.is_empty()
-            && state
-                .goal
-                .as_ref()
-                .is_none_or(|goal| goal.status != "active" && !goal.working_now)
+            && state.is_settled_for_run_rebinding()
     }
 
     fn bind_cursor_cloud_launch_profile(
@@ -3400,9 +3417,24 @@ impl CodexCommandExecutor {
         let cursor_cloud_launch_profile_digest = self.bind_cursor_cloud_launch_profile(&config)?;
         let completion_contract = completion_contract(payload)?;
         let tool_set = authorized_tool_set(payload)?;
-        if let Some(state) = self.state.as_mut() {
+        if let Some(state) = self.state.as_ref() {
+            let different_run = state
+                .run_identity
+                .as_ref()
+                .zip(self.event_identity.as_ref())
+                .is_some_and(|(saved, current)| saved.run_id != current.run_id);
+            let rebind_run = different_run
+                && state.is_settled_for_run_rebinding()
+                && state.pi_deferred_terminal.is_none()
+                && state.descendant_thread_ids.is_empty()
+                && self.provider.as_ref().is_none_or(|provider| {
+                    provider.run_attachment_live_work().is_empty()
+                        && !provider.has_active_goal()
+                        && !provider.has_known_descendants()
+                });
             if state.config != config
-                || state.completion_contract != completion_contract
+                || (state.completion_contract != completion_contract && !rebind_run)
+                || (different_run && !rebind_run)
                 || (config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context)
             {
                 return Err(DurableRunnerError::invalid(
@@ -3429,22 +3461,49 @@ impl CodexCommandExecutor {
                     "Codex provider session is already closed",
                 ));
             }
-            if state.tool_bridge.has_catalog() {
-                state
-                    .tool_bridge
-                    .verify_tool_set(&tool_set)
-                    .map_err(|error| {
+            if rebind_run && state.thread_id.is_some() {
+                // Reuse attachment's tool/accounting reset and live-provider
+                // contract update; changing only the saved binding is not enough.
+                let mut attachment_payload = payload.clone();
+                // prepare binds this invocation; only run.attach may nominate
+                // a different target authority through the warm protocol.
+                attachment_payload
+                    .as_object_mut()
+                    .expect("validated prepare payload")
+                    .remove("paperclipNextAuthority");
+                self.attach_run(&attachment_payload)?;
+            } else {
+                let state = self.state.as_mut().expect("checked prepared state");
+                let mut changed = false;
+                if state.tool_bridge.has_catalog() {
+                    state
+                        .tool_bridge
+                        .verify_tool_set(&tool_set)
+                        .map_err(|error| {
+                            DurableRunnerError::invalid(format!(
+                                "run.prepare tool contract changed: {error}"
+                            ))
+                        })?;
+                } else {
+                    state.tool_bridge.prepare(tool_set).map_err(|error| {
                         DurableRunnerError::invalid(format!(
-                            "run.prepare tool contract changed: {error}"
+                            "run.prepare tool contract rejected: {error}"
                         ))
                     })?;
-            } else {
-                state.tool_bridge.prepare(tool_set).map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "run.prepare tool contract rejected: {error}"
-                    ))
-                })?;
-                self.save_state()?;
+                    changed = true;
+                }
+                if rebind_run {
+                    // A prepared session with no thread has never started work.
+                    state.completion_contract = completion_contract;
+                    changed = true;
+                }
+                if self.event_identity.is_some() && state.run_identity != self.event_identity {
+                    state.run_identity = self.event_identity.clone();
+                    changed = true;
+                }
+                if changed {
+                    self.save_state()?;
+                }
             }
         } else {
             let mut tool_bridge = ProviderToolBridge::default();
@@ -3452,6 +3511,7 @@ impl CodexCommandExecutor {
                 DurableRunnerError::invalid(format!("run.prepare tool contract rejected: {error}"))
             })?;
             let mut state = CodexProviderState::new(config, completion_contract, tool_bridge);
+            state.run_identity = self.event_identity.clone();
             state.pi_runtime_context = pi_runtime_context;
             state.pi_launch_profile_digest = pi_launch_profile_digest;
             state.opencode_launch_profile_digest = opencode_launch_profile_digest;
@@ -3829,14 +3889,34 @@ impl CodexCommandExecutor {
         if let Some(usage) = next_state.codex_usage.as_mut() {
             usage.begin_run();
         }
-        next_state.previous_accounting_origin = self
-            .event_identity
+        next_state.previous_accounting_origin = next_state
+            .run_identity
             .clone()
+            .or_else(|| self.event_identity.clone())
             .zip(next_state.completed_provider_turn_id.clone())
             .map(|(identity, provider_turn_id)| CodexAccountingOrigin {
                 identity,
                 provider_turn_id,
             });
+        next_state.run_identity = payload
+            .pointer("/paperclipNextAuthority/identity")
+            .map(|identity| {
+                serde_json::from_value(json!({
+                    "runnerInstanceId": identity["runnerInstanceId"],
+                    "runId": identity["runId"],
+                    "normalizedSessionId": identity["normalizedSessionId"],
+                    "turnId": identity["turnId"],
+                    "itemId": identity["itemId"],
+                }))
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "run.attach provider run identity is invalid: {error}"
+                    ))
+                })
+            })
+            .transpose()?
+            .or_else(|| self.event_identity.clone())
+            .or_else(|| next_state.run_identity.clone());
         next_state.completion_contract = completion_contract;
         next_state.completed_turn_authoritative = false;
         next_state.completed_turn_process_generation = None;
@@ -7897,6 +7977,378 @@ done
         fs::remove_dir_all(directory).unwrap();
     }
 
+    fn prepare_contract_identity(run_id: &str) -> ProviderEventIdentity {
+        ProviderEventIdentity {
+            runner_instance_id: "contract-runner".to_owned(),
+            run_id: run_id.to_owned(),
+            normalized_session_id: "contract-session".to_owned(),
+            turn_id: format!("turn-{run_id}"),
+            item_id: format!("item-{run_id}"),
+        }
+    }
+
+    fn prepared_contract_checkpoint() -> (PathBuf, Value) {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-prepare-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut config = opencode_result_state().config;
+        config.provider = "codex".to_owned();
+        config.driver = "codex_app_server".to_owned();
+        config.command = directory.join("must-not-start-during-prepare");
+        config.args = vec!["app-server".to_owned()];
+        config.model = None;
+        let payload = json!({
+            "provider": config,
+            "completionContract": {"revision": "contract-X", "criterionIds": ["issue-X"]},
+        });
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.event_identity = Some(prepare_contract_identity("run-A"));
+        executor
+            .prepare(&payload)
+            .expect("run A prepares contract X");
+        // A stopped provider checkpoint, as retained by turn.stop. Preparation
+        // and recovery must not launch this deliberately nonexistent command.
+        let state = executor.state.as_mut().unwrap();
+        state.thread_id = Some("saved-contract-thread".to_owned());
+        state.provider_process_generation = 1;
+        executor.save_state().unwrap();
+        (directory, payload)
+    }
+
+    fn restore_contract_checkpoint(
+        directory: &std::path::Path,
+        run_id: &str,
+    ) -> CodexCommandExecutor {
+        let mut executor = CodexCommandExecutor::new(directory);
+        executor.event_identity = Some(prepare_contract_identity(run_id));
+        executor.load_state_without_provider().unwrap();
+        executor
+    }
+
+    // Keep: regression for SMAA-1618, where run 3b7e4a2d was refused solely
+    // because its issue's contract differed from the preceding settled run.
+    #[test]
+    fn prepare_new_run_adopts_its_completion_contract_on_a_settled_checkpoint() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        payload["completionContract"] =
+            json!({"revision": "contract-Y", "criterionIds": ["issue-Y", "follow-up"]});
+        let mut executor = restore_contract_checkpoint(&directory, "run-B");
+        executor
+            .prepare(&payload)
+            .expect("a new run owns its contract, not the previous run's contract");
+        let expected = completion_contract(&payload).unwrap();
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(state.completion_contract, expected);
+        assert_eq!(state.thread_id.as_deref(), Some("saved-contract-thread"));
+        assert!(executor.provider.is_none());
+        let mut recovered = restore_contract_checkpoint(&directory, "run-B");
+        assert_eq!(
+            recovered.state.as_ref().unwrap().completion_contract,
+            expected
+        );
+        recovered
+            .prepare(&payload)
+            .expect("same-run replay is stable");
+        payload["completionContract"]["revision"] = json!("contract-Z");
+        let before = fs::read(executor.state_path()).unwrap();
+        assert!(
+            recovered.prepare(&payload).is_err(),
+            "run B is now bound to Y"
+        );
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_same_run_refuses_a_changed_completion_contract() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let before = fs::read(executor.state_path()).unwrap();
+        let before_state = executor.state.clone();
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        let error = executor
+            .prepare(&payload)
+            .expect_err("same-run contract is immutable");
+        assert!(
+            error.to_string().contains("completion contract changed"),
+            "{error}"
+        );
+        assert_eq!(executor.state, before_state);
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_new_run_refuses_unsettled_state_without_mutation() {
+        for blocker in [
+            "active_turn",
+            "ambiguous_turn",
+            "pending_event",
+            "queued_event",
+            "goal",
+            "pending_tool",
+            "descendant",
+            "deferred_terminal",
+            "closed",
+            "reconciliation_required",
+        ] {
+            let (directory, mut executor, mut payload) = if blocker == "deferred_terminal" {
+                let (directory, mut executor, mut payload) =
+                    prepared_skill_checkpoint("pi_rpc", true);
+                payload["completionContract"] =
+                    json!({"revision": "contract-X", "criterionIds": ["issue-X"]});
+                let state = executor.state.as_mut().unwrap();
+                state.run_identity = Some(prepare_contract_identity("run-A"));
+                state.completion_contract = completion_contract(&payload).unwrap();
+                executor.event_identity = Some(prepare_contract_identity("run-A"));
+                (directory, executor, payload)
+            } else {
+                let (directory, payload) = prepared_contract_checkpoint();
+                let executor = restore_contract_checkpoint(&directory, "run-A");
+                (directory, executor, payload)
+            };
+            let state = executor.state.as_mut().unwrap();
+            match blocker {
+                "active_turn" => {
+                    state.active_provider_turn_id = Some("provider-turn-A".to_owned());
+                    state.lifecycle = "turn_active".to_owned();
+                }
+                "ambiguous_turn" => {
+                    state.ambiguous_turn_start_pending = true;
+                    state.lifecycle = "session_open".to_owned();
+                }
+                "pending_event" | "queued_event" => {
+                    state
+                        .push_event(NormalizedProviderEvent {
+                            event_type: "harness.diagnostic".to_owned(),
+                            priority: EventPriority::P0,
+                            payload: json!({"code": "uncommitted-old-run-fact"}),
+                        })
+                        .unwrap();
+                    if blocker == "queued_event" {
+                        state.queued_events = std::mem::take(&mut state.pending_events);
+                    }
+                }
+                "pending_tool" => {
+                    state.tool_bridge =
+                        tool_result_authority_state("codex", "get_task_context").tool_bridge;
+                    state
+                        .tool_bridge
+                        .begin_call(
+                            "pending-call-A".to_owned(),
+                            "get_task_context".to_owned(),
+                            json!({}),
+                        )
+                        .unwrap();
+                }
+                "descendant" => {
+                    state
+                        .descendant_thread_ids
+                        .insert("child-thread-A".to_owned());
+                }
+                "deferred_terminal" => {
+                    state.tool_bridge =
+                        tool_result_authority_state("pi_rpc", "get_task_context").tool_bridge;
+                    state
+                        .tool_bridge
+                        .begin_call(
+                            "deferred-call-A".to_owned(),
+                            "get_task_context".to_owned(),
+                            json!({}),
+                        )
+                        .unwrap();
+                    state.tool_bridge.settle_turn("turn_completed").unwrap();
+                    state.pi_deferred_terminal = Some("turn.completed".to_owned());
+                }
+                "closed" | "reconciliation_required" => state.lifecycle = blocker.to_owned(),
+                "goal" => {
+                    state.goal = Some(SessionGoalSnapshot {
+                        objective: "Continue the old run".to_owned(),
+                        status: "active".to_owned(),
+                        token_budget: None,
+                        tokens_used: 0,
+                        elapsed_seconds: 0,
+                        iterations: 0,
+                        last_reason: None,
+                        created_at: None,
+                        updated_at: None,
+                        completed_at: None,
+                        working_now: false,
+                    });
+                }
+                _ => unreachable!(),
+            }
+            executor
+                .save_state()
+                .unwrap_or_else(|error| panic!("{blocker}: {error}"));
+            let mut restored = CodexCommandExecutor::new(&directory);
+            restored.pi_launch_profile = executor.pi_launch_profile.clone();
+            restored.event_identity = Some(prepare_contract_identity("run-B"));
+            restored.load_state_without_provider().unwrap();
+            let mut executor = restored;
+            let before_state = executor.state.clone();
+            let before = fs::read(executor.state_path()).unwrap();
+            assert!(
+                executor.prepare(&payload).is_err(),
+                "{blocker}: even an identical contract cannot transfer unsettled work"
+            );
+            payload["completionContract"]["revision"] = json!("contract-Y");
+            let error = executor.prepare(&payload).expect_err(blocker);
+            assert!(
+                error.to_string().contains("completion contract changed"),
+                "{blocker}: {error}"
+            );
+            assert_eq!(executor.state, before_state, "{blocker}");
+            assert_eq!(
+                fs::read(executor.state_path()).unwrap(),
+                before,
+                "{blocker}"
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn prepare_new_run_still_refuses_a_changed_provider_config() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-B");
+        let before_state = executor.state.clone();
+        let before = fs::read(executor.state_path()).unwrap();
+        payload["provider"]["model"] = json!("different-model");
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        let error = executor
+            .prepare(&payload)
+            .expect_err("provider config stays immutable");
+        assert!(
+            error
+                .to_string()
+                .contains("provider or completion contract changed"),
+            "{error}"
+        );
+        assert_eq!(executor.state, before_state);
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_new_run_can_rebind_before_any_provider_thread_exists() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let state = executor.state.as_mut().unwrap();
+        state.thread_id = None;
+        state.provider_process_generation = 0;
+        executor.save_state().unwrap();
+        let mut executor = restore_contract_checkpoint(&directory, "run-B");
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        executor.prepare(&payload).unwrap();
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(
+            state.completion_contract,
+            completion_contract(&payload).unwrap()
+        );
+        assert_eq!(state.run_identity.as_ref().unwrap().run_id, "run-B");
+        assert!(state.thread_id.is_none());
+        assert!(executor.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_legacy_snapshot_never_guesses_the_owner_of_a_changed_contract() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let mut legacy = serde_json::to_value(executor.state.as_ref().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("runIdentity");
+        executor.state = Some(serde_json::from_value(legacy).unwrap());
+        executor.save_state().unwrap();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let before_state = executor.state.clone();
+        let before = fs::read(executor.state_path()).unwrap();
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        assert!(executor.prepare(&payload).is_err());
+        assert_eq!(executor.state, before_state);
+        assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+        // An unchanged successful replay is enough to bind the old shape to A.
+        payload["completionContract"]["revision"] = json!("contract-X");
+        executor.prepare(&payload).unwrap();
+        assert_eq!(
+            executor
+                .state
+                .as_ref()
+                .unwrap()
+                .run_identity
+                .as_ref()
+                .unwrap()
+                .run_id,
+            "run-A"
+        );
+        let mut next = restore_contract_checkpoint(&directory, "run-B");
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        next.prepare(&payload).unwrap();
+        assert_eq!(
+            next.state
+                .as_ref()
+                .unwrap()
+                .run_identity
+                .as_ref()
+                .unwrap()
+                .run_id,
+            "run-B"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepare_after_attach_uses_the_target_run_binding_and_preserves_accounting_origin() {
+        let (directory, mut payload) = prepared_contract_checkpoint();
+        let mut executor = restore_contract_checkpoint(&directory, "run-A");
+        let state = executor.state.as_mut().unwrap();
+        state.completed_turn_authoritative = true;
+        state.completed_turn_process_generation = Some(1);
+        state.completed_provider_turn_id = Some("provider-turn-A".to_owned());
+        state
+            .settled_provider_turn_ids
+            .insert("provider-turn-A".to_owned());
+        payload["completionContract"]["revision"] = json!("contract-Y");
+        payload["paperclipNextAuthority"] = json!({"identity": {
+            "runnerInstanceId": "contract-runner", "environmentLeaseId": "lease",
+            "runId": "run-B", "normalizedSessionId": "contract-session",
+            "turnId": "turn-run-B", "itemId": "item-run-B",
+        }});
+        executor.attach_run(&payload).unwrap();
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(
+            state.run_identity.as_ref().unwrap(),
+            &prepare_contract_identity("run-B")
+        );
+        assert_eq!(
+            state.previous_accounting_origin.as_ref().unwrap().identity,
+            prepare_contract_identity("run-A")
+        );
+        let mut next = restore_contract_checkpoint(&directory, "run-B");
+        payload["completionContract"]["revision"] = json!("contract-Z");
+        let before = fs::read(next.state_path()).unwrap();
+        assert!(
+            next.prepare(&payload).is_err(),
+            "B cannot replace its just-attached contract"
+        );
+        assert_eq!(fs::read(next.state_path()).unwrap(), before);
+        let mut next = restore_contract_checkpoint(&directory, "run-C");
+        // A stale attachment boundary cannot make prepare bind B instead of C.
+        next.prepare(&payload).unwrap();
+        assert_eq!(
+            next.state
+                .as_ref()
+                .unwrap()
+                .run_identity
+                .as_ref()
+                .unwrap()
+                .run_id,
+            "run-C"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn prepared_skill_checkpoint(
         provider: &str,
         include_skill_instructions: bool,
@@ -9687,6 +10139,7 @@ done
     #[test]
     fn rejects_inconsistent_provider_state() {
         let state = CodexProviderState {
+            run_identity: None,
             startup_attempt: None,
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "turn_active".to_owned(),
