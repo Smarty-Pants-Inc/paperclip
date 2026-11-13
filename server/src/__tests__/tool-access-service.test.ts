@@ -15126,6 +15126,8 @@ describeEmbeddedPostgres("tool access service", () => {
       }),
     ]);
     expect(JSON.stringify(updated.config)).not.toContain("m2m-access-token");
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
+    expect(grant!.credentialSecretRefs).toEqual(updated.credentialSecretRefs);
   });
 
   it.each(["catalog", "catalog/refresh", "health-check"])("returns reconnect instructions on %s for expired OAuth without a refresh token", async (path) => {
@@ -20393,7 +20395,7 @@ describeEmbeddedPostgres("tool access service", () => {
     );
   });
 
-  it("fails closed when credential secrets cannot be resolved and writes value-free audit", async () => {
+  it("fails closed when credential grant mapping is missing and writes value-free audit", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
     const connection = await service.createConnection(company.id, connectionInput({
@@ -20426,7 +20428,7 @@ describeEmbeddedPostgres("tool access service", () => {
       }),
     ).rejects.toMatchObject({
       status: 422,
-      details: expect.objectContaining({ code: "secret_missing" }),
+      details: expect.objectContaining({ code: "grant_credential_invalid" }),
     });
     const [updatedConnection] = await db
       .select()
@@ -20439,12 +20441,12 @@ describeEmbeddedPostgres("tool access service", () => {
 
     expect(updatedConnection).toMatchObject({
       healthStatus: "missing_secret",
-      healthMessage: "A configured credential secret could not be resolved.",
+      healthMessage: "Your credential is missing. Reconnect this connection.",
     });
     expect(audit).toMatchObject({
       action: "tool_connection.health_check",
       outcome: "failure",
-      reasonCode: "secret_missing",
+      reasonCode: "grant_credential_invalid",
       details: { status: "missing_secret", transport: "mcp_remote" },
     });
     expect(JSON.stringify(audit)).not.toContain("Bearer ");

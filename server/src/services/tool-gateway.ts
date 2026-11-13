@@ -142,7 +142,7 @@ import type {
 } from "./plugin-tool-dispatcher.js";
 import { logActivity, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
 import { secretService } from "./secrets.js";
-import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
+import { connectionCredentialConfigPath, connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
 import { RAILWAY_SSH_SECRET_PATH, runRailwaySshCommand } from "./railway-ssh.js";
 import {
@@ -4455,8 +4455,13 @@ export function createToolGatewayService(
     for (const ref of connection.credentialRefs ?? []) {
       if (ref.placement !== "header") continue;
       const grantRef = grantRefForCredential(grant, ref);
-      if (!grantRef) continue;
       try {
+        if (!grantRef) throw new ToolGatewayHttpError(
+          422,
+          "Your credential is missing. Reconnect this connection.",
+          "grant_credential_invalid",
+          { connectionId: connection.id, grantId: grant.id, credential: connectionCredentialConfigPath(ref) },
+        );
         const value = await resolveGrantSecretValue(
           session,
           connection,

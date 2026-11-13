@@ -5,7 +5,7 @@ import { oauthConfig, normalizeOauthScopes } from "./metadata.js";
 import { emitConnectionUpdated } from "../../connector-telemetry.js";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecrets, toolConnections } from "@paperclipai/db";
+import { companySecrets, connectionGrants, toolConnections } from "@paperclipai/db";
 import { conflict, HttpError, unprocessable } from "../../../errors.js";
 import { secretService } from "../../secrets.js";
 
@@ -347,7 +347,17 @@ const oauthRefreshFlights = new Map<string, Promise<unknown>>();
     const bindingsChanged =
       previousBindingKeys.size !== nextBindingKeys.size ||
       [...previousBindingKeys].some((key) => !nextBindingKeys.has(key));
-    if (bindingsChanged) await syncCredentialBindings(updated);
+    if (bindingsChanged) {
+      // Legacy shared/M2M refresh writes connection-owned tokens. Keep the
+      // active execution grant in sync; never reactivate a revoked grant.
+      if (updated.credentialPolicy === "shared") await db.update(connectionGrants).set({
+        credentialSecretRefs: updated.credentialSecretRefs, updatedAt: now(),
+      }).where(and(
+        eq(connectionGrants.companyId, updated.companyId), eq(connectionGrants.connectionId, updated.id),
+        eq(connectionGrants.kind, "organization"), eq(connectionGrants.isDefault, true), eq(connectionGrants.status, "active"),
+      ));
+      await syncCredentialBindings(updated);
+    }
     return updated;
   }
 
