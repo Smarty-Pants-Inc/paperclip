@@ -1,0 +1,2819 @@
+{
+  "note": "Scrubbed structural fields only. GET run dumps did NOT include native_run_finalizations. Tests must label any supplementary coordinator fixture; it is not production evidence. Earlier SMAA-143 run dumps were not supplied.",
+  "rows": {
+    "60c4eb3b": {
+      "id": "094062e2-1abd-402d-8401-98d750acb468",
+      "companyId": "fb18da6d-6013-4e2f-b739-26cf92681f1f",
+      "agentId": "1d89e1d2-7059-4d0b-b8c6-77df80b1eba6",
+      "nativeIssueId": "415981de-5e14-4236-9a8a-771824a28664",
+      "nativeSessionId": "ce17c083-f26b-4e02-a7e0-d1fe1feb32c7",
+      "runnerInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+      "runtimeMode": "native",
+      "status": "succeeded",
+      "createdAt": "2026-11-12T22:01:52.330Z",
+      "finishedAt": "2026-11-12T22:02:14.489Z",
+      "errorCode": null,
+      "processPid": 12854,
+      "processGroupId": null,
+      "processStartedAt": "2026-11-12T21:57:37.254Z",
+      "nativePhase": "committed",
+      "contextSnapshot": {
+        "issueId": "415981de-5e14-4236-9a8a-771824a28664",
+        "conversationSessionGeneration": 0
+      },
+      "resultJson": {},
+      "runnerProfileJson": {
+        "mode": "native",
+        "backend": "pi_rpc",
+        "protocolVersion": 1,
+        "nativeResourceDisposition": "keep_running",
+        "nativeToolContractFingerprint": "sha256:07b116cd7f04b0c9a53b87818a910be32682d5df6181c2019cb1ba8e0077be99",
+        "recoveryEventInventoryVersion": 1,
+        "nativePreparationFencingVersion": 1,
+        "inheritedProcessIdentityRunId": "546ec1f6-701a-44f5-a70e-7e183b7174de",
+        "nativeExecutionInput": {
+          "schema": "paperclip.native-execution-input.v5",
+          "session": {
+            "driverKind": "pi_rpc",
+            "lifecyclePolicy": {
+              "mode": "warm",
+              "idleTimeoutMs": 28800000
+            },
+            "protocolVersion": 1,
+            "normalizedSessionId": "ce17c083-f26b-4e02-a7e0-d1fe1feb32c7"
+          },
+          "provider": {
+            "kind": "pi_rpc",
+            "model": "paperclip/claude-opus-5-5",
+            "profile": {
+              "schema": "paperclip.pi-rpc-profile.v1",
+              "driverKind": "pi_rpc",
+              "providerKind": "pi_rpc",
+              "commandDigest": "sha256:73974de85a6796cdfc939237aa2bee3cb255d018beadea81bfeada7aae1137fc",
+              "profileVersion": 1,
+              "runtimePackage": "@earendil-works/pi-coding-agent",
+              "runtimeVersion": "1.5.2",
+              "protocolVersion": 1
+            },
+            "piRpcThinkingLevel": "xhigh"
+          },
+          "workspace": {
+            "cwd": "/paperclip/instances/default/isolated-workspaces/fb18da6d-6013-4e2f-b739-26cf92681f1f/415981de-5e14-4236-9a8a-771824a28664",
+            "repoRef": null,
+            "repoUrl": null,
+            "branchName": null
+          },
+          "executionMode": "default",
+          "binding": {
+            "runId": "094062e2-1abd-402d-8401-98d750acb468",
+            "companyId": "fb18da6d-6013-4e2f-b739-26cf92681f1f",
+            "agentId": "1d89e1d2-7059-4d0b-b8c6-77df80b1eba6",
+            "issueId": "415981de-5e14-4236-9a8a-771824a28664",
+            "executionWorkspaceId": "9660b990-86d7-4fb0-9fc4-4046691bc3fd"
+          }
+        },
+        "sessionCheckpoint": {
+          "goal": null,
+          "cursor": "83",
+          "lineage": [
+            {
+              "role": null,
+              "depth": 0,
+              "status": "unknown",
+              "nickname": null,
+              "threadId": "10457392-9b0a-44f8-8f66-a5e22d548c85",
+              "parentThreadId": null,
+              "providerSessionId": "10457392-9b0a-44f8-8f66-a5e22d548c85"
+            }
+          ],
+          "identity": {
+            "runId": "094062e2-1abd-402d-8401-98d750acb468",
+            "agentId": "1d89e1d2-7059-4d0b-b8c6-77df80b1eba6",
+            "issueId": "415981de-5e14-4236-9a8a-771824a28664",
+            "companyId": "fb18da6d-6013-4e2f-b739-26cf92681f1f",
+            "sessionId": "ce17c083-f26b-4e02-a7e0-d1fe1feb32c7"
+          },
+          "terminal": {
+            "schema": "paperclip.prp.terminal.v1",
+            "runTerminalState": "succeeded",
+            "turnTerminalState": "completed",
+            "reportedWorkDisposition": "done"
+          },
+          "sessionId": "10457392-9b0a-44f8-8f66-a5e22d548c85",
+          "driverKind": "pi_rpc",
+          "backendKind": "runner",
+          "activeTurnId": null,
+          "terminalTurns": [
+            {
+              "turnId": "pi-turn-c3ff2f8f-7787-40a7-93a1-6fbe900f7924",
+              "fingerprint": "[scrubbed semantic result]"
+            }
+          ],
+          "semanticResult": {
+            "schema": "paperclip.run_result.v1",
+            "reportedWorkDisposition": "done"
+          },
+          "workingDirectory": "/home/user/paperclip-workspace",
+          "providerSessionId": "10457392-9b0a-44f8-8f66-a5e22d548c85",
+          "pendingRuntimeRequests": [],
+          "dispositionOnlyRecoveryTurnId": null,
+          "dispositionOnlyRecoveryConsumed": false
+        }
+      },
+      "events": [
+        {
+          "seq": 1,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 2,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 3,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 4,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 5,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 6,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 7,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 8,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "comment.to_run_created",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 9,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "skills.prepare",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 10,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "native.coordinator.claim",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 11,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.acquire",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 12,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.prepare",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 13,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.workspace.realize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 14,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 15,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 16,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_environment_acquire",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 17,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 18,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 19,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_environment_realize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 20,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 21,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 22,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.github_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 23,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 24,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.github_launchers",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 25,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.snapshot_baseline",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 26,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.prepare_adopt_remote",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 27,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runtime_selection.workspace_sync",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 28,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.runtime_selection",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 29,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.queue",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 30,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare_before_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 31,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare_after_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 32,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.startup",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 33,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.artifact.verify_retained",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 34,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.artifact.verify",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 35,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "provider_pack.compatibility",
+            "outcome": "failed"
+          }
+        },
+        {
+          "seq": 36,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "provider_pack.compatibility",
+            "outcome": "failed"
+          }
+        },
+        {
+          "seq": 37,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "provider_pack.verify",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 38,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "provider_pack.select",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 39,
+          "eventType": "native.process_start_requested",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 40,
+          "eventType": "run.attached",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:38",
+          "sourceSeq": 38,
+          "payload": {}
+        },
+        {
+          "seq": 41,
+          "eventType": "turn.submitted",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:39",
+          "sourceSeq": 39,
+          "payload": {}
+        },
+        {
+          "seq": 42,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.event.persist",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 43,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.session.resume",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 44,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.turn.submit",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 45,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.session.startup",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 46,
+          "eventType": "turn.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:40",
+          "sourceSeq": 40,
+          "payload": {}
+        },
+        {
+          "seq": 47,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.event.persist",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 48,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.turn.submitted_to_started",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 49,
+          "eventType": "turn.started",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 50,
+          "eventType": "turn.accepted",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:41",
+          "sourceSeq": 41,
+          "payload": {}
+        },
+        {
+          "seq": 51,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.event.persist",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 52,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:42",
+          "sourceSeq": 42,
+          "payload": {}
+        },
+        {
+          "seq": 53,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:43",
+          "sourceSeq": 43,
+          "payload": {}
+        },
+        {
+          "seq": 54,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:44",
+          "sourceSeq": 44,
+          "payload": {}
+        },
+        {
+          "seq": 55,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:45",
+          "sourceSeq": 45,
+          "payload": {}
+        },
+        {
+          "seq": 56,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:46",
+          "sourceSeq": 46,
+          "payload": {}
+        },
+        {
+          "seq": 57,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:47",
+          "sourceSeq": 47,
+          "payload": {}
+        },
+        {
+          "seq": 58,
+          "eventType": "tool.execution.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:48",
+          "sourceSeq": 48,
+          "payload": {}
+        },
+        {
+          "seq": 59,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "tool.execute",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 60,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "provider.time_to_first_agent_event",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 61,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "tool.execute",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 62,
+          "eventType": "tool.execution.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:49",
+          "sourceSeq": 49,
+          "payload": {}
+        },
+        {
+          "seq": 63,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.time_to_first_agent_activity",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 64,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "tool.execute",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 65,
+          "eventType": "tool.execution.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:50",
+          "sourceSeq": 50,
+          "payload": {}
+        },
+        {
+          "seq": 66,
+          "eventType": "tool.execution.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:51",
+          "sourceSeq": 51,
+          "payload": {}
+        },
+        {
+          "seq": 67,
+          "eventType": "tool.execution.progressed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:52",
+          "sourceSeq": 52,
+          "payload": {}
+        },
+        {
+          "seq": 68,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:53",
+          "sourceSeq": 53,
+          "payload": {}
+        },
+        {
+          "seq": 69,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:54",
+          "sourceSeq": 54,
+          "payload": {}
+        },
+        {
+          "seq": 70,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:55",
+          "sourceSeq": 55,
+          "payload": {}
+        },
+        {
+          "seq": 71,
+          "eventType": "tool.execution.progressed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:56",
+          "sourceSeq": 56,
+          "payload": {}
+        },
+        {
+          "seq": 72,
+          "eventType": "tool.execution.progressed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:57",
+          "sourceSeq": 57,
+          "payload": {}
+        },
+        {
+          "seq": 73,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:58",
+          "sourceSeq": 58,
+          "payload": {}
+        },
+        {
+          "seq": 74,
+          "eventType": "tool.execution.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:59",
+          "sourceSeq": 59,
+          "payload": {}
+        },
+        {
+          "seq": 75,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:60",
+          "sourceSeq": 60,
+          "payload": {}
+        },
+        {
+          "seq": 76,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:61",
+          "sourceSeq": 61,
+          "payload": {}
+        },
+        {
+          "seq": 77,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:62",
+          "sourceSeq": 62,
+          "payload": {}
+        },
+        {
+          "seq": 78,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:63",
+          "sourceSeq": 63,
+          "payload": {}
+        },
+        {
+          "seq": 79,
+          "eventType": "tool.execution.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:64",
+          "sourceSeq": 64,
+          "payload": {}
+        },
+        {
+          "seq": 80,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:65",
+          "sourceSeq": 65,
+          "payload": {}
+        },
+        {
+          "seq": 81,
+          "eventType": "tool.execution.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:66",
+          "sourceSeq": 66,
+          "payload": {}
+        },
+        {
+          "seq": 82,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:67",
+          "sourceSeq": 67,
+          "payload": {}
+        },
+        {
+          "seq": 83,
+          "eventType": "tool.execution.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:68",
+          "sourceSeq": 68,
+          "payload": {}
+        },
+        {
+          "seq": 84,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:69",
+          "sourceSeq": 69,
+          "payload": {}
+        },
+        {
+          "seq": 85,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:70",
+          "sourceSeq": 70,
+          "payload": {}
+        },
+        {
+          "seq": 86,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:71",
+          "sourceSeq": 71,
+          "payload": {}
+        },
+        {
+          "seq": 87,
+          "eventType": "tool.execution.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:72",
+          "sourceSeq": 72,
+          "payload": {}
+        },
+        {
+          "seq": 88,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "completion.request.first",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 89,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:73",
+          "sourceSeq": 73,
+          "payload": {}
+        },
+        {
+          "seq": 90,
+          "eventType": "run.result.proposed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:74",
+          "sourceSeq": 74,
+          "payload": {}
+        },
+        {
+          "seq": 91,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "completion.tool_accepted",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 92,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:75",
+          "sourceSeq": 75,
+          "payload": {}
+        },
+        {
+          "seq": 93,
+          "eventType": "tool.execution.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:76",
+          "sourceSeq": 76,
+          "payload": {}
+        },
+        {
+          "seq": 94,
+          "eventType": "item.started",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:77",
+          "sourceSeq": 77,
+          "payload": {}
+        },
+        {
+          "seq": 95,
+          "eventType": "item.delta",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:78",
+          "sourceSeq": 78,
+          "payload": {}
+        },
+        {
+          "seq": 96,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "response.first_nonempty_text",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 97,
+          "eventType": "item.delta",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:79",
+          "sourceSeq": 79,
+          "payload": {}
+        },
+        {
+          "seq": 98,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.time_to_first_token",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 99,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:80",
+          "sourceSeq": 80,
+          "payload": {}
+        },
+        {
+          "seq": 100,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:81",
+          "sourceSeq": 81,
+          "payload": {}
+        },
+        {
+          "seq": 101,
+          "eventType": "item.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:82",
+          "sourceSeq": 82,
+          "payload": {}
+        },
+        {
+          "seq": 102,
+          "eventType": "turn.completed",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:094062e2-1abd-402d-8401-98d750acb468:83",
+          "sourceSeq": 83,
+          "payload": {}
+        },
+        {
+          "seq": 103,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "agent.turn",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 104,
+          "eventType": "turn.completed",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 105,
+          "eventType": "run.result.accepted",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:control",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:control:094062e2-1abd-402d-8401-98d750acb468:1",
+          "sourceSeq": 1,
+          "payload": {}
+        },
+        {
+          "seq": 106,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runner.event.persist",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 107,
+          "eventType": "run.terminal",
+          "stream": "system",
+          "sourceInstanceId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:control",
+          "sourceEventId": "c41dc284-689e-4bc2-85ca-b91b44895bd8:control:094062e2-1abd-402d-8401-98d750acb468:2",
+          "sourceSeq": 2,
+          "payload": {}
+        },
+        {
+          "seq": 108,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "completion.result_committed",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 109,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "native.session.execute",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 110,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "native.result.finalize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 111,
+          "eventType": "instruction_save",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 112,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.settle",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 113,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.provider_session.measured",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 114,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 115,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 116,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 117,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 118,
+          "eventType": "run.presentation.resolved",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 119,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "outcome": "succeeded"
+          }
+        }
+      ]
+    },
+    "babee269": {
+      "id": "64c5318e-6f33-47e1-a45c-488306727fee",
+      "companyId": "fb18da6d-6013-4e2f-b739-26cf92681f1f",
+      "agentId": "1d89e1d2-7059-4d0b-b8c6-77df80b1eba6",
+      "nativeIssueId": "415981de-5e14-4236-9a8a-771824a28664",
+      "nativeSessionId": "f6270c84-4986-4bd7-955c-920c1ed43491",
+      "runnerInstanceId": "313a296c-71b4-467b-ad7c-c7bc055c08d2",
+      "runtimeMode": "native",
+      "status": "failed",
+      "createdAt": "2026-11-12T22:04:40.059Z",
+      "finishedAt": "2026-11-12T22:05:02.118Z",
+      "errorCode": "native_continuation_requires_reconciliation",
+      "processPid": null,
+      "processGroupId": null,
+      "processStartedAt": null,
+      "nativePhase": "terminal_failure",
+      "contextSnapshot": {
+        "issueId": "415981de-5e14-4236-9a8a-771824a28664",
+        "conversationSessionGeneration": 0
+      },
+      "resultJson": {
+        "executionRecovery": {
+          "kind": "bootstrap",
+          "providerWorkStarted": false
+        },
+        "workspaceRestoreFailure": "restore_failed"
+      },
+      "runnerProfileJson": {
+        "mode": "native",
+        "backend": "pi_rpc",
+        "protocolVersion": 1,
+        "nativeResourceDisposition": "keep_running",
+        "nativeToolContractFingerprint": "sha256:07b116cd7f04b0c9a53b87818a910be32682d5df6181c2019cb1ba8e0077be99",
+        "recoveryEventInventoryVersion": 1,
+        "nativePreparationFencingVersion": 1,
+        "nativeExecutionInput": {
+          "schema": "paperclip.native-execution-input.v5",
+          "session": {
+            "driverKind": "pi_rpc",
+            "lifecyclePolicy": {
+              "mode": "warm",
+              "idleTimeoutMs": 28800000
+            },
+            "protocolVersion": 1,
+            "normalizedSessionId": "f6270c84-4986-4bd7-955c-920c1ed43491"
+          },
+          "provider": {
+            "kind": "pi_rpc",
+            "model": "paperclip/claude-opus-5-5",
+            "profile": {
+              "schema": "paperclip.pi-rpc-profile.v1",
+              "driverKind": "pi_rpc",
+              "providerKind": "pi_rpc",
+              "commandDigest": "sha256:73974de85a6796cdfc939237aa2bee3cb255d018beadea81bfeada7aae1137fc",
+              "profileVersion": 1,
+              "runtimePackage": "@earendil-works/pi-coding-agent",
+              "runtimeVersion": "1.5.2",
+              "protocolVersion": 1
+            },
+            "piRpcThinkingLevel": "xhigh"
+          },
+          "workspace": {
+            "cwd": "/paperclip/instances/default/isolated-workspaces/fb18da6d-6013-4e2f-b739-26cf92681f1f/415981de-5e14-4236-9a8a-771824a28664",
+            "repoRef": null,
+            "repoUrl": null,
+            "branchName": null
+          },
+          "executionMode": "default",
+          "binding": {
+            "runId": "64c5318e-6f33-47e1-a45c-488306727fee",
+            "companyId": "fb18da6d-6013-4e2f-b739-26cf92681f1f",
+            "agentId": "1d89e1d2-7059-4d0b-b8c6-77df80b1eba6",
+            "issueId": "415981de-5e14-4236-9a8a-771824a28664",
+            "executionWorkspaceId": "9660b990-86d7-4fb0-9fc4-4046691bc3fd"
+          }
+        }
+      },
+      "events": [
+        {
+          "seq": 1,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 2,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 3,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 4,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 5,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 6,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 7,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 8,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "comment.to_run_created",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 9,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "skills.prepare",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 10,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.acquire",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 11,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.workspace.realize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 12,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "native.coordinator.claim",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 13,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "skills.version.materialize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 14,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.configuration_skills",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 15,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.execution_configuration",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 16,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 17,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 18,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_environment_acquire",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 19,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 20,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_environment_realize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 21,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 22,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 23,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.github_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 24,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 25,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 26,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.github_launchers",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 27,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 28,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 29,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 30,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.instructions",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 31,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.snapshot_baseline",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 32,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 33,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.transfer",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 34,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.stage_workspace",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 35,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.inbound_barrier",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 36,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.prepare_host_current",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 37,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runtime_selection.workspace_sync",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 38,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.runtime_selection",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 39,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.queue",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 40,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare_before_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 41,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare_after_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 42,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.startup",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 43,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.prepare",
+            "outcome": "failed"
+          }
+        },
+        {
+          "seq": 44,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.provider_session.measured",
+            "outcome": "failed"
+          }
+        },
+        {
+          "seq": 45,
+          "eventType": "error",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 46,
+          "eventType": "instruction_save",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 47,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "outcome": "failed"
+          }
+        }
+      ]
+    },
+    "bb6091b6": {
+      "id": "6a494ff4-041f-411f-9523-81e819274dd2",
+      "companyId": "74a02570-bf1c-49e3-8c90-0f0cf8a672c1",
+      "agentId": "a6985e51-1678-4cba-9fb7-1d33a84a731b",
+      "nativeIssueId": "4912eafc-5864-423f-a944-cc8a6a2e65e8",
+      "nativeSessionId": "48194971-3ff0-4283-973f-6ed1362adc2f",
+      "runnerInstanceId": "5455696f-40c3-4335-8b9d-4e4dedf34172",
+      "runtimeMode": "native",
+      "status": "failed",
+      "createdAt": "2026-11-12T22:53:25.580Z",
+      "finishedAt": "2026-11-12T22:53:41.908Z",
+      "errorCode": "native_continuation_requires_reconciliation",
+      "processPid": null,
+      "processGroupId": null,
+      "processStartedAt": null,
+      "nativePhase": "terminal_failure",
+      "contextSnapshot": {
+        "issueId": "4912eafc-5864-423f-a944-cc8a6a2e65e8",
+        "conversationSessionGeneration": 1
+      },
+      "resultJson": {
+        "executionRecovery": {
+          "kind": "bootstrap",
+          "providerWorkStarted": false
+        },
+        "workspaceRestoreFailure": "restore_failed"
+      },
+      "runnerProfileJson": {
+        "mode": "native",
+        "backend": "pi_rpc",
+        "protocolVersion": 1,
+        "nativeResourceDisposition": "keep_running",
+        "nativeToolContractFingerprint": "sha256:07b116cd7f04b0c9a53b87818a910be32682d5df6181c2019cb1ba8e0077be99",
+        "recoveryEventInventoryVersion": 1,
+        "nativePreparationFencingVersion": 1,
+        "nativeExecutionInput": {
+          "schema": "paperclip.native-execution-input.v5",
+          "session": {
+            "driverKind": "pi_rpc",
+            "lifecyclePolicy": {
+              "mode": "warm",
+              "idleTimeoutMs": 28800000
+            },
+            "protocolVersion": 1,
+            "normalizedSessionId": "48194971-3ff0-4283-973f-6ed1362adc2f"
+          },
+          "provider": {
+            "kind": "pi_rpc",
+            "model": "paperclip/claude-opus-5-5",
+            "profile": {
+              "schema": "paperclip.pi-rpc-profile.v1",
+              "driverKind": "pi_rpc",
+              "providerKind": "pi_rpc",
+              "commandDigest": "sha256:73974de85a6796cdfc939237aa2bee3cb255d018beadea81bfeada7aae1137fc",
+              "profileVersion": 1,
+              "runtimePackage": "@earendil-works/pi-coding-agent",
+              "runtimeVersion": "1.5.2",
+              "protocolVersion": 1
+            },
+            "piRpcThinkingLevel": "xhigh"
+          },
+          "workspace": {
+            "cwd": "/paperclip/instances/default/isolated-workspaces/74a02570-bf1c-49e3-8c90-0f0cf8a672c1/4912eafc-5864-423f-a944-cc8a6a2e65e8",
+            "repoRef": null,
+            "repoUrl": null,
+            "branchName": null
+          },
+          "executionMode": "default",
+          "binding": {
+            "runId": "6a494ff4-041f-411f-9523-81e819274dd2",
+            "companyId": "74a02570-bf1c-49e3-8c90-0f0cf8a672c1",
+            "agentId": "a6985e51-1678-4cba-9fb7-1d33a84a731b",
+            "issueId": "4912eafc-5864-423f-a944-cc8a6a2e65e8",
+            "executionWorkspaceId": "16bb3339-36c4-4629-9dbd-c3b7217fb5ed"
+          }
+        }
+      },
+      "events": [
+        {
+          "seq": 1,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 2,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 3,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 4,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 5,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 6,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 7,
+          "eventType": "run.startup.reuse",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 8,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "comment.to_run_created",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 9,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "skills.prepare",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 10,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.acquire",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 11,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.workspace.realize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 12,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.conversation",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 13,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "native.coordinator.claim",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 14,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.chat_retry_admission",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 15,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.prepare",
+            "outcome": "failed"
+          }
+        },
+        {
+          "seq": 16,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_selection",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 17,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.issue_checkout",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 18,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.run_identity",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 19,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.task_context",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 20,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace.access.task_authorization",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 21,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace.access.execution",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 22,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.environment_selection",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 23,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.configuration_ai_runtime",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 24,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "skills.version.materialize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 25,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "skills.version.materialize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 26,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "skills.version.materialize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 27,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.configuration_skills",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 28,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.execution_configuration",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 29,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_source_resolution",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 30,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_config_recording",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 31,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace.repository.binding",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 32,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_repository_admission",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 33,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 34,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 35,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_environment_acquire",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 36,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 37,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace_environment_realize",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 38,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.workspace",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 39,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 40,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.github_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 41,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 42,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 43,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.github_launchers",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 44,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 45,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 46,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 47,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.instructions",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 48,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runtime_context.instructions",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 49,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runtime_selection.runtime_context",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 50,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.snapshot_baseline",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 51,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.seed_lookup",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 52,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "execution.plugin_dispatch",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 53,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.transfer",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 54,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.stage_workspace",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 55,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.inbound_barrier",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 56,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.prepare_host_current",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 57,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "workspace_sync.manifests_persist",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 58,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "runtime_selection.workspace_sync",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 59,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare.runtime_selection",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 60,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.queue",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 61,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare_before_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 62,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "heartbeat.prepare_after_environment",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 63,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "environment.startup",
+            "outcome": "ok"
+          }
+        },
+        {
+          "seq": 64,
+          "eventType": "run.performance.span",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "span": "task.provider_session.measured",
+            "outcome": "failed"
+          }
+        },
+        {
+          "seq": 65,
+          "eventType": "error",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {}
+        },
+        {
+          "seq": 66,
+          "eventType": "lifecycle",
+          "stream": "system",
+          "sourceInstanceId": null,
+          "sourceEventId": null,
+          "sourceSeq": null,
+          "payload": {
+            "outcome": "failed"
+          }
+        }
+      ]
+    }
+  }
+}
