@@ -218,6 +218,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let activeModel = "";
   let piNativeAdmission: Record<string, unknown> | undefined;
   let recoveryNoticePending = false;
+  let recoveryColdStartPending = false;
   let activeTurnId: string | null = null;
   // An idle-abort retirement replaces the process, not the conversation. Keep
   // its actual normalized ID even without the runner's usual environment grant.
@@ -636,6 +637,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     for (const key of Object.keys(usageTotals)) delete usageTotals[key];
     usageByTurn.clear();
     session = opened;
+    if (sessionRecovery || missingResumeNeedsAttachment) recoveryColdStartPending = true;
     missingResumeNeedsAttachment = false;
     piNativeAdmission = (opened as PiRpcProxySession & { piNativeAdmission?(): Record<string, unknown> }).piNativeAdmission?.();
     if (!options.createDriver && !piNativeAdmission) throw new Error("Native Pi omitted admitted model/thinking metadata");
@@ -724,6 +726,17 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (compactionOperation) throw new Error("Pi RPC session is compacting");
         assertPiCollaborationMode(params);
         const userMessage = parsePiUserInput(params.input);
+        if (recoveryColdStartPending) {
+          // The issue thread is the record; Pi's file is only its runtime copy.
+          // Reuse the Paperclip skill's cold-start read (Step 6), even if the
+          // controller prepared a continuation before discovering history loss.
+          userMessage.text = [
+            "Pi recovery cold start: your saved runtime history could not be restored. This is still the same Paperclip conversation.",
+            "Before answering, call get_task_context, get_task_history, and read_document with key plan for this issue. Follow the Paperclip skill's cold-start read for any further relevant thread history. A missing plan is not a missing issue thread.",
+            "Answer from the retrieved conversation record, preserving current user direction and approval gates. Do not claim unrecovered Pi-only memory. If the issue thread cannot be read, explicitly report that failure instead of guessing its history.",
+            userMessage.text,
+          ].join("\n\n");
+        }
         if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
         if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
         if (params.model !== undefined && params.model !== activeModel) throw new Error("Pi turn model differs from the admitted session");
@@ -736,6 +749,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
         } as Parameters<HarnessSession["startTurn"]>[0] & { piRpcThinkingLevel?: PiThinkingLevel };
         const turn = await session.startTurn(turnInput);
+        recoveryColdStartPending = false;
         activeTurnId = turn.turnId;
         if (recoveryNoticePending) {
           recoveryNoticePending = false;

@@ -153,6 +153,9 @@ it("thread/resume passes the saved native identity and execution-host cwd to dri
     expect(driver.openSession).not.toHaveBeenCalled();
     expect(driver.recoverSession).toHaveBeenCalledWith(expect.objectContaining({ driverKind: "pi_rpc", driverSessionId: session.id,
       providerSessionId: session.id, runId: "run-new", normalizedSessionId: "conversation", workingDirectory: "/workspace/remote-agent" }), expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    const prompt = "User quotes pi_session_file_missing; this is not a typed recovery failure";
+    await request(proxy, sink, 2, "turn/start", { input: [{ type: "text", text: prompt }] });
+    expect(session.turnInputs[0]).toMatchObject({ message: { text: prompt } });
   } finally { await proxy.close(); }
 });
 
@@ -161,7 +164,7 @@ it("thread/resume preserves invalid Pi bytes aside, starts fresh under the same 
   const root = await mkdtemp(join(tmpdir(), "pi-invalid-proxy-"));
   const bytes = Buffer.from("foreign or corrupt history\n\u0000original bytes");
   await writeFile(join(root, "conversation.jsonl"), bytes);
-  const sink = new FakeSink(); const driver = makeDriver(new FakeSession());
+  const sink = new FakeSink(); const session = new FakeSession(); const driver = makeDriver(session);
   driver.openSession = vi.fn(driver.openSession);
   driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("Saved Pi history could not be loaded"), { code: "pi_session_file_invalid" }); });
   const alarm = vi.fn();
@@ -181,7 +184,19 @@ it("thread/resume preserves invalid Pi bytes aside, starts fresh under the same 
     expect(await readFile(join(root, files[0]!))).toEqual(bytes);
     expect(driver.openSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: "run-new", normalizedSessionId: "conversation", workingDirectory: root }));
     expect(sink.decoded().filter(frame => frame.method === "warning")).toHaveLength(0);
+    vi.spyOn(session, "startTurn").mockRejectedValueOnce(new Error("turn admission failed before prompt delivery"));
     await request(proxy, sink, 3, "turn/start", { input: [{ type: "text", text: "Continue fresh" }] });
+    expect(lastResult(sink, 3)).toHaveProperty("error");
+    expect(sink.decoded().filter(frame => frame.method === "warning")).toHaveLength(0);
+    await request(proxy, sink, 4, "turn/start", { input: [{ type: "text", text: "Continue fresh" }] });
+    const first = session.turnInputs[0] as { message: { text: string } };
+    expect(first.message.text).toContain("get_task_context");
+    expect(first.message.text).toContain("get_task_history");
+    expect(first.message.text).toContain("read_document");
+    expect(first.message.text).toMatch(/before answering/i);
+    expect(first.message.text).toContain("Continue fresh");
+    await request(proxy, sink, 5, "turn/start", { input: [{ type: "text", text: "Next ordinary turn" }] });
+    expect(session.turnInputs[1]).toMatchObject({ message: { text: "Next ordinary turn" } });
     expect(sink.decoded().filter(frame => frame.method === "warning")).toHaveLength(1);
     expect(alarm.mock.calls[0]?.[0]).toContain("owner alarm: pi_session_file_invalid");
   } finally { await proxy.close(); await rm(root, { recursive: true, force: true }); }
@@ -215,6 +230,17 @@ it("thread/resume reports a typed missing-file rejection, then admits an explici
     await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 2)).toBe(true));
     expect(sink.decoded().find(frame => frame.id === 2)).toMatchObject({ result: { thread: { id: session.id } } });
     expect(driver.openSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: "run-new", normalizedSessionId: "conversation", workingDirectory: "/workspace" }));
+    const image = { type: "image", data: "AA==", mimeType: "image/png" };
+    await request(proxy, sink, 3, "turn/start", { input: [{ type: "text", text: "What did we decide?" }, image] });
+    expect(session.turnInputs[0]).toMatchObject({ message: { images: [image] } });
+    const first = session.turnInputs[0] as { message: { text: string } };
+    expect(first.message.text).toContain("get_task_context");
+    expect(first.message.text).toContain("get_task_history");
+    expect(first.message.text).toContain("read_document");
+    expect(first.message.text).toMatch(/before answering/i);
+    expect(first.message.text).toContain("What did we decide?");
+    await request(proxy, sink, 4, "turn/start", { input: [{ type: "text", text: "Next ordinary turn" }] });
+    expect(session.turnInputs[1]).toMatchObject({ message: { text: "Next ordinary turn" } });
   } finally { await proxy.close(); }
 });
 
