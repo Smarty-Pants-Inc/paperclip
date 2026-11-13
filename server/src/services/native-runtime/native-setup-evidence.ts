@@ -9,12 +9,16 @@ import { logger } from "../../middleware/logger.js";
 // attribution, not authority to move a live/durable session (or a replaced root).
 const setupRuntimeOwners = new Map<string, { dev: number; ino: number }>();
 
+export function nativeSetupScopeDigest(companyId: string): string {
+  return createHash("sha256").update(JSON.stringify([companyId, "setup-probe"])).digest("hex");
+}
+
 /** Setup has no agent/conversation yet. Bind its private evidence to the company
  * and purpose instead, on the same filesystem as the permanent evidence move. */
 export async function createNativeSetupRuntime(companyId: string): Promise<string> {
   const base = resolve(process.env.PAPERCLIP_RUNNER_STATE_DIR ?? join(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "durable-sessions"));
   await mkdir(base, { recursive: true, mode: 0o700 });
-  const scope = createHash("sha256").update(JSON.stringify([companyId, "setup-probe"])).digest("hex");
+  const scope = nativeSetupScopeDigest(companyId);
   const directory = join(base, scope);
   await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => { if (error.code !== "EEXIST") throw error; });
   const metadata = await lstat(directory);
