@@ -341,7 +341,10 @@ impl RunnerTransportEndpoint {
                 // No frames are read during HTTP upgrade. Apply the configured
                 // frame limits before any authentication or runtime I/O.
                 socket.set_config(|config| *config = websocket_config());
-                configure_auth_timeouts(socket.get_ref(), connect_deadline)?;
+                let deadline = socket
+                    .authentication_deadline()
+                    .map_or(connect_deadline, |deadline| deadline.min(connect_deadline));
+                configure_auth_timeouts(socket.get_ref(), deadline)?;
                 Ok(Some(RunnerSocket::Listen(socket)))
             }
         }
@@ -616,6 +619,14 @@ impl RunnerSocket {
         &mut self,
         lifecycle_deadline: Instant,
     ) -> Result<Instant, DurableRunnerError> {
+        let lifecycle_deadline = match self {
+            Self::Listen(socket) => socket
+                .authentication_deadline()
+                .map_or(lifecycle_deadline, |deadline| {
+                    deadline.min(lifecycle_deadline)
+                }),
+            Self::Dial(_) => lifecycle_deadline,
+        };
         let deadline = bounded_operation_deadline(lifecycle_deadline, AUTH_TIMEOUT)?;
         let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
@@ -636,9 +647,9 @@ fn send_auth_plain(
     max_frame_bytes: usize,
     lifecycle_deadline: Instant,
 ) -> Result<(), DurableRunnerError> {
-    socket.configure_auth_timeouts(lifecycle_deadline)?;
+    let deadline = socket.configure_auth_timeouts(lifecycle_deadline)?;
     send_plain(socket, value, max_frame_bytes)?;
-    ensure_connection_deadline(lifecycle_deadline)
+    ensure_connection_deadline(deadline)
 }
 
 fn send_auth_response_plain(
@@ -648,13 +659,13 @@ fn send_auth_response_plain(
     lifecycle_deadline: Instant,
     send_started: &mut bool,
 ) -> Result<(), DurableRunnerError> {
-    socket.configure_auth_timeouts(lifecycle_deadline)?;
+    let deadline = socket.configure_auth_timeouts(lifecycle_deadline)?;
     let message = encode_plain_message(value, max_frame_bytes)?;
     // A write error can occur after the peer receives the complete response,
     // so the one-use ticket becomes ambiguous immediately before this call.
     *send_started = true;
     socket.send_message(message).map_err(map_websocket_error)?;
-    ensure_connection_deadline(lifecycle_deadline)
+    ensure_connection_deadline(deadline)
 }
 
 #[derive(Debug)]
@@ -1059,6 +1070,9 @@ impl AuthenticatedTransport {
                 connect_deadline,
                 &mut auth_response_send_started,
             )?;
+            if let RunnerSocket::Listen(socket) = &mut socket {
+                socket.authenticated()?;
+            }
             let secure_channel = SecureChannel::client(
                 &credential.auth_key,
                 &signing_bytes,
@@ -1727,6 +1741,7 @@ mod tests {
     #[cfg(unix)]
     include!("tests/hosted_retention.rs");
     include!("tests/ack_release_poll.rs");
+    include!("tests/listener_admission.rs");
     include!("tests/indeterminate_terminal_ack.rs");
 
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
