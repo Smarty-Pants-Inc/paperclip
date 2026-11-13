@@ -52,7 +52,11 @@ export function isPiModelCompat(value: unknown): value is PiModelCompat {
   catch { return false; }
 }
 
+/** Never inherit upstream routing/auth in a managed model definition. */
+export const PI_MODEL_ROUTING_FIELDS = new Set(["provider", "baseUrl", "api", "apiKey", "headers", "authHeader", "auth", "oauth"]);
 export interface PiBindModel {
+  /** Preserve future JSON model metadata; routing/auth remains forbidden. */
+  [key: string]: unknown;
   id: string; name?: string; reasoning?: boolean; input?: Array<"text" | "image">;
   contextWindow?: number; maxTokens?: number;
   cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
@@ -185,10 +189,9 @@ function validProvider(value: unknown, model: string): value is PiBindProvider {
     const url = new URL(value.baseUrl);
     if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash) return false;
   } catch { return false; }
-  const allowed = new Set(["id", "name", "reasoning", "input", "cost", "contextWindow", "maxTokens", "thinkingLevelMap", "compat"]);
   const ids = new Set<string>();
   for (const entry of value.models) {
-    if (!object(entry) || !text(entry.id, 512) || ids.has(entry.id) || Object.keys(entry).some(key => !allowed.has(key))
+    if (!object(entry) || !isPiModelCompat(entry) || !text(entry.id, 512) || ids.has(entry.id) || Object.keys(entry).some(key => PI_MODEL_ROUTING_FIELDS.has(key))
       || (entry.name !== undefined && !text(entry.name, 512))
       || (entry.reasoning !== undefined && typeof entry.reasoning !== "boolean")
       || (entry.input !== undefined && (!Array.isArray(entry.input) || !entry.input.length || entry.input.some(item => item !== "text" && item !== "image")))

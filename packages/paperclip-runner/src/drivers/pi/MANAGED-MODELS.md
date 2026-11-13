@@ -9,7 +9,7 @@ Resolution order:
 1. The agent home's snapshot: an exact-id entry in `providers.paperclip.models`,
    otherwise an exact-id entry on another provider in the same file, in file
    order. This supports connections named, for example, `cliproxyapi-anthropic`.
-2. Missing capability fields and thinking-map keys come from the original user's
+2. Missing model-definition fields and thinking-map keys come from the original user's
    `models.json`: the explicit original `PI_CODING_AGENT_DIR`, if set, otherwise
    the original `HOME/.pi/agent` (with the process HOME / `os.homedir()` fallback).
    Capture these paths before managed-home projection. The
@@ -18,22 +18,29 @@ Resolution order:
    skipped with one bounded diagnostic, not a startup refusal. Agent-snapshot
    validation remains strict. Routing, authentication and other user settings
    are never imported into the managed home.
-3. Remaining capabilities come from the selected Pi 1.5.2 installation's bundled
-   `@earendil-works/pi-ai/providers/all` catalog. All exact-id matches must agree
-   on context window, output limit and reasoning support. A thinking-level map
-   key is inherited only when every match agrees on that key; snapshot map keys
-   override catalog keys, including explicit `null` caps.
+3. Remaining fields come from the selected Pi 1.5.2 installation's bundled
+   `@earendil-works/pi-ai/providers/all` catalog. Prefer the exact-id,
+   matching-API entry of the canonical API owner (`anthropic` for Messages,
+   `openai` for Completions/Responses), otherwise the first exact-id entry in
+   Pi's catalog order. Copy the whole winning definition, not a synthesized
+   cross-provider consensus. Snapshot thinking-map keys override catalog keys,
+   including explicit `null` caps.
 4. Unresolved fields use `contextWindow: 128000`, `maxTokens: 8192`, and
    `reasoning: true`, with one bounded diagnostic at initial resolution. The
    existing all-level thinking-map fallback applies only when the catalog is
    unresolved AND the configured limits/reasoning tuple is incomplete; complete
-   explicit configurations do not acquire synthetic map entries.
+   explicit configurations do not acquire synthetic map entries. `input` comes
+   from the selected model definition, then its source provider's explicit input,
+   then the exact-id catalog capability. An unknown model with no declared image
+   capability gets `["text"]` and an image-capability diagnostic in the same
+   bounded initial-resolution line. No model-family guess enables images.
 
 `compat` follows the same exact-id config selection but has its own API guard:
 `model.api ?? provider.api` must equal the API selected by the actual managed
 connection protocol (`messages` -> `anthropic-messages`, `chat` ->
-`openai-completions`, `responses` -> `openai-responses`). A mismatch skips only
-compat, with a bounded diagnostic, and preserves all other capabilities.
+`openai-completions`, `responses` -> `openai-responses`). A mismatch skips
+`compat`, `samplingParams` and `samplingParamsByThinkingLevel`, with a bounded
+diagnostic, and preserves API-neutral metadata.
 Provider/model compat uses Pi 1.5.2's shallow per-field override and its one-level
 merges for `openRouterRouting`, `vercelGatewayRouting`, `chatTemplateKwargs` and
 `chatTemplateArgs`. No other nested value is recursively blended. Across config
@@ -45,16 +52,20 @@ API owner: `anthropic` for Messages; `openai` for Completions and Responses. The
 whole object is copied, never a union, intersection, anonymous consensus or the
 first provider's flags. Other providers cannot contribute or suppress compat.
 Absent canonical id/API/compat is diagnosed and skipped. Copying fallback emits
-a bounded diagnostic naming the canonical provider. This does not change the
-cross-provider consensus policy for limits, reasoning or thinking-map keys.
+a bounded diagnostic naming the canonical provider. Noncanonical catalog entries
+supply only API-neutral fields.
 
-Only `thinkingLevelMap`, `contextWindow`, `maxTokens`, `reasoning` and the whole
-validated `compat` object cross from the snapshot/catalog into the broker descriptor. API, URL and key always come
-from the active managed connection/broker, never from the snapshot model or
-catalog provider. Names, input types and top-level costs keep Pi's existing
-registration defaults. Compat has no flag allowlist: false, nested null, arrays
-and nested cost metadata survive. A shared plain-JSON validator rejects
-non-JSON/nonplain values and cycles at configuration and private bind boundaries.
+The whole model definition crosses the broker and private bind boundaries.
+There is no capability allowlist: `input`, names, costs (including tiers),
+`inputLimits`, prompt-cache settings, thinking maps and future JSON metadata
+survive. At every projection, model routing/auth fields (`provider`, `baseUrl`,
+`headers`, `api`, `apiKey`, `authHeader`, `auth`, `oauth`) are removed. Provider
+API, URL, key, headers and authentication are never copied; the managed provider
+is built independently from the active connection and revocable broker token.
+The model id remains the upstream id, selected under the `paperclip/<id>`
+provider namespace. Registration defaults fill absent fields only. A shared
+plain-JSON validator rejects non-JSON/nonplain values and cycles at configuration
+and private bind boundaries.
 Strict agent config errors refuse startup; optional original-HOME errors skip
 that source without altering it. Non-managed snapshot providers and top-level
 settings remain intact. The defensive snapshot reread uses the incoming managed
@@ -86,7 +97,8 @@ the latter requests the supported effective level.
 From `packages/paperclip-runner`:
 
 ```sh
-pnpm exec vitest run src/drivers/pi src/drivers/acpx/pi-provider-loopback.test.ts src/drivers/acpx/pi-provider-loopback-host.test.ts --maxWorkers=1
+pnpm exec vitest run src/drivers/pi/pi-managed-definition.test.ts --maxWorkers=2
+pnpm exec vitest run src/drivers/pi/pi-managed-compat.test.ts --maxWorkers=2
 node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
 ```
 
@@ -109,3 +121,15 @@ requests the supported effective effort (`xhigh` with the cap, `max` without).
 Both cases retain their capabilities after warm attach/rebind and leave the
 user file unchanged. Driver turns use a local loopback protocol peer, not an
 upstream account or a simulated Pi runtime.
+
+The J1 image-loss regression exercises the real native driver, data-URL input
+parser, staged attachment read, real Pi 1.5.2 and loopback broker. It captures the
+outbound provider request and requires exactly one PNG image block (not merely
+an image in the Pi RPC command). Both forms fail on the original text-only
+projection. Run it separately on memory-constrained hosts:
+
+```sh
+PI_TEST_BINARY=/absolute/path/to/pi-coding-agent/dist/cli.js \
+PI_MANAGED_IMAGES_OUT=/absolute/path/to/evidence \
+pnpm exec vitest run src/drivers/pi/pi-managed-images.native.test.ts --maxWorkers=2
+```

@@ -15,7 +15,7 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
 
 const key = "reusable-provider-key-canary";
-const childFallback = { id: "vendor/model", contextWindow: 128000, maxTokens: 8192, reasoning: true,
+const childFallback = { id: "vendor/model", input: ["text"], contextWindow: 128000, maxTokens: 8192, reasoning: true,
   thinkingLevelMap: { off: "off", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } };
 function environment(url: string) {
   const routing = { PAPERCLIP_AI_PROVIDER_URL: url, PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "api_key", PAPERCLIP_AI_PROVIDER_KEY: key };
