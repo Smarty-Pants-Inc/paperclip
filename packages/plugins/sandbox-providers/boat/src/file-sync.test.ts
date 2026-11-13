@@ -90,7 +90,7 @@ beforeEach(async () => {
   commands = []; transfers = []; remoteTemps = new Set(); fault = undefined; partialUploadBytes = 0; downloadOverride = undefined; cleanupStatus = 503;
   vi.stubGlobal("fetch", vi.fn(mockFetch));
 });
-afterEach(async () => { vi.unstubAllGlobals(); await fs.rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.unstubAllGlobals(); vi.restoreAllMocks(); await fs.rm(root, { recursive: true, force: true }); });
 async function fixture() {
   const source = path.join(host, "source ' ; $(not-a-command)");
   await fs.mkdir(source, { mode: 0o700 }); await fs.mkdir(path.join(source, "empty"), { mode: 0o750 });
@@ -115,6 +115,61 @@ async function clean() {
   for (const directory of [host, remote]) expect((await fs.readdir(directory)).filter(name => name.startsWith(".paperclip-upload") || name.startsWith("paperclip-boat-sync"))).toEqual([]);
 }
 describe("Boat native hybrid file sync", () => {
+  describe.each([false, true])("safe transfer failures (outbound=%s)", outbound => {
+    const direction = outbound ? "download" : "upload";
+    async function failedSync() {
+      const source = path.join(outbound ? remote : host, "source"), target = path.join(outbound ? host : remote, "target");
+      await fs.writeFile(source, "NEW"); await fs.writeFile(target, "OLD");
+      const error = await sync({ sourcePath: source, targetPath: target, kind: "file" }, outbound).then(
+        () => { throw new Error("Expected sync failure"); },
+        error => error as Error,
+      );
+      expect(error).toBeInstanceOf(Error);
+      for (const text of [String(error), error.message, error.stack, JSON.stringify(Object.getOwnPropertyDescriptors(error))]) {
+        expect(text).not.toMatch(/X-Amz|https:\/\/|\?/);
+      }
+      expect(Object.hasOwn(error, "cause")).toBe(false);
+      expect(await fs.readFile(target, "utf8")).toBe("OLD");
+      await clean();
+      return error.message;
+    }
+    it.each(["TimeoutError", "AbortError", "TypeError", "unsafe fields"])("retains a URL-free signed %s cause", async name => {
+      const secret = "https://signed.invalid/file?X-Amz-Signature=synthetic";
+      const error = name === "TypeError" ? new TypeError(secret, { cause: { code: "ECONNRESET", message: secret } })
+        : name === "unsafe fields" ? Object.assign(new Error(secret), { name: secret, cause: { code: secret } })
+        : new DOMException(secret, name);
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        if (new URL(String(input)).hostname === "signed.invalid") throw error;
+        return mockFetch(input, init);
+      }));
+      const detail = name === "TypeError" ? "TypeError (ECONNRESET)" : name === "unsafe fields" ? "Error" : "timeout after 60000 ms";
+      expect(await failedSync()).toBe(`Boat signed ${direction} failed: ${detail}`);
+    });
+    it("retains signed HTTP status without the URL, response body or statusText", async () => {
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => new URL(String(input)).hostname === "signed.invalid"
+        ? new Response("https://signed.invalid/?X-Amz-Signature=synthetic", { status: 403, statusText: "X-Amz-secret" })
+        : mockFetch(input, init)));
+      expect(await failedSync()).toBe(`Boat signed ${direction} failed: HTTP 403`);
+    });
+    it.each(["timeout", "HTTP 403"])("retains %s from the URL request step", async failure => {
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      if (failure === "timeout") vi.spyOn(AbortSignal, "timeout").mockImplementation(() => timeout(1));
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        if (new URL(String(input)).pathname.endsWith(`/${direction}-url`)) {
+          if (failure === "timeout") {
+            await new Promise<void>(resolve => {
+              if (init.signal.aborted) resolve();
+              else init.signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+            throw init.signal.reason;
+          }
+          return new Response("https://signed.invalid/?X-Amz-Signature=synthetic", { status: 403 });
+        }
+        return mockFetch(input, init);
+      }));
+      expect(await failedSync()).toBe(`Boat ${direction}-url request failed: ${failure === "timeout" ? "timeout after 60000 ms" : failure}`);
+    });
+  });
   it("round-trips links, entry modes, empty directory and >5 MiB via one command per mapping", async () => {
     const source = await fixture(), target = path.join(remote, "workspace ' quoted");
     const incoming = await sync({ sourcePath: source, targetPath: target, kind: "directory" });

@@ -90,27 +90,42 @@ function installSandbox(mapping: PluginSyncFileMapping, archive: string, rootMod
     // GNU mv -T prevents a target symlink/directory from changing the rename destination.
     `mv -fT -- ${staged} ${target}` + dirMode;
 }
+function transferFailure(error: unknown, timeout: number): string {
+  const failure = error && typeof error === "object" ? error as { name?: unknown; httpStatus?: unknown; cause?: unknown } : {};
+  if (typeof failure.httpStatus === "number" && Number.isInteger(failure.httpStatus) && failure.httpStatus >= 100 && failure.httpStatus <= 599) return `HTTP ${failure.httpStatus}`;
+  if (failure.name === "TimeoutError" || failure.name === "AbortError") return `timeout after ${timeout} ms`;
+  const name = typeof failure.name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(failure.name) ? failure.name : "Error";
+  const code = failure.cause && typeof failure.cause === "object" ? (failure.cause as { code?: unknown }).code : undefined;
+  return name + (typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? ` (${code})` : "");
+}
 async function signedTransfer(io: SyncTransport, base: string, remote: string, local: string, upload: boolean, timeout: number): Promise<number> {
-  const signed = await io.request(`${base}/files/${upload ? "upload" : "download"}-url`, {
-    method: "POST", body: JSON.stringify({ path: remote }), signal: AbortSignal.timeout(timeout),
-  });
+  const direction = upload ? "upload" : "download", signal = AbortSignal.timeout(timeout);
+  let signed;
+  try {
+    signed = await io.request(`${base}/files/${direction}-url`, {
+      method: "POST", body: JSON.stringify({ path: remote }), signal,
+    });
+  } catch (error) {
+    throw new Error(`Boat ${direction}-url request failed: ${transferFailure(signal.aborted ? signal.reason : error, timeout)}`);
+  }
   let url: URL;
   try { url = new URL(signed.url); } catch { throw new Error("Boat file URL response omitted a valid URL"); }
   if (url.protocol !== "https:" || url.username || url.password) throw new Error("Boat file URL must use HTTPS without userinfo");
   // Never attach the Boat bearer to a signed URL, or include the secret URL in errors.
   assertBoatActivityAdmission();
   const body = upload ? createReadStream(local) : undefined;
+  let rejectedStatus: number | undefined;
   try {
     const response = await fetch(url.href, { method: upload ? "PUT" : "GET", body: body as unknown as BodyInit,
       ...(upload ? { duplex: "half" } : {}), redirect: "error", signal: AbortSignal.timeout(timeout) } as RequestInit);
-    if (!response.ok) { await response.body?.cancel(); throw new Error("signed transfer rejected"); }
+    if (!response.ok) { rejectedStatus = response.status; await response.body?.cancel(); throw new Error("signed transfer rejected"); }
     if (upload) await response.body?.cancel();
     else {
       if (!response.body) throw new Error("empty download response");
       await pipeline(Readable.fromWeb(response.body as any), createWriteStream(local, { flags: "wx", mode: 0o600 }));
     }
     return (await fs.stat(local)).size;
-  } catch { throw new Error(`Boat signed ${upload ? "upload" : "download"} failed`); }
+  } catch (error) { throw new Error(`Boat signed ${direction} failed: ${rejectedStatus === undefined ? transferFailure(error, timeout) : `HTTP ${rejectedStatus}`}`); }
   finally { body?.destroy(); }
 }
 async function validateExtracted(root: string, mapping: PluginSyncFileMapping): Promise<void> {
