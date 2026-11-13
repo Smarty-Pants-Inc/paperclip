@@ -16,6 +16,7 @@ export type SandboxCreationOperation = typeof sandboxCreationOperations.$inferSe
 // materialize an aborted request. Absence is conclusive only after this delay.
 const CREATION_SETTLE_FLOOR_MS = 30 * 60_000;
 const CREATION_RECOVERY_ABSENCE_BUDGET = 3;
+const CREATION_ABSENCE_RESOLUTION_REASON = "provider_absent_after_bounded_recovery";
 const TERMINAL_CREATION_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 
 /** Only a successful, operation-scoped provider absence may spend this budget.
@@ -58,7 +59,7 @@ async function recordSandboxCreationAbsence(db: Db, candidate: SandboxCreationOp
     await tx.update(sandboxCreationOperations).set({ state: resolved ? "resolved" : "pending", updatedAt: now,
       nextAttemptAt: new Date(now.getTime() + ENVIRONMENT_CLEANUP_RETRY_MS),
       metadata: { ...operation.metadata, creationRecoveryAttempts: attempts,
-        ...(resolved ? { creationReconciliationReason: "provider_absent_after_bounded_recovery" } : {}) },
+        ...(resolved ? { creationReconciliationReason: CREATION_ABSENCE_RESOLUTION_REASON } : {}) },
     }).where(eq(sandboxCreationOperations.id, operation.id));
     return resolved;
   });
@@ -165,14 +166,18 @@ export async function createOwnedSandbox(
 }
 
 /** Keep an already returned resource identity even when task attachment fails.
- * This enriches the existing owner; it never transfers or reopens ownership. */
+ * Positive evidence revives an absence-only resolution in this same journal.
+ * Save the pending deadline atomically so a crash before transfer cannot orphan it. */
 export async function recordSandboxCreationResource(db: Db, input: {
   id: string; companyId: string; environmentId: string; providerLeaseId: string;
   providerMetadata?: Record<string, unknown>;
 }): Promise<void> {
+  const resolvedAbsent = and(eq(sandboxCreationOperations.state, "resolved"), sql`${sandboxCreationOperations.leaseId} is null`,
+    sql`${sandboxCreationOperations.metadata}->>'creationReconciliationReason' = ${CREATION_ABSENCE_RESOLUTION_REASON}`);
   await writeEnvironmentCleanup(db, async tx => {
     const [recorded] = await tx.update(sandboxCreationOperations).set({
-      nextAttemptAt: sql`case when ${sandboxCreationOperations.state} = 'needs_reconciliation' then clock_timestamp() else ${sandboxCreationOperations.nextAttemptAt} end`,
+      state: sql`case when ${resolvedAbsent} then 'pending' else ${sandboxCreationOperations.state} end`,
+      nextAttemptAt: sql`case when ${sandboxCreationOperations.state} = 'needs_reconciliation' or ${resolvedAbsent} then clock_timestamp() else ${sandboxCreationOperations.nextAttemptAt} end`,
       metadata: sql`coalesce(${sandboxCreationOperations.metadata}, '{}'::jsonb) || ${JSON.stringify({ creationProviderLeaseId: input.providerLeaseId, ...(input.providerMetadata ? { creationProviderMetadata: input.providerMetadata } : {}) })}::jsonb`,
       updatedAt: new Date(),
     }).where(and(eq(sandboxCreationOperations.id, input.id), eq(sandboxCreationOperations.companyId, input.companyId),
@@ -195,10 +200,15 @@ export async function queueSandboxCreationCleanup(db: Db, input: {
     if (!operation || (operation.metadata.creationProviderLeaseId && operation.metadata.creationProviderLeaseId !== input.providerLeaseId)) {
       throw new Error("Sandbox creation cleanup ownership changed");
     }
-    if (["attached", "cleanup_pending", "resolved"].includes(operation.state)) return;
+    // The absence tombstone has no lease owner. A late exact resource must
+    // transfer under this row lock, just like an ordinary pending creation.
+    // A resolved *cleanup* retains its leaseId and must never mint another lease.
+    const resolvedAbsent = operation.state === "resolved" && !operation.leaseId &&
+      operation.metadata.creationReconciliationReason === CREATION_ABSENCE_RESOLUTION_REASON;
+    if (["attached", "cleanup_pending"].includes(operation.state) || operation.state === "resolved" && !resolvedAbsent) return;
     const contextId = operation.metadata.runnerTaskLease === true && typeof operation.metadata.runnerTaskCreationContextId === "string"
       ? operation.metadata.runnerTaskCreationContextId : null;
-    if (operation.state !== "pending" && !(operation.state === "needs_reconciliation" && contextId &&
+    if (operation.state !== "pending" && !resolvedAbsent && !(operation.state === "needs_reconciliation" && contextId &&
         operation.metadata.creationProviderLeaseId === input.providerLeaseId)) throw new Error("Sandbox creation cleanup ownership changed");
     // The non-null runId also correlates agentless creation attempts. Only the
     // original optional heartbeat reference belongs in the lease's foreign key.
