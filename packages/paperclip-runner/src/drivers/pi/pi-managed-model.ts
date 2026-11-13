@@ -1,10 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isPiModelCompat, type PiBindModel, type PiBindProvider, type PiThinkingLevel } from "./pi-bind-protocol.js";
+import { isPiModelCompat, PI_MODEL_ROUTING_FIELDS, type PiBindModel, type PiBindProvider, type PiThinkingLevel } from "./pi-bind-protocol.js";
 
-/** Only capability metadata crosses from an agent's provider into our broker. */
-export type PiManagedModel = Pick<PiBindModel, "id" | "thinkingLevelMap" | "contextWindow" | "maxTokens" | "reasoning" | "compat">;
+/** The whole model definition, with upstream routing/auth removed. */
+export type PiManagedModel = PiBindModel;
 type Diagnose = (message: string) => void;
 const diagnose: Diagnose = message => console.warn(`Pi managed model metadata: ${message}`);
 
@@ -13,7 +13,7 @@ export function originalPiModelsFile(environment: NodeJS.ProcessEnv): string {
   return join(environment.PI_CODING_AGENT_DIR ?? join(environment.HOME ?? process.env.HOME ?? homedir(), ".pi", "agent"), "models.json");
 }
 
-/** One capability builder for native startup, snapshot helpers and ACPX children.
+/** One definition builder for native startup, snapshot helpers and ACPX children.
  * Diagnostics are operation-local; warm binds reuse the resulting descriptor.
  */
 export async function buildPiManagedModel(input: {
@@ -30,17 +30,32 @@ export async function buildPiManagedModel(input: {
 }
 export interface PiBuiltinModelCatalog {
   getBuiltinProviders(): string[];
-  getBuiltinModels(provider: string): Array<{ id: string; api?: string; contextWindow: number; maxTokens: number; reasoning: boolean; thinkingLevelMap?: PiBindModel["thinkingLevelMap"]; compat?: unknown }>;
+  getBuiltinModels(provider: string): Array<PiBindModel & { api?: string; contextWindow: number; maxTokens: number; reasoning: boolean }>;
 }
 export const PI_MANAGED_MODEL_DEFAULTS = { contextWindow: 128000, maxTokens: 8192, reasoning: true } as const;
 const fields = ["thinkingLevelMap", "contextWindow", "maxTokens", "reasoning"] as const;
 const levels: PiThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+// Negative routing list, deliberately NOT a capability allowlist. New Pi model
+// metadata survives without another Paperclip patch. Provider routing is built
+// independently by createPiProviderBinding; none is inherited from the source.
+const apiShapedFields = ["compat", "samplingParams", "samplingParamsByThinkingLevel"] as const;
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
+export function piManagedModelDefinition(model: PiBindModel): PiManagedModel {
+  return structuredClone(Object.fromEntries(Object.entries(model).filter(([key]) => !PI_MODEL_ROUTING_FIELDS.has(key)))) as PiManagedModel;
+}
+function forApi(model: PiBindModel, sourceApi: unknown, api?: PiBindProvider["api"], warn: Diagnose = diagnose): PiManagedModel {
+  const result = piManagedModelDefinition(model);
+  if (api === undefined || sourceApi !== api) {
+    if (apiShapedFields.some(field => Object.hasOwn(result, field))) warn("source API mismatch; skipping compat and API-shaped fields");
+    for (const field of apiShapedFields) delete result[field];
+  }
+  return result;
+}
 
 /** Prefer the exact managed entry, otherwise the same exact id on another
- * snapshot provider. Never copy routing, credentials, API, or arbitrary fields.
+ * provider. Preserve its entire definition except routing and foreign dialects.
  */
 export function configuredPiManagedModel(snapshot: unknown, id: string, api?: PiBindProvider["api"], warn: Diagnose = diagnose): PiManagedModel {
   const providers = record(record(snapshot).providers);
@@ -49,8 +64,7 @@ export function configuredPiManagedModel(snapshot: unknown, id: string, api?: Pi
     const models = record(provider).models;
     const found = Array.isArray(models) ? models.find(model => record(model).id === id) : undefined;
     if (!found) continue;
-    const entry = record(found);
-    const metadata: PiManagedModel = { id };
+    const entry = record(found), source = record(provider);
     for (const field of fields) {
       if (!Object.hasOwn(entry, field)) continue;
       const value = entry[field];
@@ -60,38 +74,38 @@ export function configuredPiManagedModel(snapshot: unknown, id: string, api?: Pi
           || Object.entries(value).some(([level, mapped]) => !levels.includes(level as PiThinkingLevel) || mapped !== null && (typeof mapped !== "string" || !mapped.length)))) {
         throw new Error(`Pi configured model has invalid ${field}`);
       }
-      Object.assign(metadata, { [field]: structuredClone(value) });
     }
-    const source = record(provider);
     for (const candidate of [source, entry]) {
       if (Object.hasOwn(candidate, "compat") && !isPiModelCompat(candidate.compat)) throw new Error("Pi configured model has invalid compat");
     }
-    if (Object.hasOwn(source, "compat") || Object.hasOwn(entry, "compat")) {
-      if (api === undefined || (entry.api ?? source.api) !== api) {
-        warn("source API mismatch; skipping compat");
-      } else {
-        const base = source.compat as PiBindModel["compat"];
-        const override = entry.compat as PiBindModel["compat"];
-        // Match selected Pi's provider-composer: four nested values merge ONE
-        // level (even arrays), all other fields use a plain shallow override.
-        const merged = { ...base, ...override };
-        if (override) for (const key of ["openRouterRouting", "vercelGatewayRouting", "chatTemplateKwargs", "chatTemplateArgs"]) {
-          const baseValue = base?.[key]; const overrideValue = override[key];
-          if ((typeof baseValue === "object" && baseValue !== null) || (typeof overrideValue === "object" && overrideValue !== null)) {
-            merged[key] = { ...Object(baseValue), ...Object(overrideValue) };
-          }
-        }
-        metadata.compat = structuredClone(merged);
-      }
+    const metadata = forApi(entry as PiBindModel, entry.api ?? source.api, api, warn);
+    const input = entry.input ?? source.input;
+    if (input !== undefined) {
+      if (!Array.isArray(input) || !input.length || input.some(value => value !== "text" && value !== "image")) throw new Error("Pi configured model has invalid input");
+      metadata.input = structuredClone(input);
     }
+    if ((entry.api ?? source.api) === api && api !== undefined && (Object.hasOwn(source, "compat") || Object.hasOwn(entry, "compat"))) {
+      const base = source.compat as PiBindModel["compat"];
+      const override = entry.compat as PiBindModel["compat"];
+      // Match selected Pi's provider-composer: four nested values merge ONE
+      // level (even arrays), all other fields use a plain shallow override.
+      const merged = { ...base, ...override };
+      if (override) for (const key of ["openRouterRouting", "vercelGatewayRouting", "chatTemplateKwargs", "chatTemplateArgs"]) {
+        const baseValue = base?.[key]; const overrideValue = override[key];
+        if ((typeof baseValue === "object" && baseValue !== null) || (typeof overrideValue === "object" && overrideValue !== null)) {
+          merged[key] = { ...Object(baseValue), ...Object(overrideValue) };
+        }
+      }
+      metadata.compat = structuredClone(merged);
+    } else if (source.compat !== undefined && !Object.hasOwn(entry, "compat")) warn("source API mismatch; skipping compat");
+    if (!isPiModelCompat(metadata)) throw new Error("Pi configured model has invalid JSON metadata");
     return metadata;
   }
   return { id };
 }
 
-/** The agent snapshot wins per capability (and thinking-map key). The original
- * user's config is an optional, read-only fallback, never a routing/auth source.
- * Keep the strict agent-snapshot validation; a bad user file cannot refuse a run.
+/** The agent snapshot wins per field (and thinking-map key). The original
+ * user's config is an optional read-only fallback, never a routing/auth source.
  */
 export async function configuredPiManagedModelSources(snapshot: unknown, id: string, originalModelsFile?: string, api?: PiBindProvider["api"], warn: Diagnose = diagnose): Promise<PiManagedModel> {
   const messages = new Set<string>();
@@ -117,47 +131,39 @@ export async function configuredPiManagedModelSources(snapshot: unknown, id: str
   }
 }
 
-/** Fill only missing fields using Pi's own exact-id catalog. A shared id is
- * usable only when all providers agree on the complete capability tuple.
- * No model-family policy or requested-effort-derived capability is invented.
+/** Inherit the whole exact-id catalog definition, preferring the canonical API
+ * owner. A foreign-API entry can supply capabilities, never dialect metadata.
+ * Explicit config fields (including false, [] and {}) continue to win.
  */
 export function resolvePiManagedModel(model: PiManagedModel, catalog?: PiBuiltinModelCatalog, api?: PiBindProvider["api"], warn: Diagnose = diagnose): PiManagedModel & RequiredPiModelLimits {
   const diagnostics: string[] = [];
   const matches = catalog?.getBuiltinProviders().flatMap(provider => catalog.getBuiltinModels(provider).filter(candidate => candidate.id === model.id)) ?? [];
-  const first = matches[0];
-  const agreed = first && matches.every(candidate => candidate.contextWindow === first.contextWindow
-    && candidate.maxTokens === first.maxTokens && candidate.reasoning === first.reasoning);
+  const owner = api === "anthropic-messages" ? "anthropic" : "openai";
+  const canonical = api === undefined ? undefined : catalog?.getBuiltinModels(owner).find(entry => entry.id === model.id && entry.api === api);
+  const selected = canonical ?? matches[0];
+  const fallback: Partial<PiManagedModel> = selected ? forApi(selected, selected.api, api, () => {}) : {};
+  // Only the canonical API owner may supply catalog dialects (aa685317).
+  if (!canonical) for (const field of apiShapedFields) delete fallback[field];
+  if (model.compat !== undefined && !isPiModelCompat(model.compat)) throw new Error("Pi configured model has invalid compat");
+  if (model.compat === undefined && api !== undefined) {
+    if (canonical?.compat !== undefined && isPiModelCompat(canonical.compat)) diagnostics.push(`compat fallback copied from canonical provider ${owner}`);
+    else diagnostics.push(`canonical provider ${owner}: no exact API/id compat; skipped`);
+  }
+  const definition = { ...fallback, ...piManagedModelDefinition(model) };
   const complete = model.contextWindow !== undefined && model.maxTokens !== undefined && model.reasoning !== undefined;
-  if (!agreed && !complete) {
-    // One bounded, escaped line at resolution, not on every warm broker rotation.
-    diagnostics.push(`${matches.length ? "ambiguous catalog" : "unknown or catalog unavailable"}; using missing-field defaults`);
-  }
-  const fallback = agreed ? first : PI_MANAGED_MODEL_DEFAULTS;
-  // Catalog providers may differ on some levels. Inherit a mapped level only
-  // when every exact-id match agrees on it; explicit snapshot caps win per key.
   const thinkingLevelMap: PiBindModel["thinkingLevelMap"] = {};
-  // Preserve pre-catalog thinking support only for unresolved fallback fields.
-  if (!agreed && !complete) for (const level of levels) thinkingLevelMap[level] = level;
-  if (agreed) for (const level of levels) {
-    const mapped = first.thinkingLevelMap?.[level];
-    if (mapped !== undefined && matches.every(candidate => candidate.thinkingLevelMap?.[level] === mapped)) thinkingLevelMap[level] = mapped;
+  if (!selected && !complete) {
+    diagnostics.push("unknown or catalog unavailable; using missing-field defaults");
+    for (const level of levels) thinkingLevelMap[level] = level;
   }
-  Object.assign(thinkingLevelMap, model.thinkingLevelMap);
-  let compat = model.compat;
-  if (compat !== undefined && !isPiModelCompat(compat)) throw new Error("Pi configured model has invalid compat");
-  if (compat === undefined && api !== undefined) {
-    const owner = api === "anthropic-messages" ? "anthropic" : "openai";
-    const candidate = catalog?.getBuiltinModels(owner).find(entry => entry.id === model.id && entry.api === api);
-    if (candidate && isPiModelCompat(candidate.compat)) {
-      compat = structuredClone(candidate.compat);
-      diagnostics.unshift(`compat fallback copied from canonical provider ${owner}`);
-    } else {
-      diagnostics.push(`canonical provider ${owner}: no exact API/id compat; skipped`);
-    }
+  Object.assign(thinkingLevelMap, fallback.thinkingLevelMap, model.thinkingLevelMap);
+  if (definition.input === undefined) {
+    definition.input = ["text"];
+    diagnostics.unshift("image capability unknown; using text-only input");
   }
   if (diagnostics.length) warn(diagnostics.join("; "));
-  return { ...model, ...(compat === undefined ? {} : { compat: structuredClone(compat) }), contextWindow: model.contextWindow ?? fallback.contextWindow,
-    maxTokens: model.maxTokens ?? fallback.maxTokens, reasoning: model.reasoning ?? fallback.reasoning,
+  return { ...definition, contextWindow: definition.contextWindow ?? PI_MANAGED_MODEL_DEFAULTS.contextWindow,
+    maxTokens: definition.maxTokens ?? PI_MANAGED_MODEL_DEFAULTS.maxTokens, reasoning: definition.reasoning ?? PI_MANAGED_MODEL_DEFAULTS.reasoning,
     ...(Object.keys(thinkingLevelMap).length || model.thinkingLevelMap ? { thinkingLevelMap } : {}) };
 }
 type RequiredPiModelLimits = { contextWindow: number; maxTokens: number; reasoning: boolean };
@@ -165,6 +171,6 @@ type RequiredPiModelLimits = { contextWindow: number; maxTokens: number; reasoni
 /** Extension registration requires fields that models.json itself defaults. */
 export function piManagedModelRegistration(model: PiBindModel) {
   const metadata = resolvePiManagedModel(model);
-  return { ...model, ...metadata, name: model.name ?? model.id, input: model.input ?? ["text" as const],
-    cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  return { ...metadata, name: metadata.name ?? metadata.id, input: metadata.input ?? ["text" as const],
+    cost: metadata.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 }

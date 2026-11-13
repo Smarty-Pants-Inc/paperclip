@@ -14,7 +14,7 @@ import { mergedPiModelsJson } from "./pi-models-merge.js";
 
 const id = "compat-proof";
 const api = "anthropic-messages";
-const limits = { contextWindow: 1000000, maxTokens: 128000, reasoning: true };
+const limits = { contextWindow: 1000000, maxTokens: 128000, reasoning: true, input: ["text"] as Array<"text" | "image"> };
 const anthropicCompat = { forceAdaptiveThinking: true, supportsTemperature: false, supportsStrictTools: false };
 const roots: string[] = [];
 afterEach(async () => {
@@ -58,7 +58,7 @@ describe("configured Pi compatibility metadata", () => {
     const source = snapshot({ ...limits, compat, apiKey: "secret-key", baseUrl: "https://upstream.invalid", headers: { authorization: "secret-key" }, name: "not-capability" },
       { apiKey: "secret-key", baseUrl: "https://upstream.invalid", authHeader: true });
     const configured = configuredPiManagedModel(source, id, api);
-    expect(configured).toEqual({ id, ...limits, compat: {
+    expect(configured).toEqual({ id, ...limits, name: "not-capability", compat: {
       forceAdaptiveThinking: false, supportsTemperature: false,
       allowedFallbackModels: [{ provider: "anthropic", model: "fallback", cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }],
     } });

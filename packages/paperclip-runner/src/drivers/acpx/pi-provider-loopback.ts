@@ -2,7 +2,7 @@ import { startProviderLoopbackBroker, type LoopbackRouteAdapter, type LoopbackUp
 import { chatLoopbackAdapter } from "../provider-loopback/chat.js";
 import { messagesLoopbackAdapter } from "../provider-loopback/messages.js";
 import { responsesLoopbackAdapter } from "../provider-loopback/responses.js";
-import { buildPiManagedModel, originalPiModelsFile, type PiManagedModel } from "../pi/pi-managed-model.js";
+import { buildPiManagedModel, originalPiModelsFile, piManagedModelDefinition, type PiManagedModel } from "../pi/pi-managed-model.js";
 import { isPiModelCompat, type PiBindProvider } from "../pi/pi-bind-protocol.js";
 import { PI_NATIVE_THINKING_LEVELS, type PiNativeThinkingLevel } from "../pi/pi-native-config.js";
 
@@ -12,13 +12,7 @@ function managedModel(model: string, thinkingLevel?: PiNativeThinkingLevel, conf
   if (configuration && Object.hasOwn(configuration, "compat") && !isPiModelCompat(configuration.compat)) throw new Error("Pi managed model has invalid compat");
   // Effort is a request, not a capability declaration. Only snapshot/catalog
   // metadata may describe support; Pi owns normalization of the requested level.
-  return { id: model,
-    ...(configuration?.reasoning === undefined ? {} : { reasoning: configuration.reasoning }),
-    ...(configuration?.contextWindow === undefined ? {} : { contextWindow: configuration.contextWindow }),
-    ...(configuration?.maxTokens === undefined ? {} : { maxTokens: configuration.maxTokens }),
-    ...(configuration?.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: structuredClone(configuration.thinkingLevelMap) }),
-    ...(configuration?.compat === undefined ? {} : { compat: structuredClone(configuration.compat) }),
-  };
+  return piManagedModelDefinition(configuration ?? { id: model });
 }
 
 const PI_MANAGED_PROVIDER_PROTOCOLS: Readonly<Record<string, { adapter: LoopbackRouteAdapter; api: PiBindProvider["api"] }>> = {

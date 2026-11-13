@@ -25,6 +25,7 @@ class IdleTransport {
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 const model = (fields: Record<string, unknown>) => ({ id: "source-proof", ...fields });
 const provider = (fields: Record<string, unknown>) => ({ models: [model(fields)] });
+const resolved = (fields: Record<string, unknown>) => model({ input: ["text"], ...fields });
 
 async function fixture(primary: unknown, user: unknown, originalPiDir = false, managedPiDir = false, settings?: { managed?: unknown; user?: unknown }) {
   const root = await mkdtemp(join(tmpdir(), "pi-model-sources-"));
@@ -58,41 +59,41 @@ async function fixture(primary: unknown, user: unknown, originalPiDir = false, m
 it("reads the exact-id cap only in the original HOME when the runner has no Pi dir", async () => {
   const snapshot = { providers: { unrelated: { models: [{ id: "different", contextWindow: 1 }] }, "cliproxyapi-anthropic": provider({ thinkingLevelMap: { max: null }, contextWindow: 900000, maxTokens: 123000, reasoning: true, apiKey: "must-not-cross", baseUrl: "https://must-not-cross.invalid", api: "wrong-api" }) } };
   const f = await fixture({ providers: { other: { models: [{ id: "different" }] } } }, snapshot);
-  expect(f.metadata).toEqual(model({ thinkingLevelMap: { max: null }, contextWindow: 900000, maxTokens: 123000, reasoning: true }));
+  expect(f.metadata).toEqual(resolved({ thinkingLevelMap: { max: null }, contextWindow: 900000, maxTokens: 123000, reasoning: true }));
   expect(f.disk.providers.paperclip.baseUrl).toMatch(/^http:\/\/127\.0\.0\.1:/);
   expect(f.disk.providers["cliproxyapi-anthropic"]).toBeUndefined();
   expect(await readFile(f.userFile, "utf8")).toBe(JSON.stringify(snapshot));
-  expect(f.diagnostics).toEqual(["Pi managed model metadata: canonical provider openai: no exact API/id compat; skipped"]);
+  expect(f.diagnostics).toEqual(["Pi managed model metadata: image capability unknown; using text-only input; canonical provider openai: no exact API/id compat; skipped"]);
 });
 
 it("prefers the agent source per field, then the user's paperclip entry over its other provider", async () => {
   const f = await fixture({ providers: { paperclip: provider({ contextWindow: 111111, thinkingLevelMap: { max: null } }), other: provider({ maxTokens: 1, reasoning: true }) } },
     { providers: { native: provider({ contextWindow: 999999, maxTokens: 2, reasoning: true }), paperclip: provider({ contextWindow: 222222, maxTokens: 33333, reasoning: false, thinkingLevelMap: { max: "max", xhigh: null } }) } });
-  expect(f.metadata).toEqual(model({ contextWindow: 111111, maxTokens: 33333, reasoning: false, thinkingLevelMap: { max: null, xhigh: null } }));
-  expect(f.diagnostics).toEqual(["Pi managed model metadata: canonical provider openai: no exact API/id compat; skipped"]);
+  expect(f.metadata).toEqual(resolved({ contextWindow: 111111, maxTokens: 33333, reasoning: false, thinkingLevelMap: { max: null, xhigh: null } }));
+  expect(f.diagnostics).toEqual(["Pi managed model metadata: image capability unknown; using text-only input; canonical provider openai: no exact API/id compat; skipped"]);
 });
 
 it("keeps an exact agent entry on another provider ahead of a user paperclip entry", async () => {
   const f = await fixture({ providers: { paperclip: { models: [{ id: "different" }] }, native: provider({ contextWindow: 444444, maxTokens: 55555, reasoning: true }) } },
     { providers: { paperclip: provider({ contextWindow: 222222, maxTokens: 33333, reasoning: false, thinkingLevelMap: { max: null } }) } });
-  expect(f.metadata).toEqual(model({ contextWindow: 444444, maxTokens: 55555, reasoning: true, thinkingLevelMap: { max: null } }));
+  expect(f.metadata).toEqual(resolved({ contextWindow: 444444, maxTokens: 55555, reasoning: true, thinkingLevelMap: { max: null } }));
 });
 
 it("captures the runner's original PI_CODING_AGENT_DIR before the driver sets run/agent", async () => {
   const f = await fixture({}, { providers: { native: provider({ contextWindow: 777777, maxTokens: 66666, reasoning: true }) } }, true);
-  expect(f.metadata).toEqual(model({ contextWindow: 777777, maxTokens: 66666, reasoning: true }));
+  expect(f.metadata).toEqual(resolved({ contextWindow: 777777, maxTokens: 66666, reasoning: true }));
 });
 
 it("does not mistake a child managed-home override for the runner's original Pi dir", async () => {
   const metadata = { contextWindow: 777777, maxTokens: 66666, reasoning: true, thinkingLevelMap: { max: null } };
   const f = await fixture({}, { providers: { native: provider(metadata) } }, false, true);
-  expect(f.metadata).toEqual(model(metadata));
+  expect(f.metadata).toEqual(resolved(metadata));
 });
 
 it.each([undefined, "{invalid-json", "[]", "unreadable", { providers: { native: provider({ maxTokens: -1 }) } }, " ".repeat(61 * 1024)])("skips an unavailable/invalid optional user file with one bounded diagnostic (%#)", async user => {
   const metadata = { contextWindow: 333333, maxTokens: 44444, reasoning: true };
   const f = await fixture({ providers: { paperclip: provider(metadata) } }, user);
-  expect(f.metadata).toEqual(model(metadata));
+  expect(f.metadata).toEqual(resolved(metadata));
   expect(f.diagnostics).toHaveLength(1);
   expect(f.diagnostics[0]!.length).toBeLessThanOrEqual(256);
   expect(f.diagnostics[0]!.split("\n")).toHaveLength(1);
