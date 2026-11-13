@@ -14539,6 +14539,21 @@ export async function stageRemoteRunnerDirectory(input: {
   }
 }
 
+const DEFAULT_REMOTE_PROVIDER_PACK_ROOT = "/opt/paperclip-runner/provider-pack";
+
+/** Expand HOME on the target, never on the replacement controller. Launch,
+ * snapshot selection, daemon inventory and recovery share this candidate list. */
+async function discoverPreinstalledRemoteProviderPackRoots(runner: CommandManagedRuntimeRunner, cwd: string): Promise<string[]> {
+  const result = await runner.execute({
+    command: "sh",
+    args: ["-c", `for candidate in ${DEFAULT_REMOTE_PROVIDER_PACK_ROOT} "$HOME/.local/share/paperclip-runner/provider-pack"; do if [ -f "$candidate/provider-pack.json" ]; then printf '%s\\n' "$candidate"; fi; done`],
+    cwd, bypassSession: true, timeoutMs: 10_000,
+  });
+  if (result.exitCode !== 0 || result.timedOut) return [];
+  return result.stdout.split(/\r?\n/).map(parseRemoteExecutableCandidate)
+    .filter((candidate): candidate is string => candidate !== null);
+}
+
 /** The normal remote pack installer, without run/session/DB authority. Both
  * native execution and environment Test use the same admitted manifest and
  * complete archive/directory verification before a provider is invoked. */
@@ -14574,22 +14589,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
       }); },
     });
   };
-  const discoverPreinstalledProviderPack = async () => {
-    if (!remoteTarget || !remoteCommandRunner) return [];
-    const result = await remoteCommandRunner.execute({
-      command: "sh",
-      args: [
-        "-c",
-        'for candidate in /opt/paperclip-runner/provider-pack "$HOME/.local/share/paperclip-runner/provider-pack"; do if [ -f "$candidate/provider-pack.json" ]; then printf \'%s\\n\' "$candidate"; fi; done',
-      ],
-      cwd: remoteTarget.remoteCwd,
-      bypassSession: true,
-      timeoutMs: 10_000,
-    });
-    if (result.exitCode !== 0 || result.timedOut) return [];
-    return result.stdout.split(/\r?\n/).map(parseRemoteExecutableCandidate)
-      .filter((candidate): candidate is string => candidate !== null);
-  };
+  const discoverPreinstalledProviderPack = () => discoverPreinstalledRemoteProviderPackRoots(remoteCommandRunner, remoteTarget.remoteCwd);
   const usePreinstalled = async (snapshot: boolean) => useVerifiedPreinstalledRemoteProviderPack({
     candidates: preinstalledProviderPackRoots ??= await measureNativeRunnerSpan(input.trace, "provider_pack.discover", discoverPreinstalledProviderPack),
     verifyAndLink: async (preinstalledProviderPack) => {
@@ -16194,6 +16194,9 @@ async function createRunnerdBackendWithinSessionClaim(
       "runner_transport_ineligible: remote process runner is unavailable",
     );
   }
+  let preinstalledProviderPackRoots: Promise<string[]> | undefined;
+  const discoverPreinstalledProviderPack = () => preinstalledProviderPackRoots ??= remoteTarget && remoteCommandRunner
+    ? discoverPreinstalledRemoteProviderPackRoots(remoteCommandRunner, remoteTarget.remoteCwd) : Promise.resolve([]);
   const currentWakeComments = await timeController("wake_binding", () => resolveCurrentWakeCommentsBinding(
     input.db,
     input.execution.binding,
@@ -16241,10 +16244,16 @@ async function createRunnerdBackendWithinSessionClaim(
         const expected = input.runnerRemoteProviderPackPath?.trim()
           ? resolveRemoteProviderPackSource(input.runnerRemoteProviderPackPath).manifest
           : readBundledRemoteProviderPackManifest();
-        const root = "/opt/paperclip-runner/provider-pack";
-        const manifest = await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd,
-          packRoot: root, manifest: expected, provider: { kind: "pi_rpc" } });
-        return { root, manifest, immutable: true as const };
+        for (const root of await discoverPreinstalledProviderPack()) {
+          try {
+            const manifest = await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd,
+              packRoot: root, manifest: expected, provider: { kind: "pi_rpc" } });
+            return { root, manifest, immutable: true as const };
+          } catch (error) {
+            if (error instanceof Error && error.name === "AbortError") throw error;
+          }
+        }
+        return null;
       }).catch(() => null)
     : Promise.resolve(null);
   const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner, preparedSnapshot] = await Promise.allSettled([
@@ -16940,7 +16949,7 @@ async function createRunnerdBackendWithinSessionClaim(
         reuseRetainedRunner: sandboxLeaseAcquisition?.outcome === "resumed", targetPlatformArtifactVerified: remotePiCompanion !== null || useBundledRemoteImageAssets || targetMatchedCodexArtifact || remoteClaude,
         trace: input.trace, onLog: input.onLog,
         providerPackRoots: requiresRemoteProviderPack && stagedRemoteProviderPackRoot
-          ? [stagedRemoteProviderPackRoot, "/opt/paperclip-runner/provider-pack"] : undefined,
+          ? [stagedRemoteProviderPackRoot, ...await discoverPreinstalledProviderPack()] : undefined,
       })
     : null;
   const verifyRemoteRunner = async (mode: "dial_wss" | "listen_ws", executable?: string | null) => {
@@ -16951,7 +16960,7 @@ async function createRunnerdBackendWithinSessionClaim(
   // A custom operator-selected pack is an explicit runtime selection. The
   // standard app-image path is the default transport source, not an upgrade request.
   const explicitProviderPackSelection = Boolean(input.runnerRemoteProviderPackPath?.trim()
-    && input.runnerRemoteProviderPackPath.trim() !== "/opt/paperclip-runner/provider-pack");
+    && input.runnerRemoteProviderPackPath.trim() !== DEFAULT_REMOTE_PROVIDER_PACK_ROOT);
   const useInstalledProviderPack = async () => {
     const expected = expectedProviderPackManifest;
     if (!expected || !remoteTarget || !remoteCommandRunner) return false;
@@ -16992,16 +17001,28 @@ async function createRunnerdBackendWithinSessionClaim(
     if (input.restartRecovery?.kind === "reattach_remote_runner" || input.remoteWarmRecovery) {
       if (input.controllerPersistence?.runnerArtifact && !relaunchesSettledRemoteRunner) {
         if (input.execution.provider.kind === "pi_rpc" && !await useInstalledProviderPack()) {
-          // Do not stage or upgrade a surviving runner's pack. Recover the
-          // qualified snapshot or verify the exact saved staged pack instead.
-          const snapshotRoot = "/opt/paperclip-runner/provider-pack";
-          try {
-            await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd,
-              packRoot: snapshotRoot, manifest: expectedProviderPackManifest!, provider: { kind: "pi_rpc" } });
-            activeRemoteProviderPackRoot = snapshotRoot;
-            providerPackVerified = true;
-          } catch (error) {
-            if (findSandboxStoppedError(error) || error instanceof Error && error.name === "AbortError") throw error;
+          // Do not stage or upgrade a surviving runner's pack. Probe the same
+          // installations as launch, then the exact saved staged pack. A HOME
+          // installation may not be publisher-sealed: verify all its bytes then.
+          let recoveredPack = false;
+          for (const root of await discoverPreinstalledProviderPack()) {
+            try {
+              try {
+                await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd,
+                  packRoot: root, manifest: expectedProviderPackManifest!, provider: { kind: "pi_rpc" } });
+              } catch (error) {
+                if (error instanceof Error && error.name === "AbortError") throw error;
+                await verifyRemoteProviderPack(root);
+              }
+              activeRemoteProviderPackRoot = root;
+              providerPackVerified = true;
+              recoveredPack = true;
+              break;
+            } catch (error) {
+              if (error instanceof Error && error.name === "AbortError") throw error;
+            }
+          }
+          if (!recoveredPack) {
             await verifyRemoteProviderPack(stagedRemoteProviderPackRoot!);
             activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
           }

@@ -379,7 +379,7 @@ test("12 PR without-chat shards plus the dedicated chat and native-runner lanes 
   assert.ok(!files.includes(pluginWarmOwnerSuitePath));
   assert.ok(!files.includes(pluginReleaseResumeSuitePath));
   assert.ok(!files.includes(pluginEvictionSuitePath));
-  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, ingressRetrySuitePath, dotRunnerSuitePath, restartRecoverySuitePath, ...restartWaitSuites, cutTurnStartRetrySuitePath, usageDeliverySuitePath, warmCheckpointOwnershipSuitePath, pluginWarmOwnerSuitePath, pluginReleaseResumeSuitePath, pluginEvictionSuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
+  assert.deepEqual([...files, chatSuitePath, nativeRunnerSuitePath, ingressRetrySuitePath, dotRunnerSuitePath, restartRecoverySuitePath, "server/src/services/native-runtime/native-pi-restart-executable.integration.test.ts", ...restartWaitSuites, cutTurnStartRetrySuitePath, usageDeliverySuitePath, warmCheckpointOwnershipSuitePath, pluginWarmOwnerSuitePath, pluginReleaseResumeSuitePath, pluginEvictionSuitePath, "server/src/services/native-runtime/plugin-runner-probe.test.ts"].sort(), full.selectedGeneralServerSuites.sort());
   assert.equal(new Set(files).size, files.length);
   const defaultRun = dryRunJson([], prEnv);
   assert.ok(defaultRun.generalServerSuiteCount === full.generalServerSuiteCount);
@@ -433,6 +433,7 @@ test("the native-runner lane runs exactly the cargo-dependent suites", () => {
     ingressRetrySuitePath,
     dotRunnerSuitePath,
     restartRecoverySuitePath,
+    "server/src/services/native-runtime/native-pi-restart-executable.integration.test.ts",
     ...restartWaitSuites,
     cutTurnStartRetrySuitePath,
     usageDeliverySuitePath,
