@@ -17,6 +17,7 @@ import {
 } from "node:fs/promises";
 import { createServer } from "node:net";
 import { constants as osConstants } from "node:os";
+import { loopbackTokenMatches } from "../provider-loopback/broker.js";
 import { Agent as HttpAgent, createServer as createHttpServer, request as requestHttp, type IncomingMessage } from "node:http";
 import { Agent as HttpsAgent, request as requestHttps } from "node:https";
 import { getCACertificates } from "node:tls";
@@ -2506,6 +2507,8 @@ class OpenCodeHarnessSession implements HarnessSession {
 async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv, onServed?: (served: UpstreamServed | null) => void, secretValues: readonly string[] = []) {
   const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
   const token = randomBytes(32).toString("base64url");
+  const idleTimeoutMs = Number(environment.PAPERCLIP_PROVIDER_IDLE_TIMEOUT_MS ?? 120_000);
+  if (!Number.isSafeInteger(idleTimeoutMs) || idleTimeoutMs <= 0 || idleTimeoutMs > 2_147_483_647) throw new Error("Invalid provider idle timeout");
   // Agent-local settings keep one runtime's transport configuration out of other sessions.
   const proxyEnv = {
     HTTP_PROXY: environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
@@ -2527,13 +2530,24 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
   const server = createHttpServer((request, response) => {
     const controller = new AbortController();
     controllers.add(controller);
+    let idleTimer: NodeJS.Timeout | undefined;
+    const refreshIdleDeadline = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs);
+      idleTimer.unref();
+    };
     response.once("close", () => controller.abort());
     void (async () => {
-      if (request.headers.authorization !== `Bearer ${token}`) {
+      if (!loopbackTokenMatches(request.headers.authorization, `Bearer ${token}`)) {
         response.writeHead(401).end();
         return;
       }
-      if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+      // Match the origin-form pathname without normalizing a different route
+      // into it. Keep the raw query (including encoding/order) for the upstream.
+      const target = request.url ?? "";
+      const queryOffset = target.indexOf("?");
+      const pathname = queryOffset < 0 ? target : target.slice(0, queryOffset);
+      if (request.method !== "POST" || pathname !== "/v1/chat/completions") {
         response.writeHead(404).end();
         return;
       }
@@ -2566,16 +2580,21 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
       }
       let served: UpstreamServed | null = null;
       try {
+        // Byte-idle deadline only: an active stream has no total-duration cutoff.
+        refreshIdleDeadline();
         const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
           const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
             method: "POST",
+            ...(queryOffset < 0 ? {} : { path: `${upstreamUrl.pathname}${target.slice(queryOffset)}` }),
             agent,
             headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
-            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
+            signal: controller.signal,
           }, resolve);
           outgoing.once("error", reject);
           outgoing.end(body);
         });
+        refreshIdleDeadline();
+        upstream.on("data", refreshIdleDeadline);
         // Never forward authentication to a redirect destination.
         const status = upstream.statusCode ?? 502;
         if (status >= 300 && status < 400) {
@@ -2598,7 +2617,7 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
     })().catch(() => {
       if (!response.headersSent) response.writeHead(502).end("Provider request failed");
       else response.destroy();
-    }).finally(() => controllers.delete(controller));
+    }).finally(() => { if (idleTimer) clearTimeout(idleTimer); controllers.delete(controller); });
   });
   try {
     await new Promise<void>((resolve, reject) => {
