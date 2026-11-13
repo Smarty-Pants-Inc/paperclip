@@ -107,6 +107,8 @@ it.skipIf(!enabled).each(["idle", "archived", "stop-archived"] as const)("Core's
   // REG-03 differs from idle expiry: Stop leaves an in-memory warm entry,
   // then provider archival removes its processes before the next message.
   const stopArchived = resumedFrom === "stop-archived";
+  const reg03DelayMs = Number(process.env.REG03_DELAY_MS ?? "0");
+  expect(Number.isSafeInteger(reg03DelayMs) && reg03DelayMs >= 0, "REG03_DELAY_MS must be a nonnegative integer").toBe(true);
   const startupEvents: Array<{ runId: string; event: AdapterRuntimeEvent }> = [];
   let boxState: "running" | "archived" = "running";
   expect(process.platform).toBe("linux");
@@ -423,6 +425,19 @@ it.skipIf(!enabled).each(["idle", "archived", "stop-archived"] as const)("Core's
     let previous = first;
     const turn = async (index: number, holdForStop = false) => {
       await settle(previous);
+      if (stopArchived && !holdForStop) {
+        // The real Stop acknowledgement, executor settlement AND provider stop
+        // have all completed before this test-only gap and the next message.
+        const [stopped] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, previous.runId));
+        expect(stopped!.status).toBe("cancelled");
+        expect(record(record(stopped!.resultJson).nativeCancellation).dispatchState).toBe("acknowledged");
+        expect(boxState).toBe("archived");
+        const confirmedAtMs = Date.now();
+        stage("REG03 confirmed stop; delay begins before next message", { reg03DelayMs, confirmedAtMs, runId: previous.runId });
+        if (reg03DelayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, reg03DelayMs));
+        expect(Date.now() - confirmedAtMs).toBeGreaterThanOrEqual(reg03DelayMs);
+        stage("REG03 delay complete; next message may be inserted", { reg03DelayMs, confirmedAtMs, nextMessageAtMs: Date.now() });
+      }
       const [comment] = await db!.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
         body: `Turn ${index}: recall the private fact from your own earlier assistant history. Do not invent it.` }).returning();
       const next = await seed(comment!.body, first.native.normalizedSessionId, comment!.id, previous.lease.id);
