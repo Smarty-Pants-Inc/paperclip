@@ -1,5 +1,6 @@
 import { getRunExecutionTraceContext } from "../execution-preparation-timing.js";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { runWithRunnerOperationRecorder } from "./runner-operation-timing.js";
 import { createHash } from "node:crypto";
 import { isSpanContextValid, ROOT_CONTEXT, trace } from "@opentelemetry/api";
 
@@ -598,7 +599,9 @@ export function createNativeRunTrace(input: {
       },
     );
     return scopeStorage.run(state, () =>
-      runWithRuntimeParent(dynamicContext, fn),
+      runWithRunnerOperationRecorder(span => {
+        defer(() => record({ ...span, parentName: "native.session.execute" }, { deferRunLog: true }));
+      }, () => runWithRuntimeParent(dynamicContext, fn)),
     );
   };
 
@@ -775,6 +778,13 @@ export type RestartRecoveryMeasurement = {
 export async function recordNativeProviderPerformanceSpans(trace: NativeRunTrace, spans: NativeRunHistoricalSpan[]): Promise<void> {
   if (!spans.length) return;
   try {
+    // Pi timings use the existing content-free diagnostic protocol, but unlike
+    // provider-internal OTel phases they must also be visible in the run log.
+    for (const span of spans.filter(span => span.name.startsWith("runner.pi."))) {
+      await trace.record({ ...span, parentName: "native.session.execute" }, { deferRunLog: true });
+    }
+    spans = spans.filter(span => !span.name.startsWith("runner.pi."));
+    if (!spans.length) return;
     const scope = trace.start("provider.runtime", { parentName: "native.session.execute",
       startedAtMs: Math.min(...spans.map(span => span.startedAtMs)), persistRunLog: false });
     try {

@@ -10,6 +10,7 @@ import { bindContent, sendPiBindRequest, sendPiToolRequest, validateBindingConfi
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import { PiRpcCommandError, PiRpcTransport, type PiRpcExtensionUiResponseInput, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
+import { parseProviderPerformanceSpans } from "../../contracts/provider-performance.js";
 
 // Keep reason: revocable model capabilities, receipt admission, and callback refusal
 // are trust boundaries. These tests exercise the actual driver with real brokers/IPC.
@@ -185,6 +186,42 @@ describe("resident Pi model binding", () => {
     expect(f.ipc.filter(command => command.type === "bind")).toHaveLength(1);
     expect(await revoked((f.ipc.find(command => command.type === "bind") as Extract<PiBindCommand, { type: "bind" }>).provider)).toBe(true);
     expect(f.transport.closed).toBe(true);
+  });
+
+  // Keep reason: the production warm-turn latency regression needs per-RPC
+  // evidence across real broker/IPC admission, not another aggregate timer.
+  it("records every warm second-turn RPC on the reused session with its new run", async () => {
+    const f = await fixture();
+    await f.session.startTurn({ message: { role: "user", text: "one" } });
+    await finish(f);
+    const commandStart = f.transport.commands.length;
+    const startedAtMs = Date.now();
+    await f.session.attachRun({ runId: "run-b" });
+    const turn = await f.session.startTurn({ message: { role: "user", text: "two" } });
+    expect(f.events.filter(event => event.runId === "run-b").flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()))
+      .some(span => span.name === "runner.pi.prompt_to_started")).toBe(false);
+    await finish(f, 2);
+    const spans = f.events.filter(event => event.runId === "run-b")
+      .flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
+    expect(f.transport.commands.slice(commandStart)).toEqual([...admission, ...admission, "prompt"]);
+    expect(spans.map(span => span.name)).toEqual(expect.arrayContaining([
+      "runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn", "runner.pi.prompt_to_started",
+      ...admission.map(command => `runner.pi.admission.${command}`),
+    ]));
+    expect(spans.filter(span => span.name === "runner.pi.admission.get_state")).toHaveLength(4);
+    expect(spans).toHaveLength(14);
+    for (const span of spans) {
+      expect(span.outcome).toBe("ok");
+      expect(span.startedAtMs).toBeGreaterThanOrEqual(startedAtMs);
+      expect(span.endedAtMs).toBeGreaterThanOrEqual(span.startedAtMs);
+      expect(span.endedAtMs).toBeLessThanOrEqual(Date.now());
+    }
+    expect(f.events.find(event => event.turnId === turn.turnId && parseProviderPerformanceSpans(event.payload, Date.now())
+      .some(span => span.name === "runner.pi.prompt_to_started"))).toBeDefined();
+    expect(f.session.ids().providerSessionId).toBe("native-session");
+    if (process.env.PI_WARM_TIMING_OUT) await writeFile(process.env.PI_WARM_TIMING_OUT,
+      JSON.stringify({ runId: "run-b", turnId: turn.turnId, providerSessionId: f.session.ids().providerSessionId,
+        commands: f.transport.commands.slice(commandStart), spans }, null, 2));
   });
   it("boots a 200 KiB binding through a private file instead of an E2BIG environment entry", async () => {
     const large = { ...tool("large"), inputSchema: { type: "object", properties: { body: { type: "string", description: "x".repeat(200 * 1024) } } } };

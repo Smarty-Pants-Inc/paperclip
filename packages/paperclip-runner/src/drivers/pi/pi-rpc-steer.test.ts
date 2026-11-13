@@ -38,7 +38,11 @@ describe("Pi RPC same-turn steering", () => {
       expect(admissionEvents).toHaveLength(1);
       expect(admissionEvents[0]).toMatchObject({ runId: "steer-run", payload: { context: { piMetadata: { providers: ["paperclip"], promptSent: false } } } });
       expect(admissionEvents[0].turnId).toBeUndefined();
-      expect(events.every(event => event.runId === "steer-run" && (event.eventType === "session.started" || event.turnId === turnId))).toBe(true);
+      expect(events.every(event => event.runId === "steer-run")).toBe(true);
+      // Admission timing is session-scoped; conversation/steering events must
+      // still retain the original turn, with no exception for other diagnostics.
+      expect(events.filter(event => event.eventType !== "harness.diagnostic" || event.payload.code !== "provider_performance_spans")
+        .every(event => event.eventType === "session.started" || event.turnId === turnId)).toBe(true);
       for (const event of events) expect(validatePrpEvent(event)).toMatchObject({ ok: true });
       expect((await peer.commands()).filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type))).toEqual([
         expect.objectContaining({ type: "prompt", message: "scenario:queue" }),

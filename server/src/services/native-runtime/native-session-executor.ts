@@ -16039,7 +16039,7 @@ async function createRunnerdBackendWithinSessionClaim(
       codexTransportFactory: recovery => createRunnerdCodexTransport({ provider: provider.kind, stateDirectory: root,
         ...accountingTransportOptions,
         ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
-        measureOperation: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? measureRunnerOperation : undefined,
+        measureOperation: measureRunnerOperation,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
         ...owner.driver, get authorityRunId() { return owner.driver.authorityRunId; }, runnerArtifact: input.controllerPersistence?.runnerArtifact ?? description.runner,
         onCredentialsUpdated: event => owner.credentialsUpdated(event),
@@ -17818,7 +17818,7 @@ async function createRunnerdBackendWithinSessionClaim(
     codexTransportFactory: (recoveryContext) => {
       const bundle = createRunnerdCodexTransport({
         ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
-        measureOperation: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? measureRunnerOperation : undefined,
+        measureOperation: measureRunnerOperation,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
         // Remote launchers record their own stage and launch spans.
         ...(remoteTarget ? {} : { onStartupStep: (step: Parameters<typeof recordNativeRunnerStartupStep>[1]) => recordNativeRunnerStartupStep(input.trace, step) }),

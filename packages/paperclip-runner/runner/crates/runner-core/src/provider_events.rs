@@ -921,7 +921,10 @@ fn provider_performance_spans(params: &Value) -> Vec<Value> {
             | "provider.tools.resolve" | "provider.model.resolve" | "provider.model.stream"
             | "provider.workspace.snapshot.track" | "provider.workspace.snapshot.patch" | "provider.workspace.snapshot.diff"
             | "provider.workspace.git.discover" | "provider.workspace.git.default_branch"
-            | "provider.dependencies.install" | "provider.plugins.initialize") { return None; }
+            | "provider.dependencies.install" | "provider.plugins.initialize"
+            | "runner.pi.attach" | "runner.pi.bind" | "runner.pi.begin_turn" | "runner.pi.interrupt_wait" | "runner.pi.prompt_to_started"
+            | "runner.pi.admission.get_state" | "runner.pi.admission.set_model"
+            | "runner.pi.admission.get_available_thinking_levels" | "runner.pi.admission.set_thinking_level") { return None; }
         let start = span.get("startedAtMs")?.as_f64()?;
         let end = span.get("endedAtMs")?.as_f64()?;
         if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start || end - start > 86_400_000.0 { return None; }
@@ -2721,6 +2724,20 @@ mod tests {
             ]})
         )
         .is_empty());
+    }
+
+    #[test]
+    fn pi_warm_rpc_performance_timings_cross_the_existing_diagnostic_boundary() {
+        let names = ["runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn",
+            "runner.pi.interrupt_wait", "runner.pi.prompt_to_started",
+            "runner.pi.admission.get_state", "runner.pi.admission.set_model",
+            "runner.pi.admission.get_available_thinking_levels", "runner.pi.admission.set_thinking_level"];
+        let spans: Vec<Value> = names.iter().map(|name| json!({"name":name,
+            "startedAtMs":1000,"endedAtMs":1010,"prompt":"private"})).collect();
+        let events = normalize_codex_notification("paperclip/providerPerformance", &json!({"spans":spans}));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["spans"].as_array().unwrap().len(), names.len());
+        assert!(!events[0].payload.to_string().contains("private"));
     }
 
     #[test]

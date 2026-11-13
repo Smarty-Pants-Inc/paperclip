@@ -198,6 +198,33 @@ own `runner.runtime.stage` and `runner.process.launch` spans. These rows stay in
 the instance run log; with an operator OTLP endpoint they are also Observability
 spans. They are not Telemetry.
 
+## Pi RPC warm-turn timing
+
+Reused native Pi sessions record content-free `run.performance.span` rows using
+that same v1 schema, even without an operator OTLP endpoint:
+
+- `runner.pi.attach`: driver attachment, including any pending interrupt wait.
+- `runner.pi.admission.get_state`, `runner.pi.admission.set_model`,
+  `runner.pi.admission.get_available_thinking_levels`, and
+  `runner.pi.admission.set_thinking_level`: one row per admission RPC. Each
+  admission has two `get_state` rows (before selection and effective readback).
+  Attach, post-claim checks, and pre-prompt admission can each produce a set.
+- `runner.pi.interrupt_wait`: only when attach or turn start waits for Stop.
+- `runner.pi.bind` and `runner.pi.begin_turn`: private binding RPCs when used;
+  the initial preallocated binding has no `begin_turn` RPC.
+- `runner.pi.prompt_to_started`: prompt send to receipt of Pi's first owned
+  `agent_start`, not the facade's optimistic `turn.started` or the prompt ACK.
+  Handled/rejected input without a native start has no such measurement.
+- `runner.transport.attach`: the enclosing controller-side transport attach,
+  recorded against the current run rather than the retained transport's creator.
+
+These overlapping parent/child spans must not be summed as wall time. Driver
+measurements travel over the existing content-free provider-performance diagnostic
+and its closed allowlists. The controller writes the span rows as deferred
+run-log diagnostics; no extra RPC, request content, or model output is added.
+The rows stay in the instance run log, with optional Observability export and
+no first-party Telemetry.
+
 ## Native PRP Run-Log Events
 
 Provider startup command failures and failed provider turns can carry a
