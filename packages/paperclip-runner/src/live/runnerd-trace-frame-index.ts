@@ -16,8 +16,40 @@ export class RunnerdTraceFrameIndex {
   #partialBytes = 0;
   #discardUntilNewline = false;
   #frames = new Map<string, Frame>();
+  #snapshotActive = false;
+  #snapshot: { tracePath: string; ready: boolean } | { tracePath: string; error: unknown } | null = null;
+
+  withSnapshot<T>(work: () => T): T {
+    if (this.#snapshotActive) return work();
+    this.#snapshotActive = true;
+    try {
+      return work();
+    } finally {
+      this.#snapshotActive = false;
+      this.#snapshot = null;
+    }
+  }
 
   locate(tracePath: string, sourceEventId: string) {
+    let snapshot = this.#snapshotActive ? this.#snapshot : null;
+    if (snapshot?.tracePath !== tracePath) {
+      try {
+        snapshot = { tracePath, ready: this.#refresh(tracePath) };
+      } catch (error) {
+        snapshot = { tracePath, error };
+      }
+      if (this.#snapshotActive) this.#snapshot = snapshot;
+    }
+    if ("error" in snapshot) throw snapshot.error;
+    if (!snapshot.ready) return { frameId: null, nativeChannelSettled: false };
+    const frame = this.#frames.get(sourceEventId);
+    return {
+      frameId: frame?.frameId ?? null,
+      nativeChannelSettled: this.#settledAt > (frame?.record ?? 0),
+    };
+  }
+
+  #refresh(tracePath: string): boolean {
     const stat = statSync(tracePath);
     const identity = `${stat.dev}:${stat.ino}`;
     if (
@@ -34,7 +66,7 @@ export class RunnerdTraceFrameIndex {
         const opened = fstatSync(fd);
         // Do not mix a replacement file with the prefix we already indexed.
         if (`${opened.dev}:${opened.ino}` !== identity) {
-          return { frameId: null, nativeChannelSettled: false };
+          return false;
         }
         const buffer = Buffer.allocUnsafe(Math.min(READ_BUDGET_BYTES, stat.size - this.#offset));
         const bytes = readSync(fd, buffer, 0, buffer.length, this.#offset);
@@ -52,16 +84,13 @@ export class RunnerdTraceFrameIndex {
     // Until the observed suffix is indexed, a later interpretation or terminal
     // status may supersede the prefix. Let the existing pending queue retry.
     if (this.#offset < stat.size || this.#partialBytes > 0 || this.#discardUntilNewline) {
-      return { frameId: null, nativeChannelSettled: false };
+      return false;
     }
-    const frame = this.#frames.get(sourceEventId);
-    return {
-      frameId: frame?.frameId ?? null,
-      nativeChannelSettled: this.#settledAt > (frame?.record ?? 0),
-    };
+    return true;
   }
 
   clear() {
+    this.#snapshot = null;
     this.#identity = "";
     this.#offset = 0;
     this.#mtimeMs = 0;

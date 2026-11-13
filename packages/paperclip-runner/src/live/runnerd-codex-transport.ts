@@ -28,6 +28,7 @@ import { NATIVE_ASSET_PROVIDERS } from "../drivers/acpx/provider-assets-root.js"
 import { preconfiguredHomeEnvironment, preconfiguredCodexHome, usesPreconfiguredHome } from "../drivers/preconfigured-home.js";
 import { isAcpxCanonicalInputMethod } from "../drivers/acpx/profile-extensions.js";
 import { RunnerdTraceFrameIndex } from "./runnerd-trace-frame-index.js";
+import { RunnerdTraceRehydrationQueue } from "./runnerd-trace-rehydration-queue.js";
 import { waitForWarmAttachmentReadiness } from "./warm-attachment-readiness.js";
 import { resolveCodexCommand } from "../drivers/codex/codex-command.js";
 import { isCanonicalProviderEventType } from "../provider-events.js";
@@ -2114,6 +2115,13 @@ type PendingTraceRehydration = {
 
 type PendingDriverTraceInterpretation = CodexTraceInterpretation;
 
+function driverTraceFrameKey(input: PendingDriverTraceInterpretation): string {
+  return JSON.stringify([
+    input.sourceEventId, input.sourceEventType, input.providerMethod,
+    input.disposition, input.emittedEventIds, input.reason,
+  ]);
+}
+
 function appendRunnerdRehydrationTrace(
   index: RunnerdTraceFrameIndex,
   tracePath: string | undefined,
@@ -2123,7 +2131,6 @@ function appendRunnerdRehydrationTrace(
   debugSequence: number,
 ): "written" | "retry" | "not_applicable" {
   if (!tracePath) return "not_applicable";
-  if (!existsSync(tracePath)) return "retry";
   try {
     const { frameId, nativeChannelSettled } = index.locate(
       tracePath,
@@ -2183,7 +2190,6 @@ function appendCodexDriverInterpretationTrace(
   debugSequence: number,
 ): "written" | "retry" | "not_applicable" {
   if (!tracePath) return "not_applicable";
-  if (!existsSync(tracePath)) return "retry";
   try {
     const { frameId, nativeChannelSettled } = index.locate(
       tracePath,
@@ -4224,6 +4230,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #controlPlaneRelease: ((reason?: "detach") => Promise<void> | void) | null = null;
   #nextTraceDebugSequence = 1;
   #traceRehydrationSpoolOverflow = false;
+  #traceRehydrationRetriesExhausted = false;
+  #traceRehydrationClosed = false;
   readonly #traceFrameIndex = new RunnerdTraceFrameIndex();
   /** Clock of the startup, recovery, or turn-start admission in progress, if any. */
   #admissionClock: RunnerStallLedger | null = null;
@@ -4233,8 +4241,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     advance(from: RunnerdStartupStep["name"], to: RunnerdStartupStep["name"]): void;
     end(): void;
   } | null = null;
-  #pendingTraceRehydrations: PendingTraceRehydration[] = [];
-  #pendingDriverTraceInterpretations: PendingDriverTraceInterpretation[] = [];
+  readonly #pendingTraceRehydrations = new RunnerdTraceRehydrationQueue<PendingTraceRehydration>();
+  readonly #pendingDriverTraceInterpretations = new RunnerdTraceRehydrationQueue<PendingDriverTraceInterpretation>();
   #restoredRuntimeRequests: CodexRpcServerRequest[] = [];
   readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string; permission?: boolean }>();
 
@@ -5260,7 +5268,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   recordTraceInterpretation(input: CodexTraceInterpretation): void {
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    if (!tracePath) return;
+    if (!tracePath || this.#traceRehydrationClosed) return;
+    const frameKey = driverTraceFrameKey(input);
+    if (this.#pendingDriverTraceInterpretations.has(tracePath, frameKey)) return;
     const traceResult = appendCodexDriverInterpretationTrace(
       this.#traceFrameIndex,
       tracePath,
@@ -5269,14 +5279,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     );
     if (traceResult === "written") {
       this.#nextTraceDebugSequence += 1;
-    } else if (
-      traceResult === "retry" &&
-      this.#pendingDriverTraceInterpretations.length < 4_096
-    ) {
-      this.#pendingDriverTraceInterpretations.push(structuredClone(input));
-      this.#retryPumpWhile(true);
     } else if (traceResult === "retry") {
-      this.#traceRehydrationSpoolOverflow = true;
+      if (!this.#pendingDriverTraceInterpretations.enqueue(tracePath, frameKey, structuredClone(input))) {
+        this.#traceRehydrationSpoolOverflow = true;
+      }
+      this.#retryPumpWhile(true);
     }
   }
 
@@ -5770,11 +5777,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#diagnostic(`runner shutdown failed: ${String(error)}`);
       }
     }
-    this.#flushPendingTraceRehydrations();
+    this.#flushPendingTraceRehydrations(true);
+    this.#traceRehydrationClosed = true;
     const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
     if (tracePath) {
       const incomplete =
         this.#traceRehydrationSpoolOverflow ||
+        this.#traceRehydrationRetriesExhausted ||
         this.#pendingTraceRehydrations.length > 0 ||
         this.#pendingDriverTraceInterpretations.length > 0;
       const debugSequence = this.#nextTraceDebugSequence++;
@@ -5784,7 +5793,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           reason: incomplete
             ? this.#traceRehydrationSpoolOverflow
               ? "typescript_rehydration_spool_full"
-              : "typescript_rehydration_correlation_incomplete"
+              : this.#traceRehydrationRetriesExhausted
+                ? "typescript_rehydration_retry_limit"
+                : "typescript_rehydration_correlation_incomplete"
             : null,
           debugSequence,
           acknowledgedDebugSequence: debugSequence - 1,
@@ -5792,8 +5803,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       } catch {
         // Raw trace failure is intentionally independent of run authority.
       }
-      this.#pendingTraceRehydrations = [];
-      this.#pendingDriverTraceInterpretations = [];
+      if (incomplete) this.#diagnostic("typescript_rehydration_incomplete: unresolved diagnostic correlations discarded on close");
+      this.#pendingTraceRehydrations.clear();
+      this.#pendingDriverTraceInterpretations.clear();
       this.#traceFrameIndex.clear();
     }
     this.#stopPump();
@@ -8050,7 +8062,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
    * timer, and only for as long as it is held.
    */
   #pumpEvents(): void {
-    const remaining = this.#deliverCommittedEvents();
+    const remaining = this.#traceFrameIndex.withSnapshot(() => this.#deliverCommittedEvents());
     if (remaining === "next_task") this.#wakePump();
     this.#retryPumpWhile(
       remaining === "held" ||
@@ -8452,13 +8464,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         );
         if (traceResult === "written") {
           this.#nextTraceDebugSequence += 1;
-        } else if (
-          traceResult === "retry" &&
-          this.#pendingTraceRehydrations.length < 4_096
-        ) {
-          this.#pendingTraceRehydrations.push(pending);
         } else if (traceResult === "retry") {
-          this.#traceRehydrationSpoolOverflow = true;
+          if (!this.#pendingTraceRehydrations.enqueue(
+            this.options.environment.PAPERCLIP_PROVIDER_TRACE_PATH,
+            pending.sourceEventId,
+            pending,
+          )) this.#traceRehydrationSpoolOverflow = true;
         }
       }
       // The strict Codex driver must bind the provider turn from the response
@@ -8615,12 +8626,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#diagnostic(`confirmed adopted provider identity against ${source}`);
   }
 
-  #flushPendingTraceRehydrations(): void {
-    const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
-    if (!tracePath) return;
-    const retry: PendingTraceRehydration[] = [];
-    for (const pending of this.#pendingTraceRehydrations) {
-      const traceResult = appendRunnerdRehydrationTrace(
+  #flushPendingTraceRehydrations(final = false): void {
+    const expired = this.#pendingTraceRehydrations.flush((tracePath, pending) => {
+      const result = appendRunnerdRehydrationTrace(
         this.#traceFrameIndex,
         tracePath,
         pending.sourceEventId,
@@ -8628,23 +8636,22 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         pending.visibleNotificationCount,
         this.#nextTraceDebugSequence,
       );
-      if (traceResult === "written") this.#nextTraceDebugSequence += 1;
-      else if (traceResult === "retry") retry.push(pending);
-    }
-    this.#pendingTraceRehydrations = retry;
-
-    const driverRetry: PendingDriverTraceInterpretation[] = [];
-    for (const pending of this.#pendingDriverTraceInterpretations) {
-      const traceResult = appendCodexDriverInterpretationTrace(
+      if (result === "written") this.#nextTraceDebugSequence += 1;
+      return result;
+    }, final) + this.#pendingDriverTraceInterpretations.flush((tracePath, pending) => {
+      const result = appendCodexDriverInterpretationTrace(
         this.#traceFrameIndex,
         tracePath,
         pending,
         this.#nextTraceDebugSequence,
       );
-      if (traceResult === "written") this.#nextTraceDebugSequence += 1;
-      else if (traceResult === "retry") driverRetry.push(pending);
+      if (result === "written") this.#nextTraceDebugSequence += 1;
+      return result;
+    }, final);
+    if (expired > 0) {
+      this.#traceRehydrationRetriesExhausted = true;
+      this.#diagnostic(`typescript_rehydration_retry_limit: discarded ${expired} unresolved diagnostic correlations`);
     }
-    this.#pendingDriverTraceInterpretations = driverRetry;
   }
 
   #pumpEventsSafely(): void {
