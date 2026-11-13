@@ -212,13 +212,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       throw new Error("admission must not reach the sandbox");
     });
     const start = (outcome: "created" | "replacement" | "resumed" = "created",
-      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"]) => createRunnerdBackend({
+      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], restarted = false) => createRunnerdBackend({
       db, execution, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
       ...(restartRecovery ? { restartRecovery } : {}),
       runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "daytona", environmentId,
         leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
         runner: { execute: remoteExecute },
-        sandboxLeaseAcquisition: { outcome, providerLeaseId } } as never,
+        sandboxLeaseAcquisition: { outcome, providerLeaseId, ...(restarted ? { restarted: true } : {}) } } as never,
     }).then(() => "constructed", (error: Error) => error.message);
     // A local Runner keeps its controller root on this host between turns.
     const startLocal = (restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"]) => createRunnerdBackend({
@@ -226,6 +226,23 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       ...(restartRecovery ? { restartRecovery } : {}),
     }).then(() => "constructed", (error: Error) => error.message);
     return { runId, logs, start, startLocal, native: next, environmentId, leaseId, providerLeaseId, remoteExecute, selectedRunId: selected?.id ?? null };
+  }
+
+  /** The prior run's released lease on this same allocation: the evidence a
+   * resumed sandbox's retained binding requires. */
+  async function recordPriorLeaseOnSameSandbox(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>) {
+    await db.insert(environments).values({ id: followUp.environmentId, name: `restarted-${followUp.environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+      status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+    // The restarted box still holds the dead Runner's last, unsuspended state.
+    const deadRunnerState = Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", lifecycle: "ready",
+      runId: prior.runId })).toString("base64");
+    followUp.remoteExecute.mockImplementation(async (request: unknown) => {
+      if (JSON.stringify(request).includes("runner-state.json")) return { exitCode: 0, timedOut: false, stdout: deadRunnerState, stderr: "" };
+      throw new Error("admission must not reach the sandbox");
+    });
   }
 
   async function quarantined() {
@@ -652,6 +669,37 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await followUp.start("resumed")).not.toBe(ADMITTED);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
+
+  // REG-26 (I-8h run 90a2d958): the provider stopped the box under the idle
+  // warm Runner, and the resume restarted the machine. That owner is lost, not
+  // live: admission keeps its journal in place for the backend's authority
+  // rotation, which archives its unsuspended state and resumes the same
+  // conversation (native-pi-rpc-restarted-sandbox.e2e).
+  it("admits a settled warm owner of a resumed sandbox whose provider restarted it, leaving its journal for rotation", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
+    const followUp = await admitFollowUp(prior);
+    await recordPriorLeaseOnSameSandbox(prior, followUp);
+    expect(await followUp.start("resumed", undefined, true)).toBe(ADMITTED);
+    expect(await archivedOwners(await sessionRoot())).toEqual([]);
+    expect(await quarantined()).toEqual([]);
+    expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
+    expect(followUp.logs.join("")).not.toContain("not retired");
+    // Admission only read the box's Runner state; it changed nothing there.
+    expect(followUp.remoteExecute.mock.calls.every(([request]) => JSON.stringify(request).includes("base64 <"))).toBe(true);
+  }, 60_000);
+
+  // The restart proves only that the process is gone. A journal with work
+  // still owed (a pending command, an unanswered tool or its undelivered
+  // answer) keeps the owner held.
+  it.each(["pending-command", "unanswered-tool", "pending-tool-result"] as const)(
+    "keeps the owner of a restarted sandbox held when its journal is unsettled (%s)", async control => {
+      const prior = await seedRecoveredPriorRun(control, { provider: "codex", lifecycle: "warm" });
+      const followUp = await admitFollowUp(prior);
+      await recordPriorLeaseOnSameSandbox(prior, followUp);
+      expect(await followUp.start("resumed", undefined, true)).toBe(
+        "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=restarted_sandbox_owner_unproven");
+      expect(followUp.logs.join("")).toMatch(/restarted sandbox owner \S+ not retired: journal_/);
+    }, 60_000);
 
   it.each(["pending-command", "unanswered-tool"] as const)(
     "keeps a warm owner held when its journal is unsettled (%s), even on a new sandbox", async control => {
