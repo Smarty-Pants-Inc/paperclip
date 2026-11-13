@@ -13,6 +13,7 @@ import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { isQuiescentRetainedPiSource, readStoppedRemotePiSource } from "./native-retained-pi-source.js";
+import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 
 export const NATIVE_CONTROLLER_RECOVERY_MAX_BYTES = 4 * 1024;
 
@@ -263,6 +264,7 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: Retained
  * reads evidence; it grants neither command nor acknowledgement authority. */
 export async function resolveNativeControllerRecovery(db: Db, input: {
   companyId: string; agentId: string; issueId: string; normalizedSessionId: string; currentRunId: string;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
 }): Promise<NativeControllerRecoveryOutcome> {
   if (!isNativeSessionId(input.normalizedSessionId)) return { kind: "missing_evidence", reason: "session_binding" };
   const [current] = await db.select({ createdAt: heartbeatRuns.createdAt, processPid: heartbeatRuns.processPid,
