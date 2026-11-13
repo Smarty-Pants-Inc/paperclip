@@ -5908,9 +5908,15 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     // restart label. That label is never proof: use the shared exact-generation
     // probe, including on an ordinary resume of a still-running box.
     if (resumedSandboxRunner(target)) {
-      const predecessor = target.readPredecessorSandboxRecord && input.identity.runId
+      const predecessor = input.identity.runId
         ? await resolvePredecessorRunnerLease(input.db, { companyId: input.execution.binding.companyId, runId: input.identity.runId })
         : null;
+      // A marker only proves loss on the predecessor's own allocation. Without
+      // a provider reader, the current box must be bound to that exact lease.
+      if (!predecessor || (!target.readPredecessorSandboxRecord
+        && predecessor.providerLeaseId !== target.sandboxLeaseAcquisition?.providerLeaseId)) {
+        return refuse("restarted_sandbox_runner_predecessor_lease_unbound");
+      }
       if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity,
         ...(predecessor && target.readPredecessorSandboxRecord ? { predecessor: {
           start: predecessor.start,

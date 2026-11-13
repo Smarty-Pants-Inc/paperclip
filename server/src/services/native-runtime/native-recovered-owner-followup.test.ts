@@ -902,21 +902,26 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     ["replaced provider box with a lost marker", "replaced-box", false, false],
     ["foreign-company predecessor lease", "foreign-company", true, false],
     ["no predecessor lease, live marker", "no-lease", true, false],
-    ["no predecessor lease, lost marker", "no-lease", false, true],
+    ["no predecessor lease, lost marker", "no-lease", false, false],
+    ["older target with no readSandbox, no predecessor lease, lost marker", "absent-no-lease", false, false],
+    ["older target with no readSandbox, different provider box, lost marker", "absent-replaced-box", false, false],
     ["older target with no readSandbox, live marker", "absent", true, false],
-    ["older target with no readSandbox, lost marker", "absent", false, true],
+    ["older target with no readSandbox, same provider box, lost marker", "absent", false, true],
   ] as const)("uses predecessor provider proof through resumed-owner admission: %s", async (_name, observation, liveMarker, admitted) => {
     const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
     const followUp = await admitFollowUp(prior);
     await recordPriorLeaseOnSameSandbox(prior, followUp, liveMarker ? "live" : "lost");
-    const predecessorSandboxId = observation === "replaced-box" ? `predecessor-${prior.runId}` : followUp.providerLeaseId;
+    const differentBox = observation === "replaced-box" || observation === "absent-replaced-box";
+    const noLease = observation === "no-lease" || observation === "absent-no-lease";
+    const noReader = observation.startsWith("absent");
+    const predecessorSandboxId = differentBox ? `predecessor-${prior.runId}` : followUp.providerLeaseId;
     // Retained-lifecycle binding is checked before owner admission. Change the
     // durable row at that read boundary to exercise the admission's fresh DB
     // lookup, without bypassing that independent, earlier binding fence.
     const changeLease = async () => {
-      if (observation === "replaced-box") await db.update(environmentLeases).set({ providerLeaseId: predecessorSandboxId })
+      if (differentBox) await db.update(environmentLeases).set({ providerLeaseId: predecessorSandboxId })
         .where(eq(environmentLeases.id, prior.identity.environmentLeaseId));
-      if (observation === "no-lease") await db.delete(environmentLeases).where(eq(environmentLeases.id, prior.identity.environmentLeaseId));
+      if (noLease) await db.delete(environmentLeases).where(eq(environmentLeases.id, prior.identity.environmentLeaseId));
       if (observation === "foreign-company") {
         const foreignCompanyId = randomUUID();
         await db.insert(companies).values({ id: foreignCompanyId, name: "Foreign predecessor", issuePrefix: `F${foreignCompanyId.slice(0, 6)}` });
@@ -963,7 +968,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       resolveCapabilities: async () => classifyEnvironmentCapabilities({}),
       releaseRunLease: vi.fn(), inspectLeaseResource: inspect }] });
     const readPredecessor = vi.spyOn(runtime, "readPredecessorSandboxRecord");
-    const result = await followUp.start("resumed", undefined, false, observation === "absent" ? undefined : runtime);
+    const result = await followUp.start("resumed", undefined, false, noReader ? undefined : runtime);
     if (admitted) {
       expect(result).toBe(ADMITTED);
       expect(await quarantined()).toEqual([]);
@@ -975,12 +980,16 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect(followUp.logs.join("")).not.toContain("not retired");
     } else {
       expect(result).toBe(`${STRANDED}; retirement_refused=restarted_sandbox_owner_unproven`);
-      expect(followUp.logs.join("")).toContain("restarted_sandbox_runner_generation_not_lost");
+      const unbound = noLease || observation === "foreign-company" || (noReader && differentBox);
+      expect(followUp.logs.join("")).toContain(unbound
+        ? "restarted_sandbox_runner_predecessor_lease_unbound" : "restarted_sandbox_runner_generation_not_lost");
       expect(await quarantined()).toHaveLength(1);
       expect(toolDefinitions).not.toHaveBeenCalled();
+      if (unbound) expect(followUp.remoteExecute.mock.calls.some(([request]) =>
+        JSON.stringify(request).includes("paperclip-runner-generation-check"))).toBe(false);
     }
     expect(readLifecycle).toBe(true);
-    if (["absent", "no-lease", "foreign-company"].includes(observation)) {
+    if (noReader || noLease || observation === "foreign-company") {
       expect(readPredecessor).not.toHaveBeenCalled();
       expect(inspect).not.toHaveBeenCalled();
     } else {
