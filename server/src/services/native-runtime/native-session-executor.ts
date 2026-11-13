@@ -7252,7 +7252,8 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
     if (!target.runner) throw new Error("native_controller_recovery_dependency_unavailable:runner_state_reader");
     // The retained Runner wrote under its own lease's directory, which differs
     // from this target when the workspace moved within the same sandbox.
-    const retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId, target });
+    const retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId,
+      successorRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution), target });
     movedAllocation = retained.remoteCwd !== target.remoteCwd;
     state = await readRemoteRunnerState({ runner: target.runner,
       stateDirectory: remoteRunnerStateDirectory(retained.remoteCwd, nativeSessionKey(input.execution)) });

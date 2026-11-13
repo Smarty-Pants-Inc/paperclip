@@ -235,10 +235,13 @@ export class PiRpcDriver implements HarnessDriver {
           const toolSocketPath = join(privateDirectory, "tool.sock");
           // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
           await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
-          const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools, toolSocketPath };
+          // INITIAL without turnId is the extension's existing idle bootstrap:
+          // recovery must not prepare the predecessor's turn on either side.
+          const initial = { schema: 1, sessionId: input.normalizedSessionId, epoch: origin.epoch, runId: origin.runId,
+            ...(recovery ? {} : { turnId: origin.turnId }), model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools, toolSocketPath };
           if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
           resident = { directory: privateDirectory, socketPath, environment: { ...environment }, modelConfiguration, epoch: 1, context,
-            binding: { origin, close: provider.close, initial: true }, toolSocketPath };
+            binding: recovery ? null : { origin, close: provider.close, initial: true }, toolSocketPath };
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
           await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json, warn));
@@ -301,6 +304,11 @@ export class PiRpcDriver implements HarnessDriver {
       const providers = [...new Set(models.flatMap(value => typeof record(value).provider === "string" && /^[A-Za-z0-9._-]{1,80}$/u.test(record(value).provider as string) ? [record(value).provider as string] : []))].sort();
       const piMetadata = { version: "1.5.2", versionSource: "qualified-profile", providers, credentialMode, promptSent: false,
         authShape: { mode: credentialMode, source: usesPiProviderLoopback(config.model, this.#options.environment ?? {}) ? "managed-provider" : "configured-provider" } };
+      // Recovery bootstraps native identity, not a prepared turn under the
+      // predecessor's INITIAL authority. Revoke its discovery-only broker;
+      // CURRENT run.attach must use the ordinary fresh bind -> begin_turn path
+      // (new broker/epoch). Keep the live prepared-context equality fence.
+      if (recovery && resident) await closeProvider?.();
       return new PiRpcHarnessSession({
         transport,
         runId: input.runId,
