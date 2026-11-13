@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { NativeRunTrace } from "./native-run-trace.js";
-import { invalidArchive, readProviderPackLayers, stageProviderPackLayers, verifyArchive } from "./provider-pack-layers.js";
+import { invalidArchive, providerPackSandboxStopped, providerPackStageError, providerPackTransferTimedOut, readProviderPackLayers, stageProviderPackLayers, verifyArchive } from "./provider-pack-layers.js";
 import { providerPackExtractionProbe } from "./provider-pack-extraction.js";
 import { providerPackTransferTimeoutMs } from "./provider-pack-transfer.js";
 
@@ -39,6 +39,7 @@ export async function stageProviderPackArchive(input: {
   targetPath: string;
   trace?: NativeRunTrace;
   reuseRoots?: readonly string[];
+  verifyTimeoutMs?: number;
 }): Promise<boolean> {
   if ("kind" in input.archive) return stageProviderPackLayers({ ...input, archive: input.archive, reuseRoots: input.reuseRoots ?? [] });
   const archive = input.archive;
@@ -51,11 +52,16 @@ export async function stageProviderPackArchive(input: {
   }));
   if (capability.exitCode !== 0 || capability.timedOut) return false;
   try {
-    await measure("provider_pack.archive.transfer", () => input.runner.syncIn!([{
+    try { await measure("provider_pack.archive.transfer", () => input.runner.syncIn!([{
       operationId: `runner-provider-archive-${randomUUID()}`,
       files: [{ kind: "file", sourcePath: archive.sourcePath, targetPath: archivePath, mode: 0o600 }],
-    }], { minimumTimeoutMs: providerPackTransferTimeoutMs(archive.bytes) }));
-    const result = await measure("provider_pack.archive.extract", () => input.runner.execute({
+    }], { minimumTimeoutMs: providerPackTransferTimeoutMs(archive.bytes) })); }
+    catch (error) {
+      if (providerPackTransferTimedOut(error)) throw new Error("runner_remote_provider_pack_transfer_timeout");
+      providerPackStageError(error);
+    }
+    let result;
+    try { result = await measure("provider_pack.archive.extract", () => input.runner.execute({
       command: "sh",
       args: ["-c", [
         "set -eu; umask 077;",
@@ -67,7 +73,10 @@ export async function stageProviderPackArchive(input: {
       ].join(" ")],
       bypassSession: true,
       timeoutMs: 120_000,
-    }));
+    })); } catch (error) { providerPackStageError(error); }
+    if (providerPackSandboxStopped({ message: result.stderr }) || result.exitCode === null && !result.timedOut) {
+      throw new Error("runner_remote_provider_pack_sandbox_stopped");
+    }
     if (result.exitCode !== 0 || result.timedOut) throw new Error("runner_remote_provider_archive_extract_failed");
     return true;
   } finally {

@@ -18,6 +18,31 @@ export type ProviderPackLayers = {
   files: FileLayer[];
 };
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+const PROVIDER_PACK_VERIFY_TIMEOUT_MS = 120_000;
+
+export function providerPackSandboxStopped(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    const value = cause as { message?: unknown; code?: unknown; status?: unknown; statusCode?: unknown };
+    const status = value.status ?? value.statusCode;
+    const message = `${typeof value.message === "string" ? value.message : String(cause)} ${typeof value.code === "string" ? value.code : ""}`;
+    if (status === 404 || (status === 409 && /stopped/i.test(message))
+      || /(?:\b404\b|sandbox .* (?:is )?stopped|is stopped|sandbox.*not found|daytona_sandbox_not_found|SANDBOX_(?:STOPPED|NOT_FOUND|NOT_RUNNING))/i.test(message)) return true;
+  }
+  return false;
+}
+
+export function providerPackTransferTimedOut(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    const value = cause as { message?: unknown; code?: unknown };
+    if (value.code === "ETIMEDOUT" || (typeof value.message === "string" && /timed? ?out|timeout|ETIMEDOUT/i.test(value.message))) return true;
+  }
+  return false;
+}
+
+export function providerPackStageError(error: unknown): never {
+  if (providerPackSandboxStopped(error)) throw Error("runner_remote_provider_pack_sandbox_stopped");
+  throw error;
+}
 const validArchive = (value: unknown): value is Archive => {
   const entry = value as Archive | null;
   return !!entry && /^[a-f0-9]{64}$/.test(entry.sha256)
@@ -124,6 +149,7 @@ export async function stageProviderPackLayers(input: {
   targetPath: string;
   reuseRoots: readonly string[];
   trace?: NativeRunTrace;
+  verifyTimeoutMs?: number;
 }): Promise<boolean> {
   const { archive, runner } = input;
   if (!runner.syncIn) throw Error("runner_remote_provider_archive_transport_unavailable");
@@ -158,33 +184,51 @@ export async function stageProviderPackLayers(input: {
     // Concatenate independent zstd frames without recompression. One upload
     // avoids a provider round trip for every small missing layer.
     const hash = createHash("sha256");
-    await measure("provider_pack.archive.verify_missing", () => pipeline((async function* () {
-      for (const layer of layers) {
-        const file = await open(`${archive.sourceRoot}/${layer.name}`, constants.O_RDONLY | constants.O_NOFOLLOW)
-          .catch(error => { throw invalidArchive("archive_unreadable", error); });
-        try {
-          const metadata = await file.stat(), layerHash = createHash("sha256");
-          if (!metadata.isFile() || metadata.size !== layer.bytes) throw invalidArchive("size_mismatch");
-          for await (const chunk of file.createReadStream({ autoClose: false })) {
-            layerHash.update(chunk); hash.update(chunk); yield chunk;
-          }
-          if (layerHash.digest("hex") !== layer.sha256) throw invalidArchive("sha256_mismatch");
-        } finally { await file.close(); }
-      }
-    })(), createWriteStream(bundlePath, { flags: "wx", mode: 0o600 })));
+    const verifyController = new AbortController();
+    const verifyTimer = setTimeout(() => verifyController.abort(), input.verifyTimeoutMs ?? PROVIDER_PACK_VERIFY_TIMEOUT_MS);
+    try {
+      await measure("provider_pack.archive.verify_missing", () => pipeline((async function* () {
+        for (const layer of layers) {
+          const file = await open(`${archive.sourceRoot}/${layer.name}`, constants.O_RDONLY | constants.O_NOFOLLOW)
+            .catch(error => { throw invalidArchive("archive_unreadable", error); });
+          try {
+            const metadata = await file.stat(), layerHash = createHash("sha256");
+            if (!metadata.isFile() || metadata.size !== layer.bytes) throw invalidArchive("size_mismatch");
+            for await (const chunk of file.createReadStream({ autoClose: false, signal: verifyController.signal })) {
+              layerHash.update(chunk); hash.update(chunk); yield chunk;
+            }
+            if (layerHash.digest("hex") !== layer.sha256) throw invalidArchive("sha256_mismatch");
+          } finally { await file.close(); }
+        }
+      })(), createWriteStream(bundlePath, { flags: "wx", mode: 0o600 }), { signal: verifyController.signal }));
+    } catch (error) {
+      if (verifyController.signal.aborted) throw Error("runner_remote_provider_archive_verify_timeout");
+      throw error;
+    } finally { clearTimeout(verifyTimer); }
     const sha256 = hash.digest("hex");
-    await measure("provider_pack.archive.transfer", () => runner.syncIn!([{
-      operationId: `runner-provider-layers-${randomUUID()}`,
-      files: [{ kind: "file", sourcePath: bundlePath, targetPath: remoteArchive, mode: 0o600 }],
-    }], { minimumTimeoutMs: providerPackTransferTimeoutMs(layers.reduce((bytes, layer) => bytes + layer.bytes, 0)) }));
-    const result = await measure("provider_pack.archive.extract", () => runner.execute({
+    const transferBytes = layers.reduce((bytes, layer) => bytes + layer.bytes, 0);
+    const transferTimeoutMs = providerPackTransferTimeoutMs(transferBytes);
+    try {
+      await measure("provider_pack.archive.transfer", () => runner.syncIn!([{
+        operationId: `runner-provider-layers-${randomUUID()}`,
+        files: [{ kind: "file", sourcePath: bundlePath, targetPath: remoteArchive, mode: 0o600 }],
+      }], { minimumTimeoutMs: transferTimeoutMs }));
+    } catch (error) {
+      if (providerPackTransferTimedOut(error)) throw Error("runner_remote_provider_pack_transfer_timeout");
+      providerPackStageError(error);
+    }
+    let result;
+    try { result = await measure("provider_pack.archive.extract", () => runner.execute({
       command: "sh", args: ["-c", ["set -eu; umask 077;",
         `test ! -L ${quote(input.targetPath)}; test -d ${quote(input.targetPath)};`,
         `test ! -L ${quote(remoteArchive)}; test "$(sha256sum -- ${quote(remoteArchive)} | cut -d ' ' -f 1)" = ${quote(sha256)};`,
         `tar --zstd --ignore-zeros -xf ${quote(remoteArchive)} --no-same-owner --same-permissions --delay-directory-restore -C ${quote(input.targetPath)};`,
         `chmod 700 ${quote(input.targetPath)};`,
       ].join(" ")], bypassSession: true, timeoutMs: 120_000,
-    }));
+    })); } catch (error) { providerPackStageError(error); }
+    if (providerPackSandboxStopped({ message: result.stderr }) || result.exitCode === null && !result.timedOut) {
+      throw Error("runner_remote_provider_pack_sandbox_stopped");
+    }
     if (result.exitCode !== 0 || result.timedOut) throw Error("runner_remote_provider_archive_extract_failed");
     return true;
   } finally {
