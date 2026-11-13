@@ -202,6 +202,23 @@ releasing tracked work. Completed history creates no recurring discovery reads;
 new committed work reactivates the existing notification path. Pending reply
 obligations keep their existing sleep blockers.
 
+## Resumed Runner predecessor inspection
+
+Resumed sandbox admission uses the existing read-only provider inspection below
+through `environmentRuntime.readPredecessorSandboxRecord({ companyId, leaseId })`.
+The execution target binds the company and exposes a host-only callback; the
+executor passes the predecessor Runner's own `environmentLeaseId`, never the
+incoming run's lease. Each decision reads the provider afresh. Older targets
+without the callback retain the exact-generation marker probe alone.
+
+The shared `remoteRunnerGenerationLost` predicate owns all proof semantics:
+destroyed is gone; a recorded reboot after the predecessor's process start (or
+run start if no process start was recorded) proves loss; an exact stopped state
+for at least 15 minutes proves loss. Active, short-stopped, incomplete and
+throwing reads do not prove loss on their own, so the marker probe decides.
+Every existing settled-result, controller, journal and authority-rotation fence
+still applies. This adds no polling and grants no provider mutation authority.
+
 ## Scheduled routine wake protocol
 
 Historical failed ephemeral leases and terminal custom-image setup sessions can

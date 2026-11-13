@@ -20,6 +20,7 @@ import { createNativeControllerRecovery, resolveNativeControllerRecovery } from 
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { classifyEnvironmentCapabilities, environmentRuntimeService } from "../environment-runtime.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
@@ -212,12 +213,15 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       throw new Error("admission must not reach the sandbox");
     });
     const start = (outcome: "created" | "replacement" | "resumed" = "created",
-      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], restarted = false) => createRunnerdBackend({
+      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], restarted = false,
+      providerRuntime?: Pick<ReturnType<typeof environmentRuntimeService>, "readPredecessorSandboxRecord">) => createRunnerdBackend({
       db, execution, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
       ...(restartRecovery ? { restartRecovery } : {}),
       runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "daytona", environmentId,
         leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
         runner: { execute: remoteExecute },
+        ...(providerRuntime ? { readPredecessorSandboxRecord: ({ leaseId }: { leaseId: string }) =>
+          providerRuntime.readPredecessorSandboxRecord({ companyId, leaseId }) } : {}),
         sandboxLeaseAcquisition: { outcome, providerLeaseId, ...(restarted ? { restarted: true } : {}) } } as never,
     }).then(() => "constructed", (error: Error) => error.message);
     // A local Runner keeps its controller root on this host between turns.
@@ -233,7 +237,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   async function recordPriorLeaseOnSameSandbox(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
     followUp: Awaited<ReturnType<typeof admitFollowUp>>, generation: "lost" | "live" = "lost") {
     await db.insert(environments).values({ id: followUp.environmentId, name: `restarted-${followUp.environmentId}`, driver: "sandbox" });
-    await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+    await db.insert(environmentLeases).values({ id: prior.identity.environmentLeaseId, companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
       heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
       status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
     // The restarted box still holds the dead Runner's last, unsuspended state.
@@ -712,6 +716,73 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toHaveLength(1);
     expect(followUp.remoteExecute.mock.calls.every(([request]) =>
       /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
+  }, 60_000);
+
+  // Trust-boundary regression: the call site must read the predecessor's own
+  // released lease, never the replacement allocation or an acquisition label.
+  it.each([
+    ["destroyed predecessor", "destroyed", false, true],
+    ["stopped 14 minutes", "stopped", false, false],
+    ["stopped 16 minutes", "long-stop", false, true],
+    ["reboot after recorded run start", "reboot-run", false, true],
+    ["reboot after recorded process start", "reboot-process", false, true],
+    ["reboot before recorded process start", "reboot-before-process", false, false],
+    ["active with a live marker", "active", true, false],
+    ["throwing read", "throws", false, false],
+    ["missing optional fields", "missing", false, false],
+    ["older target with no readSandbox, live marker", "absent", true, false],
+    ["older target with no readSandbox, lost marker", "absent", false, true],
+  ] as const)("uses predecessor provider proof through resumed-owner admission: %s", async (_name, observation, liveMarker, admitted) => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
+    const followUp = await admitFollowUp(prior);
+    await recordPriorLeaseOnSameSandbox(prior, followUp, liveMarker ? "live" : "lost");
+    const predecessorSandboxId = followUp.providerLeaseId;
+    if (observation.startsWith("reboot")) await db.update(heartbeatRuns).set({
+      startedAt: new Date(Date.now() - 120 * 60_000),
+      processStartedAt: observation === "reboot-run" ? null : new Date(Date.now() - (observation === "reboot-process" ? 60 : 10) * 60_000),
+    }).where(eq(heartbeatRuns.id, prior.runId));
+    // The provider may now report the retained allocation gone even though
+    // acquisition said resumed. The fresh read, not that label, decides.
+    // A gone box has no predecessor marker; only the older-target positive
+    // case keeps its proven-lost marker, matching the unwired implementation.
+    const execute = followUp.remoteExecute.getMockImplementation()!;
+    if (!liveMarker && observation !== "absent") followUp.remoteExecute.mockImplementation(async request =>
+      JSON.stringify(request).includes("paperclip-runner-generation-marker")
+        ? { exitCode: 31, timedOut: false, stdout: "", stderr: "" } : execute(request));
+    const inspect = vi.fn(async ({ lease }: { lease: typeof environmentLeases.$inferSelect }) => {
+      expect(lease.id).toBe(prior.identity.environmentLeaseId);
+      expect(lease.companyId).toBe(companyId);
+      expect(lease.providerLeaseId).toBe(predecessorSandboxId);
+      expect(lease.id).not.toBe(followUp.leaseId);
+      if (observation === "throws") throw new Error("provider read unavailable");
+      return { providerLeaseId: lease.providerLeaseId!,
+        state: observation === "destroyed" ? "destroyed" as const : observation === "active" || observation.startsWith("reboot") ? "active" as const : "stopped" as const,
+        ...(observation === "stopped" || observation === "long-stop" ? {
+          stoppedAt: new Date(Date.now() - (observation === "stopped" ? 14 : 16) * 60_000).toISOString(), observedAt: new Date().toISOString(),
+        } : {}),
+        ...(observation.startsWith("reboot") ? { lastRebootAt: new Date(Date.now() - 30 * 60_000).toISOString() } : {}) };
+    });
+    const runtime = environmentRuntimeService(db, { drivers: [{ driver: "sandbox", acquireRunLease: vi.fn(),
+      resolveCapabilities: async () => classifyEnvironmentCapabilities({}),
+      releaseRunLease: vi.fn(), inspectLeaseResource: inspect }] });
+    const result = await followUp.start("resumed", undefined, false, observation === "absent" ? undefined : runtime);
+    if (admitted) {
+      expect(result).toBe(ADMITTED);
+      expect(await quarantined()).toEqual([]);
+      // Existing authority rotation, not a new retirement rule, owns this
+      // journal. Admission leaves the exact predecessor identity in place.
+      expect(await archivedOwners(await sessionRoot())).toEqual([]);
+      expect(JSON.parse(await readFile(join(await sessionRoot(), "control-plane/control-plane-state.json"), "utf8")).identity)
+        .toMatchObject(prior.identity);
+      expect(followUp.logs.join("")).not.toContain("not retired");
+    } else {
+      expect(result).toBe(`${STRANDED}; retirement_refused=restarted_sandbox_owner_unproven`);
+      expect(followUp.logs.join("")).toContain("restarted_sandbox_runner_generation_not_lost");
+      expect(await quarantined()).toHaveLength(1);
+      expect(toolDefinitions).not.toHaveBeenCalled();
+    }
+    if (observation === "absent") expect(inspect).not.toHaveBeenCalled();
+    else expect(inspect).toHaveBeenCalled();
   }, 60_000);
 
   // The restart proves only that the process is gone. A journal with work
