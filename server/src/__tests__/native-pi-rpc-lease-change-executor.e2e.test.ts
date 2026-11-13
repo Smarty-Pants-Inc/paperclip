@@ -10,7 +10,7 @@ import { eq, sql } from "drizzle-orm";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { expect, it, vi } from "vitest";
 import {
-  agents, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases,
+  agents, authUsers, companyMemberships, principalPermissionGrants, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases,
   environments, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
@@ -22,8 +22,12 @@ import {
 } from "../vendor/paperclip-runner/index.js";
 import { registerLocalRuntimeApiServer } from "../runtime-api.js";
 import { environmentService } from "../services/environments.js";
+import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
+import type { AdapterRuntimeEvent } from "../adapters/index.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
-import { closeWarmNativeSessionsForEnvironment, executePaperclipNativeSession, cancelNativeSession } from "../services/native-runtime/native-session-executor.js";
+import { reserveWarmNativeInstructionDirectory, closeWarmNativeSessionsForEnvironment, executePaperclipNativeSession, cancelNativeSession } from "../services/native-runtime/native-session-executor.js";
+import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
+import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { currentNativeControllerIdentity } from "../services/native-runtime/native-restart-recovery.js";
 import { prepareNativeHeartbeatRun } from "../services/native-runtime/prepare-native-run.js";
 import {
@@ -69,23 +73,28 @@ function sameBirth(expected: Birth): boolean {
   const current = birth(expected.pid);
   return current !== null && current.startTicks === expected.startTicks && current.bootId === expected.bootId;
 }
-function ownedDescendant(runner: Birth, kind: "pi" | "sleep"): Birth | null {
+function ownedDescendants(runner: Birth): Birth[] {
   const processes = new Map<number, Birth>();
   for (const name of readdirSync("/proc")) {
     if (!/^\d+$/.test(name)) continue;
     const current = birth(Number(name)); if (current) processes.set(current.pid, current);
   }
+  const descendants: Birth[] = [];
   for (const current of processes.values()) {
     let parent = current.ppid;
     const seen = new Set<number>();
     while (parent !== runner.pid && processes.has(parent) && !seen.has(parent)) {
       seen.add(parent); parent = processes.get(parent)!.ppid;
     }
-    if (parent !== runner.pid) continue;
-    const comm = (() => { try { return readFileSync(`/proc/${current.pid}/comm`, "utf8").trim(); } catch { return ""; } })();
-    if (kind === "sleep" ? comm === "sleep" : comm === "pi" || current.command.includes("--mode rpc") && current.command.includes("cli.js")) return current;
+    if (parent === runner.pid) descendants.push(current);
   }
-  return null;
+  return descendants;
+}
+function ownedDescendant(runner: Birth, kind: "pi" | "sleep"): Birth | null {
+  return ownedDescendants(runner).find(current => {
+    const comm = (() => { try { return readFileSync(`/proc/${current.pid}/comm`, "utf8").trim(); } catch { return ""; } })();
+    return kind === "sleep" ? comm === "sleep" : comm === "pi" || current.command.includes("--mode rpc") && current.command.includes("cli.js");
+  }) ?? null;
 }
 function sessionFile(pi: Birth): string {
   const env = Object.fromEntries(readFileSync(`/proc/${pi.pid}/environ`, "utf8").split("\0").filter(Boolean).map(entry => {
@@ -103,6 +112,18 @@ function sessionFile(pi: Birth): string {
 // "archived": the box resumes from archived (the sticky loop after a failed
 // run). Turns 2 and 3 must each continue with history.
 it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)("A %s resume of the same box continues through the executor without probing a connected warm owner", async resumedFrom => {
+  await runLeaseChangeScenario(resumedFrom);
+}, 600_000);
+
+// Keep reason: managed agent_files preparation reserves the CURRENT successor.
+// Exercise real materialization/adoption and real PRP identity/loss, not a test
+// assignment to the executor's private warm-owner map. The original four cases
+// above retain their inputs and assertions.
+it.skipIf(!enabled).each(["connected", "idle"] as const)("A managed-instructions %s resume checks its warm owner and preserves recall", async resumedFrom => {
+  await runLeaseChangeScenario(resumedFrom, true);
+}, 600_000);
+
+async function runLeaseChangeScenario(resumedFrom: "idle" | "archived" | "stopped" | "connected", managed = false) {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -169,6 +190,8 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
   const previousHttpsAgent = https.globalAgent;
   let fixtureHttpsAgent: InstanceType<typeof https.Agent> | undefined;
   const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), environmentId = randomUUID(), workspaceId = randomUUID();
+  const responsibleUserId = randomUUID();
+  const preparationReleases: Array<() => Promise<void>> = [];
   const providerLeaseId = `owned-simulated-allocation-${randomUUID()}`;
   const leaseActive = new Map<string, boolean>();
   let failure: unknown;
@@ -252,7 +275,18 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
     }
     expect(stopPostgres).toBeDefined();
     await db.insert(companies).values({ id: companyId, name: "Pi lease proof", issuePrefix: "PIL" });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Pi lease proof", adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc" } });
+    const canonical = resolveManagedInstructionsRoot({ id: agentId, companyId, name: "Pi lease proof", adapterConfig: {} });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Pi lease proof", adapterType: "paperclip_runner", adapterConfig: {
+      provider: "pi_rpc", ...(managed ? { instructionsBundleMode: "managed", instructionsRootPath: canonical, instructionsEntryFile: "AGENTS.md" } : {}) } });
+    if (managed) {
+      await db.insert(authUsers).values({ id: responsibleUserId, name: "Managed lease proof", email: `${responsibleUserId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await db.insert(companyMemberships).values([{ companyId, principalType: "user", principalId: responsibleUserId, membershipRole: "operator" },
+        { companyId, principalType: "agent", principalId: agentId, membershipRole: "member" }]);
+      await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: responsibleUserId,
+        permissionKey: "agents:configure", scope: { agentIds: [agentId] } });
+      await mkdir(canonical, { recursive: true });
+      await writeFile(join(canonical, "AGENTS.md"), "Use only the current conversation. Do not call tools or invent missing history.\n");
+    }
     await db.insert(environments).values({ id: environmentId, name: "Owned split-filesystem simulation", driver: "sandbox" });
     const [issue] = await db.insert(issues).values({ id: issueId, companyId, title: "Retain the same Pi conversation", description: null,
       assigneeAgentId: agentId, status: "in_progress" }).returning();
@@ -262,9 +296,12 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
     runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
     const controller = await currentNativeControllerIdentity();
     const environmentsService = environmentService(db);
+    const copies = agentInstructionWorkingCopyService(db);
+    let previousManagedExecution: ReturnType<typeof buildNativeExecutionInput> | undefined;
     const seed = async (prompt: string, normalizedSessionId?: string, wakeCommentId?: string, previousLeaseId?: string) => {
       const runId = randomUUID();
       const [run] = await db!.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
+        ...(managed ? { responsibleUserId, invocationSource: "on_demand" } : {}),
         nativeIssueId: issueId, ...(normalizedSessionId ? { nativeSessionId: normalizedSessionId } : {}),
         contextSnapshot: { issueId, ...(wakeCommentId ? { wakeCommentId } : {}) } }).returning();
       const lease = await environmentsService.acquireLease({ companyId, environmentId, heartbeatRunId: runId, issueId,
@@ -276,10 +313,40 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
         leaseOwner: null, leaseExpiresAt: null });
       await db!.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
       const [contract] = await db!.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
+      leaseActive.set(lease.id, true);
+      const instructionTarget: AdapterExecutionTarget = { kind: "remote", transport: "sandbox", providerKey: "boat", environmentId, leaseId: lease.id,
+        remoteCwd, runner: commandRunner(lease.id), sandboxLeaseAcquisition: { outcome: previousManagedExecution ? "resumed" : "created", providerLeaseId } };
+      const capability = (root: string) => ({ runId, preparationKey: "managed-lease-proof", root,
+        checkpointWarm: async () => {
+          const saved = await copies.checkpointWarm({ companyId, runId, target: instructionTarget });
+          return saved?.state === "warm_saved" && saved.errorCode === null;
+        },
+        hasChanges: () => copies.hasChanges({ companyId, runId, target: instructionTarget }),
+        collectStopped: async () => { await copies.collectStopped({ companyId, runId, target: instructionTarget }); },
+        retirementFailed: async () => { await copies.reportRetirementUnconfirmed(companyId, runId); } });
+      let instructionWorkingCopy: ReturnType<typeof capability> | undefined;
+      if (managed) {
+        const previousRunId = previousManagedExecution?.binding.runId;
+        const reservation = previousRunId ? await reserveWarmNativeInstructionDirectory({ companyId, agentId, previousRunId, runId,
+          target: instructionTarget, canReuse: () => copies.canReuseWarm(companyId, agentId, previousRunId) }) : null;
+        if (previousRunId) {
+          expect(reservation, "unchanged managed files hand off to this successor").not.toBeNull();
+          preparationReleases.push(reservation!.release);
+        }
+        const prepared = await copies.prepare({ companyId, agentId, runId, target: instructionTarget, cwd: remoteCwd, warm: true,
+          reuseRunId: reservation?.reuseRunId, onWarmHandoff: copy => {
+            const adopted = capability(copy.executionRoot);
+            reservation!.adopt(adopted.root, adopted.collectStopped);
+          } });
+        expect(prepared?.state).toBe("prepared");
+        instructionWorkingCopy = capability(prepared!.executionRoot);
+        runtimeContext.instructions.workingCopy = { rootPath: instructionWorkingCopy!.root, entryPath: "AGENTS.md", kind: "agent_files" };
+        runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
+      }
       const execution = buildNativeExecutionInput({ companyId, agentId, runId, provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh",
         issue: { id: issueId, identifier: "PIL-1", title: issue!.title, description: null, workMode: "standard" }, taskPrompt: prompt,
         workspace: { id: workspaceId, cwd: remoteCwd, repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: native.normalizedSessionId,
-        lifecyclePolicy: { mode: "warm", idleTimeoutMs: resumedFrom === "connected" ? 600_000 : WARM_IDLE_MS }, runtimeContext,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: managed || resumedFrom === "connected" ? 600_000 : WARM_IDLE_MS }, runtimeContext,
         completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: contract!.schemaVersion, contract: contract!.contractJson as never } });
       // The native authority uses the actual acquired DB id, never the
       // executionWorkspaceId or the unrelated PRP connection lease token.
@@ -287,7 +354,8 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
         || ${JSON.stringify({ nativeExecutionInput: execution, nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("remote", "pi_rpc") })}::jsonb` })
         .where(eq(heartbeatRuns.id, runId));
       leaseActive.set(lease.id, true);
-      return { runId, run: run!, native, execution, lease, prompt };
+      if (managed) previousManagedExecution = execution;
+      return { runId, run: run!, native, execution, lease, prompt, instructionWorkingCopy };
     };
     type Fixture = Awaited<ReturnType<typeof seed>>;
     const executionOptions = async (fixture: Fixture, outcome: "created" | "resumed") => {
@@ -311,7 +379,13 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
         sandboxLeaseAcquisition: { outcome, providerLeaseId,
           ...(outcome === "resumed" && (resumedFrom === "archived" || resumedFrom === "stopped")
             ? { resumedFromState: resumedFrom, restarted: true as const } : {}) } };
-      return { db: db!, execution: fixture.execution, runnerInstanceId: fixture.native.runnerInstanceId,
+      return { db: db!, execution: fixture.execution, runnerInstanceId: fixture.native.runnerInstanceId, instructionWorkingCopy: fixture.instructionWorkingCopy,
+        // Heartbeat normally wires this sink around the executor. Persist actual
+        // controller spans with its production event allocator in this direct
+        // executor fixture; PRP ingestion alone does not save controller spans.
+        onEvent: managed ? async (event: AdapterRuntimeEvent) => {
+          await appendHeartbeatRunEvent(db!, { ...event, companyId, agentId, runId: fixture.runId });
+        } : undefined,
         durableEnvironmentLeaseId: fixture.lease.id, controllerPersistence: { bootId: controller.bootId }, runnerIngressAuthorized: true,
         runnerExecutionTarget: target, runnerRemoteBinaryPath: runnerBinary, runnerRemoteProviderPackPath: providerPack,
         // The projection admits ordinary configured variables only. Pi home,
@@ -351,6 +425,20 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
     const settle = async (fixture: Fixture) => {
       await db!.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, fixture.runId));
       await db!.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, fixture.runId));
+      if (managed && resumedFrom === "idle") {
+        const owned = spawned.at(-1)!;
+        const ownedPi = ownedDescendant(owned, "pi");
+        expect(sameBirth(owned), "warm owner exists before actual idle loss").toBe(true);
+        expect(ownedPi).not.toBeNull();
+        // A real idle generation loss, without calling Core's close path or
+        // deleting its warm entry. Birth checks fence each signal to this test.
+        for (const child of [...ownedDescendants(owned).reverse(), owned]) if (sameBirth(child)) process.kill(child.pid, "SIGKILL");
+        await vi.waitFor(() => { expect(sameBirth(owned)).toBe(false); expect(sameBirth(ownedPi!)).toBe(false); }, { timeout: 30_000, interval: 100 });
+        stage("managed warm Runner and Pi actually lost while idle", { runner: owned, pi: ownedPi });
+        leaseActive.set(fixture.lease.id, false);
+        await environmentService(db!).releaseLease(fixture.lease.id, "released");
+        return;
+      }
       if (resumedFrom === "connected") {
         expect(sameBirth(spawned.at(-1)!)).toBe(true);
         await environmentService(db!).releaseLease(fixture.lease.id, "released");
@@ -390,6 +478,22 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
         result => ({ result }), error => ({ error: String(error) }));
       activeRunId = undefined;
       await writeFile(join(root, `turn-${index}-outcome.json`), JSON.stringify(outcome, null, 2));
+      if (managed) {
+        const managedEvents = await db!.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.runId));
+        const spans = managedEvents.filter(event => event.eventType === "run.performance.span"
+          && record(event.payload).span === "native.controller.warm_owner_identity_check");
+        expect(spans, "the current run's managed preparation must not suppress the identity check").toHaveLength(1);
+        expect(record(spans[0]!.payload).outcome).toBe(resumedFrom === "connected" ? "ok" : "failed");
+        const probes = commands.slice(beforeCommands).filter(command => (record(command).args as string[] | undefined)?.[2] === "paperclip-runner-generation-marker");
+        expect(probes.length).toBe(resumedFrom === "connected" ? 0 : 1);
+        if (resumedFrom === "idle") {
+          expect(new Set(spawned.map(entry => entry.pid)).size, "lost owner retired and a fresh generation admitted").toBe(index);
+          const latestRunner = spawned.at(-1)!;
+          const latestPi = ownedDescendant(latestRunner, "pi");
+          expect(latestPi).not.toBeNull();
+          processPairs.push({ runner: latestRunner, pi: latestPi! });
+        }
+      }
       expect(record(outcome).error, `turn ${index}: ${JSON.stringify(outcome)}`).toBeUndefined();
       if (resumedFrom === "connected") {
         expect(commands.slice(beforeCommands).filter(command =>
@@ -415,15 +519,17 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
       const leases = await db!.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, next.runId));
       expect(leases.map(lease => lease.providerLeaseId)).toEqual([providerLeaseId]);
     }
-    const epochs = resumedFrom === "connected" ? []
+    const epochs = managed || resumedFrom === "connected" ? []
       : readdirSync(join(remoteSessionRoot, "authority-epochs")).filter(name => name.startsWith("epoch-"));
     await writeFile(join(root, "proof.json"), JSON.stringify({ scope: "executePaperclipNativeSession warm path; real runnerd/proxy/Pi; simulated allocation and loopback model",
-      firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs }, null, 2));
+      managed, resumedFrom, firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs }, null, 2));
     stage(`GREEN: three turns of the same conversation (${resumedFrom})`, { epochs });
     await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "closed-owner proof complete" });
   } catch (error) { failure = error; throw error; }
   finally {
     const errors: unknown[] = [];
+    const cleanupBirths = [...spawned.flatMap(runner => ownedDescendants(runner)), ...spawned, ...processPairs.map(pair => pair.pi)];
+    for (const release of preparationReleases) try { await release(); } catch (error) { errors.push(error); }
     if (activeRunId && !earlyOutcome) try { await cancelNativeSession(activeRunId, "test cleanup", { db: db! }); } catch (error) { errors.push(error); }
     try { await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup" }); } catch (error) { errors.push(error); }
     finishHeldResponse?.();
@@ -442,6 +548,13 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
       }
     }
     try { await stopPostgres?.(); } catch (error) { errors.push(error); }
+    const emergencyCleanup = cleanupBirths.filter(sameBirth);
+    if (emergencyCleanup.length) {
+      errors.push(new Error("owned native processes required emergency cleanup after normal retirement"));
+      for (const owned of emergencyCleanup.reverse()) if (sameBirth(owned)) process.kill(owned.pid, "SIGKILL");
+      await vi.waitFor(() => { expect(cleanupBirths.filter(sameBirth)).toEqual([]); }, { timeout: 30_000, interval: 100 });
+      stage("birth-fenced emergency cleanup (test remains RED)", emergencyCleanup);
+    }
     fixtureHttpsAgent?.destroy(); https.globalAgent = previousHttpsAgent;
     setDefaultCACertificates(previousCertificates); vi.unstubAllEnvs();
     await writeFile(join(root, "stages.json"), JSON.stringify(stages, null, 2));
@@ -453,4 +566,4 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
     if (failure) await writeFile(join(root, "failure.txt"), failure instanceof Error ? failure.stack ?? failure.message : String(failure));
     if (errors.length) throw new AggregateError([...(failure ? [failure] : []), ...errors], "lease proof body/cleanup failed; evidence retained");
   }
-}, 600_000);
+}
