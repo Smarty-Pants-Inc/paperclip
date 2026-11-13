@@ -35,6 +35,29 @@ describe("native turn accounting", () => {
     expect(nativeUsageCostUsd(snapshot.usage, provider)).toBe(0.5);
   });
 
+  it.each(["turn.completed", "turn.cancelled", "turn.failed", "turn.interrupted"])(
+    "retains the measured subtotal when incomplete receipts precede or follow %s", terminal => {
+      for (const terminalFirst of [false, true]) {
+        const accounting = createNativeTurnAccounting(provider);
+        const measured = { kind: "usage", usage: { runDeltaComplete: true,
+          runDelta: { inputTokens: 14, outputTokens: 8, cacheReadTokens: 3, cacheWriteTokens: 2, providerCostUsd: 0.25 } } };
+        const partial = { kind: "usage", usage: { runDeltaComplete: false,
+          total: { inputTokens: 999999, outputTokens: 999999 }, runDelta: { inputTokens: 0, outputTokens: 0 } } };
+        const history = [event(1, "turn.started"), event(2, "item.completed", "turn-1", measured),
+          ...(terminalFirst ? [event(3, terminal), event(4, "item.completed", "turn-1", partial)]
+            : [event(3, "item.completed", "turn-1", partial), event(4, terminal)])];
+        history.forEach(value => accounting.observe(value));
+        const snapshot = accounting.snapshot();
+        expect(snapshot.complete).toBe(true);
+        expect(normalizeNativeUsage(snapshot.usage)).toEqual({ inputTokens: 16, outputTokens: 8, cachedInputTokens: 3, cacheWriteTokens: 2 });
+        expect(snapshot.usage).toMatchObject({ accountingUsageLost: true, accountingCostIncomplete: true });
+        expect(nativeUsageCostUsd(snapshot.usage, provider)).toBe(0.25);
+        history.forEach(value => accounting.observe(value));
+        expect(accounting.snapshot()).toEqual(snapshot);
+      }
+    },
+  );
+
   it.each([1, 2])("accounts measured Pi message deltas after %i compactions without counting summaries or replay twice", count => {
     const accounting = createNativeTurnAccounting({ kind: "pi_rpc", model: "paperclip/faux", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" });
     const projector = createPiEventProjector({ runId: "run", turnId: "turn-1" });
@@ -120,7 +143,7 @@ describe("native turn accounting", () => {
     expect(accounting.snapshot().usage).toMatchObject({ accountingUsageLost: true, accountingCostIncomplete: true });
   });
 
-  it("keeps the lower-bound fact after another turn and still rejects unmeasured message deltas", () => {
+  it("keeps both turns' measured lower bounds when the later turn ends on an unmeasured delta", () => {
     const accounting = createNativeTurnAccounting(provider);
     const measured = { kind: "usage", usage: { runDeltaComplete: true, runDelta: { inputTokens: 14, outputTokens: 8 } } };
     [event(1, "turn.started"), event(2, "item.completed", "turn-1", measured),
@@ -132,8 +155,8 @@ describe("native turn accounting", () => {
     expect(normalizeNativeUsage(accounting.snapshot().usage)).toMatchObject({ inputTokens: 28, outputTokens: 16 });
     expect(accounting.snapshot().usage).toMatchObject({ accountingUsageLost: true, accountingCostIncomplete: true });
     accounting.observe(event(8, "item.completed", "turn-2", { kind: "usage", usage: { runDelta: {}, runDeltaComplete: false } }));
-    expect(accounting.snapshot().complete).toBe(false);
-    expect(normalizeNativeUsage(accounting.snapshot().usage)).toMatchObject({ inputTokens: 14, outputTokens: 8 });
+    expect(accounting.snapshot().complete).toBe(true);
+    expect(normalizeNativeUsage(accounting.snapshot().usage)).toMatchObject({ inputTokens: 28, outputTokens: 16 });
   });
 
   it("retains summary provenance from a measured receipt through a later unmarked turn", () => {
