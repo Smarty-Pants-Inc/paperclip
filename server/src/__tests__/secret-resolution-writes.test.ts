@@ -137,6 +137,37 @@ describe("deferred secret resolution writes (audit data safety)", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(insert).toHaveBeenCalledTimes(3);
   });
+  it("shutdown dead-letters a permanently failed batch on its fifth deadline, then persists later arrivals and goes quiet", async () => {
+    vi.useFakeTimers();
+    const recorded: Array<Record<string, unknown>> = [];
+    const failedIds: unknown[] = [];
+    const { db, insert } = fakeDb(async rows => {
+      if (rows.some(row => row.consumerId === "poison")) {
+        failedIds.push(...rows.map(row => row.id));
+        throw new Error("persistent non-FK failure with synthetic-private-error");
+      }
+      recorded.push(...rows);
+    });
+    await enqueueSecretAccessEvent(db, { ...event, consumerId: "poison" });
+    let drained = false;
+    const drain = drainSecretResolutionWrites().then(() => { drained = true; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(insert).toHaveBeenCalledTimes(2);
+    await enqueueSecretAccessEvent(db, { ...event, consumerId: "healthy" });
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(drained).toBe(false);
+    expect(insert).toHaveBeenCalledTimes(8);
+    expect(recorded).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    await drain;
+    expect(drained).toBe(true);
+    expect(insert).toHaveBeenCalledTimes(11);
+    expect(failedIds).toHaveLength(10);
+    expect(new Set(failedIds).size).toBe(1);
+    expect(recorded).toMatchObject([{ consumerId: "healthy" }]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(insert).toHaveBeenCalledTimes(11);
+  });
   it("uses the one-second/N-event deadline, goes quiet, and reactivates on the next producer", async () => {
     vi.useFakeTimers();
     const recorded: Array<Record<string, unknown>> = [];
