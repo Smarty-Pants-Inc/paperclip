@@ -39,17 +39,33 @@ const MAX_EVIDENCE_HEADER_BYTES = 4 * 1024;
 const MAX_EVIDENCE_MANIFEST_BYTES = 1024 * 1024;
 const PI_SESSION_RECORD_PREFIX = /^\s*\{\s*"type"\s*:\s*"session"/;
 
+/** Read up to `cap` bytes, looping over legal short reads. Returns null when
+ * the file could not be read up to min(size, cap): the caller then keeps. */
+async function readPrefix(file: import("node:fs/promises").FileHandle, size: number, cap: number): Promise<Buffer | null> {
+  const want = Math.min(size, cap);
+  const buffer = Buffer.alloc(want);
+  let total = 0;
+  while (total < want) {
+    const { bytesRead } = await file.read(buffer, total, want - total, total);
+    if (bytesRead <= 0) break;
+    total += bytesRead;
+  }
+  return total === want ? buffer : null;
+}
+
+/** A leading UTF-8 BOM is not part of the record. */
+const withoutBom = (text: string) => text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+
 async function hasPiSessionHeader(filename: string): Promise<boolean> {
   let file;
   try {
     file = await open(filename, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     const stat = await file.stat();
     if (!stat.isFile()) return true;
-    const buffer = Buffer.alloc(MAX_EVIDENCE_HEADER_BYTES);
-    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
-    const bytes = buffer.subarray(0, bytesRead);
+    const bytes = await readPrefix(file, stat.size, MAX_EVIDENCE_HEADER_BYTES);
+    if (bytes === null) return true; // incomplete read: undecidable, keep.
     const newline = bytes.indexOf(0x0a);
-    const firstLine = bytes.subarray(0, newline < 0 ? bytes.length : newline).toString("utf8");
+    const firstLine = withoutBom(bytes.subarray(0, newline < 0 ? bytes.length : newline).toString("utf8"));
     // A first line cut by the read cap is undecidable only if it starts as a
     // Pi session record; keep that. Ordinary readable files (binaries, logs,
     // locks, empty files, other JSON) are not Pi history.
@@ -89,11 +105,11 @@ export async function hasNativePiConversationEvidence(root: string): Promise<boo
             manifestFile = await open(filename, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
             const manifestStat = await manifestFile.stat();
             if (!manifestStat.isFile() || manifestStat.size > MAX_EVIDENCE_MANIFEST_BYTES) return true;
-            const buffer = Buffer.alloc(manifestStat.size);
-            const { bytesRead } = await manifestFile.read(buffer, 0, buffer.length, 0);
+            const buffer = await readPrefix(manifestFile, manifestStat.size, MAX_EVIDENCE_MANIFEST_BYTES);
+            if (buffer === null) return true; // incomplete read: undecidable, keep.
             let manifest: { providerKind?: unknown; driverKind?: unknown; directories?: unknown } | null = null;
             // A readable manifest that is not JSON is not a Pi manifest.
-            try { manifest = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")); } catch { manifest = null; }
+            try { manifest = JSON.parse(withoutBom(buffer.toString("utf8"))); } catch { manifest = null; }
             if (manifest?.providerKind === "pi_rpc" || manifest?.driverKind === "pi_rpc"
               || (Array.isArray(manifest?.directories) && manifest.directories.some((child: { name?: unknown }) => isNativePiConversationDirectoryName(String(child?.name))))) return true;
           } catch {
