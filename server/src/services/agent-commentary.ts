@@ -38,7 +38,7 @@ export async function submitAgentCommentary(
   const payloadHash = createHash("sha256").update(JSON.stringify([input.kind, input.body])).digest("hex");
   try {
     // DB-only: a 40P01/40001 rolls back and is retried; publish only after commit.
-    const { result, publication } = await withTransactionRetry(() => db.transaction(async (tx) => {
+    const { result, publication } = await withTransactionRetry(db, () => db.transaction(async (tx) => {
       const scopedDb = tx as unknown as Db;
       // Native authority locks issue before run. Legacy follows the same lock order.
       if (authorizeNative) await authorizeNative(scopedDb);

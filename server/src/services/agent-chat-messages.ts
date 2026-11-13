@@ -48,7 +48,7 @@ export async function sendAgentChatMessage(
   // A deadlock (40P01) or serialization failure (40001) rolls the whole
   // transaction back, so a bounded retry cannot double-post: the retry re-reads
   // the comment by clientRequestId and returns a replayed receipt if it exists.
-  return withTransactionRetry(() => sendAgentChatMessageOnce(db, actor, input, contentHash, credentialScope.data, options));
+  return withTransactionRetry(db, () => sendAgentChatMessageOnce(db, actor, input, contentHash, credentialScope.data, options));
 }
 
 async function sendAgentChatMessageOnce(
