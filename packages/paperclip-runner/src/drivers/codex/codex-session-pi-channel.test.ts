@@ -5,6 +5,48 @@ import { rehydrateRunnerdItemNotification } from "../../live/runnerd-codex-trans
 // Keep: the real 033be069 stress run lost the UI OUTER final channel when
 // a streamed start was cached before its authoritative Pi completion arrived.
 describe("Pi authoritative completion channel", () => {
+  // Keep reason: fresh native identity must reach every live owner cache.
+  it.each(["valid", "wrong-provider", "wrong-conversation", "wrong-previous", "wrong-model", "wrong-thinking", "wrong-readback"]) (
+    "adopts only a scoped, disclosed invalid-history replacement (%s)", async fault => {
+      const recovery = { reason: "pi_session_file_invalid", previousSessionId: "old-native", normalizedSessionId: "conversation",
+        preservedFile: "conversation.jsonl.invalid-2026-11-13T00-00-00Z-00000000-0000-4000-8000-000000000000" };
+      const receipt = { threadId: "fresh-native", providerSessionId: "fresh-native", piNativeAdmission: {
+        provider: "pi_rpc", providerSessionId: "fresh-native", model: "gpt-test", piRpcThinkingLevel: "off", sessionRecovery: recovery,
+      } };
+      if (fault === "wrong-conversation") recovery.normalizedSessionId = "other-conversation";
+      if (fault === "wrong-previous") recovery.previousSessionId = "someone-else";
+      if (fault === "wrong-model") receipt.piNativeAdmission.model = "another-model";
+      if (fault === "wrong-thinking") receipt.piNativeAdmission.piRpcThinkingLevel = "high";
+      if (fault === "wrong-readback") receipt.piNativeAdmission.providerSessionId = "another-native";
+      class RecoveryTransport extends FakeCodexTransport {
+        async attachRun() { return receipt; }
+        override async request(method: string, params: Record<string, unknown>) {
+          const response = await super.request(method, params);
+          return method === "thread/start" ? { ...response, piNativeAdmission: { piRpcThinkingLevel: "off" } } : response;
+        }
+      }
+      const transport = new RecoveryTransport("old-native", "old-native");
+      const session = await makeDriver([transport], fault === "wrong-provider" ? {} : { driverIdentity: { kind: "pi_rpc", displayName: "Pi RPC", version: "1.5.2" } }).openSession({
+        runId: "old-run", normalizedSessionId: "conversation", workingDirectory: WORKSPACE,
+      });
+      try {
+        if (fault !== "valid") {
+          await expect(session.attachRun!({ runId: "new-run" })).rejects.toThrow("pi_session_recovery_identity_refused");
+          expect(session.ids().driverSessionId).toBe("old-native");
+        } else {
+          await session.attachRun!({ runId: "new-run" });
+          expect(session.ids()).toMatchObject({ driverSessionId: "fresh-native", providerSessionId: "fresh-native" });
+          await session.startTurn({ message: { role: "user", text: "Fresh input" } });
+          transport.push("turn/started", { threadId: "fresh-native", turn: { id: "turn-1", status: "inProgress" } });
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      } finally { await session.close({ reason: "test complete" }); }
+      const events: PrpEvent[] = []; for await (const event of session.events()) events.push(event);
+      if (fault === "valid") {
+        expect(events.find(event => event.eventType === "run.attached")?.payload.piSessionRecovery).toEqual(recovery);
+        expect(events.some(event => event.eventType === "session.failed")).toBe(false);
+      }
+    });
   it.each([true, false])("uses the terminal channel with prior start=%s", async started => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport], { driverIdentity: { kind: "pi_rpc", displayName: "Pi RPC", version: "1.5.2" } }).openSession({

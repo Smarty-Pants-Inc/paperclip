@@ -1,9 +1,10 @@
-import { chmod, chown, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { HarnessDriver, PersistedHarnessSession } from "../../contracts/harness-driver.js";
 import { PiRpcDriver } from "./pi-rpc-driver.js";
+import { quarantineInvalidPiSessionFile } from "./pi-session-file.js";
 import type { PiRpcRecord, PiRpcTransport, PiRpcTransportOptions } from "./pi-rpc-transport.js";
 
 // Keep reason: data safety and trust boundary. Pi itself can silently turn a
@@ -45,6 +46,25 @@ async function fixture() {
 }
 
 describe("Pi driver verified cold recovery", () => {
+  it.each(["corrupt", "foreign-workspace", "symlink"]) ("quarantines %s without deleting or following the original entry", async kind => {
+    const f = await fixture();
+    try {
+      const outside = join(f.root, "outside.jsonl");
+      if (kind === "corrupt") await writeFile(f.file, f.content + "{bad tail}\n");
+      if (kind === "foreign-workspace") await writeFile(f.file, JSON.stringify({ ...f.header, cwd: f.runtime }) + "\n");
+      if (kind === "symlink") { await rm(f.file); await writeFile(outside, f.content); await symlink(outside, f.file); }
+      const bytes = await readFile(f.file);
+      const before = await lstat(f.file);
+      await expect(f.recover()).rejects.toMatchObject({ code: "pi_session_file_invalid" });
+      const preserved = await quarantineInvalidPiSessionFile(f.runtime, f.snapshot.normalizedSessionId);
+      const aside = join(f.runtime, preserved);
+      expect(preserved).toMatch(/^conversation\.jsonl\.invalid-\d{4}-\d{2}-\d{2}T/);
+      expect(await readFile(aside)).toEqual(bytes);
+      expect(await lstat(aside)).toMatchObject({ dev: before.dev, ino: before.ino, uid: before.uid, mode: before.mode });
+      await expect(lstat(f.file)).rejects.toMatchObject({ code: "ENOENT" });
+      if (kind === "symlink") { expect(await readlink(aside)).toBe(outside); expect(await readFile(outside)).toEqual(bytes); }
+    } finally { await f.cleanup(); }
+  });
   it("loads the exact file/id and admits a warm session with current home/settings", async () => {
     const f = await fixture();
     try {

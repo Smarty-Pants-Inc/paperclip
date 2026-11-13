@@ -14,6 +14,7 @@ import type {
 import { HarnessStaleTurnError } from "../contracts/harness-driver.js";
 import { parsePiUserInput } from "../drivers/pi/pi-user-input.js";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
+import { quarantineInvalidPiSessionFile } from "../drivers/pi/pi-session-file.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 import {
   openCodeProxyItemNotification,
@@ -215,6 +216,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let cwd = "";
   let activeModel = "";
   let piNativeAdmission: Record<string, unknown> | undefined;
+  let recoveryNoticePending = false;
   let activeTurnId: string | null = null;
   // An idle-abort retirement replaces the process, not the conversation. Keep
   // its actual normalized ID even without the runner's usual environment grant.
@@ -575,6 +577,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     const driver: HarnessDriver = options.createDriver?.(config)
       ?? new PiRpcDriver(config);
     let opened: PiRpcProxySession;
+    let sessionRecovery: { reason: string; previousSessionId: string; normalizedSessionId: string; preservedFile: string } | undefined;
     if (resume) {
       const threadId = text(params.threadId);
       if (!threadId) throw new Error("Pi RPC thread/resume requires the saved native session id");
@@ -593,14 +596,25 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         activeTurnId: null,
         lastSourceSequence: 0,
       };
-      // Resume never pretends a newly minted native identity was restored.
-      // The typed missing-file rejection lets the runner explicitly start a
-      // fresh thread and carry that loss of history into the product notice.
-      const recovered = await driver.recoverSession(snapshot, { signal: openAbort.signal });
-      if (!recovered.recovered || !recovered.session) {
-        throw new Error(recovered.reason ?? "Pi RPC session recovery failed");
+      // Missing history still follows runnerd's explicit thread/start path.
+      // Only the typed invalid-file failure may quarantine this exact entry.
+      let recovered: Awaited<ReturnType<NonNullable<HarnessDriver["recoverSession"]>>> | null = null;
+      try {
+        recovered = await driver.recoverSession(snapshot, { signal: openAbort.signal });
+      } catch (error) {
+        if ((error as { code?: unknown } | null)?.code !== "pi_session_file_invalid") throw error;
+        const preservedFile = await quarantineInvalidPiSessionFile(config.runtimeDirectory, normalizedSessionId);
+        sessionRecovery = { reason: "pi_session_file_invalid", previousSessionId: threadId, normalizedSessionId, preservedFile };
+        log(`[paperclip-runner] owner alarm: pi_session_file_invalid; preserved ${preservedFile}; starting fresh under the same conversation id\n`);
       }
-      opened = recovered.session;
+      if (recovered) {
+        if (!recovered.recovered || !recovered.session) {
+          throw new Error(recovered.reason ?? "Pi RPC session recovery failed");
+        }
+        opened = recovered.session;
+      } else {
+        opened = await driver.openSession({ runId: activeRunId, normalizedSessionId, workingDirectory: cwd, signal: openAbort.signal });
+      }
     } else {
       opened = await driver.openSession({
         runId: activeRunId,
@@ -618,6 +632,14 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     piNativeAdmission = (opened as PiRpcProxySession & { piNativeAdmission?(): Record<string, unknown> }).piNativeAdmission?.();
     if (!options.createDriver && !piNativeAdmission) throw new Error("Native Pi omitted admitted model/thinking metadata");
     if (piNativeAdmission) activeModel = String(piNativeAdmission.model);
+    if (sessionRecovery) {
+      // deferInitialBinding already settled the restored run's unused origin.
+      // Do not settle twice or bypass the ordinary next-run attachment.
+      // Explicit evidence of a fresh native identity, never a fabricated resume
+      // identity. The ordinary model/thinking readback remains mandatory.
+      piNativeAdmission = { ...piNativeAdmission, sessionRecovery };
+      recoveryNoticePending = true;
+    }
     eventPump = pumpEvents(opened).finally(() => {
       // Stop/failure physically retires Pi. Never advertise that dead thread on
       // the next thread/start, and never clear a newer session's authority.
@@ -707,6 +729,13 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         } as Parameters<HarnessSession["startTurn"]>[0] & { piRpcThinkingLevel?: PiThinkingLevel };
         const turn = await session.startTurn(turnInput);
         activeTurnId = turn.turnId;
+        if (recoveryNoticePending) {
+          recoveryNoticePending = false;
+          // Publish under the next active run, not the settled run whose idle
+          // runner was restored. Runner's normal provider notice is durable.
+          send({ method: "warning", params: { threadId: session.ids().driverSessionId, turnId: turn.turnId,
+            message: "My earlier Pi conversation could not be restored (pi_session_file_invalid: the saved file is corrupt, foreign, or has a different identity). The original file was preserved. Starting fresh in this conversation." } });
+        }
         queueMicrotask(() => {
           if (session) announceTurnStarted(session, turn.turnId);
         });

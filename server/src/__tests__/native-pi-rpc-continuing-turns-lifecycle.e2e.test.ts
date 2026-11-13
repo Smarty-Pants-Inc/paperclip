@@ -46,7 +46,11 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async missingFile => {
+it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
+  const missingFile = savedFile === true;
+  const invalidFile = savedFile === "invalid";
+  let preservedBytes: Buffer | undefined;
+  let originalSessionFile: string | undefined;
   expect(["warm", "per_turn"]).toContain(lifecycleMode);
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
@@ -120,6 +124,7 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
     throw new Error(`Timed out at ${label}; wakeups=${JSON.stringify(wakeups)}`);
   };
   try {
+    const ownerAlarm = vi.spyOn((await import("../middleware/logger.js")).logger, "error");
     // Exercise the exact cold sandbox admission entry, not a copied verifier.
     // Only the command transport is local: runner.execute launches the real
     // pack-owned Node/OpenCode through the production child-process executor.
@@ -252,7 +257,12 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
     vi.spyOn(runner, "createRunnerdCodexTransport").mockImplementation(options => {
       stage("transport kind=pi_rpc", { provider: options?.provider, thinking: options?.piRpcThinkingLevel });
       expect(options?.provider).toBe("pi_rpc"); expect(options?.piRpcThinkingLevel).toBe(thinking);
-      const bundle = realFactory(options); bundles.push(bundle); return bundle;
+      // Local idle runner loss normally retires this transport. For the
+      // invalid-file cell, use the existing reconnect policy to reach real
+      // runnerd restore + thread/resume under the full server (no RPC fakes).
+      // This is local execution, not remote-target qualification.
+      const bundle = realFactory(invalidFile ? { ...options, runnerReconnectGraceMs: 10_000 } : options);
+      bundles.push(bundle); return bundle;
     });
     app = await createApp(db, {
       uiMode: "none", serverPort: 0, storageService: createStorageService(createLocalDiskStorageProvider(join(root, "storage"))),
@@ -314,12 +324,13 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
     issueId = issue.id;
     const { heartbeatService } = await import("../services/heartbeat.js");
     let replayedRecoveryNotices = 0;
-    if (missingFile) {
+    if (missingFile || invalidFile) {
       const projection = await import("../services/native-runtime/pi-session-recovery-notice.js");
       const materialize = projection.materializePiSessionRecoveryNotice;
       vi.spyOn(projection, "materializePiSessionRecoveryNotice").mockImplementation(async input => {
         await materialize(input);
-        if (!projection.piSessionRecovery(input.event)) return;
+        if (!projection.piSessionRecovery(input.event)
+          && !JSON.stringify(input.event.payload).includes("pi_session_file_invalid")) return;
         // Replay the exact real receipt concurrently against the live DB,
         // including a repeat after the first projection already committed.
         await Promise.all([materialize(input), materialize(input)]);
@@ -338,6 +349,15 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
         const files = turnProofs[0]!.sessionFiles as string[];
         for (const file of files) await unlink(file); // turn-1 snapshots retain the deleted history
         stage("saved Pi file deleted after resident shutdown", { files, previousPids: turnProofs[0]!.pids });
+      }
+      if (invalidFile && activeTurn === 2) {
+        originalSessionFile = (turnProofs[0]!.sessionFiles as string[])[0]!;
+        preservedBytes = Buffer.concat([readFileSync(originalSessionFile), Buffer.from("{corrupt Pi history between turns}\n")]);
+        await writeFile(originalSessionFile, preservedBytes);
+        process.kill((turnProofs[0]!.pids as Array<{ runnerPid: number }>)[0]!.runnerPid, "SIGKILL");
+        await vi.waitFor(() => expect(bundles[0]!.evidence().diagnostics).toContain("runner process restored its durable PRP session"), { timeout: 20_000, interval: 50 });
+        stage("saved Pi file corrupted; original runner killed and restored", { originalSessionFile,
+          sha256: createHash("sha256").update(preservedBytes).digest("hex"), oldPids: turnProofs[0]!.pids });
       }
       const requestOffset = requests.length;
       const before = await api("GET", `/issues/${issueId}`);
@@ -387,6 +407,7 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
       const currentRequests = requests.slice(requestOffset);
       const row = { turn: activeTurn, inboundCommentId: inbound.id, runId: settled!.id,
         status: settled!.status, nativeSessionId: settled!.nativeSessionId, conversation, issueStatus: closed!.status,
+        piNativeSessionId: JSON.parse(readFileSync(sessionFiles[0]!, "utf8").split("\n")[0]!).id,
         reply: reply.body, pids, sessionFiles, contextSnapshot: settled!.contextSnapshot,
         wakeups, startupReuseEvents: events.filter(event => event.eventType === "run.startup.reuse"),
         nativeProcessStartEvents: events.filter(event => event.eventType === "native.process_start_requested"),
@@ -408,14 +429,43 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
         expect(settled!.contextSnapshot?.wakeReason).toBe("issue_reopened_via_comment");
         // Soft assertions preserve all three regression observations on the
         // baseline, without weakening the test's final pass/fail result.
-        expect.soft(row.assistantHistoryRecall, "missing history is fresh, ordinary history is restored").toBe(!missingFile);
+        expect.soft(row.assistantHistoryRecall, "missing history is fresh, ordinary history is restored").toBe(!missingFile && !invalidFile);
         // Before turn 2 the fact is still Pi-only. After turn 2 it has been
         // intentionally published, so ordinary Paperclip context may include
         // that public reply on turn 3; this is not a history-loss regression.
         if (activeTurn === 2) expect.soft(row.latestInputContainsFact, "first reopen does not replay the Pi-only fact").toBe(false);
-        expect.soft(reply.body).toBe(missingFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
+        expect.soft(reply.body).toBe(missingFile || invalidFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
         expect.soft(settled!.nativeSessionId, "all three reopened turns use the SAME normalized conversation").toBe(turnProofs[0]!.nativeSessionId);
-        if (lifecycleMode === "warm") {
+        if (invalidFile) {
+          const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+          const notices = comments.filter(comment => comment.body.includes("pi_session_file_invalid"));
+          expect(notices, "one visible reason across the fresh turn and its follow-up").toHaveLength(1);
+          expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", tone: "warning" });
+          // The observer above concurrently replays the exact committed receipt
+          // while its run is current, through the same authority checks as G-2.
+          const aside = readdirSync(join(originalSessionFile!, "..")).filter(name => name.startsWith(originalSessionFile!.split("/").at(-1)! + ".invalid-"));
+          expect(aside, "original saved file renamed aside with a timestamp").toHaveLength(1);
+          const asideFile = join(originalSessionFile!, "..", aside[0]!);
+          expect(readFileSync(asideFile)).toEqual(preservedBytes);
+          expect(readFileSync(originalSessionFile!, "utf8")).not.toContain("{corrupt Pi history between turns}");
+          if (activeTurn === 2) {
+            expect(pids[0]!.runnerPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.runnerPid);
+            expect(row.piNativeSessionId).not.toBe(turnProofs[0]!.piNativeSessionId);
+            expect(events.filter(event => event.eventType === "provider.notice.recorded"
+              && JSON.stringify(event.payload).includes("pi_session_file_invalid")), "one durable owner diagnostic").toHaveLength(1);
+          } else {
+            expect(pids).toEqual(turnProofs[1]!.pids);
+            expect(row.piNativeSessionId).toBe(turnProofs[1]!.piNativeSessionId);
+            expect(events.filter(event => event.eventType === "provider.notice.recorded"
+              && JSON.stringify(event.payload).includes("pi_session_file_invalid"))).toHaveLength(0);
+          }
+          const alarms = ownerAlarm.mock.calls.filter(([detail]) => typeof detail === "object"
+            && detail !== null && "code" in detail && detail.code === "pi_session_file_invalid");
+          expect(alarms, "one scoped owner error across recovery, replay and later turns").toHaveLength(1);
+          expect(alarms[0]![0]).toMatchObject({ companyId, agentId, issueId, code: "pi_session_file_invalid" });
+          stage("invalid history safely replaced", { asideFile, notice: notices[0], nativeSessionId: settled!.nativeSessionId,
+            sha256: createHash("sha256").update(readFileSync(asideFile)).digest("hex"), ownerAlarm: alarms[0] });
+        } else if (lifecycleMode === "warm") {
           if (missingFile && activeTurn === 2) {
             expect(pids[0]!.runnerPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.runnerPid);
             expect(pids[0]!.piPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.piPid);
@@ -440,7 +490,7 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
       previousRuns.push(admitted.id);
     }
     expect(turnProofs).toHaveLength(3);
-    if (missingFile) expect(replayedRecoveryNotices).toBeGreaterThan(0);
+    if (missingFile || invalidFile) expect(replayedRecoveryNotices).toBeGreaterThan(0);
     stage("all three observations retained", { companyId, agentId, issueId, replayedRecoveryNotices, turnProofs });
   } catch (error) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });

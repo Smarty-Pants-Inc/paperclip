@@ -251,6 +251,54 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       event: { ...event, runId: f.input.run.id, sourceEventId: randomUUID() } });
     expect(await notices()).toHaveLength(1);
   });
+  it("projects a preserved invalid-Pi-file restart once, with the same authority and replay fences as missing history", async () => {
+    // Keep reason: data safety and scoped ownership on the real DB projection.
+    const f = await piFixture();
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
+    const execution = selected.nativeExecution;
+    const conversation = execution.session.normalizedSessionId;
+    const previousId = randomUUID(), id = randomUUID();
+    const recovery = { reason: "pi_session_file_invalid", normalizedSessionId: conversation, previousSessionId: previousId,
+      preservedFile: `${conversation}.jsonl.invalid-2026-11-13T05-00-00-000Z-${randomUUID()}` };
+    const event = { schema: "paperclip.prp.event.v3", schemaVersion: 3, sourceEventId: randomUUID(), sourceSeq: 1,
+      sourceInstanceId: "runner", sourceKind: "runner", priority: 0, emittedAt: new Date().toISOString(),
+      runId: f.run.id, normalizedSessionId: conversation, eventType: "session.resumed",
+      payload: { provider: "pi_rpc", providerSessionId: id, providerAccountSessionId: id,
+        providerDescriptor: { piNativeAdmission: { providerSessionId: id, sessionRecovery: recovery } } },
+    } as Parameters<typeof materializePiSessionRecoveryNotice>[0]["event"];
+    const attached = { ...event, eventType: "run.attached" as const, payload: { piSessionRecovery: recovery } };
+    const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    const alarm = vi.spyOn((await import("../../middleware/logger.js")).logger, "error");
+    const alarms = () => alarm.mock.calls.filter(([detail]) => typeof detail === "object"
+      && detail !== null && "code" in detail && detail.code === "pi_session_file_invalid");
+    try {
+      for (const invalid of [
+        { ...event, normalizedSessionId: randomUUID() },
+        { ...event, runId: randomUUID() },
+        { ...event, eventType: "item.completed" as const },
+        { ...event, payload: { ...event.payload, provider: "codex" } },
+        { ...event, payload: { ...event.payload, providerSessionId: randomUUID() } },
+        { ...attached, payload: { piSessionRecovery: { ...recovery, normalizedSessionId: randomUUID() } } },
+        { ...attached, payload: { piSessionRecovery: { ...recovery, preservedFile: `../${recovery.preservedFile}` } } },
+        { ...attached, payload: { piSessionRecovery: { ...recovery, preservedFile: `${randomUUID()}.jsonl.invalid-${randomUUID()}` } } },
+      ]) await materializePiSessionRecoveryNotice({ db, execution, event: invalid });
+      expect(await notices()).toHaveLength(0);
+      expect(alarms()).toHaveLength(0);
+      await Promise.all([event, attached, event].map(event => materializePiSessionRecoveryNotice({ db, execution, event })));
+      expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: f.run.id,
+        body: expect.stringContaining("pi_session_file_invalid"), presentation: { kind: "system_notice", tone: "warning" } }]);
+      expect(alarms()).toHaveLength(1);
+      await nextPiTurn(f);
+      const next = await selectHeartbeatRuntime(db, f.input);
+      if (!next.selected || !next.nativeExecution) throw new Error("Expected next selection");
+      await materializePiSessionRecoveryNotice({ db, execution: next.nativeExecution,
+        event: { ...attached, runId: f.input.run.id, sourceEventId: randomUUID() } });
+      expect(await notices()).toHaveLength(1);
+      expect(alarms()).toHaveLength(1);
+    } finally { alarm.mockRestore(); }
+  });
+
   async function connectorFixture(durable = true) {
     const f = await fixture(), { input } = f;
     const home = await mkdtemp(join(tmpdir(), "selection-connector-assets-"));

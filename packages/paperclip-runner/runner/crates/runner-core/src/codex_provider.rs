@@ -1572,7 +1572,14 @@ impl CodexProvider {
                 })?
                 .to_owned();
             if !restarted_missing_history
-                && resume_thread_id.is_some_and(|expected| expected != provider.thread_id)
+                && resume_thread_id.is_some_and(|expected| {
+                    expected != provider.thread_id
+                        && !crate::pi_rpc_recovery::admits_fresh_session(
+                            &config.provider,
+                            expected,
+                            &opened,
+                        )
+                })
             {
                 return Err(LocalRunnerError::invalid(
                     "Codex resumed a different provider thread",

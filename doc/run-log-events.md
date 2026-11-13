@@ -744,6 +744,32 @@ workspace-ready notices, remain available as progress information. They do not
 occupy the run's final reply slot. Final response selection still preserves
 ordinary explicit agent comments and excludes receipt-bound generated progress.
 
+### Pi saved-history recovery
+
+A typed `pi_session_file_missing` refusal starts a new native Pi thread under
+that task's existing normalized conversation identity. A typed
+`pi_session_file_invalid` refusal first renames the exact saved entry aside as
+`<conversation>.jsonl.invalid-<UTC timestamp>-<unique id>`; it never deletes the
+entry or follows a foreign symlink. If preservation fails, recovery fails closed.
+Other admission failures do not authorize a fresh thread.
+
+Both cases project one warning `system_notice` through the existing committed
+and duplicate-event observer. The current company, agent, issue, run and
+conversation generation must still authorize the projection. An issue lock and
+stable recovery provenance key deduplicate event replay and later run rotation.
+The notice is progress, not a final reply; it states that earlier history was
+lost rather than claiming a successful restore.
+
+Invalid-history recovery also records a standard `provider.notice.recorded`
+warning in durable run diagnostics and one scoped server `logger.error` owner
+alarm when the notice is first materialized. The warning names
+`pi_session_file_invalid`; the scoped log also names the preserved basename.
+Neither path logs history bytes. This
+uses the existing run-log and operator logging paths; it does not promise an
+external pager, inbox delivery or a restored transcript. The fresh native
+identity is accepted only with the adapter's explicit scoped recovery receipt;
+normal model, thinking and run-attachment checks remain in force.
+
 ## ACP terminal failure diagnostics
 
 The shared ACP adapter engine preserves typed terminal session failures in the
