@@ -331,7 +331,8 @@ import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js
 import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
-import { materializePiSessionRecoveryNotice, piSessionRecovery, writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
+import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
+  readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -7423,7 +7424,8 @@ const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch
  * later refused message adds none). Nothing else changes: the
  * refusal stands.
  */
-async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
+/** Exported for the notice-writer regression only. */
+export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
   if (!HELD_PREDECESSOR_REFUSAL.test(message)) return;
   const { companyId, issueId, agentId, runId } = input.execution.binding;
@@ -7446,10 +7448,17 @@ async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: Nativ
       const [issue] = await tx.select({ id: issues.id }).from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
       if (!issue) return;
-      await writePiSessionHistoryLossNotice(input.db, tx, { companyId, issueId, runId, agentId,
-        // One notice per held conversation: every later refused message is
-        // itself a failed run without a result and must not add another.
-        authorizationReason: `native_prior_owner_held:${normalizedSessionId}`, body: HELD_PREDECESSOR_NOTICE });
+      // One notice per HOLD: while this conversation's notice stands (no later
+      // run of the same session succeeded with a committed result), every
+      // later refused message adds none. A conversation held again after it
+      // continued gets a fresh notice. The standing rule is the banner's own
+      // reader, under this issue lock.
+      const standing = await readUnsupersededHeldConversationNotice(tx as unknown as Db, { companyId, issueId });
+      if (standing?.normalizedSessionId === normalizedSessionId) return;
+      await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
+        kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
+      }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
+        sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
     });
   } catch (failure) {
     logger.warn({ err: failure, runId }, "held predecessor notice unavailable");
