@@ -165,7 +165,10 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
     // Account and installation access for a direct GitHub sign-in. An OAuth App
     // token still proves identity without it, but shell Git and gh need it, so a
     // failed check is recorded instead of being dropped.
-    const githubMetadata = sourceTemplateKey === "github" && stateRow.subjectUserId
+    const githubSource =
+      (asRecord(connection.config).sourceTemplateKey ??
+        asRecord(connection.transportConfig).sourceTemplateKey) === "github";
+    const githubMetadata = githubSource && stateRow.subjectUserId
       ? await loadGitHubGrantMetadata(token.accessToken).catch(async (error: unknown) => {
           await logActivity(db, {
             companyId: connection.companyId,
@@ -302,7 +305,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
               refreshedAt: connectedAt.toISOString(),
             },
             // A replaced token must not keep the previous account's GitHub identity.
-            ...(sourceTemplateKey === "github" ? { github: githubMetadata ?? undefined } : {}),
+            ...(githubSource ? { github: githubMetadata ?? undefined } : {}),
           },
           credentialSecretRefs: nextCredentialSecretRefs,
           status: "active" as const,

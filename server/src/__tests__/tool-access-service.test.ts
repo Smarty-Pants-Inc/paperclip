@@ -14333,6 +14333,59 @@ describeEmbeddedPostgres("tool access service", () => {
     expect(cloudRequests).toEqual([]);
   });
 
+  it("records GitHub account access when the connection marks GitHub only in its transport config", async () => {
+    const company = await createCompany(db);
+    const userId = `github-own-app-transport-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use", "tools:manage_connections"]);
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+    const service = createTestToolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "github", connectionMethodKey: "own-oauth", name: "GitHub own app", grantKind: "user",
+      oauthClient: { clientId: "github-app-client", clientSecret: "github-app-secret" },
+    }, actor);
+    const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor, subjectUserId: userId });
+    const [saved] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const { sourceTemplateKey, ...configWithoutMarker } = saved.config as Record<string, unknown>;
+    expect(sourceTemplateKey).toBe("github");
+    await db.update(toolConnections).set({
+      config: configWithoutMarker,
+      transportConfig: { ...(saved.transportConfig as Record<string, unknown>), sourceTemplateKey: "github" },
+    }).where(eq(toolConnections.id, connected.connectionId));
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (href === "https://api.githubcopilot.com/mcp/") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string; method?: string };
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: payload.method === "tools/list"
+            ? { tools: [] }
+            : { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "GitHub test", version: "1.0.0" } },
+        });
+      }
+      if (href === "https://api.github.com/user") return Response.json({ id: 1003, login: "transport-account" });
+      if (href.startsWith("https://api.github.com/user/installations?")) {
+        return Response.json({ total_count: 1, installations: [{ id: 99, repository_selection: "selected", account: { login: "smarty" } }] });
+      }
+      if (href.startsWith("https://api.github.com/user/installations/99/repositories?")) {
+        return Response.json({ total_count: 1, repositories: [{ id: 3, full_name: "smarty/app" }] });
+      }
+      if (href !== "https://github.com/login/oauth/access_token") throw new Error(`unexpected fetch ${href}`);
+      return Response.json({ access_token: "ghu-transport", refresh_token: "ghr-transport", expires_in: 28800, token_type: "bearer" });
+    });
+    await service.completeOAuthCallback({
+      state: new URL(started.authorizationUrl).searchParams.get("state")!, code: "github-code", redirectUri, actor,
+    });
+    const [grant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connected.connectionId),
+      eq(connectionGrants.kind, "user"),
+      eq(connectionGrants.subjectUserId, userId),
+    ));
+    expect(grant).toMatchObject({ status: "active" });
+    expect(grant.providerTenant?.github).toMatchObject({ login: "transport-account", installationCount: 1, repositoryCount: 1 });
+  });
+
   it("signs in through the deployment's own GitHub App client without storing it per connection", async () => {
     const github = getConnectableAppDefinition("github")!;
     expect(appWithDeploymentOAuthClient(github)).not.toHaveProperty("deploymentOAuthClient");
