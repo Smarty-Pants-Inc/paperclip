@@ -3358,6 +3358,32 @@ resumed allocation whose own state is missing, a source whose run is still
 active, and a source with an export still pending remain ambiguous and fail
 closed.
 
+A resumed allocation can instead have its suspended Runner and provider state
+intact but a missing, invalid or foreign cold-resume file. The persistence profile
+declares those files (Pi's conversation JSONL is one). If a compatible controller
+backup contains the file, Paperclip verifies the backup before asking the provider
+to resume. On the same allocation, it repairs only that file through the existing
+file-staging path, and only when the entire saved Runner checkpoint and provider
+identity match and the controller cursor is not ahead of the backup. It never
+rewinds Runner/provider state. A different allocation still requires the full
+restore's source-lease proof.
+
+Pi's own pack-owned validator runs on the execution host, not the controller's
+filesystem. A valid live file is left alone. A candidate from the verified backup
+must also pass the same no-follow, owner, cwd, native identity and JSONL checks
+before the live entry is touched. An invalid or foreign entry is renamed aside
+through Pi's existing quarantine operation; a symlink target is never followed or
+changed. Quarantined links are kept in the sibling `pi.quarantined-links` evidence
+directory, outside the live no-links checkpoint archive. The archive retains an
+inert JSON receipt with the original link's path, target and inode metadata; it
+never restores or dereferences that link. Exclusive copy prevents clobbering a newly appearing entry, and the
+verified candidate is retained as repair evidence. Successful repair keeps the
+same native conversation and emits no history-loss receipt or notice. An unusable
+candidate leaves the original entry untouched for ordinary typed provider recovery.
+A newer checkpoint or an unavailable validation path fails closed; a file absent
+from the backup too remains the provider's recovery decision. Existing backup
+manifests and sessions carry forward without migration.
+
 A Runner close can also fail to prove suspension after the control plane
 accepted the run's result (`native.post_result_failure` with category
 `runner_settlement_incomplete`). The provider work is complete, so this is not
