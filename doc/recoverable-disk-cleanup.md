@@ -147,8 +147,16 @@ conversation yet. Probes allocate under that scope on the durable state volume,
 not the OS temporary directory. On retirement for every provider (including Codex
 and Pi), the whole runtime (including metadata-only and failed-admission diagnostics)
 moves into `conversation-evidence`. This also applies to preparation failures before
-probe handoff. A still-existing probe with no resolvable evidence scope blocks cleanup
-with `native_setup_evidence_not_retained`; it is never treated as disposable scratch.
+probe handoff. Setup cleanup can move or remove only scratch allocated by its own
+creator in the current server process, with the same filesystem device and inode.
+An existing live session, lookalike setup path, or replaced directory is left intact
+and rejected with `native_setup_evidence_not_owned`. Missing roots make repeated
+confirmed cleanup a no-op. A still-existing owned probe with no resolvable evidence
+scope blocks cleanup with `native_setup_evidence_not_retained`; it is never treated
+as disposable scratch. Existing evidence and live session paths do not change on
+upgrade; old unowned scratch stays preserved rather than being adopted for deletion.
+The durable-sessions base also contains setup scopes, evidence and quarantine, so
+readers must use their actual transport's session path, not its first directory entry.
 A remote probe first pulls the complete retired remote root through the existing
 runner backup sync-out path, without exclusions, and commits that local tree into
 permanent evidence **before** removing the remote root. A pull or evidence move

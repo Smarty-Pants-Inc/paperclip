@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -92,12 +92,54 @@ it("pulls real raw bytes through the existing backup tar path before source reti
     afterSha256: createHash("sha256").update(await readFile(retained)).digest("hex"), sourceRemoved: true }, null, 2));
 }, 60_000);
 
-it("fails closed when a whole-tree probe has no resolvable evidence scope", async () => {
-  const root = await fixture(); // odd/unscoped state path, no sourceScope binding
+it("fails closed when cleanup did not create the source", async () => {
+  const root = await fixture(); // An arbitrary existing tree is not setup scratch.
   const trace = join(root, "raw-session.ndjson");
   await writeFile(trace, "sole copy\n");
-  await expect(cleanupNativeSetupRuntime(root, true)).rejects.toThrow("native_setup_evidence_not_retained");
+  await expect(cleanupNativeSetupRuntime(root, true)).rejects.toThrow("native_setup_evidence_not_owned");
   expect(await readFile(trace, "utf8")).toBe("sole copy\n");
+  expect(logger.info).not.toHaveBeenCalled();
+});
+
+// Keep: the full-server regression reads runtime-context.json again on a warm
+// session. Setup cleanup must never retire that live root, even if misdirected.
+it.each([
+  { wholeTree: false, piHistory: false }, { wholeTree: true, piHistory: false },
+  { wholeTree: false, piHistory: true }, { wholeTree: true, piHistory: true },
+])("refuses a live session root during setup cleanup ($wholeTree, Pi=$piHistory)", async ({ wholeTree, piHistory }) => {
+  const state = await fixture();
+  const live = join(state, "f".repeat(64));
+  await mkdir(live, { mode: 0o700 });
+  const context = join(live, "runtime-context.json");
+  await writeFile(context, '{"session":"live"}\n');
+  if (piHistory) {
+    await mkdir(join(live, "pi"));
+    await writeFile(join(live, "pi", "history.jsonl"), "live history\n");
+  }
+  const setup = await createNativeSetupRuntime("company");
+  await writeFile(join(setup, "provider-trace.ndjson"), "retired probe\n");
+  await cleanupNativeSetupRuntime(setup, true);
+  expect(await readFile(context, "utf8")).toBe('{"session":"live"}\n');
+  let cleanupError: unknown;
+  try { await cleanupNativeSetupRuntime(live, wholeTree); } catch (error) { cleanupError = error; }
+  // Read before checking the refusal: on the regressed code this is the same
+  // ENOENT as the full-server context read, not merely a mock-call mismatch.
+  expect(await readFile(context, "utf8")).toBe('{"session":"live"}\n');
+  if (piHistory) expect(await readFile(join(live, "pi", "history.jsonl"), "utf8")).toBe("live history\n");
+  expect(cleanupError).toMatchObject({ message: "native_setup_evidence_not_owned" });
+  expect(logger.info).not.toHaveBeenCalledWith(expect.objectContaining({ source: live }));
+});
+
+it("refuses a replacement directory at a previously owned scratch path", async () => {
+  await fixture();
+  const root = await createNativeSetupRuntime("company");
+  await writeFile(join(root, "provider-trace.ndjson"), "original evidence\n");
+  await rename(root, `${root}.original`);
+  await mkdir(root, { mode: 0o700 });
+  await writeFile(join(root, "runtime-context.json"), "foreign replacement\n");
+  await expect(cleanupNativeSetupRuntime(root, true)).rejects.toThrow("native_setup_evidence_not_owned");
+  expect(await readFile(join(root, "runtime-context.json"), "utf8")).toBe("foreign replacement\n");
+  expect(await readFile(join(`${root}.original`, "provider-trace.ndjson"), "utf8")).toBe("original evidence\n");
   expect(logger.info).not.toHaveBeenCalled();
 });
 
