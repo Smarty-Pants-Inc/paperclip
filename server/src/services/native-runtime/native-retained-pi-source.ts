@@ -16,14 +16,84 @@ export interface RetainedPiSourceEvidence {
   runnerState: unknown;
   providerState: unknown;
   processesAbsent: boolean;
+  /** Authenticated, exact-run controller journal; never a caller-supplied flag. */
+  checkpointRecords?: ReadonlyMap<string, string>;
+}
+
+/** Pi's turn/interrupt reply is synchronous settlement evidence: its adapter
+ * clears queues, stops owned children, awaits abort AND agent_settled, then
+ * re-admits. Escalation throws instead of replying successfully. A physical
+ * turn.stop clears completed-turn authority, so bind this alternative to the
+ * exact accepted provider turn and completed interrupt/drain/suspend receipts
+ * (plus native cancellation or physical turn.stop), not merely to `prepared`
+ * or to a cancelled business-run status.
+ * A terminal frame can be in the provider FIFO when turn.stop retires it; the
+ * successful Pi interrupt receipt still certifies native cancellation. */
+function settledPiInterrupt(input: RetainedPiSourceEvidence, provider: Record<string, unknown>): boolean {
+  if (input.runStatus !== "cancelled" || !input.checkpointRecords
+    || !["prepared", "session_open"].includes(String(provider.lifecycle)) || provider.completedTurnAuthoritative !== false
+    || provider.completedProviderTurnId !== null || provider.completedTurnProcessGeneration !== null) return false;
+  try {
+    const commands = [...input.checkpointRecords].filter(([key]) => /^command:\d+$/.test(key))
+      .map(([, bytes]) => record(JSON.parse(bytes))).sort((a, b) => Number(a.controllerSeq) - Number(b.controllerSeq));
+    const result = (command: Record<string, unknown>) => record(record(command.result).result);
+    if (!commands.length || commands.some(command => command.status !== "completed"
+      || record(command.result).status !== "completed" || record(command.result).commandId !== command.commandId
+      || record(command.result).commandType !== command.type || record(command.result).controllerSeq !== command.controllerSeq)) return false;
+    const start = commands.findLast(command => command.type === "turn.start");
+    const turnId = start && result(start).providerTurnId;
+    if (!start || result(start).status !== "accepted" || typeof turnId !== "string" || !turnId
+      || !Array.isArray(provider.settledProviderTurnIds) || !provider.settledProviderTurnIds.includes(turnId)) return false;
+    const interrupt = commands.findLast(command => command.type === "turn.interrupt");
+    const stop = commands.findLast(command => command.type === "turn.stop");
+    const drain = commands.findLast(command => command.type === "runner.drain");
+    const suspend = commands.at(-1);
+    if (!interrupt || !drain || !suspend || suspend.type !== "runner.suspend"
+      || !(Number(start.controllerSeq) < Number(interrupt.controllerSeq)
+        && Number(interrupt.controllerSeq) < Number(drain.controllerSeq) && Number(drain.controllerSeq) < Number(suspend.controllerSeq))
+      || record(interrupt.payload).threadId !== input.providerSessionId || record(interrupt.payload).turnId !== turnId
+      || result(interrupt).providerTurnId !== turnId || result(interrupt).status !== "interrupt_requested"
+      || (stop && (!(Number(interrupt.controllerSeq) < Number(stop.controllerSeq) && Number(stop.controllerSeq) < Number(drain.controllerSeq))
+        || result(stop).status !== "stopped" || result(stop).providerExitConfirmed !== true
+        || ![turnId, null].includes(result(stop).providerTurnId as string | null)))
+      || result(drain).retainedEventsDrained !== true || result(suspend).status !== "completed") return false;
+    const events = [...input.checkpointRecords].filter(([key]) => /^event:\d+$/.test(key))
+      .map(([, bytes]) => record(JSON.parse(bytes)));
+    let accepted = false, requested = false, cancelled = false;
+    for (const event of events) {
+      const envelope = record(event.envelope), prp = record(envelope.payload), payload = record(prp.payload);
+      if (!["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId", "turnId", "itemId"]
+        .every(key => envelope[key] === input.identity[key]) || prp.runId !== input.identity.runId
+        || prp.normalizedSessionId !== input.identity.normalizedSessionId || prp.sourceInstanceId !== input.identity.runnerInstanceId
+        || event.eventType !== prp.eventType) return false;
+      const diagnostic = record(payload.details);
+      if ([payload.code, diagnostic.code, record(payload.error).code].some(code =>
+        typeof code === "string" && /pi_abort_escalated|side_effect.*(?:pending|uncertain)|cleanup_uncertain/.test(code))) return false;
+      if (event.eventType === "turn.accepted" && payload.providerTurnId === turnId) accepted = true;
+      if (event.eventType === "harness.diagnostic" && payload.code === "provider_interrupt_requested"
+        && payload.providerTurnId === turnId) {
+        if (!emptyArray(payload.pendingCallIds)) return false;
+        requested = true;
+      }
+      if (event.eventType === "turn.cancelled" && payload.providerTurnId === turnId) cancelled = true;
+    }
+    // A terminal already consumed by the controller makes turn.stop needless:
+    // runner.suspend owns physical retirement, verified separately by the
+    // lineage reader. Without that native cancelled frame require turn.stop.
+    return accepted && requested && (stop
+      ? provider.lifecycle === "prepared" && (result(stop).providerTurnId === turnId || cancelled)
+      : provider.lifecycle === "session_open" && cancelled);
+  } catch { return false; }
 }
 
 /** A failed business turn is not a committed result. Only a separately stopped,
- * authoritative idle Pi checkpoint may cross this read-only admission boundary.
+ * authoritative idle or proven clean-interrupted Pi checkpoint may cross this read-only admission boundary.
  * This never settles/replays a turn or retires process-scoped authority. */
 export function isQuiescentRetainedPiSource(input: RetainedPiSourceEvidence): boolean {
   const runner = record(input.runnerState), provider = record(input.providerState);
   const pendingTools = record(provider.toolBridge).pending;
+  const completed = provider.lifecycle === "session_open" && provider.completedTurnAuthoritative === true;
+  const interrupted = settledPiInterrupt(input, provider);
   return input.owner.phase === "terminal_failure" && input.owner.leaseOwner === null
     && input.owner.resultId === null && input.owner.recoveryState === null
     && ["cancelled", "failed", "interrupted", "timed_out"].includes(input.runStatus)
@@ -35,7 +105,7 @@ export function isQuiescentRetainedPiSource(input: RetainedPiSourceEvidence): bo
     && runner.pendingProviderCleanup == null && runner.warmTransition == null && runner.recoverableFailure == null
     && provider.schema === "paperclip.runner.codex-provider-state.v1"
     && record(provider.config).provider === "pi_rpc" && record(provider.config).driver === "pi_rpc"
-    && provider.lifecycle === "session_open" && provider.completedTurnAuthoritative === true
+    && (completed || interrupted)
     && typeof input.providerSessionId === "string" && input.providerSessionId.length > 0
     && provider.providerSessionId === input.providerSessionId && provider.threadId === input.providerSessionId
     && provider.activeProviderTurnId === null && provider.startupAttempt === null
