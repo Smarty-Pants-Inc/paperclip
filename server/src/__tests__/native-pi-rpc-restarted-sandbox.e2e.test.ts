@@ -87,6 +87,18 @@ function sessionFile(pi: Birth): string {
 
 // "recover" continues from the saved checkpoint; "open" is a fresh open with
 // no usable warm checkpoint over the same dead owner's root.
+// The live owner keeps its working ingress, so nothing should touch its runner
+// state: assert it is byte-identical, and save before/after plus any changed
+// keys as evidence (a failure names the keys).
+const assertLiveOwnerStateKept = async (path: string, before: Buffer, evidence: string) => {
+  const after = await readFile(path);
+  const was = JSON.parse(before.toString()), now = JSON.parse(after.toString());
+  const changed = Object.keys({ ...was, ...now }).filter(key => JSON.stringify(was[key]) !== JSON.stringify(now[key]));
+  await writeFile(evidence, JSON.stringify({ changed, before: was, after: now }, null, 2));
+  expect(changed, "live owner runner-state keys changed").toEqual([]);
+  expect(after.equals(before), "live owner runner-state bytes unchanged").toBe(true);
+};
+
 // "alive" (RFL F1): Boat may resume the same machine with its programs still
 // running, so the restarted label alone never retires an owner. The owner
 // stays alive, its close never happens, and the successor must refuse
@@ -361,7 +373,9 @@ it.skipIf(!enabled).each(["recover", "open", "alive"] as const)("REG-26: a provi
         .catch(error => { stage("dead owner close failed", String(error)); });
       closedSessions.add(firstSession);
     }
-    leaseActive.set(first.lease.id, false);
+    // The live owner ("alive") keeps its working ingress: only the DB lease is
+    // handed over, so nothing in this test disturbs the owner it checks.
+    if (mode !== "alive") leaseActive.set(first.lease.id, false);
     await environmentsService.releaseLease(first.lease.id, "released");
     const resultId = randomUUID();
     await db.insert(nativeRunResults).values({ id: resultId, companyId, issueId, runId: first.runId,
@@ -426,10 +440,9 @@ it.skipIf(!enabled).each(["recover", "open", "alive"] as const)("REG-26: a provi
         /restarted_sandbox_runner_generation_not_lost|runner_state_identity_mismatch|native_runner_authority_rotation_requires_settled_state/);
       expect(sameBirth(processPairs[0]!.runner)).toBe(true); expect(sameBirth(processPairs[0]!.pi)).toBe(true);
       expect(existsSync(join(remoteSessionRoot, "authority-epochs")) ? readdirSync(join(remoteSessionRoot, "authority-epochs")) : []).toEqual([]);
-      expect((await readFile(join(remoteSessionRoot, "runner", "runner-state.json"))).equals(sourceRunnerBytes)).toBe(true);
+      await assertLiveOwnerStateKept(join(remoteSessionRoot, "runner", "runner-state.json"), sourceRunnerBytes, join(root, "live-owner-runner-state.json"));
       expect(new Set(spawned.map(entry => entry.pid)).size, "no successor Runner was launched").toBe(1);
       // Cleanup only: the live owner closes through its own lease.
-      leaseActive.set(first.lease.id, true);
       await cancelThenClose(firstSession, "live-owner proof complete");
       await vi.waitFor(() => { expect(sameBirth(processPairs[0]!.runner)).toBe(false); }, { timeout: 15_000, interval: 50 });
       await Promise.allSettled(pumps);

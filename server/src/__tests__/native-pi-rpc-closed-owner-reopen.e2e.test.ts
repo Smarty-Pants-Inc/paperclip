@@ -90,6 +90,18 @@ function sessionFile(pi: Birth): string {
 // and from then on every turn on this conversation opens a fresh Runner over
 // the durable root still stamped with the closed owner's identity. Each fresh
 // open must rotate that suspended authority and continue the same Pi file.
+// The live owner keeps its working ingress, so nothing should touch its runner
+// state: assert it is byte-identical, and save before/after plus any changed
+// keys as evidence (a failure names the keys).
+const assertLiveOwnerStateKept = async (path: string, before: Buffer, evidence: string) => {
+  const after = await readFile(path);
+  const was = JSON.parse(before.toString()), now = JSON.parse(after.toString());
+  const changed = Object.keys({ ...was, ...now }).filter(key => JSON.stringify(was[key]) !== JSON.stringify(now[key]));
+  await writeFile(evidence, JSON.stringify({ changed, before: was, after: now }, null, 2));
+  expect(changed, "live owner runner-state keys changed").toEqual([]);
+  expect(after.equals(before), "live owner runner-state bytes unchanged").toBe(true);
+};
+
 // "alive" (RFL F1): the owner's close never succeeds (here: it never runs),
 // so its Runner stays live and unsuspended. A fresh open must refuse and
 // leave it untouched: never rotate or replace a live owner.
@@ -380,7 +392,9 @@ it.skipIf(!enabled).each(["closed", "alive"] as const)("a fresh open over a Runn
       }).where(eq(heartbeatRuns.id, previous.runId));
       await db.update(nativeRunFinalizations).set({ phase: "committed", resultId, leaseOwner: null, leaseExpiresAt: null,
         recoveryState: null }).where(eq(nativeRunFinalizations.runId, previous.runId));
-      leaseActive.set(previous.lease.id, false);
+      // The live owner ("alive") keeps its working ingress: only the DB lease is
+      // handed over, so nothing in this test disturbs the owner it checks.
+      if (mode !== "alive") leaseActive.set(previous.lease.id, false);
       await environmentsService.releaseLease(previous.lease.id, "released");
       if (mode === "alive") {
         expect(JSON.parse(liveRunnerBytes!.toString()).lifecycle).not.toBe("suspended");
@@ -402,10 +416,9 @@ it.skipIf(!enabled).each(["closed", "alive"] as const)("a fresh open over a Runn
           /runner_state_identity_mismatch|native_runner_authority_rotation_requires_settled_state|native_session_supervisor_busy/);
         expect(sameBirth(processPairs[0]!.runner)).toBe(true); expect(sameBirth(processPairs[0]!.pi)).toBe(true);
         expect(existsSync(join(remoteSessionRoot, "authority-epochs")) ? readdirSync(join(remoteSessionRoot, "authority-epochs")) : []).toEqual([]);
-        expect((await readFile(join(remoteSessionRoot, "runner", "runner-state.json"))).equals(liveRunnerBytes!)).toBe(true);
+        await assertLiveOwnerStateKept(join(remoteSessionRoot, "runner", "runner-state.json"), liveRunnerBytes!, join(root, "live-owner-runner-state.json"));
         expect(new Set(spawned.map(entry => entry.pid)).size, "no successor Runner was launched").toBe(1);
         // Cleanup only: the live owner closes through its own lease.
-        leaseActive.set(previous.lease.id, true);
         await cancelThenClose(firstSession, "live-owner proof complete");
         await vi.waitFor(() => { expect(sameBirth(processPairs[0]!.runner)).toBe(false); }, { timeout: 15_000, interval: 50 });
         await Promise.allSettled(pumps);
