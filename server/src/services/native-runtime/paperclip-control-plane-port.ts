@@ -326,7 +326,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       if (owner && selected) await measureNativeControllerStep("checkpoint_owner_validate", () => validateNativeRunnerCheckpointOwner(tx, owner,
         { leaseOwner: selected.leaseOwner ?? null, leaseExpiresAt: selected.leaseExpiresAt ?? null,
           resultId: selected.resultId ?? null, phase: selected.phase!, failureCode: selected.failureCode ?? null,
-          recoveryState: selected.recoveryState ?? null, now: selected.now }, !snapshot.semanticResult));
+          recoveryState: selected.recoveryState ?? null, now: selected.now }, !snapshot.semanticResult,
+        { checkpointMaintenanceOnly: false }));
       const header = recovery && selected?.checkpointHeader
         ? inspectNativeRunnerUpgradeHeader(this.#binding, selected.checkpointHeader) : null;
       if (header && (header.normalizedSessionId !== identity.sessionId || header.runnerInstanceId !== this.#binding.sourceInstanceId)) {
@@ -595,7 +596,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       }
       if (recovery && owner) {
         const [clock] = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
-        await validateNativeRunnerCheckpointOwner(tx, recovery.owner, { ...owner, now: clock.now }, false);
+        await validateNativeRunnerCheckpointOwner(tx, recovery.owner, { ...owner, now: clock.now }, false,
+          { checkpointMaintenanceOnly: false });
       }
 
       const callerConditions = [eq(nativeRunResults.serverFingerprint, serverFingerprint)];

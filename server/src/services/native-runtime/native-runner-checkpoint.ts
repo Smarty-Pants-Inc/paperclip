@@ -89,6 +89,7 @@ export async function lockNativeRunnerCheckpointOwner(
 export async function validateNativeRunnerCheckpointOwner(
   tx: CheckpointTransaction, owner: NativeRunnerCheckpointFenceOwner,
   owned: Awaited<ReturnType<typeof lockNativeRunnerCheckpointOwner>>, newWork: boolean,
+  authorization: { checkpointMaintenanceOnly: boolean },
 ): Promise<void> {
   const current = owned;
   const activeOwner = owner.leaseOwner !== null && current.leaseOwner === owner.leaseOwner
@@ -113,18 +114,35 @@ export async function validateNativeRunnerCheckpointOwner(
             .where(eq(nativeRunFinalizations.runId, heartbeatRuns.id))))) : [];
     // A clean retained Stop has no semantic result by design. Its exact
     // controller epoch can still persist maintenance (auth, ACK, snapshots),
-    // never new work. The executor publishes this receipt only after Pi's
-    // cancellation/child cleanup and idle snapshot have all been proved.
+    // never new work or semantic publication. Only the checkpoint writer opts
+    // in; result, session and artifact callers retain the no-result fence.
+    // A native successor must retain this exact physical runner and session;
+    // a generic same-boot lease must not authorize a different runner's writer.
+    // Preparation may precede runner selection, but a bound different runner
+    // revokes idle authority immediately. The receipt's controller generation
+    // remains checked by the coordinator lock and below.
+    // The executor issues the receipt only after cancellation/child cleanup
+    // and the idle snapshot have all been proved.
     let retainedIdle = false;
-    if (!current.resultId && !newWork && owner.runId === owner.authorityRunId
+    if (authorization.checkpointMaintenanceOnly && !current.resultId && !newWork
+      && owner.runId === owner.authorityRunId
       && current.leaseOwner === null && current.phase === "terminal_failure"
       && current.failureCode === "native_retry_cancelled" && current.recoveryState === null) {
       const [run] = await tx.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, owner.runId), eq(heartbeatRuns.companyId, owner.companyId),
         eq(heartbeatRuns.nativeIssueId, owner.issueId))).for("share");
+      const [nextRun] = task?.executionRunId && task.executionRunId !== owner.runId
+        ? await tx.select({ runnerInstanceId: heartbeatRuns.runnerInstanceId, sessionId: heartbeatRuns.nativeSessionId })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, task.executionRunId),
+            eq(heartbeatRuns.companyId, owner.companyId))) : [];
+      const sameRunner = !!run?.runnerInstanceId && nextRun?.runnerInstanceId === run.runnerInstanceId
+        && nextRun.sessionId === run.nativeSessionId;
+      const noRunnerSelected = !!preparingSuccessor && !!nextRun && nextRun.runnerInstanceId === null;
+      const runnerUnchanged = !task?.executionRunId || task.executionRunId === owner.runId
+        || (!!successor && sameRunner) || noRunnerSelected;
       const value = run?.runnerProfileJson?.nativeRetainedIdleCheckpoint;
       const receipt = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-      retainedIdle = !!run && run.status === "cancelled" && hasAcknowledgedNativeStopIntent(run)
+      retainedIdle = runnerUnchanged && !!run && run.status === "cancelled" && hasAcknowledgedNativeStopIntent(run)
         && receipt.schema === "paperclip.native-retained-idle-checkpoint.v1"
         && receipt.runId === owner.runId && receipt.companyId === owner.companyId && receipt.issueId === owner.issueId
         && receipt.sessionId === run.nativeSessionId && receipt.bootId === owner.bootId && receipt.generation === owner.generation;
@@ -135,9 +153,10 @@ export async function validateNativeRunnerCheckpointOwner(
   }
 }
 
-export async function assertNativeRunnerCheckpointOwner(tx: CheckpointTransaction, owner: NativeRunnerCheckpointOwner, newWork: boolean) {
+export async function assertNativeRunnerCheckpointOwner(tx: CheckpointTransaction, owner: NativeRunnerCheckpointOwner, newWork: boolean,
+  authorization: { checkpointMaintenanceOnly: boolean }) {
   const locked = await lockNativeRunnerCheckpointOwner(tx, owner);
-  await validateNativeRunnerCheckpointOwner(tx, owner, locked, newWork);
+  await validateNativeRunnerCheckpointOwner(tx, owner, locked, newWork, authorization);
 }
 
 export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpointOwner) {
@@ -151,7 +170,8 @@ export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpoi
         await measureNativeControllerStep("source_coordinator_locks", () => lockSourceRecoveryCoordinators(tx, owner.companyId, [owner.runId, owner.authorityRunId]));
         await assertNativeSourceCheckpointConsumer(tx, owner, checkpoint);
       }
-      await measureNativeControllerStep("runner_checkpoint_owner", () => assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id))));
+      await measureNativeControllerStep("runner_checkpoint_owner", () => assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id)),
+        { checkpointMaintenanceOnly: true }));
       if (checkpoint.reset || checkpoint.changedRecords.has("header") || checkpoint.removedRecords.includes("header")) {
         const [header] = await measureNativeControllerStep("runner_checkpoint_header_read", () => tx.select({ material: nativeRunnerCheckpoints.material }).from(nativeRunnerCheckpoints).where(and(
           eq(nativeRunnerCheckpoints.companyId, owner.companyId), eq(nativeRunnerCheckpoints.runId, owner.runId),

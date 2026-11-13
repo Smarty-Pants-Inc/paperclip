@@ -179,7 +179,7 @@ async function recordNativeProviderPackAdmissionOnce(db: Db, input: AdmissionInp
       await assertNativeRunnerCheckpointOwner(tx, { companyId: input.identity.companyId,
         issueId: input.identity.issueId, runId: input.identity.runId, authorityRunId: input.identity.runId,
         bootId: input.claim.controllerBootId, leaseOwner: input.claim.leaseOwner,
-        generation: input.claim.controllerGeneration }, false);
+        generation: input.claim.controllerGeneration }, false, { checkpointMaintenanceOnly: false });
     }
     const [owner] = await measureNativeControllerStep("admission_owner_lock", () => tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
       eq(nativeRunFinalizations.runId, input.identity.runId), eq(nativeRunFinalizations.companyId, input.identity.companyId),
