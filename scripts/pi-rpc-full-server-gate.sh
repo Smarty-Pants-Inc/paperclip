@@ -113,8 +113,9 @@ unset PAPERCLIP_PI_E2E_EXCLUDE_SUBAGENTS
 export PAPERCLIP_PI_E2E_FIXTURE_MANIFEST_SHA256=$(sha256sum "$PAPERCLIP_PI_E2E_HOME_FIXTURE/SHA256SUMS" | cut -d' ' -f1)
 export L3_RUN="$run" L3_SHA="$sha"
 # Select once: the receipt hashes exactly the test files passed to Vitest below.
-# Stop/continue is mandatory; the older warm test defaults on but can be omitted.
-tests=(src/__tests__/native-pi-rpc-full-server.e2e.test.ts src/__tests__/native-pi-rpc-stop-continue.e2e.test.ts)
+# Stop/continue and Done/comment continuing turns are mandatory; the older warm
+# test defaults on but can be omitted. Strict continuity is a separate image opt-in.
+tests=(src/__tests__/native-pi-rpc-full-server.e2e.test.ts src/__tests__/native-pi-rpc-stop-continue.e2e.test.ts src/__tests__/native-pi-rpc-continuing-turns.e2e.test.ts)
 if [ "${PAPERCLIP_PI_GATE_INCLUDE_STOP:-1}" = 1 ]; then tests+=(src/__tests__/native-pi-rpc-stop-warm.e2e.test.ts); fi
 python3 - "${tests[@]}" <<'PY'
 import hashlib,json,os,pathlib,sys
