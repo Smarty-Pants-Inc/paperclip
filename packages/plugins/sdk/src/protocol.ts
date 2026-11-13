@@ -736,6 +736,9 @@ export interface PluginEnvironmentLeaseObservation {
   creationCleanup?: import("./environment-creation-cleanup.js").PluginEnvironmentCreationCleanup;
   providerLeaseId: string;
   state: "active" | "stopped" | "destroyed" | "unknown";
+  stoppedAt?: string | null;
+  lastRebootAt?: string | null;
+  observedAt?: string | null;
 }
 
 export interface PluginEnvironmentRealizeWorkspaceParams extends PluginEnvironmentDriverBaseParams {

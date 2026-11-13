@@ -68,7 +68,7 @@ describe("Boat provider", () => {
     expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ detached: true, timeoutSeconds: 600 }); expect(result).toMatchObject({ timedOut: true, exitCode: null, stdout: "partial" });
   });
   it("resumes an archived sandbox, waits for ready, and reapplies configured TTL", async () => {
-    const fetch = vi.fn().mockResolvedValueOnce(response({ sandbox: { id: "bx_archived", state: "archived" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_archived", state: "archived" } })).mockResolvedValueOnce(response({ sandbox: { id: "bx_archived", state: "ready", expiresAt: "2030-01-01T00:00:00Z" } })); vi.stubGlobal("fetch", fetch);
+    const fetch = vi.fn().mockResolvedValueOnce(response({ sandbox: { id: "bx_archived", state: "archived" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_archived", state: "archived" } })).mockResolvedValueOnce(response({ sandbox: { id: "bx_archived", state: "ready", expiresAt: "2030-01-01T00:00:00Z", team: { id: "team_lease" } } })); vi.stubGlobal("fetch", fetch);
     const lease = await plugin.definition.onEnvironmentResumeLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: { ...cfg, reuseLease: true }, providerLeaseId: "bx_archived" });
     expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ ttlSeconds: 1800, noEnv: true }); expect(lease).toMatchObject({ providerLeaseId: "bx_archived", expiresAt: "2030-01-01T00:00:00Z" }); expect(fetch).toHaveBeenCalledTimes(3);
   });

@@ -1,8 +1,10 @@
 # Route A: S9 resident guardian over SSH
 
-Version `0.1.14-runner-envfile-snapid-retain-routea`. Vendored SDK/shared from
-Paperclip `cl/img1b` **ae66270620cb7eeaae2a13fc0aef22e3656d44ad**. Existing plugin
-ID `paperclip.boat-sandbox-provider`, provider key `boat`. No Core/SDK patch.
+Version `0.1.15-runner-envfile-snapid-retain-routea`. Vendored SDK/shared originate
+from Paperclip `cl/img1b` **ae66270620cb7eeaae2a13fc0aef22e3656d44ad**; the SDK adds
+only the optional liveness observation fields described in [README.md](README.md).
+Existing plugin ID `paperclip.boat-sandbox-provider`, provider key `boat`.
+The guardian/SSH behavior is unchanged; no Core runtime patch is included.
 The S9 host-boundary test fixture is Core **51d9a5afbd2a99b974ae060a372082352174df71**;
 the image 1b archive lacks that S9 host module. These are not carrier-on
 qualification results for image 1b.

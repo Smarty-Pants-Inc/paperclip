@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { syncFiles } from "./file-sync.js";
+import { parseHttpDate } from "./http-date.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
 import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
@@ -47,18 +48,89 @@ function parse(raw: Record<string, unknown>): Config {
     ...(typeof raw.boatEnvironment === "string" ? { boatEnvironment: raw.boatEnvironment } : {}),
   };
 }
-async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false): Promise<any> {
-  if (init.method && init.method !== "GET") assertBoatActivityAdmission();
-  const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
-  if (allocation) idleActivity.resource(activityKey(config, decodeURIComponent(allocation)));
-  const headers = new Headers(init.headers);
-  headers.set("Authorization", `Bearer ${config.apiKey}`);
-  if (init.body !== undefined) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: init.signal ?? AbortSignal.timeout(30_000) });
-  if (allowMissing && response.status === 404) { await response.body?.cancel(); return null; }
-  const body = response.status === 204 ? null : await response.json().catch(() => null);
-  if (!response.ok) throw Object.assign(new Error(`Boat ${init.method ?? "GET"} ${path} failed (${response.status}): ${body?.message ?? body?.error?.message ?? response.statusText}`), { httpStatus: response.status });
-  return body;
+type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "parse_error" | "ambiguous_404";
+/** Never retain provider/transport diagnostics, even as a cause. Only these safe
+ * fields may cross the worker boundary; scrub the key from our own stack too. */
+function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory): Error & { httpStatus: number | null; category: RequestErrorCategory } {
+  const redact = (text: string) => config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text;
+  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}`)), { httpStatus, category });
+  if (error.stack) error.stack = redact(error.stack);
+  return error;
+}
+async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: { onHeaders?: (headers: Headers) => void; requireJson?: boolean; strictMissing?: boolean } = {}): Promise<any> {
+  let category: RequestErrorCategory = "request_error";
+  let httpStatus: number | null = null;
+  try {
+    if (init.method && init.method !== "GET") assertBoatActivityAdmission();
+    const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
+    if (allocation) idleActivity.resource(activityKey(config, decodeURIComponent(allocation)));
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", `Bearer ${config.apiKey}`);
+    if (init.body !== undefined) headers.set("Content-Type", "application/json");
+    category = "network_error";
+    const response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: init.signal ?? AbortSignal.timeout(30_000) });
+    httpStatus = response.status;
+    responseOptions.onHeaders?.(response.headers);
+    if (allowMissing && response.status === 404) {
+      if (!responseOptions.strictMissing) { await response.body?.cancel(); return null; }
+      category = "ambiguous_404";
+      // Boat's 404 'not_found' also covers an unknown route (details.path).
+      const missing = await response.json();
+      if (missing?.code === "not_found" && missing?.error?.details?.path === undefined) return null;
+      throw new Error(category);
+    }
+    if (!response.ok) {
+      category = "http_error";
+      // Do not parse or retain provider message, nested error, or statusText.
+      await response.body?.cancel();
+      throw new Error(category);
+    }
+    category = "parse_error";
+    const body = response.status === 204 ? null : await response.json().catch(error => {
+      if (responseOptions.requireJson) throw error;
+      return null;
+    });
+    if (responseOptions.requireJson && body === null) throw new Error(category);
+    return body;
+  } catch {
+    throw requestError(config, init.method ?? "GET", path, httpStatus, category);
+  }
+}
+/** Conservative inventory guard, NOT key-scope detection. Count Personal and
+ * inactive rows too; active is only the default wallet for new sandboxes.
+ * https://docs.boat.dev/api/reference/account/list-organizations.md */
+async function soleBoatOrgId(config: Config): Promise<string | undefined> {
+  const result = await request(config, "/orgs", { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, false, { requireJson: true });
+  if (result?.ok !== true || !Array.isArray(result.orgs) || result.orgs.length !== 1) return undefined;
+  const org = result.orgs[0];
+  return org?.type === "org" && typeof org.id === "string" && org.id.trim() ? org.id : undefined;
+}
+/** Strict RFC 3339 deadline parsing: reject Date.parse's permissive grammar and
+ * calendar rollover, just as observedAt rejects impossible HTTP dates. */
+function parseDeadline(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, y, mo, d, h, mi, s, zone] = match;
+  const year = Number(y), month = Number(mo), day = Number(d);
+  if (year < 1970 || month < 1 || month > 12 || day < 1 || Number(h) > 23 || Number(mi) > 59 || Number(s) > 59) return null;
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  if (calendar.getUTCFullYear() !== year || calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return null;
+  if (zone !== "Z" && (Number(zone.slice(1, 3)) > 23 || Number(zone.slice(4)) > 59)) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && timestamp >= 0 ? value : null;
+}
+function assertSandboxId(sandbox: any, id: string): void {
+  if (sandbox?.id !== id) throw new Error("Boat response returned a different allocation.");
+}
+/** Only the latest exact-ID observation can authorize retirement. team:null is
+ * personal billing; omission is unknown, never the account's current wallet.
+ * https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md (Sandbox.team) */
+function boatOwnershipForLease(sandbox: any, id: string): { boatOrgId?: string; boatOwner?: { kind: "personal" } } {
+  assertSandboxId(sandbox, id);
+  if (sandbox.team === null) return { boatOwner: { kind: "personal" } };
+  const orgId = sandbox.team?.id;
+  return typeof orgId === "string" && orgId.trim() ? { boatOrgId: orgId } : {};
 }
 export type BoatSnapshotIdentity = { provider: "boat"; requestedRef: string; id: string; name: string; createdAt: string };
 /** Resolve the mutable create name to its immutable artifact; never use the UUID as create.from. */
@@ -126,6 +198,7 @@ async function waitReady(config: Config, id: string, allowArchived = false): Pro
   while (Date.now() < until) {
     const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
     const s = result.sandbox ?? result;
+    assertSandboxId(s, id);
     if (["ready", "idle", "running"].includes(s.state)) return s;
     if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new Error(`Boat sandbox ${id} entered ${s.state}`);
     // Bounded transition observation only; no idle worker poller. Ready webhook
@@ -134,12 +207,13 @@ async function waitReady(config: Config, id: string, allowArchived = false): Pro
   }
   throw new Error(`Boat sandbox ${id} readiness timed out`);
 }
-async function waitSetup(config: Config, id: string): Promise<void> {
+async function waitSetup(config: Config, id: string): Promise<any> {
   const until = Date.now() + config.setupTimeoutSeconds * 1000;
   while (Date.now() < until) {
     const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
     const s = result.sandbox ?? result;
-    if (s.setupStatus === "done") return;
+    assertSandboxId(s, id);
+    if (s.setupStatus === "done") return s;
     if (s.setupStatus === "failed") {
       const detail = typeof s.setupError === "string" ? s.setupError : typeof s.setupErrorText === "string" ? s.setupErrorText : typeof s.error === "string" ? s.error : s.error?.message;
       throw new Error(`Boat sandbox ${id} setup failed${detail ? `: ${detail}` : "."}`);
@@ -363,10 +437,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       id = sb.id;
       idleActivity.resource(activityKey(c, sb.id));
       const ready = await waitReady(c, sb.id);
-      if (c.setupScript !== undefined) await waitSetup(c, sb.id);
+      const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
+      const ownership = boatOwnershipForLease(ownershipObservation, sb.id);
       let snapshotIdentity: BoatLeaseSnapshotIdentity | undefined;
       if (params.resolveSnapshotIdentity === true && snapshot) {
-        const organizationId = ready.team?.id ?? sb.team?.id;
+        const organizationId = ownership.boatOrgId;
         if (typeof organizationId !== "string" || !organizationId.trim()) {
           throw new Error("Boat snapshot identity requires a team organizationId on the created sandbox.");
         }
@@ -381,6 +456,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       });
       await bindDuplexLease(params, sb.id, guardianPreflight);
       return { providerLeaseId: sb.id, expiresAt: expiry, metadata: { provider: c.provider, sandboxId: sb.id, remoteCwd,
+        ...ownership,
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}),
         ...(c.snapshot === undefined ? {} : { snapshot: c.snapshot }),
         ...(snapshotIdentity ? { snapshotIdentity } : {}),
@@ -413,12 +489,33 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     idleActivity.resource(activityKey(c, params.providerLeaseId));
     const proof = idleActivity.proof(activityKey(c, params.providerLeaseId));
-    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, {}, true);
-    if (!result) { idleActivity.confirm(proof, true); return { providerLeaseId: params.providerLeaseId, state: "destroyed" }; }
+    let observedAt: string | null = null;
+    const personal = (params.leaseMetadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal";
+    const boatOrgId = personal ? undefined : params.leaseMetadata?.boatOrgId;
+    // Explicit request scope, never an inference from the mutable active wallet.
+    // https://docs.boat.dev/api-keys.md (organization/account key table)
+    const orgHeaders = typeof boatOrgId === "string" && boatOrgId.trim() ? { "X-Boat-Org": boatOrgId } : undefined;
+    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, { method: "GET", headers: orgHeaders, cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true, strictMissing: true, onHeaders: headers => {
+      observedAt = parseHttpDate(headers.get("Date"));
+    } });
+    if (result === null) {
+      // Even a valid key can see a foreign org's lease as missing. The read
+      // above must name the recorded org, and the whole inventory must match.
+      if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(params.providerLeaseId)) throw new Error("Boat lease absence is not proven: inspection id is not a sandbox id");
+      if (personal) throw new Error("Boat personal lease absence is not proven; refusing to report it destroyed");
+      if (typeof boatOrgId !== "string" || !boatOrgId.trim()) throw new Error("Boat lease absence is not proven: no recorded boatOrgId; refusing to report it destroyed");
+      if (await soleBoatOrgId(c) !== boatOrgId) throw new Error("Boat lease absence is not proven: could not confirm the lease organization; inventory is not exclusively the recorded org");
+      idleActivity.confirm(proof, true);
+      return { providerLeaseId: params.providerLeaseId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt };
+    }
     const sandbox = result.sandbox ?? result;
     if (sandbox.id !== params.providerLeaseId) throw new Error("Boat inspection returned a different allocation.");
     if (sandbox.state === "archived") idleActivity.confirm(proof, true);
-    return { providerLeaseId: params.providerLeaseId, state: sandbox.state === "archived" ? "stopped" : ["ready", "idle", "running"].includes(sandbox.state) ? "active" : "unknown" };
+    // Boat documents terminal cancelled/404, the state enum, stoppedAt and lastReboot:
+    // https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md
+    const stoppedAt = sandbox.stoppedAt ?? null;
+    const state = sandbox.state === "cancelled" ? "destroyed" : sandbox.state === "archived" && stoppedAt !== null ? "stopped" : ["ready", "idle", "running"].includes(sandbox.state) ? "active" : "unknown";
+    return { providerLeaseId: params.providerLeaseId, state, stoppedAt, lastRebootAt: sandbox.lastReboot?.at ?? null, observedAt };
   },
   async onEnvironmentResumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
     const c = parse(params.config), id = params.providerLeaseId;
@@ -435,36 +532,70 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     let sandbox: any;
     if (requiresProof) {
       const found = await request(c, `/sandboxes/${encodeURIComponent(id)}`, {}, true);
-      if (!found) return { providerLeaseId: null, metadata: { expired: true } };
+      if (!found) {
+        if ((metadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal") throw new Error("Boat personal lease absence is not proven; refusing to expire it");
+        return { providerLeaseId: null, metadata: { expired: true } };
+      }
       sandbox = found.sandbox ?? found;
       if (sandbox.id !== id) throw new Error("Boat resume returned a different allocation.");
     }
     const resumedFromState = sandbox?.state ?? null;
+    let ttlRefresh: { status: "ok" | "unconfirmed"; at: string; archiveAfter: string | null }
+      | { status: "failed"; at: string; category: RequestErrorCategory; httpStatus: number | null; archiveAfter: string | null } | undefined;
+    let refreshExpiresAt: string | null = null;
     if (!sandbox || !["ready", "idle", "running"].includes(sandbox.state)) {
       // boatdocs-0110c/api_reference_sandboxes_resume-sandbox.md:35-75,147-172.
       const response = await request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
       const sb = response.sandbox ?? response;
-      if (sb.id !== undefined && sb.id !== id) throw new Error("Boat resume returned a different allocation.");
+      assertSandboxId(sb, id);
       sandbox = await waitReady(c, id, true);
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
-    } else if (effectiveTtlSeconds(c) > c.ttlSeconds) {
-      // Boat TTL is relative to its last write, not Daytona's SDK activity clock.
-      // Renew only on an authorized warm handoff, never with an idle timer.
-      // out/runner/boat-docs/update-sandbox.md:84-93.
-      const refreshed = await request(c, `/sandboxes/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c) }) });
-      sandbox = refreshed.sandbox ?? refreshed;
-      if (sandbox.id !== id) throw new Error("Boat TTL refresh returned a different allocation.");
+    } else {
+      // Boat auto-stop counts from create/last resume, not activity:
+      // https://docs.boat.dev/long-running-tasks/auto-stop.md:14-16.
+      // PATCH ttlSeconds sets the deadline to now + ttlSeconds:
+      // https://docs.boat.dev/api/reference/sandboxes/update-sandbox.md:91-93.
+      // Renew every authorized warm handoff, never with an idle timer.
+      const path = `/sandboxes/${encodeURIComponent(id)}`;
+      const personal = (metadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal";
+      const boatOrgId = personal ? undefined : metadata?.boatOrgId;
+      const orgHeaders = typeof boatOrgId === "string" && boatOrgId.trim() ? { "X-Boat-Org": boatOrgId } : undefined;
+      const ttlSeconds = effectiveTtlSeconds(c), requestedAt = Date.now();
+      const at = new Date(requestedAt).toISOString();
+      try {
+        const refreshed = await request(c, path, { method: "PATCH", headers: orgHeaders, body: JSON.stringify({ ttlSeconds }) }, false, { requireJson: true });
+        const candidate = refreshed?.sandbox ?? refreshed;
+        if (candidate?.id !== id) throw requestError(c, "PATCH", path, 200, "parse_error");
+        const archiveAfter = parseDeadline(candidate.archiveAfter);
+        const expectedDeadline = requestedAt + ttlSeconds * 1000;
+        const confirmed = archiveAfter !== null && Math.abs(Date.parse(archiveAfter) - expectedDeadline) <= 120_000;
+        ttlRefresh = { status: confirmed ? "ok" : "unconfirmed", at, archiveAfter };
+        refreshExpiresAt = archiveAfter ?? parseDeadline(candidate.expiresAt);
+        sandbox = candidate;
+      } catch (error) {
+        // request and the exact-ID check expose only our safe error fields.
+        // Keep the pre-PATCH observation: neither owner nor deadline is renewed.
+        const failure = error as ReturnType<typeof requestError>;
+        ttlRefresh = { status: "failed", at, category: failure.category, httpStatus: failure.httpStatus, archiveAfter: sandbox.archiveAfter ?? null };
+      }
+      const details = { providerLeaseId: c.apiKey ? id.split(c.apiKey).join("[REDACTED]") : id, status: ttlRefresh.status,
+        category: ttlRefresh.status === "failed" ? ttlRefresh.category : ttlRefresh.status === "unconfirmed" ? "deadline_mismatch" : null };
+      if (ttlRefresh.status === "ok") duplexLogger?.info("Boat warm lease TTL refresh", details);
+      else duplexLogger?.warn("Boat warm lease TTL refresh", details);
     }
     const workspaceSentinel = sentinel ? await verifyWorkspaceSentinel(sentinel, { request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout) }) : undefined;
-    if (workspaceSentinel && workspaceSentinel.result !== "matched") return { providerLeaseId: null, metadata: { expired: true, workspaceSentinel } };
+    if (workspaceSentinel && workspaceSentinel.result !== "matched") return { providerLeaseId: null, metadata: { expired: true, workspaceSentinel, ...(ttlRefresh ? { ttlRefresh } : {}) } };
     const guardianPreflight = await stageGuardian(params.config, id, {
       request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout),
     }, metadata);
     // A disabled carrier must not inherit an earlier lease's usable receipt.
-    const { guardianPreflight: _previousGuardian, runnerGuardianVersion: _previousVersion, ...retainedMetadata } = metadata ?? {};
+    const { guardianPreflight: _previousGuardian, runnerGuardianVersion: _previousVersion,
+      boatOrgId: _previousOrg, boatOwner: _previousOwner, ttlRefresh: _previousTtlRefresh, ...retainedMetadata } = metadata ?? {};
     await bindDuplexLease(params, id, guardianPreflight);
-    return { providerLeaseId: id, expiresAt: sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
+    const ownership = boatOwnershipForLease(sandbox, id);
+    return { providerLeaseId: id, expiresAt: ttlRefresh && ttlRefresh.status !== "failed" ? refreshExpiresAt : sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
+        ...ownership, ...(ttlRefresh ? { ttlRefresh } : {}),
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {

@@ -1,11 +1,75 @@
-# Boat sandbox provider 0.1.14-runner-envfile-snapid-retain-routea
+# Boat sandbox provider 0.1.15-runner-envfile-snapid-retain-routea
+
+## Provider liveness inspection
+
+Each ordinary `environmentInspectLease` call makes a fresh, uncached
+`GET /sandboxes/{id}` with a 10-second timeout. Transport and HTTP failures throw;
+only a confirmed sandbox-not-found or Boat's terminal `cancelled` state reports
+`destroyed`. A missing sandbox requires a JSON 404 envelope with
+`code: "not_found"` and no `error.details.path`, an ID matching Boat's
+`^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$` pattern, and a fresh, uncached
+`GET /orgs` with the same key returning `ok: true` and exactly **one entry total**,
+which must be an organization whose `id` equals the lease's recorded
+`metadata.boatOrgId` (also bounded to 10 seconds). In addition, the sandbox read
+explicitly sends `X-Boat-Org: <recorded boatOrgId>`: this is the documented
+[account-key request scope](https://docs.boat.dev/api-keys.md), not an inference
+about key type. An organization key naming another org is refused by Boat.
+The inventory guard counts Personal, inactive, and duplicate rows too; it does
+not filter by `active`. Boat defines `active` as the default billing wallet for
+new sandboxes, not key scope ([list organizations](https://docs.boat.dev/api/reference/account/list-organizations.md),
+[active wallet](https://docs.boat.dev/organizations/active-wallet.md)). Thus even
+a scoped request with a multi-entry inventory is conservatively refused.
+A bare, malformed, route-style, or otherwise ambiguous 404, an invalid ID,
+missing recorded org, personal ownership, failed org lookup, or a different or
+ambiguous inventory throws instead: absence is **not proven**. Boat's
+[API error contract](https://docs.boat.dev/api/v1.md#error-model) says `not_found`
+can also mean a missing key or saved snapshot, so a 404 alone is not sufficient.
+
+Acquire and successful resume record `boatOrgId` only from the latest exact-ID
+sandbox observation's `team.id`. Explicit `team: null` means personal billing
+and records `boatOwner: {kind: "personal"}` with no `boatOrgId`; omitted or
+invalid `team` means unknown and records neither. There is **no `/orgs` fallback**
+for ownership. Readiness and setup observations must match the expected sandbox
+ID, as must resume reads, POST responses and TTL refreshes. On resume, both old
+ownership fields are removed before the new observation's ownership is recorded;
+unrelated metadata is retained. An earlier create/read/POST response never
+supplies ownership missing or contradicted in the final observation. See Boat's
+[`Sandbox.team` contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).
+Personal and unknown leases (including unbound older leases) cannot prove 404
+retirement. Positive inspection does not migrate or persist ownership for an
+older lease; rollout/backfill remains a separate operational requirement.
+`archived` reports `stopped` only when `stoppedAt` is non-null. `ready`, `idle`,
+and `running` report `active`; all other states report `unknown`, including
+`archived` without a stop timestamp. See Boat's [GET contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).
+
+Observations preserve `stoppedAt` and `lastReboot.at` as `lastRebootAt` verbatim,
+using null when absent. `observedAt` is the HTTP response's strict RFC 7231
+`Date` converted to ISO, or null when missing or invalid; it is never replaced
+with the plugin's local clock. IMF-fixdate and the obsolete RFC 850/asctime
+recipient forms are accepted only with exact grammar, matching weekday, valid
+calendar/time components, and a post-epoch timestamp no more than 24 hours ahead
+of the local clock. Numeric/ISO dates, invalid calendar dates, non-GMT zones,
+and out-of-range clocks return null; `Date.parse` leniency is not used.
+Missing resources also retain the response observation time when available.
+The existing idle-drain accounting and creation-operation inspection are unchanged.
+These fields describe provider observations, not authenticated Runner readiness
+or process continuity. This release adds the three optional observation fields
+to its vendored SDK; the corresponding Core consumer is a separate change.
+
+Request failures retain only method, path, HTTP status (`httpStatus`, null when
+no response arrived), and a fixed category (`request_error`, `network_error`,
+`http_error`, `parse_error`, or `ambiguous_404`). Provider error fields,
+`statusText`, network diagnostics, JSON previews and original causes are not
+retained. The configured key is centrally redacted from the resulting message
+and stack, including accidental collisions with an otherwise-safe path.
 
 ## Route A — default off
 
 This build preserves the live env-file, snapshotIdentity and unconditional
 stop-and-retain line and the existing S9 guardian/duplex contract. Its vendored
-Paperclip SDK and shared package come from Core `cl/img1b`
-`ae66270620cb7eeaae2a13fc0aef22e3656d44ad`, without modifying those sources.
+Paperclip SDK and shared package originate from Core `cl/img1b`
+`ae66270620cb7eeaae2a13fc0aef22e3656d44ad`. This release adds only the three
+optional liveness observation fields to the SDK protocol; shared is unchanged.
 The inherited S9 Core-boundary tests use host sources at
 `51d9a5afbd2a99b974ae060a372082352174df71`; the image 1b archive does not contain
 that S9 host module. This build does not qualify carrier-on operation on image 1b.
@@ -54,7 +118,7 @@ Exec env values are uploaded as shell-quoted `export` lines using the files API,
 
 There is no file-mode field in Boat's [write API](https://docs.boat.dev/api/reference/agent/write-sandbox-file.md): permissions use `umask 077` and shell chmod, not an invented API. Values exist briefly on sandbox disk; a snapshot in that window can capture them. They remain in the process environment. Whether file PUT bodies are retained in provider audit/internal logs is **unknown (docs silent)**. [Command history](https://docs.boat.dev/long-running-tasks/command-history.md) retains command text for 90 days and excludes regular-file writes from process-output capture; that is not a guarantee about HTTP-body retention. Cleanup cannot be guaranteed after a provider outage or plugin crash. This does not redact caller-supplied command arguments, stdin, or process output. No live qualification is claimed by these local tests.
 
-Install `paperclipai-plugin-boat-0.1.13-runner-envfile-snapid-retain-routea.tgz` as an instance plugin. Destroy, release, failed-acquisition cleanup, and orphan cleanup always use the same non-force, completion-confirmed stop. The plugin never sends `DELETE /sandboxes/{id}`. The `retainOnDestroy` boolean remains accepted for compatibility, defaults to true, and is ignored: false, absent, and true all stop and keep the sandbox. Configure `"reuseLease": true` to resume the same retained Boat sandbox ID across runs; reuse defaults to false. A successful destroy returns `{ providerLeaseId, state: "stopped" }`, not a false `destroyed` receipt. Stop failures remain failures, without force or a destructive fallback. This is sandbox-lifecycle retention, not a general file-immutability policy: command cancellation and temporary stdin-file housekeeping do not delete the sandbox and are unchanged.
+Install `paperclipai-plugin-boat-0.1.15-runner-envfile-snapid-retain-routea.tgz` as an instance plugin. Destroy, release, failed-acquisition cleanup, and orphan cleanup always use the same non-force, completion-confirmed stop. The plugin never sends `DELETE /sandboxes/{id}`. The `retainOnDestroy` boolean remains accepted for compatibility, defaults to true, and is ignored: false, absent, and true all stop and keep the sandbox. Configure `"reuseLease": true` to resume the same retained Boat sandbox ID across runs; reuse defaults to false. A successful destroy returns `{ providerLeaseId, state: "stopped" }`, not a false `destroyed` receipt. Stop failures remain failures, without force or a destructive fallback. This is sandbox-lifecycle retention, not a general file-immutability policy: command cancellation and temporary stdin-file housekeeping do not delete the sandbox and are unchanged.
 
 Reuse is scoped by the same agent and the same execution workspace. For projectless environments, the issue ID is used instead. Reuse across issues therefore requires a project with a shared execution workspace. This follows Paperclip's `buildReusableSandboxLeaseScope` behavior (`server/src/services/environment-runtime.ts:1016-1043`). Retention without reuse preserves the disk but does not make a subsequent run reuse that allocation. Existing lease configurations are also protected once this plugin version is installed, even if their recorded `retainOnDestroy` is false or absent.
 
