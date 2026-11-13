@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink, writeFile } from 
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
 import { nodeCompileCacheEnvironment } from "../../node-compile-cache-environment.js";
+import { piProcessEnvironment } from "./pi-process-environment.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1719,15 +1720,6 @@ function usageDelta(usage: Record<string, unknown>): Record<string, unknown> {
     totalTokens: numberValue(usage.totalTokens),
     ...(isRecord(usage.cost) ? { cost: usage.cost } : {}),
   };
-}
-
-const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SystemRoot", "WINDIR", "PATHEXT"] as const;
-
-function piProcessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = {};
-  for (const key of SAFE_PI_ENV_KEYS) if (process.env[key] !== undefined) environment[key] = process.env[key];
-  for (const [key, value] of Object.entries(overrides)) if (value !== undefined) environment[key] = value;
-  return environment;
 }
 
 function safeSessionName(value: string): string {

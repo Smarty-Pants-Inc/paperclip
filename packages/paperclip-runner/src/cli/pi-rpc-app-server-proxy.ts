@@ -28,6 +28,7 @@ import {
 } from "./opencode-proxy-output.js";
 import { createOpenCodeProxyControllerRequests } from "./opencode-proxy-controller.js";
 import { trustedPiLaunchBinding, withoutAmbientPiCommand } from "./pi-proxy-command.js";
+import { protectPiProxyProcess } from "./linux-process-hardening.js";
 
 type RpcMessage = {
   id?: string | number;
@@ -198,6 +199,7 @@ function runtimeDirectory(environment: NodeJS.ProcessEnv): string {
 export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   const environment = options.environment ?? process.env;
   const launchBinding = options.createDriver ? null : trustedPiLaunchBinding(options.argv ?? process.argv.slice(2));
+  if (launchBinding) protectPiProxyProcess(launchBinding.trustedProxyEntrypointUrl);
   const stdoutFrames = createBackpressuredFrameWriter(options.stdout);
   // A session open can wait up to the driver's process-startup bound; closing
   // the proxy must be able to cut that wait short.

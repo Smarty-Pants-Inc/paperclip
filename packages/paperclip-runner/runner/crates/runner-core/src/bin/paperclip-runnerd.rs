@@ -1093,6 +1093,46 @@ mod tests {
     }
 }
 
+// A provider and its bash tools share our uid, not our credential authority.
+// Do this before argument parsing, state/IPC setup, or any provider launch.
+#[cfg(target_os = "linux")]
+fn protect_runner_process() -> std::io::Result<()> {
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
+    if rustix::process::dumpable_behavior()? != rustix::process::DumpableBehavior::NotDumpable {
+        return Err(std::io::Error::other(
+            "runner process isolation verification failed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn runner_process_is_not_dumpable_and_can_read_child_proc() {
+    protect_runner_process().expect("disable process dumpability");
+    assert_eq!(
+        rustix::process::dumpable_behavior().unwrap(),
+        rustix::process::DumpableBehavior::NotDumpable
+    );
+    // exec resets the child's flag; our own flag must not obstruct lineage/journal
+    // observations, or the child's /proc/self/fd verified launch mechanism.
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("2")
+        .spawn()
+        .unwrap();
+    let result = fs::read(format!("/proc/{}/environ", child.id()));
+    let stat = fs::read_to_string(format!("/proc/{}/stat", child.id()));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(result.is_ok());
+    assert!(stat.is_ok());
+}
+
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Err(error) = protect_runner_process() {
+        eprintln!("runner process isolation failed: {error}");
+        return ExitCode::FAILURE;
+    }
     run_main(std::env::args().skip(1).collect())
 }

@@ -111,13 +111,26 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
 ];
 const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "AGENT_HOME",
+    // Pi's Langfuse observability plugin reads these from the configured secret
+    // environment, as Paperclip documents (runner-pi-capabilities.md:72-76,
+    // :108-111).
+    "LANGFUSE_BASE_URL",
+    "LANGFUSE_HOST",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "LANGFUSE_USER_ID",
+    "LANGFUSE_TRACING_ENABLED",
+    "LANGFUSE_TRACING_ENVIRONMENT",
+    "LANGFUSE_RELEASE",
+    "PI_LANGFUSE_DEBUG",
+    // Agent-readable Ed25519 identity, not Paperclip API bearer credentials.
+    "PAPERCLIP_AGENT_KEY_ID",
+    "PAPERCLIP_AGENT_PUBLIC_KEY",
+    "PAPERCLIP_AGENT_PRIVATE_KEY",
     "PAPERCLIP_AI_PROVIDER_PROTOCOL",
     "PAPERCLIP_AI_PROVIDER_AUTH",
     "PAPERCLIP_AI_PROVIDER_KEY",
     "PAPERCLIP_AI_PROVIDER_URL",
-    "PAPERCLIP_AGENT_KEY_ID",
-    "PAPERCLIP_AGENT_PUBLIC_KEY",
-    "PAPERCLIP_AGENT_PRIVATE_KEY",
     "PAPERCLIP_NATIVE_MCP_NAME",
     "PAPERCLIP_NATIVE_MCP_URL",
     "PAPERCLIP_NATIVE_MCP_TOKEN",
@@ -129,7 +142,13 @@ const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_NORMALIZED_SESSION_ID",
     "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
     "PI_CODING_AGENT_DIR",
-    "LANGFUSE_TRACING_ENABLED",
+    "PI_OFFLINE",
+    "LANGUAGE",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "TERM",
+    "COLORTERM",
 ];
 const CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "CURSOR_API_KEY",
@@ -1252,10 +1271,18 @@ impl CodexProvider {
             "cursor_cloud" => CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS,
             _ => CODEX_PROVIDER_ENVIRONMENT_KEYS,
         };
-        let github_environment_keys = if config.provider == "cursor_cloud" {
+        let github_environment_keys =
+            if matches!(config.provider.as_str(), "cursor_cloud" | "pi_rpc") {
+                &[][..]
+            } else {
+                GITHUB_CREDENTIAL_ENVIRONMENT_KEYS
+            };
+        // Pi uses the host broker and run-scoped callbacks. Proxy credentials,
+        // OTEL/Langfuse headers and GitHub login state are not shell settings.
+        let common_environment_keys = if config.provider == "pi_rpc" {
             &[][..]
         } else {
-            GITHUB_CREDENTIAL_ENVIRONMENT_KEYS
+            &common_environment_keys[..]
         };
         let environment_keys = common_environment_keys
             .iter()

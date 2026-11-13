@@ -291,6 +291,7 @@ try {
   const piRpcProxyPath = "dist/cli/pi-rpc-app-server-proxy.cjs";
   const piExtensionPath = "dist/drivers/pi/extension/index.js";
   const piChildBridgePath = "dist/drivers/pi/extension/child-bridge.js";
+  const piProcessHardeningPath = "dist/cli/linux-process-hardening.node";
   const piRpcExecutablePath = "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
   if (nativeProviders.pi_rpc) chmodSync(join(temporaryRoot, piRpcExecutablePath), 0o755);
   const opencodeProxyPath = "dist/cli/opencode-app-server-proxy.cjs";
@@ -310,6 +311,7 @@ try {
     piRpcProxyPath,
     piExtensionPath,
     piChildBridgePath,
+    ...(process.platform === "linux" ? [piProcessHardeningPath] : []),
     ...(nativeProviders.pi_rpc ? [piRpcExecutablePath] : []),
     acpxSidecarPath,
     opencodeCommand,
@@ -378,6 +380,7 @@ try {
       piRpcProxy: { path: piRpcProxyPath, sha256: sha256File(join(temporaryRoot, piRpcProxyPath)) },
       piExtension: { path: piExtensionPath, sha256: sha256File(join(temporaryRoot, piExtensionPath)) },
       piChildBridge: { path: piChildBridgePath, sha256: sha256File(join(temporaryRoot, piChildBridgePath)) },
+      ...(process.platform === "linux" ? { piProcessHardening: { path: piProcessHardeningPath, sha256: sha256File(join(temporaryRoot, piProcessHardeningPath)) } } : {}),
       ...(nativeProviders.pi_rpc ? { piRpcExecutable: { path: piRpcExecutablePath,
         sha256: sha256File(join(temporaryRoot, piRpcExecutablePath)) } } : {}),
       grokLauncher: {
