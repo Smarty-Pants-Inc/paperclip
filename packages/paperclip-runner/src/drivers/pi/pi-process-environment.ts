@@ -42,6 +42,9 @@ export const PI_PROCESS_ENVIRONMENT_KEYS = [
 ] as const;
 const PI_KEYS = new Set<string>(PI_PROCESS_ENVIRONMENT_KEYS);
 const PROXY_KEYS = new Set([
+  // Controller-owned serialized projection, consumed by Rust before the proxy
+  // starts. Never part of PI_KEYS or Pi's own environment.
+  "PAPERCLIP_PI_GITHUB_PROJECTION_SECRET",
   ...PI_KEYS, "PAPERCLIP_PI_RUNTIME_DIR", "PAPERCLIP_PI_THINKING_LEVEL", "PAPERCLIP_PI_RPC_CREDENTIAL_MODE",
   "PAPERCLIP_RUNNER_INSTANCE_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_NORMALIZED_SESSION_ID",
   "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",

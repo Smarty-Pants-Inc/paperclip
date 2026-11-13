@@ -1031,6 +1031,25 @@ pub struct SupervisedProcess {
     _named_executable: Option<Arc<NamedExecutableSnapshot>>,
 }
 
+fn pi_github_projection_environment(
+    raw: Option<&str>,
+) -> std::collections::BTreeMap<String, String> {
+    let Some(serde_json::Value::Object(values)) =
+        raw.and_then(|raw| serde_json::from_str(raw).ok())
+    else {
+        return Default::default();
+    };
+    crate::codex_provider::PI_GITHUB_PROJECTION_KEYS
+        .iter()
+        .filter_map(|key| {
+            values
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .map(|value| ((*key).to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
 impl SupervisedProcess {
     #[cfg(test)]
     pub(crate) fn replace_output_receiver_for_test(
@@ -1221,7 +1240,11 @@ impl SupervisedProcess {
         .into_iter()
         .chain(additional_environment_keys.iter().copied())
         {
-            if !allow_configured_environment && key.starts_with("PAPERCLIP_RUNTIME_NOTIFICATION_") {
+            if !allow_configured_environment
+                && (key.starts_with("PAPERCLIP_RUNTIME_NOTIFICATION_")
+                    || crate::codex_provider::PI_GITHUB_PROJECTION_KEYS.contains(&key)
+                    || key == crate::codex_provider::PI_GITHUB_PROJECTION_ENV)
+            {
                 continue;
             }
             if let Some(value) = std::env::var_os(key) {
@@ -1233,6 +1256,14 @@ impl SupervisedProcess {
                 std::env::var(key).ok()
             })?;
         } else {
+            // Do not read the 15 names from runnerd's ambient environment. The
+            // controller strips this payload from config, then writes only this
+            // run's managed projection. Invalid/missing payloads fail closed.
+            command.envs(pi_github_projection_environment(
+                std::env::var(crate::codex_provider::PI_GITHUB_PROJECTION_ENV)
+                    .ok()
+                    .as_deref(),
+            ));
             command.envs(pi_git_config_environment(|key| std::env::var(key).ok()));
             // Locale values are nonsecret runtime settings, unlike arbitrary task
             // vars. Native Pi must not regain secrets through the configured marker.
@@ -1800,6 +1831,126 @@ mod tests {
         assert_eq!(project_git_environment(&source), expected);
         source.insert("GIT_CONFIG_COUNT".into(), "0".into());
         assert!(project_git_environment(&source).is_empty());
+    }
+
+    // Keep reason: exercise the real env_clear/spawn boundary without mutating
+    // the parallel test harness's environment. Config/auth-mode is not proof.
+    #[test]
+    fn pi_spawn_github_values_require_the_controller_projection() {
+        use crate::codex_provider::{PI_GITHUB_PROJECTION_ENV, PI_GITHUB_PROJECTION_KEYS};
+        const GUARD: &str = "PAPERCLIP_TEST_PI_PROJECTION_CHILD";
+        if let Ok(case) = std::env::var(GUARD) {
+            let script = format!(
+                "printf '%s\\n' {}",
+                PI_GITHUB_PROJECTION_KEYS
+                    .iter()
+                    .map(|key| format!("\"${{{key}-ABSENT}}\""))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let mut process = SupervisedProcess::spawn_command(
+                Path::new("/bin/sh"),
+                &["-c".into(), script],
+                Duration::from_millis(500),
+                4096,
+                PI_GITHUB_PROJECTION_KEYS,
+                None,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+            for (index, key) in PI_GITHUB_PROJECTION_KEYS.iter().enumerate() {
+                let expected = if case == "projection" {
+                    if index % 2 == 0 {
+                        format!("projection-{key}")
+                    } else {
+                        String::new()
+                    }
+                } else if case == "partial" && *key == "BASH_ENV" {
+                    "/managed/startup".to_owned()
+                } else {
+                    "ABSENT".to_owned()
+                };
+                assert_eq!(
+                    process.receive_stdout_line(Duration::from_secs(5)).unwrap(),
+                    Some(expected),
+                    "{case}: {key}"
+                );
+            }
+            process.terminate_group().unwrap();
+            return;
+        }
+        for case in [
+            "configured",
+            "spoofed-auth",
+            "ambient",
+            "projection",
+            "partial",
+            "malformed",
+        ] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "process_supervisor::tests::pi_spawn_github_values_require_the_controller_projection"])
+                .env(GUARD, case).env_remove(PI_GITHUB_PROJECTION_ENV);
+            for key in PI_GITHUB_PROJECTION_KEYS {
+                command.env(key, format!("ambient-{key}"));
+            }
+            if case != "ambient" {
+                command.env(
+                    "PAPERCLIP_CONFIGURED_ENV_KEYS",
+                    serde_json::to_string(PI_GITHUB_PROJECTION_KEYS).unwrap(),
+                );
+            }
+            if case == "spoofed-auth" {
+                command.env("PAPERCLIP_GITHUB_AUTH_MODE", "managed");
+            }
+            if case == "projection" {
+                let values: std::collections::BTreeMap<_, _> = PI_GITHUB_PROJECTION_KEYS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, key)| {
+                        (
+                            *key,
+                            if index % 2 == 0 {
+                                format!("projection-{key}")
+                            } else {
+                                String::new()
+                            },
+                        )
+                    })
+                    .collect();
+                command.env(
+                    PI_GITHUB_PROJECTION_ENV,
+                    serde_json::to_string(&values).unwrap(),
+                );
+            } else if case == "partial" {
+                command.env(PI_GITHUB_PROJECTION_ENV, r#"{"BASH_ENV":"/managed/startup","GH_TOKEN":"raw-decoy","ASCII_TOKEN":"decoy"}"#);
+            } else if case == "malformed" {
+                command.env(PI_GITHUB_PROJECTION_ENV, "not-json");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        for raw in [
+            None,
+            Some("[]"),
+            Some("null"),
+            Some("{}"),
+            Some(r#"{"BASH_ENV":false}"#),
+        ] {
+            assert!(pi_github_projection_environment(raw).is_empty());
+        }
+        assert_eq!(
+            pi_github_projection_environment(Some(r#"{"GH_TOKEN":"decoy","ASCII_TOKEN":"decoy"}"#))
+                .len(),
+            0
+        );
     }
 
     #[test]
