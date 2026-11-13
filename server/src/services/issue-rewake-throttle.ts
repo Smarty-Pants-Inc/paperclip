@@ -103,7 +103,10 @@ export interface IssueRewakeCandidateInput {
   requestedByActorType?: "user" | "agent" | "system" | null;
   forceFreshSession: boolean;
   hasExplicitResume: boolean;
+  declaredContinuationKind?: string | null;
 }
+
+export const NATIVE_STATUS_COMMITTER_ACTOR_ID = "native-status-committer";
 
 /**
  * Whether a wake is even a candidate for throttling. Wakes that carry new

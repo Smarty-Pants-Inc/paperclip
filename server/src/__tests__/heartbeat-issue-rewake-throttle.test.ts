@@ -355,6 +355,89 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
   });
 
+  function nativeStatusWake(agentId: string, issueId: string, payload: Record<string, unknown>) {
+    return heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_status_changed",
+      payload: { issueId, nativeDecisionId: randomUUID(), ...payload },
+      contextSnapshot: { issueId, wakeReason: "issue_status_changed", source: "native_status_decision" },
+      requestedByActorType: "system",
+      requestedByActorId: "native-status-committer",
+    });
+  }
+
+  async function recordNativeStatusDecision(companyId: string, issueId: string, runId: string) {
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "native-status-committer",
+      runId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { source: "native_status_decision", reasonCode: "live_continuation_registered" },
+      createdAt: new Date(Date.now() - 11_000),
+    });
+  }
+
+  it.each(["same_agent", "response_wake", "retry"])(
+    "does not throttle a %s continuation the agent declared after consecutive no-progress runs",
+    async (continuationKind) => {
+      const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+      for (const finishedSecondsAgo of [40, 10]) {
+        const runId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo });
+        await recordNativeStatusDecision(companyId, issueId, runId);
+      }
+
+      const wake = await nativeStatusWake(agentId, issueId, {
+        continuationKind,
+        continuationSummary: "Nothing changed; wait.",
+        continuationIdempotencyKey: `loop-${randomUUID()}`,
+      });
+      // Org/RFL 13:11Z: ship the response_wake park only, not generic continuation throttling.
+      expect(wake).not.toBeNull();
+      expect(await latestWakeRequest(agentId)).toMatchObject({
+        reason: "issue_status_changed",
+        payload: expect.objectContaining({ continuationKind }),
+      });
+    },
+  );
+
+  it("keeps a declared continuation prompt after a run with issue-visible progress", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    const progressRunId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+    await recordNativeStatusDecision(companyId, issueId, progressRunId);
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      runId: progressRunId,
+      action: "issue.document_upserted",
+      entityType: "issue",
+      entityId: issueId,
+      createdAt: new Date(Date.now() - 12_000),
+    });
+
+    const wake = await nativeStatusWake(agentId, issueId, {
+      continuationKind: "same_agent",
+      continuationSummary: "Continue the remaining steps.",
+      continuationIdempotencyKey: "next-step",
+    });
+    expect(wake).not.toBeNull();
+  });
+
+  it("does not throttle status wakes that carry no declared continuation", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+
+    const wake = await nativeStatusWake(agentId, issueId, { unblockAction: "Resolve the dependency." });
+    expect(wake).not.toBeNull();
+  });
+
   it("does not throttle the wake that follows a failed run", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
 
