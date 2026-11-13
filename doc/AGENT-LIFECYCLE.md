@@ -67,6 +67,26 @@ catalog. Authentication failures, unavailable models, and probe timeouts still
 prevent readiness. Without an explicit local working directory, the native
 probe uses a temporary empty directory instead of the server's checkout.
 
+## Caller permissions
+
+An agent key can pause, resume, or terminate another agent when its direct
+`agents:configure` grant covers that target. The routes use the same scoped
+`agent_config:update` authorization as configuration writes, including company,
+responsible-user, and trust restrictions. Read or suggest-only access does not
+permit lifecycle commands.
+
+The default configuration grant is rooted at the acting agent's reporting
+subtree. It permits lifecycle control of reports and transitive descendants,
+not a manager, sibling, or unrelated agent. Unlike configuration changes,
+lifecycle commands always exclude the acting agent itself, even when its grant
+covers the subtree root. Scope changes and reporting changes apply to the next
+request. Board lifecycle controls remain unchanged.
+
+This applies to `POST /api/agents/:id/pause`, `/resume`, and `/terminate`, and to
+`PATCH /api/agents/:id` with lifecycle status changes. Activity entries retain
+the authenticated actor type and ID. Resume still enforces organization-chain
+health and does not remove budget or company holds.
+
 ## Commands and transactions
 
 `requestHire` writes the agent record before preparation starts.
