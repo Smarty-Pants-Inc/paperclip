@@ -33,6 +33,7 @@ import {
 } from "@paperclipai/db";
 import { recoveryPostgresSupport as embeddedPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 import { nativeHarnessBackupExpirationService } from "../services/native-runtime/native-harness-backup-expiration.ts";
+import { createNativeSetupRuntime } from "../services/native-runtime/native-setup-evidence.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { logger } from "../middleware/logger.js";
 
@@ -391,6 +392,22 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await db.delete(agentTaskSessions);
     expect(await expiration.tickCheckpoints({ maxEntries: 2 })).toMatchObject({ expiredCheckpoints: 2, truncated: true });
     expect(await expiration.tickCheckpoints({ maxEntries: 2 })).toMatchObject({ expiredCheckpoints: 1, truncated: false });
+  });
+
+  it("excludes setup evidence scopes from session discovery without altering their evidence", async () => {
+    const session = await seedSession();
+    vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", stateBase);
+    const setupRuntime = await createNativeSetupRuntime(session.companyId);
+    const setupRoot = path.dirname(setupRuntime);
+    const evidence = path.join(setupRoot, "setup-evidence.json");
+    await fs.writeFile(evidence, "preserve setup evidence\n");
+
+    const result = await service().tick();
+
+    expect(result).toMatchObject({ checked: 1, candidates: 1, expired: 1 });
+    expect(result.skipped.no_backup).toBeUndefined();
+    expect(await fs.readFile(evidence, "utf8")).toBe("preserve setup evidence\n");
+    await fs.rm(setupRuntime, { recursive: true, force: true });
   });
 
   it("expires the backup of a session whose issue closed before the window and clears its resume pointer", async () => {
