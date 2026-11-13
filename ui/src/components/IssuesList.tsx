@@ -536,9 +536,11 @@ export function IssueSearchInput({
   const [draftValue, setDraftValue] = useState(value);
   const [isFocused, setIsFocused] = useState(false);
   const lastCommittedValueRef = useRef(value);
+  const ownCommittedValuesRef = useRef(new Set<string>());
 
   useEffect(() => {
-    if (isFocused || value === lastCommittedValueRef.current) return;
+    if (isFocused || ownCommittedValuesRef.current.has(value) || value === lastCommittedValueRef.current) return;
+    ownCommittedValuesRef.current.clear();
     setDraftValue(value);
     lastCommittedValueRef.current = value;
   }, [isFocused, value]);
@@ -548,6 +550,7 @@ export function IssueSearchInput({
 
     const timeoutId = window.setTimeout(() => {
       lastCommittedValueRef.current = draftValue;
+      ownCommittedValuesRef.current.add(draftValue);
       startTransition(() => {
         onDebouncedChange(draftValue);
       });

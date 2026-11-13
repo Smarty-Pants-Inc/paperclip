@@ -1563,6 +1563,54 @@ describe("IssuesList", () => {
     await reactAct(async () => root.unmount());
   });
 
+  it("keeps a debounced draft when a stale own value arrives on blur", async () => {
+    vi.useFakeTimers();
+
+    let parentValue = "";
+    const emittedValues: string[] = [];
+    let root: ReturnType<typeof createRoot>;
+    const renderSearch = () => root.render(
+      <IssueSearchInput
+        value={parentValue}
+        onDebouncedChange={(search) => { emittedValues.push(search); }}
+      />,
+    );
+    root = createRoot(container);
+    await reactAct(async () => renderSearch());
+
+    const input = container.querySelector('input[aria-label="Search tasks"]') as HTMLInputElement;
+    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+    expect(valueSetter).toBeTypeOf("function");
+    await reactAct(async () => input.focus());
+
+    await reactAct(async () => {
+      valueSetter!.call(input, "S");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await reactAct(async () => vi.advanceTimersByTime(250));
+    expect(emittedValues).toEqual(["S"]);
+    parentValue = "S";
+    await reactAct(async () => renderSearch());
+
+    await reactAct(async () => {
+      valueSetter!.call(input, "SMAA-");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await reactAct(async () => vi.advanceTimersByTime(250));
+    expect(emittedValues).toEqual(["S", "SMAA-"]);
+
+    // The router still echoes the previous value when the input loses focus.
+    await reactAct(async () => {
+      input.blur();
+      vi.advanceTimersByTime(250);
+    });
+    expect(input.value).toBe("SMAA-");
+    expect(emittedValues).toEqual(["S", "SMAA-"]);
+
+    await reactAct(async () => root.unmount());
+    vi.useRealTimers();
+  });
+
   it("debounces search updates so typing does not notify the page on every keystroke", async () => {
     vi.useFakeTimers();
 
