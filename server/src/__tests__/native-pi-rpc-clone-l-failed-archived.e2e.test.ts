@@ -6,7 +6,7 @@ import https, { createServer as createHttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getCACertificates, setDefaultCACertificates } from "node:tls";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { expect, it, vi } from "vitest";
 import {
@@ -22,6 +22,7 @@ import {
 } from "../vendor/paperclip-runner/index.js";
 import { registerLocalRuntimeApiServer } from "../runtime-api.js";
 import { environmentService } from "../services/environments.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { closeWarmNativeSessionsForEnvironment, executePaperclipNativeSession, cancelNativeSession, reserveWarmNativeInstructionDirectory,
   type NativeInstructionWorkingCopy } from "../services/native-runtime/native-session-executor.js";
@@ -474,6 +475,7 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
       // The next message after a failed one: the heartbeat marks the failed
       // run failed and releases its lease; the person sends another message.
       let second: Record<string, unknown> | undefined;
+      let c9: Record<string, unknown> | undefined;
       if (record(outcome).error !== undefined || "hung" in outcome) {
         await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "adapter_failed",
           error: String(record(outcome).error ?? "hung") }).where(eq(heartbeatRuns.id, next.runId));
@@ -481,6 +483,21 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
           .where(eq(nativeRunFinalizations.runId, next.runId));
         leaseActive.set(next.lease.id, false);
         await environmentsService.releaseLease(next.lease.id, "released").catch(error => stage("second-message lease release", String(error)));
+        // C9: the stranded sweep settles the unanswered first message. The
+        // heartbeat is not running here, so the coordinator's same-run retry
+        // never starts; it is made overdue (the SMAA-143 msg-1 shape seen in
+        // production), and the run ended past the settle window.
+        const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, next.runId));
+        await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(Date.now() - 10 * 60_000) })
+          .where(and(eq(nativeRunFinalizations.runId, next.runId), eq(nativeRunFinalizations.phase, "retryable_failure")));
+        await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 20_000) }).where(eq(heartbeatRuns.id, next.runId));
+        await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId });
+        const visibleAfterSweep = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+          .filter(comment => comment.authorType === "system" && !comment.deletedAt && record(comment.metadata).recoveryResponsibility !== "system");
+        c9 = { finalization: { phase: finalization?.phase ?? null, failureCode: finalization?.failureCode ?? null },
+          visible: visibleAfterSweep.length, bodies: visibleAfterSweep.map(comment => comment.body),
+          reasons: visibleAfterSweep.map(comment => record(comment.metadata).authorizationReason ?? null) };
+        stage("C9 first-message notice", c9);
         const before2 = commands.length;
         const again = await follow(next, "Are you there? Recall the private fact from your own earlier assistant history.");
         const againOutcome = await run(again, "resumed", ownerAtArchive === "idle-archived", 120_000);
@@ -498,7 +515,7 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
       const finding = { variant, managed, reservations: managedReservations, hung: "hung" in outcome, error: record(outcome).error ?? null,
         exitCode: record(record(outcome).result).exitCode ?? null, recall: summary === `RECALLED_${fact}`, probes, identitySpan,
         reuse: events.filter(event => event.eventType === "run.startup.reuse").map(event => event.payload),
-        newRunner: spawned.length > spawnedBeforeIdle, notices: held.length, second };
+        newRunner: spawned.length > spawnedBeforeIdle, notices: held.length, second, c9 };
       stage("idle-loss finding", finding);
       await writeFile(join(root, "proof.json"), JSON.stringify(finding, null, 2));
       // A message after a failed one is never a silent error: it continues
@@ -507,6 +524,8 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
       if (second) expect.soft(second.recall === true || second.notices === 1,
         `the next message recalls or carries exactly one held notice: ${JSON.stringify(finding)}`).toBe(true);
       expect.soft(finding.hung, `the next message never hangs: ${JSON.stringify(finding)}`).toBe(false);
+      // C9: a failed first message gets exactly one visible notice from the sweep.
+      if (c9) expect.soft(c9.visible, `the failed first message has exactly one visible notice: ${JSON.stringify(finding)}`).toBe(1);
       expect.soft(finding.recall || held.length === 1, `recall or exactly one notice: ${JSON.stringify(finding)}`).toBe(true);
       return;
     }
