@@ -91,6 +91,20 @@ paths. Board behavior and generic adapter-config protections are unchanged.
 API-key management, company budgets and budget-policy/incident administration
 are not delegated by these changes.
 
+## Concurrent reporting-tree changes
+
+Descendant budget, permission, instruction-path and lifecycle writes recheck
+management authority inside their writer transaction, after acquiring the same
+company-row accounting lock as `reportsTo` updates. Moving an intermediate
+manager therefore cannot race a stale descendant check. The lock order is
+company, then target/task/run rows. Board behavior and explicitly unscoped legacy
+lifecycle grants remain unchanged.
+
+Managed wakes and run cancellation use that boundary when saving their durable
+wake receipt or Stop intent. Execution/provider cleanup may finish after a later
+reparent; that completes the already-accepted request, not a new grant of access.
+Self-wake remains separate from cross-agent lifecycle management.
+
 ## Named follow-up: target-manager consent-card eligibility
 
 This minimal grant fix does **not** establish or test that only the target

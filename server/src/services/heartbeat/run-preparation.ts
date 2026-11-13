@@ -808,6 +808,8 @@ export async function resolveRunScopedMentionedSkillKeys(input: {
 
 
 export interface WakeupOptions {
+  /** Authenticated managed-wake actor, never copied from public wake JSON. */
+  managementActor?: import("../authorization.js").AuthorizationActor;
   /** Internal durable case assignment receipt. Never accepted from public wake payloads. */
   durableCaseHandoffRequest?: { handoffId: string; wakeupRequestId: string; issueId: string; expectedIssueStatusVersion: number };
   /** Set only by authenticated board wake routes; never copied from caller payloads. */

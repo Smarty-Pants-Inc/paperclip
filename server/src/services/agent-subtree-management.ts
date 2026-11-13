@@ -2,8 +2,9 @@ import { agents, budgetPolicies, type Db } from "@paperclipai/db";
 import { addCents, compareCents, type PermissionKey } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import { forbidden } from "../errors.js";
-import { authorizationService, isAgentInSubtree } from "./authorization.js";
+import { authorizationService, authorizationDeniedDetails, isAgentInSubtree } from "./authorization.js";
 import { computeObservedSpend } from "./budget-exposure.js";
+import { lockAccountingCompany } from "./accounting-transaction.js";
 
 type Actor = Parameters<ReturnType<typeof authorizationService>["decide"]>[0]["actor"];
 type Target = { id: string; companyId: string };
@@ -21,6 +22,28 @@ export async function assertCanManageSubordinateAgent(db: Db, actor: Actor, targ
     scope: { targetAgentId: target.id, requiresChangeGrant: true },
   });
   if (!decision.allowed) throw forbidden(decision.explanation);
+}
+
+/** Recheck lifecycle authority inside the company-locked writer transaction.
+ * Unlike administrative grants/budgets, legacy unscoped configure stays valid. */
+export async function assertAgentLifecycleAuthority(db: Db, actor: Actor, target: Target) {
+  if (actor.type !== "agent") return;
+  if (actor.agentId === target.id) throw forbidden("Agents cannot manage their own lifecycle.");
+  const decision = await authorizationService(db).decide({
+    actor, action: "agent_config:update",
+    resource: { type: "agent", companyId: target.companyId, agentId: target.id },
+    scope: { targetAgentId: target.id, requiresChangeGrant: true },
+  });
+  if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+}
+
+/** Internal managed-work writers join the same company mutex as reportsTo.
+ * An accepted wake/Stop intent is the linearization point; async execution may
+ * finish after a later reparent without granting a new management request. */
+export async function lockAgentLifecycleAuthority(db: Db, actor: Actor | undefined, target: Target) {
+  if (actor?.type !== "agent") return;
+  await lockAccountingCompany(db, target.companyId);
+  await assertAgentLifecycleAuthority(db, actor, target);
 }
 
 /** Delegation is bounded by both the caller's explicit grant and its current subtree. */

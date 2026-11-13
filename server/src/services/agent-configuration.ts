@@ -24,7 +24,7 @@ import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
 import { agentCredentialService } from "./agent-credentials.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { budgetServiceInTransaction } from "./budgets.js";
-import { assertSubordinateBudgetChange } from "./agent-subtree-management.js";
+import { assertCanManageSubordinateAgent, assertSubordinateBudgetChange } from "./agent-subtree-management.js";
 
 export async function lockAgentConfigurationInteractions(tx: Db, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions) {
   const pluginOrigin = currentPluginInteractionOrigin();
@@ -41,6 +41,10 @@ export async function lockAgentConfigurationInteractions(tx: Db, id: string, dat
 }
 
 export async function prepareAgentConfiguration(db: Db, existing: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch> {
+  if (options?.requireSubordinateManagement && options.recordRevision?.createdByAgentId) {
+    await assertCanManageSubordinateAgent(db, { type: "agent", agentId: options.recordRevision.createdByAgentId,
+      companyId: existing.companyId }, existing);
+  }
   await assertAgentInteraction(db, { companyId: existing.companyId, actorAgentId: options?.recordRevision?.createdByAgentId,
     operation: "mention", texts: changedConfigurationText(data, existing) });
   if (data.permissions !== undefined) data = { ...data, permissions: preserveAgentInteractionPermissions(existing.permissions, data.permissions) };
