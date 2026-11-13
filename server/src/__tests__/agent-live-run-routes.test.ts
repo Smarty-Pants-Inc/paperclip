@@ -20,7 +20,6 @@ const mockHeartbeatService = vi.hoisted(() => ({
   readLog: vi.fn(),
   wakeup: vi.fn(),
   getRun: vi.fn(),
-  cancelRun: vi.fn(),
 }));
 
 const mockIssueService = vi.hoisted(() => ({
@@ -497,10 +496,10 @@ describe("agent live run routes", () => {
       expect(mockHeartbeatService.readLog).not.toHaveBeenCalled();
     });
 
-    it("keeps board-only and instance-admin checks ahead of malformed-ID validation", async () => {
+    it("keeps board and instance-admin checks ahead of malformed-ID validation", async () => {
       const app = await createApp({}, { type: "agent", companyId: "company-1", agentId: routeAgentId });
       for (const [method, suffix] of routes.filter(([, suffix]) =>
-        suffix === "/runtime-requests/approval-1/resolve" || suffix.startsWith("/provider-trace"),
+        suffix === "/cancel" || suffix === "/runtime-requests/approval-1/resolve" || suffix.startsWith("/provider-trace"),
       )) {
         const response = await requestApp(app, (url) =>
           request(url)[method](`/api/heartbeat-runs/undefined${suffix}`).send({}),
@@ -508,14 +507,6 @@ describe("agent live run routes", () => {
         expect(response.status, `${method} ${suffix}`).toBe(403);
       }
       expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
-    });
-
-    it("validates a malformed cancellation ID before resolving its scoped target", async () => {
-      const app = await createApp({}, { type: "agent", companyId: "company-1", agentId: routeAgentId });
-      const response = await requestApp(app, url => request(url).post("/api/heartbeat-runs/undefined/cancel").send({}));
-      expect(response.status).toBe(400);
-      expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
-      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
     });
   });
 
