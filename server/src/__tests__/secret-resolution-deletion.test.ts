@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, companySecrets, createDb, heartbeatRuns, issues, plugins,
   secretAccessEvents, userSecretDefinitions,
 } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
+import { deleteCompany } from "../services/company-deletion.js";
 import { issueService } from "../services/issues.js";
 import { secretService } from "../services/secrets.js";
 import {
@@ -38,6 +40,80 @@ suite("deferred secret audit reference deletion (real PostgreSQL)", () => {
       if (previousKey === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
       else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKey;
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("drops a deleted company's queued handoff with a count-only warning and persists the other company's handoff", async () => {
+    const companyA = randomUUID();
+    const companyB = randomUUID();
+    const [deletedCompany] = await db.insert(companies).values({ id: companyA, name: "Deleted company", issuePrefix: `A${companyA.slice(0, 7)}` }).returning();
+    await db.insert(companies).values({ id: companyB, name: "Healthy company", issuePrefix: `B${companyB.slice(0, 7)}` });
+    const service = secretService(db);
+    const context = { consumerType: "system" as const, consumerId: "company-handoff", actorType: "system" as const };
+    const secretA = await service.create(companyA, { name: "deleted-company", provider: "local_encrypted", value: "synthetic-company-A-value" });
+    const secretB = await service.create(companyB, { name: "healthy-company", provider: "local_encrypted", value: "synthetic-company-B-value" });
+    const warning = vi.spyOn(logger, "warn");
+    try {
+      expect(await service.resolveSecretValue(companyA, secretA.id, "latest", { accessContext: context })).toBe("synthetic-company-A-value");
+      expect(await service.resolveSecretValue(companyB, secretB.id, "latest", { accessContext: context })).toBe("synthetic-company-B-value");
+      expect(await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.companyId, companyB))).toHaveLength(0);
+      expect(await deleteCompany(db, companyA)).toMatchObject({ id: companyA });
+      expect(await db.select().from(companies).where(eq(companies.id, companyA))).toHaveLength(0);
+      await flushSecretResolutionWrites(db);
+      expect(await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.companyId, companyA))).toHaveLength(0);
+      expect(await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.companyId, companyB))).toMatchObject([{ secretId: secretB.id }]);
+      expect(warning).toHaveBeenCalledWith({ kind: "audit", droppedCount: 1 }, "Dropped secret audit events for deleted companies");
+      await drainSecretResolutionWrites();
+      await flushSecretResolutionWrites(db);
+      expect(await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.companyId, companyB))).toHaveLength(1);
+      console.info(JSON.stringify({ target: "deleted-company", droppedEvents: 1, healthyPersisted: 1, drained: true }));
+    } finally {
+      warning.mockRestore();
+      // Restore only a disposable tenant on RED so the old queue can drain.
+      await db.insert(companies).values(deletedCompany).onConflictDoNothing();
+      await flushSecretResolutionWrites(db);
+    }
+  });
+
+  it("dead-letters the same batch after five failed flushes and persists a later healthy batch (real non-FK failure)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Dead-letter isolation", issuePrefix: `L${companyId.slice(0, 7)}` });
+    const event = { companyId, provider: "local_encrypted", actorType: "system", consumerType: "system", consumerId: "poison-dead-letter", outcome: "success" };
+    await db.execute(sql`ALTER TABLE secret_access_events ADD CONSTRAINT secret_audit_dead_letter_test CHECK (consumer_id <> 'poison-dead-letter')`);
+    const errors = vi.spyOn(logger, "error");
+    const insert = vi.spyOn(db, "insert");
+    try {
+      const withUnexpectedValue = { ...event, value: "synthetic-dead-letter-plaintext", providerCredentials: "synthetic-dead-letter-credential" };
+      await enqueueSecretAccessEvent(db, withUnexpectedValue);
+      await expect(flushSecretResolutionWrites(db)).rejects.toThrow("audit write failed");
+      // New arrivals must not change the failed batch or reset its budget.
+      await enqueueSecretAccessEvent(db, { ...event, consumerId: "healthy-after-poison" });
+      for (let failure = 2; failure <= 4; failure++) {
+        await expect(flushSecretResolutionWrites(db)).rejects.toThrow("audit write failed");
+        expect(await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.companyId, companyId))).toHaveLength(0);
+      }
+      await flushSecretResolutionWrites(db);
+      const recorded = await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.companyId, companyId));
+      expect(recorded).toMatchObject([{ consumerId: "healthy-after-poison" }]);
+      expect(insert).toHaveBeenCalledTimes(11); // two attempts per failed flush, then one healthy INSERT
+      const deadLetters = errors.mock.calls.filter(call => call[1] === "Secret audit batch dead-lettered after bounded retries");
+      expect(deadLetters).toHaveLength(1);
+      expect(deadLetters[0][0]).toMatchObject({ kind: "audit", failedFlushes: 5, count: 1, eventIds: [expect.any(String)], records: [{ ...event, id: expect.any(String), createdAt: expect.any(Date) }] });
+      const payload = deadLetters[0][0] as { eventIds: string[]; records: Array<{ id: string }> };
+      expect(payload.eventIds).toEqual(payload.records.map(row => row.id));
+      expect(payload.eventIds).not.toContain(recorded[0].id);
+      expect(JSON.stringify(deadLetters)).not.toContain("synthetic-company-");
+      expect(JSON.stringify(errors.mock.calls)).not.toContain("synthetic-dead-letter-plaintext");
+      expect(JSON.stringify(errors.mock.calls)).not.toContain("synthetic-dead-letter-credential");
+      await drainSecretResolutionWrites();
+      await flushSecretResolutionWrites(db);
+      expect(insert).toHaveBeenCalledTimes(11);
+      console.info(JSON.stringify({ target: "persistent-non-FK", failedFlushes: 5, failedInsertAttempts: 10, deadLetterCount: 1, healthyPersisted: 1, drained: true }));
+    } finally {
+      errors.mockRestore();
+      insert.mockRestore();
+      await db.execute(sql`ALTER TABLE secret_access_events DROP CONSTRAINT secret_audit_dead_letter_test`);
+      await flushSecretResolutionWrites(db);
     }
   });
 
