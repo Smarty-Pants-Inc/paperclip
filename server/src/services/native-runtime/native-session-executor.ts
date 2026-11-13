@@ -5906,8 +5906,13 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   }
   if (!prior || prior.run.runtimeMode !== "native") return refuse("owner_missing");
   if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(prior.run.status)) return refuse("owner_run_not_terminal");
-  if (prior.owner.phase !== "committed") return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
-  if (!prior.owner.resultId) return refuse("owner_result_missing");
+  // A board Stop settles its run without a result: the Stop path writes
+  // native_retry_cancelled only after the acknowledged user Stop receipt that
+  // also lets a warm Pi owner be retained (retainCancelledSession).
+  const stoppedByUser = prior.run.status === "cancelled" && prior.owner.phase === "terminal_failure"
+    && prior.owner.failureCode === "native_retry_cancelled" && hasAcknowledgedNativeStopIntent(prior.run);
+  if (prior.owner.phase !== "committed" && !stoppedByUser) return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
+  if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
   if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
   // A durable controller is fenced by its released database lease; a legacy
