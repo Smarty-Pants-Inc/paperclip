@@ -501,8 +501,13 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
         newRunner: spawned.length > spawnedBeforeIdle, notices: held.length, second };
       stage("idle-loss finding", finding);
       await writeFile(join(root, "proof.json"), JSON.stringify(finding, null, 2));
-      expect(finding.hung, `the next message never hangs: ${JSON.stringify(finding)}`).toBe(false);
-      expect(finding.recall || held.length === 1, `recall or exactly one notice: ${JSON.stringify(finding)}`).toBe(true);
+      // A message after a failed one is never a silent error: it continues
+      // or carries exactly one held notice. Soft, so the first message's
+      // verdict below is reported in the same run.
+      if (second) expect.soft(second.recall === true || second.notices === 1,
+        `the next message recalls or carries exactly one held notice: ${JSON.stringify(finding)}`).toBe(true);
+      expect.soft(finding.hung, `the next message never hangs: ${JSON.stringify(finding)}`).toBe(false);
+      expect.soft(finding.recall || held.length === 1, `recall or exactly one notice: ${JSON.stringify(finding)}`).toBe(true);
       return;
     }
 
