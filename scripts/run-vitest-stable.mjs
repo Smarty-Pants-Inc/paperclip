@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -409,82 +409,109 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return shardFiles.map((file) => byRepoPath.get(file));
 }
 
+function makeTestDirectoriesWritable(directory) {
+  let entries;
+  try {
+    const stats = lstatSync(directory);
+    if (!stats.isDirectory()) return; // Never follow fixture symlinks.
+    chmodSync(directory, stats.mode | 0o700);
+    entries = readdirSync(directory);
+  } catch {
+    // Best effort: still try removal, and let its result determine the warning.
+    return;
+  }
+  for (const entry of entries) makeTestDirectoriesWritable(path.join(directory, entry));
+}
+
 async function runVitest(args, label, testShard = null, exactFiles = false) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
-  const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
+  const tempRootParent = os.tmpdir();
   // Production workspace/security checks reject symlink aliases. In particular
   // /tmp is /private/tmp on macOS, so fixture roots must use the canonical path.
   const testRoot = realpathSync(mkdtempSync(path.join(tempRootParent, "pv-")));
-  // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
-  const env = {
-    ...process.env,
-    NODE_ENV: "test",
-    PAPERCLIP_TEST_HOST_HOME: process.env.PAPERCLIP_TEST_HOST_HOME
-      ?? (process.env.PAPERCLIP_HOME?.trim() || path.join(os.homedir(), ".paperclip")),
-    PAPERCLIP_HOME: path.join(testRoot, "h"),
-    // Config discovery otherwise prefers the checkout's .paperclip/config.json
-    // over PAPERCLIP_HOME, importing preview scheduling policy into unit tests.
-    PAPERCLIP_CONFIG: path.join(testRoot, "h", "config.json"),
-    PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
-    TMPDIR: path.join(testRoot, "t"),
-  };
-  // The wrapper has already validated and consumed this shard's manifest.
-  // Tests may launch independent runner fixtures with a different root/inventory.
-  delete env.PAPERCLIP_CI_TEST_SELECTION;
-  delete env.PAPERCLIP_CI_SELECTION_HASH;
-  mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
-  mkdirSync(env.TMPDIR, { recursive: true });
-  if (testShard) {
-    const file = path.resolve(repoRoot, chatSuite);
-    const sourceLines = readFileSync(file, "utf8").split("\n");
-    const collect = (filters, name) => {
-      const output = path.join(testRoot, `${name}.json`);
-      const result = spawnSync("pnpm", ["exec", "vitest", "list", ...sourceOnlyVitestArgs,
-        ...filters, "--allowOnly=false", "--includeTaskLocation", `--json=${output}`], {
-        cwd: repoRoot, env, stdio: "inherit",
-      });
-      if (result.error || result.status !== 0) throw new Error(`Vitest collection failed: ${result.error?.message ?? result.status}`);
-      return JSON.parse(readFileSync(output, "utf8"));
+  // Keep the pv-/h/t paths compact for Unix socket limits; a longer TMPDIR
+  // is the caller's choice.
+  try {
+    const env = {
+      ...process.env,
+      NODE_ENV: "test",
+      PAPERCLIP_TEST_HOST_HOME: process.env.PAPERCLIP_TEST_HOST_HOME
+        ?? (process.env.PAPERCLIP_HOME?.trim() || path.join(os.homedir(), ".paperclip")),
+      PAPERCLIP_HOME: path.join(testRoot, "h"),
+      // Config discovery otherwise prefers the checkout's .paperclip/config.json
+      // over PAPERCLIP_HOME, importing preview scheduling policy into unit tests.
+      PAPERCLIP_CONFIG: path.join(testRoot, "h", "config.json"),
+      PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-${invocationIndex}`,
+      TMPDIR: path.join(testRoot, "t"),
     };
-    const allCollected = collect(args, "all");
-    const collected = [];
-    const bogusCollected = [];
-    for (const test of allCollected) {
-      (chatSuiteRunLine(sourceLines, test.location.line) === null ? bogusCollected : collected).push(test);
+    // The wrapper has already validated and consumed this shard's manifest.
+    // Tests may launch independent runner fixtures with a different root/inventory.
+    delete env.PAPERCLIP_CI_TEST_SELECTION;
+    delete env.PAPERCLIP_CI_SELECTION_HASH;
+    mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
+    mkdirSync(env.TMPDIR, { recursive: true });
+    if (testShard) {
+      const file = path.resolve(repoRoot, chatSuite);
+      const sourceLines = readFileSync(file, "utf8").split("\n");
+      const collect = (filters, name) => {
+        const output = path.join(testRoot, `${name}.json`);
+        const result = spawnSync("pnpm", ["exec", "vitest", "list", ...sourceOnlyVitestArgs,
+          ...filters, "--allowOnly=false", "--includeTaskLocation", `--json=${output}`], {
+          cwd: repoRoot, env, stdio: "inherit",
+        });
+        if (result.error || result.status !== 0) throw new Error(`Vitest collection failed: ${result.error?.message ?? result.status}`);
+        return JSON.parse(readFileSync(output, "utf8"));
+      };
+      const allCollected = collect(args, "all");
+      const collected = [];
+      const bogusCollected = [];
+      for (const test of allCollected) {
+        (chatSuiteRunLine(sourceLines, test.location.line) === null ? bogusCollected : collected).push(test);
+      }
+      if (bogusCollected.length > 0) {
+        console.warn(
+          `[test:run] dropping ${bogusCollected.length} bogus Vitest collection entr${bogusCollected.length === 1 ? "y" : "ies"} with no matching it()/test() call: ${bogusCollected.map((test) => `${test.location.line}:${JSON.stringify(test.name)}`).join(", ")}`,
+        );
+      }
+      const selected = partitionTestLines(collected, testShard.count, file)[testShard.index];
+      // Validate shard membership with the same `list`-reported lines that
+      // produced `selected`, then switch to the `run`-compatible lines only for
+      // the filters handed to the real `vitest run` below (see
+      // chatSuiteRunLine).
+      const validationFilters = selected.lines.map((line) => `${chatSuite}:${line}`);
+      const validationArgs = [...args.filter((arg) => arg !== chatSuite), ...validationFilters];
+      assertSelectedTests(selected.tests, collect(validationArgs, "selected"), file);
+      console.log(`[test:run] chat shard ${testShard.index + 1}/${testShard.count}: ${selected.tests.length}/${collected.length} tests, ${selected.lines.length} source lines; exact filter coverage verified`);
+      const runFilters = selected.lines.map((line) => `${chatSuite}:${chatSuiteRunLine(sourceLines, line)}`);
+      args = [...args.filter((arg) => arg !== chatSuite), ...runFilters, "--allowOnly=false"];
     }
-    if (bogusCollected.length > 0) {
-      console.warn(
-        `[test:run] dropping ${bogusCollected.length} bogus Vitest collection entr${bogusCollected.length === 1 ? "y" : "ies"} with no matching it()/test() call: ${bogusCollected.map((test) => `${test.location.line}:${JSON.stringify(test.name)}`).join(", ")}`,
-      );
+    await new Promise((resolve, reject) => {
+      const command = exactFiles ? process.execPath : "pnpm";
+      const prefix = exactFiles ? [path.join(scriptsDir, "ci/run-selected-vitest.mjs")] : ["exec", "vitest", "run"];
+      // `vitest list` collection above never retries; only the run does.
+      const child = spawn(command, [...prefix, ...sourceOnlyVitestArgs, ...vitestRetryArgs(), ...args], {
+        cwd: repoRoot,
+        env: invocationEnv("vitest", env),
+        stdio: "inherit",
+      });
+      child.once("error", reject);
+      child.once("close", (code, signal) => {
+        if (code === 0) resolve();
+        else reject(new Error(`${label} failed (${signal ?? code})`));
+      });
+    });
+  } finally {
+    if (process.env.PAPERCLIP_TEST_KEEP_TMP !== "1") {
+      try {
+        makeTestDirectoriesWritable(testRoot);
+        rmSync(testRoot, { recursive: true, force: true });
+      } catch (error) {
+        // Cleanup must never mask a child failure or turn a passing run red.
+        console.warn(`[test:run] warning: could not remove temporary root ${JSON.stringify(testRoot)}: ${JSON.stringify(error.message)}`);
+      }
     }
-    const selected = partitionTestLines(collected, testShard.count, file)[testShard.index];
-    // Validate shard membership with the same `list`-reported lines that
-    // produced `selected`, then switch to the `run`-compatible lines only for
-    // the filters handed to the real `vitest run` below (see
-    // chatSuiteRunLine).
-    const validationFilters = selected.lines.map((line) => `${chatSuite}:${line}`);
-    const validationArgs = [...args.filter((arg) => arg !== chatSuite), ...validationFilters];
-    assertSelectedTests(selected.tests, collect(validationArgs, "selected"), file);
-    console.log(`[test:run] chat shard ${testShard.index + 1}/${testShard.count}: ${selected.tests.length}/${collected.length} tests, ${selected.lines.length} source lines; exact filter coverage verified`);
-    const runFilters = selected.lines.map((line) => `${chatSuite}:${chatSuiteRunLine(sourceLines, line)}`);
-    args = [...args.filter((arg) => arg !== chatSuite), ...runFilters, "--allowOnly=false"];
   }
-  await new Promise((resolve, reject) => {
-    const command = exactFiles ? process.execPath : "pnpm";
-    const prefix = exactFiles ? [path.join(scriptsDir, "ci/run-selected-vitest.mjs")] : ["exec", "vitest", "run"];
-    // `vitest list` collection above never retries; only the run does.
-    const child = spawn(command, [...prefix, ...sourceOnlyVitestArgs, ...vitestRetryArgs(), ...args], {
-      cwd: repoRoot,
-      env: invocationEnv("vitest", env),
-      stdio: "inherit",
-    });
-    child.once("error", reject);
-    child.once("close", (code, signal) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${label} failed (${signal ?? code})`));
-    });
-  });
 }
 
 async function runGeneralSuites(routeTests, chatShards) {
