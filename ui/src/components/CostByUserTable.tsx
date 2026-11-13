@@ -38,7 +38,7 @@ export function CostByUserTable({ report }: { report: CostByUserReport }) {
                   </td>
                   <td className="px-4 py-3 text-right tabular-nums">{formatTokens(row.outputTokens)}</td>
                   <td className="py-3 pl-4 text-right tabular-nums">
-                    <CostAmount costCents={row.costCents} eventCount={row.eventCount} estimatedEventCount={row.estimatedEventCount} unpricedEventCount={row.unpricedEventCount} />
+                    <CostAmount costCents={row.costCents} eventCount={row.eventCount} estimatedEventCount={row.estimatedEventCount} unpricedEventCount={row.unpricedEventCount} accountingUsageLost={row.accountingUsageLost} />
                     {row.unpricedEventCount > 0 && <div className="whitespace-nowrap text-xs text-muted-foreground">{row.unpricedEventCount} unpriced {row.unpricedEventCount === 1 ? "charge" : "charges"}</div>}
                   </td>
                 </tr>

@@ -998,8 +998,28 @@ same fact without adding summary tokens or manufacturing a zero-cost call.
 Producer receipt replay retains it across later turns. The run receipt's existing
 `pricingProvenance.evidence` explicitly states that Pi summary usage is unknown
 and observed usage/cost are a lower bound. `GET /api/heartbeat-runs/:runId`
-returns that provenance in `usageJson`; this does not change cost aggregation or
-run-level UI presentation.
+returns that provenance and the typed `usageJson.accountingUsageLost` boolean.
+The boolean is true when some provider usage is missing. Counts and charges are
+measured lower bounds in that case, even if `accountingReceiptReady` is true.
+Receipt persistence preserves the boolean across replay, later messages, and
+attempts. The server does not infer the boolean from explanatory prose.
+
+Company, agent, and related cost rollups carry `accountingUsageLost` when any
+included charge belongs to a flagged run. The company summary also sets
+`pricingComplete: false`. The flag does not change measured tokens or money.
+Run metrics and cost views show “Additional usage unknown”. A zero measured
+subtotal with missing usage also shows the warning.
+
+Budget admission applies the existing incomplete-accounting policy to a final
+charge whose run has this typed flag. Such accounting gaps do not trigger the
+`block-unpriced` gate. Known charges still count toward monetary limits.
+Ordinary unpriced measured usage still blocks under that policy. The existing
+typed lost-on-restore receipt exemption remains separate; prose grants neither
+exemption. This is not permission to treat an unknown increment as zero cost.
+
+The field is optional for old clients and receipts. There is no prose-based
+backfill. Historical runs need typed receipt replay or reconciliation before
+their missing usage can appear through this new field.
 
 This unknown summary spend does not invalidate later assistant-message usage
 receipts. Their deltas, completeness, and cost provenance describe the measured

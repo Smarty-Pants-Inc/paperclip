@@ -11081,7 +11081,7 @@ async function executePaperclipNativeSessionAttempt(
     const costUsdExact = input.execution.provider.kind !== "cursor_cloud" && typeof usage?.accountingCostUsdExact === "string" ? usage.accountingCostUsdExact : undefined;
     const checkpoint: AdapterUsageCheckpoint = { usage: accountingUsage, ...billing, complete, usageBasis: "per_run", costUsdExact,
       model: input.execution.provider.model ?? "unknown", costUsd: accountingCost ?? null, costStatus,
-      ...(usage?.accountingUsageLost === true ? { pricingProvenance: { source: accountingCost != null || costUsdExact ? "provider_reported" as const : "unknown" as const,
+      ...(usage?.accountingUsageLost === true ? { accountingUsageLost: true, pricingProvenance: { source: accountingCost != null || costUsdExact ? "provider_reported" as const : "unknown" as const,
         version: "accounting-receipt/v1", evidence: nativeUsageLowerBoundEvidence(usage) } } : {}) };
     if (input.onUsage) await input.onUsage(checkpoint);
     else {
@@ -13472,7 +13472,7 @@ async function executePaperclipNativeSessionAttempt(
       ? input.execution.provider.kind === "aws_agentcore" ? "estimated" : undefined
       : "unpriced",
     usageComplete: nativeAccountingComplete,
-    ...(native.usage?.accountingUsageLost === true ? { pricingProvenance: {
+    ...(native.usage?.accountingUsageLost === true ? { accountingUsageLost: true, pricingProvenance: {
       source: typeof native.usage.accountingCostUsdExact === "string" ? "provider_reported" as const : "unknown" as const,
       version: "accounting-receipt/v1", evidence: nativeUsageLowerBoundEvidence(native.usage) } } : {}),
     usageBasis: "per_run",

@@ -5,6 +5,8 @@ import { AgentActionButtons } from "../components/AgentActionButtons";
 import type { Agent, HeartbeatRun } from "@paperclipai/shared";
 import { describe, expect, it, vi } from "vitest";
 import { RunAccountingMetrics } from "./AgentDetail";
+import { CostAmount } from "../components/CostAmount";
+import { SubscriptionTokenUsage } from "../components/SubscriptionCostCard";
 import { hasUnavailableProviderAccounting } from "../lib/utils";
 
 vi.mock("@/lib/router", () => ({ useNavigate: () => vi.fn() }));
@@ -29,6 +31,33 @@ describe("run accounting provenance", () => {
     expect(markup).toContain("40");
     expect(markup).toContain("$0.1200");
     expect(markup).not.toContain("Unavailable");
+  });
+
+  it.each([0, 120])("qualifies lower-bound counts even when the measured subtotal is %s", inputTokens => {
+    const markup = renderToStaticMarkup(<RunAccountingMetrics run={run({ inputTokens, outputTokens: 0, accountingUsageLost: true })} />);
+    expect(markup).toContain("Additional usage unknown");
+    expect(markup).toContain(`>${inputTokens}<`);
+  });
+
+  it("does not infer missing usage from an ordinary estimate or explanatory prose", () => {
+    const markup = renderToStaticMarkup(<RunAccountingMetrics run={run({ inputTokens: 120, outputTokens: 20, costStatus: "estimated",
+      pricingProvenance: { evidence: "Additional usage unknown" } })} />);
+    expect(markup).not.toContain("Additional usage unknown");
+  });
+
+  it("qualifies company and agent amounts with the same typed lower-bound marker", () => {
+    const markup = renderToStaticMarkup(<CostAmount costCents={25} accountingUsageLost />);
+    expect(markup).toContain("Additional usage unknown");
+    expect(markup).toContain("$0.25");
+    expect(renderToStaticMarkup(<CostAmount costCents={25} />)).not.toContain("Additional usage unknown");
+  });
+
+  it("qualifies subscription usage without qualifying the unrelated monthly fee", () => {
+    const usage = { inputTokens: 120, cachedInputTokens: 20, outputTokens: 10, costCents: "0", eventCount: 1,
+      estimatedEventCount: 0, unpricedEventCount: 0, accountingUsageLost: true };
+    expect(renderToStaticMarkup(<SubscriptionTokenUsage usage={usage} />)).toContain("Additional usage unknown");
+    expect(renderToStaticMarkup(<SubscriptionTokenUsage usage={{ ...usage, accountingUsageLost: false }} />))
+      .not.toContain("Additional usage unknown");
   });
 
   it("requires the saved externally billed and unavailable facts", () => {

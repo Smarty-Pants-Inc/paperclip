@@ -153,6 +153,10 @@ export interface GitWorktreeBranchIncoherenceEvidence {
   };
 }
 
+export interface HeartbeatRunUsage extends Record<string, unknown> {
+  accountingUsageLost?: boolean;
+}
+
 export interface HeartbeatRun {
   /** Persisted native driver identity; older servers may omit this field. */
   driverKind?: string | null;
@@ -192,7 +196,7 @@ export interface HeartbeatRun {
   wakeupRequestId: string | null;
   exitCode: number | null;
   signal: string | null;
-  usageJson: Record<string, unknown> | null;
+  usageJson: HeartbeatRunUsage | null;
   resultJson: Record<string, unknown> | null;
   sessionIdBefore: string | null;
   sessionIdAfter: string | null;

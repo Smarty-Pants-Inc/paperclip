@@ -19,6 +19,7 @@ export function SubscriptionTokenUsage({ usage }: { usage: SubscriptionUsage }) 
   return <span className="font-mono text-xs text-muted-foreground">
     {formatTokens(usage.inputTokens + usage.cachedInputTokens)} in · {formatTokens(usage.outputTokens)} out
     {usage.cachedInputTokens > 0 && <span className="block">{formatTokens(usage.cachedInputTokens)} input cached</span>}
+    {usage.accountingUsageLost && <span className="block font-sans">Additional usage unknown</span>}
   </span>;
 }
 

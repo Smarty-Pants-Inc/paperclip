@@ -609,6 +609,9 @@ export function Costs({
       {scopedAgentError && (
         <p role="alert" className="text-sm text-destructive">Could not load agent details. Totals below show recorded organization costs.</p>
       )}
+      {spendData?.summary.accountingUsageLost && (
+        <p role="status" className="text-sm text-muted-foreground">Additional usage unknown</p>
+      )}
       {museUsageUnavailable && (
         <p role="status" className="text-sm text-muted-foreground">
           {scopedAgent.name}'s Muse activity has no reported usage or cost. Totals below show recorded organization charges only. Paperclip cannot enforce a Muse spend ceiling.
@@ -795,7 +798,7 @@ export function Costs({
                                   {row.agentStatus === "terminated" ? <StatusBadge status="terminated" /> : null}
                                 </div>
                                 <div className="text-right text-sm tabular-nums">
-                                  <CostAmount costCents={row.costCents} eventCount={row.eventCount} estimatedEventCount={row.estimatedEventCount} />
+                                  <CostAmount costCents={row.costCents} eventCount={row.eventCount} estimatedEventCount={row.estimatedEventCount} accountingUsageLost={row.accountingUsageLost} />
                                   <div className="text-xs text-muted-foreground">
                                     in {formatTokens(row.inputTokens + row.cachedInputTokens)} ({formatTokens(row.cachedInputTokens)} cached) · out {formatTokens(row.outputTokens)}
                                   </div>
@@ -836,6 +839,7 @@ export function Costs({
                                             costCents={modelRow.costCents}
                                             eventCount={modelRow.eventCount}
                                             estimatedEventCount={modelRow.estimatedEventCount}
+                                            accountingUsageLost={modelRow.accountingUsageLost}
                                             suffix={<span className="ml-1 font-normal text-muted-foreground">({sharePct}%)</span>}
                                           />
                                           <div className="text-muted-foreground">
@@ -876,7 +880,7 @@ export function Costs({
                             className="flex items-center justify-between gap-3 border border-border px-3 py-2 text-sm"
                           >
                             <span className="truncate">{row.projectName ?? row.projectId ?? "Unattributed"}</span>
-                            <CostAmount costCents={row.costCents} eventCount={row.eventCount} estimatedEventCount={row.estimatedEventCount} />
+                            <CostAmount costCents={row.costCents} eventCount={row.eventCount} estimatedEventCount={row.estimatedEventCount} accountingUsageLost={row.accountingUsageLost} />
                           </div>
                         ))
                       )}

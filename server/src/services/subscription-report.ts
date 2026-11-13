@@ -3,6 +3,7 @@ import { aiSubscriptions, aiSubscriptionPrices, aiSubscriptionConnections, conne
 import { addCents, monthlySubscriptionCents, type SubscriptionCostReport, type SubscriptionPrice, type SubscriptionUsage } from "@paperclipai/shared";
 import { withAccountingReadSnapshot } from "./accounting-transaction.js";
 import { ordinaryInputTokens } from "./costs.js";
+import { aggregateAccountingUsageLost } from "./cost-usage-completeness.js";
 import { resolveCostDateRange, type CostDateRange } from "./cost-date-range.js";
 import { canEditSubscription, canonicalSubscriptionId, type SubscriptionActor } from "./subscriptions.js";
 
@@ -12,6 +13,7 @@ export function emptySubscriptionUsage(): SubscriptionUsage {
 
 function addUsage(target: SubscriptionUsage, source: SubscriptionUsage) {
   target.costCents = addCents(target.costCents, source.costCents);
+  if (source.accountingUsageLost) target.accountingUsageLost = true;
   for (const key of ["inputTokens", "cachedInputTokens", "outputTokens", "eventCount", "estimatedEventCount", "unpricedEventCount"] as const) target[key] += Number(source[key]);
 }
 
@@ -62,6 +64,7 @@ export async function subscriptionCostReport(db: Db, companyId: string, actor: S
         cachedInputTokens: sql<number>`coalesce(sum(${costEvents.cachedInputTokens}), 0)::double precision`,
         outputTokens: sql<number>`coalesce(sum(${costEvents.outputTokens}), 0)::double precision`,
         costCents: sql<string>`coalesce(sum(${costEvents.costCents}), 0)::text`,
+        accountingUsageLost: aggregateAccountingUsageLost,
         eventCount: sql<number>`count(*)::int`,
         estimatedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'estimated')::int`,
         unpricedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'unpriced' and ${costEvents.billingType} <> 'subscription_included')::int`,

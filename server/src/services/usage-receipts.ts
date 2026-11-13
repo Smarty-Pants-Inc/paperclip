@@ -37,6 +37,7 @@ const checkpointSchema = z.object({
   costStatus: z.enum(["reported", "estimated", "unpriced"]).optional(),
   pricingContext: z.object({ serviceTier: z.string().max(50).optional(), contextTier: z.enum(["short", "long"]).optional() }).optional(),
   pricingProvenance: pricingProvenanceSchema.optional(),
+  accountingUsageLost: z.boolean().optional(),
   costUsdExact: z.string().max(160).refine(value => { try { return !value.startsWith("-") && usdToUnits(value) >= 0n; } catch { return false; } }, "Invalid exact USD amount").nullable().optional(),
   providerRequestId: z.string().max(250).nullable().optional(), complete: z.boolean(),
 });
@@ -220,6 +221,7 @@ export async function persistUsageReceiptInTransaction(tx: Db, raw: UsageReceipt
       usageByModel: receipt.usageByModel ?? null, usageSource: receipt.usageBasis ?? "per_run", providerRequestId: receipt.providerRequestId ?? null,
       accountingReceiptReady: previous.accountingCaptureFailed !== true && receipt.complete && receipt.usageBasis !== "session_cumulative", accountingReceiptId: envelope.id,
       accountingReceiptSequence: envelope.sequence, accountingReceiptReceivedAt: envelope.receivedAt,
+      ...(previous.accountingUsageLost === true || receipt.accountingUsageLost === true ? { accountingUsageLost: true } : {}),
       costStatus: receipt.costStatus ?? null,
       budgetExposure: { sourceId: envelope.sourceId, sequence: envelope.sequence, costCents: observedCost },
       pricingProvenance: receipt.pricingProvenance ?? { source: receipt.costUsd != null || receipt.costUsdExact != null ? "provider_reported" : "unknown", version: "accounting-receipt/v1" },
@@ -656,6 +658,7 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
     if (!attempts.has(attempt)) currentAttempt = attempt;
     const previous = attempts.get(attempt);
     const priced = priceAnthropicReceipt(priceCodexReceipt({ ...parsed, usage: parsed.usage ?? previous?.usage,
+      ...(previous?.accountingUsageLost === true ? { accountingUsageLost: true } : {}),
       complete: parsed.complete && !(previous?.usage && !parsed.usage) }));
     priced.pricingProvenance ??= {
       source: priced.costUsd != null || priced.costUsdExact != null || priced.cacheAdjustedCostUsd != null ? "provider_reported" : "unknown",
@@ -665,7 +668,8 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
     const liveCostCents = projectLiveUsage(attempt, priced);
     const parts = [...attempts.values()];
     const latest = attempts.get(currentAttempt)!;
-    const receipt: AdapterUsageCheckpoint = { ...latest, complete: latest.complete && !captureFailed, usage: {
+    const receipt: AdapterUsageCheckpoint = { ...latest, complete: latest.complete && !captureFailed,
+      ...(parts.some(part => part.accountingUsageLost === true) ? { accountingUsageLost: true } : {}), usage: {
       inputTokens: parts.reduce((sum, item) => sum + (item.usage?.inputTokens ?? 0), 0),
       cachedInputTokens: parts.reduce((sum, item) => sum + (item.usage?.cachedInputTokens ?? 0), 0),
       ...(parts.some(item => item.usage?.cacheWriteTokens !== undefined) ? { cacheWriteTokens: parts.reduce((sum, item) => sum + (item.usage?.cacheWriteTokens ?? 0), 0) } : {}),
@@ -733,7 +737,8 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
         const finalPrice = final.cacheAdjustedCostUsd ?? final.costUsdExact ?? final.costUsd;
         const previousPrice = previous.cacheAdjustedCostUsd ?? previous.costUsdExact ?? previous.costUsd;
         const moreCost = finalPrice != null && (previousPrice == null || usdToUnits(finalPrice) > usdToUnits(previousPrice));
-        if (!moreTokens && !moreCost) return capture(previous);
+        if (!moreTokens && !moreCost) return capture({ ...previous,
+          ...(final.accountingUsageLost === true ? { accountingUsageLost: true } : {}) });
       }
       return capture(final);
     }),
@@ -760,7 +765,7 @@ const producerAccountingProjectionFields = [
   "accountingSourceReceiptPending", "accountingLateReceiptPending", "accountingLateReceiptId",
   "accountingLateReceiptAttemptedId", "accountingReconciledReceiptId", "accountingLateReceiptDebts", "accountingLateDeltas",
   "accountingReconciledReceiptSourceId", "accountingReconciledReceiptSequence",
-  "inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteTokens",
+  "inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteTokens", "accountingUsageLost",
   "provider", "biller", "model", "billingType", "usageSource", "providerRequestId", "usageByModel",
   "costUsd", "costUsdExact", "cacheAdjustedCostUsd", "costStatus", "pricingProvenance", "budgetExposure",
 ];

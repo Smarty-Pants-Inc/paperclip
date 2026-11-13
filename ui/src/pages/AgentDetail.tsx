@@ -2925,7 +2925,8 @@ export function AgentFileRunNotice({ resultJson }: { resultJson: HeartbeatRun["r
 
 export function RunAccountingMetrics({ run }: { run: HeartbeatRun }) {
   const metrics = runMetrics(run);
-  if (!metrics.usageUnavailable && ![metrics.input, metrics.output, metrics.cached, metrics.cost].some(value => (value ?? 0) > 0)) return null;
+  const accountingUsageLost = run.usageJson?.accountingUsageLost === true;
+  if (!metrics.usageUnavailable && !accountingUsageLost && ![metrics.input, metrics.output, metrics.cached, metrics.cost].some(value => (value ?? 0) > 0)) return null;
   const values = [
     ["Input", metrics.input === null ? "Unavailable" : formatTokens(metrics.input)],
     ["Output", metrics.output === null ? "Unavailable" : formatTokens(metrics.output)],
@@ -2940,6 +2941,7 @@ export function RunAccountingMetrics({ run }: { run: HeartbeatRun }) {
           <div className="text-sm font-medium font-mono">{value}</div>
         </div>
       ))}
+      {accountingUsageLost && <p className="col-span-2 text-xs text-muted-foreground">Additional usage unknown</p>}
     </div>
   );
 }

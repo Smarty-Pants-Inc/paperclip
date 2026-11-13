@@ -8822,8 +8822,8 @@ describe("native terminal-turn accounting", () => {
     const result = await executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, [], {}, "running", replay ? before : []),
       execution: { ...execution, provider: { kind: "acpx", agent: "claude", model: "claude-sonnet-5" } } as NativeExecutionInput,
       runnerInstanceId: "runner", runnerEnvironment: { ANTHROPIC_API_KEY: "fixture" }, onUsage });
-    expect(result).toMatchObject({ usageComplete: true });
-    expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ complete: true,
+    expect(result).toMatchObject({ usageComplete: true, accountingUsageLost: true });
+    expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ complete: true, accountingUsageLost: true,
       pricingProvenance: expect.objectContaining({ evidence: expect.any(String) }) }));
   });
 
@@ -8851,7 +8851,7 @@ describe("native terminal-turn accounting", () => {
         expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ complete }));
         if (!complete) expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ costUsd: null, costStatus: "unpriced" }));
         if (scenario === "later_partial") expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({
-          usage: expect.objectContaining({ inputTokens: 12, outputTokens: 4 }), costStatus: "unpriced",
+          usage: expect.objectContaining({ inputTokens: 12, outputTokens: 4 }), costStatus: "unpriced", accountingUsageLost: true,
           pricingProvenance: expect.objectContaining({ evidence: expect.stringContaining("lower bound") }),
         }));
       }

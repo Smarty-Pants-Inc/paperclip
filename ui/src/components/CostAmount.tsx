@@ -8,10 +8,11 @@ export function CostAmount({
   costCents,
   eventCount,
   estimatedEventCount,
+  accountingUsageLost,
   unpricedEventCount,
   showUnavailableCount = false,
   suffix,
-}: Pick<CostByAgent, "costCents"> & Partial<Pick<CostByAgent, "eventCount" | "estimatedEventCount">> & {
+}: Pick<CostByAgent, "costCents"> & Partial<Pick<CostByAgent, "eventCount" | "estimatedEventCount" | "accountingUsageLost">> & {
   unpricedEventCount?: number;
   showUnavailableCount?: boolean;
   suffix?: ReactNode;
@@ -24,6 +25,7 @@ export function CostAmount({
         {suffix}
       </div>
       <CostEstimateLabel eventCount={eventCount} estimatedEventCount={estimatedEventCount} />
+      {accountingUsageLost && <span className="text-xs text-muted-foreground">Additional usage unknown</span>}
       {showUnavailableCount && !!unpricedEventCount && <Badge variant="outline" className="font-normal text-muted-foreground">
         {unpricedEventCount} {unpricedEventCount === 1 ? "cost" : "costs"} unavailable
       </Badge>}
