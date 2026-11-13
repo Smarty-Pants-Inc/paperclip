@@ -291,13 +291,17 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)(
     };
     type Fixture = Awaited<ReturnType<typeof seed>>;
     const executionOptions = async (fixture: Fixture, outcome: "created" | "resumed") => {
-      const path = `/api/runner/v1/connect/${fixture.runId}`;
-      previewBindings.set(path, fixture.lease.id);
-      const endpoint = async (): Promise<RunnerIngressEndpoint> => {
+      // Honest provider ingress: like the production provider endpoint, it
+      // exposes exactly the listener path the caller requests (runnerd's
+      // --listen-path), bound to this run's lease.
+      const endpoint = async (request?: { leaseId: string; port: number; path: string }): Promise<RunnerIngressEndpoint> => {
         if (!leaseActive.get(fixture.lease.id)) throw new Error("retired environment lease cannot obtain ingress");
+        const path = request?.path ?? `/api/runner/v1/connect/${fixture.runId}`;
+        previewBindings.set(path, fixture.lease.id);
+        stage("ingress endpoint requested", { runId: fixture.runId, leaseId: fixture.lease.id, path });
         return { kind: "authenticated_websocket", websocketUrl: `wss://127.0.0.1:${previewAddress.port}${path}`,
           secretHeaders: [{ name: "X-Owned-Lease", value: fixture.lease.id }], generation: fixture.lease.id,
-          refresh: endpoint, close: async () => {} };
+          refresh: () => endpoint(request), close: async () => {} };
       };
       const target: AdapterExecutionTarget = { kind: "remote", transport: "sandbox", providerKey: "boat", environmentId,
         leaseId: fixture.lease.id, remoteCwd, reusableLeaseConfigured: true, runner: commandRunner(fixture.lease.id),
