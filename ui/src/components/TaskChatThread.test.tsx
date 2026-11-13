@@ -6195,3 +6195,135 @@ it("explains a missing provider runtime with an installation repair", () => {
   expect(container.textContent).toContain("Reinstall or rebuild Paperclip");
   expect(container.textContent).toContain("test the agent's runtime");
 });
+
+// C9 (Smarty fork, TEMPORARY with the B' server commit d22668bdf): the stranded
+// sweep's notice for a person's message that nothing answered. The fixture is
+// the EXACT output of buildStrandedRecoveryEscalationNotice
+// (server/src/services/recovery/stranded-notice.ts:254-330) called with the
+// arguments of server/src/services/recovery/unanswered-person-message.ts:307-319
+// (SMAA-143 msg 1 shape: failed run, board hold, code runner_harness_state_mismatch),
+// stored by its addComment at :331-335 with detailsDefaultOpen true and
+// authorizationReason `unanswered_message:<commentId>`. Upstream's v2 filter
+// (TaskChatThread.tsx:930, upstream d33b40a5c / #16965) hides only
+// recoveryResponsibility "system". With the builder's default
+// detailsDefaultOpen false, the row shows only its title
+// (TaskChatSystemNotice.tsx:65), not the plain-words next step.
+describe("C9 unanswered person message notice (B' stranded sweep) in the chat", () => {
+  const BPRIME_NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
+  const BPRIME_NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
+  const NEXT_ACTION = "Send the message again; if it fails again, assign this agent a new task.";
+  const at = (second: number) => new Date(`2026-11-13T20:00:${String(second).padStart(2, "0")}Z`);
+  const personMessage = (id: string, body: string, second: number) => ({
+    id, body, companyId: "company", issueId: "issue", authorType: "user" as const, authorAgentId: null,
+    authorUserId: "viewer", presentation: null, metadata: null, createdAt: at(second), updatedAt: at(second),
+  });
+  const agentAnswer = (id: string, body: string, second: number, runId: string) => ({
+    id, body, companyId: "company", issueId: "issue", authorType: "agent" as const, authorAgentId: "agent",
+    authorUserId: null, runId, createdByRunId: runId, presentation: null, metadata: null,
+    createdAt: at(second), updatedAt: at(second),
+  });
+  // buildStrandedRecoveryEscalationNotice output, run branch (unanswered-person-message.ts:307-319).
+  const bPrimeNotice = (second: number, overrides: { recoveryResponsibility?: "user" | "system"; deletedAt?: Date | null } = {}) => ({
+    id: "bprime-notice", companyId: "company", issueId: "issue", authorType: "system" as const,
+    authorAgentId: null, authorUserId: null, body: BPRIME_NOT_ANSWERED,
+    presentation: { kind: "system_notice" as const, tone: "warning" as const, title: "Your message wasn't answered", detailsDefaultOpen: true },
+    metadata: {
+      version: 1 as const,
+      recoveryResponsibility: overrides.recoveryResponsibility ?? "user" as const,
+      sourceRunId: "failed-run",
+      sections: [
+        { title: "Recovery", rows: [
+          { type: "key_value" as const, label: "Recovery action", value: "recovery-action-1" },
+          { type: "key_value" as const, label: "Recovery owner", value: "Board decision required" },
+          { type: "key_value" as const, label: "Next action", value: NEXT_ACTION },
+        ] },
+        { title: "Run evidence", rows: [
+          { type: "run_link" as const, label: "Source run", runId: "failed-run", agentId: "agent", title: "failed" },
+          { type: "key_value" as const, label: "Failure code", value: "runner_harness_state_mismatch" },
+        ] },
+      ],
+      authorizationReason: "unanswered_message:person-message",
+    },
+    deletedAt: overrides.deletedAt ?? null,
+    createdAt: at(second), updatedAt: at(second),
+  });
+  // The no-run branch of the same builder (no source run, failureCode "no_run").
+  const bPrimeNoRunNotice = (second: number) => ({
+    ...bPrimeNotice(second), id: "bprime-no-run-notice", body: BPRIME_NO_RUN,
+    metadata: {
+      version: 1 as const, recoveryResponsibility: "user" as const, sourceRunId: null,
+      sections: [
+        { title: "Recovery", rows: [{ type: "key_value" as const, label: "Next action", value: NEXT_ACTION }] },
+        { title: "Run evidence", rows: [{ type: "key_value" as const, label: "Failure code", value: "no_run" }] },
+      ],
+      authorizationReason: "unanswered_message:person-message",
+    },
+  });
+  const linkedRun = (runId: string, status: string, second: number, errorCode: string | null = null) => ({
+    runId, status, runtimeMode: "native" as const, adapterType: "paperclip_runner", agentId: "agent", agentName: "Managed Pi",
+    errorCode, createdAt: at(second).toISOString(), startedAt: at(second).toISOString(), finishedAt: at(second + 1).toISOString(),
+  });
+  const failedRun = linkedRun("failed-run", "failed", 1, "runner_harness_state_mismatch");
+  const anchor = (id: string) => container.querySelector(`[data-thread-anchor="${id}"]`);
+  const precedes = (earlier: string, later: string) =>
+    expect(anchor(earlier)!.compareDocumentPosition(anchor(later)!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+  describe.each([true, false])("conversationMode=%s", (conversationMode) => {
+    const paint = (props: Partial<ComponentProps<typeof TaskChatThread>>) => render(
+      <TaskChatThread issueId="issue" conversationMode={conversationMode} currentUserId="viewer" onAdd={async () => {}}
+        issueStatus="blocked" comments={[]} {...props} />,
+    );
+
+    it("(a) shows the B' notice (recoveryResponsibility 'user') in plain words after the person's message", () => {
+      paint({ comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5)], linkedRuns: [failedRun] });
+      expect(anchor("bprime-notice")).not.toBeNull();
+      expect(anchor("bprime-notice")!.textContent).toContain("Your message wasn't answered");
+      expect(anchor("bprime-notice")!.querySelector('[data-testid="task-chat-system-notice-details"]')).not.toBeNull();
+      expect(anchor("bprime-notice")!.textContent).toContain(BPRIME_NOT_ANSWERED);
+      expect(container.textContent).not.toContain("backup_without_reusable_lease");
+      precedes("person-message", "bprime-notice");
+    });
+
+    it("(a) shows the no-run variant (no source run) in plain words", () => {
+      paint({ comments: [personMessage("person-message", "Please continue.", 0), bPrimeNoRunNotice(5)], linkedRuns: [] });
+      expect(anchor("bprime-no-run-notice")).not.toBeNull();
+      expect(anchor("bprime-no-run-notice")!.textContent).toContain(BPRIME_NO_RUN);
+    });
+
+    it("(b) hides the same comment when recoveryResponsibility is 'system' (upstream's filter kept)", () => {
+      paint({ comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5, { recoveryResponsibility: "system" })],
+        linkedRuns: [failedRun] });
+      expect(anchor("bprime-notice")).toBeNull();
+      expect(container.textContent).not.toContain(BPRIME_NOT_ANSWERED);
+      expect(container.textContent).toContain("Please continue.");
+    });
+
+    it("(c) a later agent answer: B' soft-deletes the notice (unanswered-person-message.ts:207) -> hidden, thread in order", () => {
+      paint({
+        comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5, { deletedAt: at(20) }),
+          personMessage("resend", "Please continue (again).", 10), agentAnswer("answer", "Here is my answer.", 15, "answer-run")],
+        linkedRuns: [failedRun, linkedRun("answer-run", "succeeded", 11)],
+        issueStatus: "in_progress",
+      });
+      expect(anchor("bprime-notice")).toBeNull();
+      expect(container.textContent).not.toContain(BPRIME_NOT_ANSWERED);
+      expect(container.textContent).toContain("Here is my answer.");
+      precedes("person-message", "resend");
+      precedes("resend", "answer");
+    });
+
+    it("(c) before the sweep supersedes it, the answering run already makes the notice historical (statusRelevance.isHistoricalNotice)", () => {
+      paint({
+        comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5),
+          personMessage("resend", "Please continue (again).", 10), agentAnswer("answer", "Here is my answer.", 15, "answer-run")],
+        linkedRuns: [failedRun, linkedRun("answer-run", "succeeded", 11)],
+        issueStatus: "in_progress",
+      });
+      expect(anchor("bprime-notice")).toBeNull();
+      expect(container.textContent).not.toContain(BPRIME_NOT_ANSWERED);
+      expect(container.textContent).toContain("Here is my answer.");
+      precedes("person-message", "resend");
+      precedes("resend", "answer");
+    });
+  });
+});
