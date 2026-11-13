@@ -46,9 +46,9 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
+it.skipIf(!enabled).each([false, true, "invalid", "foreign"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
   const missingFile = savedFile === true;
-  const invalidFile = savedFile === "invalid";
+  const invalidFile = savedFile === "invalid" || savedFile === "foreign";
   let preservedBytes: Buffer | undefined;
   let originalSessionFile: string | undefined;
   expect(["warm", "per_turn"]).toContain(lifecycleMode);
@@ -59,6 +59,7 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
   if (!process.env.PAPERCLIP_RUNNER_BINARY || !process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH)
     throw new Error("Set absolute PAPERCLIP_RUNNER_BINARY and PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH to qualified local artifacts");
   const root = await mkdtemp(join(process.env.PAPERCLIP_PI_E2E_EVIDENCE ?? tmpdir(), "native-pi-continuing-"));
+  await writeFile(join(root, "fixture.json"), JSON.stringify({ savedFile, lifecycleMode, thinking, protocol }, null, 2));
   const privateFact = `PI_PRIVATE_MEMORY_${randomUUID()}`;
   const freshFact = `PI_FRESH_MEMORY_${randomUUID()}`;
   const readSessionFile = (piPid: number) => {
@@ -352,7 +353,13 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
       }
       if (invalidFile && activeTurn === 2) {
         originalSessionFile = (turnProofs[0]!.sessionFiles as string[])[0]!;
-        preservedBytes = Buffer.concat([readFileSync(originalSessionFile), Buffer.from("{corrupt Pi history between turns}\n")]);
+        const original = readFileSync(originalSessionFile, "utf8");
+        if (savedFile === "foreign") {
+          const [header, ...entries] = original.split("\n");
+          preservedBytes = Buffer.from([JSON.stringify({ ...JSON.parse(header!), id: randomUUID() }), ...entries].join("\n"));
+        } else {
+          preservedBytes = Buffer.concat([Buffer.from(original), Buffer.from("{corrupt Pi history between turns}\n")]);
+        }
         await writeFile(originalSessionFile, preservedBytes);
         // Under per_turn the settled runner already exited after turn 1, so the
         // next turn cold-opens the corrupted file with no kill or restore. A warm
@@ -363,7 +370,7 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
           process.kill(residentRunner!, "SIGKILL");
           await vi.waitFor(() => expect(bundles[0]!.evidence().diagnostics).toContain("runner process restored its durable PRP session"), { timeout: 20_000, interval: 50 });
         }
-        stage(lifecycleMode === "per_turn" ? "saved Pi file corrupted; next turn cold-opens it" : "saved Pi file corrupted; original runner killed and restored", { originalSessionFile,
+        stage(lifecycleMode === "per_turn" ? "saved Pi file corrupted; next turn cold-opens it" : "saved Pi file corrupted; original runner killed and restored", { savedFile, originalSessionFile,
           sha256: createHash("sha256").update(preservedBytes).digest("hex"), oldPids: turnProofs[0]!.pids });
       }
       const requestOffset = requests.length;
@@ -378,6 +385,14 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
       const admitted = await waitFor(`turn ${activeTurn} admitted`, async () =>
         (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
           .find(run => run.nativeIssueId === issueId && !previousRuns.includes(run.id)) ?? null);
+      if (activeTurn === 3) {
+        const comments = await api("GET", `/issues/${issueId}/comments`) as Array<typeof issueComments.$inferSelect>;
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+        await writeFile(join(root, "comments-next-turn-admitted.json"), JSON.stringify(comments, null, 2));
+        await writeFile(join(root, "runs-next-turn-admitted.json"), JSON.stringify(runs, null, 2));
+        const notices = comments.filter(comment => /^(pi_session_file_missing|pi_session_file_invalid):/.test(comment.metadata?.authorizationReason ?? ""));
+        expect(notices, "exactly one durable notice survives the next real admission").toHaveLength(missingFile || invalidFile ? 1 : 0);
+      }
       await waitFor(`turn ${activeTurn} settled`, async () => {
         const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
         return run?.status === "succeeded" ? run : null;
@@ -456,7 +471,7 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
           expect(readFileSync(asideFile)).toEqual(preservedBytes);
           expect(readFileSync(originalSessionFile!, "utf8")).not.toContain("{corrupt Pi history between turns}");
           if (activeTurn === 2) {
-            expect(pids[0]!.runnerPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.runnerPid);
+            if (lifecycleMode === "warm") expect(pids[0]!.runnerPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.runnerPid);
             expect(row.piNativeSessionId).not.toBe(turnProofs[0]!.piNativeSessionId);
             expect(events.filter(event => event.eventType === "provider.notice.recorded"
               && JSON.stringify(event.payload).includes("pi_session_file_invalid")), "one durable owner diagnostic").toHaveLength(1);
@@ -486,13 +501,24 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
           }
         }
       }
-      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      // A fresh HTTP read is the same durable comments surface the chat reloads.
+      const comments = await api("GET", `/issues/${issueId}/comments`) as Array<typeof issueComments.$inferSelect>;
       await writeFile(join(root, `comments-turn-${activeTurn}.json`), JSON.stringify(comments, null, 2));
-      const notices = comments.filter(comment => comment.body.startsWith("My earlier conversation could not be restored:"));
-      expect(notices).toHaveLength(missingFile && activeTurn >= 2 ? 1 : 0);
+      const reloaded = await api("GET", `/issues/${issueId}/comments`) as Array<typeof issueComments.$inferSelect>;
+      await writeFile(join(root, `comments-turn-${activeTurn}-reloaded.json`), JSON.stringify(reloaded, null, 2));
+      expect(reloaded.map(comment => comment.id), "reload reads the same durable transcript").toEqual(comments.map(comment => comment.id));
+      const notices = comments.filter(comment => /^(pi_session_file_missing|pi_session_file_invalid):/.test(comment.metadata?.authorizationReason ?? ""));
+      expect(notices).toHaveLength((missingFile || invalidFile) && activeTurn >= 2 ? 1 : 0);
       if (notices.length) {
-        expect(notices[0]!.body).toBe("My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.");
+        if (missingFile) expect(notices[0]!.body).toBe("My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.");
+        else expect(notices[0]!.body).toContain("pi_session_file_invalid");
         expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", tone: "warning" });
+        // Run-owned notices become historical at Done / next admission. This
+        // transcript boundary must instead keep its audit link in the details.
+        expect.soft(notices[0]!.createdByRunId, "reloaded recovery notice is not ephemeral run status").toBeNull();
+        expect(notices[0]!.metadata?.sections).toEqual(expect.arrayContaining([
+          expect.objectContaining({ rows: expect.arrayContaining([expect.objectContaining({ type: "run_link" })]) }),
+        ]));
       }
       previousRuns.push(admitted.id);
     }

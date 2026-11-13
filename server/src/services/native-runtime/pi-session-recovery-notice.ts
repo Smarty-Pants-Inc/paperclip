@@ -31,17 +31,19 @@ export function piSessionRecovery(event: Pick<PrpEvent, "eventType" | "payload" 
 
 function invalidPiSessionRecovery(event: Pick<PrpEvent, "eventType" | "payload" | "normalizedSessionId">): { previousId: string; preservedFile: string } | null {
   if (event.eventType !== "session.resumed" && event.eventType !== "run.attached") return null;
-  const admission = record(record(event.payload.providerDescriptor).piNativeAdmission);
+  const nativeReceipt = event.payload.provider === "pi_rpc";
+  const admission = nativeReceipt ? record(record(event.payload.providerDescriptor).piNativeAdmission)
+    : record(record(event.payload.context).piNativeAdmission);
   const recovery = record(event.eventType === "run.attached" ? event.payload.piSessionRecovery : admission.sessionRecovery);
   if (recovery.reason !== "pi_session_file_invalid" || recovery.normalizedSessionId !== event.normalizedSessionId
     || !nativeId(recovery.previousSessionId) || typeof recovery.preservedFile !== "string"
     || /[\\/]/u.test(recovery.preservedFile)
     || !recovery.preservedFile.startsWith(`${event.normalizedSessionId}.jsonl.invalid-`)
     || !/\d{4}-\d{2}-\d{2}T[\d-]+Z-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/u.test(recovery.preservedFile)) return null;
-  if (event.eventType === "session.resumed" && (event.payload.provider !== "pi_rpc"
+  if (event.eventType === "session.resumed" && ((!nativeReceipt && (event.payload.provider !== undefined || admission.provider !== "pi_rpc"))
     || !nativeId(admission.providerSessionId) || admission.providerSessionId === recovery.previousSessionId
-    || admission.providerSessionId !== event.payload.providerSessionId
-    || admission.providerSessionId !== event.payload.providerAccountSessionId)) return null;
+    || admission.providerSessionId !== (nativeReceipt ? event.payload.providerSessionId : event.payload.driverSessionId)
+    || admission.providerSessionId !== (nativeReceipt ? event.payload.providerAccountSessionId : event.payload.providerSessionId))) return null;
   return { previousId: recovery.previousSessionId, preservedFile: recovery.preservedFile };
 }
 
@@ -80,7 +82,10 @@ export async function materializePiSessionRecoveryNotice(input: {
     if (existing) return false;
     await issueService(db).addComment(issueId, invalid ? invalidNotice
       : "My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.",
-      { runId }, { authorType: "system", presentation: {
+      // Every history-loss reason is a lasting transcript boundary, not run
+      // status. Keep provenance in its detail link without making chat relevance
+      // hide the notice when this run completes or a later turn is admitted.
+      {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
       }, metadata: { version: 1, authorizationReason: key,
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
