@@ -5,6 +5,37 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { logger } from "../../middleware/logger.js";
 vi.mock("../../middleware/logger.js", () => ({ logger: { info: vi.fn() } }));
+
+const fsyncDirectories = vi.hoisted(() => [] as string[]);
+const filesystemEvents = vi.hoisted(() => [] as string[]);
+vi.mock("node:fs", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const paths = new Map<number, string>();
+  return {
+    ...actual,
+    openSync: (directory: string, ...args: unknown[]) => {
+      const descriptor = actual.openSync(directory, ...(args as [number, number?]));
+      paths.set(descriptor, String(directory));
+      return descriptor;
+    },
+    fsyncSync: (descriptor: number) => {
+      const directory = paths.get(descriptor) ?? "unknown";
+      fsyncDirectories.push(directory);
+      filesystemEvents.push(`fsync:${directory}`);
+      return actual.fsyncSync(descriptor);
+    },
+  };
+});
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      filesystemEvents.push("rename");
+      return actual.rename(...args);
+    },
+  };
+});
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { retainNativePiConversationEvidence, retainNativeRuntimeEvidence } from "./native-pi-conversation-evidence.js";
 
@@ -74,6 +105,18 @@ it("leaves the sole source intact and emits no success log if inventory exceeds 
   expect(logger.info).not.toHaveBeenCalled();
 });
 
+it("syncs both rename parents after retaining the source tree", async () => {
+  const f = await fixture();
+  fsyncDirectories.length = 0;
+  filesystemEvents.length = 0;
+  expect(await retainNativePiConversationEvidence(f.source)).toBe(true);
+  expect(fsyncDirectories).toContain(f.base);
+  expect(fsyncDirectories).toContain(join(f.evidence, scope));
+  const renameIndex = filesystemEvents.indexOf("rename");
+  expect(renameIndex).toBeGreaterThanOrEqual(0);
+  expect(filesystemEvents.slice(renameIndex + 1)).toContain(`fsync:${join(f.base, scope, "failover-backups")}`);
+  expect(filesystemEvents.slice(renameIndex + 1)).toContain(`fsync:${join(f.evidence, scope)}`);
+});
 it("fails closed without deleting source when the private evidence directory is replaced by a symlink", async () => {
   const f = await fixture(), outside = join(f.base, "other-owner");
   await mkdir(outside); await symlink(outside, f.evidence);
