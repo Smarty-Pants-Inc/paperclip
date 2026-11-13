@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterEach, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pack-archive.js";
+import { providerPackTransferTimeoutMs } from "./provider-pack-transfer.js";
 import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 // @ts-expect-error Build-time script has no TypeScript declaration.
 import { createProviderPackArchive, createProviderPackLayers } from "../../../../scripts/create-provider-pack-archive.mjs";
@@ -93,6 +94,28 @@ async function layeredFixture() {
   if (!("kind" in archive)) throw Error("Expected layered archive");
   return { root, pack, receipt, archive };
 }
+
+it.each([
+  [0, 300_000],
+  [1024 * 1024 * 1024, 1_084_000],
+  [1024 * 1024 * 1024 * 2, 1_800_000],
+])("bounds the provider archive transfer deadline for %i bytes", (bytes, expected) => {
+  expect(providerPackTransferTimeoutMs(bytes)).toBe(expected);
+});
+
+it.skipIf(!tar || !hasZstd).each(["v1", "v2"])("gives a slow %s archive transfer the native sync deadline override", async version => {
+  const { root, pack, archive } = version === "v2" ? await layeredFixture() : await fixture();
+  const remote = await runner(root);
+  const transfer = remote.syncIn;
+  remote.syncIn = vi.fn<NonNullable<CommandManagedRuntimeRunner["syncIn"]>>(async (operations, options) => {
+    if ((options?.minimumTimeoutMs ?? 60_000) <= 60_000) throw Error("Boat signed upload failed");
+    return transfer(operations, options);
+  });
+  const targetPath = path.join(root, "slow-upload");
+  expect(await stageProviderPackArchive({ archive, runner: remote, targetPath, reuseRoots: [] })).toBe(true);
+  expect(await fs.readFile(path.join(targetPath, "bin/tool"))).toEqual(await fs.readFile(path.join(pack, "bin/tool")));
+  expect(remote.syncIn.mock.calls[0]?.[1]).toEqual({ minimumTimeoutMs: 300_000 });
+});
 
 it.skipIf(!tar || !hasZstd)("reuses only byte-matched image files, keeps modes, and never shares writable hardlinks", async () => {
   const { root, pack, archive } = await layeredFixture();

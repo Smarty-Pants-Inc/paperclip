@@ -3496,6 +3496,23 @@ Only missing or mismatched layers and the overlay are uploaded. The controller
 checks those archives before upload; the sandbox checks all received hashes
 before extraction. Normal full pack admission still runs afterward.
 
+Both archive formats pass the existing per-call `minimumTimeoutMs` sync option:
+verified compressed bytes receive one second per MiB plus one minute, with a
+five-minute floor and the sync contract's thirty-minute cap. This overrides a
+provider's small-file default without changing saved environment settings or
+weakening archive/installed-pack verification. A larger configured provider
+budget still wins. A failed transfer remains a preparation failure, not proof
+that the owning sandbox is safe to discard.
+
+After an image rollout, use the matching immutable sandbox snapshot in the
+saved environment configuration. The documented
+[compatible configuration drain](idle-environment-cleanup.md#compatible-changes-on-reusable-sandboxes)
+already prefers that new allocation after the owner settles and its latest
+checkpoint and workspace are safe. Until then, the admitted allocation stays
+pinned; the existing verified-upload path remains the fallback. A pack digest
+mismatch alone neither proves the configured snapshot contains the selected
+pack nor authorizes retirement of live or uncheckpointed conversation state.
+
 Historical v1 `provider-pack.tar.zst` receipts remain readable. Missing sidecars,
 remote zstd, compatible GNU tar/checksum tools, or the Node 18+ helper retain
 directory staging; invalid sidecars fail
