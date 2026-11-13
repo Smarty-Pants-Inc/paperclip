@@ -37,6 +37,7 @@ import type { StorageService } from "../../storage/types.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { issueService } from "../issues.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
 
 export type RemoteWorkspaceFileReader = (input: Pick<NativeRunnerFileHandoffInput, "contentRef" | "byteSize" | "sha256">) => Promise<Buffer>;
 
@@ -835,6 +836,7 @@ export async function resolveNativeRunnerWakeAttachmentSelections(input: {
       contextSnapshot: heartbeatRuns.contextSnapshot,
       agentStatus: agents.status,
       assigneeAgentId: issues.assigneeAgentId,
+      executionRunId: issues.executionRunId,
     })
     .from(heartbeatRuns)
     .innerJoin(
@@ -861,7 +863,6 @@ export async function resolveNativeRunnerWakeAttachmentSelections(input: {
         inArray(heartbeatRuns.status, input.requireRunning ? ["running"] : ["queued", "running"]),
         eq(issues.id, input.binding.issueId),
         eq(issues.companyId, input.binding.companyId),
-        eq(issues.executionRunId, input.binding.runId),
         eq(agents.id, input.binding.agentId),
         eq(agents.companyId, input.binding.companyId),
       ),
@@ -884,7 +885,11 @@ export async function resolveNativeRunnerWakeAttachmentSelections(input: {
         contextSnapshot: reviewContext,
       })
     : null;
-  if (run.assigneeAgentId !== input.binding.agentId && !nativeReview) {
+  const ownsExecution = run.executionRunId === input.binding.runId
+    && (run.assigneeAgentId === input.binding.agentId || nativeReview);
+  if (!ownsExecution && !await getNativeAddressedInteractionGrant(input.db, input.binding, {
+    requireRunning: input.requireRunning ?? false,
+  })) {
     throw new Error("paperclip_runner_attachment_staging_not_authorized");
   }
   const selections = wakeAttachmentSelections(run.contextSnapshot);

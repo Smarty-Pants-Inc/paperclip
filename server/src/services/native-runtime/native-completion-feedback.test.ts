@@ -33,6 +33,26 @@ describe("native final-response feedback", () => {
     } }) as { document: { id: string; latestRevisionId: string }; documentHref: string };
     return { companyId, agentId, issueId, runId, saved };
   }
+  async function addressedFixture() {
+    const value = await fixture(), resolverAgentId = randomUUID(), responseRunId = randomUUID(), interactionId = randomUUID();
+    await db.update(agents).set({ name: "KA task assignee" }).where(eq(agents.id, value.agentId));
+    await db.insert(agents).values({ id: resolverAgentId, companyId: value.companyId, name: "KP card resolver", adapterType: "paperclip_runner", status: "active" });
+    await db.update(issues).set({ description: "KA still has unfinished task objectives." }).where(eq(issues.id, value.issueId));
+    await db.insert(issueThreadInteractions).values({ id: interactionId, companyId: value.companyId, issueId: value.issueId,
+      kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "not_creator", effectiveResolverPolicy: "not_creator",
+      resolverPolicyProvenance: "explicit", effectiveResolverPolicySource: "requested",
+      sourceRunId: null, createdByAgentId: null, createdByUserId: "board-user",
+      addresseeAgentId: resolverAgentId, addresseeUserId: null,
+      payload: { version: 1, prompt: "Approve the bounded handoff?" },
+    });
+    await db.insert(heartbeatRuns).values({ id: responseRunId, companyId: value.companyId, agentId: resolverAgentId,
+      nativeIssueId: value.issueId, status: "running", runtimeMode: "native",
+      contextSnapshot: { issueId: value.issueId, taskId: value.issueId, wakeReason: "interaction_pending",
+        interactionId, interactionIds: [interactionId] },
+    });
+    return { ...value, resolverAgentId, responseRunId, interactionId };
+  }
   async function publishedFileReport(value: Awaited<ReturnType<typeof fixture>>, objective = "Save a document on this task. Export the results as a CSV."): Promise<PrpStructuredRunResult> {
     await db.update(issues).set({ description: objective }).where(eq(issues.id, value.issueId));
     const bytes = Buffer.from("category,total\nverified,3\n");
@@ -44,6 +64,48 @@ describe("native final-response feedback", () => {
     } }) as { downloadPath: string };
     return { ...done, evidence: [{ ref: `${receipt.downloadPath}#download` }] };
   }
+  it("does not let an addressed response run finish while its board confirmation is pending", async () => {
+    const value = await addressedFixture();
+    await expect(nativeCompletionFeedback(db, value.responseRunId, done)).rejects.toThrow(/Resolve your addressed confirmation/);
+    const blocker: PrpStructuredRunResult = { ...done, reportedWorkDisposition: "blocked",
+      summary: "The board confirmation remains pending.",
+      completionClaim: { ...done.completionClaim, objectiveSatisfied: false,
+        remainingWork: [{ description: "Wait for the board decision", blocksCompletion: true }] },
+      blocker: { reasonCode: "missing_access", owner: { kind: "user", name: "Board operator" },
+        scope: "task_wide", unblockAction: "Resolve the addressed confirmation" },
+    };
+    await expect(nativeCompletionFeedback(db, value.responseRunId, blocker)).resolves.toContain("Response blocker recorded");
+    const [task] = await db.select().from(issues).where(eq(issues.id, value.issueId));
+    expect(task).toMatchObject({ status: "in_progress", assigneeAgentId: value.agentId, executionRunId: value.runId });
+  });
+  it.each(["accepted", "rejected"] as const)("accepts its exact %s card response without completing KA's task", async status => {
+    const value = await addressedFixture();
+    await db.update(issueThreadInteractions).set({ status, resolvedByAgentId: value.resolverAgentId,
+      resolvedByRunId: value.responseRunId, resolvedAt: new Date(), result: { version: 1, outcome: status } })
+      .where(eq(issueThreadInteractions.id, value.interactionId));
+    const feedback = await nativeCompletionFeedback(db, value.responseRunId, done);
+    expect(feedback).toContain("Response turn accepted");
+    expect(feedback).toContain("does not claim completion of the assignee's task");
+    const [task] = await db.select().from(issues).where(eq(issues.id, value.issueId));
+    expect(task).toMatchObject({ status: "in_progress", assigneeAgentId: value.agentId, executionRunId: value.runId,
+      description: "KA still has unfinished task objectives." });
+    const [responseRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, value.responseRunId));
+    expect(responseRun?.status).toBe("running");
+  });
+  it.each(["different agent", "different run", "invalidated card"] as const)("does not treat a %s as its successful response", async mismatch => {
+    const value = await addressedFixture();
+    const resolution = mismatch === "different agent"
+      ? { status: "accepted", resolvedByAgentId: value.agentId, resolvedByRunId: value.runId, resolvedAt: new Date(),
+        resolvedByUserId: null, result: { version: 1, outcome: "accepted" } } as const
+      : mismatch === "different run"
+        ? { status: "accepted", resolvedByAgentId: value.resolverAgentId, resolvedByRunId: value.runId, resolvedAt: new Date(),
+          resolvedByUserId: null, result: { version: 1, outcome: "accepted" } } as const
+        : { status: "cancelled", resolvedByAgentId: null, resolvedByRunId: null, resolvedAt: new Date(),
+          resolvedByUserId: "board-user", result: { version: 1, outcome: "withdrawn" } } as const;
+    await db.update(issueThreadInteractions).set(resolution).where(eq(issueThreadInteractions.id, value.interactionId));
+    await expect(nativeCompletionFeedback(db, value.responseRunId, { ...done, evidence: [{ ref: `interaction:${value.interactionId}` }] }))
+      .rejects.toThrow(/stale or no longer authorized/);
+  });
   it("sends the active review participant to record its stage decision before reporting", async () => {
     const value = await fixture(), stageId = randomUUID(), otherAgentId = randomUUID();
     await db.insert(agents).values({ id: otherAgentId, companyId: value.companyId, name: "Implementer", adapterType: "paperclip_runner", status: "active" });

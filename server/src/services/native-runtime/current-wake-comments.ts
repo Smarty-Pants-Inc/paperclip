@@ -11,8 +11,10 @@ import {
 } from "@paperclipai/db";
 import type { SourceTrustMetadata } from "@paperclipai/shared";
 
+import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
+import { getNativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 
 export const READ_CURRENT_WAKE_COMMENTS_TOOL_NAME =
@@ -752,6 +754,7 @@ export async function assertCurrentWakeCommentsRead(
     agentId: string;
   },
   expectedBinding?: CurrentWakeCommentsBinding | null,
+  terminalResult?: PrpStructuredRunResult | null,
 ): Promise<void> {
   await db.transaction(async (tx) => {
     const locked = await tx
@@ -792,7 +795,14 @@ export async function assertCurrentWakeCommentsRead(
         throw new Error("native_current_wake_comments_binding_changed");
       }
     } else if (locked.issueAssigneeAgentId !== input.agentId || locked.issueExecutionRunId !== input.runId) {
-      throw new Error("native_current_wake_comments_binding_changed");
+      if (expectedBinding !== null || !terminalResult || terminalResult.continuation) {
+        throw new Error("native_current_wake_comments_binding_changed");
+      }
+      const grant = await getNativeAddressedInteractionGrant(tx as unknown as Db, input, { phase: "settlement" });
+      if (!grant || (grant.interaction.status === "pending"
+        && (terminalResult.reportedWorkDisposition !== "blocked" || !terminalResult.blocker || !terminalResult.summary.trim()))) {
+        throw new Error("native_current_wake_comments_binding_changed");
+      }
     }
     const currentBinding = await resolveCurrentWakeCommentsBinding(
       tx as unknown as Db,

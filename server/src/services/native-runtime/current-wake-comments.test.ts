@@ -9,9 +9,11 @@ import {
   type Db,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 
+import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import {
   assertCurrentWakeCommentsRead,
   readCurrentWakeComments,
@@ -156,6 +158,95 @@ describeEmbeddedPostgres("current external-chat wake comment reader", () => {
       .where(eq(issues.id, issueId));
     return { companyId, agentId, issueId, runId, comments, commentIds };
   }
+
+  async function seedAddressedParticipant() {
+    const task = await seed({ bodies: ["The board created this confirmation."] });
+    const resolverAgentId = randomUUID();
+    const interactionId = randomUUID();
+    const responseRunId = randomUUID();
+    await db.insert(agents).values({
+      id: resolverAgentId,
+      companyId: task.companyId,
+      name: "KP card resolver",
+      role: "engineer",
+      status: "running",
+      adapterType: "paperclip_runner",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId: task.companyId,
+      issueId: task.issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      requestedResolverPolicy: "not_creator",
+      effectiveResolverPolicy: "not_creator",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      sourceRunId: null,
+      createdByAgentId: null,
+      createdByUserId: "local-board",
+      addresseeAgentId: resolverAgentId,
+      addresseeUserId: null,
+      payload: { version: 1, prompt: "Approve the board's bounded request?" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: responseRunId,
+      companyId: task.companyId,
+      agentId: resolverAgentId,
+      nativeIssueId: task.issueId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      runtimeMode: "native",
+      status: "running",
+      contextSnapshot: {
+        issueId: task.issueId,
+        taskId: task.issueId,
+        wakeReason: "interaction_pending",
+        interactionId,
+        interactionIds: [interactionId],
+      },
+    });
+    return { ...task, resolverAgentId, responseRunId, interactionId };
+  }
+
+  const responseResult: PrpStructuredRunResult = {
+    schema: "paperclip.run_result.v1",
+    reportedWorkDisposition: "done",
+    summary: "The addressed confirmation response was recorded.",
+    completionClaim: {
+      contractRevision: "test",
+      objectiveSatisfied: false,
+      criteria: [],
+      remainingWork: [],
+    },
+    evidence: [],
+    verification: [],
+    attentionRequests: [],
+    artifacts: [],
+  };
+
+  const pendingBlockerResult: PrpStructuredRunResult = {
+    ...responseResult,
+    reportedWorkDisposition: "blocked",
+    summary: "The addressed board confirmation is still pending.",
+    completionClaim: {
+      ...responseResult.completionClaim,
+      objectiveSatisfied: false,
+      remainingWork: [
+        { description: "Wait for the board decision", blocksCompletion: true },
+      ],
+    },
+    blocker: {
+      reasonCode: "missing_access",
+      owner: { kind: "user", name: "Board operator" },
+      scope: "task_wide",
+      unblockAction: "Resolve the addressed confirmation",
+    },
+  };
 
   it("exposes no reader for an inline-complete wake", async () => {
     const seeded = await seed({
@@ -412,6 +503,221 @@ describeEmbeddedPostgres("current external-chat wake comment reader", () => {
 
     await expect(
       assertCurrentWakeCommentsRead(racingDb, seeded, binding),
+    ).rejects.toThrow("native_current_wake_comments_binding_changed");
+  });
+
+  it.each(["accepted", "rejected"] as const)(
+    "allows only its exact %s board confirmation to cross the terminal fence",
+    async (status) => {
+      const value = await seedAddressedParticipant();
+      await db
+        .update(issueThreadInteractions)
+        .set({
+          status,
+          resolvedByAgentId: value.resolverAgentId,
+          resolvedByRunId: value.responseRunId,
+          resolvedAt: new Date(),
+          result: { version: 1, outcome: status },
+        })
+        .where(eq(issueThreadInteractions.id, value.interactionId));
+      const binding = {
+        companyId: value.companyId,
+        issueId: value.issueId,
+        agentId: value.resolverAgentId,
+        runId: value.responseRunId,
+      };
+
+      await expect(
+        assertCurrentWakeCommentsRead(db, binding, null),
+      ).rejects.toThrow("native_current_wake_comments_binding_changed");
+      await expect(
+        assertCurrentWakeCommentsRead(db, binding, null, responseResult),
+      ).resolves.toBeUndefined();
+      const [task] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, value.issueId));
+      expect(task).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: value.agentId,
+        executionRunId: value.runId,
+      });
+    },
+  );
+
+  it("allows an exact pending participant only to finish an explicit blocked response turn", async () => {
+    const value = await seedAddressedParticipant();
+    await expect(
+      assertCurrentWakeCommentsRead(
+        db,
+        {
+          companyId: value.companyId,
+          issueId: value.issueId,
+          agentId: value.resolverAgentId,
+          runId: value.responseRunId,
+        },
+        null,
+        pendingBlockerResult,
+      ),
+    ).resolves.toBeUndefined();
+    const [card] = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, value.interactionId));
+    expect(card).toMatchObject({ status: "pending", resolvedByRunId: null });
+  });
+
+  it("denies a pending done report and any participant continuation", async () => {
+    const value = await seedAddressedParticipant();
+    const binding = {
+      companyId: value.companyId,
+      issueId: value.issueId,
+      agentId: value.resolverAgentId,
+      runId: value.responseRunId,
+    };
+    await expect(
+      assertCurrentWakeCommentsRead(db, binding, null, responseResult),
+    ).rejects.toThrow("native_current_wake_comments_binding_changed");
+    await expect(
+      assertCurrentWakeCommentsRead(db, binding, null, {
+        ...pendingBlockerResult,
+        continuation: {
+          kind: "response_wake",
+          idempotencyKey: "participant-wait",
+          summary: "Wait for the board decision",
+        },
+      }),
+    ).rejects.toThrow("native_current_wake_comments_binding_changed");
+  });
+
+  it.each(["agent", "run"] as const)(
+    "denies an accepted card attributed to another %s",
+    async (mismatch) => {
+      const value = await seedAddressedParticipant();
+      await db
+        .update(issueThreadInteractions)
+        .set({
+          status: "accepted",
+          resolvedByAgentId:
+            mismatch === "agent" ? value.agentId : value.resolverAgentId,
+          resolvedByRunId:
+            mismatch === "run" ? value.runId : value.responseRunId,
+          resolvedAt: new Date(),
+          result: { version: 1, outcome: "accepted" },
+        })
+        .where(eq(issueThreadInteractions.id, value.interactionId));
+      await expect(
+        assertCurrentWakeCommentsRead(
+          db,
+          {
+            companyId: value.companyId,
+            issueId: value.issueId,
+            agentId: value.resolverAgentId,
+            runId: value.responseRunId,
+          },
+          null,
+          responseResult,
+        ),
+      ).rejects.toThrow("native_current_wake_comments_binding_changed");
+    },
+  );
+
+  it.each(["cancelled", "stale primary wake"] as const)(
+    "denies a %s addressed card at terminal settlement",
+    async (state) => {
+      const value = await seedAddressedParticipant();
+      if (state === "cancelled") {
+        await db
+          .update(issueThreadInteractions)
+          .set({ status: "cancelled" })
+          .where(eq(issueThreadInteractions.id, value.interactionId));
+      } else {
+        const [run] = await db
+          .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, value.responseRunId));
+        await db
+          .update(heartbeatRuns)
+          .set({
+            contextSnapshot: {
+              ...(run!.contextSnapshot as Record<string, unknown>),
+              interactionId: randomUUID(),
+            },
+          })
+          .where(eq(heartbeatRuns.id, value.responseRunId));
+      }
+      await expect(
+        assertCurrentWakeCommentsRead(
+          db,
+          {
+            companyId: value.companyId,
+            issueId: value.issueId,
+            agentId: value.resolverAgentId,
+            runId: value.responseRunId,
+          },
+          null,
+          pendingBlockerResult,
+        ),
+      ).rejects.toThrow("native_current_wake_comments_binding_changed");
+    },
+  );
+
+  it("denies a participant card moved to another task", async () => {
+    const value = await seedAddressedParticipant();
+    const [otherTask] = await db
+      .insert(issues)
+      .values({
+        companyId: value.companyId,
+        title: "Different task",
+        status: "in_progress",
+      })
+      .returning();
+    if (!otherTask) throw new Error("Expected a second task fixture");
+    await db
+      .update(issueThreadInteractions)
+      .set({ issueId: otherTask.id })
+      .where(eq(issueThreadInteractions.id, value.interactionId));
+    await expect(
+      assertCurrentWakeCommentsRead(
+        db,
+        {
+          companyId: value.companyId,
+          issueId: value.issueId,
+          agentId: value.resolverAgentId,
+          runId: value.responseRunId,
+        },
+        null,
+        pendingBlockerResult,
+      ),
+    ).rejects.toThrow("native_current_wake_comments_binding_changed");
+  });
+
+  it("does not let terminal participant evidence bypass a non-null owner reader binding", async () => {
+    const value = await seedAddressedParticipant();
+    const ownerBinding = await resolveCurrentWakeCommentsBinding(db, value);
+    if (!ownerBinding) throw new Error("Expected the KA current-wake reader binding");
+    await db
+      .update(issueThreadInteractions)
+      .set({
+        status: "accepted",
+        resolvedByAgentId: value.resolverAgentId,
+        resolvedByRunId: value.responseRunId,
+        resolvedAt: new Date(),
+        result: { version: 1, outcome: "accepted" },
+      })
+      .where(eq(issueThreadInteractions.id, value.interactionId));
+    await expect(
+      assertCurrentWakeCommentsRead(
+        db,
+        {
+          companyId: value.companyId,
+          issueId: value.issueId,
+          agentId: value.resolverAgentId,
+          runId: value.responseRunId,
+        },
+        ownerBinding,
+        responseResult,
+      ),
     ).rejects.toThrow("native_current_wake_comments_binding_changed");
   });
 });
