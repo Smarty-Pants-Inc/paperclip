@@ -16,7 +16,9 @@ describe("lifecycle host stop scope", () => {
       lifecycleVersion: 2, lifecycleRequiredPluginIds: [], lifecycleError: null, lifecycleOperation: null } as never)).toBe("complete");
     expect(update).toHaveBeenCalledOnce();
     // A pause keeps the messages it deferred (work-intent outbox).
-    expect(stop).toHaveBeenCalledWith(["target"], "Agent lifecycle stop requested", { preservePauseDeferred: true });
+    expect(stop).toHaveBeenCalledWith(["target"], "Agent lifecycle stop requested", {
+      preservePauseDeferred: true, onPending: expect.any(Function),
+    });
     expect(db.select).not.toHaveBeenCalled();
   });
 });

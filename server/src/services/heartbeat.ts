@@ -4401,14 +4401,17 @@ export function heartbeatService(
     for (const run of runs) {
       if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
           adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
-          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
+          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) {
+        options.onPending?.(run.id);
+        return false;
+      }
       if (needsRelease.has(run.id)) {
         // Retry incomplete cleanup after a run becomes terminal.
         await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId,
           agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
       }
     }
-    return agentExecutionsHaveStopped(db, agentIds);
+    return agentExecutionsHaveStopped(db, agentIds, options.onPending);
   }
 
   return {

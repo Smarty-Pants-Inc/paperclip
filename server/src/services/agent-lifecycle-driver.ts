@@ -90,8 +90,11 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
             inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
         }
+        let invocationId: string | undefined;
         if (!await heartbeat.stopInvocationsForAgents(ids, reason,
-          { preservePauseDeferred: agent.lifecycleState === "pausing" })) return "pending";
+          { preservePauseDeferred: agent.lifecycleState === "pausing", onPending: id => { invocationId = id; } })) {
+          return { status: "pending", ...(invocationId ? { invocationId } : {}) };
+        }
       }
       return "complete";
     },

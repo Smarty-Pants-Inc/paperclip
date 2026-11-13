@@ -5,6 +5,7 @@ import type { AgentLifecycleOperation } from "@paperclipai/shared";
 import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatus, isLifecycleWorkPending, transition, type LifecycleCommand } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
 import type { LifecycleStore } from "../application/ports.js";
+import { lifecycleRetryDelay } from "../application/retry.js";
 
 export function assertRootDatabase(db: Db) {
   if ("nestedIndex" in db) throw new AgentLifecycleConflict("Lifecycle commands require the root database connection");
@@ -26,7 +27,7 @@ export const pendingLifecycleWork = and(
   inArray(agents.lifecycleState, ["preparing", "verifying", "pausing", "resuming", "terminating", "cleaning_up"]),
   lifecycleStartupAllowed,
   sql`not (${agents.lifecycleState} = 'verifying' and ${agents.lifecycleHolds} @> '["setup"]'::jsonb)`,
-  sql`not (${agents.lifecycleState} in ('verifying', 'resuming') and coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') = 'true')`,
+  sql`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') <> 'true'`,
   sql`not (${agents.lifecycleState} = 'verifying' and coalesce(${agents.lifecycleOperation}->>'waitingForSignal', 'false') = 'true')`,
 );
 
@@ -113,7 +114,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     }
     await effects.notifyWork(tx);
     const [updated] = await tx.update(agents).set({ lifecycleError: null,
-      lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'waitingForSignal' - 'recheckRequested'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
+      lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'stopFailures' - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'waitingForSignal' - 'recheckRequested'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
     return updated;
   }
   if (command === "resume" && !["ready", "paused", "pausing", "resuming"].includes(agent.lifecycleState)) transition(agent.lifecycleState, command);
@@ -278,16 +279,21 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
           sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
         return rows.length > 0;
       }
-      const retry: Partial<AgentLifecycleOperation> = options?.retryRequired && ["verifying", "resuming"].includes(agent.lifecycleState)
+      const failures = options?.stopFailures ?? options?.verificationFailures;
+      const delay = failures !== undefined ? lifecycleRetryDelay(failures) : error ? 60_000 : 2_000;
+      const retry: Partial<AgentLifecycleOperation> = options?.retryRequired
         ? { retryRequired: true }
-        : { retryAt: new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString() };
+        : { retryAt: new Date(now.getTime() + delay).toISOString() };
       if (options?.verificationFailures !== undefined && ["verifying", "resuming"].includes(agent.lifecycleState)) {
         retry.verificationFailures = options.verificationFailures;
+      }
+      if (options?.stopFailures !== undefined && ["pausing", "terminating", "cleaning_up"].includes(agent.lifecycleState)) {
+        retry.stopFailures = options.stopFailures;
       }
       const rows = await db.update(agents).set({
         lifecycleError: sql`case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true' then null else ${error}::text end`,
         lifecycleOperation: sql`((case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
-            then ${agents.lifecycleOperation} - 'verificationFailures' else ${agents.lifecycleOperation} end)
+            then ${agents.lifecycleOperation} - 'verificationFailures' - 'stopFailures' else ${agents.lifecycleOperation} end)
           - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested')
           || case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
             then '{}'::jsonb else ${JSON.stringify(retry)}::jsonb end`,
