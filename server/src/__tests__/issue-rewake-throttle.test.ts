@@ -69,6 +69,22 @@ describe("isThrottleCandidateIssueRewake", () => {
     })).toBe(true);
   });
 
+  it("throttles declared no-progress live continuations but preserves real wakes", () => {
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_status_changed",
+      declaredContinuationKind: "response_wake",
+    })).toBe(true);
+    expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_status_changed" })).toBe(false);
+    expect(isThrottleCandidateIssueRewake({
+      ...base,
+      reason: "issue_commented",
+      wakeCommentId: "user-comment-1",
+      requestedByActorType: "user",
+    })).toBe(false);
+    expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_assigned" })).toBe(true);
+  });
+
   it("passes event-shaped wake reasons through", () => {
     for (const reason of [
       "issue_commented",
