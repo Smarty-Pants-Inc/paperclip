@@ -12,6 +12,18 @@ describe("complete Anthropic receipt pricing", () => {
     expect(priced.pricingProvenance).toMatchObject({ version: "anthropic-standard-2026-10-12", inputCentsPerMillion: "400", cachedInputCentsPerMillion: "20", cacheWriteCentsPerMillion: "800", outputCentsPerMillion: "2000" });
     expect(priced.costStatus).toBe("estimated");
   });
+  it("prices a gateway-prefixed Opus receipt with the real sample cache counts", () => {
+    const priced = priceAnthropicReceipt({ ...receipt, model: "paperclip/claude-opus-5-5",
+      usage: { inputTokens: 7923, cachedInputTokens: 391189, cacheWriteTokens: 7915, outputTokens: 535 } });
+    expect(priced.costUsdExact).toBe("0.152289800");
+    expect(priced.costStatus).toBe("estimated");
+  });
+  it("does not guess nested or unknown gateway model identities", () => {
+    for (const model of ["paperclip/gateway/claude-opus-5-5", "paperclip/claude-opus-5-5-custom"]) {
+      const original = { ...receipt, model };
+      expect(priceAnthropicReceipt(original)).toBe(original);
+    }
+  });
   it("prices complete counters conservatively and labels their provenance as an estimate", () => {
     const priced = priceAnthropicReceipt(receipt);
     expect(priced.costUsdExact).toBe("0.155967600");
