@@ -4087,7 +4087,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   }, [issue?.id, openTaskSidePanel, isMobile]);
   const decisionAttachmentOpened = useRef<string | null>(null);
   useEffect(() => {
-    if (!coordinatorWorkspaceEnabled || !issue?.id) return;
+    if (!issue?.id) return;
     const params = new URLSearchParams(location.hash.split("&").slice(1).join("&"));
     const attachmentId = params.get("attachment") ?? new URLSearchParams(location.search).get("attachmentId");
     if (!attachmentId) { decisionAttachmentOpened.current = null; return; }
@@ -4097,7 +4097,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     if (!attachment) return;
     decisionAttachmentOpened.current = key;
     handleOpenTextAttachment(attachment.id, attachment.originalFilename ?? "Attachment");
-  }, [coordinatorWorkspaceEnabled, issue?.id, location.hash, location.search, location.key, attachments, handleOpenTextAttachment]);
+  }, [issue?.id, location.hash, location.search, location.key, attachments, handleOpenTextAttachment]);
 
   // History links restore the exact point of decision while its artifact opens
   // in the side pane. Wait for the real thread to mount, without guessing a row.
