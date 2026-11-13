@@ -54,6 +54,37 @@ export function isPiModelCompat(value: unknown): value is PiModelCompat {
 
 /** Never inherit upstream routing/auth in a managed model definition. */
 export const PI_MODEL_ROUTING_FIELDS = new Set(["provider", "baseUrl", "api", "apiKey", "headers", "authHeader", "auth", "oauth"]);
+// Pi 1.5.2 applies samplingParams last (Object.assign in the completions,
+// responses and Azure providers). These are request controls, not sampling.
+// Template containers can use arbitrary compat-defined thinking key names, so
+// they must not replace the admitted provider-generated container at all.
+const PI_PROTECTED_SAMPLING_FIELDS = new Set([
+  "model", ...PI_MODEL_ROUTING_FIELDS,
+  "reasoning_effort", "reasoningEffort", "reasoning", "thinking", "effort", "budget_tokens",
+  "thinking_budget", "thinking_token_budget", "thinking_budget_tokens", "enable_thinking", "preserve_thinking",
+  "thinkingBudget", "thinkingBudgets", "thinkingEnabled", "thinkingBudgetTokens", "thinkingLevel", "thinkingConfig", "thinking_config", "thinking_level",
+  "chat_template_kwargs", "chat_template_args",
+]);
+
+/** Shared by config sanitation and bind validation. Walk every samplingParams*
+ * dialect, including per-level maps, nested output_config.effort and arrays.
+ * Return references only; the caller may strip from its own cloned definition.
+ */
+export function piModelSamplingOverrides(model: PiBindModel): Array<{ parameters: Record<string, unknown>; key: string; path: string }> {
+  const overrides: Array<{ parameters: Record<string, unknown>; key: string; path: string }> = [];
+  const seen = new Set<object>();
+  function visit(value: unknown, path: string): void {
+    if (value === null || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = `${path}.${key}`;
+      if (PI_PROTECTED_SAMPLING_FIELDS.has(key)) overrides.push({ parameters: value as Record<string, unknown>, key, path: childPath });
+      else visit(child, childPath);
+    }
+  }
+  for (const [key, value] of Object.entries(model)) if (key.startsWith("samplingParams")) visit(value, key);
+  return overrides;
+}
 export interface PiBindModel {
   /** Preserve future JSON model metadata; routing/auth remains forbidden. */
   [key: string]: unknown;
@@ -196,7 +227,7 @@ function validProvider(value: unknown, model: string): value is PiBindProvider {
       || (entry.reasoning !== undefined && typeof entry.reasoning !== "boolean")
       || (entry.input !== undefined && (!Array.isArray(entry.input) || !entry.input.length || entry.input.some(item => item !== "text" && item !== "image")))
       || (entry.contextWindow !== undefined && !integer(entry.contextWindow, 1)) || (entry.maxTokens !== undefined && !integer(entry.maxTokens, 1))) return false;
-    if (Object.hasOwn(entry, "compat") && !isPiModelCompat(entry.compat)) return false;
+    if (piModelSamplingOverrides(entry as PiBindModel).length || Object.hasOwn(entry, "compat") && !isPiModelCompat(entry.compat)) return false;
     if (entry.cost !== undefined) {
       const cost = entry.cost;
       if (!object(cost) || ["input", "output", "cacheRead", "cacheWrite"].some(key => typeof cost[key] !== "number" || !Number.isFinite(cost[key]) || (cost[key] as number) < 0)) return false;
