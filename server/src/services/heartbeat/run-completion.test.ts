@@ -935,9 +935,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(run).toMatchObject({ status: "failed", errorCode: phase === "setup" ? "setup_failed" : "adapter_failed",
       error: "Usage write failed: Database query failed (40001)", resultJson: { failureCause: "40001" } });
     expect(JSON.stringify(run.resultJson)).not.toMatch(/heartbeat_runs|sk-live-secret|params/);
-    expect(logged).toHaveBeenCalledWith(expect.objectContaining(phase === "setup"
-      ? { runId: f.run.id, failureCause: "40001" }
-      : { runId: f.run.id }), expect.any(String));
+    expect(logged).toHaveBeenCalledWith(expect.objectContaining({ runId: f.run.id, failureCause: "40001" }), expect.any(String));
   });
 
   it("bounds the failure cause to a closed-shape token and falls back to the error class", async () => {
@@ -1583,7 +1581,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       resultJson: { failureCause: "40001" } });
     expect(JSON.stringify(failed)).not.toMatch(/heartbeat_runs|secret-run-id|Failed query/);
     const failureLog = logged.mock.calls.find(call => call[1] === "heartbeat execution failed");
-    expect(failureLog?.[0]).toMatchObject({ runId: f.run.id, errorCode: "adapter_failed" });
+    expect(failureLog?.[0]).toMatchObject({ runId: f.run.id, errorCode: "adapter_failed", failureCause: "40001" });
   });
 
   describe("a native run that fails before provider work", () => {
