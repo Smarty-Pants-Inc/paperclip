@@ -27,6 +27,8 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
+  plugins,
+  pluginCompanySettings,
   chatActions,
   heartbeatRuns,
   issueComments,
@@ -261,6 +263,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
+      const locallyExcludedWakeIds = [...(excludedWakeIds ?? [])];
       while (true) {
         const row = await tx
           .select()
@@ -269,7 +272,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
-              excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
+              locallyExcludedWakeIds.length ? notInArray(agentWakeupRequests.id, locallyExcludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
               interruptQueueId ? eq(agentWakeupRequests.agentId, run.agentId) : undefined,
@@ -280,6 +283,57 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
         const candidate = toDeferredWakeCandidate(row);
+        const payload = candidate.payload;
+        const context = parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]);
+        const pluginId = readNonEmptyString(payload.pluginId);
+        const pluginKey = readNonEmptyString(payload.pluginKey);
+        const pluginWake = payload.mutation === "plugin_wakeup" && pluginId !== null && pluginKey !== null &&
+          context.pluginId === pluginId && context.pluginKey === pluginKey &&
+          row.requestedByActorType === "system" && row.requestedByActorId === pluginId;
+        if (pluginWake) {
+          const [plugin] = await tx.select({ id: plugins.id, pluginKey: plugins.pluginKey, status: plugins.status })
+            .from(plugins).where(sql`${plugins.id}::text = ${pluginId}`);
+          const [companySetting] = plugin ? await tx.select({ enabled: pluginCompanySettings.enabled })
+            .from(pluginCompanySettings).where(and(eq(pluginCompanySettings.pluginId, plugin.id),
+              eq(pluginCompanySettings.companyId, companyId))) : [];
+          // A plugin mid-install or awaiting upgrade approval keeps its wake for a later release.
+          if (plugin?.pluginKey === pluginKey && (plugin.status === "installed" || plugin.status === "upgrade_pending") &&
+              companySetting?.enabled !== false) {
+            locallyExcludedWakeIds.push(row.id);
+            continue;
+          }
+          if (plugin?.pluginKey !== pluginKey || plugin.status !== "ready" || companySetting?.enabled === false) {
+            const now = new Date();
+            await tx.update(agentWakeupRequests).set({ status: "cancelled", error: "plugin_wakeup_origin_unavailable",
+              finishedAt: now, updatedAt: now }).where(and(eq(agentWakeupRequests.id, row.id),
+              eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
+            continue;
+          }
+          if (row.idempotencyKey) {
+            const [prior] = await tx.select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
+              .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, row.agentId),
+                eq(agentWakeupRequests.idempotencyKey, row.idempotencyKey),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+                sql`${agentWakeupRequests.id} <> ${row.id}`,
+                sql`${agentWakeupRequests.payload}->>'mutation' = 'plugin_wakeup'`,
+                sql`${agentWakeupRequests.payload}->>'pluginId' = ${pluginId}`,
+                sql`${agentWakeupRequests.payload}->>'pluginKey' = ${pluginKey}`,
+                sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}' = ${pluginId}`,
+                sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginKey}' = ${pluginKey}`,
+                eq(agentWakeupRequests.requestedByActorType, "system"),
+                eq(agentWakeupRequests.requestedByActorId, pluginId),
+                sql`${agentWakeupRequests.runId} is not null`)).limit(1);
+            if (prior) {
+              const now = new Date();
+              await tx.update(agentWakeupRequests).set({ status: "coalesced", error: "plugin_wakeup_already_delivered",
+                finishedAt: now, updatedAt: now }).where(and(eq(agentWakeupRequests.id, row.id),
+                eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
+              continue;
+            }
+          }
+        }
         // Upgrade repair: older code could merge two conversations into one
         // saved chat wake. Split it and read the queue again.
         const conversationId = readWakeChatConversationId(candidate.deferredContextSeed);
