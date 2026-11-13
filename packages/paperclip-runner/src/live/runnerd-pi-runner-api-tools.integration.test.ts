@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { expect, it, vi } from "vitest";
 import { paperclipSemanticAction } from "../catalog/semantic-action-catalog.js";
+import { configuredEnvironmentProjection } from "../configured-environment.js";
 import type { CodexRpcNotification } from "../drivers/codex/app-server-transport.js";
 import { createRunnerdCodexTransport, defaultCapabilityRunnerdBinary } from "./runnerd-codex-transport.js";
 
@@ -236,12 +237,21 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
   // Agent-intended by Paperclip's design: the Ed25519 identity (doc/AGENT-IDENTITY.md:61-71) and the
   // Langfuse export credentials (doc/architecture/runner-pi-capabilities.md:72-76, :108-111).
   const identityKeys = ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY"];
+  // Exported by the server's real launch-boundary regression test. This keeps
+  // the live proof on that exact script instead of a stand-in sanitizer.
+  const launchScriptPath = process.env.PI_TEST_RUNNER_LAUNCH_SCRIPT;
+  if (!launchScriptPath) throw new Error("PI_TEST_RUNNER_LAUNCH_SCRIPT must name the tested remote runner launch script");
+  const launchScript = readFileSync(launchScriptPath, "utf8");
   const decoys = Object.fromEntries([
-    ...identityKeys, "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_API_KEY", "PAPERCLIP_AGENT_JWT_SECRET", "ASCII_TOKEN",
+    ...identityKeys, "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_API_KEY", "PAPERCLIP_AGENT_JWT_SECRET", "ASCII_TOKEN", "ASCII_API_KEY", "ASCII_FUTURE_SECRET",
     "RUNNER_INTERNAL_CANARY",
   ].map(name => [name, `C44_DECOY_${name}_NOT_A_CREDENTIAL`]));
   const seededRunner = join(root, "seeded-runnerd.sh");
-  await writeFile(seededRunner, `#!/bin/sh\n${Object.entries(decoys).map(([name, value]) => `export ${name}='${value}'`).join("\n")}\nexport LANGFUSE_TRACING_ENABLED=true\nexport PAPERCLIP_CONFIGURED_ENV_KEYS='["ASCII_TOKEN","LANGFUSE_SECRET_KEY","LANGFUSE_PUBLIC_KEY","RUNNER_INTERNAL_CANARY"]'\nexec '${runnerBinary}' "$@"\n`, { mode: 0o755 });
+  const launchNames = join(root, "runnerd-launch-env-names.json");
+  const recordLaunch = `node -e 'require("node:fs").writeFileSync(process.argv[1], JSON.stringify(Object.keys(process.env).sort()))' '${launchNames}'; exec "$@"`;
+  const scrubAndRecord = launchScript.replace('exec "$@"', recordLaunch);
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  await writeFile(seededRunner, `#!/bin/sh\n${Object.entries(decoys).filter(([name]) => !identityKeys.includes(name)).map(([name, value]) => `export ${name}='${value}'`).join("\n")}\nexec /bin/sh -c ${quote(scrubAndRecord)} runner-env '${runnerBinary}' "$@"\n`, { mode: 0o755 });
   const proof: Record<string, unknown> = {
     schema: "paperclip.pi.runner-api-tools.proof.v1", status: "running", root,
     source: "real runnerd -> production CJS proxy -> PiRpcDriver -> owned extension -> installed Pi 1.5.2; local faux model and server-side authority only",
@@ -261,6 +271,22 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
   const workspace = join(root, "workspace"), agentDirectory = join(root, "pi-agent");
   await mkdir(workspace); await mkdir(agentDirectory);
   const faux = await fauxOpenAi();
+  const tracePosts: { path: string; authorization: string; bytes: number }[] = [];
+  const traceServer = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", chunk => chunks.push(Buffer.from(chunk)));
+    request.on("end", () => {
+      const body = Buffer.concat(chunks);
+      tracePosts.push({ path: request.url ?? "", authorization: String(request.headers.authorization ?? ""), bytes: body.length });
+      writeFile(join(root, `trace-${tracePosts.length}.bin`), body).then(() => { response.writeHead(200, { "content-type": "application/json" }); response.end("{}"); }, error => response.destroy(error));
+    });
+  });
+  await new Promise<void>(done => traceServer.listen(0, "127.0.0.1", done));
+  const traceAddress = traceServer.address();
+  if (!traceAddress || typeof traceAddress === "string") throw new Error("local Langfuse capture did not bind");
+  const langfusePlugin = process.env.PI_TEST_LANGFUSE_PLUGIN;
+  // Use Pi's existing installed-package settings, not a new env-based loader.
+  await writeFile(join(agentDirectory, "settings.json"), JSON.stringify({ packages: langfusePlugin ? [langfusePlugin] : [], cacheWarming: "off" }));
   await writeFile(join(agentDirectory, "models.json"), JSON.stringify({ providers: { localFaux: {
     baseUrl: faux.url, api: "openai-completions", apiKey: "local-only-no-credentials",
     models: [{ id: "faux", name: "local faux", contextWindow: 16384, maxTokens: 256 }],
@@ -274,7 +300,13 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
     lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
     prpIdentity: { runnerInstanceId: "runner-pi-api-tools", environmentLeaseId: "lease-pi-api-tools", runId: runIds[0], normalizedSessionId, turnId: "turn-pi-api-tools-1", itemId: "item-pi-api-tools-1" },
     environment: {
-      PATH: process.env.PATH, PI_CODING_AGENT_DIR: agentDirectory, PI_OFFLINE: "1",
+      PATH: process.env.PATH, PI_CODING_AGENT_DIR: agentDirectory, PI_OFFLINE: "1", NO_PROXY: "127.0.0.1,localhost",
+      ...Object.fromEntries(identityKeys.filter(name => name.startsWith("PAPERCLIP_")).map(name => [name, decoys[name]!])),
+      ...configuredEnvironmentProjection({
+        ...Object.fromEntries(identityKeys.filter(name => name.startsWith("LANGFUSE_")).map(name => [name, decoys[name]!])),
+        LANGFUSE_BASE_URL: `http://127.0.0.1:${traceAddress.port}`, LANGFUSE_TRACING_ENABLED: "true",
+        LANGFUSE_UNKNOWN_SECRET: "unlisted-langfuse-decoy", RUNNER_CONFIGURED_CANARY: "unlisted-configured-decoy",
+      }),
       PAPERCLIP_AI_PROVIDER_URL: faux.url, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none",
       PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker",
     },
@@ -312,9 +344,11 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
     owned = [processIdentity(runnerPid!)!, ...descendants(runnerPid!)];
     const nativePi = piIdentity(runnerPid!);
     const proxyPid = nativePi.ppid;
+    const sweep = `import glob,json\ndecoys=${JSON.stringify(decoys)}\nfound=[]\nfor path in glob.glob('/proc/[0-9]*/environ'):\n try:\n  with open(path,'rb') as source: raw=source.read()\n except (OSError,PermissionError): continue\n names=[name for name,value in decoys.items() if value.encode() in raw]\n if names: found.append({'pid':int(path.split('/')[2]),'decoys':names})\nwith open('proc-decoy-sweep.json','w') as out: json.dump(found,out)\n`;
+    await writeFile(join(workspace, "probe-decoy-sweep.py"), sweep);
     // Real Pi bash, not a host-side inspection. Capture all three process envs,
     // including the proxy (which retains the upstream model-broker capability).
-    faux.setProbe(`env > tool-env.txt; cat /proc/${runnerPid}/environ > runner-env.bin 2> runner-env.err; printf 'runner-read-exit=%s\\n' "$?"; cat /proc/${proxyPid}/environ > proxy-env.bin 2> proxy-env.err; printf 'proxy-read-exit=%s\\n' "$?"; cat /proc/${nativePi.pid}/environ > pi-env.bin; printf 'pi-read-exit=%s\\n' "$?"; cat tool-env.txt; tr '\\0' '\\n' < runner-env.bin; tr '\\0' '\\n' < proxy-env.bin; tr '\\0' '\\n' < pi-env.bin; cat runner-env.err proxy-env.err`);
+    faux.setProbe(`env > tool-env.txt; cat /proc/${runnerPid}/environ > runner-env.bin 2> runner-env.err; printf 'runner-read-exit=%s\\n' "$?"; cat /proc/${proxyPid}/environ > proxy-env.bin 2> proxy-env.err; printf 'proxy-read-exit=%s\\n' "$?"; cat /proc/${nativePi.pid}/environ > pi-env.bin; printf 'pi-read-exit=%s\\n' "$?"; cat tool-env.txt; tr '\\0' '\\n' < runner-env.bin; tr '\\0' '\\n' < proxy-env.bin; tr '\\0' '\\n' < pi-env.bin; cat runner-env.err proxy-env.err; python3 probe-decoy-sweep.py`);
     for (const index of [0, 1]) {
       proof.phase = `run-${index + 1}`;
       if (index === 1) {
@@ -344,7 +378,25 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
     for (const [index, request] of faux.requests.entries()) assertNativeCatalog(request, index < 3 ? 0 : 1);
     const observed = Object.fromEntries(["tool-env.txt", "runner-env.bin", "proxy-env.bin", "pi-env.bin", "runner-env.err", "proxy-env.err"].map(name => [name, readFileSync(join(workspace, name), "utf8")]));
     const decoyFindings = Object.fromEntries(Object.entries(observed).map(([name, value]) => [name, Object.keys(decoys).filter(key => value.includes(decoys[key]!))]));
-    proof.credentialIsolation = { decoyFindings, permittedIdentityKeys: identityKeys, bashResult: faux.probeOutput(), proxyPid, piPid: nativePi.pid, langfuseEnabled: true };
+    const procSweep = JSON.parse(readFileSync(join(workspace, "proc-decoy-sweep.json"), "utf8")) as { pid: number; decoys: string[] }[];
+    proof.procDecoySweep = procSweep;
+    expect(procSweep.flatMap(entry => entry.decoys).filter(name => !identityKeys.includes(name)), "no forbidden decoy in any readable process environ").toEqual([]);
+    const runnerLaunchNames = JSON.parse(readFileSync(launchNames, "utf8")) as string[];
+    proof.credentialIsolation = { decoyFindings, permittedIdentityKeys: identityKeys, bashResult: faux.probeOutput(), proxyPid, piPid: nativePi.pid,
+      langfuseEnabled: true, langfuseSource: "agent configured secret env", runnerLaunchNames };
+    expect(runnerLaunchNames.filter(name => name.startsWith("ASCII_")), "Boat-added machine names absent at actual runnerd exec").toEqual([]);
+    for (const name of ["LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_BASE_URL"]) expect(runnerLaunchNames).toContain(name);
+    for (const name of ["tool-env.txt", "pi-env.bin"]) {
+      expect(observed[name]).toContain("NO_PROXY=127.0.0.1,localhost");
+      expect(observed[name]).not.toContain("LANGFUSE_UNKNOWN_SECRET");
+      expect(observed[name]).not.toContain("RUNNER_CONFIGURED_CANARY");
+    }
+    if (langfusePlugin) await vi.waitFor(() => {
+      expect(tracePosts.length, "real configured Langfuse extension emits trace POSTs").toBeGreaterThanOrEqual(2);
+      expect(tracePosts.every(post => post.path === "/api/public/otel/v1/traces" && post.bytes > 0
+        && post.authorization === `Basic ${Buffer.from(`${decoys.LANGFUSE_PUBLIC_KEY}:${decoys.LANGFUSE_SECRET_KEY}`).toString("base64")}`)).toBe(true);
+    }, { timeout: 10_000, interval: 50 });
+    proof.langfuseTracePosts = tracePosts;
     expect(Object.values(decoyFindings).flat().filter(key => !identityKeys.includes(key)), "no runner-only/API decoy reaches Pi, bash, or readable /proc envs").toEqual([]);
     for (const name of ["tool-env.txt", "pi-env.bin"]) {
       expect(decoyFindings[name], `agent-intended identity and Langfuse export remain in ${name}`).toEqual(identityKeys);
@@ -379,6 +431,8 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
     } catch (error) { cleanupError = error; proof.cleanupError = String(error); proof.status = "failed"; }
     finally {
       await faux.close();
+      traceServer.closeAllConnections();
+      await new Promise<void>(done => traceServer.close(() => done()));
       Object.assign(proof, { runnerPid, semanticCalls, modelRequests: faux.requests, returnedTools: faux.returnedTools, piProcesses: pids, turnIds, nativeSessionIds: sessionIds, diagnostics,
         ownedAfterCleanup: owned.map(before => ({ before, after: processIdentity(before.pid) })), retainedRoot: true });
       await writeFile(join(root, "proof.json"), `${JSON.stringify(proof, null, 2)}\n`);
@@ -391,3 +445,58 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
   if (primaryError) throw primaryError;
   if (cleanupError) throw cleanupError;
 }, 90_000);
+
+// Same-uid attacker controls both the guest addon and its local manifest. The
+// admitted controller digest must still win before any model/broker work starts.
+it.skipIf(process.platform !== "linux" || !pi || !process.env.PI_TEST_PROVIDER_PACK)("real runnerd refuses a consistent addon and guest manifest replacement", async () => {
+  const evidence = process.env.PI_PROOF_PATH ? dirname(process.env.PI_PROOF_PATH) : tmpdir();
+  const root = await mkdtemp(join(evidence, "runnerd-pi-addon-swap-"));
+  const runtime = await productionRuntime(root), pack = process.env.PI_TEST_PROVIDER_PACK!;
+  const guest = join(root, "guest-pack");
+  await cp(join(pack, "dist"), join(guest, "dist"), { recursive: true });
+  const proxy = join(guest, "dist/cli/pi-rpc-app-server-proxy.cjs");
+  const addon = join(guest, "dist/cli/linux-process-hardening.node");
+  const pinnedDigest = digest(join(pack, "dist/cli/linux-process-hardening.node"));
+  const maliciousSource = join(root, "noop-hardening.c");
+  await writeFile(maliciousSource, '__attribute__((visibility("default"))) void *napi_register_module_v1(void *env, void *exports) { return exports; }\n');
+  execFileSync("cc", ["-shared", "-fPIC", "-o", addon, maliciousSource]);
+  const manifest = JSON.parse(readFileSync(join(pack, "provider-pack.json"), "utf8"));
+  manifest.payload.artifacts.piProcessHardening.sha256 = digest(addon);
+  await writeFile(join(guest, "provider-pack.json"), JSON.stringify(manifest));
+  const faux = await fauxOpenAi(), diagnostics: string[] = [];
+  const { transport } = createRunnerdCodexTransport({ provider: "pi_rpc",
+    runnerBinary: process.env.PAPERCLIP_RUNNERD_PATH ?? defaultCapabilityRunnerdBinary(),
+    stateDirectory: join(root, "state"), sourceCodexHome: "", providerNodeCommand: process.execPath,
+    providerNodeCommandSha256: digest(process.execPath), piCommand: runtime.executable, piCommandSha256: digest(runtime.executable),
+    piProxyPath: proxy, piProxySha256: digest(proxy), piProcessHardeningSha256: pinnedDigest,
+    piRuntimeDirectory: join(root, "pi-runtime"), piRpcThinkingLevel: "off",
+    environment: { PATH: process.env.PATH, PI_OFFLINE: "1", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker",
+      PAPERCLIP_AI_PROVIDER_URL: faux.url, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+    onDiagnostic: message => diagnostics.push(message),
+  });
+  let refusal = "";
+  try {
+    try { await transport.request("thread/start", { cwd: root, model: "paperclip/faux" }); }
+    catch (error) { refusal = String(error); }
+    expect(refusal).toMatch(/hardening|artifact|digest/i);
+    expect(faux.requests).toHaveLength(0);
+  } finally {
+    const runnerPid = transport.processInfo?.().pid;
+    const owned = runnerPid ? [processIdentity(runnerPid), ...descendants(runnerPid)].filter((entry): entry is ProcessIdentity => entry !== null) : [];
+    let closeError: string | undefined;
+    try { await transport.close("addon-swap-proof-stop"); }
+    catch (error) {
+      closeError = String(error);
+      // No provider was born, hence there is no durable provider checkpoint.
+      // Do not waive physical process retirement or any unexpected close error.
+      expect(refusal).toMatch(/hardening|artifact|digest/i);
+      expect(closeError).toContain("runner did not durably suspend before checkpoint");
+    } finally { await faux.close(); }
+    await vi.waitFor(() => {
+      for (const before of owned) expect(processIdentity(before.pid)?.started).not.toBe(before.started);
+    }, { timeout: 5_000, interval: 50 });
+    await writeFile(join(root, "proof.json"), JSON.stringify({ status: refusal ? "startup-refused" : "FAIL-startup-accepted",
+      pinnedDigest, replacementDigest: digest(addon), manifestDigest: manifest.payload.artifacts.piProcessHardening.sha256,
+      refusal, closeError, physicalRetirementVerified: true, owned, diagnostics, modelRequests: faux.requests.length }, null, 2));
+  }
+}, 30_000);

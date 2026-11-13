@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { RUNNER_LAUNCH_ENVIRONMENT_SCRIPT } from "./runner-launch-environment.js";
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { DurableRecoveryIdentity, RunnerExecutionDriver } from "../../vendor/paperclip-runner/index.js";
@@ -232,7 +233,8 @@ export function createSandboxRunnerRetention(initial: SandboxRunnerRetentionInpu
       const epoch = generation;
       // A proven cold recovery may retain the durable Runner ID. Its new
       // process nonce must not collide with the previous launch's receipt.
-      const reply = await carrier({ op: "launch", id: `launch_${sha(`${input.runnerInstanceId}:${request.identityNonce}`)}`, ...request });
+      const reply = await carrier({ op: "launch", id: `launch_${sha(`${input.runnerInstanceId}:${request.identityNonce}`)}`, ...request,
+        command: "/bin/sh", args: ["-c", RUNNER_LAUNCH_ENVIRONMENT_SCRIPT + 'exec "$@"', "paperclip-runner-env", request.command, ...request.args] });
       assertOwner(epoch);
       if (reply.status !== "launched") throw failure("guardian_launch_unconfirmed");
     },

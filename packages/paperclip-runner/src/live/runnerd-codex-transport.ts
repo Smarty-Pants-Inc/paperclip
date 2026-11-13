@@ -50,7 +50,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, posix, resolve } from "node:path";
+import { basename, dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type {
@@ -1696,6 +1696,7 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   piCommandSha256?: string;
   piProxyPath?: string;
   piProxySha256?: string;
+  piProcessHardeningSha256?: string;
   piRuntimeDirectory?: string;
   piProfile?: import("../drivers/pi/qualified-profile.js").NativePiRpcProfileSnapshot;
   opencodeCommand?: string;
@@ -3664,9 +3665,14 @@ function piRunnerLaunchProfile(options: CapabilityRunnerdCodexTransportOptions, 
     if (remote && !configured?.startsWith("sha256:")) throw new Error(`runner_remote_provider_artifact_incompatible: ${label} has no provider-pack digest`);
     return configured ?? `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
   };
+  const processHardening = join(dirname(proxyPath), "linux-process-hardening.node");
+  const hardening = remote ? options.piProcessHardeningSha256 : process.platform === "linux"
+    ? digest("Pi process hardening", processHardening, options.piProcessHardeningSha256) : undefined;
+  if (remote && !hardening?.startsWith("sha256:")) throw new Error("runner_remote_provider_artifact_incompatible: Pi process hardening has no provider-pack digest");
   return { command: nodeCommand, commandSha256: digest("Pi Node", nodeCommand, options.providerNodeCommandSha256),
     proxyScript: proxyPath, proxyScriptSha256: digest("Pi proxy", proxyPath, options.piProxySha256),
-    executable, executableSha256: digest("Pi executable", executable, options.piCommandSha256) };
+    executable, executableSha256: digest("Pi executable", executable, options.piCommandSha256),
+    ...(hardening ? { processHardening, processHardeningSha256: hardening } : {}) };
 }
 
 function opencodeRunnerLaunchProfile(

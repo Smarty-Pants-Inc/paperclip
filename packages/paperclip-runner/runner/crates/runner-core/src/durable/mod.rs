@@ -225,9 +225,11 @@ pub struct OpenCodeLaunchProfile {
     pub command: QualifiedLaunchArtifact,
     pub proxy_script: QualifiedLaunchArtifact,
     pub executable: QualifiedLaunchArtifact,
+    /// Linux Pi proxy initializer, pinned by the controller (not the guest manifest).
+    pub process_hardening: Option<QualifiedLaunchArtifact>,
 }
 
-// Native Pi uses the same three protected launch artifacts as the resident OpenCode facade.
+// Native Pi also binds its credential-bearing proxy's Linux isolation initializer.
 pub type PiRpcLaunchProfile = OpenCodeLaunchProfile;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,8 +398,10 @@ impl DurableRunnerConfig {
             }
         }
         if let Some(profile) = self.pi_launch_profile.as_ref() {
-            let artifacts = [&profile.command, &profile.proxy_script, &profile.executable];
-            if artifacts.iter().any(|artifact| {
+            let artifacts = [&profile.command, &profile.proxy_script, &profile.executable]
+                .into_iter()
+                .chain(profile.process_hardening.iter());
+            if artifacts.into_iter().any(|artifact| {
                 !artifact.path.is_absolute()
                     || artifact.path.to_str().is_none()
                     || artifact.sha256.len() != 71

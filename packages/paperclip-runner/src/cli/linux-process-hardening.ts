@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,9 +7,9 @@ import { fileURLToPath } from "node:url";
  * THIS process, after exec, before the broker reads any upstream credential.
  * Missing/tampered native code is a startup error, never an insecure fallback.
  */
-export function protectPiProxyProcess(trustedProxyEntrypointUrl: string | undefined): void {
+export function protectPiProxyProcess(trustedProxyEntrypointUrl: string | undefined, verifiedDescriptor?: string): void {
   if (process.platform !== "linux") return;
-  if (!trustedProxyEntrypointUrl) throw new Error("Pi proxy isolation requires the verified pack resource binding");
+  if (!trustedProxyEntrypointUrl || !verifiedDescriptor || !/^\/proc\/self\/fd\/\d+$/.test(verifiedDescriptor)) throw new Error("Pi proxy isolation requires the runner-verified hardening descriptor");
   const cli = dirname(fileURLToPath(trustedProxyEntrypointUrl));
   const path = resolve(cli, "linux-process-hardening.node"), root = resolve(cli, "../..");
   const metadata = lstatSync(path), directory = lstatSync(cli);
@@ -24,5 +23,9 @@ export function protectPiProxyProcess(trustedProxyEntrypointUrl: string | undefi
   if (!artifact || typeof artifact.path !== "string" || resolve(root, artifact.path) !== realpathSync(path) || artifact.sha256 !== actual) {
     throw new Error("Pi proxy isolation artifact integrity check failed");
   }
-  createRequire(trustedProxyEntrypointUrl)(path);
+  const verified = `sha256:${createHash("sha256").update(readFileSync(verifiedDescriptor)).digest("hex")}`;
+  if (actual !== verified) throw new Error("Pi proxy isolation artifact differs from the controller-pinned descriptor");
+  // dlopen the sealed runner-owned snapshot, not the mutable guest path checked
+  // above. A concurrent addon/manifest swap cannot change the loaded bytes.
+  process.dlopen({ exports: {} } as NodeJS.Module, verifiedDescriptor);
 }
