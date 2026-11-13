@@ -3358,6 +3358,20 @@ resumed allocation whose own state is missing, a source whose run is still
 active, and a source with an export still pending remain ambiguous and fail
 closed.
 
+A resumed allocation can instead have its suspended Runner and provider state
+intact but be missing a cold-resume file because a directory restore stopped
+partway through. The persistence profile declares those files (Pi's conversation
+JSONL is one). If a compatible controller backup contains the absent file,
+Paperclip verifies the backup before asking the provider to resume. On the same
+allocation, it restores only that absent file through the existing file-staging
+path, and only when the entire saved Runner checkpoint and provider identity
+match and the controller cursor is not ahead of the backup. It never rewinds
+Runner/provider state or overwrites an existing, invalid or symlink file.
+A different allocation still requires the full restore's source-lease proof.
+A newer checkpoint or unreadable path fails closed; a file absent from the
+backup too remains the provider's missing-history decision. Existing backup
+manifests and sessions carry forward without migration.
+
 A Runner close can also fail to prove suspension after the control plane
 accepted the run's result (`native.post_result_failure` with category
 `runner_settlement_incomplete`). The provider work is complete, so this is not
