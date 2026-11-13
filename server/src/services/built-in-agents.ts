@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { readPaperclipSkillSyncPreference, writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { and, desc, eq, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, builtInManagedResources, companies, issueThreadInteractions, issues, routines, routineTriggers, fileStorageDb } from "@paperclipai/db";
+import { activityLog, agents, builtInManagedResources, companies, issueThreadInteractions, issues, routines, routineTriggers, fileStorageDb, principalPermissionGrants } from "@paperclipai/db";
 import { agentHarnessType, paperclipRunnerProfileForHarness, agentRunner, syncRoutineVariablesWithTemplate, type AgentRunnerChoice } from "@paperclipai/shared";
 import type { Agent, Approval, CompanySkill, PermissionKey, Routine, RoutineTrigger, RoutineVariable } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
@@ -831,7 +831,18 @@ export function builtInAgentService(db: Db) {
     await accessSvc.ensureMembership(companyId, "agent", agentId, "member", "active");
     let ensured = 0;
     for (const permissionKey of grantKeys) {
-      await accessSvc.setPrincipalPermission(companyId, "agent", agentId, permissionKey, true, null);
+      // Reconciliation only fills missing defaults. An operator's stored scope
+      // (including a deliberate unscoped grant) must never be replaced here.
+      await db.insert(principalPermissionGrants).values({
+        companyId,
+        principalType: "agent",
+        principalId: agentId,
+        permissionKey,
+        scope: permissionKey === "agents:configure" ? { subtreeRootAgentId: agentId } : null,
+      }).onConflictDoNothing({
+        target: [principalPermissionGrants.companyId, principalPermissionGrants.principalType,
+          principalPermissionGrants.principalId, principalPermissionGrants.permissionKey],
+      });
       ensured += 1;
     }
     return ensured;

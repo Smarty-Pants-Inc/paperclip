@@ -5091,6 +5091,15 @@ export function agentRoutes(
         res.status(403).json({ error: "Only CEO can manage permissions" });
         return;
       }
+      const configureDecision = await access.decide({
+        actor: req.actor,
+        action: "agent_config:update",
+        resource: { type: "agent", companyId: existing.companyId, agentId: existing.id },
+        scope: { targetAgentId: existing.id, requiresChangeGrant: true },
+      });
+      if (!configureDecision.allowed) {
+        throw forbidden(configureDecision.explanation, authorizationDeniedDetails(configureDecision));
+      }
       // Hiring authority is granted only by an actor that holds it. A CEO the
       // board denied hiring must not restore it for itself or pass it to
       // another agent to hire through.

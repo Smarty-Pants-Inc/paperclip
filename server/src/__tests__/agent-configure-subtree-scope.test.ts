@@ -14,6 +14,7 @@ import { agentRoutes } from "../routes/agents.js";
 import { agentPermissionGrantRoutes } from "../routes/agent-permission-grants.js";
 import { accessRoutes } from "../routes/access.js";
 import { authorizationService } from "../services/authorization.js";
+import { builtInAgentService } from "../services/built-in-agents.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // Trust boundary: exercise authenticated HTTP writes and persisted state, not mocked authorization calls.
@@ -162,6 +163,41 @@ describe("subtree-scoped agent configuration", () => {
     expect(response.status, response.text).toBe(403);
     expect(response.body.error).toContain("/api/agents/:id/permission-grants");
     expect(response.body.error).not.toContain("removed");
+  }, 60_000);
+
+  it("requires target-scoped configure for CEO permission writes even without a hiring change", async () => {
+    const f = await seed();
+    await db.update(agents).set({ role: "ceo" }).where(eq(agents.id, f.ids.lead));
+    const before = (await db.select().from(agents).where(eq(agents.id, f.ids.unrelated)))[0]!.permissions;
+    const denied = await request(f.api).patch(`/api/agents/${f.ids.unrelated}/permissions`).set("Authorization", `Bearer ${f.token}`).send({ canCreateAgents: true, canAssignTasks: true });
+    expect(denied.status, denied.text).toBe(403);
+    expect((await db.select().from(agents).where(eq(agents.id, f.ids.unrelated)))[0]!.permissions).toEqual(before);
+    const allowed = await request(f.api).patch(`/api/agents/${f.ids.report}/permissions`).set("Authorization", `Bearer ${f.token}`).send({ canCreateAgents: true, canAssignTasks: true });
+    expect(allowed.status, allowed.text).toBe(200);
+    expect((await db.select().from(agents).where(eq(agents.id, f.ids.report)))[0]!.permissions).toMatchObject({ canAssignTasks: true });
+  }, 60_000);
+
+  for (const style of ["structured", "allow", "unscoped"] as const) {
+    it(`${style}: startup and direct-create reconciliation never widen a root CEO's existing configure grant`, async () => {
+      const f = await seed(style);
+      await db.update(agents).set({ role: "ceo", reportsTo: null }).where(eq(agents.id, f.ids.lead));
+      const readScope = async () => (await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.ids.lead), eq(principalPermissionGrants.permissionKey, "agents:configure"))))[0]!.scope;
+      const before = await readScope();
+      await builtInAgentService(db).ensureCompanyDefaultAgentGrants(f.companyId);
+      expect(await readScope()).toEqual(before);
+      const created = await request(f.board).post(`/api/companies/${f.companyId}/agents`).send({ name: "Another agent", role: "engineer", adapterType: "process", adapterConfig: {}, runtimeConfig: { heartbeat: { enabled: false } } });
+      expect(created.status, created.text).toBe(201);
+      expect(await readScope()).toEqual(before);
+    }, 60_000);
+  }
+
+  it("reconciles a missing root CEO configure grant as subtree-scoped, not unscoped", async () => {
+    const f = await seed();
+    await db.update(agents).set({ role: "ceo", reportsTo: null }).where(eq(agents.id, f.ids.lead));
+    await db.delete(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.ids.lead), eq(principalPermissionGrants.permissionKey, "agents:configure")));
+    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(f.companyId);
+    const [grant] = await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.ids.lead), eq(principalPermissionGrants.permissionKey, "agents:configure")));
+    expect(grant!.scope).toEqual({ subtreeRootAgentId: f.ids.lead });
   }, 60_000);
 
   it("rejects malformed, empty or unknown scope constraints without changing the grant", async () => {
