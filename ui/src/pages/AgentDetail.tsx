@@ -71,7 +71,7 @@ import { ScrollToBottom } from "../components/ScrollToBottom";
 import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallout";
 import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
-import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal, hasUnavailableProviderAccounting, supportsRawProviderTrace } from "../lib/utils";
+import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal, usageCompletenessLabel, hasUnavailableProviderAccounting, supportsRawProviderTrace } from "../lib/utils";
 import { cn } from "../lib/utils";
 import { RunRetryDetails } from "../components/RunRetryDetails";
 import { Button } from "@/components/ui/button";
@@ -314,6 +314,7 @@ function runMetrics(run: HeartbeatRun) {
   const model = asNonEmptyString(usage?.model) ?? null;
   return {
     usageUnavailable,
+    usageQualifier: usageCompletenessLabel(usage),
     input: usageUnavailable ? null : input,
     output: usageUnavailable ? null : output,
     cached: usageUnavailable ? null : cached,
@@ -2809,11 +2810,14 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
           {summary.slice(0, 60)}
         </span>
       )}
-      {(metrics.usageUnavailable || (metrics.totalTokens ?? 0) > 0 || (metrics.cost ?? 0) > 0) && (
-        <div className="flex items-center gap-2 pl-5.5 text-(length:--text-micro) text-muted-foreground tabular-nums">
-          {metrics.usageUnavailable && <span>Usage and cost unavailable</span>}
-          {metrics.totalTokens !== null && metrics.totalTokens > 0 && <span>{formatTokens(metrics.totalTokens)} tok</span>}
-          {metrics.cost !== null && metrics.cost > 0 && <span>${metrics.cost.toFixed(3)}</span>}
+      {(metrics.usageUnavailable || metrics.usageQualifier || (metrics.totalTokens ?? 0) > 0 || (metrics.cost ?? 0) > 0) && (
+        <div className="flex flex-col gap-1 pl-5.5 text-(length:--text-micro) text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-2 tabular-nums">
+            {metrics.usageUnavailable && <span>Usage and cost unavailable</span>}
+            {metrics.totalTokens !== null && metrics.totalTokens > 0 && <span>{formatTokens(metrics.totalTokens)} tok</span>}
+            {metrics.cost !== null && metrics.cost > 0 && <span>${metrics.cost.toFixed(3)}</span>}
+          </div>
+          {metrics.usageQualifier && <span>{metrics.usageQualifier}</span>}
         </div>
       )}
     </Link>
@@ -2925,7 +2929,7 @@ export function AgentFileRunNotice({ resultJson }: { resultJson: HeartbeatRun["r
 
 export function RunAccountingMetrics({ run }: { run: HeartbeatRun }) {
   const metrics = runMetrics(run);
-  if (!metrics.usageUnavailable && ![metrics.input, metrics.output, metrics.cached, metrics.cost].some(value => (value ?? 0) > 0)) return null;
+  if (!metrics.usageUnavailable && !metrics.usageQualifier && ![metrics.input, metrics.output, metrics.cached, metrics.cost].some(value => (value ?? 0) > 0)) return null;
   const values = [
     ["Input", metrics.input === null ? "Unavailable" : formatTokens(metrics.input)],
     ["Output", metrics.output === null ? "Unavailable" : formatTokens(metrics.output)],
@@ -2940,6 +2944,7 @@ export function RunAccountingMetrics({ run }: { run: HeartbeatRun }) {
           <div className="text-sm font-medium font-mono">{value}</div>
         </div>
       ))}
+      {metrics.usageQualifier && <p className="col-span-2 text-xs text-muted-foreground">{metrics.usageQualifier}</p>}
     </div>
   );
 }

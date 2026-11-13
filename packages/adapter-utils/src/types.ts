@@ -6,7 +6,7 @@ import type { SshRemoteExecutionSpec } from "./ssh.js";
 import type { AdapterExecutionTarget } from "./execution-target.js";
 import type { RuntimeStatusSink } from "./runtime-progress.js";
 import type { AdapterExecutionPhaseSink } from "./execution-phase.js";
-import type { ExecutionContinuationEnvelope, NativeFinalizationResult } from "@paperclipai/shared";
+import type { ExecutionContinuationEnvelope, HeartbeatRunUsage, NativeFinalizationResult } from "@paperclipai/shared";
 
 export interface AdapterAgent {
   id: string;
@@ -40,7 +40,7 @@ export interface UsageSummary {
 }
 
 /** Accounting-only snapshot. Never include prompt, response, or credentials. */
-export interface AdapterUsageCheckpoint {
+export interface AdapterUsageCheckpoint extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   attemptId?: string;
   usage?: UsageSummary;
   usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
@@ -99,7 +99,7 @@ export type AdapterExecutionErrorFamily =
   | "refresh_token_expired"
   | "refresh_token_invalidated";
 
-export interface AdapterExecutionResult {
+export interface AdapterExecutionResult extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   /** Positive evidence for retrying bootstrap; absent evidence never authorizes replay. */
   executionRecovery?: { kind: "bootstrap"; providerWorkStarted: false } | {
     kind: "interrupted";

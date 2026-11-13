@@ -711,6 +711,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       includeDescendants: true,
       costCents: 600,
       costCentsExact: "600.0000000",
+      accountingUsageLost: false,
       inputTokens: 54,
       cachedInputTokens: 6,
       outputTokens: 12,

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { SUBSCRIPTION_CURRENCIES, centsToUsd, usdToCents, type SubscriptionAccountReport, type SubscriptionCostReport, type SubscriptionUsage } from "@paperclipai/shared";
 import { subscriptionsApi } from "../api/subscriptions";
-import { formatCents, formatDateTime, formatTokens, providerDisplayName } from "../lib/utils";
+import { formatCents, formatDateTime, formatTokens, providerDisplayName, usageCompletenessLabel } from "../lib/utils";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { Card } from "./ui/card";
@@ -16,9 +16,11 @@ export function subscriptionMoney(cents: string, currency: string) {
 }
 
 export function SubscriptionTokenUsage({ usage }: { usage: SubscriptionUsage }) {
+  const usageQualifier = usageCompletenessLabel(usage);
   return <span className="font-mono text-xs text-muted-foreground">
     {formatTokens(usage.inputTokens + usage.cachedInputTokens)} in · {formatTokens(usage.outputTokens)} out
     {usage.cachedInputTokens > 0 && <span className="block">{formatTokens(usage.cachedInputTokens)} input cached</span>}
+    {usageQualifier && <span className="block font-sans">{usageQualifier}</span>}
   </span>;
 }
 

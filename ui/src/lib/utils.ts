@@ -185,6 +185,10 @@ function readRunCostUsd(payload: Record<string, unknown> | null): number | null 
   return null;
 }
 
+export function usageCompletenessLabel(usage: { accountingUsageLost?: unknown } | null | undefined): string | null {
+  return usage?.accountingUsageLost === true ? "Additional usage unknown" : null;
+}
+
 /** Receipt-backed runs and legacy Claude/Gemini snapshots store uncached input
  * separately. OpenCode/Pi persist their provider-qualified model IDs and also
  * separate cache reads. Older Codex input already includes cached tokens.

@@ -1,4 +1,5 @@
 import { receiptFingerprint } from "./receipt-fingerprint.js";
+import { aggregateAccountingUsageLost } from "./cost-usage-completeness.js";
 import { agentAvatarUrl, resolveAgentAppearance, createCostEventSchema, createServiceCostEventSchema, normalizeCents, isUuidLike, type MoneyInput, type CostByUserReport } from "@paperclipai/shared";
 import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -161,11 +162,12 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
-      const [{ total, totalExact, eventCount, unpricedEventCount, estimatedEventCount, unknownBillingEventCount }] = await db
+      const [{ total, totalExact, eventCount, unpricedEventCount, estimatedEventCount, unknownBillingEventCount, accountingUsageLost }] = await db
         .select({
           eventCount: sql<number>`count(*)::int`,
           estimatedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'estimated')::int`,
           unknownBillingEventCount: sql<number>`count(*) filter (where ${costEvents.billingType} = 'unknown')::int`,
+          accountingUsageLost: aggregateAccountingUsageLost,
           unpricedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'unpriced' and ${costEvents.billingType} <> 'subscription_included')::int`,
           total: sumAsNumber(costEvents.costCents),
           totalExact: sql<string>`coalesce(sum(${costEvents.costCents}), 0)::text`,
@@ -192,7 +194,8 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         unknownBillingEventCount,
         estimatedEventCount,
         pendingRunCount,
-        pricingComplete: unpricedEventCount === 0 && pendingRunCount === 0,
+        accountingUsageLost,
+        pricingComplete: unpricedEventCount === 0 && pendingRunCount === 0 && !accountingUsageLost,
         spendCents,
         spendCentsExact: normalizeCents(totalExact),
         budgetCents: company.budgetMonthlyCents,
@@ -300,6 +303,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         db
           .select({
             issueCount: sql<number>`count(distinct ${issues.id})::int`,
+            accountingUsageLost: aggregateAccountingUsageLost,
             costCents: sumAsNumber(costEvents.costCents),
           costCentsExact: sql<string>`coalesce(sum(${costEvents.costCents}), 0)::text`,
             inputTokens: sumAsNumber(ordinaryInputTokens),
@@ -332,6 +336,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       return {
         issueId,
         issueCount: Number(costRow?.issueCount ?? 0),
+        accountingUsageLost: costRow?.accountingUsageLost ?? false,
         includeDescendants: true,
         costCents: Number(costRow?.costCents ?? 0),
         costCentsExact: normalizeCents(costRow?.costCentsExact ?? 0),
@@ -366,6 +371,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       if (bounds.to) conditions.push(lte(costEvents.occurredAt, bounds.to));
       const totals = await tx.select({
         userId: companyMemberships.principalId,
+        accountingUsageLost: aggregateAccountingUsageLost,
         eventCount: sql<number>`count(*)::int`,
         estimatedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'estimated')::int`,
         unpricedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'unpriced' and ${costEvents.billingType} <> 'subscription_included')::int`,
@@ -406,7 +412,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         if (represented.has(member.userId)) continue;
         rows.push({
           userId: member.userId, userName: member.userName ?? "Unknown user", userImage: member.userImage,
-          eventCount: 0, estimatedEventCount: 0, unpricedEventCount: 0,
+          eventCount: 0, estimatedEventCount: 0, unpricedEventCount: 0, accountingUsageLost: false,
           costCents: 0, costCentsExact: "0.0000000",
           inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, runCount: 0,
         });
@@ -426,6 +432,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           agentName: agents.name,
           agentAppearance: agents.appearance,
           agentStatus: agents.status,
+          accountingUsageLost: aggregateAccountingUsageLost,
           eventCount: sql<number>`count(*)::int`,
           estimatedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'estimated')::int`,
           costCents: sumAsNumber(costEvents.costCents),
@@ -467,6 +474,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           biller: costEvents.biller,
           billingType: costEvents.billingType,
           model: costEvents.model,
+          accountingUsageLost: aggregateAccountingUsageLost,
           costCents: sumAsNumber(costEvents.costCents),
           costCentsExact: sql<string>`coalesce(sum(${costEvents.costCents}), 0)::text`,
           eventCount: sql<number>`count(*)::int`,
@@ -501,6 +509,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       return db
         .select({
           biller: costEvents.biller,
+          accountingUsageLost: aggregateAccountingUsageLost,
           costCents: sumAsNumber(costEvents.costCents),
           costCentsExact: sql<string>`coalesce(sum(${costEvents.costCents}), 0)::text`,
           eventCount: sql<number>`count(*)::int`,
@@ -547,6 +556,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           const rows = await db
             .select({
               provider: costEvents.provider,
+              accountingUsageLost: aggregateAccountingUsageLost,
               biller: sql<string>`case when count(distinct ${costEvents.biller}) = 1 then min(${costEvents.biller}) else 'mixed' end`,
               costCents: sumAsNumber(costEvents.costCents),
           costCentsExact: sql<string>`coalesce(sum(${costEvents.costCents}), 0)::text`,
@@ -597,6 +607,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           agentId: costEvents.agentId,
           agentName: agents.name,
           agentAppearance: agents.appearance,
+          accountingUsageLost: aggregateAccountingUsageLost,
           provider: costEvents.provider,
           biller: costEvents.biller,
           billingType: costEvents.billingType,
@@ -667,6 +678,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         .select({
           projectId: projects.id,
           projectName: projects.name,
+          accountingUsageLost: aggregateAccountingUsageLost,
           eventCount: sql<number>`count(*)::int`,
           estimatedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'estimated')::int`,
           costCents: costCentsExpr,

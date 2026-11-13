@@ -1,3 +1,4 @@
+import type { HeartbeatRunUsage } from "./heartbeat.js";
 import type { AgentAppearance } from "../agent-appearance.js";
 import type { BillingType, CostStatus } from "../constants.js";
 
@@ -30,7 +31,7 @@ export interface CostEvent {
   createdAt: Date;
 }
 
-export interface CostSummary {
+export interface CostSummary extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   eventCount: number;
   pendingRunCount: number;
   unpricedEventCount: number;
@@ -69,7 +70,7 @@ export interface CostDataQualityReport {
   hasMoreRuns: boolean;
 }
 
-export interface IssueCostSummary {
+export interface IssueCostSummary extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   issueId: string;
   issueCount: number;
   includeDescendants: boolean;
@@ -85,7 +86,7 @@ export interface IssueCostSummary {
   runtimeMs: number;
 }
 
-export interface CostByUser {
+export interface CostByUser extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   /** The run's recorded responsible user; null means unattributed. */
   userId: string | null;
   userName: string | null;
@@ -110,7 +111,7 @@ export interface CostByUserReport {
   rows: CostByUser[];
 }
 
-export interface CostByAgent {
+export interface CostByAgent extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   agentId: string | null;
   agentName: string | null;
   agentAppearance?: AgentAppearance | null;
@@ -131,7 +132,7 @@ export interface CostByAgent {
   subscriptionOutputTokens: number;
 }
 
-export interface CostByProviderModel {
+export interface CostByProviderModel extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   provider: string;
   biller: string;
   billingType: BillingType;
@@ -151,7 +152,7 @@ export interface CostByProviderModel {
   subscriptionOutputTokens: number;
 }
 
-export interface CostByBiller {
+export interface CostByBiller extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   biller: string;
   costCents: number;
   costCentsExact?: string;
@@ -171,7 +172,7 @@ export interface CostByBiller {
 }
 
 /** per-agent breakdown by provider + model, for identifying token-hungry agents */
-export interface CostByAgentModel {
+export interface CostByAgentModel extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   agentId: string | null;
   agentName: string | null;
   agentAppearance?: AgentAppearance | null;
@@ -191,7 +192,7 @@ export interface CostByAgentModel {
 }
 
 /** spend per provider for a fixed rolling time window */
-export interface CostWindowSpendRow {
+export interface CostWindowSpendRow extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   provider: string;
   biller: string;
   /** duration label, e.g. "5h", "24h", "7d" */
@@ -206,7 +207,7 @@ export interface CostWindowSpendRow {
 }
 
 /** cost attributed to a project via heartbeat run → activity log → issue → project chain */
-export interface CostByProject {
+export interface CostByProject extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   projectId: string | null;
   projectName: string | null;
   /** Ledger events in this project and selected date range, not distinct runs. */

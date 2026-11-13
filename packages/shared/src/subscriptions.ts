@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { HeartbeatRunUsage } from "./types/heartbeat.js";
 import { exactCentsSchema } from "./accounting.js";
 import { centsToUnits, unitsToCents } from "./money.js";
 
@@ -66,7 +67,7 @@ export interface SubscriptionPrice {
   effectiveAt: string;
 }
 
-export interface SubscriptionUsage {
+export interface SubscriptionUsage extends Pick<HeartbeatRunUsage, "accountingUsageLost"> {
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;

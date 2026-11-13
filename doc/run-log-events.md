@@ -998,8 +998,30 @@ same fact without adding summary tokens or manufacturing a zero-cost call.
 Producer receipt replay retains it across later turns. The run receipt's existing
 `pricingProvenance.evidence` explicitly states that Pi summary usage is unknown
 and observed usage/cost are a lower bound. `GET /api/heartbeat-runs/:runId`
-returns that provenance in `usageJson`; this does not change cost aggregation or
-run-level UI presentation.
+returns that provenance and the typed `usageJson.accountingUsageLost` boolean.
+The boolean is true when some provider usage is missing. Counts and charges are
+measured lower bounds in that case, even if `accountingReceiptReady` is true.
+Receipt persistence preserves the boolean across replay, later messages, and
+attempts. The server does not infer the boolean from explanatory prose.
+
+Company, agent, and related cost rollups carry `accountingUsageLost` when any
+included charge belongs to a flagged run. The company summary also sets
+`pricingComplete: false`. The flag does not change measured tokens or money.
+Run metrics and cost views, including Task Activity's direct-run and sub-task
+Cost Summary, show “Additional usage unknown”. A zero measured subtotal with
+missing usage also shows the warning.
+
+Under `unpricedUsagePolicy: "block"`, an unpriced charge whose run has this typed
+flag blocks admission and new reservations. This includes typed lost-on-restore
+usage, known partial costs, and zero observed tokens: none bounds the missing
+increment. This reverses the earlier restore-loss exemption. Known charges still
+count toward monetary limits. Ordinary unpriced measured usage still blocks;
+prose alone does not set the typed flag or confer an exemption. Legacy incomplete
+accounting without typed usage-loss evidence retains its existing policy.
+
+The field is optional for old clients and receipts. There is no prose-based
+backfill. Historical runs need typed receipt replay or reconciliation before
+their missing usage can appear through this new field.
 
 This unknown summary spend does not invalidate later assistant-message usage
 receipts. Their deltas, completeness, and cost provenance describe the measured

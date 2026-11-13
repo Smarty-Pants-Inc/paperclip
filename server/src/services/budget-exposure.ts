@@ -1,6 +1,6 @@
 import { addCents, normalizeCents, usdToUnits, unitsToCents } from "@paperclipai/shared";
 import { and, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
-import { budgetPolicies, budgetReservations, browserUseRuns, browserUseSessions, costEvents, heartbeatRuns, issues, runUsageReceipts, type Db } from "@paperclipai/db";
+import { budgetPolicies, budgetReservations, browserUseRuns, browserUseSessions, costEvents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { withBudgetSpan } from "./budget-tracing.js";
 
 export interface BudgetExposure {
@@ -127,37 +127,22 @@ async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): P
         and ${budgetReservations.runId} = ${heartbeatRuns.id} and ${budgetReservations.state} = 'held')`;
     ledgerPredicates.push(ledger); heldPredicates.push(held); runPredicates.push(run);
     ledgerColumns[`total${index}`] = sql`coalesce(sum(${costEvents.costCents}) filter (where ${ledger}), 0)::text`;
-    // "Usage with no reliable price" means usage from a complete receipt that
-    // could not be priced. These unpriced charges are not that, so they never
-    // trip the blocking policy (they stay visible in Costs):
-    // - a final charge accounting settled without its receipt: lost with a
-    //   stopped provider, closure evidence that never arrived, or a failed
-    //   capture (its receipt is never certified complete, even if a later
-    //   report adds usage). Accounting is never a company gate (plan decision 1); its
-    //   exposure is recorded, and the activity entry is the board's notice;
-    // - a charge that carries a known partial cost;
-    // - metered API or subscription billing with no observed tokens.
-    // Unknown billing with no tokens (for example Cursor Cloud) still counts.
-    // The receipt-unavailable exemption covers only that run's settled final
-    // charge; later growth from a complete receipt is ordinary usage.
     const finalCharge = sql`${costEvents.idempotencyKey} = 'heartbeat:' || ${costEvents.heartbeatRunId}::text || ':final'`;
     const exemptFromUnpricedBlock = sql`((${finalCharge}
         and exists (select 1 from ${heartbeatRuns} lost_receipt_run where lost_receipt_run.id = ${costEvents.heartbeatRunId}
           and lost_receipt_run.company_id = ${costEvents.companyId}
           and (lost_receipt_run.usage_json->>'accountingReceiptUnavailable' = 'true'
             or lost_receipt_run.usage_json->>'accountingClosureTimedOut' = 'true'
-            or lost_receipt_run.usage_json->>'accountingCaptureFailed' = 'true'
-            or exists (select 1 from ${runUsageReceipts} lost_turn_receipt
-              where lost_turn_receipt.run_id = lost_receipt_run.id
-                and lost_turn_receipt.company_id = lost_receipt_run.company_id
-                -- Typed producer marker, derived only from the existing
-                -- provider_turn_lost_on_restore error code. Never match prose.
-                and lost_turn_receipt.receipt_json->'producerEvent'->>'lostOnRestore' = 'true'))))
+            or lost_receipt_run.usage_json->>'accountingCaptureFailed' = 'true')))
       or ${costEvents.costCents} > 0
       or (${costEvents.billingType} in ('metered_api', 'api', 'subscription') and ${costEvents.inputTokens} = 0 and ${costEvents.cachedInputTokens} = 0
         and ${costEvents.outputTokens} = 0))`;
+    const hasUsageLoss = sql`exists (select 1 from ${heartbeatRuns} usage_loss_run
+      where usage_loss_run.id = ${costEvents}.${sql.identifier(costEvents.heartbeatRunId.name)}
+        and usage_loss_run.company_id = ${costEvents}.${sql.identifier(costEvents.companyId.name)}
+        and usage_loss_run.usage_json->>'accountingUsageLost' = 'true')`;
     ledgerColumns[`unpriced${index}`] = sql`count(*) filter (where ${ledger} and ${costEvents.costStatus} = 'unpriced' and ${costEvents.billingType} <> 'subscription_included'
-      and not ${exemptFromUnpricedBlock})::int`;
+      and (${hasUsageLoss} or not ${exemptFromUnpricedBlock}))::int`;
     runColumns[`live${index}`] = sql`coalesce(sum(${liveCost}) filter (where ${run} and ${inWindow}), 0)::text`;
     runColumns[`unreserved${index}`] = sql`coalesce(sum(${liveCost}) filter (where ${run} and not ${hasReservation}), 0)::text`;
     // Reservations carry over UTC windows. A reservation and its running

@@ -197,7 +197,7 @@ function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sour
         costUsdExact: typeof snapshot.usage?.accountingCostUsdExact === "string" ? snapshot.usage.accountingCostUsdExact : undefined,
         costStatus: usage === undefined || snapshot.usage?.accountingCostIncomplete === true ? "unpriced"
           : input.provider.kind === "aws_agentcore" ? "estimated" : undefined,
-        ...(snapshot.usage?.accountingUsageLost === true ? { pricingProvenance: {
+        ...(snapshot.usage?.accountingUsageLost === true ? { accountingUsageLost: true, pricingProvenance: {
           source: typeof snapshot.usage.accountingCostUsdExact === "string" ? "provider_reported" as const : "unknown" as const,
           version: "accounting-receipt/v1", evidence: nativeUsageLowerBoundEvidence(snapshot.usage) } } : {}),
       }));
