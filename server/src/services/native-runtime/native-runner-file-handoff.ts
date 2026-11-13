@@ -37,7 +37,7 @@ import type { StorageService } from "../../storage/types.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { issueService } from "../issues.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
-import { getNativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
+import { getNativeAddressedInteractionAttachmentSelections } from "./native-addressed-interaction.js";
 
 export type RemoteWorkspaceFileReader = (input: Pick<NativeRunnerFileHandoffInput, "contentRef" | "byteSize" | "sha256">) => Promise<Buffer>;
 
@@ -887,12 +887,14 @@ export async function resolveNativeRunnerWakeAttachmentSelections(input: {
     : null;
   const ownsExecution = run.executionRunId === input.binding.runId
     && (run.assigneeAgentId === input.binding.agentId || nativeReview);
-  if (!ownsExecution && !await getNativeAddressedInteractionGrant(input.db, input.binding, {
-    requireRunning: input.requireRunning ?? false,
-  })) {
+  const selections = ownsExecution
+    ? wakeAttachmentSelections(run.contextSnapshot)
+    : await getNativeAddressedInteractionAttachmentSelections(input.db, input.binding, {
+        requireRunning: input.requireRunning ?? false,
+      });
+  if (selections === null) {
     throw new Error("paperclip_runner_attachment_staging_not_authorized");
   }
-  const selections = wakeAttachmentSelections(run.contextSnapshot);
   if (selections.length > MAX_NATIVE_STAGED_ATTACHMENTS) {
     throw new Error("paperclip_runner_attachment_staging_count_denied");
   }

@@ -1,5 +1,6 @@
-import { agents, companies, heartbeatRuns, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { agents, companies, heartbeatRuns, issueAttachments, issueComments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNull } from "drizzle-orm";
+import { isLowTrustQuarantined } from "../source-trust.js";
 import { authorizationService, type AuthorizationActor } from "../authorization.js";
 import { budgetServiceInTransaction } from "../budgets.js";
 import { evaluateIssueThreadInteractionResolverAudience } from "../issue-thread-interaction-resolution.js";
@@ -81,6 +82,27 @@ export async function getNativeAddressedInteractionGrant(db: Db, binding: Native
   if (await budgetServiceInTransaction(db).getInvocationBlock(binding.companyId, binding.agentId,
     { issueId: binding.issueId, runId: binding.runId, admittedRecovery: true })) return null;
   return { ...binding, interaction };
+}
+
+export async function getNativeAddressedInteractionAttachmentSelections(db: Db, binding: NativeAddressedInteractionBinding, options: {
+  requireRunning?: boolean;
+} = {}): Promise<Array<{ id: string; commentId: string }> | null> {
+  const grant = await getNativeAddressedInteractionGrant(db, binding, options);
+  if (!grant) return null;
+  const commentIds = [...new Set([grant.interaction.sourceCommentId,
+    ...(Array.isArray(grant.interaction.originCommentIds) ? grant.interaction.originCommentIds : []),
+  ].filter((id): id is string => typeof id === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)))];
+  if (commentIds.length === 0) return [];
+  const rows = await db.select({ id: issueAttachments.id, commentId: issueComments.id, sourceTrust: issueComments.sourceTrust })
+    .from(issueAttachments)
+    .innerJoin(issueComments, and(eq(issueComments.id, issueAttachments.issueCommentId),
+      eq(issueComments.companyId, binding.companyId), eq(issueComments.issueId, binding.issueId), isNull(issueComments.deletedAt)))
+    .where(and(eq(issueAttachments.companyId, binding.companyId), eq(issueAttachments.issueId, binding.issueId),
+      inArray(issueAttachments.issueCommentId, commentIds)))
+    .orderBy(issueAttachments.createdAt, issueAttachments.id);
+  return rows.filter(row => !isLowTrustQuarantined(row.sourceTrust))
+    .map(row => ({ id: row.id, commentId: row.commentId }));
 }
 
 export const NATIVE_ADDRESSED_INTERACTION_TOOLS = new Set([
