@@ -659,6 +659,23 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
 
+  // check6: a remote owner whose sandbox lease ended elsewhere counts an
+  // undelivered tool answer as settled only on a committed result. A
+  // Stop-settled owner has none, so that answer keeps it held.
+  it.each([
+    { control: "pending-tool-result" as const, outcome: stranded("owner_stop_unsettled") },
+    { control: "settled" as const, outcome: ADMITTED },
+  ])("retires a remote-gone Stop-settled owner only with every tool answer delivered ($control)", async ({ control, outcome }) => {
+    const prior = await seedRecoveredPriorRun(control, { provider: "opencode" });
+    const followUp = await admitFollowUp(prior);
+    await db.insert(environments).values({ id: followUp.environmentId, name: `ended-${followUp.environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: `sandbox-${prior.runId}`,
+      status: "expired", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+    await stopSettledOwner(prior);
+    expect(await followUp.start()).toBe(outcome);
+  }, 60_000);
+
   it("keeps a Stop-settled owner held while its controller is still running", async () => {
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });
     try {
