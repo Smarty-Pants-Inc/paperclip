@@ -5105,24 +5105,40 @@ Holds recorded by earlier releases take this path. The successor is marked
 `nativePreClaimContinuationOf`; if it also fails, it keeps the ordinary
 reconciliation hold instead of chaining another continuation.
 
-Failed native predecessor selection uses that same affirmative pre-claim fact,
-not missing spawn telemetry. A terminal-failure coordinator must be unowned and
-have no result, with either the untouched attempt-0/generation-0 bootstrap proof
-or the durable server-owned prior-owner fence-refusal event. A launch intent,
-runner launch/dispatch span, recorded process start, controller checkpoint or
-provider/tool/result evidence keeps the predecessor held. Selection has no box
-to probe and does not invent another process-death predicate: dispatched remote
-owners still use `remoteRunnerGenerationLost` for the exact recorded runner.
-The same rule applies to admitted failures without a saved session checkpoint.
+Failed native predecessor selection and Pi's legacy identity walk-back share
+one gate, `canBypassFailedNativePredecessor`. The terminal-failure coordinator
+must be unowned. It then requires one of two proofs:
+
+- **P1 — lost runner generation:** `remoteRunnerGenerationLost` reads the exact
+  predecessor's recorded sandbox lease and directory, never the successor's
+  replacement box. Its matching marker must prove the process absent or its
+  boot/start generation changed. A live process, missing/foreign marker,
+  replaced box that cannot be probed, timeout or read failure proves nothing.
+- **P2 — no execution ever started:** `hasNativeExecutionStartEvidence` is false
+  for the predecessor and every earlier run in that native session, across all
+  controller generations. The predecessor has a server-owned lifecycle
+  `task.run.measured` event (a complete terminal log), no `native_run_results`
+  row, no `native_runner_checkpoints` row, and no accepted finalization result
+  or provider/tool work. A claimed attempt 1 / controller generation 1 may pass:
+  claiming is not execution. Attempt 0 alone is no longer sufficient.
+
+P2 relies on the executor awaiting the durable `PROCESS_START_REQUESTED` append
+in `onSessionAdmission`, and the session runtime awaiting that callback before
+any attach/open/spawn. A truncated log or start evidence in an earlier carried
+run remains held. Unknown evidence retains the named refusal; neither proof
+permits silent continuation. All existing ownership, checkpoint and admission
+fences remain. An eligible fresh provider session uses the existing single
+history-loss notice and required context re-read. The same gate covers admitted
+failures without a saved session checkpoint.
 
 Some older Pi task-session pointers name a different normalized session after
-each setup failure. Their bounded legacy lookup walks back only over these
-proved pre-spawn failures, within the same company, agent, issue and explicit
+each setup failure. Their bounded legacy lookup walks back only over failures
+proved by that same P1-or-P2 gate, within the same company, agent, issue and explicit
 conversation generation. An unproved or incompatible predecessor is a named
 `pi_conversation_legacy_predecessor_unproven` hold, not silent permission to
 start another history. A proved chain can retain the last successful
 conversation/checkpoint; normal workspace, provider, checkpoint and cold-start
-admission fences still apply. If every supplied predecessor is proved pre-spawn
+admission fences still apply. If every supplied predecessor passes the gate
 and no checkpoint exists, one transactional legacy-history warning accompanies
 the new recorded conversation. Missing historical coordinator records are not
 backfilled or interpreted as affirmative proof.

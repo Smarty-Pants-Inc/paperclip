@@ -1,5 +1,15 @@
 {
-  "note": "Scrubbed structural fields only. GET run dumps did NOT include native_run_finalizations. Tests must label any supplementary coordinator fixture; it is not production evidence. Earlier SMAA-143 run dumps were not supplied.",
+  "note": "Scrubbed structural GET run/event fields. Restored exact task.run.measured messages/payloads from local raw event dumps. GET dumps omit finalizations; the 2026-11-13 12:20Z platform-lead addendum confirms the following identical finalization for babee269 and bb6091b6, with zero result/checkpoint rows. Earlier SMAA-143 run dumps were not supplied.",
+  "confirmedFailedFinalization": {
+    "attempt": 1,
+    "controllerGeneration": 1,
+    "phase": "terminal_failure",
+    "recoveryState": "blocked",
+    "failureCode": "native_continuation_requires_reconciliation",
+    "leaseOwner": null,
+    "leaseExpiresAt": null,
+    "resultId": null
+  },
   "rows": {
     "60c4eb3b": {
       "id": "094062e2-1abd-402d-8401-98d750acb468",
@@ -1958,12 +1968,16 @@
         {
           "seq": 47,
           "eventType": "lifecycle",
+          "message": "task.run.measured",
           "stream": "system",
           "sourceInstanceId": null,
           "sourceEventId": null,
           "sourceSeq": null,
           "payload": {
-            "outcome": "failed"
+            "phase": "task.run.measured",
+            "outcome": "failed",
+            "durationMs": 22058,
+            "durableSettlement": true
           }
         }
       ]
@@ -2805,12 +2819,16 @@
         {
           "seq": 66,
           "eventType": "lifecycle",
+          "message": "task.run.measured",
           "stream": "system",
           "sourceInstanceId": null,
           "sourceEventId": null,
           "sourceSeq": null,
           "payload": {
-            "outcome": "failed"
+            "phase": "task.run.measured",
+            "outcome": "failed",
+            "durationMs": 17049,
+            "durableSettlement": true
           }
         }
       ]

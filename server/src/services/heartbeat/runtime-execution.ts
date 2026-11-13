@@ -117,6 +117,7 @@ type Lifecycle = ReturnType<typeof createHeartbeatLifecycle>;
 
 /** Dispatches a prepared run; admission and terminal run status remain owned by the executor. */
 export interface HeartbeatRuntimeExecutionInput {
+  predecessorEnvironmentRuntime?: Selection["predecessorEnvironmentRuntime"];
   run: typeof heartbeatRuns.$inferSelect;
   agent: typeof agents.$inferSelect;
   options: {
@@ -633,6 +634,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           (markDispatchStarted) => {
             return executePaperclipNativeSession({
               casesEnabled: context.paperclipCasesEnabled === true,
+              predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
               db,
               execution: nativeExecution,
               observability,

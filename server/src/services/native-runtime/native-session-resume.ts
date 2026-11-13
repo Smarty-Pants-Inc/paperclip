@@ -9,7 +9,7 @@ import type {
   PersistedNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
-import { provesNativeRunPreSpawnFailure } from "./native-provider-work-proof.js";
+import { canBypassFailedNativePredecessor, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
@@ -250,6 +250,7 @@ type NativeSessionResumeSelection = {
   beforeCreatedAt: Date;
   /** Recovery discovery must retain an ineligible newest progress barrier. */
   includeProgressBarrier?: boolean;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
 };
 
 const NATIVE_RESUME_CANDIDATE_WINDOW = 32;
@@ -289,7 +290,8 @@ async function isUnstartedInheritedFollowUp(
     processGroupId: number | null; processStartedAt: Date | null; runnerProfileJson: { sessionCheckpoint: unknown; nativeControllerRecovery: unknown } },
 ): Promise<boolean> {
   if (run.runtimeMode === "native" && run.status === "failed" && run.runnerProfileJson.sessionCheckpoint == null) {
-    return provesNativeRunPreSpawnFailure(db, { companyId: input.companyId, runId: run.id });
+    return canBypassFailedNativePredecessor(db, { companyId: input.companyId, runId: run.id,
+      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime });
   }
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
@@ -334,11 +336,8 @@ async function isUnstartedInheritedFollowUp(
       evidence.controllerCheckpoint || evidence.result || evidence.processStart) return false;
   const bootstrap = noProcess && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false && evidence.controllerPid === null;
   if (!bootstrap && !(piRecovery && (noProcess || evidence.inheritedProcess))) return false;
-  // Launch intent invalidates an absence-based inference even if identity
-  // retrieval/onSpawn persistence never completed. This selector has no box to
-  // probe: post-dispatch process retirement belongs to the existing executor's
-  // exact-generation prover, not a third "gone" predicate here.
-  return provesNativeRunPreSpawnFailure(db, { companyId: input.companyId, runId: run.id });
+  return canBypassFailedNativePredecessor(db, { companyId: input.companyId, runId: run.id,
+    predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime });
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {

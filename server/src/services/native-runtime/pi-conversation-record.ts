@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, desc, eq, lte, ne } from "drizzle-orm";
 import { agentTaskSessions, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { issueService } from "../issues.js";
-import { provesNativeRunPreSpawnFailure } from "./native-provider-work-proof.js";
+import { canBypassFailedNativePredecessor, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 
 /** Server-owned metadata; never handed to a provider as adapter configuration. */
 export const PI_CONVERSATION_KEY = "__paperclipPiConversation";
@@ -50,7 +50,8 @@ export function piConversationBoundaryChange(previous: PiConversationBoundary, n
  * Only affirmative pre-spawn failures may be walked back, within the same
  * company/agent/task and explicit conversation generation. An ambiguous row is
  * a named hold, not permission to silently start a new conversation. */
-async function legacyPiConversationOwner(db: Pick<Db, "select" | "execute">, owner: typeof heartbeatRuns.$inferSelect, generation: unknown) {
+async function legacyPiConversationOwner(db: Pick<Db, "select" | "execute">, owner: typeof heartbeatRuns.$inferSelect,
+  generation: unknown, predecessorEnvironmentRuntime?: FailedNativePredecessorProbe) {
   if (owner.status !== "failed" || owner.runnerProfileJson?.sessionCheckpoint != null) return owner;
   const candidates = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, owner.companyId), eq(heartbeatRuns.agentId, owner.agentId),
@@ -71,7 +72,7 @@ async function legacyPiConversationOwner(db: Pick<Db, "select" | "execute">, own
     }
     if (candidate.status === "succeeded" && candidate.runnerProfileJson?.sessionCheckpoint != null) return candidate;
     if (candidate.status !== "failed" || candidate.runnerProfileJson?.sessionCheckpoint != null
-      || !await provesNativeRunPreSpawnFailure(db, { companyId: owner.companyId, runId: candidate.id })) {
+      || !await canBypassFailedNativePredecessor(db, { companyId: owner.companyId, runId: candidate.id, predecessorEnvironmentRuntime })) {
       throw new Error("pi_conversation_legacy_predecessor_unproven");
     }
   }
@@ -86,6 +87,7 @@ async function legacyPiConversationOwner(db: Pick<Db, "select" | "execute">, own
 export async function selectPiConversation(db: Db, input: {
   companyId: string; agentId: string; issueId: string; runId: string;
   boundary: PiConversationBoundary;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
 }): Promise<PiConversationRecord> {
   return db.transaction(async tx => {
     const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).for("no key update");
@@ -112,7 +114,7 @@ export async function selectPiConversation(db: Db, input: {
       // Never reinterpret a foreign/stale task-session pointer as lineage.
       const boundLastRun = lastRun?.nativeSessionId === legacyId && lastRun.nativeIssueId === input.issueId;
       const owner = boundLastRun ? await legacyPiConversationOwner(tx, lastRun,
-        run.contextSnapshot?.conversationSessionGeneration) : lastRun;
+        run.contextSnapshot?.conversationSessionGeneration, input.predecessorEnvironmentRuntime) : lastRun;
       if (boundLastRun && owner && owner.id !== lastRun.id) legacyId = owner.nativeSessionId;
       const execution = owner?.runnerProfileJson?.nativeExecutionInput as {
         provider?: { kind?: string }; workspace?: { cwd?: string }; session?: { normalizedSessionId?: string };

@@ -29,6 +29,7 @@ import type { agentInstructionWorkingCopyService } from "../agent-instruction-wo
 import { createHash, randomUUID } from "node:crypto";
 import { nativeSha256 } from "../native-runtime/canonical.js";
 import { selectPiConversation } from "../native-runtime/pi-conversation-record.js";
+import type { FailedNativePredecessorProbe } from "../native-runtime/native-provider-work-proof.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentHarnessType, CHAT_PROVIDERS } from "@paperclipai/shared";
@@ -151,6 +152,7 @@ export interface HeartbeatRuntimeSelectionInput {
   issuesSvc: Pick<ReturnType<typeof issueService>, "addComment">;
   runtimeEnv: Record<string, string | undefined>;
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   onAdapterEvent: (event: AdapterRuntimeEvent) => Promise<void>;
   // Teardown must observe these updates even when a later preparation step throws.
   onNativeLifecycleSelected: (telemetry: NativeLifecycleTelemetry) => void;
@@ -533,6 +535,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     const piConversation = nativeRuntimeResolution.profile.backend === "pi_rpc"
       ? await selectPiConversation(db, {
           companyId: agent.companyId, agentId: agent.id, issueId: issueRef.id, runId: run.id,
+          predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
           boundary: {
             provider: nativeRuntimeResolution.profile.backend,
             cwd: executionWorkspace.cwd,
@@ -570,6 +573,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             normalizedSessionId: requestedNativeSessionId,
             currentRunId: run.id,
             beforeCreatedAt: run.createdAt,
+            predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
           }))
         : null;
     nativeRunnerInstanceId =

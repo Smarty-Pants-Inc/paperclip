@@ -258,6 +258,7 @@ import {
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
+import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeCredentialUpdateOwner, appendNativeCredentialUpdate } from "./native-credential-updates.js";
@@ -6114,6 +6115,7 @@ async function retiredLocalPiConversation(input: Omit<Parameters<typeof inspectF
 async function migrateRunnerdStateRootForExecution(input: {
   db: Db;
   execution: NativeExecutionInput;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   preparedExecutionAdmission?: NativePreparedExecutionAdmission;
   allowVerifiedBackup: boolean;
   retainedWarmOwnerRunId?: string;
@@ -7119,6 +7121,7 @@ function idleWarmNativeSessionOwnerRunId(input: {
 
 async function restorePerTurnRunnerdController(input: {
   db: Db; execution: NativeExecutionInput;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   restartRecovery?: NativeRestartRecoveryClaim;
 }): Promise<void> {
@@ -7135,7 +7138,7 @@ async function restorePerTurnRunnerdController(input: {
   const reference = identity ?? readRunnerdDurableIdentity(root, true);
   if (!reference) {
     if (existsSync(resolve(root, "control-plane", "control-plane-state.json"))) return;
-    if (!await restoreNativeControllerProjections(input.db, input.execution, root)) return;
+    if (!await restoreNativeControllerProjections(input.db, input.execution, root, input.predecessorEnvironmentRuntime)) return;
   } else {
     if (!durableIdentityMatchesSession(reference, input.execution)) return;
     if (identity?.runId === input.execution.binding.runId) return;
@@ -7160,6 +7163,7 @@ async function restorePerTurnRunnerdController(input: {
     }
     const recovered = await resolveNativeControllerRecovery(input.db, {
       ...input.execution.binding, currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
+      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
     });
     if (recovered.kind === "recoverable") {
       await refreshFinishedPerTurnRunnerdProjection(input, root, reference, recovered.checkpoint.runId, !identity, referenceBytes);
@@ -7186,6 +7190,7 @@ async function refreshFinishedPerTurnRunnerdProjection(
       [reference.runId, sourceRunId, input.execution.binding.runId]);
     const recovered = await resolveNativeControllerRecovery(tx as unknown as Db, {
       ...input.execution.binding, currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
+      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
     });
     if (recovered.kind !== "recoverable" || recovered.checkpoint.runId !== sourceRunId) return refuse("source_changed");
     const scratch = mkdtempSync(join(tmpdir(), "paperclip-controller-projection-"));
@@ -7342,6 +7347,7 @@ function isUndeliveredSuspendReceipt(state: Record<string, unknown>, root: strin
  * the original external marker can precede several in-process warm turns. */
 async function restoreWarmRunnerdController(input: {
   db: Db; execution: NativeExecutionInput;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   managedAiAccountIdentity?: string; managedAiCredentialIdentity?: string;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   restartRecovery?: NativeRestartRecoveryClaim;
@@ -7353,7 +7359,7 @@ async function restoreWarmRunnerdController(input: {
   const identity = readRunnerdDurableIdentity(root);
   const reference = identity ?? readRunnerdDurableIdentity(root, true);
   if (!idleWarmNativeSessionOwnerRunId(input) && (!reference || !existsSync(nativeSessionCheckpointPath(input.execution)))) {
-    if (await restoreNativeControllerProjections(input.db, input.execution, root)) {
+    if (await restoreNativeControllerProjections(input.db, input.execution, root, input.predecessorEnvironmentRuntime)) {
       await restoreRemoteSuspendedRunnerCheckpoint(input, root);
       return;
     }
@@ -7389,9 +7395,11 @@ async function restoreWarmRunnerdController(input: {
   if (!retainedRunId) await restoreRemoteSuspendedRunnerCheckpoint(input, root);
 }
 
-async function restoreNativeControllerProjections(db: Db, execution: NativeExecutionInput, root: string): Promise<boolean> {
+async function restoreNativeControllerProjections(db: Db, execution: NativeExecutionInput, root: string,
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe): Promise<boolean> {
   const recovered = await resolveNativeControllerRecovery(db, {
     ...execution.binding, currentRunId: execution.binding.runId, normalizedSessionId: nativeSessionKey(execution),
+    predecessorEnvironmentRuntime,
   });
   if (recovered.kind === "no_prior_execution") return false;
   if (recovered.kind === "waiting_for_owner") {
@@ -10015,6 +10023,7 @@ export async function executePaperclipNativeSession(input: {
   managedAiAccountIdentity?: string;
   managedAiCredentialWriteback?: ManagedAiCredentialWritebackBinding;
   billingIdentity?: Pick<AdapterExecutionResult, "provider" | "biller" | "billingType">;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   onTaskDispatched?: () => Promise<void> | void;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   /** Resolved per-run authorization; not an independent instance setting. */
@@ -10614,6 +10623,7 @@ async function executePaperclipNativeSessionAttempt(
       onLog: input.onLog,
       restartRecovery: input.restartRecovery,
       runnerExecutionTarget: input.runnerExecutionTarget,
+      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
       bootstrapRetryLeaseOwner: input.leaseOwner,
       managedAiAccountIdentity: input.managedAiAccountIdentity, managedAiCredentialIdentity: input.managedAiCredentialIdentity,
     }));
@@ -15521,6 +15531,7 @@ export async function createRunnerdBackend(input: {
   observability?: ProviderObservabilityLaunch;
   runnerEnvironment?: NodeJS.ProcessEnv;
   prepareRunnerEnvironment?: () => Promise<NodeJS.ProcessEnv | undefined>;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   /** Private grant materialization; never a user-configured host path. */
   managedAiCredentialHome?: string;
   managedAiCredentialIdentity?: string;
@@ -15599,6 +15610,7 @@ export async function createRunnerdBackend(input: {
         onLog: input.onLog,
         restartRecovery: input.restartRecovery,
         runnerExecutionTarget: input.runnerExecutionTarget,
+        predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
       });
     }
     input.executionContext?.signal.throwIfAborted();
