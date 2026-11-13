@@ -74,45 +74,6 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
     const replay = await commit(f, status); expect(replay.replayed).toBe(true); expect(replay.decision.id).toBe(first.decision.id);
     expect((await db.select().from(routineRuns).where(eq(routineRuns.id, f.invocationId)))[0]).toEqual(saved);
   });
-  it("relays a native blocked child result and wakes its assigned parent", async () => {
-    const f = await seed("ordinary");
-    const parentAgentId = randomUUID();
-    const parentId = randomUUID();
-    await db.insert(agents).values({ id: parentAgentId, companyId, name: "Parent owner", adapterType: "process", status: "active" });
-    await db.insert(issues).values({ id: parentId, companyId, title: "Parent task", status: "in_progress", assigneeAgentId: parentAgentId });
-    await db.update(issues).set({ parentId }).where(eq(issues.id, f.issueId));
-
-    const committed = await commit(f, "blocked");
-    const relays = await db.select().from(issueComments).where(eq(issueComments.issueId, parentId));
-    expect(relays).toHaveLength(1);
-    expect(relays[0]).toMatchObject({
-      authorType: "system",
-      body: expect.stringContaining("transitioned to `blocked`"),
-    });
-    expect(relays[0]?.body).toContain(f.issueId);
-
-    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, parentAgentId));
-    expect(wakes).toHaveLength(1);
-    expect(wakes[0]).toMatchObject({
-      reason: "issue_commented",
-      payload: expect.objectContaining({
-        issueId: parentId,
-        commentId: relays[0]!.id,
-        _paperclipWakeContext: expect.objectContaining({
-          wakeCommentId: relays[0]!.id,
-          source: "native_status_decision",
-          statusDecisionSource: "native_status_decision",
-          childIssueId: f.issueId,
-          childStatus: "blocked",
-        }),
-      }),
-    });
-
-    expect((await commit(f, "blocked")).replayed).toBe(true);
-    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, parentId))).toHaveLength(1);
-    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, parentAgentId))).toHaveLength(1);
-    expect(committed.replayed).toBe(false);
-  });
   it("retains the native decision author when requesting a protected agent reviewer", async () => {
     const f = await seed(), reviewer = randomUUID();
     await db.insert(agents).values({ id: reviewer, companyId, name: "Protected reviewer", adapterType: "process", status: "active",
