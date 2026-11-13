@@ -5856,11 +5856,10 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
       return refuse("target_not_sandbox_runner");
     }
-    // A resume from a provider's stopped state is only the trigger to look:
-    // Boat may resume the same machine with its programs still running. The
-    // prior Runner is treated as stopped only when its exact launch marker on
-    // the box names a process that is gone or of another generation.
-    if (restartedSandboxResume(target)) {
+    // Any resumed box can have lost its idle Runner, even without a provider
+    // restart label. That label is never proof: use the shared exact-generation
+    // probe, including on an ordinary resume of a still-running box.
+    if (resumedSandboxRunner(target)) {
       if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
         return refuse("restarted_sandbox_runner_generation_not_lost");
       }
@@ -5880,7 +5879,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   try { originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8"); }
   catch { return refuse("journal_unreadable"); }
   const { binding } = input.execution;
-  const remoteRunnerStopped = !localRunner && restartedSandboxResume(target);
+  const remoteRunnerStopped = !localRunner && resumedSandboxRunner(target);
   const remoteRunnerGone = !localRunner && !remoteRunnerStopped && await priorRemoteSandboxLeasesEnded(input.db, {
     companyId: binding.companyId, runId: identity.runId,
     currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
@@ -5989,19 +5988,19 @@ async function priorRemoteSandboxLeasesEnded(db: Db, input: {
   }
 }
 
-function restartedSandboxResume(target: AdapterExecutionTarget | null | undefined): boolean {
-  return target?.kind === "remote" && target.transport === "sandbox" && !target.runnerTask
-    && target.sandboxLeaseAcquisition?.outcome === "resumed" && target.sandboxLeaseAcquisition.restarted === true;
+function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined): boolean {
+  return target?.kind === "remote" && target.transport === "sandbox" && !!target.runner && !target.runnerTask
+    && target.sandboxLeaseAcquisition?.outcome === "resumed";
 }
 
-/** The prior Runner of a provider-restarted sandbox is lost, not live: its
- * process died with the machine and it never suspended. Return its exact
- * identity only when the ordinary finished-owner proofs pass (committed or
- * cleanly stopped result, released lease, stopped controller, settled
- * journal); authority rotation then archives its last state. */
-async function provenLostRestartedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
+/** An idle Runner can exit while its sandbox remains running. Return its exact
+ * identity only after the shared remote process-generation loss probe AND the
+ * ordinary finished-owner proofs (committed result, released lease, stopped
+ * controller, settled journal). The existing authority rotation keeps Pi's
+ * history and archives the old Runner; no third retirement rule is introduced. */
+async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
   : Promise<DurableRecoveryIdentity | null> {
-  if (!restartedSandboxResume(input.runnerExecutionTarget) || !isSafeNativeStateDirectory(input.root)) return null;
+  if (!resumedSandboxRunner(input.runnerExecutionTarget) || !isSafeNativeStateDirectory(input.root)) return null;
   const identity = readRunnerdDurableIdentity(input.root);
   if (!identity || !durableIdentityMatchesSession(identity, input.execution) || identity.runId === input.execution.binding.runId) return null;
   const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
@@ -6321,10 +6320,10 @@ async function migrateRunnerdStateRootForExecution(input: {
       let retirementRefusal = "";
       if (verification === "terminal_state_indeterminate" && !input.retainedWarmOwnerRunId
         && (!input.restartRecovery || input.restartRecovery.kind === "bootstrap_incomplete")) {
-        if (restartedSandboxResume(input.runnerExecutionTarget)) {
-          // The backend's authority rotation archives a proven-lost owner of a
-          // restarted sandbox, keeping its journal and provider files in place.
-          if (await provenLostRestartedSandboxRunner({ ...input, root: scoped })) return;
+        if (resumedSandboxRunner(input.runnerExecutionTarget)) {
+          // The backend's existing authority rotation archives the exact lost
+          // owner, keeping its journal and provider files in place.
+          if (await provenLostResumedSandboxRunner({ ...input, root: scoped })) return;
           retirementRefusal = "; retirement_refused=restarted_sandbox_owner_unproven";
         } else {
           const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
@@ -10180,6 +10179,21 @@ export async function executePaperclipNativeSession(input: {
     // checkpoint is still being saved. The scope reservation also prevents
     // a later sweep from closing an owner this turn is about to acquire.
     await closingWarmNativeSessions.get(sessionScopeId);
+    const idleOwner = warmNativeSessions.get(sessionScopeId);
+    if (idleOwner && !idleOwner.busy && !idleOwner.preparingRunId && !idleOwner.instructionPreparationRunId
+      && idleOwner.runId !== input.execution.binding.runId && resumedSandboxRunner(input.runnerExecutionTarget)) {
+      const root = scopedRunnerdStateRoot(input.execution);
+      await restoreWarmRunnerdController(input);
+      if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
+        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })) {
+        // Idle close may have suspended the box's Runner but failed its final
+        // controller/checkpoint cleanup. Do not ask that dead owner to close a
+        // second time. Only detach the local controller; ordinary admission and
+        // authority rotation below still fence and preserve the saved history.
+        await detachReleasedWarmNativeSession(idleOwner);
+        forgetWarmNativeSession(sessionScopeId, idleOwner);
+      }
+    }
 
     if (input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8") {
       return await executePaperclipNativeSessionWithinScope(input, undefined, false, ownDiagnosticLease);
@@ -10622,7 +10636,12 @@ async function executePaperclipNativeSessionAttempt(
       await logPostTerminalEvents(root, input.onLog);
     }
     if (durableIdentityMatchesSession(identity, input.execution) && identity.runId !== input.execution.binding.runId &&
-        runnerdAuthorityLifecycleWithVerifiedBackup({ root, identity, execution: input.execution, allowVerifiedBackup: true }) !== "suspended") {
+        runnerdAuthorityLifecycleWithVerifiedBackup({ root, identity, execution: input.execution, allowVerifiedBackup: true }) !== "suspended"
+        // Core's idle close leaves the authoritative suspend on the box, not
+        // necessarily in the server projection. Prove generation loss before
+        // selecting live adoption, or it reconnects forever to the exited Runner.
+        && !await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
+          runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })) {
       let releasedSource: DurableRecoveryIdentity | undefined;
       remoteWarmRecovery = await inspectRemoteWarmSessionRecovery({
         db: input.db, execution: input.execution, target: input.runnerExecutionTarget, identity,
@@ -16433,7 +16452,7 @@ async function createRunnerdBackendWithinSessionClaim(
   // unsuspended state. Authority rotation may archive it only after the
   // ordinary finished-owner proofs; anything unproven keeps the refusal.
   const lostRunnerSource = !pluginTask && !input.restartRecovery && !input.remoteWarmRecovery
-    ? await provenLostRestartedSandboxRunner({ db: input.db, root, execution: input.execution,
+    ? await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
       runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })
     : null;
   let verifyRetainedRemoteProcess: (() => Promise<void>) | undefined;
