@@ -1272,8 +1272,16 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       : !storageUnavailable ? thrownMessage
         : failureErrorCode === STORAGE_UNAVAILABLE_CODE ? storageUnavailableMessage(err) : storageUnavailableHeldMessage(err);
     const failureCause = GENERIC_RUN_FAILURE_CODES.has(failureErrorCode) ? thrownFailureCause : null;
+    const cause = err instanceof Error ? err.cause : undefined;
+    const causeRecord = typeof cause === "object" && cause !== null ? cause as Record<string, unknown> : {};
+    const causeSummary = cause === undefined ? undefined : {
+      code: typeof causeRecord.code === "string" ? causeRecord.code : null,
+      errno: typeof causeRecord.errno === "string" || typeof causeRecord.errno === "number" ? causeRecord.errno : null,
+      statusCode: typeof causeRecord.statusCode === "number" ? causeRecord.statusCode : null,
+      message: identityRedactor.redact(cause instanceof Error ? cause.message : String(cause)),
+    };
     logger.error({ err: identityRedactor.redact({ message: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined }), runId,
-      errorCode: failureErrorCode, failureCause: thrownFailureCause }, "heartbeat execution failed");
+      errorCode: failureErrorCode, failureCause: thrownFailureCause, ...(causeSummary ? { causeSummary } : {}) }, "heartbeat execution failed");
 
     let logSummary: {
       bytes: number | null;
