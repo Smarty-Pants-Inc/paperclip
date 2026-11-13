@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -46,7 +46,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history and native identity (lifecycle=${lifecycleMode}, thinking=${thinking})`, async () => {
+it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async missingFile => {
   expect(["warm", "per_turn"]).toContain(lifecycleMode);
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
@@ -56,6 +56,7 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
     throw new Error("Set absolute PAPERCLIP_RUNNER_BINARY and PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH to qualified local artifacts");
   const root = await mkdtemp(join(process.env.PAPERCLIP_PI_E2E_EVIDENCE ?? tmpdir(), "native-pi-continuing-"));
   const privateFact = `PI_PRIVATE_MEMORY_${randomUUID()}`;
+  const freshFact = `PI_FRESH_MEMORY_${randomUUID()}`;
   const readSessionFile = (piPid: number) => {
     const args = readFileSync(`/proc/${piPid}/cmdline`, "utf8").split("\0");
     const at = args.indexOf("--session");
@@ -161,6 +162,11 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
           && latest.content.some((part: { type: string }) => part.type === "tool_result");
         const remembersPrivateFact = (parsed.messages ?? []).some((message: { role: string; content: unknown }) =>
           message.role === "assistant" && JSON.stringify(message.content).includes(privateFact));
+        if (missingFile && activeTurn === 3) {
+          expect((parsed.messages ?? []).some((message: { role: string; content: unknown }) =>
+            message.role === "assistant" && JSON.stringify(message.content).includes(freshFact)), "third turn continues the new private history").toBe(true);
+          expect(JSON.stringify(latest), "fresh fact is not replayed in the new input").not.toContain(freshFact);
+        }
         requests.push({ path: req.url!, model: parsed.model, lastMessage: latest,
           messages: parsed.messages ?? [], remembersPrivateFact,
           tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? "") });
@@ -189,7 +195,7 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
         if (!isToolResult) {
           // The fact originates ONLY in the first assistant response and is not
           // published in the first final chat reply or any Paperclip tool result.
-          textBlock(activeTurn === 1 ? `Private fact: ${privateFact}` : "Completing the reopened issue.");
+          textBlock(activeTurn === 1 ? `Private fact: ${privateFact}` : missingFile && activeTurn === 2 ? `Fresh private fact: ${freshFact}` : "Completing the reopened issue.");
           if (!contract) throw new Error("Model request lacks the current completion contract");
           const input = { reportedWorkDisposition: "done", summary: `Turn ${activeTurn} complete`,
             evidence: [{ ref: "provider:pi_rpc:agent-message" }], verification: [], attentionRequests: [], artifacts: [],
@@ -307,8 +313,30 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
     }, 201);
     issueId = issue.id;
     const { heartbeatService } = await import("../services/heartbeat.js");
+    let replayedRecoveryNotices = 0;
+    if (missingFile) {
+      const projection = await import("../services/native-runtime/pi-session-recovery-notice.js");
+      const materialize = projection.materializePiSessionRecoveryNotice;
+      vi.spyOn(projection, "materializePiSessionRecoveryNotice").mockImplementation(async input => {
+        await materialize(input);
+        if (!projection.piSessionRecovery(input.event)) return;
+        // Replay the exact real receipt concurrently against the live DB,
+        // including a repeat after the first projection already committed.
+        await Promise.all([materialize(input), materialize(input)]);
+        replayedRecoveryNotices += 2;
+      });
+    }
     const previousRuns: string[] = [];
     for (activeTurn = 1; activeTurn <= 3; activeTurn++) {
+      if (missingFile && activeTurn === 2) {
+        // Close the settled resident through the production restart boundary.
+        // The next real runner must thread/resume, not reuse an in-memory Pi.
+        const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
+        expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: 1, busy: 0, failed: 0 });
+        const files = turnProofs[0]!.sessionFiles as string[];
+        for (const file of files) await unlink(file); // turn-1 snapshots retain the deleted history
+        stage("saved Pi file deleted after resident shutdown", { files, previousPids: turnProofs[0]!.pids });
+      }
       const requestOffset = requests.length;
       const before = await api("GET", `/issues/${issueId}`);
       expect(before.status).toBe(activeTurn === 1 ? "backlog" : "done");
@@ -334,6 +362,9 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
       const [closed] = await db.select().from(issueRows).where(eq(issueRows.id, issueId));
       const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
       const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, admitted.id));
+      const [taskSession] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, issueId));
+      const conversation = taskSession?.sessionParamsJson?.__paperclipPiConversation;
+      expect(conversation).toMatchObject({ id: settled!.nativeSessionId, generation: 1 });
       const pids = bundles.flatMap(bundle => {
         const info = bundle.transport.processInfo?.();
         return info?.pid ? [{ runnerPid: info.pid, piPid: piDescendant(info.pid) }] : [];
@@ -353,7 +384,7 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
       for (const [i, file] of sessionFiles.entries()) await writeFile(join(root, `pi-session-turn-${activeTurn}-${i}.jsonl`), readFileSync(file));
       const currentRequests = requests.slice(requestOffset);
       const row = { turn: activeTurn, inboundCommentId: inbound.id, runId: settled!.id,
-        status: settled!.status, nativeSessionId: settled!.nativeSessionId, issueStatus: closed!.status,
+        status: settled!.status, nativeSessionId: settled!.nativeSessionId, conversation, issueStatus: closed!.status,
         reply: reply.body, pids, sessionFiles, contextSnapshot: settled!.contextSnapshot,
         wakeups, startupReuseEvents: events.filter(event => event.eventType === "run.startup.reuse"),
         nativeProcessStartEvents: events.filter(event => event.eventType === "native.process_start_requested"),
@@ -375,26 +406,40 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
         expect(settled!.contextSnapshot?.wakeReason).toBe("issue_reopened_via_comment");
         // Soft assertions preserve all three regression observations on the
         // baseline, without weakening the test's final pass/fail result.
-        expect.soft(row.assistantHistoryRecall, "Pi sends its own private history, not a replay in the new input").toBe(true);
+        expect.soft(row.assistantHistoryRecall, "missing history is fresh, ordinary history is restored").toBe(!missingFile);
         // Before turn 2 the fact is still Pi-only. After turn 2 it has been
         // intentionally published, so ordinary Paperclip context may include
         // that public reply on turn 3; this is not a history-loss regression.
         if (activeTurn === 2) expect.soft(row.latestInputContainsFact, "first reopen does not replay the Pi-only fact").toBe(false);
-        expect.soft(reply.body).toBe(`TURN_${activeTurn}_RECALLED_${privateFact}`);
-        expect.soft(settled!.nativeSessionId, "all three reopened turns use the SAME native session").toBe(turnProofs[0]!.nativeSessionId);
+        expect.soft(reply.body).toBe(missingFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
+        expect.soft(settled!.nativeSessionId, "all three reopened turns use the SAME normalized conversation").toBe(turnProofs[0]!.nativeSessionId);
         if (lifecycleMode === "warm") {
-          expect.soft(pids, "normal reopens keep the SAME physical runner/Pi, not just logical identity").toEqual(turnProofs[0]!.pids);
-          for (const layer of ["runner", "provider_session"]) {
+          if (missingFile && activeTurn === 2) {
+            expect(pids[0]!.runnerPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.runnerPid);
+            expect(pids[0]!.piPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.piPid);
+          } else {
+            expect.soft(pids, "the next normal turn keeps the SAME physical runner/Pi").toEqual(turnProofs[missingFile ? 1 : 0]!.pids);
+          }
+          for (const layer of missingFile && activeTurn === 2 ? [] : ["runner", "provider_session"]) {
             expect.soft(events, `${layer} startupReuse must be reused`).toEqual(expect.arrayContaining([
               expect.objectContaining({ eventType: "run.startup.reuse", payload: expect.objectContaining({ layer, state: "reused" }) }),
             ]));
           }
         }
       }
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      await writeFile(join(root, `comments-turn-${activeTurn}.json`), JSON.stringify(comments, null, 2));
+      const notices = comments.filter(comment => comment.body.startsWith("My earlier conversation could not be restored:"));
+      expect(notices).toHaveLength(missingFile && activeTurn >= 2 ? 1 : 0);
+      if (notices.length) {
+        expect(notices[0]!.body).toBe("My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.");
+        expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", tone: "warning" });
+      }
       previousRuns.push(admitted.id);
     }
     expect(turnProofs).toHaveLength(3);
-    stage("all three observations retained", { companyId, agentId, issueId, turnProofs });
+    if (missingFile) expect(replayedRecoveryNotices).toBeGreaterThan(0);
+    stage("all three observations retained", { companyId, agentId, issueId, replayedRecoveryNotices, turnProofs });
   } catch (error) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;
@@ -414,6 +459,10 @@ it.skipIf(!enabled)(`three done/comment-reopened turns preserve Pi-only history 
         await heartbeat.waitForRunExecutionDrain(run.id, { timeoutMs: 15_000 }).catch(error => console.error("Owned run drain", error));
       }
     }
+    // Retire registry-owned residents before closing their test transports;
+    // otherwise a later case inherits a stale warm-session registry entry.
+    const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
+    await closeIdleWarmNativeSessionsForRestart();
     for (const bundle of bundles) await bundle.transport.close().catch(error => console.error("Owned runner teardown", error));
     await app?.locals.paperclipShutdown?.();
     if (http) { http.closeAllConnections(); await new Promise<void>(resolve => http!.close(() => resolve())); }

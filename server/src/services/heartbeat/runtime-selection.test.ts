@@ -32,6 +32,7 @@ import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
+import { materializePiSessionRecoveryNotice } from "../native-runtime/pi-session-recovery-notice.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -208,6 +209,46 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: {
       session: { normalizedSessionId: selected.nativeExecution.session.normalizedSessionId },
     } });
+    expect(await notices()).toHaveLength(1);
+  });
+  it("projects a typed missing-Pi-file restart once across concurrent events, replay and later turns", async () => {
+    // Trust-boundary/data-safety regression for RFL G-2. Use the real issue,
+    // run and conversation locks, not a mock comment-call count.
+    const f = await piFixture();
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
+    const execution = selected.nativeExecution;
+    const previousId = randomUUID(), id = randomUUID();
+    const event = { schema: "paperclip.prp.event.v3", schemaVersion: 3, sourceEventId: randomUUID(), sourceSeq: 1,
+      sourceInstanceId: "runner", sourceKind: "runner", priority: 0, emittedAt: new Date().toISOString(),
+      runId: f.run.id, normalizedSessionId: execution.session.normalizedSessionId, eventType: "session.resumed",
+      payload: { provider: "pi_rpc", providerSessionId: id, providerAccountSessionId: id,
+        providerDescriptor: { piNativeAdmission: { sessionRecovery: {
+          code: "pi_session_file_missing", previousDriverSessionId: previousId, driverSessionId: id,
+        } } } } } as Parameters<typeof materializePiSessionRecoveryNotice>[0]["event"];
+    const facadeEvent = { ...event, payload: { driverSessionId: id, providerSessionId: id,
+      context: { piNativeAdmission: { provider: "pi_rpc", sessionRecovery: {
+        code: "pi_session_file_missing", previousDriverSessionId: previousId, driverSessionId: id,
+      } } } } };
+    const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    for (const invalid of [
+      { ...event, normalizedSessionId: randomUUID() },
+      { ...event, runId: randomUUID() },
+      { ...event, eventType: "item.completed" as const },
+      { ...event, payload: { ...event.payload, providerSessionId: randomUUID() } },
+      { ...event, payload: { ...event.payload, provider: "codex" } },
+    ]) await materializePiSessionRecoveryNotice({ db, execution, event: invalid });
+    expect(await notices()).toHaveLength(0);
+    await Promise.all([1, 2].map(() => materializePiSessionRecoveryNotice({ db, execution, event: facadeEvent })));
+    expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: f.run.id,
+      body: "My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.",
+      presentation: { kind: "system_notice", tone: "warning" } }]);
+    await materializePiSessionRecoveryNotice({ db, execution, event: { ...event, sourceEventId: randomUUID() } });
+    await nextPiTurn(f);
+    const next = await selectHeartbeatRuntime(db, f.input);
+    if (!next.selected || !next.nativeExecution) throw new Error("Expected next selection");
+    await materializePiSessionRecoveryNotice({ db, execution: next.nativeExecution,
+      event: { ...event, runId: f.input.run.id, sourceEventId: randomUUID() } });
     expect(await notices()).toHaveLength(1);
   });
   async function connectorFixture(durable = true) {

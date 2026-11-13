@@ -149,19 +149,21 @@ it("thread/resume refuses an invalid saved Pi file with its typed code and never
   } finally { await proxy.close(); }
 });
 
-it("thread/resume with the saved Pi file missing on this box continues in a fresh Pi conversation under the same id", async () => {
+it("thread/resume reports a typed missing-file rejection, then admits an explicit fresh thread/start under the same conversation id", async () => {
   const sink = new FakeSink(); const session = new FakeSession(); const driver = makeDriver(session);
   driver.openSession = vi.fn(driver.openSession);
   driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("Saved Pi session file is missing"), { code: "pi_session_file_missing" }); });
-  const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
   const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_RUN_ID: "run-new", PAPERCLIP_NORMALIZED_SESSION_ID: "conversation" }, createDriver: () => driver });
   try {
     proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: "native-id", cwd: "/workspace", model: "neutral/model" } }));
     await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 1)).toBe(true));
-    expect(sink.decoded().find(frame => frame.id === 1)).toMatchObject({ result: { thread: { id: session.id } } });
-    expect(driver.openSession).toHaveBeenCalledWith(expect.objectContaining({ runId: "run-new", normalizedSessionId: "conversation", workingDirectory: "/workspace" }));
-    expect(stderr.mock.calls.map(call => String(call[0])).join("")).toContain("pi_session_history_missing");
-  } finally { stderr.mockRestore(); await proxy.close(); }
+    expect(sink.decoded().find(frame => frame.id === 1)).toMatchObject({ error: { code: -32000, data: { code: "pi_session_file_missing" } } });
+    expect(driver.openSession).not.toHaveBeenCalled();
+    proxy.acceptLine(JSON.stringify({ id: 2, method: "thread/start", params: { cwd: "/workspace", model: "neutral/model" } }));
+    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 2)).toBe(true));
+    expect(sink.decoded().find(frame => frame.id === 2)).toMatchObject({ result: { thread: { id: session.id } } });
+    expect(driver.openSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: "run-new", normalizedSessionId: "conversation", workingDirectory: "/workspace" }));
+  } finally { await proxy.close(); }
 });
 
 it("thread/resume refuses without the server-owned conversation id (no thread-id fallback)", async () => {

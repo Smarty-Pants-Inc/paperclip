@@ -61,6 +61,7 @@ export interface PiRpcDriverLaunchConfig {
   environment: NodeJS.ProcessEnv;
   runnerInstanceId: string;
   piRpcThinkingLevel?: PiThinkingLevel;
+  deferInitialBinding?: boolean;
   systemInstructions: string;
   runtimeContext: ReturnType<typeof parseNativeRuntimeContext> | null;
   dynamicTools: Record<string, unknown>[];
@@ -210,6 +211,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   let eventPump: Promise<void> | null = null;
   let pendingInput = Promise.resolve();
   let bootstrapFailure: Error | null = null;
+  let missingResumeNeedsAttachment = false;
   let cwd = "";
   let activeModel = "";
   let piNativeAdmission: Record<string, unknown> | undefined;
@@ -537,6 +539,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       runtimeContext,
       dynamicTools,
       durableToolRequests: true,
+      // A restored process initially belongs to the previous run. Release its
+      // unused bootstrap origin before the current run's explicit attachment.
+      deferInitialBinding: resume || missingResumeNeedsAttachment,
       dynamicToolHandler: async (call) => {
         const opened = session;
         const { runId, turnId, callId, tool, arguments: arguments_, signal } = call;
@@ -588,25 +593,14 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         activeTurnId: null,
         lastSourceSequence: 0,
       };
-      let recovered: Awaited<ReturnType<NonNullable<HarnessDriver["recoverSession"]>>> | null = null;
-      try {
-        recovered = await driver.recoverSession(snapshot, { signal: openAbort.signal });
-      } catch (error) {
-        // The box was replaced and its transcript wasn't restored: continue in
-        // a fresh Pi conversation under the SAME conversation id rather than
-        // failing every later message. Say so in the run log. A file that
-        // exists but is invalid (pi_session_file_invalid) is still refused.
-        if ((error as { code?: unknown } | null)?.code !== "pi_session_file_missing") throw error;
-        process.stderr.write("[paperclip-runner] pi_session_history_missing: the saved Pi conversation file is not on this box; starting a fresh Pi conversation for the same conversation id\n");
+      // Resume never pretends a newly minted native identity was restored.
+      // The typed missing-file rejection lets the runner explicitly start a
+      // fresh thread and carry that loss of history into the product notice.
+      const recovered = await driver.recoverSession(snapshot, { signal: openAbort.signal });
+      if (!recovered.recovered || !recovered.session) {
+        throw new Error(recovered.reason ?? "Pi RPC session recovery failed");
       }
-      if (recovered) {
-        if (!recovered.recovered || !recovered.session) {
-          throw new Error(recovered.reason ?? "Pi RPC session recovery failed");
-        }
-        opened = recovered.session;
-      } else {
-        opened = await driver.openSession({ runId: activeRunId, normalizedSessionId, workingDirectory: cwd, signal: openAbort.signal });
-      }
+      opened = recovered.session;
     } else {
       opened = await driver.openSession({
         runId: activeRunId,
@@ -620,6 +614,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     for (const key of Object.keys(usageTotals)) delete usageTotals[key];
     usageByTurn.clear();
     session = opened;
+    missingResumeNeedsAttachment = false;
     piNativeAdmission = (opened as PiRpcProxySession & { piNativeAdmission?(): Record<string, unknown> }).piNativeAdmission?.();
     if (!options.createDriver && !piNativeAdmission) throw new Error("Native Pi omitted admitted model/thinking metadata");
     if (piNativeAdmission) activeModel = String(piNativeAdmission.model);
@@ -802,10 +797,12 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
 
   function failRequest(message: RpcMessage, error: unknown): void {
     const normalized = error instanceof Error ? error : new Error(String(error));
-    if (message.method === "initialize" || message.method === "thread/start" || message.method === "thread/resume") {
+    const code = (normalized as Error & { code?: unknown }).code;
+    const missingResume = message.method === "thread/resume" && code === "pi_session_file_missing";
+    if (missingResume) missingResumeNeedsAttachment = true;
+    if (!missingResume && (message.method === "initialize" || message.method === "thread/start" || message.method === "thread/resume")) {
       bootstrapFailure ??= normalized;
     }
-    const code = (normalized as Error & { code?: unknown }).code;
     send({ id: message.id, error: { code: -32000, message: normalized.message,
       ...(code === "pi_session_file_missing" || code === "pi_session_file_invalid" ? { data: { code } } : {}) } });
   }

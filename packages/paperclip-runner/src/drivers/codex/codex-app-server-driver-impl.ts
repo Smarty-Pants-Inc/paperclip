@@ -2,7 +2,7 @@ import { usesPreconfiguredHome } from "../preconfigured-home.js";
 import { codexProviderFailure } from "./provider-failure.js";
 import { writeManagedCodexObservability, redactObservabilityDiagnostic } from "../agent-observability.js";
 import { trustCodexStartupRoot } from "./codex-startup-trust.js";
-import { readCodexThreadState, readCodexTurnMetadata } from "./codex-history.js";
+import { readCodexTurnMetadata } from "./codex-history.js";
 import { codexExecutableReadOnlyRoots } from "./codex-security-config.js";
 
 import type {
@@ -425,6 +425,8 @@ export class CodexAppServerDriver implements HarnessDriver {
         reason: "persisted session identity is incomplete",
       };
     }
+    const recoveredRunId = snapshot.runId;
+    const recoveredNormalizedSessionId = snapshot.normalizedSessionId;
     // A session saved under an abandoned remote workspace root cannot resume
     // in the newly assigned root. When it holds no in-flight turn or runtime
     // request (a follow-up's inherited checkpoint, for example), decline
@@ -483,10 +485,37 @@ export class CodexAppServerDriver implements HarnessDriver {
           : { threadId: snapshot.driverSessionId }));
       }
       const existing = await cancellation.wait(
-        readCodexThreadState(transport, snapshot.driverSessionId),
+        transport.request("thread/read", { threadId: snapshot.driverSessionId, includeTurns: false }),
       );
-      await cancellation.wait(this.#persistProcessOwnership(transport));
       const existingThread = record(existing.thread);
+      const piRecovery = record(record(existing.piNativeAdmission).sessionRecovery);
+      // A missing Pi transcript is an explicit fresh native thread, not a
+      // successful history restore. Only the authenticated runner receipt and
+      // an idle checkpoint authorize dropping old native-turn bookkeeping.
+      // Never apply this to Codex or replay an input with uncertain effects.
+      if (this.#options.driverIdentity?.kind === "pi_rpc"
+        && piRecovery.code === "pi_session_file_missing"
+        && existing.normalizedSessionId === snapshot.normalizedSessionId
+        && piRecovery.previousDriverSessionId === snapshot.driverSessionId
+        && piRecovery.previousDriverSessionId === snapshot.providerSessionId
+        && typeof piRecovery.driverSessionId === "string" && piRecovery.driverSessionId.length > 0
+        && piRecovery.driverSessionId !== snapshot.driverSessionId
+        && piRecovery.driverSessionId === existingThread.id
+        && piRecovery.driverSessionId === existingThread.sessionId
+        && !persistedSessionInFlight(snapshot) && snapshot.goal?.status !== "active") {
+        snapshot = {
+          driverKind: snapshot.driverKind, runId: snapshot.runId,
+          normalizedSessionId: snapshot.normalizedSessionId,
+          workingDirectory: snapshot.workingDirectory,
+          driverSessionId: piRecovery.driverSessionId, providerSessionId: piRecovery.driverSessionId,
+          providerIdentity: snapshot.providerIdentity, lastSourceSequence: snapshot.lastSourceSequence,
+          providerRecoveryPolicy: snapshot.providerRecoveryPolicy, activeTurnId: null,
+        };
+      }
+      if (text(existingThread.id) !== snapshot.driverSessionId) {
+        throw new HarnessReconciliationError("thread/read returned a different driver session");
+      }
+      await cancellation.wait(this.#persistProcessOwnership(transport));
       existingThread.turns = await cancellation.wait(readCodexTurnMetadata(transport, snapshot.driverSessionId));
       if (text(existingThread.id) !== snapshot.driverSessionId) {
         await cancellation.wait(cancellation.close());
@@ -751,8 +780,8 @@ export class CodexAppServerDriver implements HarnessDriver {
         opened.context.liveConsole.goals = this.#caps.goals;
       const session = this.#session({
         transport,
-        runId: snapshot.runId,
-        normalizedSessionId: snapshot.normalizedSessionId,
+        runId: recoveredRunId,
+        normalizedSessionId: recoveredNormalizedSessionId,
         opened,
         goal,
         goalAvailability: this.#goalAvailability,
@@ -1032,6 +1061,9 @@ export class CodexAppServerDriver implements HarnessDriver {
         ...(Object.keys(record(response.piNativeAdmission)).length ? {
           piRpcThinkingLevel: record(response.piNativeAdmission).piRpcThinkingLevel,
           piMetadata: record(response.piNativeAdmission).piMetadata,
+          ...(this.#options.driverIdentity?.kind === "pi_rpc" ? {
+            piNativeAdmission: boundedCodexValue(response.piNativeAdmission),
+          } : {}),
         } : {}),
         modelProvider: boundedText(
           response.modelProvider,

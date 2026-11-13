@@ -63,6 +63,43 @@ function cursorProviderIdentity(mode: unknown) {
 }
 
 describe("Codex app-server Codex driver", () => {
+  it.each(["fresh", "wrong-code", "wrong-conversation", "wrong-prior", "wrong-new", "busy", "goal", "codex"])(
+    "admits only exact idle Pi missing-history recovery: %s", async mode => {
+      const first = new FakeCodexTransport("old-pi", "old-pi");
+      const second = new FakeCodexTransport("new-pi", "new-pi");
+      const driver = makeDriver([first, second], mode === "codex" ? {} : {
+        driverIdentity: { kind: "pi_rpc", displayName: "Pi", version: "1.5.2" },
+      });
+      const original = await driver.openSession({ runId: "pi-run", normalizedSessionId: "same-conversation", workingDirectory: WORKSPACE });
+      if (mode === "goal") await original.goal?.({ action: "set", objective: "Still active" });
+      const snapshot = await original.snapshot();
+      if (mode === "busy") snapshot.activeTurnId = "unsettled-old-turn";
+      await original.close({ reason: "controller restart" });
+      second.readResponse = { normalizedSessionId: mode === "wrong-conversation" ? "other" : "same-conversation",
+        piNativeAdmission: { provider: "pi_rpc", sessionRecovery: {
+          code: mode === "wrong-code" ? "pi_session_file_invalid" : "pi_session_file_missing",
+          previousDriverSessionId: mode === "wrong-prior" ? "other" : "old-pi",
+          driverSessionId: mode === "wrong-new" ? "other" : "new-pi",
+        } }, thread: { id: "new-pi", sessionId: "new-pi", cwd: WORKSPACE, turns: [] } };
+      const request = second.request.bind(second);
+      vi.spyOn(second, "request").mockImplementation(async (method, params) => {
+        const response = await request(method, params);
+        return method === "thread/resume" ? { ...response, piNativeAdmission: second.readResponse!.piNativeAdmission } : response;
+      });
+      const recovery = await driver.recoverSession(snapshot);
+      expect(recovery.recovered).toBe(mode === "fresh");
+      expect(second.calls.some(call => call.method === "turn/start")).toBe(false);
+      if (recovery.session) {
+        expect((await recovery.session.events()[Symbol.asyncIterator]().next()).value).toMatchObject({
+          eventType: "session.resumed", payload: { context: { piNativeAdmission: second.readResponse!.piNativeAdmission } },
+        });
+        expect(await recovery.session.snapshot()).toMatchObject({ normalizedSessionId: "same-conversation",
+          driverSessionId: "new-pi", providerSessionId: "new-pi", activeTurnId: null });
+        await recovery.session.close({ reason: "fixture complete" });
+      }
+    },
+  );
+
   it("keeps one disposition request after a restart continuation completes without a result", async () => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({

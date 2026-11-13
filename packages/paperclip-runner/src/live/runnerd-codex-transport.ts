@@ -4646,6 +4646,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         throw new Error("runner_prepared_launch_working_directory_mismatch");
       }
       return {
+        ...(this.options.provider === "pi_rpc" && this.#observedPiAdmission ? {
+          piNativeAdmission: structuredClone(this.#observedPiAdmission),
+          normalizedSessionId: this.#core?.store.state.identity.normalizedSessionId,
+        } : {}),
         thread: {
           id: this.#threadId,
           sessionId: this.#sessionId,
@@ -4704,6 +4708,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         );
       }
       return {
+        ...(this.options.provider === "pi_rpc" && this.#observedPiAdmission ? {
+          model: this.#observedProviderModel,
+          piNativeAdmission: structuredClone(this.#observedPiAdmission),
+        } : {}),
         ...this.#preparedThreadWorkingDirectory(),
         thread: {
           id: this.#threadId,
@@ -8515,6 +8523,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         throw new Error("Native Pi did not acknowledge the selected model/thinking identity");
       }
       this.#observedPiAdmission = admitted;
+      const recovery = record(admitted.sessionRecovery);
+      const expected = this.#checkpointProviderIdentityExpectation;
+      // This receipt is produced by runnerd only after the proxy's typed
+      // missing-file refusal and an explicit successful thread/start. It
+      // authorizes that one native identity change, not a conversation reset
+      // or an exception to live model/thinking admission.
+      if (expected && recovery.code === "pi_session_file_missing"
+        && recovery.previousDriverSessionId === expected.driverSessionId
+        && recovery.previousDriverSessionId === expected.providerSessionId
+        && recovery.driverSessionId === threadId && recovery.driverSessionId === sessionId
+        && typeof threadId === "string" && threadId !== expected.driverSessionId) {
+        this.#checkpointProviderIdentityExpectation = { ...expected,
+          driverSessionId: threadId, providerSessionId: sessionId! };
+      }
     }
     this.#confirmCheckpointProviderIdentity(started, event.eventType);
     if (this.options.provider === "acpx") {

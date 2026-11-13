@@ -322,6 +322,7 @@ import {
 import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
+import { materializePiSessionRecoveryNotice, piSessionRecovery } from "./pi-session-recovery-notice.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
@@ -11165,6 +11166,7 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
+        await materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event });
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});
@@ -11236,8 +11238,11 @@ async function executePaperclipNativeSessionAttempt(
           });
         }
         if (event.eventType === "session.resumed") {
-          await emitStartupReuse(input.onEvent, "provider_session", { state: "reused", reason: "verified_reuse" });
-          trace.setBudgetStart("warm");
+          const restarted = piSessionRecovery(event) !== null;
+          await emitStartupReuse(input.onEvent, "provider_session", restarted
+            ? { state: "fresh", reason: "resume_failed" }
+            : { state: "reused", reason: "verified_reuse" });
+          trace.setBudgetStart(restarted ? "cold" : "warm");
         }
         if (
           event.eventType === "turn.submitted" &&
@@ -11441,6 +11446,7 @@ async function executePaperclipNativeSessionAttempt(
         );
       },
       onDuplicateEvent: async (event, cursor) => {
+        await materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event });
         await input.onPersistedNativeLog?.(cursor, formatNativeRunLogEvent(event));
         if (!firstTokenRecorded) observeDeliverableText(event);
         await observeAccountingEvent(event);

@@ -72,6 +72,8 @@ export interface PiRpcDriverOptions {
   processStartupTimeoutMs?: number;
   /** Dynamic tools have their own end-to-end deadline (protocol maximum: 60 s). */
   dynamicToolTimeoutMs?: number;
+  /** Cold recovery must attach the current run before spending bootstrap authority. */
+  deferInitialBinding?: boolean;
   /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
   promptTimeoutMs?: number;
   /** No Pi events during an accepted turn, default 10 minutes. Native tools and host callbacks pause it. */
@@ -303,7 +305,7 @@ export class PiRpcDriver implements HarnessDriver {
       const providers = [...new Set(models.flatMap(value => typeof record(value).provider === "string" && /^[A-Za-z0-9._-]{1,80}$/u.test(record(value).provider as string) ? [record(value).provider as string] : []))].sort();
       const piMetadata = { version: "1.5.2", versionSource: "qualified-profile", providers, credentialMode, promptSent: false,
         authShape: { mode: credentialMode, source: usesPiProviderLoopback(config.model, this.#options.environment ?? {}) ? "managed-provider" : "configured-provider" } };
-      return new PiRpcHarnessSession({
+      const session = new PiRpcHarnessSession({
         transport,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
@@ -330,6 +332,8 @@ export class PiRpcDriver implements HarnessDriver {
         callbacks,
         bindRequest: this.#options.bindRequest ?? sendPiBindRequest,
       });
+      if (this.#options.deferInitialBinding) await session.releaseInitialBindingForRecovery();
+      return session;
     } catch (error) {
       await callbacks?.close().catch(() => undefined);
       await transport?.close().catch(() => undefined);
@@ -559,6 +563,18 @@ export class PiRpcHarnessSession implements HarnessSession {
 
   events(): AsyncIterable<PrpEvent> {
     return this.#events;
+  }
+
+  /** Settle an unused bootstrap origin through the existing authenticated IPC.
+   * This is only called before exposing a cold recovery session to its caller.
+   * The next attach must bind/admit afresh; prepared-context checks stay strict.
+   */
+  async releaseInitialBindingForRecovery(): Promise<void> {
+    const binding = this.#resident?.binding;
+    if (!binding) return;
+    if (!binding.initial || this.#activeTurn) throw new Error("Pi recovery cannot release an active binding");
+    await this.#sendBind({ schema: 1, type: "settle", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
+    await this.#revokeBinding();
   }
 
   async attachRun(input: Parameters<NonNullable<HarnessSession["attachRun"]>>[0] & {

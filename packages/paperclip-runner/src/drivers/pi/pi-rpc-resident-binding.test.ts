@@ -123,6 +123,19 @@ async function revoked(provider: { baseUrl: string; apiKey: string }) {
 }
 
 describe("resident Pi model binding", () => {
+  it("settles unused recovery bootstrap authority before attaching a different current run", async () => {
+    const f = await fixture({ deferInitialBinding: true });
+    expect(f.ipc.map(command => command.type)).toEqual(["settle"]);
+    expect(f.transport.commands).not.toContain("prompt");
+    expect((await f.session.snapshot()).binding?.preparedTurnId).toBeNull();
+    await f.session.attachRun({ runId: "run-b", baseInstructions: "current run", dynamicTools: [tool("new_tool")], runtimeContext: { revision: 2 } });
+    expect(f.ipc.find(command => command.type === "bind")).toMatchObject({ runId: "run-b", epoch: 2, expectedPriorEpoch: 1 });
+    await f.session.startTurn({ message: { role: "user", text: "fresh turn" } });
+    await finish(f);
+    expect(f.events.find(event => event.eventType === "turn.started")).toMatchObject({ runId: "run-b" });
+    expect(f.ipc.map(command => command.type)).toEqual(["settle", "bind", "begin_turn"]);
+  });
+
   it("boots a 200 KiB binding through a private file instead of an E2BIG environment entry", async () => {
     const large = { ...tool("large"), inputSchema: { type: "object", properties: { body: { type: "string", description: "x".repeat(200 * 1024) } } } };
     const f = await fixture({ dynamicTools: [large] });

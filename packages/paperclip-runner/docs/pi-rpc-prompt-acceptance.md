@@ -129,6 +129,43 @@ stays explicitly incomplete; these display receipts do not establish billing.
 boundaries, including the captured Pi 1.5.2 compaction recording. They do not
 qualify a live provider deployment.
 
+## Missing saved conversations
+
+A cold `thread/resume` whose saved Pi JSONL file is absent returns JSON-RPC
+`error.data.code = "pi_session_file_missing"`; it never reports a newly minted
+native thread as a successful resume. Runnerd recognizes only that typed
+rejection and explicitly sends `thread/start` with the same server-owned
+normalized conversation ID. It records the old and new native session IDs in
+`piNativeAdmission.sessionRecovery` on the ordinary session identity receipt.
+Live model/thinking admission remains mandatory. The facade's cold recovery
+settles the unused bootstrap binding over the existing authenticated `settle` channel and
+revokes its broker before exposing the session. The current run then binds and
+admits normally; prepared-binding ownership checks are not relaxed. The shared
+facade accepts changed native IDs only for the exact Pi receipt, same normalized
+conversation, and an idle checkpoint without pending runtime requests or an
+active goal. It drops the old native-turn bookkeeping, never replays an
+uncertain input, and leaves Codex's exact-identity checks unchanged. An existing
+but invalid file, an untyped error, a timeout, or an unexplained identity
+mismatch still fails closed; this fallback does not repair or overwrite an
+invalid transcript.
+
+The server projects the receipt into one warning in the issue thread:
+“My earlier conversation could not be restored: the saved Pi conversation file
+is missing on this computer. Starting a new one.” Conversation selection keeps
+the normalized ID and generation. The new Pi thread has no old private history;
+subsequent turns continue its new history normally. Projection is serialized
+under the issue/run/task locks and deduplicated by conversation and previous
+native session, including replay after an interrupted projection and later warm
+identity events. This does not claim restored history or process continuity.
+
+The full-server continuing-turns lifecycle test deletes the file after closing
+the settled resident through the controller-restart boundary. It checks a new
+runner/Pi, a successful fresh second turn, the unchanged conversation ID, exactly
+one visible notice, and private-history continuity on the third turn. The
+runnerd recovery integration separately covers real SIGKILL recovery with an
+intact file on local and split-filesystem layouts. These credential-free local
+checks are not separate-host, deployed, or daily-work qualification.
+
 ## Lost acknowledgments
 
 `PiRpcTransport` gives commands a 30-second client response deadline. Set

@@ -2754,7 +2754,7 @@ impl CodexCommandExecutor {
         let provider_label = state.config.provider.clone();
         let provider_name = facade_provider_name(&provider_label);
         let provider_had_exited = state.lifecycle == "provider_exited";
-        let thread_id = state.thread_id.clone().ok_or_else(|| {
+        state.thread_id.as_ref().ok_or_else(|| {
             DurableRunnerError::invalid(format!(
                 "recoverable {provider_name} state omitted its thread id"
             ))
@@ -2788,6 +2788,7 @@ impl CodexCommandExecutor {
                 ))
                 .with_provider_failure(error.provider_failure())
             })?;
+        let thread_id = provider.thread_id().to_owned();
         let admission = (|| -> Result<(), DurableRunnerError> {
             provider.enable_durable_tool_call_replays();
             provider
@@ -3072,6 +3073,7 @@ impl CodexCommandExecutor {
                     .expect("Codex state remains available during recovery");
                 state.provider_process_generation = process_generation;
                 state.provider_session_id = resumed_provider_session_id.clone();
+                state.thread_id = Some(thread_id.clone());
                 state.settled_provider_turn_ids = settled_provider_turn_ids;
                 state.settled_provider_turn_filter = settled_provider_turn_filter;
                 if ambiguous_start_never_created {

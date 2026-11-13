@@ -882,7 +882,7 @@ impl SettledProviderTurnIds {
 }
 
 enum ProviderRequestError {
-    Rejected(LocalRunnerError),
+    Rejected(LocalRunnerError, Option<String>),
     Ambiguous(LocalRunnerError),
 }
 
@@ -895,7 +895,7 @@ pub(crate) enum RejectedAcceptedTurn {
 impl ProviderRequestError {
     fn into_inner(self) -> LocalRunnerError {
         match self {
-            Self::Rejected(error) | Self::Ambiguous(error) => error,
+            Self::Rejected(error, _) | Self::Ambiguous(error) => error,
         }
     }
 }
@@ -1545,7 +1545,23 @@ impl CodexProvider {
                 "thread/start"
             };
             stage = ProviderStartupStage::ThreadOpen;
-            let opened = provider.request(method, params)?;
+            // Only a typed missing-history rejection authorizes a fresh Pi
+            // thread. Timeouts, invalid files and identity mismatches do not.
+            let mut restarted_missing_history = false;
+            let opened = match provider.request_classified(method, params.clone()) {
+                Ok(opened) => opened,
+                Err(ProviderRequestError::Rejected(_, Some(code)))
+                    if config.provider == "pi_rpc"
+                        && method == "thread/resume"
+                        && code == "pi_session_file_missing" =>
+                {
+                    params.as_object_mut().unwrap().remove("threadId");
+                    let opened = provider.request("thread/start", params)?;
+                    restarted_missing_history = true;
+                    opened
+                }
+                Err(error) => return Err(error.into_inner()),
+            };
             provider.thread_id = opened
                 .pointer("/thread/id")
                 .or_else(|| opened.get("threadId"))
@@ -1555,7 +1571,9 @@ impl CodexProvider {
                     LocalRunnerError::invalid(format!("Codex {method} omitted thread.id"))
                 })?
                 .to_owned();
-            if resume_thread_id.is_some_and(|expected| expected != provider.thread_id) {
+            if !restarted_missing_history
+                && resume_thread_id.is_some_and(|expected| expected != provider.thread_id)
+            {
                 return Err(LocalRunnerError::invalid(
                     "Codex resumed a different provider thread",
                 ));
@@ -1568,6 +1586,25 @@ impl CodexProvider {
                 .map(str::to_owned);
             if config.provider == "pi_rpc" {
                 provider.observed_pi_admission = opened.get("piNativeAdmission").cloned();
+                if restarted_missing_history {
+                    let admission = provider
+                        .observed_pi_admission
+                        .as_mut()
+                        .and_then(Value::as_object_mut)
+                        .ok_or_else(|| {
+                            LocalRunnerError::invalid("Fresh Pi thread omitted native admission")
+                        })?;
+                    // Runner-owned proof, not a model-authored claim. The
+                    // normalized conversation identity has not changed.
+                    admission.insert(
+                        "sessionRecovery".to_owned(),
+                        json!({
+                            "code": "pi_session_file_missing",
+                            "previousDriverSessionId": resume_thread_id,
+                            "driverSessionId": provider.thread_id,
+                        }),
+                    );
+                }
             }
             provider.observed_model = opened
                 .get("model")
@@ -1576,7 +1613,7 @@ impl CodexProvider {
                 .filter(|value| !value.is_empty() && value.len() <= 240)
                 .map(str::to_owned);
 
-            if resume_thread_id.is_some() {
+            if resume_thread_id.is_some() && !restarted_missing_history {
                 stage = ProviderStartupStage::ThreadRead;
                 let snapshot = provider.read_thread()?;
                 provider.active_provider_turn_id = latest_active_turn_id(&snapshot)
@@ -2225,7 +2262,7 @@ impl CodexProvider {
                 }
                 Ok(result)
             }
-            Err(ProviderRequestError::Rejected(error)) => {
+            Err(ProviderRequestError::Rejected(error, _)) => {
                 if starts_idle_turn {
                     let definite_rejection = self
                         .pending_messages
@@ -2418,7 +2455,7 @@ impl CodexProvider {
         }
         let result = match self.request_classified("turn/start", turn_params) {
             Ok(result) => result,
-            Err(ProviderRequestError::Rejected(error)) => {
+            Err(ProviderRequestError::Rejected(error, _)) => {
                 // A definite rejection proves no replacement work began.
                 // Only diagnostics without provider-work identity belong to
                 // that rejected request. Contradictory turn/item evidence or a
@@ -2574,7 +2611,7 @@ impl CodexProvider {
         let runtime_request_scope = new_runtime_request_scope()?;
         match self.request_classified("thread/compact/start", json!({"threadId": self.thread_id})) {
             Ok(_) => {}
-            Err(ProviderRequestError::Rejected(error)) => {
+            Err(ProviderRequestError::Rejected(error, _)) => {
                 let definite_rejection = self
                     .pending_messages
                     .iter()
@@ -4252,7 +4289,10 @@ impl CodexProvider {
     ) -> Result<Value, ProviderRequestError> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
-            ProviderRequestError::Rejected(LocalRunnerError::invalid("Codex request id exhausted"))
+            ProviderRequestError::Rejected(
+                LocalRunnerError::invalid("Codex request id exhausted"),
+                None,
+            )
         })?;
         self.last_request_got_no_reply = false;
         self.send_frame(&json!({"id": request_id, "method": method, "params": params}))
@@ -4342,6 +4382,10 @@ impl CodexProvider {
                                 None
                             },
                         ),
+                        error
+                            .pointer("/data/code")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                     ));
                 }
                 return Ok(message.get("result").cloned().unwrap_or(Value::Null));
