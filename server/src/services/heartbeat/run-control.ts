@@ -397,7 +397,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       status,
       leaseOwnerRun?.errorCode,
     );
-    if (cancelledRun?.runtimeMode === "native" && status === "cancelled"
+    // A warm (keep_running) sandbox keeps a cancelled turn's prepared files in
+    // place for the next turn, exactly like a succeeded turn; only a sandbox
+    // that is about to stop or be destroyed needs its prepared files preserved.
+    if (providerResourceDisposition !== "keep_running"
+      && cancelledRun?.runtimeMode === "native" && status === "cancelled"
       && readNativeWorkspaceSyncReference(cancelledRun.runnerProfileJson?.nativeWorkspaceSync)?.state === "prepared"
       && !nativeRunHasNoWorkspaceAccess(cancelledRun)) {
       try {

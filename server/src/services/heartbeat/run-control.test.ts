@@ -877,6 +877,33 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).toBe("in_progress");
   }, 15_000);
 
+  it("keeps a warm sandbox running when a board cancel leaves prepared native files", async () => {
+    const { company, agent } = await fixture();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Cancel keeps warm",
+      status: "in_progress", assigneeAgentId: agent.id }).returning();
+    const runId = randomUUID(), leaseId = randomUUID(), providerLeaseId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: company.id, agentId: agent.id,
+      issueId: issue.id, nativeIssueId: issue.id, runtimeMode: "native", status: "cancelled", finishedAt: new Date(),
+      errorCode: "cancelled",
+      runnerProfileJson: { nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v3", state: "prepared",
+        descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64), finalHostSha256: null,
+        workspaceId: randomUUID(), leaseId, providerLeaseId, remoteCwd: "/work", resourceDisposition: "keep_running" } },
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator" },
+    });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId: company.id, heartbeatRunId: runId,
+      issueId: issue.id, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
+      metadata: { driver: "sandbox", pluginId: randomUUID(), sandboxProviderPlugin: true, remoteCwd: "/work" } });
+    const deps = callbacks(db), control = createHeartbeatRunControl(db, deps);
+    await control.releaseEnvironmentLeasesForRun({ runId, companyId: company.id, agentId: agent.id,
+      status: "cancelled", providerResourceDisposition: "keep_running" });
+    expect(deps.envOrchestrator.releaseForRun).toHaveBeenCalledWith(expect.objectContaining({
+      heartbeatRunId: runId, providerResourceDisposition: "keep_running",
+    }));
+    expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalledWith(expect.objectContaining({
+      providerResourceDisposition: "stop_and_retain",
+    }));
+  }, 15_000);
+
   it("reports a missing run without entering cancellation", async () => {
     const deps = callbacks(db);
     await expect(createHeartbeatRunControl(db, deps).cancelRunInternal(randomUUID())).rejects.toThrow("Heartbeat run not found");
