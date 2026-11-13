@@ -68,6 +68,8 @@ export interface PiRpcDriverOptions {
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
   startupTimeoutMs?: number;
+  /** First RPC of a new Pi process (startup + extension load), default 60 s. */
+  processStartupTimeoutMs?: number;
   /** Dynamic tools have their own end-to-end deadline (protocol maximum: 60 s). */
   dynamicToolTimeoutMs?: number;
   /** Prompt acceptance deadline, default 30s. Never retries an unknown input. */
@@ -277,10 +279,16 @@ export class PiRpcDriver implements HarnessDriver {
       transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
       // --session loads an existing file too: no saved selection bypasses live
       // admission. The broker/models.json bootstrap above remains first.
-            const port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
+      const port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
+      // Pi answers RPC only after it has started and loaded its extensions. On
+      // a cold box (lazy snapshot files, no compile cache yet) that alone took
+      // 6.6-12.4 s, so the first request of a NEW process waits for startup
+      // under its own bound; every later admission RPC keeps the short bound.
+      const ready = record(await withAbort(withTimeout(transport.request("get_state"),
+        this.#options.processStartupTimeoutMs ?? PI_PROCESS_STARTUP_TIMEOUT_MS, "Pi RPC startup timed out"), input.signal).then(response => response.data));
       if (recovery) {
         // Check native readback before model/config mutation, not just the argv.
-        const live = record(await port.request({ type: "get_state" }, input.signal));
+        const live = ready;
         if (live.sessionId !== recovery.snapshot.driverSessionId || live.sessionFile !== sessionFile) throw piSessionFileInvalid();
       }
       const identity = await admitPiRpcSession(port, config, input.signal);
@@ -376,6 +384,8 @@ interface PiSessionState {
   turnIdleTimeoutMs?: number;
   abortTimeoutMs?: number;
 }
+
+const PI_PROCESS_STARTUP_TIMEOUT_MS = 60_000;
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
   return { request: async ({ type, ...params }, signal) => {
