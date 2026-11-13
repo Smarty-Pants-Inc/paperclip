@@ -31,7 +31,11 @@ export function priceCodexReceipt(
     receipt.usageByModel?.length
   )
     return receipt;
-  const model = receipt.model ?? "";
+  // Paperclip namespaces connection models for the runner. Only remove that
+  // single namespace when the remainder is an exact built-in card ID.
+  const model = receipt.model?.startsWith("paperclip/")
+    ? receipt.model.slice("paperclip/".length)
+    : receipt.model ?? "";
   const rates = Object.hasOwn(RATES, model) ? RATES[model] : undefined;
   if (!rates) return receipt;
   const usage = receipt.usage;
