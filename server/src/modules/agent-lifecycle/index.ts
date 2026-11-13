@@ -2,7 +2,7 @@ import type { ActivityPublication } from "../../types/activity-publication.js";
 import { AgentLifecycleConflict } from "./domain/policy.js";
 import { hireApprovalService as approvalRecords, type HireDecisionTarget } from "./adapters/approvals.js";
 import { agents, companies } from "@paperclipai/db";
-import { and, asc, desc, eq, gt, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { LifecycleEffects } from "./adapters/effects.js";
 export type { LifecycleEffects } from "./adapters/effects.js";
@@ -10,7 +10,7 @@ import { updateAgentConfiguration } from "./adapters/configuration.js";
 import type { AgentConfigurationPatch, UpdateAgentOptions } from "../../lib/agent-records.js";
 import { purgeAgent } from "./adapters/deletion.js";
 import { agentRecords } from "./adapters/records.js";
-import { assertRootDatabase, createLifecycleStore, pendingLifecycleWork, lifecycleSignalWait, requestAgentLifecycleRecheckInTransaction } from "./adapters/postgres.js";
+import { assertRootDatabase, createLifecycleStore, pendingLifecycleWork, lifecycleSignalWait, lifecycleStopParkWithoutError, surfaceAgentLifecycleStopParkInTransaction, requestAgentLifecycleRecheckInTransaction } from "./adapters/postgres.js";
 import { hasCompanyHoldMismatch, projectCompanyHolds } from "./adapters/company-policy.js";
 import { createLifecycleWorker } from "./application/worker.js";
 import type { LifecycleDriver } from "./application/ports.js";
@@ -129,7 +129,9 @@ export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: L
   let recoveryInitialized = false, recoveryDone = false;
   let recoveryThrough: string | undefined, recoveryAfter: string | undefined;
   let recoveryInitialization: Promise<void> | undefined;
-  const recoveryCondition = and(lifecycleSignalWait, lte(agents.createdAt, recoveryStartedAt));
+  // Reuse the bounded startup recovery pass for old parks missing a diagnostic.
+  // These rows stay excluded from automatic lifecycle work throughout recovery.
+  const recoveryCondition = and(or(lifecycleSignalWait, lifecycleStopParkWithoutError), lte(agents.createdAt, recoveryStartedAt));
   async function initializeRecovery() {
     if (recoveryInitialized) return;
     return recoveryInitialization ??= (async () => {
@@ -143,13 +145,17 @@ export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: L
     if (recoveryDone || !recoveryThrough) return;
     const page = await db.select({ id: agents.id, companyId: agents.companyId, version: agents.lifecycleVersion })
       .from(agents).innerJoin(companies, eq(companies.id, agents.companyId))
-      .where(and(recoveryCondition, eq(companies.status, "active"), lte(agents.id, recoveryThrough),
+      .where(and(recoveryCondition, or(eq(companies.status, "active"), lifecycleStopParkWithoutError), lte(agents.id, recoveryThrough),
         recoveryAfter ? gt(agents.id, recoveryAfter) : undefined)).orderBy(asc(agents.id)).limit(100);
     for (const agent of page) {
       if (stopped || !canRun()) return;
-      await effects.transaction(db, agent.companyId, tx => requestAgentLifecycleRecheckInTransaction(tx,
-        { companyId: agent.companyId, agentId: agent.id, expectedVersion: agent.version, onlyIfWaiting: true },
-        () => effects.notifyWork(tx)));
+      await effects.transaction(db, agent.companyId, async tx => {
+        await surfaceAgentLifecycleStopParkInTransaction(tx,
+          { companyId: agent.companyId, agentId: agent.id, expectedVersion: agent.version });
+        await requestAgentLifecycleRecheckInTransaction(tx,
+          { companyId: agent.companyId, agentId: agent.id, expectedVersion: agent.version, onlyIfWaiting: true },
+          () => effects.notifyWork(tx));
+      });
       recoveryAfter = agent.id;
     }
     if (page.length < 100) recoveryDone = true;
