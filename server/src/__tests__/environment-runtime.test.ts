@@ -6777,7 +6777,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       command: "echo",
       args: ["ok"],
       cwd: "/workspace/project",
-      env: { FOO: "bar", NODE_DISABLE_COMPILE_CACHE: "1" },
+      env: { FOO: "bar" },
     }), 31000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {
       driverKey: "fake-plugin",

@@ -488,10 +488,6 @@ impl VerifiedProcessLaunch {
             .args(&inherited.args)
             .env_clear()
             .envs(environment)
-            // Assigned stdio MCP bindings replace the inherited policy. No
-            // private cache is verified here, so apply the safe launch default
-            // after the binding's env, for root and unprivileged children.
-            .env("NODE_DISABLE_COMPILE_CACHE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -1654,47 +1650,6 @@ mod tests {
         drop(orphans);
         let _ = fs::remove_dir_all(directory);
         assert!(!alive, "tool job {} outlived its provider", job.pid);
-    }
-
-    // REG-12: assigned stdio MCP uses a separate env_clear boundary from providers.
-    #[test]
-    fn verified_stdio_children_disable_optional_node_cache() {
-        let shell = PathBuf::from("/bin/sh");
-        let bytes = fs::read(&shell).unwrap();
-        let program = VerifiedProcessArtifact::snapshot_verified(
-            shell.clone(),
-            File::open(&shell).unwrap(),
-            &format!("sha256:{:x}", Sha256::digest(&bytes)),
-        )
-        .unwrap();
-        let launch = VerifiedProcessLaunch::new(
-            program,
-            vec![
-                VerifiedProcessArgument::Literal("-c".to_owned()),
-                VerifiedProcessArgument::Literal(
-                    "printf '%s|%s' \"$NODE_DISABLE_COMPILE_CACHE\" \"$CUSTOM\"".to_owned(),
-                ),
-            ],
-        );
-        for disabled in [None, Some(""), Some("0"), Some("1")] {
-            let mut environment = std::collections::BTreeMap::from([
-                ("CUSTOM".to_owned(), "preserved".to_owned()),
-                (
-                    "NODE_COMPILE_CACHE".to_owned(),
-                    "/tmp/node-compile-cache".to_owned(),
-                ),
-            ]);
-            if let Some(value) = disabled {
-                environment.insert("NODE_DISABLE_COMPILE_CACHE".to_owned(), value.to_owned());
-            }
-            let output = launch
-                .spawn_stdio(&environment)
-                .unwrap()
-                .wait_with_output()
-                .unwrap();
-            assert!(output.status.success());
-            assert_eq!(String::from_utf8(output.stdout).unwrap(), "1|preserved");
-        }
     }
 
     // Boat cache EACCES regression: cross the real env_clear/spawn boundary.

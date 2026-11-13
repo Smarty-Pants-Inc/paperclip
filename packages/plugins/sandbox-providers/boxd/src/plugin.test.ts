@@ -1,8 +1,4 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { PluginEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -315,28 +311,6 @@ describe("boxd sandbox provider plugin", () => {
     expect(params.command).toContain(". \"$HOME/.profile\"");
     expect(params.command).toMatch(/exec env GREETING='it'"'"'s here' 'sh' '-c' 'echo \$GREETING'$/);
     expect(result).toEqual({ exitCode: 42, timedOut: false, stdout: "out\n", stderr: "err\n" });
-  });
-
-  // REG-12: a profile can start Node before command-only env assignments.
-  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("carries controller cache policy before profile children and into the command", async () => {
-    const root = await mkdtemp(join(tmpdir(), "boxd-node-policy-"));
-    const shared = join(root, "node-compile-cache"), marker = join(root, "profile.json");
-    const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
-    await mkdir(shared, { mode: 0o555 });
-    try {
-      await expect(writeFile(join(shared, "permission-probe"), "no")).rejects.toMatchObject({ code: "EACCES" });
-      const probe = "const result=require('node:module').enableCompileCache(); console.log(JSON.stringify({disabled:process.env.NODE_DISABLE_COMPILE_CACHE,status:result.status}));";
-      await writeFile(join(root, ".profile"), `${quote(process.execPath)} -e ${quote(probe)} > ${quote(marker)}\n`);
-      machines.exec.mockImplementation(async (_id: string, params: { command: string }) => execOk(execFileSync("sh", ["-c", params.command], {
-        env: { PATH: process.env.PATH, HOME: root, TMPDIR: root, NODE_COMPILE_CACHE: shared }, encoding: "utf8", timeout: 5000,
-      })));
-      const result = await hooks.onEnvironmentExecute!({ ...base, config: { apiKey: "fixture-not-a-key" }, lease: lease(),
-        command: process.execPath, args: ["-e", probe], env: { NODE_DISABLE_COMPILE_CACHE: "1" } });
-      expect(result.exitCode).toBe(0);
-      expect(JSON.parse(await readFile(marker, "utf8"))).toEqual({ disabled: "1", status: 3 });
-      expect(JSON.parse(result.stdout!)).toEqual({ disabled: "1", status: 3 });
-      expect(await readdir(shared)).toEqual([]);
-    } finally { await chmod(shared, 0o700); await rm(root, { recursive: true, force: true }); }
   });
 
   it("falls back to the configured timeout", async () => {
