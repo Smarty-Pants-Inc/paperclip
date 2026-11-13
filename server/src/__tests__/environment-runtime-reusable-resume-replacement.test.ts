@@ -263,6 +263,51 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     expect(call).not.toHaveBeenCalledWith(seeded.pluginId, "environmentAcquireLease", expect.anything(), expect.anything());
   });
 
+  it.each(["wakes", "stays_stopped", "resume_fails"] as const)("REG-26: an archived continuation %s without replaying an ambiguous command", async (mode) => {
+    const seeded = await seed({ backupStamp: false });
+    let stopped = true;
+    let resumeCalls = 0;
+    const stoppedError = () => new JsonRpcCallError({ code: -32000,
+      message: `Boat POST /sandboxes/${seeded.providerLeaseId}/commands failed (409): Sandbox ${seeded.providerLeaseId} is stopped. Run boat resume, then retry.` });
+    const call = vi.fn(async (_plugin: string, method: string) => {
+      if (method === "environmentResumeLease") {
+        resumeCalls++;
+        if (resumeCalls > 1 && mode === "resume_fails") throw new Error("resume refused");
+        stopped = resumeCalls > 1 && mode === "stays_stopped";
+        return { providerLeaseId: seeded.providerLeaseId, metadata: { remoteCwd: "/home/daytona/paperclip-workspace" } };
+      }
+      if (method === "environmentExecute") {
+        if (stopped) throw stoppedError();
+        return { exitCode: 0, timedOut: false, stdout: "existing-conversation", stderr: "" };
+      }
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+    } as unknown as PluginWorkerManager });
+    const acquired = await acquire(seeded, runtime);
+    expect(resumeCalls).toBe(1); // Normal turn-2 admission already calls resume.
+    stopped = true; // External archive after admission; same allocation, no new session.
+    const started = Date.now();
+    const execution = runtime.execute({ environment: seeded.environment, lease: acquired.lease,
+      command: "node", args: ["conversation-probe"], bypassSession: true, timeoutMs: 5_000 });
+    if (mode === "wakes") {
+      await expect(execution).resolves.toMatchObject({ exitCode: 0, stdout: "existing-conversation" });
+    } else {
+      await expect(execution).rejects.toMatchObject({ name: "SandboxStoppedError", code: "sandbox_stopped" });
+    }
+    expect(Date.now() - started).toBeLessThan(30_000);
+    expect(resumeCalls).toBe(2); // One recovery, not a polling/restart loop.
+    const calls = call.mock.calls as unknown as Array<[string, string, unknown, number]>;
+    expect(calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(0);
+    expect(calls.filter(([, method]) => method === "environmentExecute")).toHaveLength(mode === "resume_fails" ? 1 : 2);
+    expect(calls.filter(([, method]) => method === "environmentResumeLease").at(-1)?.[3]).toBeLessThanOrEqual(20_000);
+    await expect(environmentService(db).getLeaseById(acquired.lease.id)).resolves.toMatchObject({
+      status: "active", heartbeatRunId: seeded.runId, providerLeaseId: seeded.providerLeaseId,
+    });
+  });
+
   it.each([
     ["unsaved work on the sandbox", { dirty: true }, undefined],
     ["no saved workspace version", { snapshot: null }, undefined],
