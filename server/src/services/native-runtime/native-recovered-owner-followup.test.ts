@@ -170,6 +170,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       await rm(scratch, { recursive: true, force: true });
     }
     const snapshot: PersistedNativeSession = { backendKind: "runner", sessionId: native.normalizedSessionId,
+      ...(options.provider === "pi_rpc" ? { driverKind: "pi_rpc" as const } : {}),
       providerSessionId: "provider-session-before-recovery", activeTurnId: null, pendingRuntimeRequests: [],
       identity: { companyId, agentId, issueId, runId, sessionId: native.normalizedSessionId } };
     const [prepared] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -240,7 +241,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const deadRunnerState = Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", lifecycle: "ready",
       runId: prior.runId })).toString("base64");
     followUp.remoteExecute.mockImplementation(async (request: unknown) => {
-      if (JSON.stringify(request).includes("runner-state.json")) return { exitCode: 0, timedOut: false, stdout: deadRunnerState, stderr: "" };
+      const command = JSON.stringify(request);
+      if (command.includes("paperclip-runner-generation-marker")) return { exitCode: 0, timedOut: false,
+        stdout: `nonce\n42424\n2026-11-13T10:00:00.000Z\n${prior.native.runnerInstanceId}\nlinux:00000000-0000-4000-8000-000000000000:100\n`, stderr: "" };
+      if (command.includes("paperclip-runner-generation-check")) return { exitCode: 45, timedOut: false, stdout: "", stderr: "" };
+      if (command.includes("runner-state.json")) return { exitCode: 0, timedOut: false, stdout: deadRunnerState, stderr: "" };
       throw new Error("admission must not reach the sandbox");
     });
   }
@@ -684,8 +689,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toEqual([]);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
     expect(followUp.logs.join("")).not.toContain("not retired");
-    // Admission only read the box's Runner state; it changed nothing there.
-    expect(followUp.remoteExecute.mock.calls.every(([request]) => JSON.stringify(request).includes("base64 <"))).toBe(true);
+    // Admission reads the box's state and verifies its exact process generation;
+    // no command may mutate it or signal a process.
+    expect(followUp.remoteExecute.mock.calls.every(([request]) => {
+      const command = JSON.stringify(request);
+      return command.includes("base64 <") || command.includes("paperclip-runner-generation-marker")
+        || command.includes("paperclip-runner-generation-check");
+    })).toBe(true);
   }, 60_000);
 
   // The restart proves only that the process is gone. A journal with work
@@ -718,7 +728,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
 
-  it.each(["empty", "inherited"] as const)("recovers past a Pi follow-up that failed before provider recovery (%s process)", async processMode => {
+  it.each(["empty", "inherited"] as const)("holds a Pi follow-up with launch intent but no affirmative launch-failure proof (%s process)", async processMode => {
     const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
     const failed = await failUnstartedFollowUp(prior);
     const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
@@ -744,10 +754,49 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100,
       eventType: "native.process_start_requested", stream: "system", payload: {} });
     const retry = await admitFollowUp(prior);
-    expect(retry.selectedRunId).toBe(prior.runId);
+    expect(retry.selectedRunId).toBe(failed);
     expect((await resolveNativeControllerRecovery(db, { companyId, agentId, issueId: prior.issueId,
-      normalizedSessionId: prior.native.normalizedSessionId, currentRunId: retry.runId })).kind).toBe("recoverable");
-    expect(await retry.start()).toBe(ADMITTED);
+      normalizedSessionId: prior.native.normalizedSessionId, currentRunId: retry.runId })).kind).not.toBe("recoverable");
+    expect(await retry.start()).not.toBe(ADMITTED);
+  }, 60_000);
+
+  // Keep reason: F2 is a data-safety boundary. A live process plus lost spawn
+  // telemetry must never be confused with a run that did not dispatch.
+  it.each([false, true])("holds RFL's live-child lost-telemetry shape (launch intent=%s)", async launchIntent => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+    try {
+      await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+      const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+      const failed = await failUnstartedFollowUp(prior);
+      const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
+      await db.update(heartbeatRuns).set({ resultJson: {}, runnerProfileJson: { ...row.runnerProfileJson,
+        sessionCheckpoint: { ...(row.runnerProfileJson!.sessionCheckpoint as object), driverKind: "pi_rpc" } } })
+        .where(eq(heartbeatRuns.id, failed));
+      await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, failed));
+      await db.update(nativeRunFinalizations).set({ attempt: 1, controllerGeneration: 1, controllerPid: child.pid! })
+        .where(eq(nativeRunFinalizations.runId, failed));
+      if (launchIntent) await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100,
+        eventType: "native.process_start_requested", stream: "system", payload: {} });
+      expect((await admitFollowUp(prior)).selectedRunId).toBe(failed);
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      child.kill("SIGKILL");
+      await exited;
+    }
+  }, 60_000);
+
+  it.each(["pre-claim", "claimed", "launch-intent"] as const)("requires affirmative pre-spawn proof (%s)", async scenario => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const failed = await failUnstartedFollowUp(prior);
+    await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, failed));
+    await db.update(nativeRunFinalizations).set({ attempt: scenario === "claimed" ? 1 : 0,
+      controllerGeneration: scenario === "claimed" ? 1 : 0, controllerPid: null })
+      .where(eq(nativeRunFinalizations.runId, failed));
+    if (scenario === "launch-intent") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100,
+      eventType: "native.process_start_requested", stream: "system", payload: {} });
+    expect((await admitFollowUp(prior)).selectedRunId).toBe(scenario === "pre-claim" ? prior.runId : failed);
   }, 60_000);
 
   it.each(["own process", "recorded process", "provider event", "sourced event", "tool invocation", "controller checkpoint", "run result",
