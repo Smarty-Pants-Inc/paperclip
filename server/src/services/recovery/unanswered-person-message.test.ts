@@ -13,7 +13,7 @@ import {
   issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
@@ -378,6 +378,59 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.run({ commentId: await f.message("What is the status?"), status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
     await f.sweep();
     expect(await f.visible()).toHaveLength(1);
+  });
+
+  // RFL bprime3 F1 (22:17Z): the fenced recheck must be the SAME predicate as
+  // outside: the turn's own card under every carrying key, and a wake queued
+  // while the sweep waits on the fence.
+  async function waitForSweepAtIssueFence() {
+    const end = Date.now() + 5_000;
+    while (Date.now() < end) {
+      const rows = await db.$client<{ n: number }[]>`select count(*)::int as n from pg_stat_activity
+        where datname = current_database() and wait_event_type = 'Lock' and query ilike '%for no key update%'`;
+      if (rows[0]?.n) return;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    throw new Error("Sweep did not reach the issue fence; race is not established");
+  }
+  it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId"] as const)(
+    "F1 fence: a carrying run (%s) and ITS OWN card committed while the sweep waits -> no notice, then or later", async key => {
+      const f = await fixture({ status: "blocked" });
+      const commentId = await f.message();
+      await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+      let pending: Promise<void> | undefined;
+      try {
+        await db.transaction(async tx => {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("no key update");
+          pending = f.sweep();
+          await waitForSweepAtIssueFence();
+          const [answering] = await tx.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+            runtimeMode: "native", nativeIssueId: f.issueId, contextSnapshot: { issueId: f.issueId, [key]: commentId },
+            createdAt: sql`statement_timestamp()`, finishedAt: sql`statement_timestamp()` }).returning();
+          await tx.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation",
+            status: "pending", sourceRunId: answering!.id, createdByAgentId: f.agentId, addresseeUserId: f.userId,
+            payload: { version: 1, prompt: "Apply this?" } as never, createdAt: sql`statement_timestamp()` });
+        });
+      } finally { await pending; }
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+    });
+
+  it("F1 fence: a wake for the message queued while the sweep waits -> no notice", async () => {
+    const f = await fixture({ status: "blocked" });
+    const commentId = await f.message();
+    await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    let pending: Promise<void> | undefined;
+    try {
+      await db.transaction(async tx => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issueId)).for("no key update");
+        pending = f.sweep();
+        await waitForSweepAtIssueFence();
+        await tx.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+          reason: "issue_commented", status: "queued", payload: { issueId: f.issueId, commentId } });
+      });
+    } finally { await pending; }
+    expect(await f.visible()).toHaveLength(0);
   });
 
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
