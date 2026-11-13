@@ -5842,6 +5842,22 @@ function retirementReasonName(kind: keyof typeof RETIREMENT_REASON_NAMES, value:
  * cleanup, or an interrupt with pending tool calls (the markers the settled
  * Pi interrupt proof rejects, native-retained-pi-source.ts). An unreadable
  * event log is uncertain too. */
+/** The conversation's Pi history file exists in the session root or in the
+ * latest continuity-break archive of a retired owner (retiredLocalPiConversation). */
+function localPiHistoryPresent(execution: NativeExecutionInput): boolean {
+  const root = scopedRunnerdStateRoot(execution);
+  const name = `${nativeSessionKey(execution)}.jsonl`;
+  const present = (file: string) => {
+    const stat = lstatSync(file, { throwIfNoEntry: false });
+    return stat?.isFile() === true && stat.size > 0;
+  };
+  if (present(resolve(root, "pi", name))) return true;
+  const archives = resolve(root, "continuity-breaks");
+  if (!isSafeNativeStateDirectory(archives)) return false;
+  const latest = readdirSync(archives).sort().at(-1);
+  return latest !== undefined && present(resolve(archives, latest, "pi", name));
+}
+
 /** The settled-journal projection lets a gone remote Runner's undelivered
  * semantic_tool.result count as answered: a committed result vouches for it.
  * A Stop-settled owner has no result, so every journaled tool input needs a
@@ -12132,9 +12148,9 @@ async function executePaperclipNativeSessionAttempt(
           await reportWarmAttachFailure(code, text, "checkpoint_missing");
           return false;
         }
-        await reportWarmAttachFailure(code, text);
         persistedWarmSession = checkpoint;
-        if (runnerdBackend !== null) {
+        if (runnerdBackend === null) await reportWarmAttachFailure(code, text);
+        else {
           // Closing proves the old process stopped, not that its durable state
           // was retired: a lost Runner never suspended. The run's state
           // migration skipped the prior-owner fence for the retained owner, so
@@ -12153,7 +12169,20 @@ async function executePaperclipNativeSessionAttempt(
             runnerExecutionTarget: input.runnerExecutionTarget,
             bootstrapRetryLeaseOwner: input.leaseOwner,
             managedAiAccountIdentity: input.managedAiAccountIdentity, managedAiCredentialIdentity: input.managedAiCredentialIdentity,
-          }));
+          })).catch(async (error: unknown) => {
+            await reportWarmAttachFailure(code, text, "prior_owner_unproven");
+            throw error;
+          });
+          // RFL F2: without the conversation's Pi file the cold start could
+          // only open a different Pi session, losing history without notice.
+          // Without a runner authority to resume, the typed missing-file
+          // ladder is unreachable here, so refuse under the typed code.
+          if (input.execution.provider.kind === "pi_rpc" && input.runnerExecutionTarget?.kind !== "remote"
+            && !localPiHistoryPresent(input.execution)) {
+            await reportWarmAttachFailure(code, text, "pi_history_missing");
+            throw new NativeProviderStateIncompatibleError("pi_session_file_missing: the conversation's saved Pi history is absent");
+          }
+          await reportWarmAttachFailure(code, text);
           runnerdBackend = await createExecutionBackend();
         }
         remoteCleanupLease = await readRemoteCleanupLease();
