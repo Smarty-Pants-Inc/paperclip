@@ -36,12 +36,11 @@ An agent can install a connection or bind/unbind a tool profile for its current
 strict reporting descendants with direct, target-scoped `agents:configure`.
 This includes a just-hired direct report and indirect reports; no grant snapshot
 or hire-time expansion is needed. Peers, managers and other reporting subtrees
-remain forbidden for ordinary leads even with a legacy unscoped grant or a grant
-naming that agent. A current top-level principal (`reportsTo: null`) with an
-explicitly company-wide `agents:configure` grant (`scope: null`) can assign tools
-across reporting roots. A root's subtree-scoped or target-list grant does not
-activate that exception; neither does an ordinary lead's unscoped grant.
-Existing self-service assignments and board authority are unchanged. Connection
+remain forbidden for all agents, including roots and CEOs, even with a legacy
+unscoped grant or a grant naming that agent. Neither changing `reportsTo` to
+`null` nor changing an agent's role grants cross-root tool authority. Cross-root
+assignments use the existing board path with its configuration and management
+checks. Existing self-service assignments and board authority are unchanged. Connection
 and profile management grants, responsible-user authority, private-connection
 access and interaction restrictions still apply; a suggestion grant is not a
 substitute for direct configuration authority.
