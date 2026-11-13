@@ -73,6 +73,26 @@ async function inputProxyFixture() {
   return { ...f, frames, request, async close() { await proxy.close(); await f.close(); } };
 }
 describe("PiRpcDriver", () => {
+  it("drains failed direct-env admission timings without requiring a turn or session close", async () => {
+    const f = await failureFixture();
+    const request = f.transport.request.bind(f.transport);
+    f.transport.request = async (type, input) => {
+      const response = await request(type, input);
+      return type === "get_state" ? { data: { ...response.data, model: { provider: "neutral", id: "wrong" } } } : response;
+    };
+    try {
+      await expect(f.session.startTurn({ message: { role: "user", text: "must not start" } })).rejects.toThrow(/model/);
+      await flushFailure();
+      const timings = f.events.filter(event => event.payload.code === "provider_performance_spans");
+      expect(timings).toHaveLength(1);
+      expect(timings[0]).toMatchObject({ runId: "run-old" });
+      expect(timings[0]!.turnId).toBeUndefined();
+      expect(timings[0]!.payload.spans).toEqual(expect.arrayContaining([expect.objectContaining({ name: "runner.pi.admission.get_state" })]));
+      expect(f.events.some(event => event.eventType === "turn.started")).toBe(false);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
+
   it.each(["native", "data-url", "mixed-native", "mixed-data-url"])("passes %s images through the facade into prompt and steer RPC images", async shape => {
     const f = await inputProxyFixture();
     const image = shape.endsWith("native") ? { type: "image", data: "aGVsbG8=", mimeType: "image/png" } : { type: "image", url: "data:image/png;base64,aGVsbG8=" };

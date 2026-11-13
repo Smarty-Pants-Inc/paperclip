@@ -28,6 +28,26 @@ See [Pi's prompt command contract](https://github.com/earendil-works/pi/blob/v1.
 Disposition, independent-extension ownership and same-resident reuse regressions
 are in `pi-rpc-prompt.test.ts` and `pi-rpc-resident-binding.test.ts`.
 
+## Timing diagnostics
+
+Pi admission and prompt-start timings use the existing
+`provider_performance_spans` diagnostic array. The driver buffers measured
+intervals instead of publishing one PRP event per RPC. After the first admitted
+`agent_start`, it publishes the batch behind the host's already-emitted
+`turn.started`; measurement never delays that lifecycle event. Turn settlement
+also drains the buffer for handled or rejected prompts without `agent_start`,
+and session failure/close drains unused admission intervals before closing the
+event stream. A failure that closes the session inside a measured operation
+captures that interval as failed before the queue closes.
+
+Span names, timestamps and outcomes keep the existing reader contract. Batches
+retain captured run/turn identities; run-scoped admission is associated only
+with its matching admitted turn, or stays run-scoped if no turn was created.
+The existing reader's batch-size limit still applies. These diagnostics explain
+local intervals, not deployed latency improvement; use a real warm-turn trace
+for that claim. Ordering and failure-path regressions live in
+`pi-rpc-resident-binding.test.ts` and `pi-rpc-stop.test.ts`.
+
 ## Late receipts and bounded identity history
 
 Settlement releases the turn's projector, arguments, text and exact identity
