@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -113,6 +113,50 @@ test("materialization refuses relative, root and existing outputs before install
   await assert.rejects(materializePiDistribution({ outputRoot: "relative" }), /must be absolute/);
   await assert.rejects(materializePiDistribution({ outputRoot: "/" }), /unsafe/);
   await assert.rejects(materializePiDistribution({ outputRoot: root }), /already exists/);
+});
+
+// The materializer verifies the executable hash before spawning npm, so this
+// boundary regression requires the exact target Node release, not a substitute.
+// Keep: the npm subprocess must not leave a shared compile cache after failure.
+test("npm child owns its Node compile cache inside disposable distribution staging", async (t) => {
+  if (process.versions.node !== PI_DISTRIBUTION_PINS.nodeVersion) {
+    t.skip(`requires pinned Node ${PI_DISTRIBUTION_PINS.nodeVersion}`);
+    return;
+  }
+  const fixtureRoot = await fixture(t);
+  const root = await realpath(fixtureRoot.root);
+  const node = await realpath(process.execPath);
+  const receipt = join(root, "npm-env.json");
+  const npm = join(root, "npm-fixture.cjs");
+  // Record the real execFile environment outside staging, then fail before
+  // package verification. Node itself creates the cache selected at startup.
+  await fixtureRoot.write("npm-fixture.cjs", `#!${node}
+const { writeFileSync, existsSync } = require("node:fs");
+const { getCompileCacheDir } = require("node:module");
+const cache = process.env.NODE_COMPILE_CACHE;
+writeFileSync(${JSON.stringify(receipt)}, JSON.stringify({
+  argv: process.argv.slice(2), cwd: process.cwd(), HOME: process.env.HOME,
+  NODE_COMPILE_CACHE: cache, activeCache: getCompileCacheDir(),
+  cacheExists: typeof cache === "string" && existsSync(cache)
+}));
+process.exit(73);
+`);
+  await chmod(npm, 0o755);
+  await assert.rejects(materializePiDistribution({
+    outputRoot: join(root, "distribution"), nodeExecutable: node, npmExecutable: npm,
+  }), (error) => error.code === 73);
+
+  const child = JSON.parse(await readFile(receipt, "utf8"));
+  const staging = dirname(child.cwd);
+  assert.equal(child.argv[0], "ci");
+  assert.match(staging, /[\\/]\.paperclip-pi-distribution-[^\\/]+$/);
+  assert.equal(child.HOME, join(staging, "build-home"));
+  assert.equal(typeof child.NODE_COMPILE_CACHE, "string");
+  assert.equal(child.NODE_COMPILE_CACHE, join(staging, "node-compile-cache"));
+  assert.notEqual(child.NODE_COMPILE_CACHE, join(tmpdir(), "node-compile-cache"));
+  assert.equal(dirname(child.activeCache), child.NODE_COMPILE_CACHE);
+  assert.equal(child.cacheExists, true);
+  await assert.rejects(lstat(staging), { code: "ENOENT" });
 });
 
 test("Node dependency inspection rejects Homebrew and non-system Linux libraries", () => {

@@ -228,6 +228,8 @@ export async function materializePiDistribution({ outputRoot, nodeExecutable, np
     // .npmrc. Public registry downloads need no private application credential.
     const environment = Object.fromEntries(["PATH", "LANG", "LC_ALL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"].flatMap((key) => typeof process.env[key] === "string" ? [[key, process.env[key]]] : []));
     environment.HOME = buildHome;
+    // Keep npm's Node compile cache build-owned and covered by staging cleanup.
+    environment.NODE_COMPILE_CACHE = join(staging, "node-compile-cache");
     // npm 10 prunes non-host packages bundled by upstream Pi, unlike the npm
     // 11.19.0 used to qualify this complete closure. Public setup must use the
     // npm pinned by the verified Node archive, never whichever npm is on PATH.
