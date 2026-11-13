@@ -30,17 +30,17 @@
     {
       "path": "schemas/command-v2.schema.json",
       "id": "https://paperclip.dev/schemas/prp/v2/command.schema.json",
-      "sha256": "06bb3b3b0b420119007494c64e64a736fd5d58cb68d04ced843ada00c54668be"
+      "sha256": "a0d1cfce63918db50474097fc9d9743e0a83832a25ba8a2559516f77a7990eca"
     },
     {
       "path": "schemas/command-v3.schema.json",
       "id": "https://paperclip.dev/schemas/prp/v3/command.schema.json",
-      "sha256": "3c8a2d55bfcd1151885ed74bfb4fe2994b9b56f4794d02e446606253d2e8870d"
+      "sha256": "d05ee2ecb3fa772b523584941dc0c4fd0b6c4a6d44e8a1d61626b55026d9d884"
     },
     {
       "path": "schemas/command.schema.json",
       "id": "https://paperclip.dev/schemas/prp/v1/command.schema.json",
-      "sha256": "fc813e6b4d5b7e6890b496bd69848ada25dba58adbf7cf04163ca9e9bf2bcb79"
+      "sha256": "8befa4e9becc75c1fb21e682fc5a087d2ccdaa31b490827676d329433cf2a599"
     },
     {
       "path": "schemas/conformance-fixture.schema.json",

@@ -21,6 +21,31 @@ accepted and rejected compatibility cases.
 The `unknown-optional-fields.json` fixture must be accepted. The
 `unsupported-required-version.json` fixture must be rejected.
 
+## Runner identity check
+
+`runner.identity` is a runner-owned read-only command on the authenticated,
+encrypted PRP control channel (v1, v2 and v3). Its payload is `{}`. Runnerd
+answers it before `run.attach`, without restoring, polling, draining or calling
+the provider. It uses the ordinary durable command/result journal and returns
+`{ runnerInstanceId, nonce }`, where `nonce` equals the request's `commandId`.
+The ordinary result envelope also echoes `commandId`, `commandType` and
+`controllerSeq`. Journaling the receipt does not change provider/session state.
+
+A retained warm owner is verified with a fresh unpredictable command ID, an
+approximately 1,500 ms deadline, and the already-open authenticated connection
+whose `identity.runnerInstanceId` matches the recorded warm generation. Only a
+completed result on that same connection with the exact ID, type, sequence,
+runner ID and nonce can avoid the sandbox generation probe. A connection count,
+transport ping/pong, lease renewal, recent inbound frame or previous result is
+not an answer. Errors, missing/expired/revoked authority, mismatches and timeouts
+retain the normal probe; stopped/archived sandbox resumes and cache misses
+always probe. Each turn checks once and records
+`native.controller.warm_owner_identity_check` in its preparation timing spans.
+Older runners without this command cannot establish this optimization.
+
+`session.snapshot` is not used for this check: its provider implementation can
+call `restore_provider_if_needed()` and inspect mutable provider state.
+
 ## Session goals (v2)
 
 PRP v2 adds a provider-neutral durable session-goal lifecycle. Every v2

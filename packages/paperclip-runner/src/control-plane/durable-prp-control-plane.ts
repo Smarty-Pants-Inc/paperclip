@@ -79,14 +79,10 @@ const EVENT_DELIVERY_STALL_FAILURES = 20;
 const EVENT_DELIVERY_STALL_MS = 45_000;
 const maxStateBytes = 256 * 1024 * 1024;
 const authChallengeTtlMs = 5_000;
-// One outbound WebSocket ping interval: DEFAULT_LIVENESS_INTERVAL_MS in
-// server/src/realtime/runner-prp-outbound.ts. Socket membership can outlive a
-// lost runner by its separate 90-second transport timeout; it is not freshness.
-export const RUNNER_FRESH_LIVENESS_WINDOW_MS = 20_000;
 const stableIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/;
 const runnerDigestPattern = /^sha256:[0-9a-f]{64}$/;
 export function isRunnerRecoveryMaintenanceCommand(type: string): boolean {
-  return ["session.snapshot", "session.goal.get", "runner.drain", "runner.suspend", "runner.shutdown", "turn.stop"].includes(type);
+  return ["runner.identity", "session.snapshot", "session.goal.get", "runner.drain", "runner.suspend", "runner.shutdown", "turn.stop"].includes(type);
 }
 
 /** The Runner journaled this command before its effect, then died. It sends
@@ -119,6 +115,7 @@ const commandTypes = new Set([
   "session.budget.increase",
   "session.destroy",
   "run.cancel",
+  "runner.identity",
   "runner.drain",
   "runner.suspend",
   "runner.shutdown",
@@ -420,7 +417,7 @@ function captureCheckpoint(state: StoredCoreState, runnerVersion: string, runner
   records.set("header", JSON.stringify(header));
   records.set("cursor", JSON.stringify({ ackedSourceSeq: state.ackedSourceSeq, replayDeliveries: state.replayDeliveries,
     commandCount: commands.length, eventCount: recoveryEvents.length }));
-  const maintenance = new Set(["turn.stop", "runner.drain", "runner.suspend", "session.snapshot", "session.close"]);
+  const maintenance = new Set(["runner.identity", "turn.stop", "runner.drain", "runner.suspend", "session.snapshot", "session.close"]);
   return {
     runnerVersion, runnerDigest, runId, records, ...checkpointChanges(records, runId),
     recoveryEvidence: { runnerInstanceId: state.identity.runnerInstanceId, normalizedSessionId: state.identity.normalizedSessionId,
@@ -1848,10 +1845,9 @@ export interface DurablePrpConnectionLeaseFailure {
   readonly observedAtUnixMs: number;
 }
 
-type SerializedFrame = (
+type SerializedFrame =
   | { readonly raw: unknown }
-  | { readonly decrypted: Record<string, unknown> }
-) & { readonly receivedAtMs: number };
+  | { readonly decrypted: Record<string, unknown> };
 
 /** Reason supplied when a transport-neutral PRP peer closes. */
 export interface TransportCloseReason {
@@ -2033,7 +2029,6 @@ class AuthorityConnection {
   terminalLifecycleCommandId: string | null = null;
   warmTransitionVersion: 1 | null = null;
   identity: DurableRecoveryIdentity | null = null;
-  lastAuthenticatedInboundAtMs: number | null = null;
   replayOnly = false;
   activationReceipt: DurableWarmRunTransition | null = null;
   readonly wire: PrpWireConnection;
@@ -2139,6 +2134,11 @@ export class DurablePrpControlPlane {
   #sendQueues = new Map<AuthorityConnection, Promise<void>>();
   #recoveredCursor: { runId: string; sourceSeq: number } | null = null;
   #readableStateListeners = new Set<() => void>();
+  #runnerIdentityChecks = new Map<string, {
+    connection: AuthorityConnection;
+    expectedRunnerInstanceId: string;
+    finish: (matches: boolean) => void;
+  }>();
 
   constructor(options: DurablePrpControlPlaneOptions) {
     if (
@@ -2517,18 +2517,31 @@ export class DurablePrpControlPlane {
     ).length;
   }
 
-  /** Local, synchronous evidence for this exact authenticated runner generation.
-   * No persistence, timer, outbound frame or socket count refreshes the age. */
-  runnerFreshlyAlive(expectedRunnerInstanceId: string, nowMs = Date.now()): boolean {
-    return [...this.#connections].some(connection => {
-      const receivedAtMs = connection.lastAuthenticatedInboundAtMs;
+  /** Ask the already-authenticated runner command loop, never its transport.
+   * The unique commandId is the nonce. A journal/cache hit or another socket
+   * cannot answer this check; timeout/error always leaves the caller to probe. */
+  checkRunnerIdentity(expectedRunnerInstanceId: string, timeoutMs = 1_500): Promise<boolean> {
+    const connection = [...this.#connections].find(connection => {
       const lease = connection.lease;
-      return connection.secureChannel !== null
+      return connection.secureChannel !== null && !connection.replayOnly
         && connection.identity?.runnerInstanceId === expectedRunnerInstanceId
-        && receivedAtMs !== null && nowMs >= receivedAtMs
-        && nowMs - receivedAtMs <= RUNNER_FRESH_LIVENESS_WINDOW_MS
-        && lease !== null && lease.revokedAt === null && lease.expiresAtUnixMs > nowMs
+        && lease !== null && lease.revokedAt === null && lease.expiresAtUnixMs > Date.now()
         && canonicalJson(this.#store.state.leases[lease.credentialId]) === canonicalJson(lease);
+    });
+    if (!connection || this.#protocolIntegrityError !== null) return Promise.resolve(false);
+    const commandId = `command_identity_${randomUUID()}`;
+    return new Promise(resolve => {
+      const finish = (matches: boolean) => {
+        clearTimeout(timer);
+        this.#runnerIdentityChecks.delete(commandId);
+        resolve(matches);
+      };
+      // Event-driven result/close notifications; one bounded safety deadline,
+      // not polling. Keep any timed-out command in the ordinary durable journal.
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      this.#runnerIdentityChecks.set(commandId, { connection, expectedRunnerInstanceId, finish });
+      try { this.queueCommand("runner.identity", {}, commandId, true); }
+      catch { finish(false); }
     });
   }
 
@@ -2905,7 +2918,7 @@ export class DurablePrpControlPlane {
     const staged = this.#store.state.stagedRunAttachment;
     const retireStaged = stagedTargetActivated(this.#store.state) && (type === "turn.start"
       || (this.#stagedTargetCheckpointPublished === canonicalJson(this.#store.state.identity)
-        && !["runner.drain", "session.snapshot", "turn.stop", "runner.suspend", "session.close"].includes(type)));
+        && !["runner.identity", "runner.drain", "session.snapshot", "turn.stop", "runner.suspend", "session.close"].includes(type)));
     if (staged && !retireStaged) {
       if (type === "run.attach") {
         const { paperclipNextAuthority, ...template } = payload;
@@ -2913,7 +2926,7 @@ export class DurablePrpControlPlane {
           || canonicalJson(paperclipNextAuthority.identity) !== canonicalJson(staged.targetIdentity)
           || `sha256:${canonicalDigest(template)}` !== staged.templateDigest
           || (staged.commandId !== null && staged.commandId !== commandId)) throw new Error("Staged run attachment command conflicts.");
-      } else if (!stagedTargetActivated(this.#store.state) && !["runner.drain", "session.open", "session.snapshot", "turn.stop", "runner.suspend", "session.close", "semantic_tool.result"].includes(type)) {
+      } else if (!stagedTargetActivated(this.#store.state) && !["runner.identity", "runner.drain", "session.open", "session.snapshot", "turn.stop", "runner.suspend", "session.close", "semantic_tool.result"].includes(type)) {
         throw new Error("Staged run attachment permits recovery maintenance only.");
       }
     }
@@ -3092,7 +3105,6 @@ export class DurablePrpControlPlane {
     connection = new AuthorityConnection({
       wire,
       onJson: (value) => {
-        const receivedAtMs = Date.now();
         let frame: SerializedFrame;
         if (connection.secureChannel !== null && undecryptedFrames === 0) {
           const decrypted = this.#decryptOnArrival(connection, value);
@@ -3104,21 +3116,21 @@ export class DurablePrpControlPlane {
             // renewed expiry durably before its reply, and its admission is
             // checked against persisted authority exactly as before.
             try {
-              this.#handleDecrypted(connection, decrypted, receivedAtMs);
+              this.#handleDecrypted(connection, decrypted);
             } catch {
               connection.close();
             }
             return;
           }
-          frame = { decrypted, receivedAtMs };
+          frame = { decrypted };
         } else {
           undecryptedFrames += 1;
-          frame = { raw: value, receivedAtMs };
+          frame = { raw: value };
         }
         processing = processing
           .then(() => "raw" in frame
-            ? this.#handleJson(connection, frame.raw, frame.receivedAtMs).finally(() => { undecryptedFrames -= 1; })
-            : this.#handleDecryptedFrame(connection, frame.decrypted, frame.receivedAtMs))
+            ? this.#handleJson(connection, frame.raw).finally(() => { undecryptedFrames -= 1; })
+            : this.#handleDecryptedFrame(connection, frame.decrypted))
           .catch(() => connection.close());
         const tail = processing;
         this.#connectionProcessing.set(connection, tail);
@@ -3129,11 +3141,14 @@ export class DurablePrpControlPlane {
         void tail.then(release, release);
       },
       onPong: () => {
-        if (connection.secureChannel !== null) this.#admitAuthenticatedFrame(connection, Date.now());
+        if (connection.secureChannel !== null) this.#admitAuthenticatedFrame(connection);
       },
       onClose: () => {
         this.#recordLeaseFailureIfLapsed(connection);
         this.#connections.delete(connection);
+        for (const check of this.#runnerIdentityChecks.values()) {
+          if (check.connection === connection) check.finish(false);
+        }
         if (connection.secureChannel !== null && this.activeRunnerConnectionCount() === 0)
           this.#runnerDisconnectedAt ??= Date.now();
       },
@@ -3150,7 +3165,6 @@ export class DurablePrpControlPlane {
   async #handleJson(
     connection: AuthorityConnection,
     wire: unknown,
-    receivedAtMs: number,
   ): Promise<void> {
     this.#store.assertWritable();
     let envelope: Record<string, unknown>;
@@ -3165,7 +3179,7 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
-    await this.#handleDecryptedFrame(connection, envelope, receivedAtMs);
+    await this.#handleDecryptedFrame(connection, envelope);
   }
 
   /** Decrypt one secure frame in arrival order; null when it closed the connection. */
@@ -3191,11 +3205,10 @@ export class DurablePrpControlPlane {
   #handleDecrypted(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
-    receivedAtMs: number,
   ): void {
     this.#store.assertWritable();
     if (!this.#admitEnvelopeVersion(connection, envelope)) return;
-    if (!this.#admitAuthenticatedFrame(connection, receivedAtMs)) return;
+    if (!this.#admitAuthenticatedFrame(connection)) return;
     if (envelope.kind === "lease_renew") this.#renewLease(connection, envelope);
   }
 
@@ -3228,7 +3241,7 @@ export class DurablePrpControlPlane {
    * expired credential or bypass changes to its persisted binding. An expired
    * lease is recorded so the owner can report why the runner left.
    */
-  #admitAuthenticatedFrame(connection: AuthorityConnection, receivedAtMs: number): boolean {
+  #admitAuthenticatedFrame(connection: AuthorityConnection): boolean {
     if (
       connection.secureChannel === null ||
       connection.lease === null ||
@@ -3241,7 +3254,6 @@ export class DurablePrpControlPlane {
       connection.close();
       return false;
     }
-    connection.lastAuthenticatedInboundAtMs = Math.max(connection.lastAuthenticatedInboundAtMs ?? receivedAtMs, receivedAtMs);
     return true;
   }
 
@@ -3273,7 +3285,6 @@ export class DurablePrpControlPlane {
   async #handleDecryptedFrame(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
-    receivedAtMs: number,
   ): Promise<void> {
     this.#store.assertWritable();
     if (!this.#admitEnvelopeVersion(connection, envelope)) return;
@@ -3283,10 +3294,10 @@ export class DurablePrpControlPlane {
       return;
     }
     if (connection.secureChannel === null && kind === "auth_response") {
-      await this.#authResponse(connection, envelope, receivedAtMs);
+      await this.#authResponse(connection, envelope);
       return;
     }
-    if (!this.#admitAuthenticatedFrame(connection, receivedAtMs)) return;
+    if (!this.#admitAuthenticatedFrame(connection)) return;
     // After admission the lease is non-null; keep the narrowed reference.
     if (connection.lease === null) return;
     if (kind === "lease_renew") {
@@ -3731,7 +3742,6 @@ export class DurablePrpControlPlane {
   async #authResponse(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
-    receivedAtMs: number,
   ): Promise<void> {
     const pending = connection.pendingChallenge;
     const payload = envelope.payload as Record<string, unknown> | undefined;
@@ -3925,7 +3935,6 @@ export class DurablePrpControlPlane {
       pending.serverProof,
       clientProof,
     );
-    connection.lastAuthenticatedInboundAtMs = receivedAtMs;
     this.#runnerDisconnectedAt = null;
     this.#eventOwner = connection;
     for (const active of this.#connections) {
@@ -4133,6 +4142,11 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
+    if (command.type === "runner.identity"
+      && (result.commandType !== command.type || result.controllerSeq !== command.controllerSeq)) {
+      connection.close();
+      return;
+    }
     if (this.#isTerminalLifecycleCommand(command)) {
       connection.terminalLifecycleCommandId = command.commandId;
     }
@@ -4207,6 +4221,14 @@ export class DurablePrpControlPlane {
     command.result = structuredClone(result);
     this.#store.save();
     if (turnStart) crashPoint("runner.turn_start.after_controller_journal_before_db_checkpoint");
+    const check = this.#runnerIdentityChecks.get(commandId);
+    if (check) {
+      check.finish(check.connection === connection && this.#connections.has(connection)
+        && connection.identity?.runnerInstanceId === check.expectedRunnerInstanceId
+        && command.type === "runner.identity" && status === "completed"
+        && isRecord(result.result) && result.result.runnerInstanceId === check.expectedRunnerInstanceId
+        && result.result.nonce === commandId);
+    }
     this.#ackTerminalCommandResult(connection, command);
     this.#releaseServingLifecycle(connection, command);
     if (!this.#isTerminalLifecycleCommand(command) || connection.terminalLifecycleCommandId === null) {

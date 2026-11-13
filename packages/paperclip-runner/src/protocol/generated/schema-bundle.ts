@@ -488,6 +488,7 @@ export const commandSchema = {
         "session.budget.increase",
         "session.destroy",
         "run.cancel",
+        "runner.identity",
         "runner.drain",
         "runner.suspend",
         "runner.shutdown"
@@ -582,6 +583,7 @@ export const commandV2Schema = {
         "session.budget.increase",
         "session.destroy",
         "run.cancel",
+        "runner.identity",
         "runner.drain",
         "runner.suspend",
         "runner.shutdown",
@@ -723,6 +725,7 @@ export const commandV3Schema = {
         "session.budget.increase",
         "session.destroy",
         "run.cancel",
+        "runner.identity",
         "runner.drain",
         "runner.suspend",
         "runner.shutdown",

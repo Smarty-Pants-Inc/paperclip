@@ -12,7 +12,7 @@
       "enum": [
         "run.prepare", "run.attach", "session.open", "turn.start", "turn.steer", "turn.interrupt", "turn.stop",
         "request.resolve", "interaction.receipt", "semantic_tool.result", "session.snapshot", "session.close",
-        "session.budget.increase", "session.destroy", "run.cancel", "runner.drain", "runner.suspend", "runner.shutdown",
+        "session.budget.increase", "session.destroy", "run.cancel", "runner.identity", "runner.drain", "runner.suspend", "runner.shutdown",
         "session.goal.get", "session.goal.set", "session.goal.clear"
       ]
     },

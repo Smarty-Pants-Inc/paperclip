@@ -440,6 +440,9 @@ type NativeSessionStartup = {
   unstartedClaim?: { leaseOwner: string; attempt: number };
   /** A provider session handle was published; a turn may have followed it. */
   sessionPublished?: boolean;
+  /** One fresh identity exchange per attempt, shared by nested admission checks. */
+  resumedSandboxProbeDecision?: Promise<boolean>;
+  warmOwnerIdentitySpan?: NativeRunHistoricalSpan;
   /** Restart recovery reattaches a provider that may already have worked. */
   providerWorkMayPrecede?: boolean;
   executionContext?: NativeExecutionContext;
@@ -711,7 +714,7 @@ type WarmNativeSession = {
   onReleased: () => void;
   sessionCheckpointPersisted?: (snapshot: PersistedNativeSession) => void;
   runnerConnectionLive?: () => boolean;
-  runnerFreshlyAlive?: (nowMs: number) => boolean;
+  runnerIdentityCheck?: () => Promise<boolean>;
   pluginTaskId?: string;
   sandboxProviderLeaseId?: string;
   observabilityCompatibilityKey?: string;
@@ -5998,18 +6001,34 @@ function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined)
 }
 
 // Lease reuse is also reported as "resumed" on an ordinary running box. Only
-// fresh authenticated inbound liveness from the cached runner generation can
-// avoid the loss probe. A counted socket can be stale; stopped/archived resumes
-// and cache misses always keep the existing recovery probe.
-function resumedSandboxRunnerNeedsProbe(input: {
+// a fresh runner-owned command answer on the retained authenticated PRP channel
+// avoids the loss probe. Transport pongs/inbound age are never evidence here.
+// Stopped/archived resumes and cache misses retain the existing probe path.
+async function resumedSandboxRunnerNeedsProbe(input: {
   execution: NativeExecutionInput; runnerExecutionTarget?: AdapterExecutionTarget | null;
-}): boolean {
+}): Promise<boolean> {
   const target = input.runnerExecutionTarget;
   if (!resumedSandboxRunner(target)) return false;
   const resumedFromState = target?.kind === "remote" && target.transport === "sandbox"
     ? target.sandboxLeaseAcquisition?.resumedFromState : undefined;
-  return resumedFromState === "stopped" || resumedFromState === "archived"
-    || warmNativeSessions.get(nativeSessionScopeKey(input.execution))?.runnerFreshlyAlive?.(Date.now()) !== true;
+  if (resumedFromState === "stopped" || resumedFromState === "archived") return true;
+  const entry = warmNativeSessions.get(nativeSessionScopeKey(input.execution));
+  if (!entry) return true;
+  const startup = nativeSessionStartups.get(input.execution.binding.runId);
+  const check = async () => {
+    const startedAtMs = Date.now();
+    let matches = false;
+    try { matches = await entry.runnerIdentityCheck?.() === true; }
+    catch { /* An error is not ownership evidence: keep the generation probe. */ }
+    if (startup) startup.warmOwnerIdentitySpan = {
+      name: "native.controller.warm_owner_identity_check", startedAtMs, endedAtMs: Date.now(),
+      outcome: matches ? "ok" : "failed",
+    };
+    return !matches;
+  };
+  // The startup reservation is run-owned and removed on completion. Never memoize
+  // on the warm entry: the next turn must issue a new unpredictable commandId.
+  return startup ? (startup.resumedSandboxProbeDecision ??= check()) : check();
 }
 
 /** An idle Runner can exit while its sandbox remains running. A resume from a
@@ -6021,7 +6040,7 @@ function resumedSandboxRunnerNeedsProbe(input: {
  * rule is introduced. */
 async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
   : Promise<DurableRecoveryIdentity | null> {
-  if (!resumedSandboxRunnerNeedsProbe(input) || !isSafeNativeStateDirectory(input.root)) return null;
+  if (!await resumedSandboxRunnerNeedsProbe(input) || !isSafeNativeStateDirectory(input.root)) return null;
   const identity = readRunnerdDurableIdentity(input.root);
   if (!identity || !durableIdentityMatchesSession(identity, input.execution) || identity.runId === input.execution.binding.runId) return null;
   const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
@@ -10210,7 +10229,7 @@ export async function executePaperclipNativeSession(input: {
     await closingWarmNativeSessions.get(sessionScopeId);
     const idleOwner = warmNativeSessions.get(sessionScopeId);
     if (idleOwner && !idleOwner.busy && !idleOwner.preparingRunId && !idleOwner.instructionPreparationRunId
-      && idleOwner.runId !== input.execution.binding.runId && resumedSandboxRunnerNeedsProbe(input)) {
+      && idleOwner.runId !== input.execution.binding.runId && await resumedSandboxRunnerNeedsProbe(input)) {
       const root = scopedRunnerdStateRoot(input.execution);
       await restoreWarmRunnerdController(input);
       if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
@@ -10530,7 +10549,8 @@ async function executePaperclipNativeSessionAttempt(
       "paperclip_runner_provider_unsupported: ACPX candidate requires exact host qualification authorization",
     );
   }
-  const preparationSpans = input.preparationSpans ?? [];
+  const identityCheckSpan = nativeSessionStartups.get(input.execution.binding.runId)?.warmOwnerIdentitySpan;
+  const preparationSpans = [...(input.preparationSpans ?? []), ...(identityCheckSpan ? [identityCheckSpan] : [])];
   const preparationStarts = nativeRunPreparationStarts(
     preparationSpans,
     Date.now(),
@@ -12323,7 +12343,7 @@ async function executePaperclipNativeSessionAttempt(
                   if (existing.session !== session) {
                     existing.sessionCheckpointPersisted = runnerdBackend?.sessionCheckpointPersisted;
                     existing.runnerConnectionLive = runnerdBackend?.runnerConnectionLive;
-                    existing.runnerFreshlyAlive = runnerdBackend?.runnerFreshlyAlive;
+                    existing.runnerIdentityCheck = runnerdBackend?.runnerIdentityCheck;
                   }
                   const ingress = input.useRunnerd ? nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget) : undefined;
                   existing.ingressOwner = ingress ? { ...input.execution.binding, ingress,
@@ -12339,7 +12359,7 @@ async function executePaperclipNativeSessionAttempt(
                     })(),
                     sessionCheckpointPersisted: runnerdBackend?.sessionCheckpointPersisted,
                     runnerConnectionLive: runnerdBackend?.runnerConnectionLive,
-                    runnerFreshlyAlive: runnerdBackend?.runnerFreshlyAlive,
+                    runnerIdentityCheck: runnerdBackend?.runnerIdentityCheck,
                     onReleased: () => releaseRetainedNativeSessionCleanup(input.db, {
                       companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
                     }, { companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,
@@ -15939,8 +15959,8 @@ async function prepareRemoteExternalRunner({ input, target, runner, root, identi
 type ManagedRunnerdBackend = NativeSessionBackend & {
   /** Synchronous local transport state; never contacts the allocation. */
   runnerConnectionLive?: () => boolean;
-  /** Fresh inbound evidence bound to this backend's recorded runner generation. */
-  runnerFreshlyAlive?: (nowMs: number) => boolean;
+  /** Fresh PRP command/result exchange for this backend's recorded generation. */
+  runnerIdentityCheck?: () => Promise<boolean>;
   sandboxRetention?: SandboxRunnerRetention;
   bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
   bindDiagnosticSession?(session: NativeSession): void;
@@ -18150,7 +18170,7 @@ async function createRunnerdBackendWithinSessionClaim(
     },
     beforeConnect: async (identity, authority) => {
       runnerControlPlane = authority;
-      // Missing identity cannot establish freshness (including legacy callers).
+      // Missing identity cannot establish ownership (including legacy callers).
       warmRunnerInstanceId ??= identity?.runnerInstanceId;
       await input.remoteWarmRecovery?.revalidate();
       if (stagedRecovery && authority.store.state.stagedRunAttachment) {
@@ -18537,10 +18557,10 @@ async function createRunnerdBackendWithinSessionClaim(
     runnerConnectionLive: () => replacementBackend
       ? replacementBackend.runnerConnectionLive?.() ?? false
       : (runnerControlPlane?.activeRunnerConnectionCount() ?? 0) > 0,
-    runnerFreshlyAlive: nowMs => replacementBackend
-      ? replacementBackend.runnerFreshlyAlive?.(nowMs) ?? false
+    runnerIdentityCheck: async () => replacementBackend
+      ? await replacementBackend.runnerIdentityCheck?.() ?? false
       : warmRunnerInstanceId !== undefined
-        && runnerControlPlane?.runnerFreshlyAlive?.(warmRunnerInstanceId, nowMs) === true,
+        && await runnerControlPlane?.checkRunnerIdentity?.(warmRunnerInstanceId) === true,
     sandboxRetention,
     bindManagedSession: (session, options) => replacementBackend
       ? replacementBackend.bindManagedSession(session, options) : wrapManagedSession(session),

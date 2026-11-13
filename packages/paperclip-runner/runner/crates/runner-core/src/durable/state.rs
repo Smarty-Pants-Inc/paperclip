@@ -156,6 +156,7 @@ impl Command {
                 | "session.budget.increase"
                 | "session.destroy"
                 | "run.cancel"
+                | "runner.identity"
                 | "runner.drain"
                 | "runner.suspend"
                 | "runner.shutdown"
@@ -380,7 +381,8 @@ impl DurableState {
                 matches!(command.status.as_str(), "pending" | "indeterminate")
                     && !matches!(
                         command.command_type.as_str(),
-                        "session.snapshot"
+                        "runner.identity"
+                            | "session.snapshot"
                             | "session.goal.get"
                             | "runner.drain"
                             | "runner.suspend"
