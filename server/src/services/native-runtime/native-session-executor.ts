@@ -48,6 +48,7 @@ import { nativeProviderPackAdmissionFailureCode, nativeProviderPackAdmissionPend
 import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
 import { verifySnapshotProviderPack } from "./remote-provider-pack-snapshot.js";
+import { nativePiRemoteLaunchOptions } from "./native-pi-launch.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
@@ -16256,10 +16257,15 @@ async function createRunnerdBackendWithinSessionClaim(
       remoteCwd: remoteTarget!.remoteCwd, providerDigest: nativeSha256(input.execution.provider) },
     reattach,
     retainProviderPack: !providerArtifacts && (reattach || retainProviderPack),
-    runnerArtifact: () => readRunnerdArtifactBinding(controllerRunnerBinary),
+    runnerArtifact: () => (adoptingPersistedRemoteRunner ? input.controllerPersistence?.runnerArtifact : undefined)
+      ?? readRunnerdArtifactBinding(controllerRunnerBinary),
     current: () => providerArtifacts?.manifest as RemoteProviderPackManifest ?? resolveCurrentProviderPackManifest(),
   }) : null;
-  let providerPackAuthority = adoptingPersistedRemoteRunner ? null : selectProviderPackAuthority(reattachProviderPack);
+  // Pi recovery constructs its native launch profile even when the daemon
+  // survives. Resolve the same durable, session-bound pack authority as launch;
+  // a warm in-memory owner or environment metadata is not executable authority.
+  let providerPackAuthority = adoptingPersistedRemoteRunner && input.execution.provider.kind !== "pi_rpc"
+    ? null : selectProviderPackAuthority(reattachProviderPack);
   let expectedProviderPackManifest: RemoteProviderPackManifest | null = providerPackAuthority?.manifest
     ?? providerArtifacts?.manifest as RemoteProviderPackManifest ?? null;
   let providerPackVerified = false;
@@ -16480,6 +16486,21 @@ async function createRunnerdBackendWithinSessionClaim(
     selectedRemoteMode = requiredMode;
     if (input.restartRecovery?.kind === "reattach_remote_runner" || input.remoteWarmRecovery) {
       if (input.controllerPersistence?.runnerArtifact && !relaunchesSettledRemoteRunner) {
+        if (input.execution.provider.kind === "pi_rpc" && !await useInstalledProviderPack()) {
+          // Do not stage or upgrade a surviving runner's pack. Recover the
+          // qualified snapshot or verify the exact saved staged pack instead.
+          const snapshotRoot = "/opt/paperclip-runner/provider-pack";
+          try {
+            await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd,
+              packRoot: snapshotRoot, manifest: expectedProviderPackManifest!, provider: { kind: "pi_rpc" } });
+            activeRemoteProviderPackRoot = snapshotRoot;
+            providerPackVerified = true;
+          } catch (error) {
+            if (findSandboxStoppedError(error) || error instanceof Error && error.name === "AbortError") throw error;
+            await verifyRemoteProviderPack(stagedRemoteProviderPackRoot!);
+            activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
+          }
+        }
         remotePrepared = true;
         return;
       }
@@ -17919,12 +17940,9 @@ async function createRunnerdBackendWithinSessionClaim(
                 expectedProviderPackManifest.payload.artifacts.nodeCommand
                   .sha256,
               providerPackAuthorityDigest: expectedProviderPackManifest.digest,
-              ...(input.execution.provider.kind === "pi_rpc" ? {
-                piCommand: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.artifacts.piRpcExecutable!.path),
-                piCommandSha256: expectedProviderPackManifest.payload.artifacts.piRpcExecutable!.sha256,
-                piProxyPath: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.artifacts.piRpcProxy!.path),
-                piProxySha256: expectedProviderPackManifest.payload.artifacts.piRpcProxy!.sha256,
-              } : {}),
+              ...(input.execution.provider.kind === "pi_rpc"
+                ? nativePiRemoteLaunchOptions(activeRemoteProviderPackRoot, expectedProviderPackManifest, remoteRunnerFilesystemRoot ?? root)
+                : {}),
               opencodeCommand: posix.join(
                 activeRemoteProviderPackRoot,
                 expectedProviderPackManifest.payload.artifacts
