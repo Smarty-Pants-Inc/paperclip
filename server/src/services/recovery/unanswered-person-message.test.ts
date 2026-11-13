@@ -11,7 +11,9 @@ import {
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
+  completionContracts,
   nativeRunFinalizations,
+  nativeRunResults,
 } from "@paperclipai/db";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -431,6 +433,34 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       });
     } finally { await pending; }
     expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("25-SILENT-BLOCK (org 23:03Z): an accepted native result that declared a blocker but whose words were never published -> exactly one notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message("Deploy it.");
+    const runId = await f.run({ commentId, status: "succeeded" });
+    const contractId = randomUUID();
+    await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId, revision: 1,
+      schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
+      contractJson: {}, canonicalSha256: "46".repeat(32), createdByActorType: "system", createdByActorId: "fixture" });
+    await db.update(heartbeatRuns).set({ completionContractId: contractId }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(nativeRunResults).values({ companyId: f.companyId, issueId: f.issueId, runId, completionContractId: contractId,
+      serverFingerprint: "fixture", schemaStatus: "accepted", canonicalSha256: "fixture",
+      resultJson: { result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "blocked", summary: "The deploy key is missing.",
+        blocker: { scope: "current_track", owner: { kind: "system", name: "Deploy key" }, reasonCode: "permission_denied",
+          unblockAction: "Add the deploy key, then retry." } },
+        terminal: { schema: "paperclip.prp.terminal.v1", runTerminalState: "succeeded", reportedWorkDisposition: "blocked" } } });
+    await f.sweep();
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    // Published words answer it: the same shape WITH the run's reply is quiet.
+    const g = await fixture();
+    const replied = await g.run({ commentId: await g.message("Deploy it."), status: "succeeded" });
+    await g.reply(replied);
+    await g.sweep();
+    expect(await g.visible()).toHaveLength(0);
   });
 
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {

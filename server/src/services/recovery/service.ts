@@ -6859,11 +6859,25 @@ export function recoveryService(
     liveRunExecutions: deps.liveRunExecutions,
     settleLostRunProcess: deps.settleLostRunProcess,
   });
+  /** Whether the native blocked-request repair (nativeBlockedUnblockAction)
+   * applies to this run: it then publishes the run's unblock request as a
+   * visible notice itself. Read-only; for the unanswered-message step. */
+  async function nativeBlockedRepairApplies(input: { companyId: string; issueId: string; runId: string }, database: Db = db) {
+    const [issue] = await database.select().from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+    const [run] = await database.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
+      error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot,
+      livenessState: heartbeatRuns.livenessState, startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+    if (!issue || !run) return false;
+    return Boolean(await nativeBlockedUnblockAction(issue as RecoveryIssue, run, database));
+  }
 
   return {
     assignedWork,
     buildRunOutputSilence,
     buildRunOutputSilences,
+    nativeBlockedRepairApplies,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
     recordWatchdogDecision,

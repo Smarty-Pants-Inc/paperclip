@@ -1724,9 +1724,11 @@ export function heartbeatService(
     if (unanswered === false) return result;
     const settled = unanswered === true && recoveryOpts.companyId && recoveryOpts.issueId
       ? await settleUnansweredPersonMessagesForTask(db, { companyId: recoveryOpts.companyId, issueId: recoveryOpts.issueId,
-        issueCreatedAtGte, onDeferredDeadline: recoveryOpts.onDeferredDeadline })
+        issueCreatedAtGte, onDeferredDeadline: recoveryOpts.onDeferredDeadline,
+        nativeBlockedRepairApplies: recovery.nativeBlockedRepairApplies })
       : await settleUnansweredPersonMessages(db, { companyId: recoveryOpts.companyId, issueId: recoveryOpts.issueId,
-        issueCreatedAtGte, onDeferredDeadline: recoveryOpts.onDeferredDeadline });
+        issueCreatedAtGte, onDeferredDeadline: recoveryOpts.onDeferredDeadline,
+        nativeBlockedRepairApplies: recovery.nativeBlockedRepairApplies });
     return { ...result, unansweredMessagesNoticed: settled.noticed };
   }
 
