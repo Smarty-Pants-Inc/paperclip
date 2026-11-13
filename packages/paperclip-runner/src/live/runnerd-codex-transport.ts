@@ -6323,6 +6323,24 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
   }
 
+  /** A fresh Pi open over a proven-lost external Runner's root (its sandbox
+   * restarted under it) retires exactly that epoch through the ordinary
+   * rotation, as the recovery path does. Pi's own files stay in place; any
+   * other stored authority still fails the control plane's identity check. */
+  async #rotateLostExternalPiOpenAuthority(desired: DurableRecoveryIdentity): Promise<void> {
+    const lost = this.options.lostRunnerSource!;
+    const directory = resolve(this.#root, "control-plane");
+    const active = existsSync(resolve(directory, "control-plane-state.json")) ? readControlPlaneState(directory) : null;
+    if (active && controlPlaneIdentity(active).runId === desired.runId) return;
+    const source = active
+      ? takeCommittedRotation(this.#root, active) ?? active
+      : latestArchivedControlPlaneState(this.#root, desired);
+    if (!source || !recoveryIdentityMatches(controlPlaneIdentity(source), lost)) return;
+    if (source.warmTransition !== undefined || source.stagedRunAttachment !== undefined)
+      throw new Error("native_runner_authority_archive_conflict");
+    await rotateAuthorityEpoch(this.#root, source, desired, this.#externalRunnerStateArchive(), lost);
+  }
+
   /** Runner state held by an external Runner host (a plugin task or a sandbox). */
   #externalRunnerStateArchive(): RunnerStateArchive {
     const { readRunnerState, prepareExternalRunnerState, archiveExternalRunnerState } = this.options;
@@ -6375,6 +6393,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.options.provider === "pi_rpc" && !this.options.prepareLaunch && !this.options.readRunnerState
         && this.options.runnerStateDirectory === undefined && this.options.runnerFilesystemRoot === undefined) {
       await rotateLocalPiOpenAuthority(this.#root, identity);
+    } else if (this.options.provider === "pi_rpc" && this.options.lostRunnerSource) {
+      await this.#rotateLostExternalPiOpenAuthority(identity);
     }
     const core = new DurablePrpControlPlane({
       stateDirectory: resolve(this.#root, "control-plane"),
