@@ -105,6 +105,21 @@ async function soleBoatOrgId(config: Config): Promise<string | undefined> {
   const org = result.orgs[0];
   return org?.type === "org" && typeof org.id === "string" && org.id.trim() ? org.id : undefined;
 }
+/** Strict RFC 3339 deadline parsing: reject Date.parse's permissive grammar and
+ * calendar rollover, just as observedAt rejects impossible HTTP dates. */
+function parseDeadline(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (!match) return null;
+  const [, y, mo, d, h, mi, s, zone] = match;
+  const year = Number(y), month = Number(mo), day = Number(d);
+  if (year < 1970 || month < 1 || month > 12 || day < 1 || Number(h) > 23 || Number(mi) > 59 || Number(s) > 59) return null;
+  const calendar = new Date(Date.UTC(year, month - 1, day));
+  if (calendar.getUTCFullYear() !== year || calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== day) return null;
+  if (zone !== "Z" && (Number(zone.slice(1, 3)) > 23 || Number(zone.slice(4)) > 59)) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && timestamp >= 0 ? value : null;
+}
 function assertSandboxId(sandbox: any, id: string): void {
   if (sandbox?.id !== id) throw new Error("Boat response returned a different allocation.");
 }
@@ -525,7 +540,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       if (sandbox.id !== id) throw new Error("Boat resume returned a different allocation.");
     }
     const resumedFromState = sandbox?.state ?? null;
-    let ttlRefresh: { status: "failed"; category: RequestErrorCategory; httpStatus: number | null } | undefined;
+    let ttlRefresh: { status: "ok" | "unconfirmed"; at: string; archiveAfter: string | null }
+      | { status: "failed"; at: string; category: RequestErrorCategory; httpStatus: number | null; archiveAfter: string | null } | undefined;
+    let refreshExpiresAt: string | null = null;
     if (!sandbox || !["ready", "idle", "running"].includes(sandbox.state)) {
       // boatdocs-0110c/api_reference_sandboxes_resume-sandbox.md:35-75,147-172.
       const response = await request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
@@ -540,20 +557,34 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // https://docs.boat.dev/api/reference/sandboxes/update-sandbox.md:91-93.
       // Renew every authorized warm handoff, never with an idle timer.
       const path = `/sandboxes/${encodeURIComponent(id)}`;
+      const personal = (metadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal";
+      const boatOrgId = personal ? undefined : metadata?.boatOrgId;
+      const orgHeaders = typeof boatOrgId === "string" && boatOrgId.trim() ? { "X-Boat-Org": boatOrgId } : undefined;
+      const ttlSeconds = effectiveTtlSeconds(c), requestedAt = Date.now();
+      const at = new Date(requestedAt).toISOString();
       try {
-        const refreshed = await request(c, path, { method: "PATCH", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c) }) }, false, { requireJson: true });
+        const refreshed = await request(c, path, { method: "PATCH", headers: orgHeaders, body: JSON.stringify({ ttlSeconds }) }, false, { requireJson: true });
         const candidate = refreshed?.sandbox ?? refreshed;
         if (candidate?.id !== id) throw requestError(c, "PATCH", path, 200, "parse_error");
+        const archiveAfter = parseDeadline(candidate.archiveAfter);
+        const expectedDeadline = requestedAt + ttlSeconds * 1000;
+        const confirmed = archiveAfter !== null && Math.abs(Date.parse(archiveAfter) - expectedDeadline) <= 120_000;
+        ttlRefresh = { status: confirmed ? "ok" : "unconfirmed", at, archiveAfter };
+        refreshExpiresAt = archiveAfter ?? parseDeadline(candidate.expiresAt);
         sandbox = candidate;
       } catch (error) {
         // request and the exact-ID check expose only our safe error fields.
         // Keep the pre-PATCH observation: neither owner nor deadline is renewed.
         const failure = error as ReturnType<typeof requestError>;
-        ttlRefresh = { status: "failed", category: failure.category, httpStatus: failure.httpStatus };
+        ttlRefresh = { status: "failed", at, category: failure.category, httpStatus: failure.httpStatus, archiveAfter: sandbox.archiveAfter ?? null };
       }
+      const details = { providerLeaseId: c.apiKey ? id.split(c.apiKey).join("[REDACTED]") : id, status: ttlRefresh.status,
+        category: ttlRefresh.status === "failed" ? ttlRefresh.category : ttlRefresh.status === "unconfirmed" ? "deadline_mismatch" : null };
+      if (ttlRefresh.status === "ok") duplexLogger?.info("Boat warm lease TTL refresh", details);
+      else duplexLogger?.warn("Boat warm lease TTL refresh", details);
     }
     const workspaceSentinel = sentinel ? await verifyWorkspaceSentinel(sentinel, { request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout) }) : undefined;
-    if (workspaceSentinel && workspaceSentinel.result !== "matched") return { providerLeaseId: null, metadata: { expired: true, workspaceSentinel } };
+    if (workspaceSentinel && workspaceSentinel.result !== "matched") return { providerLeaseId: null, metadata: { expired: true, workspaceSentinel, ...(ttlRefresh ? { ttlRefresh } : {}) } };
     const guardianPreflight = await stageGuardian(params.config, id, {
       request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout),
     }, metadata);
@@ -562,7 +593,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       boatOrgId: _previousOrg, boatOwner: _previousOwner, ttlRefresh: _previousTtlRefresh, ...retainedMetadata } = metadata ?? {};
     await bindDuplexLease(params, id, guardianPreflight);
     const ownership = boatOwnershipForLease(sandbox, id);
-    return { providerLeaseId: id, expiresAt: sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
+    return { providerLeaseId: id, expiresAt: ttlRefresh && ttlRefresh.status !== "failed" ? refreshExpiresAt : sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
         ...ownership, ...(ttlRefresh ? { ttlRefresh } : {}),
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
