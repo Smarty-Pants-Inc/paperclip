@@ -1,4 +1,7 @@
+import { randomUUID } from "node:crypto";
+import path from "node:path";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { redactSensitiveText } from "../../redaction.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import { readProviderPackArchive, stageProviderPackArchive } from "./provider-pack-archive.js";
 import type { ProviderPackIdentity } from "./remote-provider-pack-verification.js";
@@ -55,12 +58,26 @@ export async function uploadVerifiedProviderPack(input: {
   }
   if (!archive) await verifyDirectory();
   input.signal?.throwIfAborted();
+  const target = quote(input.targetPath);
+  const stalePrefix = path.posix.join(path.posix.dirname(input.targetPath), `.${path.posix.basename(input.targetPath)}.stale-`);
+  // Keep the rename on the same filesystem. Large snapshot-carried packs must
+  // not put recursive deletion on the turn's critical path. Also sweep trees
+  // left by an interrupted earlier cleanup, never the new upload at target.
   const cleared = await measure("provider_pack.clear_stale", () => input.runner.execute({
-    command: "sh", args: ["-c", `rm -rf ${quote(input.targetPath)}`],
+    command: "sh", args: ["-c", `if [ -e ${target} ] || [ -L ${target} ]; then mv -T -- ${target} ${quote(`${stalePrefix}${randomUUID()}`)} || exit $?; fi\nnohup setsid rm -rf -- ${quote(stalePrefix)}* </dev/null >/dev/null 2>&1 &`],
     cwd: input.cwd, bypassSession: true, timeoutMs: 10_000,
   }));
   if (cleared.exitCode !== 0 || cleared.timedOut) {
-    throw new Error("runner_remote_provider_artifact_incompatible: stale provider pack could not be replaced");
+    // Some image packs cannot be renamed in their parent directory. Retain the
+    // old delete path for those images, with enough time for a large pack.
+    const deleted = await input.runner.execute({
+      command: "sh", args: ["-c", `rm -rf -- ${target}`],
+      cwd: input.cwd, bypassSession: true, timeoutMs: 60_000,
+    });
+    if (deleted.exitCode !== 0 || deleted.timedOut) {
+      const reason = redactSensitiveText(deleted.stderr ?? "").trim().slice(-1_024);
+      throw new Error(`runner_remote_provider_artifact_incompatible: stale provider pack could not be replaced (exitCode=${deleted.exitCode}; timedOut=${deleted.timedOut}${reason ? `; ${reason}` : ""})`);
+    }
   }
   await measure("provider_pack.upload", async () => {
     if (archive && await stageProviderPackArchive({
