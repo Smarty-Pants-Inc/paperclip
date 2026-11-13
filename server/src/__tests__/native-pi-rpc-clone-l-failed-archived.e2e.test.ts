@@ -600,7 +600,9 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
         newTask: record(freshOutcome).error ?? record(record(freshOutcome).result) };
       stage("escape: a new task on the same agent", escape.newTask);
       await writeFile(join(root, "escapes.json"), JSON.stringify(escape, null, 2));
-      expect(String(record(plainOutcome).error ?? ""), "the old conversation is stuck").toContain("retained_sandbox_binding");
+      // The old conversation is held (B: the binding refusal; C: the fence's
+      // prior-owner hold after the proven-dead predicate).
+      expect(String(record(plainOutcome).error ?? ""), "the old conversation is held").toMatch(/retained_sandbox_binding|prior_owner_/);
       expect(record(freshOutcome).error, "a new task answers").toBeUndefined();
       expect(record(record(freshOutcome).result).exitCode, "a new task answers").toBe(0);
       return;

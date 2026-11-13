@@ -1,0 +1,71 @@
+{
+  "source": "fork-lead REG-03 real-driver run, REG03_DELAY_MS=45000, fl/reg03-qual a5701149: the stopped run's controller journal (control-plane-state.json commands), unchanged. Side-by-side diagnosis: epyc1 /srv/scratch/paul/tasks/direct/reg03-qual2/artifacts/diagnosis/side-by-side.json",
+  "commands": [
+    {
+      "schema": "paperclip.prp.command.v1",
+      "commandId": "command_lab_ea720c7fac794a478e7670d71f44d036",
+      "controllerSeq": 1,
+      "type": "turn.start",
+      "issuedAt": "2026-11-13T16:02:30.300Z",
+      "payload": {
+        "text": "{\"schema\":\"paperclip.native-model-envelope.v3\",\"requestedSkills\":[],\"task\":{\"identifier\":\"PIL-1\",\"title\":\"Retain the same Pi conversation\",\"prompt\":\"Use Paperclip's request_human_input for durable task questions.\\n\\nCall bash to record an unsaved edit and wait; the board will Stop the tool.\",\"workMode\":\"standard\"},\"executionMode\":\"default\",\"planningContext\":null,\"workspace\":{\"cwd\":\"/srv/scratch/paul/shared-harness/evidence/20261113T160126-a5701149-228453/proof/native-pi-new-sandbox-lease-NqVMJw/simulated-sandbox/workspace\"},\"completionContract\":{\"revision\":\"1\",\"objective\":\"Retain the same Pi conversation\",\"criteria\":[{\"id\":\"objective\",\"requirement\":\"Complete: Retain the same Pi conversation\"}]},\"interactionResponses\":[]}",
+        "turnId": "turn_lab_a2bc361ec4b240feb81b9916c4bc3532"
+      },
+      "status": "completed",
+      "result": {
+        "commandId": "command_lab_ea720c7fac794a478e7670d71f44d036",
+        "commandType": "turn.start",
+        "controllerSeq": 1,
+        "result": {
+          "providerTurnId": "pi-turn-53b15798-8801-45d6-bdc7-a518be900f85",
+          "status": "accepted"
+        },
+        "status": "completed"
+      }
+    },
+    {
+      "schema": "paperclip.prp.command.v1",
+      "commandId": "command_lab_f09147d6808449a68c49d3e733babaf2",
+      "controllerSeq": 2,
+      "type": "turn.interrupt",
+      "issuedAt": "2026-11-13T16:02:31.915Z",
+      "payload": {
+        "threadId": "01a1d5a5-49aa-740d-be72-a991845957b0",
+        "turnId": "pi-turn-53b15798-8801-45d6-bdc7-a518be900f85",
+        "reason": "queued_before_start"
+      },
+      "status": "completed",
+      "result": {
+        "commandId": "command_lab_f09147d6808449a68c49d3e733babaf2",
+        "commandType": "turn.interrupt",
+        "controllerSeq": 2,
+        "result": {
+          "providerTurnId": "pi-turn-53b15798-8801-45d6-bdc7-a518be900f85",
+          "reason": "queued_before_start",
+          "status": "interrupt_requested"
+        },
+        "status": "completed"
+      }
+    },
+    {
+      "schema": "paperclip.prp.command.v1",
+      "commandId": "command_close_drain_ac7a3c978ab64b199d51f73119316cad",
+      "controllerSeq": 3,
+      "type": "runner.drain",
+      "issuedAt": "2026-11-13T16:03:08.273Z",
+      "payload": {},
+      "status": "pending",
+      "result": null
+    },
+    {
+      "schema": "paperclip.prp.command.v1",
+      "commandId": "command_close_suspend_4192da73e8b24324964c35f31214d3c2",
+      "controllerSeq": 4,
+      "type": "runner.suspend",
+      "issuedAt": "2026-11-13T16:03:13.276Z",
+      "payload": {},
+      "status": "pending",
+      "result": null
+    }
+  ]
+}

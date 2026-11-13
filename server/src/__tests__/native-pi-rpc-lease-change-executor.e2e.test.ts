@@ -644,6 +644,14 @@ it.skipIf(!enabled || resumedFrom === "connected")(`Core's idle close or Stop, t
       }
       const outcome = await execution; execution = undefined; activeRunId = undefined;
       await writeFile(join(root, `turn-${index}-outcome.json`), JSON.stringify(outcome, null, 2));
+      if (stopArchived && !holdForStop && record(outcome).error !== undefined) {
+        // Never silent: a message refused behind the Stopped run carries
+        // exactly one held notice (reported with the turn's own verdict below).
+        const held = (await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+          .filter(comment => String(record(comment.metadata).authorizationReason ?? "").startsWith("native_prior_owner_held:"));
+        stage("refused message notices", { error: record(outcome).error, notices: held.length });
+        expect.soft(held, `a refused message carries exactly one held notice: ${JSON.stringify(outcome)}`).toHaveLength(1);
+      }
       const reuse = startupEvents.filter(row => row.runId === next.runId && row.event.eventType === "run.startup.reuse").map(row => row.event.payload);
       await writeFile(join(root, `turn-${index}-startup-reuse.json`), JSON.stringify(reuse, null, 2));
       if (holdForStop) {
