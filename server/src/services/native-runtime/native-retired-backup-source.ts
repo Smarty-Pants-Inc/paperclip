@@ -8,16 +8,8 @@ import { LEGACY_WORKSPACE_RECOVERY_KEY, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from 
 import { readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-workspace-finalization-state.js";
 
-/** Durable run events that prove a provider session did work in a run. */
-export const NATIVE_PROVIDER_DURABLE_EVENT_TYPES = new Set([
-  "harness.ready",
-  "session.started",
-  "session.resumed",
-  "session.updated",
-  "turn.started",
-  "provider.event",
-  "provider.rpc_result",
-]);
+import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-provider-work-proof.js";
+export { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-provider-work-proof.js";
 
 export function nativeHarnessBackupManifestSha256(manifestBytes: Buffer | string): string {
   return `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;

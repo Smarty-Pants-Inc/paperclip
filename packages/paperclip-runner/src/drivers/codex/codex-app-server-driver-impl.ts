@@ -482,7 +482,12 @@ export class CodexAppServerDriver implements HarnessDriver {
           : undefined;
         await cancellation.wait(transport.prepareConversationResume(resumeDirectory
           ? this.#resumeThreadParams(snapshot.driverSessionId, resumeDirectory)
-          : { threadId: snapshot.driverSessionId }));
+          : { threadId: snapshot.driverSessionId },
+          this.#options.driverIdentity?.kind === "pi_rpc"
+            && snapshot.activeTurnId === null
+            && Array.isArray(snapshot.pendingRuntimeRequests) && snapshot.pendingRuntimeRequests.length === 0
+            && snapshot.goal?.status !== "active"
+            ? { allowMissingProviderState: true } : undefined));
       }
       const existing = await cancellation.wait(
         transport.request("thread/read", { threadId: snapshot.driverSessionId, includeTurns: false }),
