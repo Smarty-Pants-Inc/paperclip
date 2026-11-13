@@ -177,12 +177,16 @@ export function createProviderTraceObjectStore(
           signal: capture.signal,
         });
         capture.channels.push({ ...source, writer });
-        const file = await fs.open(source.path, options.restore === false ? "a+" : "w", 0o600);
+        const file = await fs.open(source.path, "a+", 0o600);
         try {
           await file.chmod(0o600);
+          const local = await file.stat();
+          // R-keep-all-traces: an existing non-empty local tail may be the only
+          // copy of raw frames. Restore only into a new or empty file; never
+          // truncate or append an entire object head over an existing capture.
           for (
             let start = 0;
-            options.restore !== false && start < writer.head.end;
+            options.restore !== false && local.size === 0 && start < writer.head.end;
             start += CHUNK_BYTES
           ) {
             await file.write(
