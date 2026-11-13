@@ -58,6 +58,7 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
     stages.push(row); console.log(`[pi-full-server] ${name} ${JSON.stringify(detail)}`);
   };
   const bundles: Bundle[] = [];
+  const runtimeDirectories = new Map<Bundle, string>();
   const requests: Array<{ path: string; model: unknown; lastMessage: unknown; tools: string[] }> = [];
   const scriptedToolCall = process.env.PAPERCLIP_PI_E2E_TOOL_CALL === "1";
   const returnedTools: Array<Record<string, unknown>> = [];
@@ -352,7 +353,11 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
     vi.spyOn(runner, "createRunnerdCodexTransport").mockImplementation(options => {
       stage("transport kind=pi_rpc", { provider: options?.provider, thinking: options?.piRpcThinkingLevel });
       expect(options?.provider).toBe("pi_rpc"); expect(options?.piRpcThinkingLevel).toBe(thinking);
-      const bundle = realFactory(options); bundles.push(bundle); return bundle;
+      expect(options?.stateDirectory, "capture the actual transport's runtime root").toBeTruthy();
+      const bundle = realFactory(options);
+      bundles.push(bundle);
+      runtimeDirectories.set(bundle, options!.stateDirectory!);
+      return bundle;
     });
     app = await createApp(db, {
       uiMode: "none", serverPort: 0, storageService: createStorageService(createLocalDiskStorageProvider(join(root, "storage"))),
@@ -465,8 +470,12 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
     const echoText = typeof echo.content === "string" ? echo.content : JSON.stringify(echo.content);
     expect(echo.is_error).not.toBe(true);
     const procEnvironment = readPiEnvironment();
-    const runtimeContexts = readdirSync(join(root, "runner-state")).map(name => join(root, "runner-state", name, "runtime-context.json"));
-    const runtimeContext = JSON.parse(readFileSync(runtimeContexts[0]!, "utf8"));
+    // Setup scopes, retained evidence and quarantine also live under runner-state.
+    // Bind this read to the observed live Runner, never the first directory entry.
+    const liveBundle = bundles.find(bundle => bundle.transport.processInfo?.()?.pid === pid.runnerPid);
+    const runtimeDirectory = liveBundle && runtimeDirectories.get(liveBundle);
+    expect(runtimeDirectory, "runtime context belongs to the same observed Runner PID").toBeTruthy();
+    const runtimeContext = JSON.parse(readFileSync(join(runtimeDirectory!, "runtime-context.json"), "utf8"));
     const expectedAgentHome = runtimeContext.instructions.workingCopy.rootPath;
     const agentHomeProof = { piPid: pid.piPid, procValue: procEnvironment.AGENT_HOME || "EMPTY", expectedAgentHome, echo: echoText, cwd: workspace, tmpdir: procEnvironment.TMPDIR || "EMPTY" };
     nativeProbeProofs.push({ type: "agent_home", ...agentHomeProof }); stage("AGENT_HOME proc + model bash", agentHomeProof);
