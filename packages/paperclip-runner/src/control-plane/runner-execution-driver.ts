@@ -68,6 +68,13 @@ export interface RunnerExecutionDriver {
   readRunnerState?: () => Promise<Record<string, unknown>>;
   /** Materializes a verified external checkpoint before authority rotation. */
   prepareExternalRunnerState?: () => Promise<void>;
+  /**
+   * A prior external Runner that the controller proved lost: its environment
+   * restarted (so no process survived) and its journal is settled. Authority
+   * rotation may archive this exact identity's unsuspended state; every other
+   * prior state must still be suspended.
+   */
+  lostRunnerSource?: DurableRecoveryIdentity;
   /** Idempotently archives and returns the verified suspended runner binding. */
   archiveExternalRunnerState?: (input: {
     archiveKey: string;
