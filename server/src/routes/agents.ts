@@ -6102,11 +6102,6 @@ export function agentRoutes(
     }
     await assertCanManageAgentLifecycle(req, existing);
 
-    // Approval decisions have only decidedByUserId. Do not invent a board
-    // identity for an agent; pending-hire rejection remains a real user action.
-    if (existing.status === "pending_approval" && req.actor.type === "agent") {
-      throw forbidden("Only a board user can reject a pending hire; agent approval deciders are not supported.");
-    }
     const agent = existing.status === "pending_approval"
       ? (await approvalsSvc.rejectHire(id, req.actor.userId ?? "board"))?.agent
       : await lifecycleForRequest(req, existing).terminateAgent(id);
