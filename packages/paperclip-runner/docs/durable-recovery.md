@@ -322,6 +322,30 @@ That proof also reads the fence's single quarantined copy of the owner's
 state, and accepts a provider restore that failed its own admission once its
 process and process group are gone.
 
+A board Stop cancels the business run, not the Pi conversation. After a
+reusable sandbox lease retires, a plain next message may recover that same
+conversation from a clean mid-turn Stop. Admission binds the saved checkpoint
+to the exact run, agent, task, native session, Runner and physical source lease;
+a new remote Runner records that lease ID rather than its workspace ID.
+The old coordinator must be terminal, result-free and owner-free, with no
+recovery in progress. Both sides of the reusable lease handoff and the
+provider's stopped receipt must agree. The read-only lineage check must prove
+the old Runner, Pi and tools gone and its suspended journal drained.
+
+An interrupted turn does not acquire completed-turn authority. Instead, its
+controller journal must record acceptance of that exact Pi turn and successful
+`turn.interrupt`, followed by drain and suspension. Pi replies to interruption
+only after clearing queued work, stopping owned children, native abort and
+`agent_settled`; an escalated abort fails that command. If the controller has
+already consumed the native `turn.cancelled` frame, suspension retires the
+process. Otherwise admission additionally requires the exact `turn.stop`
+receipt with confirmed provider exit and the settled provider-turn inventory.
+A lifecycle string alone, `pi_abort_escalated`, pending semantic effects,
+unsettled commands, queued events or changed evidence during inspection all
+remain refusals. No failed result is committed and no interrupted input is
+replayed. This is a Pi-only extension of the existing recovery boundary, not
+a new adapter or a replacement-session fallback.
+
 Saved OpenCode and Cursor Cloud provider state binds the digest of its own
 qualified launch profile (command, proxy script and, for OpenCode, the
 executable, each by path and SHA-256). Cursor Cloud does not re-bind. A changed

@@ -200,7 +200,8 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
   const measured = await readStoppedRemotePiSource({ runner: target.runner, remoteCwd: sourceLease.metadata!.remoteCwd as string,
     normalizedSessionId, runnerInstanceId: source.runnerInstanceId! });
   if (!measured || !isQuiescentRetainedPiSource({ owner, runStatus: source.status, terminationReceipt: true, leaseHandoff: true,
-    identity: identity as Record<string, string>, providerSessionId: snapshot.providerSessionId, ...measured })) return false;
+    identity: identity as Record<string, string>, providerSessionId: snapshot.providerSessionId,
+    checkpointRecords: checkpoint.records, ...measured })) return false;
   // Measurements await a remote read. Recheck the exact source and current
   // ownership before accepting them; changed durable bytes keep the refusal.
   const [freshOwner] = await db.select().from(nativeRunFinalizations).where(and(
@@ -212,7 +213,10 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
   const [freshTask] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(and(
     eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
   const sorted = <T extends { id: string }>(rows: T[]) => [...rows].sort((left, right) => left.id.localeCompare(right.id));
-  return nativeSha256(freshOwner) === nativeSha256(owner)
+  const freshCheckpoint = await loadNativeRunnerCheckpoint(db, { companyId: input.companyId, issueId: input.issueId, runId: source.id });
+  const parts = (value: DurablePrpCheckpoint) => [...value.records].sort(([left], [right]) => left.localeCompare(right));
+  return freshCheckpoint !== null && nativeSha256(parts(freshCheckpoint)) === nativeSha256(parts(checkpoint))
+    && nativeSha256(freshOwner) === nativeSha256(owner)
     && nativeSha256(sorted(freshHistory)) === nativeSha256(sorted(history))
     && nativeSha256(sorted(freshRuns)) === nativeSha256(sorted(runs)) && freshTask?.executionRunId === successorRunId;
 }

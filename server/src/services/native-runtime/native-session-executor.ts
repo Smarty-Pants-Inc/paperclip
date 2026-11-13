@@ -15858,6 +15858,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const effectiveEnvironmentLeaseId =
     (pluginTask ? remoteTarget?.leaseId : undefined) ?? durableBinding?.environmentLeaseId ??
     input.durableEnvironmentLeaseId ??
+    remoteTarget?.leaseId ??
     input.execution.binding.executionWorkspaceId;
   mkdirSync(root, { recursive: true, mode: 0o700 });
   function readDurableState() {
