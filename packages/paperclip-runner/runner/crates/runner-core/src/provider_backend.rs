@@ -3401,10 +3401,7 @@ impl CodexCommandExecutor {
         let completion_contract = completion_contract(payload)?;
         let tool_set = authorized_tool_set(payload)?;
         if let Some(state) = self.state.as_mut() {
-            if state.config != config
-                || state.completion_contract != completion_contract
-                || (config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context)
-            {
+            if state.config != config || state.completion_contract != completion_contract {
                 return Err(DurableRunnerError::invalid(
                     "Codex provider or completion contract changed across the durable run",
                 ));
@@ -3452,7 +3449,7 @@ impl CodexCommandExecutor {
                 DurableRunnerError::invalid(format!("run.prepare tool contract rejected: {error}"))
             })?;
             let mut state = CodexProviderState::new(config, completion_contract, tool_bridge);
-            state.pi_runtime_context = pi_runtime_context;
+            state.pi_runtime_context = pi_runtime_context.clone();
             state.pi_launch_profile_digest = pi_launch_profile_digest;
             state.opencode_launch_profile_digest = opencode_launch_profile_digest;
             state.opencode_release_digest = self.opencode_release_digest(&state.config);
@@ -3460,11 +3457,65 @@ impl CodexCommandExecutor {
             self.state = Some(state);
             self.save_state()?;
         }
+        if self.state.as_ref().is_some_and(|state| {
+            state.config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context
+        }) {
+            let state = self.state.as_ref().expect("prepared state exists");
+            let goal_active = self.provider.is_some()
+                && state
+                    .goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.status == "active");
+            if state.lifecycle == "reconciliation_required"
+                || state.active_provider_turn_id.is_some()
+                || state.ambiguous_turn_start_pending
+                || state.tool_bridge.pending_calls().next().is_some()
+                || goal_continues_after_turn(state, goal_active)
+                || self
+                    .provider
+                    .as_ref()
+                    .is_some_and(|provider| !provider.run_attachment_live_work().is_empty())
+            {
+                return Err(DurableRunnerError::invalid(
+                    "run.prepare Pi context refresh requires a settled provider session",
+                ));
+            }
+            if let Some(provider) = self.provider.as_mut() {
+                let (accounting, drained) =
+                    provider.drain_completed_turn_tail_for_warm_attachment();
+                self.persist_completed_accounting_tail(accounting, drained.is_err())?;
+                drained.map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to checkpoint Pi context refresh: {error}"
+                    ))
+                })?;
+            }
+            // Context is run-scoped, not an immutable provider profile. Reuse
+            // run.attach's cold checkpoint path so startup skills are reloaded
+            // while the Pi session/thread and completion authority stay intact.
+            self.checkpoint_provider_for_run_refresh()?;
+            let state = self.state.as_mut().expect("prepared state exists");
+            state.pi_runtime_context = pi_runtime_context;
+            state.lifecycle = "prepared".to_owned();
+            self.save_state()?;
+        }
         Ok(CommandExecution::result(json!({
             "status": "prepared",
             "provider": provider_name,
             "driver": driver,
         })))
+    }
+
+    fn checkpoint_provider_for_run_refresh(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(provider) = self.provider.as_mut() {
+            provider.shutdown().map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to checkpoint Codex before attaching a new run: {error}"
+                ))
+            })?;
+        }
+        self.provider = None;
+        Ok(())
     }
 
     fn ensure_provider(&mut self) -> Result<&mut CodexProvider, DurableRunnerError> {
@@ -3914,14 +3965,7 @@ impl CodexCommandExecutor {
             Err(error) => return Err(error),
         };
         if !retained_provider {
-            if let Some(provider) = self.provider.as_mut() {
-                provider.shutdown().map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to checkpoint Codex before attaching a new run: {error}"
-                    ))
-                })?;
-            }
-            self.provider = None;
+            self.checkpoint_provider_for_run_refresh()?;
         }
         // Pending facts remain owned by their original authority. The runner
         // must commit this retained FIFO before rotating authority; only the
@@ -7967,6 +8011,222 @@ done
         restored.restore().unwrap();
         assert!(restored.provider.is_none());
         (directory, restored, payload)
+    }
+
+    #[test]
+    fn pi_prepare_refreshes_runtime_context_without_replacing_the_durable_conversation() {
+        // Keep reason: production run 25bba118 could not resume after a SKILL.md PUT.
+        for context in [
+            json!({
+                "runId": "fresh-run",
+                "instructions": {"text": "updated company instructions"},
+                "skills": [{"name": "smarty-base", "digest": "updated-skill"}],
+            }),
+            Value::Null,
+        ] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            payload["completionContract"] = json!({
+                "revision": "existing-contract", "criterionIds": ["objective"],
+            });
+            executor.state.as_mut().unwrap().completion_contract =
+                completion_contract(&payload).unwrap();
+            executor.save_state().unwrap();
+            let before = executor.state.as_ref().unwrap().clone();
+            payload["provider"]["runtimeContext"] = context.clone();
+            executor
+                .prepare(&payload)
+                .expect("a changed Pi runtime context must refresh, not refuse the durable run");
+            let saved: CodexProviderState =
+                serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+            let mut expected = before;
+            expected.pi_runtime_context = context;
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+            );
+            let mut restored = CodexCommandExecutor::new(&directory);
+            restored.pi_launch_profile = executor.pi_launch_profile.clone();
+            restored.restore().unwrap();
+            assert_eq!(
+                restored.state.as_ref().unwrap().pi_runtime_context,
+                expected.pi_runtime_context
+            );
+            assert_eq!(
+                restored.state.as_ref().unwrap().thread_id.as_deref(),
+                Some("stopped-thread")
+            );
+            assert!(restored.provider.is_none());
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_prepare_runtime_context_refresh_still_refuses_config_and_completion_contract_changes() {
+        for changed_field in ["instructions", "model", "completionContract"] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            let before = fs::read(executor.state_path()).unwrap();
+            let before_state = serde_json::to_value(executor.state.as_ref().unwrap()).unwrap();
+            payload["provider"]["runtimeContext"] = json!({"runId": "fresh-run"});
+            match changed_field {
+                "completionContract" => {
+                    payload["completionContract"] = json!({
+                        "revision": "new-contract", "criterionIds": ["objective"],
+                    })
+                }
+                "model" => payload["provider"]["model"] = json!("other/model"),
+                _ => payload["provider"]["instructions"] = json!("changed immutable config"),
+            }
+            let error = executor.prepare(&payload).expect_err(
+                "runtime context refresh cannot relax the upstream config/contract guards",
+            );
+            assert!(
+                error.to_string().contains(
+                    "Codex provider or completion contract changed across the durable run"
+                ),
+                "{changed_field}: {error}"
+            );
+            assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(executor.state.as_ref().unwrap()).unwrap(),
+                before_state
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn pi_prepare_runtime_context_refresh_does_not_rebind_unsettled_work() {
+        for ambiguous in [false, true] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+            let state = executor.state.as_mut().unwrap();
+            state.lifecycle = "turn_active".to_owned();
+            if ambiguous {
+                state.lifecycle = "session_open".to_owned();
+                state.ambiguous_turn_start_pending = true;
+            } else {
+                state.active_provider_turn_id = Some("active-turn".to_owned());
+            }
+            executor.save_state().unwrap();
+            let before = fs::read(executor.state_path()).unwrap();
+            payload["provider"]["runtimeContext"] = json!({"runId": "fresh-run"});
+            let error = executor
+                .prepare(&payload)
+                .expect_err("live work cannot be rebound");
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires a settled provider session"),
+                "{error}"
+            );
+            assert_eq!(fs::read(executor.state_path()).unwrap(), before);
+            assert_eq!(
+                executor.state.as_ref().unwrap().pi_runtime_context,
+                json!({"runId": "original-run"})
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_prepare_refresh_retires_the_settled_process_and_launches_with_the_new_context() {
+        let (directory, mut executor, mut payload) = prepared_skill_checkpoint("pi_rpc", true);
+        let requests = directory.join("requests.jsonl");
+        let proxy = directory.join("proxy.sh");
+        fs::write(&proxy, format!(r#"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{}'
+  id=${{line#*\"id\":}}; id=${{id%%,*}}
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"thread/resume"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"stopped-thread","sessionId":"saved-pi-session"}}}}}}\n' "$id" ;;
+    *'"method":"thread/read"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"stopped-thread","turns":[]}}}}}}\n' "$id" ;;
+    *'"method":"turn/start"'*) printf '{{"id":%s,"result":{{"turn":{{"id":"fresh-turn"}}}}}}\n' "$id" ;;
+    *'"id":'*) printf '{{"id":%s,"result":true}}\n' "$id" ;;
+  esac
+done
+"#, requests.display())).unwrap();
+        let artifact = |path: PathBuf| crate::durable::QualifiedLaunchArtifact {
+            sha256: format!("sha256:{:x}", Sha256::digest(fs::read(&path).unwrap())),
+            path,
+        };
+        let command = fs::canonicalize("/bin/sh").unwrap();
+        executor.pi_launch_profile = Some(OpenCodeLaunchProfile {
+            command: artifact(command.clone()),
+            proxy_script: artifact(proxy.clone()),
+            executable: artifact(fs::canonicalize("/bin/true").unwrap()),
+        });
+        let state = executor.state.as_mut().unwrap();
+        state.config.command = command;
+        state.config.args = vec![proxy.to_string_lossy().into_owned()];
+        let config = state.config.clone();
+        payload["provider"] = serde_json::to_value(&config).unwrap();
+        payload["provider"]["runtimeContext"] = json!({"runId": "original-run"});
+        let digest = executor.bind_pi_launch_profile(&config).unwrap();
+        executor.state.as_mut().unwrap().pi_launch_profile_digest = digest;
+        executor.save_state().unwrap();
+        let old_pid = executor.ensure_provider().unwrap().process_id();
+        assert_eq!(
+            executor
+                .state
+                .as_ref()
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("saved-pi-session")
+        );
+        executor
+            .prepare(&payload)
+            .expect("unchanged context keeps the existing process");
+        assert_eq!(executor.provider.as_ref().unwrap().process_id(), old_pid);
+        let context = json!({"runId": "fresh-run", "skills": [{"name": "updated-company-skill"}]});
+        payload["provider"]["runtimeContext"] = context.clone();
+        executor
+            .prepare(&payload)
+            .expect("context refresh must checkpoint the settled Pi process");
+        assert!(
+            executor.provider.is_none(),
+            "the old Pi process must not retain stale startup skills"
+        );
+        assert!(local_process_definitely_gone(old_pid, false));
+        let saved = executor.state.as_ref().unwrap();
+        assert_eq!(saved.lifecycle, "prepared");
+        assert_eq!(saved.pi_runtime_context, context);
+        assert_eq!(saved.thread_id.as_deref(), Some("stopped-thread"));
+        let next_provider = executor.ensure_provider().unwrap();
+        assert_ne!(next_provider.process_id(), old_pid);
+        assert_eq!(next_provider.thread_id(), "stopped-thread");
+        assert_eq!(
+            next_provider.provider_session_id(),
+            Some("saved-pi-session")
+        );
+        next_provider
+            .start_turn_with_options_and_effort(
+                "Recall our earlier conversation",
+                &config.cwd,
+                CodexTurnOptions::default(),
+                None,
+                Some("fresh-run"),
+            )
+            .unwrap();
+        next_provider.shutdown().unwrap();
+        let frames = fs::read_to_string(&requests)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let turn = frames
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(turn["params"]["runtimeContext"], context);
+        assert_eq!(turn["params"]["paperclipRunId"], "fresh-run");
+        assert_eq!(turn["params"]["threadId"], "stopped-thread");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
