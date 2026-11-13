@@ -1017,13 +1017,22 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     assignedConnectionIds.has(tool.connectionId),
   );
   const service = createToolGatewayService(input.db);
+  // Health/disable exclusions must be visible in the run, not just an empty
+  // assignment digest. Never include endpoint config, credentials or raw errors.
+  const unavailableConnections = resolvedInstalledConnections
+    .filter(connection => permittedConnectionIds.has(connection.id) && !assignedConnectionIds.has(connection.id) &&
+      (connection.transport === "mcp_remote" || connection.transport === "local_stdio" || isBrowserUseConnection(connection) || restConnectorFor(connection) || githubBotConnectionIds.has(connection.id) || spekoConnectionIds.has(connection.id)))
+    .map(({ id, name, enabled, status, healthStatus }) => ({ id, name, enabled, status, healthStatus }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const deliveryDiagnostic = {
+    companyId: input.agent.companyId,
+    agentId: input.agent.id,
+    runId: input.runId,
+    permittedNotInstalledConnections,
+    unavailableConnections,
+  };
   if (assignedConnections.length === 0) {
-    await service.recordRuntimeMcpDeliveryDiagnostic({
-      companyId: input.agent.companyId,
-      agentId: input.agent.id,
-      runId: input.runId,
-      permittedNotInstalledConnections,
-    });
+    await service.recordRuntimeMcpDeliveryDiagnostic(deliveryDiagnostic);
     return [];
   }
   const assignment = {
@@ -1041,6 +1050,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     input.expectedAssignmentDigest !== undefined &&
     input.expectedAssignmentDigest !== assignmentDigest
   ) {
+    await service.recordRuntimeMcpDeliveryDiagnostic({ ...deliveryDiagnostic, assignmentChanged: true });
     return [];
   }
   const profileKey = `native:${input.agent.id}:${assignmentDigest}`;
@@ -1229,6 +1239,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     actor: { agentId: input.agent.id },
   });
 
+  await service.recordRuntimeMcpDeliveryDiagnostic({ ...deliveryDiagnostic, deliveredServerCount: 1 });
   return [
     {
       name: ASSIGNED_MCP_SERVER_NAME,
