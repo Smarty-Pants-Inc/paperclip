@@ -3,7 +3,7 @@ import { appendFile, mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { companies, companySecrets, companySecretBindings, environments, plugins, secretAccessEvents, createDb } from "@paperclipai/db";
+import { agents, companies, companySecrets, companySecretBindings, companySecretVersions, environments, heartbeatRuns, issues, plugins, secretAccessEvents, createDb } from "@paperclipai/db";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { resolveEnvironmentDriverConfigForRuntime } from "../services/environment-config.js";
 import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
@@ -118,16 +118,42 @@ suite("warm secret resolution (real PostgreSQL lock boundary)", () => {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Transaction audit", issuePrefix: `T${companyId.slice(0, 6)}` });
     const secret = await secretService(db).create(companyId, { name: "transaction-key", provider: "local_encrypted", value: "synthetic-transaction-value" });
+    const [environment] = await db.insert(environments).values({ name: `Transaction ${randomUUID()}`, driver: "sandbox", config: { provider: "fake" } }).returning();
+    await secretService(db).createBinding({ companyId, secretId: secret.id, targetType: "environment", targetId: environment.id, configPath: "apiKey" });
     await expect(db.transaction(async tx => {
       expect(await secretService(tx).resolveSecretValue(companyId, secret.id, "latest", {
         accessContext: { consumerType: "system", consumerId: "transaction", actorType: "system" },
       })).toBe("synthetic-transaction-value");
+      expect(await secretService(tx).resolveSecretValueForEnvironmentRuntime(companyId, secret.id, {
+        consumerType: "environment", consumerId: environment.id, configPath: "apiKey", actorType: "system",
+      }, "transaction-revision")).toBe("synthetic-transaction-value");
       const events = await tx.select().from(secretAccessEvents).where(eq(secretAccessEvents.secretId, secret.id));
-      expect(events).toHaveLength(1);
+      expect(events).toHaveLength(2);
       throw new Error("rollback-test");
     })).rejects.toThrow("rollback-test");
     await flushSecretResolutionWrites(db);
     expect(await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.secretId, secret.id))).toHaveLength(0);
+  });
+
+  it("audits missing and cross-company identity failures without invalid foreign keys or leaked metadata", async () => {
+    const companyId = randomUUID();
+    const foreignCompanyId = randomUUID();
+    await db.insert(companies).values([
+      { id: companyId, name: "Denied identity", issuePrefix: `D${companyId.slice(0, 6)}` },
+      { id: foreignCompanyId, name: "Foreign identity", issuePrefix: `F${foreignCompanyId.slice(0, 6)}` },
+    ]);
+    const service = secretService(db);
+    const foreignSecret = await service.create(foreignCompanyId, { name: "foreign-key", provider: "local_encrypted", value: "synthetic-foreign-value" });
+    const context = { consumerType: "environment" as const, consumerId: randomUUID(), configPath: "apiKey", actorType: "user" as const, actorId: "audit-test-user" };
+    await expect(service.resolveSecretValueForEnvironmentRuntime(companyId, randomUUID(), context, "missing")).rejects.toThrow("Secret not found");
+    await expect(service.resolveSecretValueForEnvironmentRuntime(companyId, foreignSecret.id, context, "foreign")).rejects.toThrow("same company");
+    await flushSecretResolutionWrites(db);
+    const recorded = await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.companyId, companyId));
+    expect(recorded).toHaveLength(2);
+    expect(recorded.every(event => event.secretId === null && event.version === null && event.provider === "unknown" &&
+      event.outcome === "failure" && event.consumerId === context.consumerId && event.configPath === "apiKey" &&
+      event.actorType === "user" && event.actorId === "audit-test-user")).toBe(true);
+    expect(JSON.stringify(recorded)).not.toContain(foreignSecret.id);
   });
 
   it("100 concurrent Boat-style config calls resolve once; rotation/config changes invalidate and revocation fails closed", async () => {
@@ -151,12 +177,26 @@ suite("warm secret resolution (real PostgreSQL lock boundary)", () => {
     }).returning();
     await service.createBinding({ companyId, secretId: secret.id, targetType: "environment", targetId: environment.id, configPath: "apiKey" });
     const providerResolve = vi.spyOn(localEncryptedProvider, "resolveVersion");
-    const call = () => resolveEnvironmentDriverConfigForRuntime(db, companyId, { ...environment, driver: "sandbox" });
-    const configs = await Promise.all(Array.from({ length: 100 }, call));
+    const [agent] = await db.insert(agents).values({ companyId, name: "Audit consumer" }).returning();
+    const [issue] = await db.insert(issues).values({ companyId, title: "Provider audit context" }).returning();
+    const runs = await db.insert(heartbeatRuns).values(Array.from({ length: 100 }, () => ({ companyId, agentId: agent.id }))).returning();
+    const call = (heartbeatRunId?: string) => resolveEnvironmentDriverConfigForRuntime(db, companyId, { ...environment, driver: "sandbox" }, {
+      issueId: issue.id, heartbeatRunId: heartbeatRunId ?? runs[0].id,
+    });
+    const configs = await Promise.all(runs.map(run => call(run.id)));
     for (const config of configs) expect(config.config).toMatchObject({ apiKey: "synthetic-boat-v1" });
     expect(providerResolve).toHaveBeenCalledTimes(1);
     await flushSecretResolutionWrites(db);
-    expect(await service.listAccessEvents(companyId, secret.id)).toHaveLength(1);
+    const events = await service.listAccessEvents(companyId, secret.id);
+    expect(events).toHaveLength(100);
+    expect(new Set(events.map(event => event.heartbeatRunId))).toEqual(new Set(runs.map(run => run.id)));
+    expect(events.every(event => event.consumerType === "environment" && event.consumerId === environment.id &&
+      event.configPath === "apiKey" && event.issueId === issue.id && event.actorType === "system" && event.actorId === null &&
+      event.outcome === "success" && event.version === 1 && event.provider === "local_encrypted")).toBe(true);
+    // An already-filled cache hit also owns a fresh event, not the fill's run.
+    await call(runs[99].id);
+    expect(providerResolve).toHaveBeenCalledTimes(1);
+    expect(await service.listAccessEvents(companyId, secret.id)).toHaveLength(101);
     await service.rotate(secret.id, { value: "synthetic-boat-v2" });
     expect((await call()).config).toMatchObject({ apiKey: "synthetic-boat-v2" });
     expect(providerResolve).toHaveBeenCalledTimes(2);
@@ -166,10 +206,27 @@ suite("warm secret resolution (real PostgreSQL lock boundary)", () => {
     await service.update(secret.id, { description: "metadata invalidation" });
     await call();
     expect(providerResolve).toHaveBeenCalledTimes(4);
+    environment.config = { ...environment.config, image: "test:provider-failure" };
+    providerResolve.mockRejectedValueOnce(new Error("synthetic-provider-failure-must-not-enter-audit"));
+    await expect(call(runs[3].id)).rejects.toThrow("synthetic-provider-failure");
+    expect(providerResolve).toHaveBeenCalledTimes(5);
+    await db.update(companySecretVersions).set({ revokedAt: new Date() }).where(eq(companySecretVersions.secretId, secret.id));
+    await expect(call(runs[1].id)).rejects.toThrow("Secret version is not active");
+    await db.update(companySecretVersions).set({ revokedAt: null }).where(eq(companySecretVersions.secretId, secret.id));
     await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, secret.id));
-    await expect(call()).rejects.toThrow();
-    expect(providerResolve).toHaveBeenCalledTimes(4);
-    await recordEvidence({ providerCalls: 100, initialSecretResolutions: 1, rotationInvalidated: true, configInvalidated: true, metadataInvalidated: true, revokedBindingRejected: true });
+    await expect(call(runs[2].id)).rejects.toThrow();
+    expect(providerResolve).toHaveBeenCalledTimes(5);
+    const allEvents = await service.listAccessEvents(companyId, secret.id);
+    expect(allEvents).toHaveLength(107);
+    expect(JSON.stringify(allEvents)).not.toContain("synthetic-provider-failure-must-not-enter-audit");
+    const failures = allEvents.filter(event => event.outcome === "failure");
+    expect(failures).toHaveLength(3);
+    expect(new Set(failures.map(event => event.heartbeatRunId))).toEqual(new Set([runs[1].id, runs[2].id, runs[3].id]));
+    expect(failures.every(event => event.consumerId === environment.id && event.configPath === "apiKey" && event.issueId === issue.id)).toBe(true);
+    expect(failures.some(event => event.errorCode === "version_inactive")).toBe(true);
+    await recordEvidence({ providerCalls: 100, initialSecretResolutions: 1, initialAuditEvents: events.length, distinctRunContexts: 100,
+      rotationInvalidated: true, configInvalidated: true, metadataInvalidated: true, revokedVersionRejected: true,
+      revokedBindingRejected: true, filledCacheHitAudited: true, providerFailureAudited: true, failureEvents: failures.length });
     providerResolve.mockRestore();
     await flushSecretResolutionWrites(db);
   });

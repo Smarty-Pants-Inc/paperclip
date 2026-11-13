@@ -56,6 +56,68 @@ describe("deferred secret resolution writes (audit data safety)", () => {
     await flushSecretResolutionWrites(db);
     expect(recorded).toHaveLength(20);
   });
+  it.each(["stalled", "failing"])("backpressures at 10,000 pending records while INSERTs are %s, then delivers every event", async mode => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    let recovered = false;
+    const recorded: Array<Record<string, unknown>> = [];
+    const { db } = fakeDb(async rows => {
+      if (!recovered) {
+        if (mode === "failing") throw new Error("offline");
+        await blocked;
+      }
+      recorded.push(...rows);
+    });
+    let admitted = 0;
+    const producers = Array.from({ length: 10_050 }, (_, i) =>
+      Promise.resolve(enqueueSecretAccessEvent(db, { ...event, consumerId: `call-${i}` })).then(() => { admitted++; }));
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(admitted, "full queue must hold producers instead of growing or dropping events").toBe(10_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(admitted).toBe(10_000);
+      expect(recorded).toHaveLength(0);
+    } finally {
+      recovered = true;
+      release();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.all(producers);
+      await flushSecretResolutionWrites(db);
+    }
+    expect(admitted).toBe(10_050);
+    expect(recorded).toHaveLength(10_050);
+    expect(new Set(recorded.map(row => row.id)).size).toBe(10_050);
+    expect(new Set(recorded.map(row => row.consumerId)).size).toBe(10_050);
+  });
+  it("bounds usage touches and audit rows together without dropping either obligation", async () => {
+    vi.useFakeTimers();
+    let recovered = false;
+    const recorded: Array<Record<string, unknown>> = [];
+    const { db, update } = fakeDb(async rows => { recorded.push(...rows); });
+    const touched = new Set<string>();
+    update.mockImplementation(() => ({ set: () => ({ where: async () => {
+      if (!recovered) throw new Error("offline");
+      touched.add(String(update.mock.calls.length));
+    } }) }));
+    let admitted = 0;
+    const producers = Array.from({ length: 10_000 }, (_, i) =>
+      Promise.resolve(enqueueSecretLastResolvedAt(db, { id: `secret-${i}`, lastResolvedAt: null })).then(() => { admitted++; }));
+    producers.push(Promise.resolve(enqueueSecretAccessEvent(db, event)).then(() => { admitted++; }));
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(admitted).toBe(10_000);
+      expect(recorded).toHaveLength(0);
+    } finally {
+      recovered = true;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await Promise.all(producers);
+      await flushSecretResolutionWrites(db);
+    }
+    expect(recorded).toHaveLength(1);
+    expect(touched.size).toBe(10_000);
+    expect(admitted).toBe(10_001);
+  });
   it("shutdown drain remains pending after both INSERT attempts fail, then awaits the scheduled recovery", async () => {
     vi.useFakeTimers();
     let fail = true;

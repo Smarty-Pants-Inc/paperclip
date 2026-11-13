@@ -24,13 +24,18 @@ provider credentials.
 - Each failed write is logged without its raw SQL/provider error and retried
   once immediately. A second failure retains the whole batch, propagates from
   explicit flush, and establishes a new one-second recovery deadline. Records
-  are removed from memory only after confirmed insertion. There is no sampling
-  or maximum-count truncation; a prolonged database outage can grow the queue.
+  are removed from memory only after confirmed insertion. Events plus advisory
+  touches (including in-flight writes) share a 10,000-record per-DB capacity.
+  At capacity, enqueuers await space released by successful writes and recheck
+  capacity before admitting a record; failures retain the backlog and existing
+  recovery deadline. There is no sampling, truncation or dropping on overload.
+  Waiting producers retain their obligations and cannot finish resolution until
+  admitted; this bounds the queue, not the number of upstream requests.
 - Usage timestamps are advisory. A process-wide per-DB debounce queues no more
   than one touch per secret per hour. The eventual conditional UPDATE also
   requires `last_resolved_at IS NULL` or a value older than one hour, including
   across processes. It does **not** change `updated_at`. No usage UPDATE or
-  audit INSERT is awaited by ordinary runtime resolution.
+  audit INSERT is awaited below capacity; overloaded resolution waits for space.
 - Pending writes hold the existing idle-work admission blocker. No pending
   writes means no deadline, SQL or network activity. Server shutdown stops its
   producers first, then awaits the queue before closing DB clients. The drain
@@ -44,6 +49,8 @@ provider credentials.
 
 This is an in-process queue, not a durable outbox. SIGKILL, host loss or an
 external shutdown deadline that kills the process can lose unflushed events.
+The accepted trade-off is normally up to about one second of rows; backpressure
+bounds their count, not their age during a database outage.
 Deployments requiring crash-durable audit delivery need a durable outbox;
 this change does not claim that property.
 
@@ -64,8 +71,13 @@ current provider-vault metadata. Thus rotation, secret metadata/status changes,
 provider-vault changes, binding revocation and environment config changes
 invalidate without waiting for TTL,
 even when the write happened in another process. These are ordinary SELECTs,
-not row locks. Cache hits do not re-resolve or create another resolution audit;
-one fill produces one event. A failed fill is evicted, and a stale failure
+not row locks. Cache hits do not re-resolve the provider but every handoff,
+including every waiter on a shared fill, queues its own access event with that
+call's environment, config path, issue/run and actor context. Validation and
+provider failures likewise queue one failure event per caller. The owning
+secret service keeps validation, cache access and audit in one boundary; shared
+fills emit no additional event. Caller-owned transactions bypass this cache and
+retain synchronous atomic auditing. A failed fill is evicted, and a stale failure
 cannot evict a newer revision. Secret material is held only in the server heap
 and is never added to keys, logs or persisted configs.
 
@@ -76,13 +88,16 @@ encrypted provider to prove 20 resolves complete while the secret row is locked,
 and that a locked audit table does not delay resolution. After explicit flush it
 requires exactly 20 distinct audit records, one usage UPDATE across the debounce
 window, and unchanged `updatedAt`. The same suite exercises the real sandbox
-config resolver 100 times concurrently, requires one provider resolution, then
-checks rotation, config/metadata invalidation and binding revocation.
+config resolver 100 times concurrently, requires one provider resolution and
+100 events with distinct run contexts, then checks rotation, config/metadata
+invalidation, version revocation and binding revocation with failure auditing.
 
 The queue and cache suites cover TTL, failure eviction, ambiguous-commit retry,
 retained counts after both write attempts fail, records arriving during flush,
 shutdown recovery, caller-owned transaction rollback, one-second/100-event
-batching and quiet settled state.
+batching and quiet settled state. Stalled and failed INSERT tests hold 10,050
+producers at 10,000 admitted records, then require all unique events on recovery;
+a mixed touch/audit test proves the shared capacity also bounds usage metadata.
 These are data-safety and recorded warm-turn row-contention regressions. They
 are not a claim of a deployed Boat wake-to-start latency improvement; that must
 be measured on the real company after the candidate is integrated.

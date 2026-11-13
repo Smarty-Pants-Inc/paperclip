@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createHash, randomUUID } from "node:crypto";
-import { resolveCachedEnvironmentProviderSecret } from "./environment-provider-secret-cache.js";
+import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import type {
   Environment,
@@ -331,24 +330,11 @@ async function resolveConfigSecretRefsForRuntime(input: {
       heartbeatRunId: input.context.heartbeatRunId ?? null,
       configPath: path,
     };
-    // Existing metadata-only identity validation checks the live binding,
-    // scope/status and version revocation on EVERY call, including cache hits.
-    // DB-backed revisions invalidate across processes, not only local writers.
-    const [identity, metadata] = await Promise.all([
-      secrets.resolveSecretVersionIdentity(input.companyId, trimmed, "latest", context),
-      secrets.getById(trimmed),
-    ]);
-    if (!metadata || metadata.scope !== "company") throw unprocessable("Environment secrets must be company-scoped");
-    const providerConfig = metadata.providerConfigId ? await secrets.getProviderConfigById(metadata.providerConfigId) : null;
-    const revision = createHash("sha256").update(JSON.stringify([
-      input.config, input.schema, identity, metadata.updatedAt, metadata.providerConfigId, providerConfig,
-    ])).digest("hex");
-    nextConfig = writeConfigValueAtPath(nextConfig, path, await resolveCachedEnvironmentProviderSecret({
-      db: input.db,
-      key: JSON.stringify([input.companyId, input.context.consumerId, path, trimmed]),
-      revision,
-      resolve: () => secrets.resolveSecretValue(input.companyId, trimmed, "latest", context),
-    }));
+    // The owning secret service audits every handoff and failed validation,
+    // independently of whether this caller shares a provider-cache fill.
+    nextConfig = writeConfigValueAtPath(nextConfig, path,
+      await secrets.resolveSecretValueForEnvironmentRuntime(input.companyId, trimmed, context,
+        JSON.stringify([input.config, input.schema])));
   }
   return nextConfig;
 }
