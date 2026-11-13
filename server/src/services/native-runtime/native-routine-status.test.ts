@@ -1,7 +1,7 @@
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { agentWakeupRequests, agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issueRelations, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, pluginManagedResources, plugins, routineRuns, routines, statusDecisionEffects, statusDecisions, workAssessments } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -16,11 +16,17 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
 (support.supported ? describe : describe.skip)("native routine history status projection", () => {
   let db: ReturnType<typeof createDb>, database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   const companyId = randomUUID(), agentId = randomUUID();
+  let resetAgentPermissions = false;
   beforeAll(async () => {
     if (!external) database = await startEmbeddedPostgresTestDatabase("native-routine-status-"); db = createDb(external ?? database.connectionString, { maxConnections: 6 });
     await db.insert(companies).values({ id: companyId, name: "Routine status fixture", issuePrefix: "NRS" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Routine worker", adapterType: "paperclip_runner", status: "running" });
   }, 60_000);
+  afterEach(async () => {
+    if (!resetAgentPermissions) return;
+    await db.update(agents).set({ permissions: {} }).where(eq(agents.id, agentId));
+    resetAgentPermissions = false;
+  });
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
   async function seed(mode = "matching") {
     let issueId: string = randomUUID(), invocationId: string = randomUUID();
@@ -73,6 +79,61 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
     expect(saved.completedAt !== null).toBe(status !== "in_progress");
     const replay = await commit(f, status); expect(replay.replayed).toBe(true); expect(replay.decision.id).toBe(first.decision.id);
     expect((await db.select().from(routineRuns).where(eq(routineRuns.id, f.invocationId)))[0]).toEqual(saved);
+  });
+  it.each(["blocked", "cancelled"] as const)("relays a native low-trust %s child result and wakes its assigned parent once", async status => {
+    const f = await seed("ordinary");
+    resetAgentPermissions = true;
+    await db.update(agents).set({ permissions: {
+      trustPreset: "low_trust_review",
+      authorizationPolicy: { trustBoundary: {
+        mode: "low_trust_review", companyId, rootIssueId: f.issueId,
+      } },
+    } }).where(eq(agents.id, agentId));
+    const parentAgentId = randomUUID(), parentId = randomUUID();
+    await db.insert(agents).values({ id: parentAgentId, companyId, name: "Parent owner", adapterType: "process", status: "active" });
+    await db.insert(issues).values({ id: parentId, companyId, title: "Parent task", status: "in_progress", assigneeAgentId: parentAgentId });
+    await db.update(issues).set({ parentId }).where(eq(issues.id, f.issueId));
+
+    const committed = await commit(f, status);
+    const relays = await db.select().from(issueComments).where(eq(issueComments.issueId, parentId));
+    expect(relays).toHaveLength(1);
+    expect(relays[0]).toMatchObject({
+      authorType: "system",
+      body: expect.stringContaining(`transitioned to \`${status}\``),
+    });
+    expect(relays[0]?.body).toContain(f.issueId);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, parentAgentId));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({
+      reason: "issue_commented",
+      payload: expect.objectContaining({
+        issueId: parentId,
+        commentId: relays[0]!.id,
+        _paperclipWakeContext: expect.objectContaining({
+          wakeCommentId: relays[0]!.id,
+          source: "native_status_decision",
+          statusDecisionSource: "native_status_decision",
+          childIssueId: f.issueId,
+          childStatus: status,
+        }),
+      }),
+    });
+
+    expect((await commit(f, status)).replayed).toBe(true);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, parentId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, parentAgentId))).toHaveLength(1);
+    expect(committed.replayed).toBe(false);
+  });
+  it("does not relay a native standard-trust blocked child result", async () => {
+    const f = await seed("ordinary");
+    const parentAgentId = randomUUID(), parentId = randomUUID();
+    await db.insert(agents).values({ id: parentAgentId, companyId, name: "Parent owner", adapterType: "process", status: "active" });
+    await db.insert(issues).values({ id: parentId, companyId, title: "Parent task", status: "in_progress", assigneeAgentId: parentAgentId });
+    await db.update(issues).set({ parentId }).where(eq(issues.id, f.issueId));
+
+    await commit(f, "blocked");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, parentId))).toEqual([]);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, parentAgentId))).toEqual([]);
   });
   it("retains the native decision author when requesting a protected agent reviewer", async () => {
     const f = await seed(), reviewer = randomUUID();
