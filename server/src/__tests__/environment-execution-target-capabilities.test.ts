@@ -49,6 +49,7 @@ async function buildSandboxTarget(input: {
   config?: Record<string, unknown>;
   // Reject the capability resolution to exercise the fail-closed error path.
   rejectResolution?: boolean;
+  readPredecessorSandboxRecord?: EnvironmentRuntimeService["readPredecessorSandboxRecord"];
 }) {
   mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
     driver: "sandbox",
@@ -65,6 +66,7 @@ async function buildSandboxTarget(input: {
   });
   const environmentRuntime = {
     execute,
+    ...(input.readPredecessorSandboxRecord ? { readPredecessorSandboxRecord: input.readPredecessorSandboxRecord } : {}),
     supportsSync: () => input.supportsSync,
     syncIn: vi.fn(),
     syncOut: vi.fn(),
@@ -96,6 +98,23 @@ async function buildSandboxTarget(input: {
 describe("resolveEnvironmentExecutionTarget effective capability snapshot", () => {
   beforeEach(() => {
     mockResolveEnvironmentDriverConfigForRuntime.mockReset();
+  });
+
+  it("binds fresh predecessor inspection to the target company and the caller's predecessor lease", async () => {
+    const read = vi.fn<EnvironmentRuntimeService["readPredecessorSandboxRecord"]>()
+      .mockResolvedValueOnce({ kind: "gone" }).mockRejectedValueOnce(new Error("provider unavailable"));
+    const { target } = await buildSandboxTarget({ snapshot: null, supportsSync: false, readPredecessorSandboxRecord: read });
+    await expect(target.readPredecessorSandboxRecord!({ leaseId: "predecessor-lease" })).resolves.toEqual({ kind: "gone" });
+    await expect(target.readPredecessorSandboxRecord!({ leaseId: "predecessor-lease" })).rejects.toThrow("provider unavailable");
+    expect(read.mock.calls).toEqual([
+      [{ companyId: "company-1", leaseId: "predecessor-lease" }],
+      [{ companyId: "company-1", leaseId: "predecessor-lease" }],
+    ]);
+  });
+
+  it("omits predecessor inspection for an older runtime", async () => {
+    const { target } = await buildSandboxTarget({ snapshot: null, supportsSync: false });
+    expect(target.readPredecessorSandboxRecord).toBeUndefined();
   });
 
   it("test_execution_target_carries_read_only_effective_snapshot", async () => {
