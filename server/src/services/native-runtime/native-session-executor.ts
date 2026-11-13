@@ -268,6 +268,7 @@ import { dispatchToolCallback, recoverToolCallback, type SemanticInputAdmission 
 import { createAssignedMcpTools, getAssignedMcpGateway } from "./assigned-mcp-tools.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
 import { getNativeAddressedInteractionGrant, readNativeAddressedInteractionId } from "./native-addressed-interaction.js";
+import { appendNativeAddressedInteractionFailureNotice, NATIVE_ADDRESSED_INTERACTION_FAILED, NATIVE_ADDRESSED_INTERACTION_FAILURE_ACTION, readNativeAddressedInteractionFailure } from "./native-addressed-interaction-failure.js";
 import { NativeChatAttachmentReadScope } from "./chat-attachment-read.js";
 import {
   assertCurrentWakeCommentsRead,
@@ -8541,6 +8542,7 @@ export function nativeSessionFailureDisposition(
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
 ) {
   const permanentFailure =
+    sourceFailureCode === NATIVE_ADDRESSED_INTERACTION_FAILED ||
     sourceFailureCode === "runner_task_admission_rejected" ||
     sourceFailureCode === "runner_ingress_access_rejected" ||
     sourceFailureCode === "native_provider_runtime_missing" ||
@@ -8654,6 +8656,7 @@ function runnerClosedTurnStartSession(error: unknown, depth = 0): boolean {
 export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
+  | typeof NATIVE_ADDRESSED_INTERACTION_FAILED
   | "pi_conversation_identity_missing"
   | "native_permission_declined"
   | "native_provider_terminal_failed"
@@ -9961,6 +9964,7 @@ export async function executePaperclipNativeSession(input: {
   refreshTools?: boolean;
   db: Db;
   execution: NativeExecutionInput;
+  runContextSnapshot?: Record<string, unknown> | null;
   /** Private server preparation proof; never persisted or accepted from a tool. */
   preparedExecutionAdmission?: NativePreparedExecutionAdmission;
   runnerInstanceId: string;
@@ -12651,15 +12655,21 @@ async function executePaperclipNativeSessionAttempt(
         throw error;
       }
       const now = new Date();
-      const startupClassifiedFailureCode = nativeSessionFailureSourceCode(error);
+      const rawFailureCode = nativeSessionFailureSourceCode(error);
+      const addressedFailure = !ownershipUnverified && readNativeAddressedInteractionId(input.runContextSnapshot)
+        ? await readNativeAddressedInteractionFailure(input.db, input.execution.binding) : null;
+      const startupClassifiedFailureCode = addressedFailure
+        ? NATIVE_ADDRESSED_INTERACTION_FAILED : rawFailureCode;
       // A timed-out session.open may still have opened a provider session
       // before its runner stopped. The same-run retry must not reuse it.
       const classifiedFailureCode = startupClassifiedFailureCode === "provider_session_open_timeout" &&
         !prepareNativeSessionOpenTimeoutRetry(input.execution, input.runnerExecutionTarget?.kind !== "remote")
         ? "native_session_interrupted" as const
         : startupClassifiedFailureCode;
-      const sourceFailureCode =
-        classifiedFailureCode === "native_event_replay_conflict"
+      const sourceFailureCode = ownershipUnverified
+        ? NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT
+        : classifiedFailureCode === NATIVE_ADDRESSED_INTERACTION_FAILED ||
+          classifiedFailureCode === "native_event_replay_conflict"
           ? classifiedFailureCode
           : providerUsageLimitObserved
             ? "native_provider_usage_limit"
@@ -12761,6 +12771,7 @@ async function executePaperclipNativeSessionAttempt(
       // transitions the run into "failed". Read after the transaction
       // commits, so a rolled-back write never reports a false failure.
       let terminalRunToReport: typeof heartbeatRuns.$inferSelect | null = null;
+      let addressedFailurePublication: Awaited<ReturnType<typeof appendNativeAddressedInteractionFailureNotice>> = null;
       await input.db.transaction(async (tx) => {
         await tx.execute(
           sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
@@ -12789,7 +12800,7 @@ async function executePaperclipNativeSessionAttempt(
             controlDeadlineAt: null,
             leaseOwner: null,
             leaseExpiresAt: null,
-            recoveryState:
+            recoveryState: addressedFailure ? null :
               phase === "retryable_failure" ? "resuming_session" : "blocked",
             failureCode,
             failureDetail: identityRedactor.redact({
@@ -12813,8 +12824,11 @@ async function executePaperclipNativeSessionAttempt(
               ...(providerCooldownAt ? { providerCooldownAt: providerCooldownAt.toISOString() } : {}),
               ...(providerLimit?.plan.resetAt ? { providerLimitResetAt: providerLimit.plan.resetAt.toISOString() } : {}),
               recoveryOwner: recoveryProjection.recoveryOwner,
-              nextAction:
-                providerLimit
+              nextAction: ownershipUnverified
+                ? "Inspect the retained runner's executable and authenticated connection. Do not replace its provider until ownership is safely resolved."
+                : addressedFailure
+                  ? NATIVE_ADDRESSED_INTERACTION_FAILURE_ACTION
+                  : providerLimit
                   ? providerLimit.nextAction
                   : sourceFailureCode === "native_permission_declined"
                   ? "Provider permission was declined. Inspect the task and give explicit direction before starting further provider work. Automatic recovery is stopped."
@@ -13032,7 +13046,13 @@ async function executePaperclipNativeSessionAttempt(
         ) {
           terminalRunToReport = updatedRun;
         }
+        if (addressedFailure) {
+          addressedFailurePublication = await appendNativeAddressedInteractionFailureNotice(
+            tx as unknown as Db, input.execution.binding, addressedFailure.interactionId,
+          );
+        }
         const stillOwnsTask =
+          !addressedFailure &&
           failureTask?.assigneeAgentId === input.execution.binding.agentId &&
           ["in_progress", "in_review"].includes(failureTask.status) &&
           (!failureTask.executionRunId ||
@@ -13092,8 +13112,9 @@ async function executePaperclipNativeSessionAttempt(
             ...(providerCooldownAt ? { providerCooldownAt: providerCooldownAt.toISOString() } : {}),
             ...(providerLimit?.plan.resetAt ? { providerLimitResetAt: providerLimit.plan.resetAt.toISOString() } : {}),
           },
-          nextAction:
-            providerLimit
+          nextAction: ownershipUnverified
+            ? "Resolve the retained runner's authentication or executable compatibility before an explicit recovery; do not blindly restart, cancel, or replace its provider session."
+            : providerLimit
               ? providerLimit.nextAction
               : sourceFailureCode === "native_permission_declined"
               ? "Provider permission was declined. Inspect the task and give explicit direction before starting further provider work. Automatic recovery is stopped."
@@ -13186,6 +13207,7 @@ async function executePaperclipNativeSessionAttempt(
       });
       // Pass the raw error only for closed settlement labels: its text bypasses
       // the identity redactor applied to the persisted message above.
+      if (addressedFailurePublication) publishActivity(addressedFailurePublication);
       if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport, { nativeCloseFailure: error });
       await boundedExecutionCleanup(async () => {
         await stoppedLeaseRenewal;
@@ -15455,6 +15477,7 @@ export async function createRunnerdBackend(input: {
   controllerPersistence?: { bootId: string; runnerArtifact?: { version: string; digest: string } };
   onAccountingEvent?: (event: PrpEvent) => Promise<void>;
   execution: NativeExecutionInput;
+  runContextSnapshot?: Record<string, unknown> | null;
   preparedExecutionAdmission?: NativePreparedExecutionAdmission;
   runnerInstanceId: string;
   chatAttachmentReadScope?: NativeChatAttachmentReadScope;
@@ -15738,18 +15761,25 @@ async function createRunnerdBackendWithinSessionClaim(
     input.execution.binding,
   ));
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
-  const reviewRun = await timeController("review_binding", async () => input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot,
+  const addressedInteractionHint = readNativeAddressedInteractionId(input.runContextSnapshot);
+  const reviewRun = addressedInteractionHint ? await timeController("review_binding", async () => input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot,
     assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId })
     .from(heartbeatRuns).innerJoin(issues, and(eq(issues.id, heartbeatRuns.nativeIssueId), eq(issues.companyId, heartbeatRuns.companyId))).where(and(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
-    )).limit(1).then((rows) => rows[0]));
+    )).limit(1).then((rows) => rows[0])) : undefined;
+  const runContextSnapshot = addressedInteractionHint ? reviewRun?.contextSnapshot
+    : input.runContextSnapshot ?? await timeController("review_binding", async () => input.db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.execution.binding.runId),
+        eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+      )).limit(1).then((rows) => rows[0]?.contextSnapshot));
   const addressedParticipant = Boolean(readNativeAddressedInteractionId(reviewRun?.contextSnapshot)
     && (reviewRun?.assigneeAgentId !== input.execution.binding.agentId || reviewRun?.executionRunId !== input.execution.binding.runId));
   if (addressedParticipant && !await getNativeAddressedInteractionGrant(input.db, input.execution.binding))
     throw new Error("native_addressed_interaction_no_longer_available");
   const connectorAssignments = !addressedParticipant && input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
-  const nativeReview = readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
+  const nativeReview = readNativeReviewAssignmentContext(runContextSnapshot);
   if (nativeReview && !await getNativeReviewAssignment(input.db, {
     ...input.execution.binding, contextSnapshot: nativeReview,
   })) throw new Error("native_review_assignment_no_longer_available");
@@ -15845,7 +15875,7 @@ async function createRunnerdBackendWithinSessionClaim(
     installRemoteArtifact: !pluginTask && remoteTarget && remoteCommandRunner
       ? createArtifactInstaller(remoteTarget.remoteCwd, remoteCommandRunner) : undefined,
     imageGeneration: nativeReview || addressedParticipant || pluginTask ? undefined
-      : imageGenerationBindingForRun({ providerKind: input.execution.provider.kind, contextSnapshot: reviewRun?.contextSnapshot }),
+      : imageGenerationBindingForRun({ providerKind: input.execution.provider.kind, contextSnapshot: runContextSnapshot }),
     readRemoteWorkspaceFile: !pluginTask && remoteTarget && remoteCommandRunner
       ? (file) => readVerifiedRemoteWorkspaceFile({ runner: remoteCommandRunner, workspaceRoot: remoteTarget.remoteCwd, ...file })
       : undefined,

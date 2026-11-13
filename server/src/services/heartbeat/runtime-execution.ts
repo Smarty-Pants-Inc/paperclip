@@ -635,6 +635,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               casesEnabled: context.paperclipCasesEnabled === true,
               db,
               execution: nativeExecution,
+              runContextSnapshot: context,
               observability,
               getFreshSessionHandoff: getNativeFreshSessionHandoff,
               refreshTools: context.refreshTools === true,
