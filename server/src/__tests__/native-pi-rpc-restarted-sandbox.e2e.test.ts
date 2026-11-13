@@ -85,7 +85,9 @@ function sessionFile(pi: Birth): string {
   return join(env.PAPERCLIP_PI_RUNTIME_DIR, `${env.PAPERCLIP_NORMALIZED_SESSION_ID}.jsonl`);
 }
 
-it.skipIf(!enabled)("REG-26: a provider stop kills the idle warm Runner; the restarted box's successor retires the dead owner and recovers the same Pi file", async () => {
+// "recover" continues from the saved checkpoint; "open" is a fresh open with
+// no usable warm checkpoint over the same dead owner's root.
+it.skipIf(!enabled).each(["recover", "open"] as const)("REG-26: a provider stop kills the idle warm Runner; the restarted box's successor retires the dead owner and continues the same Pi file (%s)", async mode => {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -410,7 +412,10 @@ it.skipIf(!enabled)("REG-26: a provider stop kills the idle warm Runner; the res
     const nextBackend = await backend(next, "resumed", true);
     // This is the real returned production backend, not a spy or a fake result.
     if (!nextBackend.recoverSession) throw new Error("native backend has no recoverSession");
-    const recovered = await nextBackend.recoverSession(snapshot, { signal: AbortSignal.timeout(120_000) });
+    const recovered = mode === "recover"
+      ? await nextBackend.recoverSession(snapshot, { signal: AbortSignal.timeout(120_000) })
+      : { recovered: true, reason: undefined, session: await nextBackend.openSession({ identity: { companyId, agentId, issueId,
+          runId: next.runId, sessionId: next.native.normalizedSessionId }, workingDirectory: remoteCwd }) };
     expect(recovered.recovered, recovered.reason).toBe(true); expect(recovered.session).toBeDefined();
     sessions.push(recovered.session!);
     const continued = await runTurn(recovered.session!, next);
@@ -436,14 +441,17 @@ it.skipIf(!enabled)("REG-26: a provider stop kills the idle warm Runner; the res
       try { return { direction: frame.direction, frame: JSON.parse(raw) }; } catch { return { direction: frame.direction, frame: { raw } }; }
     });
     const resumes = frames.filter(entry => entry.frame.method === "thread/resume");
-    expect(resumes, "exactly one real Rust -> Pi proxy resume required; no replay").toHaveLength(1);
+    stage("provider resume frames", { mode, resumes: resumes.length });
     const resume = resumes[0];
-    expect(resume!.frame.params?.threadId).toBe(initial.snapshot.providerSessionId);
-    const response = frames.find(entry => entry.direction !== resume!.direction
-      && entry.frame.id === resume!.frame.id && entry.frame.result !== undefined);
-    expect(response, "matching successful real proxy resume response required").toBeDefined();
-    expect(response!.frame.error).toBeUndefined();
-    expect(record(record(response!.frame.result).thread).sessionId).toBe(initial.snapshot.providerSessionId);
+    const response = resume ? frames.find(entry => entry.direction !== resume.direction
+      && entry.frame.id === resume.frame.id && entry.frame.result !== undefined) : undefined;
+    if (mode === "recover") {
+      expect(resumes, "exactly one real Rust -> Pi proxy resume required; no replay").toHaveLength(1);
+      expect(resume!.frame.params?.threadId).toBe(initial.snapshot.providerSessionId);
+      expect(response, "matching successful real proxy resume response required").toBeDefined();
+      expect(response!.frame.error).toBeUndefined();
+      expect(record(record(response!.frame.result).thread).sessionId).toBe(initial.snapshot.providerSessionId);
+    }
     const controllerRoot = scopedRunnerdStateRoot(next.execution);
     // Ordinary remote recoverSession rotates authority-epochs, not the
     // executor's different continuity-breaks lane. Require exact preserved
