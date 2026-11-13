@@ -1007,15 +1007,17 @@ attempts. The server does not infer the boolean from explanatory prose.
 Company, agent, and related cost rollups carry `accountingUsageLost` when any
 included charge belongs to a flagged run. The company summary also sets
 `pricingComplete: false`. The flag does not change measured tokens or money.
-Run metrics and cost views show “Additional usage unknown”. A zero measured
-subtotal with missing usage also shows the warning.
+Run metrics and cost views, including Task Activity's direct-run and sub-task
+Cost Summary, show “Additional usage unknown”. A zero measured subtotal with
+missing usage also shows the warning.
 
-Budget admission applies the existing incomplete-accounting policy to a final
-charge whose run has this typed flag. Such accounting gaps do not trigger the
-`block-unpriced` gate. Known charges still count toward monetary limits.
-Ordinary unpriced measured usage still blocks under that policy. The existing
-typed lost-on-restore receipt exemption remains separate; prose grants neither
-exemption. This is not permission to treat an unknown increment as zero cost.
+Under `unpricedUsagePolicy: "block"`, an unpriced charge whose run has this typed
+flag blocks admission and new reservations. This includes typed lost-on-restore
+usage, known partial costs, and zero observed tokens: none bounds the missing
+increment. This reverses the earlier restore-loss exemption. Known charges still
+count toward monetary limits. Ordinary unpriced measured usage still blocks;
+prose alone does not set the typed flag or confer an exemption. Legacy incomplete
+accounting without typed usage-loss evidence retains its existing policy.
 
 The field is optional for old clients and receipts. There is no prose-based
 backfill. Historical runs need typed receipt replay or reconciliation before

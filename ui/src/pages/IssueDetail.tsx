@@ -213,6 +213,7 @@ import {
   formatTokens,
   visibleRunCostUsd,
   visibleRunTokenTotal,
+  usageCompletenessLabel,
 } from "../lib/utils";
 import { liveBlueBadge } from "../lib/status-colors";
 import { ApprovalCard } from "../components/ApprovalCard";
@@ -2875,7 +2876,7 @@ type IssueDetailActivityTabProps = {
   externalReferences?: MarkdownExternalReferenceMap;
 };
 
-function IssueDetailActivityTab({
+export function IssueDetailActivityTab({
   issue,
   issueId,
   companyId,
@@ -2949,6 +2950,7 @@ function IssueDetailActivityTab({
     let runCount = 0;
     let hasCost = false;
     let hasTokens = false;
+    let usageQualifier: string | null = null;
     const nowMs = Date.now();
 
     for (const run of linkedRuns ?? []) {
@@ -2963,6 +2965,7 @@ function IssueDetailActivityTab({
         "cache_read_input_tokens",
       );
       const runCost = visibleRunCostUsd(usage, result);
+      usageQualifier ??= usageCompletenessLabel(usage);
       if (runCost > 0) hasCost = true;
       if (runInput + runOutput + runCached > 0) hasTokens = true;
       input += runInput;
@@ -2995,6 +2998,7 @@ function IssueDetailActivityTab({
       totalTokens,
       hasCost,
       hasTokens,
+      usageQualifier,
       runtimeMs,
       runCount,
       hasRuntime: runtimeMs > 0,
@@ -3004,9 +3008,11 @@ function IssueDetailActivityTab({
     (issueTreeCostSummary?.inputTokens ?? 0) +
     (issueTreeCostSummary?.cachedInputTokens ?? 0) +
     (issueTreeCostSummary?.outputTokens ?? 0);
+  const issueTreeUsageQualifier = usageCompletenessLabel(issueTreeCostSummary);
   const hasIssueTreeCost =
     !!issueTreeCostSummary &&
-    (issueTreeCostSummary.costCents > 0 ||
+    (issueTreeUsageQualifier !== null ||
+      issueTreeCostSummary.costCents > 0 ||
       issueTreeCostTokens > 0 ||
       issueTreeCostSummary.cachedInputTokens > 0 ||
       issueTreeCostSummary.runtimeMs > 0 ||
@@ -3027,6 +3033,7 @@ function IssueDetailActivityTab({
           </div>
           {!issueCostSummary.hasCost &&
           !issueCostSummary.hasTokens &&
+          !issueCostSummary.usageQualifier &&
           !hasIssueTreeCost ? (
             <div className="text-xs text-muted-foreground">
               No cost data yet.
@@ -3048,6 +3055,9 @@ function IssueDetailActivityTab({
                       : ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)})`}
                   </span>
                 ) : null}
+                {issueCostSummary.usageQualifier && (
+                  <span>{issueCostSummary.usageQualifier}</span>
+                )}
                 {issueCostSummary.hasRuntime ? (
                   <span>
                     Runtime {formatDurationMs(issueCostSummary.runtimeMs)}
@@ -3056,6 +3066,7 @@ function IssueDetailActivityTab({
                 ) : null}
                 {!issueCostSummary.hasCost &&
                 !issueCostSummary.hasTokens &&
+                !issueCostSummary.usageQualifier &&
                 !issueCostSummary.hasRuntime ? (
                   <span>No direct cost data.</span>
                 ) : null}
@@ -3080,6 +3091,9 @@ function IssueDetailActivityTab({
                       ? ` (in ${formatTokens(issueTreeCostSummary.inputTokens)}, out ${formatTokens(issueTreeCostSummary.outputTokens)}, cached ${formatTokens(issueTreeCostSummary.cachedInputTokens)})`
                       : ` (in ${formatTokens(issueTreeCostSummary.inputTokens)}, out ${formatTokens(issueTreeCostSummary.outputTokens)})`}
                   </span>
+                  {issueTreeUsageQualifier && (
+                    <span>{issueTreeUsageQualifier}</span>
+                  )}
                   {issueTreeCostSummary.runCount > 0 ? (
                     <span>
                       Runtime {formatDurationMs(issueTreeCostSummary.runtimeMs)}

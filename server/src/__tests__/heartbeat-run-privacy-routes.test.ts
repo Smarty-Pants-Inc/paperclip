@@ -330,20 +330,22 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     }
   });
 
-  it.each(["typed", "prose", "normal"])("fix3 %s restore-gap admission at 99/100 and 101/100 cents", async kind => {
+  it.each(["typed", "typed-pi", "prose", "normal"])("fix3 %s restore-gap admission at 99/100 and 101/100 cents", async kind => {
     const f = await seedFixture(), runnerInstanceId = randomUUID(), runId = f.privateRunId;
     await db.update(heartbeatRuns).set({ runnerInstanceId, runtimeMode: "native", status: "running", costAccountingPending: true })
       .where(eq(heartbeatRuns.id, runId));
     const delivery = await createNativeUsageDelivery(db, { companyId: f.companyId, runId, runnerInstanceId,
-      provider: { kind: "opencode", model: "unknown-test-model" },
-      billing: { provider: "test", biller: "test", billingType: "metered_api" } });
+      provider: kind === "typed-pi"
+        ? { kind: "pi_rpc", profile: QUALIFIED_PI_RPC_PROFILE, model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "xhigh" }
+        : { kind: "opencode", model: "unknown-test-model" },
+      billing: { provider: kind === "typed-pi" ? "anthropic" : "test", biller: kind === "typed-pi" ? "anthropic" : "test", billingType: "metered_api" } });
     const values = [
       ["turn.failed", "lost", { error: { code: "provider_turn_lost_on_restore" } }],
       ["turn.started", "next", {}],
       ["usage.reported", "next", { runDeltaAvailable: true, runDelta: { inputTokens: 11, outputTokens: 3 } }],
       ["turn.completed", "next", {}],
     ] as const;
-    const selected = kind === "typed" ? values : values.slice(1);
+    const selected = kind.startsWith("typed") ? values : values.slice(1);
     for (const [index, [eventType, turnId, payload]] of selected.entries()) await delivery.capture({ schema: "paperclip.prp.event.v1", schemaVersion: 1,
       sourceKind: "runner", sourceInstanceId: runnerInstanceId, sourceEventId: `budget-${index}`, sourceSeq: index + 1, priority: 0,
       runId, normalizedSessionId: "budget-session", emittedAt: new Date().toISOString(), eventType, turnId, payload } as PrpEvent);
@@ -351,9 +353,10 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     expect(await accountRunCost(db, runId)).toBe(true);
     const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     if (kind !== "normal") await db.update(heartbeatRuns).set({ usageJson: { ...saved.usageJson,
-      pricingProvenance: { source: "unknown", evidence: kind === "typed" ? "wording changed" : "lost on restore" } } })
+      pricingProvenance: { source: "unknown", evidence: kind.startsWith("typed") ? "wording changed" : "lost on restore" } } })
       .where(eq(heartbeatRuns.id, runId));
-    await assertBudgetAdmissionAtLimits(db, f.companyId, f.ownerAgentId, kind === "typed" ? 0 : 1);
+    expect(saved.usageJson?.accountingUsageLost ?? false).toBe(kind.startsWith("typed"));
+    await assertBudgetAdmissionAtLimits(db, f.companyId, f.ownerAgentId, 1);
   });
 
   it("marks company and agent totals that include lower-bound runs, without changing their measured money", async () => {
@@ -384,20 +387,19 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     expect(await costs.summary(foreignCompanyId)).toMatchObject({ accountingUsageLost: false, pricingComplete: true, spendCents: 3 });
   });
 
-  it("blocks a typed lower-bound final charge under block-unpriced, just like prose-only uncertainty", async () => {
+  it.each([{ costCents: 0, inputTokens: 11 }, { costCents: 1, inputTokens: 11 }, { costCents: 0, inputTokens: 0 }])("blocks a typed lower-bound final charge under block-unpriced ($costCents cents, $inputTokens input tokens)", async ({ costCents, inputTokens }) => {
     const f = await seedFixture();
     await db.update(heartbeatRuns).set({ usageJson: { accountingUsageLost: true } }).where(eq(heartbeatRuns.id, f.privateRunId));
     const [policy] = await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "company", scopeId: f.companyId,
       metric: "billed_cents", windowKind: "lifetime", amount: 100000, unpricedUsagePolicy: "block", notifyEnabled: false }).returning();
     await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.ownerAgentId, heartbeatRunId: f.privateRunId,
       idempotencyKey: `heartbeat:${f.privateRunId}:final`, provider: "test", model: "unpriced", billingType: "metered_api",
-      costStatus: "unpriced", costCents: 0, inputTokens: 11, outputTokens: 3, occurredAt: new Date() });
+      costStatus: "unpriced", costCents, inputTokens, outputTokens: 0, occurredAt: new Date() });
     expect((await computeObservedSpend(db, policy)).unpricedEventCount).toBe(1);
     expect(await budgetService(db).getInvocationBlock(f.companyId, f.ownerAgentId)).not.toBeNull();
     await db.update(heartbeatRuns).set({ usageJson: { pricingProvenance: { source: "unknown", evidence: "Pi summary usage is unknown; observed usage and cost are a lower bound" } } })
       .where(eq(heartbeatRuns.id, f.privateRunId));
-    expect((await computeObservedSpend(db, policy)).unpricedEventCount).toBe(1);
-    expect(await budgetService(db).getInvocationBlock(f.companyId, f.ownerAgentId)).not.toBeNull();
+    expect((await computeObservedSpend(db, policy)).unpricedEventCount).toBe(costCents === 0 && inputTokens > 0 ? 1 : 0);
     await db.update(heartbeatRuns).set({ usageJson: { accountingUsageLost: true } }).where(eq(heartbeatRuns.id, f.privateRunId));
     await db.update(costEvents).set({ costCents: 100001, costStatus: "reported" }).where(eq(costEvents.heartbeatRunId, f.privateRunId));
     expect(await computeObservedSpend(db, policy)).toMatchObject({ totalExact: "100001.0000000", unpricedEventCount: 0 });
