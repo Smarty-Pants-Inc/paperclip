@@ -18,6 +18,8 @@ test("Linux proxy isolation artifact and fail-closed loader", { skip: process.pl
     mkdirSync(cli, { recursive: true });
     const native = buildLinuxProcessHardening(join(cli, "linux-process-hardening.node"));
     const original = readFileSync(native);
+    const verified = join(root, "runner-verified.node");
+    writeFileSync(verified, original);
     const manifest = { payload: { artifacts: { piProcessHardening: {
       path: "dist/cli/linux-process-hardening.node",
       sha256: `sha256:${createHash("sha256").update(original).digest("hex")}`,
@@ -30,9 +32,10 @@ test("Linux proxy isolation artifact and fail-closed loader", { skip: process.pl
     const entrypoint = pathToFileURL(join(cli, "pi-rpc-app-server-proxy.cjs")).href;
     const run = () => spawnSync(process.execPath, ["--input-type=module", "-e", `
       import { protectPiProxyProcess } from ${JSON.stringify(pathToFileURL(guard).href)};
-      import { readdirSync } from 'node:fs';
+      import { readdirSync, openSync } from 'node:fs';
       import { spawnSync } from 'node:child_process';
-      protectPiProxyProcess(${JSON.stringify(entrypoint)});
+      const fd = openSync(${JSON.stringify(verified)}, 'r');
+      protectPiProxyProcess(${JSON.stringify(entrypoint)}, '/proc/self/fd/' + fd);
       const peer = spawnSync('/bin/cat', ['/proc/' + process.pid + '/environ'], { encoding: 'utf8' });
       process.stdout.write(JSON.stringify({ peerStatus: peer.status, peerDenied: peer.stderr.includes('Permission denied'),
         selfFdAccessible: readdirSync('/proc/self/fd').length > 0,
@@ -46,6 +49,12 @@ test("Linux proxy isolation artifact and fail-closed loader", { skip: process.pl
     const tampered = run();
     assert.notEqual(tampered.status, 0);
     assert.match(tampered.stderr, /integrity check failed/);
+    const replaced = readFileSync(native);
+    manifest.payload.artifacts.piProcessHardening.sha256 = `sha256:${createHash("sha256").update(replaced).digest("hex")}`;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    assert.match(run().stderr, /differs from the controller-pinned descriptor/);
+    manifest.payload.artifacts.piProcessHardening.sha256 = `sha256:${createHash("sha256").update(original).digest("hex")}`;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
     writeFileSync(native, original);
     chmodSync(native, 0o666);
     assert.match(run().stderr, /not a trusted regular file/);

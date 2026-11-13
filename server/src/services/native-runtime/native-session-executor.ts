@@ -1,4 +1,5 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
+import { RUNNER_LAUNCH_ENVIRONMENT_SCRIPT } from "./runner-launch-environment.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -13587,6 +13588,7 @@ type RemoteProviderPackManifest = {
       acpxSidecar: { path: string; sha256: string };
       piRpcExecutable?: { path: string; sha256: string };
       piRpcProxy?: { path: string; sha256: string };
+      piProcessHardening?: { path: string; sha256: string };
     };
   };
 };
@@ -13741,6 +13743,7 @@ export async function resolveLocalPiLaunchArtifacts(configuredRoot?: string | nu
     piCommandSha256: artifacts.piRpcExecutable.sha256,
     piProxyPath: join(packRoot, artifacts.piRpcProxy.path),
     piProxySha256: artifacts.piRpcProxy.sha256,
+    piProcessHardeningSha256: artifacts.piProcessHardening?.sha256,
     providerPackAuthorityDigest: manifest.digest,
   };
 }
@@ -13854,6 +13857,7 @@ function* providerPackIdentityChecks(
     ],
     ...(payload.nativeProviders?.pi_rpc ? [
       ["native Pi proxy", payload.artifacts?.piRpcProxy, "dist/cli/pi-rpc-app-server-proxy.cjs"],
+      ...(payload.target.platform === "linux" ? [["native Pi process hardening", payload.artifacts?.piProcessHardening, "dist/cli/linux-process-hardening.node"]] as const : []),
       ["native Pi executable", payload.artifacts?.piRpcExecutable,
         "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"],
     ] as const : []),
@@ -14753,6 +14757,7 @@ export const REMOTE_RUNNER_AUTHORITY_ARCHIVE_SCRIPT =
 // The launch nonce + child PID names a private file; noclobber refuses reuse or
 // a planted symlink. Nothing deletes diagnostics from an earlier generation.
 export const REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT =
+  RUNNER_LAUNCH_ENVIRONMENT_SCRIPT +
   'set -eu; identity_path=$1; identity_nonce=$2; runner_instance_id=$3; diagnostics_directory=$4; shift 4; umask 077; test ! -L "$diagnostics_directory"; if test -e "$diagnostics_directory"; then test -d "$diagnostics_directory"; else mkdir -p -- "$diagnostics_directory"; fi; chmod 0700 "$diagnostics_directory"; set -C; exec 2> "$diagnostics_directory/runnerd.launch-stderr.${identity_nonce}.$$.log"; set +C; started_at=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"); pid=$$; process_fingerprint=""; if ' +
   REMOTE_RUNNER_PROCESS_FINGERPRINT_SCRIPT +
   '; then :; else process_fingerprint=""; fi; identity_tmp="${identity_path}.tmp.$$"; printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "$identity_nonce" "$$" "$started_at" "$runner_instance_id" "$process_fingerprint" > "$identity_tmp"; chmod 0600 "$identity_tmp"; mv -f -- "$identity_tmp" "$identity_path"; exec "$@"';
@@ -15176,7 +15181,7 @@ export function createRemoteRunnerProcessLauncher(input: {
         command: "sh",
         args: [
           "-c",
-          'set -eu; node -e "process.kill(process.pid, 0)"; identity_path=$1; identity_nonce=$2; runner_instance_id=$3; child_script=$4; shift 4; umask 077; identity_dir=$(dirname -- "$identity_path"); mkdir -p -- "$identity_dir"; if command -v setsid >/dev/null 2>&1; then nohup setsid sh -c "$child_script" paperclip-runner-child "$identity_path" "$identity_nonce" "$runner_instance_id" "$@" </dev/null >/dev/null 2>&1 & else nohup sh -c "$child_script" paperclip-runner-child "$identity_path" "$identity_nonce" "$runner_instance_id" "$@" </dev/null >/dev/null 2>&1 & fi',
+          RUNNER_LAUNCH_ENVIRONMENT_SCRIPT + 'set -eu; node -e "process.kill(process.pid, 0)"; identity_path=$1; identity_nonce=$2; runner_instance_id=$3; child_script=$4; shift 4; umask 077; identity_dir=$(dirname -- "$identity_path"); mkdir -p -- "$identity_dir"; if command -v setsid >/dev/null 2>&1; then nohup setsid sh -c "$child_script" paperclip-runner-child "$identity_path" "$identity_nonce" "$runner_instance_id" "$@" </dev/null >/dev/null 2>&1 & else nohup sh -c "$child_script" paperclip-runner-child "$identity_path" "$identity_nonce" "$runner_instance_id" "$@" </dev/null >/dev/null 2>&1 & fi',
           "paperclip-runner-launch",
           input.processIdentityPath,
           identityNonce,
@@ -17885,6 +17890,7 @@ async function createRunnerdBackendWithinSessionClaim(
                 piCommandSha256: expectedProviderPackManifest.payload.artifacts.piRpcExecutable!.sha256,
                 piProxyPath: posix.join(activeRemoteProviderPackRoot, expectedProviderPackManifest.payload.artifacts.piRpcProxy!.path),
                 piProxySha256: expectedProviderPackManifest.payload.artifacts.piRpcProxy!.sha256,
+                piProcessHardeningSha256: expectedProviderPackManifest.payload.artifacts.piProcessHardening?.sha256,
               } : {}),
               opencodeCommand: posix.join(
                 activeRemoteProviderPackRoot,

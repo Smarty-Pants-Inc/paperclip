@@ -222,6 +222,7 @@ async function nativePiFixture(extraFiles: Record<string, string> = {}) {
     files[`node_modules/${pkg}/package.json`] = JSON.stringify({ version });
   }
   pack.payload.artifacts.piRpcProxy = { path: proxyPath, sha256: sha(files[proxyPath]) };
+  pack.payload.artifacts.piProcessHardening = { path: "dist/cli/linux-process-hardening.node", sha256: sha("fixture hardening") };
   pack.payload.artifacts.piRpcExecutable = { path: executablePath, sha256: sha(files[executablePath]) };
   for (const [name, artifact] of Object.entries(pack.payload.artifacts)) {
     files[artifact.path] ??= `fixture ${name}\n`;
@@ -312,7 +313,7 @@ describe("native Pi remote provider pack verification", () => {
     } finally { await fixture.cleanup(); }
   });
 
-  it.each(["piRpcProxy", "piRpcExecutable"])("refuses a missing %s manifest entry", async name => {
+  it.each(["piRpcProxy", "piRpcExecutable", "piProcessHardening"])("refuses a missing %s manifest entry", async name => {
     const fixture = await nativePiFixture();
     try {
       delete fixture.pack.payload.artifacts[name];
@@ -321,7 +322,7 @@ describe("native Pi remote provider pack verification", () => {
     } finally { await fixture.cleanup(); }
   });
 
-  it.each(["piRpcProxy", "piRpcExecutable"])("refuses a missing %s file", async name => {
+  it.each(["piRpcProxy", "piRpcExecutable", "piProcessHardening"])("refuses a missing %s file", async name => {
     const fixture = await nativePiFixture();
     try {
       await rm(join(fixture.root, fixture.pack.payload.artifacts[name].path));
@@ -329,7 +330,7 @@ describe("native Pi remote provider pack verification", () => {
     } finally { await fixture.cleanup(); }
   });
 
-  it.each(["piRpcProxy", "piRpcExecutable"])("refuses a %s digest mismatch", async name => {
+  it.each(["piRpcProxy", "piRpcExecutable", "piProcessHardening"])("refuses a %s digest mismatch", async name => {
     const fixture = await nativePiFixture();
     try {
       fixture.pack.payload.artifacts[name].sha256 = sha("not the file's bytes");
