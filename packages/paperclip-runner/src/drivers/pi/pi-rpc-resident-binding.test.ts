@@ -447,12 +447,15 @@ real("real Pi 1.5.2 resident binding", () => {
     await expect(session.startTurn({ message: { role: "user", text: "forbidden retry" } })).rejects.toThrow();
     const snapshot = await session.snapshot(); await writeFile(join(root, "sessions", "proof.json"), JSON.stringify({ binary: process.env.PI_TEST_BINARY, outcome: "lost ACK fenced", binds, prompts, upstreamRequests: upstream.requests.length, trace: snapshot.sessionFile, traceSha256: digest(await readFile(snapshot.sessionFile, "utf8")) }, null, 2));
   }, 30_000);
-  it("preserves explicit env-mode as a nonsecret-claim counterexample", async () => {
+  it("preserves explicit env-mode's model file while scrubbing upstream process credentials", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-resident-env-")); const workspace = join(root, "workspace"); await mkdir(workspace); const upstream = await faux(); const agent = join(root, "agent");
     const session = await new PiRpcDriver({ command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), environment: { ...upstream.environment, PI_CODING_AGENT_DIR: agent, PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "env" }, shutdownTimeoutMs: 1000 }).openSession({ runId: "env", normalizedSessionId: "env", workingDirectory: workspace }) as PiRpcHarnessSession; sessions.push(session);
     const iterator = session.events()[Symbol.asyncIterator](); await session.startTurn({ message: { role: "user", text: "env opt-in" } });
     for (;;) { const next = await iterator.next(); if (next.done || next.value.eventType === "turn.failed") throw new Error("env turn failed"); if (next.value.eventType === "turn.completed") break; }
-    expect(upstream.requests).toHaveLength(1); expect(await readFile(`/proc/${session.processPid()}/environ`, "utf8")).toContain("PAPERCLIP_AI_PROVIDER_KEY=upstream-binding-canary");
+    expect(upstream.requests).toHaveLength(1);
+    // Explicit env-mode still puts its opt-in credential in models.json below,
+    // but I-4's process ceiling must not restore upstream credentials to Pi.
+    expect(await readFile(`/proc/${session.processPid()}/environ`, "utf8")).not.toContain("PAPERCLIP_AI_PROVIDER_KEY=");
     expect(await readFile(join(agent, "models.json"), "utf8")).toContain("upstream-binding-canary");
     await session.close(); expect(session.processExited()).toBe(true);
   }, 30_000);
