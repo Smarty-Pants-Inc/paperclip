@@ -77,6 +77,18 @@ reset boundaries, deleted messages, source quarantine, and secret redaction
 apply before model submission. Successful recovery does not fetch or replay the
 handoff.
 
+Native Pi can discover missing or invalid saved history later, inside
+`thread/resume`. When that existing recovery path admits a fresh Pi thread under
+the same normalized conversation, its first turn gets the
+[Paperclip skill's cold-start read](../../skills/paperclip/SKILL.md#the-heartbeat-procedure):
+read this issue's context, thread and `plan` with `get_task_context`,
+`get_task_history` and `read_document` before answering. The issue thread remains
+the record; runtime-only memory is not claimed as recovered. An unreadable issue
+thread must be reported, not guessed. This is a first-turn instruction, not a new
+retrieval service or tool authorization. Successful resume and later ordinary
+turns keep their existing input, and the existing durable recovery notice is
+unchanged.
+
 Legacy adapters advertise `supportsToolRefreshOnResume` for their selected
 harness: Claude and Codex CLI/ACP, Grok CLI, Gemini/Kimi CLI/ACP, and
 Cursor/OpenCode/Pi CLI. CLI adapters using environment tool delivery start each
