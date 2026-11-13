@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import https, { createServer as createHttpsServer } from "node:https";
@@ -87,7 +87,11 @@ function sessionFile(pi: Birth): string {
 
 // "recover" continues from the saved checkpoint; "open" is a fresh open with
 // no usable warm checkpoint over the same dead owner's root.
-it.skipIf(!enabled).each(["recover", "open"] as const)("REG-26: a provider stop kills the idle warm Runner; the restarted box's successor retires the dead owner and continues the same Pi file (%s)", async mode => {
+// "alive" (RFL F1): Boat may resume the same machine with its programs still
+// running, so the restarted label alone never retires an owner. The owner
+// stays alive, its close never happens, and the successor must refuse
+// without rotating or replacing it.
+it.skipIf(!enabled).each(["recover", "open", "alive"] as const)("REG-26: a provider stop kills the idle warm Runner; the restarted box's successor retires the dead owner and continues the same Pi file, never a live one (%s)", async mode => {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -346,15 +350,17 @@ it.skipIf(!enabled).each(["recover", "open"] as const)("REG-26: a provider stop 
     expect(JSON.stringify(requests[0]!.request)).not.toContain(fact);
     // REG-26: the provider stops the box under the idle warm Runner. Every
     // process dies at once; nothing suspends and no harness backup is written.
-    process.kill(processPairs[0]!.pi.pid, "SIGKILL");
-    process.kill(processPairs[0]!.runner.pid, "SIGKILL");
-    await vi.waitFor(() => {
-      expect(sameBirth(processPairs[0]!.runner)).toBe(false); expect(sameBirth(processPairs[0]!.pi)).toBe(false);
-    }, { timeout: 5000, interval: 50 });
-    // Core drops the retained session; closing a dead Runner cannot settle it.
-    await firstSession.close({ reason: "warm native session allocation restarted" })
-      .catch(error => { stage("dead owner close failed", String(error)); });
-    closedSessions.add(firstSession);
+    if (mode !== "alive") {
+      process.kill(processPairs[0]!.pi.pid, "SIGKILL");
+      process.kill(processPairs[0]!.runner.pid, "SIGKILL");
+      await vi.waitFor(() => {
+        expect(sameBirth(processPairs[0]!.runner)).toBe(false); expect(sameBirth(processPairs[0]!.pi)).toBe(false);
+      }, { timeout: 5000, interval: 50 });
+      // Core drops the retained session; closing a dead Runner cannot settle it.
+      await firstSession.close({ reason: "warm native session allocation restarted" })
+        .catch(error => { stage("dead owner close failed", String(error)); });
+      closedSessions.add(firstSession);
+    }
     leaseActive.set(first.lease.id, false);
     await environmentsService.releaseLease(first.lease.id, "released");
     const resultId = randomUUID();
@@ -408,6 +414,28 @@ it.skipIf(!enabled).each(["recover", "open"] as const)("REG-26: a provider stop 
     const snapshot = admission.checkpoint as PersistedNativeSession;
     await db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
       || ${JSON.stringify({ sessionCheckpoint: snapshot })}::jsonb` }).where(eq(heartbeatRuns.id, next.runId));
+    if (mode === "alive") {
+      // The same machine came back with the owner still running: no rotation, no replacement.
+      const refused = await (async () => {
+        const liveBackend = await backend(next, "resumed", true);
+        return liveBackend.openSession({ identity: { companyId, agentId, issueId, runId: next.runId,
+          sessionId: next.native.normalizedSessionId }, workingDirectory: remoteCwd });
+      })().then(session => { sessions.push(session); return null; }, error => String(error));
+      stage("live owner refusal", refused);
+      expect(refused, "a live owner of the same generation is never rotated or replaced").toMatch(
+        /restarted_sandbox_runner_generation_not_lost|runner_state_identity_mismatch|native_runner_authority_rotation_requires_settled_state/);
+      expect(sameBirth(processPairs[0]!.runner)).toBe(true); expect(sameBirth(processPairs[0]!.pi)).toBe(true);
+      expect(existsSync(join(remoteSessionRoot, "authority-epochs")) ? readdirSync(join(remoteSessionRoot, "authority-epochs")) : []).toEqual([]);
+      expect((await readFile(join(remoteSessionRoot, "runner", "runner-state.json"))).equals(sourceRunnerBytes)).toBe(true);
+      expect(new Set(spawned.map(entry => entry.pid)).size, "no successor Runner was launched").toBe(1);
+      // Cleanup only: the live owner closes through its own lease.
+      leaseActive.set(first.lease.id, true);
+      await cancelThenClose(firstSession, "live-owner proof complete");
+      await vi.waitFor(() => { expect(sameBirth(processPairs[0]!.runner)).toBe(false); }, { timeout: 15_000, interval: 50 });
+      await Promise.allSettled(pumps);
+      stage("GREEN: a live owner on a restarted label was neither rotated nor replaced");
+      return;
+    }
     // The provider woke the same box from its stopped state (resumedFromState archived).
     const nextBackend = await backend(next, "resumed", true);
     // This is the real returned production backend, not a spy or a fake result.

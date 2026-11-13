@@ -5857,9 +5857,15 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
       return refuse("target_not_sandbox_runner");
     }
-    // A resume that woke a provider-stopped allocation restarted its machine,
-    // so the prior Runner is no more alive there than on a new sandbox.
-    if (!restartedSandboxResume(target) && !["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
+    // A resume from a provider's stopped state is only the trigger to look:
+    // Boat may resume the same machine with its programs still running. The
+    // prior Runner is treated as stopped only when its exact launch marker on
+    // the box names a process that is gone or of another generation.
+    if (restartedSandboxResume(target)) {
+      if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
+        return refuse("restarted_sandbox_runner_generation_not_lost");
+      }
+    } else if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
   }
