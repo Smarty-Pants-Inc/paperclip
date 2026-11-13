@@ -27,7 +27,10 @@ describe("predecessorSandboxRecordFromObservation", () => {
     // An older plugin without the optional fields: present, but nothing to prove with.
     expect(predecessorSandboxRecordFromObservation({ providerLeaseId: id, state: "stopped" }, id)).toEqual({ kind: "present",
       state: "stopped", stoppedAt: null, lastRebootAt: null, observedAt: null });
-    expect(predecessorSandboxRecordFromObservation({ providerLeaseId: id, state: "stopped", stoppedAt: "yesterday" }, id)).toMatchObject({ stoppedAt: null });
+    for (const bad of ["yesterday", "2026-02-30T10:00:00.000Z", "2026-11-13T10:00:00"]) {
+      expect(predecessorSandboxRecordFromObservation({ providerLeaseId: id, state: "stopped", stoppedAt: bad, lastRebootAt: bad,
+        observedAt: bad }, id), bad).toMatchObject({ stoppedAt: null, lastRebootAt: null, observedAt: null });
+    }
     expect(() => predecessorSandboxRecordFromObservation({ providerLeaseId: id, state: "unknown" }, id)).toThrow("predecessor_sandbox_state_unknown");
     expect(() => predecessorSandboxRecordFromObservation(undefined, id)).toThrow("predecessor_sandbox_unobserved");
     expect(() => predecessorSandboxRecordFromObservation({ providerLeaseId: "bx_other", state: "destroyed" }, id)).toThrow("predecessor_sandbox_unobserved");

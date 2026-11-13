@@ -323,6 +323,7 @@ import {
   type NativeRunTrace,
 } from "./native-run-trace.js";
 import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { materializePiSessionRecoveryNotice, piSessionRecovery } from "./pi-session-recovery-notice.js";
@@ -15052,8 +15053,9 @@ export async function verifyRemoteRunnerReattachment(input: {
 export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
 /** Whether a predecessor sandbox stopped for at least PREDECESSOR_LONG_STOP_MS
  * proves its Runner gone by itself. RFL ruled yes (2026-11-13) under exact
- * conditions: a fresh provider read at decision time, state exactly stopped or
- * archived with a stoppedAt, and the provider's clock when it sends one.
+ * conditions: a fresh provider read at decision time, the provider-neutral
+ * state exactly stopped with a stoppedAt, and the provider's clock when it
+ * sends one.
  * Set false to require a failed marker probe as well. */
 export const PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE = true;
 /** Bound on the caller's read of the predecessor's provider record. */
@@ -15067,7 +15069,7 @@ export type PredecessorSandboxRecord =
   | { kind: "gone" }
   | {
       kind: "present";
-      /** Provider state name, for example running, stopped or archived. */
+      /** Provider-neutral state: "stopped" or "running" (from the typed observation). */
       state: string;
       /** When the sandbox last stopped, by any cause; null while it is not stopped (Boat stoppedAt). */
       stoppedAt: string | null;
@@ -15080,11 +15082,6 @@ export type PredecessorSandboxRecord =
 /** The predecessor Runner's own recorded start, and which record it is. */
 export type PredecessorStart = { at: string; source: "process" | "run" };
 
-// Exactly these states: Boat's API names a stopped sandbox archived (states
-// idle|running|archiving|archived|error|cancelled; get-sandbox reference), and
-// "stopped" is the generic name. A sandbox still stopping (archiving),
-// starting or resuming, or in any other state, is not stopped.
-const LONG_STOP_PROVIDER_STATES = new Set(["stopped", "archived"]);
 
 /**
  * The shared "prior owner proven gone" predicate for a remote Runner (RFL F1).
@@ -15098,9 +15095,11 @@ const LONG_STOP_PROVIDER_STATES = new Set(["stopped", "archived"]);
  * Provider record (optional `predecessor`: `readSandbox` must be a FRESH read
  * of the predecessor's own sandbox id at decision time, never cached state;
  * existing callers pass none):
- * - gone (404, or cancelled): lost;
+ * - gone (the provider no longer has it): lost;
  * - lastRebootAt later than the predecessor's recorded start: lost;
- * - state exactly stopped or archived, with a stoppedAt at least
+ * - timestamps must be strict ISO 8601 instants with a zone and real calendar
+ *   fields (parseStrictIsoInstant); any other value proves nothing;
+ * - state exactly stopped (provider-neutral), with a strict stoppedAt at least
  *   PREDECESSOR_LONG_STOP_MS before now (the provider's clock, observedAt,
  *   when it sent one, else this server's): lost
  *   (PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE; when false, the marker probe
@@ -15131,16 +15130,17 @@ export async function remoteRunnerGenerationLost(input: {
   if (typeof runnerInstanceId !== "string" || !runnerInstanceId || typeof normalizedSessionId !== "string" || !normalizedSessionId) return false;
   if (input.predecessor) {
     const record = await readPredecessorSandbox(input.predecessor.readSandbox);
-    if (record?.kind === "gone" || (record?.kind === "present" && record.state === "cancelled")) return true;
+    if (record?.kind === "gone") return true;
     if (record?.kind === "present") {
-      const rebootAt = record.lastRebootAt ? Date.parse(record.lastRebootAt) : Number.NaN;
-      const startAt = input.predecessor.start ? Date.parse(input.predecessor.start.at) : Number.NaN;
-      if (Number.isFinite(rebootAt) && Number.isFinite(startAt) && rebootAt > startAt) return true;
-      const stoppedAt = record.stoppedAt ? Date.parse(record.stoppedAt) : Number.NaN;
-      const providerNow = record.observedAt ? Date.parse(record.observedAt) : Number.NaN;
-      const now = Number.isFinite(providerNow) ? providerNow : (input.now ?? Date.now)();
-      const longStop = LONG_STOP_PROVIDER_STATES.has(record.state) && Number.isFinite(stoppedAt)
-        && now - stoppedAt >= PREDECESSOR_LONG_STOP_MS;
+      // Strict instants only: an impossible or zone-less timestamp proves nothing.
+      const rebootAt = parseStrictIsoInstant(record.lastRebootAt);
+      const startAt = parseStrictIsoInstant(input.predecessor.start?.at);
+      if (rebootAt !== null && startAt !== null && rebootAt > startAt) return true;
+      const stoppedAt = parseStrictIsoInstant(record.stoppedAt);
+      const now = parseStrictIsoInstant(record.observedAt) ?? (input.now ?? Date.now)();
+      // Exactly the provider-neutral "stopped" state (the plugin maps Boat's
+      // archived-with-stoppedAt to it); Core reads no raw provider state names.
+      const longStop = record.state === "stopped" && stoppedAt !== null && now - stoppedAt >= PREDECESSOR_LONG_STOP_MS;
       if (longStop && (input.longStopProvesLossAlone ?? PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE)) return true;
     }
   }

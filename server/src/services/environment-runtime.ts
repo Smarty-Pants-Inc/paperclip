@@ -75,6 +75,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { hasSandboxSnapshotQualification, qualifiedSandboxSnapshotId, usesManagedCloudSandboxImage, type SandboxTemplateIdentity } from "./sandbox-snapshot-qualification.js";
 import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-harness-backup-storage.js";
 import type { PredecessorSandboxRecord } from "./native-runtime/native-session-executor.js";
+import { parseStrictIsoInstant } from "./native-runtime/strict-iso-instant.js";
 import {
   collectEnvironmentSecretRefs,
   parseEnvironmentDriverConfig,
@@ -3906,7 +3907,7 @@ export function predecessorSandboxRecordFromObservation(
   if (!observation || observation.providerLeaseId !== providerLeaseId) throw new Error("predecessor_sandbox_unobserved");
   if (observation.state === "destroyed") return { kind: "gone" };
   if (observation.state !== "stopped" && observation.state !== "active") throw new Error("predecessor_sandbox_state_unknown");
-  const instant = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null;
+  const instant = (value: unknown) => parseStrictIsoInstant(value) === null ? null : value as string;
   return {
     kind: "present",
     state: observation.state === "stopped" ? "stopped" : "running",
