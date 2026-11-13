@@ -1,0 +1,208 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import plugin from "./plugin.js";
+import manifest from "./manifest.js";
+import { PluginEnvironmentRunnerIngressError } from "@paperclipai/plugin-sdk";
+
+// Keep: provider/core trust boundary, retained workspace data safety, and
+// failures (foreign allocation, lost reply, secret-bearing errors) unsafe to seed live.
+const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: true };
+const scope = { driverKey: "boat", companyId: "company", environmentId: "environment", config: cfg };
+const acquire = { ...scope, runId: "run-1", agentId: "agent", executionWorkspaceId: "workspace", adapterType: "paperclip_runner" };
+const path = "/api/runner/v1/connect/run-1";
+function reply(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status }); }
+function fixture() {
+  let state = "ready", revision = "2026-11-12T00:00:00Z", token = "private-token", sentinel: any;
+  const network = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url), body = init?.body ? JSON.parse(String(init.body)) : {};
+    if (u.endsWith("/sandboxes") && init?.method === "POST") return reply({ sandbox: { id: "bx_runner", state: "ready", updatedAt: revision } }, 202);
+    if (u.endsWith("/sandboxes/bx_runner")) return reply({ sandbox: { id: "bx_runner", state, updatedAt: revision, archiveAfter: "2030-01-01T00:00:00Z" } });
+    if (u.endsWith("/host")) return reply({ port: 43127, url: `https://swift-otter-9021-43127.on.boat.dev?_token=${token}`, isProtected: true, access: "private" });
+    if (u.endsWith("/resume")) { state = "ready"; revision = "2026-11-12T00:01:00Z"; return reply({ sandbox: { id: "bx_runner", state, updatedAt: revision } }, 202); }
+    if (u.endsWith("/files") && init?.method === "PUT") { sentinel = JSON.parse(body.content); return reply({ success: true }); }
+    if (u.includes("/files?")) return reply({ content: JSON.stringify(sentinel), encoding: "utf8" });
+    if (u.endsWith("/commands")) return reply({ exitCode: 0, timedOut: false, stdout: body.command?.includes("cat ") ? JSON.stringify(sentinel) : "", stderr: "" });
+    if (u.endsWith("/stop")) { state = "archived"; return reply({ operation: { id: "stop_1" } }, 202); }
+    if (u.endsWith("/stops/stop_1")) return reply({ stop: { status: "completed" } });
+    throw new Error(`Unexpected fixture request ${init?.method ?? "GET"} ${u}`);
+  });
+  vi.stubGlobal("fetch", network);
+  return { network, setState: (value: string) => { state = value; }, setRevision: (value: string) => { revision = value; }, setToken: (value: string) => { token = value; }, getSentinel: () => sentinel, corruptSentinel: () => { sentinel.token = "foreign"; } };
+}
+async function ingress(lease = { providerLeaseId: "bx_runner" } as any) {
+  if (!plugin.definition.onEnvironmentRunnerIngressEndpoint) throw new Error("Runner ingress hook missing");
+  return plugin.definition.onEnvironmentRunnerIngressEndpoint({ ...scope, lease, port: 43127, path });
+}
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe("Boat Runner contract", () => {
+  it("declares only implemented Runner transport and host-owned lifecycle controls", () => {
+    const driver = manifest.environmentDrivers![0];
+    expect(driver.sandboxCapabilities).toMatchObject({ reusableLeases: true, runnerWebSocketIngress: true });
+    // The existing host has no per-environment config narrowing hook. Do not
+    // advertise capability just because SSH methods have been implemented.
+    expect(driver.sandboxCapabilities?.duplexCommandStream).toBe(true);
+    expect(driver.configSchema?.properties?.duplexCarrier).toMatchObject({ default: "off" });
+    expect(driver.configSchema?.properties?.runnerLifecycleMode).toMatchObject({ enum: ["inherit", "per_turn", "warm"], default: "inherit" });
+    expect(driver.configSchema?.properties?.runnerIdleTimeoutMs).toMatchObject({ minimum: 1000, maximum: 86400000, default: 300000 });
+    expect(driver.defaultAcquireTimeoutMs).toBeGreaterThanOrEqual(120000);
+  });
+  it("acquires a private fixed-port WSS route with Cookie secret, never a token in its URL", async () => {
+    const f = fixture(); const endpoint = await ingress();
+    expect(endpoint).toMatchObject({ kind: "authenticated_websocket", websocketUrl: `wss://swift-otter-9021-43127.on.boat.dev${path}`, secretHeaders: [{ name: "Cookie", value: "_port_auth=private-token" }] });
+    const call = f.network.mock.calls.find(([url]) => String(url).endsWith("/host"))!;
+    expect(JSON.parse(String(call[1]?.body))).toEqual({ port: 43127, public: false, localhost: false });
+    expect(endpoint.generation).toMatch(/^[a-f0-9]{64}$/);
+  });
+  it("keeps generation stable across credential rotation and changes it after lifecycle revision", async () => {
+    const f = fixture(); const a = await ingress(); f.setToken("rotated-token"); const b = await ingress();
+    expect(a.generation).toBe(b.generation); expect(b.secretHeaders[0].value).toBe("_port_auth=rotated-token");
+    f.setRevision("2026-11-12T01:00:00Z"); expect((await ingress()).generation).not.toBe(a.generation);
+  });
+  it.each([{ port: 80, path }, { port: 43127, path: "/wrong" }, { port: 43127, path: `${path}?token=oops` }, { port: 43127, path: "/api/runner/v1/connect/../escape" }])("rejects invalid ingress before provider calls: %j", async input => {
+    const f = fixture(); await expect(plugin.definition.onEnvironmentRunnerIngressEndpoint?.({ ...scope, lease: { providerLeaseId: "bx_runner" }, ...input })).rejects.toThrow(); expect(f.network).not.toHaveBeenCalled();
+  });
+  it.each(["http://swift-otter-9021-43127.on.boat.dev?_token=secret", "https://attacker.test?_token=secret", "https://swift-otter-9021-43127.on.boat.dev?_token=x%3Badmin%3Dtrue", "https://swift-otter-9021-43127.on.boat.dev?_token=x&other=y", "https://swift-otter-9021-43127.on.boat.dev"])("rejects invalid/ungated preview without reflecting credentials: %s", async url => {
+    fixture(); vi.stubGlobal("fetch", vi.fn(async (target: string) => target.endsWith("/host") ? reply({ url, isProtected: true, access: "private", port: 43127 }) : reply({ sandbox: { id: "bx_runner", state: "ready" } })));
+    await expect(ingress()).rejects.toThrow(/invalid|incomplete/i);
+  });
+  it.each([401, 403, 404, 429, 503])("serializes safe SDK ingress failure for HTTP %i", async status => {
+    fixture(); vi.stubGlobal("fetch", vi.fn(async () => reply({ message: "do not leak private-token" }, status)));
+    const error = await ingress().catch(e => e);
+    expect(error).toBeInstanceOf(PluginEnvironmentRunnerIngressError);
+    expect(error.failure).toEqual({ phase: "sandbox_lookup", httpStatus: status });
+    expect(error.message).not.toContain("private-token");
+  });
+  it("does not send API credentials to a redirected provider endpoint", async () => {
+    const f = fixture(); await ingress();
+    for (const [, init] of f.network.mock.calls) expect(init?.redirect).toBe("error");
+  });
+  it("writes a scoped reusable sentinel and records exact allocation file digest", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire);
+    expect(lease.metadata).toMatchObject({ adapterType: "paperclip_runner", reuseLease: true, workspaceSentinel: { result: "written", path: "/home/user/paperclip-workspace/.paperclip-runtime/reusable-sandbox-lease.json", token: expect.stringMatching(/^[a-f0-9]{64}$/) }, workspaceAllocationFiles: { providerLeaseId: "bx_runner", remoteCwd: "/home/user/paperclip-workspace", files: [{ relativePath: ".paperclip-runtime/reusable-sandbox-lease.json", sha256: expect.stringMatching(/^[a-f0-9]{64}$/) }] } });
+    expect(f.getSentinel()).toMatchObject({ version: 1, provider: "boat", companyId: "company", environmentId: "environment", agentId: "agent", executionWorkspaceId: "workspace" });
+  });
+  it("fingerprints allocation shape but not the new run ID for a reusable workspace", async () => {
+    fixture(); const a = await plugin.definition.onEnvironmentAcquireLease!(acquire);
+    const b = await plugin.definition.onEnvironmentAcquireLease!({ ...acquire, runId: "run-2" });
+    const c = await plugin.definition.onEnvironmentAcquireLease!({ ...acquire, config: { ...cfg, type: "large" } });
+    expect((a.metadata!.workspaceSentinel as any).token).toBe((b.metadata!.workspaceSentinel as any).token);
+    expect((a.metadata!.workspaceSentinel as any).token).not.toBe((c.metadata!.workspaceSentinel as any).token);
+  });
+  it("resumes the same stopped allocation, verifies the sentinel, and preserves allocation ownership", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire); f.setState("archived");
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: lease.providerLeaseId!, leaseMetadata: lease.metadata });
+    expect(resumed).toMatchObject({ providerLeaseId: "bx_runner", metadata: { resumedLease: true, workspaceSentinel: { result: "matched" } }, expiresAt: "2030-01-01T00:00:00Z" });
+    expect(resumed.metadata!.workspaceAllocationFiles).toEqual(lease.metadata!.workspaceAllocationFiles);
+  });
+  it("resumes at the recorded sentinel after Core rewrites remoteCwd to a shared workspace", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire);
+    const original = lease.metadata!.remoteCwd as string;
+    const remoteCwd = `${original}/.paperclip-workspaces/project/shared`;
+    const metadata = { ...lease.metadata, remoteCwd };
+    f.setState("archived"); f.network.mockClear();
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", requestedCwd: remoteCwd, leaseMetadata: metadata });
+    expect(resumed).toMatchObject({ providerLeaseId: "bx_runner", metadata: { remoteCwd, workspaceSentinel: { path: `${original}/.paperclip-runtime/reusable-sandbox-lease.json`, result: "matched", token: (lease.metadata!.workspaceSentinel as any).token } } });
+    expect(resumed.metadata!.workspaceAllocationFiles).toEqual(lease.metadata!.workspaceAllocationFiles);
+    const commands = f.network.mock.calls.filter(([url]) => String(url).endsWith("/commands")).map(([, init]) => JSON.parse(String(init?.body)).command);
+    expect(commands).toContain(`cat '${original}/.paperclip-runtime/reusable-sandbox-lease.json'`);
+    expect(commands.some(command => command.includes(`${remoteCwd}/.paperclip-runtime`))).toBe(false);
+  });
+  it.each(["/foreign/.paperclip-runtime/reusable-sandbox-lease.json", "/home/user/paperclip-workspace-other/.paperclip-runtime/reusable-sandbox-lease.json", "/home/user/paperclip-workspace/../foreign/.paperclip-runtime/reusable-sandbox-lease.json"])("refuses a recorded sentinel outside the original allocation cwd: %s", async sentinelPath => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire);
+    const metadata = { ...lease.metadata, remoteCwd: "/home/user/paperclip-workspace/.paperclip-workspaces/project/shared", workspaceSentinel: { ...(lease.metadata!.workspaceSentinel as any), path: sentinelPath } };
+    f.network.mockClear();
+    expect(await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", leaseMetadata: metadata })).toMatchObject({ providerLeaseId: null });
+    expect(f.network).not.toHaveBeenCalled();
+  });
+  it("refuses an allocation receipt for a different sandbox after a remoteCwd rewrite", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire);
+    const metadata = { ...lease.metadata, remoteCwd: "/home/user/paperclip-workspace/.paperclip-workspaces/project/shared", workspaceAllocationFiles: { ...(lease.metadata!.workspaceAllocationFiles as any), providerLeaseId: "bx_foreign" } };
+    f.network.mockClear();
+    expect(await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", leaseMetadata: metadata })).toMatchObject({ providerLeaseId: null });
+    expect(f.network).not.toHaveBeenCalled();
+  });
+  it("never restarts an already warm sandbox during resume or ingress", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire); f.network.mockClear();
+    await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata }); await ingress(lease);
+    expect(f.network.mock.calls.some(([url]) => String(url).endsWith("/resume"))).toBe(false);
+  });
+  it("expires a mismatched sentinel without destroying or recreating the allocation", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire); f.corruptSentinel(); f.network.mockClear();
+    expect(await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata })).toMatchObject({ providerLeaseId: null, metadata: { expired: true, workspaceSentinel: { result: "mismatch" } } });
+    expect(f.network.mock.calls.every(([, init]) => init?.method !== "DELETE")).toBe(true);
+  });
+  it("never accepts a pre-Runner lease with no sentinel on the Runner path", async () => {
+    const f = fixture(); const result = await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", leaseMetadata: { adapterType: "paperclip_runner", remoteCwd: "/home/user/paperclip-workspace" } });
+    expect(result.providerLeaseId).toBeNull(); expect(f.network).not.toHaveBeenCalled();
+  });
+  it("refuses changed workspace before resuming", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire); f.network.mockClear();
+    await expect(plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata, requestedCwd: "/foreign" })).rejects.toThrow(/directory|workspace/i); expect(f.network).not.toHaveBeenCalled();
+  });
+  it("does not erase the configured Boat environment on resume", async () => {
+    const f = fixture(); const config = { ...cfg, boatEnvironment: "runner" }; const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...acquire, config }); f.setState("archived");
+    await plugin.definition.onEnvironmentResumeLease!({ ...scope, config, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata });
+    const call = f.network.mock.calls.find(([url]) => String(url).endsWith("/resume"))!;
+    expect(JSON.parse(String(call[1]?.body))).not.toHaveProperty("noEnv");
+  });
+  it("refuses a hard caller deadline before allocating because Boat auto-stop can extend", async () => {
+    const f = fixture();
+    await expect(plugin.definition.onEnvironmentAcquireLease!({ ...acquire, requestedExpiresAt: new Date(Date.now() + 120000).toISOString() })).rejects.toThrow(/hard requestedExpiresAt/);
+    expect(f.network).not.toHaveBeenCalled();
+  });
+  it("raises provider TTL above host warm idle and reconnect windows", async () => {
+    const f = fixture(); const config = { ...cfg, ttlSeconds: 60, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 600000, runnerReconnectGraceMs: 1200000 };
+    await plugin.definition.onEnvironmentAcquireLease!({ ...acquire, config });
+    const body = JSON.parse(String(f.network.mock.calls[0][1]?.body)); expect(body.ttlSeconds).toBe(1500);
+    expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config })).toMatchObject({ ok: true, normalizedConfig: { runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 600000 } });
+  });
+  it.each([{ runnerLifecycleMode: "unknown" }, { runnerIdleTimeoutMs: 999 }, { runnerIdleTimeoutMs: 86400001 }, { runnerIdleTimeoutMs: 1.5 }, { reuseLease: "yes" }])("rejects invalid lifecycle settings %j", async invalid => {
+    expect(await plugin.definition.onEnvironmentValidateConfig!({ driverKey: "boat", config: { ...cfg, ...invalid } })).toMatchObject({ ok: false });
+  });
+  it("fails workspace realization loudly rather than reporting a nonexistent cwd", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply({ exitCode: 1, timedOut: false, stdout: "", stderr: "permission denied" })));
+    await expect(plugin.definition.onEnvironmentRealizeWorkspace!({ ...scope, lease: { providerLeaseId: "bx_runner" }, workspace: { remotePath: "/workspace" } })).rejects.toThrow(/workspace/i);
+  });
+  it("renews an already-running warm lease on handoff without resuming its machine", async () => {
+    const f = fixture(); const config = { ...cfg, ttlSeconds: 60, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 600000 };
+    const lease = await plugin.definition.onEnvironmentAcquireLease!({ ...acquire, config }); f.network.mockClear();
+    await plugin.definition.onEnvironmentResumeLease!({ ...scope, config, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata });
+    expect(f.network.mock.calls.some(([, init]) => init?.method === "PATCH" && JSON.parse(String(init.body)).ttlSeconds === 900)).toBe(true);
+    expect(f.network.mock.calls.some(([url]) => String(url).endsWith("/resume"))).toBe(false);
+  });
+  it("fences ingress and commands after confirmed stop, then admits only verified resume", async () => {
+    const f = fixture(); const owned = { ...acquire, companyId: "fence-company" }; const lease = await plugin.definition.onEnvironmentAcquireLease!(owned);
+    await plugin.definition.onEnvironmentStopLease!({ ...owned, providerLeaseId: "bx_runner" }); f.network.mockClear();
+    await expect(plugin.definition.onEnvironmentRunnerIngressEndpoint!({ ...owned, lease, port: 43127, path })).rejects.toThrow(/no longer active/);
+    await expect(plugin.definition.onEnvironmentExecute!({ ...owned, lease, command: "true" })).rejects.toThrow(/no longer active/);
+    expect(f.network).not.toHaveBeenCalled();
+    const resumed = await plugin.definition.onEnvironmentResumeLease!({ ...owned, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata });
+    expect(resumed.providerLeaseId).toBe("bx_runner");
+    expect(await plugin.definition.onEnvironmentExecute!({ ...owned, lease: resumed, command: "true" })).toMatchObject({ exitCode: 0 });
+  });
+  it("a command whose stdin was in flight cannot launch after operator stop", async () => {
+    const f = fixture(); const owned = { ...acquire, companyId: "cancel-company" }; const lease = await plugin.definition.onEnvironmentAcquireLease!(owned);
+    const delegate = globalThis.fetch;
+    let entered!: () => void, finish!: () => void;
+    const enteredPromise = new Promise<void>(resolve => { entered = resolve; });
+    const blocked = new Promise<void>(resolve => { finish = resolve; });
+    vi.stubGlobal("fetch", async (url: any, init?: RequestInit) => {
+      if (String(url).endsWith("/files") && init?.method === "PUT") { entered(); await blocked; return reply({ success: true }); }
+      return delegate(url, init);
+    });
+    const executing = plugin.definition.onEnvironmentExecute!({ ...owned, lease, command: "dangerous-command", stdin: "input" }).catch(error => error);
+    await enteredPromise;
+    await plugin.definition.onEnvironmentStopLease!({ ...owned, providerLeaseId: "bx_runner" });
+    const refused = await plugin.definition.onEnvironmentResumeLease!({ ...owned, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata }).catch(error => error);
+    finish(); const execution = await executing;
+    expect(refused).toBeInstanceOf(Error); expect(refused.message).toMatch(/settling/);
+    expect(execution.message).toMatch(/no longer active/);
+    expect(f.network.mock.calls.some(([, init]) => String(init?.body).includes("dangerous-command"))).toBe(false);
+  });
+  it("does not report a deleted lease as active or erase a transient inspection failure", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply({}, 404)));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_runner" })).toEqual({ providerLeaseId: "bx_runner", state: "destroyed" });
+    vi.stubGlobal("fetch", vi.fn(async () => reply({}, 503)));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_runner" })).rejects.toThrow();
+  });
+});

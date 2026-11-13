@@ -1,0 +1,46 @@
+import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
+
+const manifest: PaperclipPluginManifestV1 = {
+  id: "paperclip.boat-sandbox-provider",
+  apiVersion: 1,
+  version: "0.1.14-runner-envfile-snapid-retain-routea",
+  displayName: "Boat Sandbox Provider",
+  description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
+  author: "Paperclip",
+  categories: ["automation"],
+  capabilities: ["environment.drivers.register"],
+  entrypoints: { worker: "./dist/worker.js" },
+  environmentDrivers: [{
+    driverKey: "boat",
+    kind: "sandbox_provider",
+    defaultAcquireTimeoutMs: 300_000,
+    creationOperationVersion: 1,
+    displayName: "Boat Cloud Sandbox",
+    description: "Boat sandboxes with private Runner ingress and reusable workspace leases.",
+    sandboxCapabilities: { reusableLeases: true, runnerWebSocketIngress: true, persistentProcessSessions: false, incrementalSessionOutput: false, independentControlCommands: true, duplexCommandStream: true },
+    templateRefKind: "snapshot",
+    templateConfigBinding: { field: "snapshot", unsetFields: ["from", "pinnedSnapshotId"] },
+    configSchema: {
+      type: "object",
+      properties: {
+        apiKey: { type: "string", format: "secret-ref", description: "Boat API key or Paperclip secret reference." },
+        duplexCarrier: { type: "string", enum: ["off", "ssh"], default: "off", description: "Resident S9 guardian over pinned SSH. Default off. Only SSH leases with successful guardian preflight carry runnerGuardianVersion:1; all other duplex opens are refused." },
+        reuseLease: { type: "boolean", description: "Whether to resume the same retained sandbox across runs. Sandboxes are always stopped and kept on release.", default: false },
+        runnerLifecycleMode: { type: "string", enum: ["inherit", "per_turn", "warm"], description: "paperclip_runner lifecycle for this environment. Inherit uses the agent setting; warm keeps runnerd and the sandbox available between turns.", default: "inherit" },
+        runnerIdleTimeoutMs: { type: "integer", description: "How long an idle warm paperclip_runner stays alive before it checkpoints and suspends.", minimum: 1000, maximum: 86400000, default: 300000 },
+        retainOnDestroy: { type: "boolean", description: "ignored: sandboxes are always stopped and kept", default: true },
+        type: { type: "string", enum: ["small", "default", "large", "xlarge"], default: "small" },
+        ttlSeconds: { type: "number", default: 1800, description: "Sandbox auto-stop TTL (seconds; maximum 30 days). Raised above a host warm idle or reconnect window plus five minutes; hard caller expiry is unsupported and rejected before allocation." },
+        setupTimeoutSeconds: { type: "number", default: 180, minimum: 1, maximum: 600, description: "Maximum seconds to wait for setupScript to finish." },
+        labels: { type: "object", additionalProperties: { type: "string" }, description: "Additional Boat labels, merged with Paperclip ownership labels." },
+        setupScript: { type: "string", maxLength: 16384, description: "Optional Boat setup script (maximum 16 KiB UTF-8)." },
+        snapshot: { type: "string", minLength: 1, description: "Saved-snapshot name or immutable UUID. UUIDs resolve to exactly one name and are checked again immediately before create. Cannot be combined with from or pinnedSnapshotId." },
+        from: { type: "string", minLength: 1, description: "Legacy saved-snapshot name or bsh_ share code, passed to Boat as from. Use snapshot for lease identity qualification." },
+        pinnedSnapshotId: { type: "string", minLength: 1, description: "Optional immutable snapshot ID. Before create, resolve from and fail closed if its current artifact differs. Requires from." },
+        boatEnvironment: { type: "string", minLength: 1, description: "Optional Boat environment name; when set, sends environment and omits noEnv. When unset, noEnv remains true." },
+      },
+      required: ["apiKey"],
+    },
+  }],
+};
+export default manifest;

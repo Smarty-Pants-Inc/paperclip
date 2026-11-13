@@ -1,0 +1,23 @@
+{
+  "name": "@paperclipai/plugin-boat",
+  "version": "0.1.14-runner-envfile-snapid-retain-routea",
+  "description": "Boat sandbox provider plugin for Paperclip environments",
+  "license": "MIT",
+  "type": "module",
+  "exports": { ".": "./dist/index.js" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "guest", "README.md", "SSH.md"],
+  "paperclipPlugin": { "manifest": "./dist/manifest.js", "worker": "./dist/worker.js" },
+  "scripts": {
+    "prebuild": "pnpm -C ../../../.. --filter @paperclipai/plugin-sdk ensure-build-deps",
+    "build": "rm -rf dist && tsc",
+    "typecheck": "pnpm -C ../../../.. --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts",
+    "prepack": "rm -f package.dev.json && cp package.json package.dev.json && node ../../../../scripts/generate-plugin-package-json.mjs",
+    "postpack": "if [ -f package.dev.json ]; then mv package.dev.json package.json; fi"
+  },
+  "dependencies": {},
+  "devDependencies": { "@types/node": "^24.0.0", "typescript": "^5.7.3", "vitest": "^4.1.8" },
+  "engines": { "node": ">=24.11.0" }
+}

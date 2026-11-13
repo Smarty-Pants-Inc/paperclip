@@ -1,0 +1,37 @@
+#!/usr/bin/node
+// Node 24 treats this extensionless entry as ESM. Keep alongside guest/*.mjs.
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createGuardian, GUARDIAN_SOCKET_PATH } from './guardian.mjs';
+import { guardianClient } from './guardian-client.mjs';
+import { fail, SupervisorError, validId } from './protocol.mjs';
+import { refusal } from './guardian-protocol.mjs';
+export { GUARDIAN_SOCKET_PATH };
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.length === 5 && args[0] === 'client' && args[1] === '--protocol' && args[2] === '1' && args[3] === '--runner-id' && validId(args[4])) {
+    // sshd supplies this value; a forced key must not silently ignore an
+    // attempted shell, alternate Runner or different protocol command.
+    const original = process.env.SSH_ORIGINAL_COMMAND;
+    if (original !== undefined || process.env.SSH_CONNECTION) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(args[4]) ||
+          original !== `/usr/local/libexec/paperclip-runner-guardian client --protocol 1 --runner-id ${args[4]}`) fail('UNTRUSTED_SSH_COMMAND');
+    }
+    process.exitCode = await guardianClient({ runnerId: args[4] }); return;
+  }
+  if (args.length !== 2 || args[0] !== 'serve') fail('INVALID_ARGUMENTS');
+  const guardian = await createGuardian({ stateDir: args[1], socketPath: GUARDIAN_SOCKET_PATH });
+  process.stdout.write(JSON.stringify({ version: 1, socketPath: guardian.socketPath }) + '\n');
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return; stopping = true;
+    try { await guardian.close(); } catch { process.exitCode = 1; }
+  };
+  process.on('SIGTERM', stop); process.on('SIGINT', stop);
+}
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    process.stdout.write(JSON.stringify(refusal(null, error instanceof SupervisorError ? error : new SupervisorError('INTERNAL_ERROR'))) + '\n');
+    process.exitCode = 1;
+  });
+}
