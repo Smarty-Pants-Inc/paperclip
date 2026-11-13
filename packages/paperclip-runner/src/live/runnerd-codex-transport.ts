@@ -6626,6 +6626,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
       onProtocolIntegrityError: (error) => this.#failTransport(error),
+      onAuthenticatedDisconnect: () => this.#handle?.requestExitVerification?.(),
       // The runner process is up once it authenticates; provider work follows.
       onAuthenticatedConnection: () => this.#startupSteps?.advance("runner.process.launch", "provider.session.load"),
       get authorityRunId() { return authorityRunId(); },
@@ -7246,6 +7247,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
       onProtocolIntegrityError: (error) => this.#failTransport(error),
+      onAuthenticatedDisconnect: () => this.#handle?.requestExitVerification?.(),
       // The runner process is up once it authenticates; provider work follows.
       onAuthenticatedConnection: () => this.#startupSteps?.advance("runner.process.launch", "provider.session.load"),
       get authorityRunId() { return authorityRunId(); },
