@@ -15,6 +15,7 @@ import {
 } from "@paperclipai/db";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
@@ -31,7 +32,8 @@ import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { environmentService } from "../services/environments.js";
 import type { AdapterRuntimeEvent } from "@paperclipai/adapter-utils";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
-import { closeWarmNativeSessionsForEnvironment, executePaperclipNativeSession, cancelNativeSession } from "../services/native-runtime/native-session-executor.js";
+import { closeWarmNativeSessionsForEnvironment, executePaperclipNativeSession, cancelNativeSession, reserveWarmNativeInstructionDirectory,
+  type NativeInstructionWorkingCopy } from "../services/native-runtime/native-session-executor.js";
 import { currentNativeControllerIdentity } from "../services/native-runtime/native-restart-recovery.js";
 import { prepareNativeHeartbeatRun } from "../services/native-runtime/prepare-native-run.js";
 import {
@@ -429,6 +431,29 @@ it.skipIf(!enabled || resumedFrom === "connected")(`Core's idle close or Stop, t
       return { runId, run: run!, native, execution, lease, prompt, acquired };
     };
     type Fixture = Awaited<ReturnType<typeof seed>>;
+    // A MANAGED-instructions agent by default (REG03_MANAGED=0 runs unmanaged):
+    // each turn runs with a registered agent-files working copy, and the next
+    // turn first reserves the warm owner's instruction directory exactly as
+    // heartbeat/instruction-working-copy.ts does.
+    const managed = process.env.REG03_MANAGED !== "0";
+    const instructionRoot = join(root, "managed-instructions");
+    let lastManagedRunId: string | undefined;
+    const managedReservations: Array<Record<string, unknown>> = [];
+    const managedTurn = async (fixture: Fixture, target: AdapterExecutionTarget) => {
+      if (!managed) return { extra: {}, release: async () => {} };
+      let release = async () => {};
+      if (lastManagedRunId) {
+        const reservation = await reserveWarmNativeInstructionDirectory({ companyId, agentId, previousRunId: lastManagedRunId,
+          runId: fixture.runId, target, canReuse: async () => true });
+        managedReservations.push({ runId: fixture.runId, previousRunId: lastManagedRunId, reserved: reservation !== null });
+        stage("managed instruction reservation", managedReservations.at(-1));
+        if (reservation) { reservation.adopt(instructionRoot, async () => {}); release = reservation.release; }
+      }
+      lastManagedRunId = fixture.runId;
+      const instructionWorkingCopy: NativeInstructionWorkingCopy = { runId: fixture.runId, preparationKey: "managed-fixture",
+        root: instructionRoot, checkpointWarm: async () => true, hasChanges: async () => false, collectStopped: async () => {} };
+      return { extra: { instructionWorkingCopy }, release };
+    };
     const executionOptions = async (fixture: Fixture) => {
       const target = await resolveEnvironmentExecutionTarget({ db: db!, companyId, adapterType: "paperclip_runner", environment,
         leaseId: fixture.lease.id, leaseMetadata: fixture.lease.metadata, lease: fixture.lease as EnvironmentLease, environmentRuntime: runtime });
@@ -492,8 +517,10 @@ it.skipIf(!enabled || resumedFrom === "connected")(`Core's idle close or Stop, t
     const first = await seed("Invent a private fact, say it once, and retain it only in your assistant history.");
     activeRunId = first.runId;
     const firstOptions = await executionOptions(first);
-    const firstOutcome = await executePaperclipNativeSession({ ...firstOptions, useRunnerd: true, conversationMode: true }).then(
+    const firstManaged = await managedTurn(first, firstOptions.runnerExecutionTarget);
+    const firstOutcome = await executePaperclipNativeSession({ ...firstOptions, ...firstManaged.extra, useRunnerd: true, conversationMode: true }).then(
       result => ({ result }), error => ({ error: String(error) }));
+    await firstManaged.release().catch(() => undefined);
     activeRunId = undefined;
     await writeFile(join(root, "execution-outcome.json"), JSON.stringify(firstOutcome, null, 2));
     expect(record(firstOutcome).error, JSON.stringify(firstOutcome)).toBeUndefined();
@@ -592,8 +619,10 @@ it.skipIf(!enabled || resumedFrom === "connected")(`Core's idle close or Stop, t
       }
       activeRunId = next.runId; earlyOutcome = undefined;
       judgeHold.active = holdForStop;
-      execution = executePaperclipNativeSession({ ...nextOptions, useRunnerd: true, conversationMode: true }).then(
-        result => (earlyOutcome = { result }), error => (earlyOutcome = { error: String(error) }));
+      const nextManaged = await managedTurn(next, nextOptions.runnerExecutionTarget);
+      execution = executePaperclipNativeSession({ ...nextOptions, ...nextManaged.extra, useRunnerd: true, conversationMode: true }).then(
+        result => (earlyOutcome = { result }), error => (earlyOutcome = { error: String(error) }))
+        .finally(() => nextManaged.release().catch(() => undefined));
       if (holdForStop) {
         await vi.waitFor(() => expect(judgeHold.inFlight === 1 || earlyOutcome !== undefined).toBe(true), { timeout: 120_000, interval: 100 });
         if (earlyOutcome) throw new Error(`turn 1 ended before Stop: ${JSON.stringify(earlyOutcome)}`);
@@ -667,7 +696,8 @@ it.skipIf(!enabled || resumedFrom === "connected")(`Core's idle close or Stop, t
     const epochs = resumedFrom === "connected" ? []
       : readdirSync(join(remoteSessionRoot, "authority-epochs")).filter(name => name.startsWith("epoch-"));
     await writeFile(join(root, "proof.json"), JSON.stringify({ scope: "executePaperclipNativeSession warm path; real runnerd/proxy/Pi; simulated allocation and loopback model",
-      firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs, startupEvents, stopArchived, stopDelayMs }, null, 2));
+      firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs, startupEvents, stopArchived, stopDelayMs,
+      managed, managedReservations }, null, 2));
     stage(`GREEN: three turns of the same conversation across Core's idle closes (${resumedFrom})`, { epochs });
     await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "closed-owner proof complete" });
   } catch (error) { failure = error; throw error; }

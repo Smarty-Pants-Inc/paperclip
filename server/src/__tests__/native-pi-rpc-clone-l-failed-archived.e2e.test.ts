@@ -110,16 +110,20 @@ function sessionFile(pi: Birth): string {
 // of the same generation: a same-machine resume) and "other-box" (the failed
 // run's lease names another sandbox): neither may retire the owner; the
 // conversation is held with exactly one notice and no second Runner.
-// Managed instructions (an agent with instructionsBundleMode "managed", as
-// d981): each turn runs with a registered agent-files working copy, and the
-// next turn first reserves the warm owner's instruction directory exactly as
-// heartbeat/instruction-working-copy.ts does (reserveWarmNativeInstructionDirectory),
-// which marks the warm owner as preparing for that run. "idle-loss": the warm
+// Every variant runs a MANAGED-instructions agent by default (an agent with
+// instructionsBundleMode "managed", as d981): each turn runs with a registered
+// agent-files working copy, and the next turn first reserves the warm owner's
+// instruction directory exactly as heartbeat/instruction-working-copy.ts does
+// (reserveWarmNativeInstructionDirectory), which marks the warm owner as
+// preparing for that run. "unmanaged-*" runs the same shape without it. "idle-loss": the warm
 // owner's Runner and Pi die while idle on a still-running box, then a plain
-// message. "managed-*" runs the same shape with managed instructions.
-it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box", "escape", "managed-unsuspended", "idle-loss", "managed-idle-loss"] as const)("Clone L: a failed run, then the box archived (%s), then a plain message", async variant => {
-  const managed = variant.startsWith("managed-");
-  const ownerAtArchive = variant.replace("managed-", "") as "suspended" | "unsuspended" | "live-owner" | "other-box" | "escape" | "idle-loss";
+// message. "idle-archived": the box is archived while the warm owner is idle
+// (no idle close ran; every process on it ends and its lease can run nothing
+// more), then a plain message resumes it from archived.
+it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box", "escape", "idle-loss", "idle-archived",
+  "unmanaged-suspended", "unmanaged-unsuspended", "unmanaged-idle-loss", "unmanaged-idle-archived"] as const)("Clone L: a failed run, then the box archived (%s), then a plain message", async variant => {
+  const managed = !variant.startsWith("unmanaged-");
+  const ownerAtArchive = variant.replace("unmanaged-", "") as "suspended" | "unsuspended" | "live-owner" | "other-box" | "escape" | "idle-loss" | "idle-archived";
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -443,8 +447,10 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
     await environmentsService.releaseLease(first.lease.id, "released");
     stage("turn 1 succeeded", { runId: first.runId, runner, pi });
 
-    if (ownerAtArchive === "idle-loss") {
-      // The warm owner's Runner and Pi die while idle; the box keeps running.
+    if (ownerAtArchive === "idle-loss" || ownerAtArchive === "idle-archived") {
+      // The warm owner's Runner and Pi die while idle; "idle-loss" keeps the
+      // box running, "idle-archived" archives it first (its lease runs nothing more).
+      if (ownerAtArchive === "idle-archived") leaseActive.set(first.lease.id, false);
       for (const owned of spawned) {
         if (!sameBirth(owned)) continue;
         const ownedPi = ownedDescendant(owned, "pi");
@@ -452,11 +458,11 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
         try { process.kill(owned.pid, "SIGKILL"); } catch { /* already gone */ }
       }
       await vi.waitFor(() => { expect(spawned.filter(sameBirth)).toEqual([]); }, { timeout: 15_000, interval: 100 });
-      stage("warm owner died while idle; the box keeps running", { runner, pi });
+      stage(ownerAtArchive === "idle-archived" ? "box archived while the warm owner was idle" : "warm owner died while idle; the box keeps running", { runner, pi });
       await new Promise(resolve => setTimeout(resolve, 2_000));
       const before = commands.length, spawnedBeforeIdle = spawned.length;
       const next = await follow(first, "Recall the private fact from your own earlier assistant history. Do not invent it.");
-      const outcome = await run(next, "resumed", false, 120_000);
+      const outcome = await run(next, "resumed", ownerAtArchive === "idle-archived", 120_000);
       await writeFile(join(root, "turn-2-outcome.json"), JSON.stringify(outcome, null, 2));
       const probes = commands.slice(before).filter(entry =>
         (record(entry).args as string[] | undefined)?.[2] === "paperclip-runner-generation-check").map(entry => record(entry).exitCode);
@@ -465,10 +471,34 @@ it.skipIf(!enabled).each(["suspended", "unsuspended", "live-owner", "other-box",
       const held = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
         .filter(comment => String(record(comment.metadata).authorizationReason ?? "").startsWith("native_prior_owner_held:"));
       const summary = record(record(outcome).result).summary;
+      // The next message after a failed one: the heartbeat marks the failed
+      // run failed and releases its lease; the person sends another message.
+      let second: Record<string, unknown> | undefined;
+      if (record(outcome).error !== undefined || "hung" in outcome) {
+        await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "adapter_failed",
+          error: String(record(outcome).error ?? "hung") }).where(eq(heartbeatRuns.id, next.runId));
+        await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+          .where(eq(nativeRunFinalizations.runId, next.runId));
+        leaseActive.set(next.lease.id, false);
+        await environmentsService.releaseLease(next.lease.id, "released").catch(error => stage("second-message lease release", String(error)));
+        const before2 = commands.length;
+        const again = await follow(next, "Are you there? Recall the private fact from your own earlier assistant history.");
+        const againOutcome = await run(again, "resumed", ownerAtArchive === "idle-archived", 120_000);
+        await writeFile(join(root, "turn-3-outcome.json"), JSON.stringify(againOutcome, null, 2));
+        const heldAgain = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+          .filter(comment => String(record(comment.metadata).authorizationReason ?? "").startsWith("native_prior_owner_held:"));
+        second = { hung: "hung" in againOutcome, error: record(againOutcome).error ?? null,
+          exitCode: record(record(againOutcome).result).exitCode ?? null,
+          recall: record(record(againOutcome).result).summary === `RECALLED_${fact}`,
+          probes: commands.slice(before2).filter(entry =>
+            (record(entry).args as string[] | undefined)?.[2] === "paperclip-runner-generation-check").map(entry => record(entry).exitCode),
+          notices: heldAgain.length };
+        stage("second message finding", second);
+      }
       const finding = { variant, managed, reservations: managedReservations, hung: "hung" in outcome, error: record(outcome).error ?? null,
         exitCode: record(record(outcome).result).exitCode ?? null, recall: summary === `RECALLED_${fact}`, probes, identitySpan,
         reuse: events.filter(event => event.eventType === "run.startup.reuse").map(event => event.payload),
-        newRunner: spawned.length > spawnedBeforeIdle, notices: held.length };
+        newRunner: spawned.length > spawnedBeforeIdle, notices: held.length, second };
       stage("idle-loss finding", finding);
       await writeFile(join(root, "proof.json"), JSON.stringify(finding, null, 2));
       expect(finding.hung, `the next message never hangs: ${JSON.stringify(finding)}`).toBe(false);
