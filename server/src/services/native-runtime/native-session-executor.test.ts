@@ -11485,6 +11485,23 @@ describe("native warm session supervision", () => {
       expect(alarm).toHaveLength(1);
     });
 
+    // REG-30 (I-8g run 4d5c3f26): the first turn after a Stop failed with
+    // runner_event_commit_stalled (checkpoint_flush_failed). Events the
+    // controller could not commit may record the stopped tool's effects; a
+    // cold resume from the last committed checkpoint would drop them. Refuse.
+    it("refuses the cold start when attach failed on an event-commit integrity stall", async () => {
+      const stall = new NativeSessionProtocolIntegrityError("runner_event_commit_stalled", "checkpoint_flush_failed:EIO at source seq 7");
+      const { errorCode, close, events, alarm } = await run("warm-attach-commit-stall",
+        (options, session) => rejectAttach(options, session, stall));
+      expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(close).not.toHaveBeenCalled();
+      expect(errorCode).toBe("native_event_replay_conflict");
+      expect(events.find(event => event.eventType === "native.warm_attach.failed")?.payload).toMatchObject({
+        state: "warm_attach_failed_refused", reason: "native_event_replay_conflict", refusal: "protocol_integrity",
+        error: expect.stringContaining("checkpoint_flush_failed:EIO") });
+      expect(alarm).toHaveLength(1);
+    });
+
     it("leaves a Stop during attach to the Stop path", async () => {
       const { events, alarm, close } = await run("warm-attach-stopped",
         (options, session) => rejectAttach(options, session, new Error("native_session_cancelled")));

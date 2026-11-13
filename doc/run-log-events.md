@@ -81,8 +81,9 @@ reason the attach code, and the redacted attach error), `runner` and
 `logger.error` owner alarm. If that cold start also fails with an otherwise
 generic cause, the run's code is `native_warm_attach_cold_fallback_failed`. A
 Stop, an uncertain side effect (`native_provider_side_effect_pending`), an
-unproven close, a missing checkpoint or unsettled released-runner state refuses
-the cold start; the warning then has state `warm_attach_failed_refused` and names
+unproven close, a missing checkpoint, unsettled released-runner state or a
+protocol-integrity failure (`native_event_replay_conflict`, for example an event
+commit stall) refuses the cold start; the warning then has state `warm_attach_failed_refused` and names
 the refusal.
 
 ## Ordinary event persistence
