@@ -13946,6 +13946,58 @@ describe("native session bounded recovery", () => {
     expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
   });
 
+  // Trust/data-safety boundary: cheap injection of escalated cleanup and
+  // unresolved requests that the real same-PID board-Stop flow cannot force.
+  it.each(["clean", "warm-checkpoint", "escalated", "uncertain", "failed", "codex", "instruction-edits", "diagnostic"])("board Stop retains only the clean Pi warm owner: %s", async mode => {
+    const name = `pi-board-stop-${mode}`;
+    const current = { ...execution, provider: mode === "codex" ? execution.provider : { kind: "pi_rpc", model: "provider/model" },
+      binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
+      session: { ...execution.session, driverKind: mode === "codex" ? execution.session.driverKind : "pi_rpc",
+        normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const runResultJson: Record<string, unknown> = {};
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const close = vi.fn(async () => {});
+    const cancel = vi.fn(() => ({ cleanup: mode === "escalated" ? Promise.reject(new Error("pi_abort_escalated")) : Promise.resolve() }));
+    const session = { close, cancel, snapshot: vi.fn(async () => ({ identity: {
+      ...current.binding, sessionId: current.session.normalizedSessionId,
+    }, activeTurnId: null, pendingRuntimeRequests: mode === "uncertain" ? [{ requestId: "unknown-effect" }] : [] })) };
+    let opened!: () => void, end!: () => void;
+    const ready = new Promise<void>(resolve => { opened = resolve; });
+    const ended = new Promise<void>(resolve => { end = resolve; });
+    let retained: boolean | undefined;
+    const event = (eventType: PrpEvent["eventType"]): PrpEvent => ({ schema: "paperclip.prp.event.v1",
+      sourceEventId: `${name}:${eventType}`, sourceSeq: 1, sourceInstanceId: name, sourceKind: "runner",
+      runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId!, turnId: "stopped-turn",
+      eventType, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: {} });
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession(session);
+      opened(); await ended;
+      if (mode === "diagnostic") await accountingEvents.committed?.({ ...event("harness.diagnostic"), payload: { code: "pi_abort_escalated" } });
+      retained = await options.retainCancelledSession({ session, signal: new AbortController().signal,
+        terminalEvent: event(mode === "failed" ? "turn.failed" : "turn.cancelled") });
+      throw new Error("native_finalization_missing: session returned no semantic result");
+    });
+    const running = executePaperclipNativeSession({ db: leaseDb(current, {}, runResultJson, updates), execution: current,
+      runnerInstanceId: name, ...(["instruction-edits", "warm-checkpoint"].includes(mode) ? { instructionWorkingCopy: {
+        runId: name, root: `/tmp/${name}`, checkpointWarm: async () => mode === "warm-checkpoint", hasChanges: async () => true, collectStopped: async () => {},
+      } } : {}) }).catch(error => error);
+    const persistence = cancellationDb({ runId: current.binding.runId,
+      resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } });
+    try {
+      await Promise.race([ready, running.then(error => { throw error; })]);
+      await expect(cancelNativeSession(current.binding.runId, "Board Stop", { db: persistence.db, scope: "run" }))
+        .resolves.toMatchObject({ dispatched: true });
+      Object.assign(runResultJson, persistence.getResultJson());
+      end();
+      const outcome = await running;
+      if (!(outcome instanceof NativeCancellationPendingRecoveryError)) throw outcome;
+      expect(retained).toBe(["clean", "warm-checkpoint"].includes(mode));
+      expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint"].includes(mode) ? 0 : 1);
+      expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
+    } finally { end(); await running; await closeIdleWarmNativeSessionsForRestart(); }
+  });
+
   // H1 (restart chaos): a budget pause's lifecycle Stop interrupted a Codex
   // turn, which ended without a semantic result. That Stop must stay a
   // cancellation (resume continues it), never an interrupted-run retry the

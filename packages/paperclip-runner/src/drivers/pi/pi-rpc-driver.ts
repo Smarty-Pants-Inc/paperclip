@@ -849,6 +849,9 @@ export class PiRpcHarnessSession implements HarnessSession {
         // Uncertain idle/child cleanup retires only this process generation.
         // Transport close owns the bounded process-group TERM/KILL ladder.
         await this.close();
+        // Cancellation authority still stands, but the owner must distinguish
+        // escalation from a clean interrupt before offering this host for reuse.
+        throw error;
       } finally {
         if (this.#nativeAbortSettled?.turn === turn) this.#nativeAbortSettled = undefined;
       }

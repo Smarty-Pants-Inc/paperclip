@@ -10,6 +10,7 @@ import { eq } from "drizzle-orm";
 import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, agentTaskSessions } from "@paperclipai/db";
 import { expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
 
 // Explicit-only regression adapted from H8S's real-server Stop/warm proof.
 // Keep reason: data safety; Stop must not discard Pi's private conversation.
@@ -148,7 +149,11 @@ it.skipIf(!enabled)(`ASK -> ACCEPT -> CONTINUE keeps the same resident Pi and pr
       req.on("data", (chunk: string) => { body += chunk; });
       req.on("end", () => {
         if (new URL(req.url ?? "", "http://127.0.0.1").pathname !== "/v1/messages") { res.writeHead(404).end(); return; }
-        const parsed = JSON.parse(body), useTool = requests.length === 0;
+        const parsed = JSON.parse(body);
+        // Native hire verification is not the task's first model turn. Answer
+        // its no-tool hello without consuming the ASK/private-history script.
+        if (respondToNativePiHello(parsed, res, "messages")) return;
+        const useTool = requests.length === 0;
         // The fact is generated only in the first MODEL response. Never send it
         // in a task, comment, tool result, instruction, or subsequent user turn.
         const remembersPrivateFact = (parsed.messages ?? []).some((message: { role: string; content: unknown }) =>

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { agentTaskSessions, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { issueService } from "../issues.js";
 
 /** Server-owned metadata; never handed to a provider as adapter configuration. */
 export const PI_CONVERSATION_KEY = "__paperclipPiConversation";
@@ -106,6 +107,16 @@ export async function selectPiConversation(db: Db, input: {
     if (session) await tx.update(agentTaskSessions).set({ sessionParamsJson, updatedAt: new Date() }).where(eq(agentTaskSessions.id, session.id));
     else await tx.insert(agentTaskSessions).values({ companyId: input.companyId, agentId: input.agentId,
       adapterType: "paperclip_runner", taskKey: input.issueId, sessionParamsJson });
+    if (legacyUnverified) {
+      // The issue lock and this transaction make the notice and first recorded
+      // conversation atomic. Replays/later turns read the record, not the legacy
+      // pointer, so they cannot repeat it (or lose it after a failed selection).
+      await issueService(db).addComment(input.issueId,
+        "My earlier conversation could not be restored (it predates conversation records). Starting a new one.",
+        { runId: input.runId }, { authorType: "system", presentation: {
+          kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
+        } }, tx);
+    }
     return record;
   });
 }

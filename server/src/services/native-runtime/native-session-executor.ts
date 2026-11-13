@@ -162,7 +162,7 @@ import { hostname, tmpdir, userInfo } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES, loadNativeRunnerCheckpoint, loadNativeRunnerCheckpointHeader, loadNativeUnclaimedBootstrapCheckpoint, nativeRunnerCheckpointPersistence, nativeRunnerCheckpointRegistration, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { REMOTE_CONTROLLER_LEASE_MS, REMOTE_RUNNER_RECONNECT_GRACE_MS, localRunnerProcessReconnectGraceMs } from "./native-runner-recovery-contract.js";
-import type { NativeTaskSessionPublicationContext } from "./native-task-session-publication.js";
+import { publishPiConversationInTransaction, type NativeTaskSessionPublicationContext } from "./native-task-session-publication.js";
 import { basename, dirname, join, posix, resolve } from "node:path";
 import type {
   AdapterExecutionResult,
@@ -363,6 +363,8 @@ import {
 type ActiveNativeSession = {
   session: NativeSession;
   cancelRequested: boolean;
+  /** Resolution, not timeout/rejection, of this owner's interrupt cleanup. */
+  cancellationCleanupSucceeded?: boolean;
   cancellationSettled?: Promise<void>;
   restartDetach?: Promise<void>;
 };
@@ -9646,6 +9648,7 @@ async function performNativeCancellation(
       dispatched = true;
       if (!active.cancelRequested) {
         active.cancelRequested = true;
+        active.cancellationCleanupSucceeded = false;
         active.cancellationSettled = new Promise<void>(resolve => { settleActiveCancellation = resolve; });
         try {
           if (active.session.cancel) {
@@ -9657,7 +9660,7 @@ async function performNativeCancellation(
             let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
             const settled = await Promise.race([
               cleanup.then(
-                () => true,
+                () => { active.cancellationCleanupSucceeded = !cancellationAbort.signal.aborted; return true; },
                 () => true,
               ),
               new Promise<false>((resolve) => {
@@ -9669,13 +9672,17 @@ async function performNativeCancellation(
             ]);
             if (cleanupTimer) clearTimeout(cleanupTimer);
             if (!settled) {
+              // A late resolution cannot certify cleanup inside the Stop bound.
+              active.cancellationCleanupSucceeded = false;
               cancellationAbort.abort(
                 new Error("native session cancellation cleanup timed out"),
               );
               void cleanup.catch(() => undefined);
             }
-          } else if (active.session.interrupt)
+          } else if (active.session.interrupt) {
             await active.session.interrupt({ reason });
+            active.cancellationCleanupSucceeded = true;
+          }
         } catch (error) {
           active.cancelRequested = false;
           throw error;
@@ -10967,6 +10974,9 @@ async function executePaperclipNativeSessionAttempt(
   let firstTokenRecorded = false;
   const observeDeliverableText = createNativeDeliverableTextObservation();
   let providerUsageLimitObserved = false;
+  let cancelledSessionRetained = false;
+  let retainedCancelledCheckpoint: PersistedNativeSession | undefined;
+  let piCancellationUnsafe = false;
   const providerFailureObservation = createNativeProviderFailureObservation(input.execution.provider);
   let turnCompletedAtMs: number | null = null;
   let runnerSessionStartupScope: NativeRunSpanScope | null = null;
@@ -11158,6 +11168,10 @@ async function executePaperclipNativeSessionAttempt(
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});
+        }
+        if (event.eventType === "session.failed" || event.eventType === "turn.failed"
+          || (event.eventType === "harness.diagnostic" && event.payload.code === "pi_abort_escalated")) {
+          piCancellationUnsafe = true;
         }
         if (event.eventType === "harness.diagnostic") {
           await recordNativeProviderPerformanceSpans(trace, parseProviderPerformanceSpans(event.payload, Date.now()));
@@ -12000,6 +12014,41 @@ async function executePaperclipNativeSessionAttempt(
             existingSession: existingWarmSession,
             persistedSession: persistedWarmSession,
             keepSessionOpen: warmSessionId !== null,
+            retainCancelledSession: async ({ session, terminalEvent, signal }) => {
+              // Board Stop cancels the run, not Pi conversation C. Only Pi's
+              // clean abort ladder certifies reusable idle after child cleanup;
+              // other providers and every uncertain/error path keep retiring.
+              if (input.execution.provider.kind !== "pi_rpc" || lifecyclePolicy.mode !== "warm"
+                || warmSessionId === null || piCancellationUnsafe || terminalEvent.eventType !== "turn.cancelled"
+                || terminalEvent.runId !== input.execution.binding.runId
+                || terminalEvent.normalizedSessionId !== nativeSessionKey(input.execution)) return false;
+              const active = activeNativeSessions.get(input.execution.binding.runId);
+              if (!active?.cancelRequested || active.session !== session) return false;
+              await active.cancellationSettled;
+              signal.throwIfAborted();
+              if (active.cancellationCleanupSucceeded !== true || piCancellationUnsafe) return false;
+              const [stoppedRun] = await input.db.select().from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.id, input.execution.binding.runId),
+                eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+                eq(heartbeatRuns.agentId, input.execution.binding.agentId),
+                eq(heartbeatRuns.nativeIssueId, input.execution.binding.issueId),
+              )).limit(1);
+              if (!stoppedRun || !hasAcknowledgedNativeStopIntent(stoppedRun)) return false;
+              const snapshot = await session.snapshot({ signal });
+              signal.throwIfAborted();
+              const copy = input.instructionWorkingCopy;
+              if (copy && (copy.checkpointWarm ? !await copy.checkpointWarm() : await copy.hasChanges())) return false;
+              signal.throwIfAborted();
+              const owner = warmNativeSessions.get(warmSessionId);
+              cancelledSessionRetained = snapshot.identity.runId === input.execution.binding.runId
+                && snapshot.identity.sessionId === nativeSessionKey(input.execution)
+                && snapshot.activeTurnId === null && Array.isArray(snapshot.pendingRuntimeRequests)
+                && snapshot.pendingRuntimeRequests.length === 0
+                && owner?.session === session && owner.ownerToken === warmSessionOwnerToken
+                && !owner.closeOnReleaseReason && !piCancellationUnsafe;
+              if (cancelledSessionRetained) retainedCancelledCheckpoint = snapshot;
+              return cancelledSessionRetained;
+            },
             sessionGoalControl: input.sessionGoalControl,
             resumeSessionGoalHeartbeat: input.resumeSessionGoalHeartbeat,
             sessionCompaction: input.sessionCompaction,
@@ -12468,21 +12517,45 @@ async function executePaperclipNativeSessionAttempt(
         if (stoppedRun && (pendingStartupStop || hasAcknowledgedNativeStopIntent(stoppedRun) || hasAcknowledgedNativeReassignmentStopIntent(stoppedRun)
           || governancePauseStop || hasAcknowledgedNativeLifecycleStopIntent(stoppedRun)
           || (error instanceof NativeCancellationPendingRecoveryError && hasAcknowledgedNativeRunStopReceipt(stoppedRun)))) {
-          const [settled] = await writeExecutionControl(input.db, [DELIVERY_QUEUES.executionFinalization, DELIVERY_QUEUES.accounting], tx => tx.update(nativeRunFinalizations).set({
-            phase: "terminal_failure", failureCode: "native_retry_cancelled", nextAttemptAt: null,
-            leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null, recoveryState: null,
-            updatedAt: new Date(),
-          }).where(and(
-            eq(nativeRunFinalizations.runId, input.execution.binding.runId),
-            eq(nativeRunFinalizations.companyId, input.execution.binding.companyId),
-            eq(nativeRunFinalizations.leaseOwner, leaseOwner),
-            eq(nativeRunFinalizations.attempt, attempt),
-            isNull(nativeRunFinalizations.resultId),
-          )).returning({ runId: nativeRunFinalizations.runId }), { companyId: input.execution.binding.companyId });
+          const [settled] = await writeExecutionControl(input.db, [DELIVERY_QUEUES.executionFinalization, DELIVERY_QUEUES.accounting], async tx => {
+            const settled = await tx.update(nativeRunFinalizations).set({
+              phase: "terminal_failure", failureCode: "native_retry_cancelled", nextAttemptAt: null,
+              leaseOwner: null, leaseExpiresAt: null, controlDeadlineAt: null, recoveryState: null,
+              updatedAt: new Date(),
+            }).where(and(
+              eq(nativeRunFinalizations.runId, input.execution.binding.runId),
+              eq(nativeRunFinalizations.companyId, input.execution.binding.companyId),
+              eq(nativeRunFinalizations.leaseOwner, leaseOwner),
+              eq(nativeRunFinalizations.attempt, attempt),
+              isNull(nativeRunFinalizations.resultId),
+            )).returning({ runId: nativeRunFinalizations.runId });
+            if (settled.length && cancelledSessionRetained && retainedCancelledCheckpoint && input.taskSessionPublication) {
+              // First-turn Stop can beat Pi's first provider-backed checkpoint.
+              // Publish the prepared config + lastRunId so the next admission
+              // reserves this owner's existing instruction directory, not a
+              // different cold directory that forces process replacement.
+              // Hold coordinator → issue → run → task, just like checkpoints.
+              const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.execution.binding.issueId),
+                eq(issues.companyId, input.execution.binding.companyId))).for("no key update");
+              const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.execution.binding.runId),
+                eq(heartbeatRuns.companyId, input.execution.binding.companyId))).for("update");
+              // writeExecutionControl supplies a real transaction, typed as Db.
+              cancelledSessionRetained = !!run && await publishPiConversationInTransaction(
+                tx as unknown as Parameters<typeof publishPiConversationInTransaction>[0], {
+                binding: { ...input.execution.binding, sessionId: nativeSessionKey(input.execution),
+                  completionContractId: input.execution.completionContract.id,
+                  completionContractSha256: input.execution.completionContract.sha256,
+                  sourceInstanceId: effectiveRunnerInstanceId, controlPlaneSourceInstanceId: controlPlaneInstanceId },
+                context: input.taskSessionPublication, snapshot: retainedCancelledCheckpoint, run, issue: issue ?? null,
+              }, { retainedCancelledOwner: true }) === "published";
+            }
+            return settled;
+          }, { companyId: input.execution.binding.companyId });
           if (settled) {
             await stoppedLeaseRenewal;
             if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
-              await timeController("warm_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken, lifecyclePolicy.idleTimeoutMs, true));
+              await timeController("warm_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+                lifecyclePolicy.idleTimeoutMs, !cancelledSessionRetained));
             }
             error = new NativeCancellationPendingRecoveryError();
           }

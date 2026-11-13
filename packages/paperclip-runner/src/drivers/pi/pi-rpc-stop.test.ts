@@ -72,7 +72,9 @@ describe("Pi Stop abort ladder", () => {
     const f = await fixture({ abortTimeoutMs: 30 } as Partial<PiRpcDriverOptions>);
     try {
       f.transport.abort = missing === "ack" ? () => new Promise<void>(() => {}) : async () => {};
-      await f.session.interrupt({ turnId: f.turn.turnId });
+      // A swallowed escalation looks identical to a clean reusable Stop to the
+      // embedding owner. Keep the cleanup failure observable after retirement.
+      await expect(f.session.interrupt({ turnId: f.turn.turnId })).rejects.toThrow();
       expect(f.transport.commands).toContain("abort"); expect(f.transport.closed).toBe(true);
       expect(f.events.some(e => e.eventType === "turn.cancelled")).toBe(true);
       expect(f.events.some(e => e.eventType === "harness.diagnostic" && e.payload.code === "pi_abort_escalated")).toBe(true);
