@@ -26,6 +26,14 @@ export interface ChatMessageReceipt {
   replayed: boolean;
 }
 
+const CHAT_TX_ATTEMPTS = 3;
+function retryableTxError(error: unknown): boolean {
+  for (let e = error as { code?: unknown; cause?: unknown } | undefined, depth = 0; e && depth < 5; e = e.cause as typeof e, depth++) {
+    if (e.code === "40P01" || e.code === "40001") return true;
+  }
+  return false;
+}
+
 function runTask(run: typeof heartbeatRuns.$inferSelect) {
   return run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId;
 }
@@ -44,6 +52,28 @@ export async function sendAgentChatMessage(
   if (credentialScope.data.kind !== "standard") throw forbidden("Scoped test and task bridge credentials cannot publish agent chat messages");
   const input = parsed.data;
   const contentHash = createHash("sha256").update(input.body).digest("hex");
+  // A deadlock (40P01) or serialization failure (40001) rolls the whole
+  // transaction back, so a bounded retry cannot double-post: the retry re-reads
+  // the comment by clientRequestId and returns a replayed receipt if it exists.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await sendAgentChatMessageOnce(db, actor, input, contentHash, credentialScope.data, options);
+    } catch (error) {
+      if (attempt >= CHAT_TX_ATTEMPTS || !retryableTxError(error)) throw error;
+      await new Promise(resolve => setTimeout(resolve, 25 * 2 ** attempt + Math.floor(Math.random() * 50)));
+    }
+  }
+}
+
+async function sendAgentChatMessageOnce(
+  db: Db,
+  actor: Actor,
+  input: ReturnType<typeof sendChatMessageSchema.parse>,
+  contentHash: string,
+  credentialScopeData: AgentApiKeyScope,
+  options: { authorizeNative?: (tx: Db) => Promise<unknown>; receiptOnly?: boolean },
+): Promise<ChatMessageReceipt | null> {
+  const credentialScope = { data: credentialScopeData };
   const publications: ActivityPublication[] = [];
   const result = await db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
@@ -131,7 +161,13 @@ export async function sendAgentChatMessage(
     if (!lockedSource) throw forbidden("This run no longer owns the source task");
     source = lockedSource;
     if (options.authorizeNative) await options.authorizeNative(tx);
-    const [lockedContext] = await contextQuery().for("update");
+    // Lock order agents -> heartbeat_runs, the same order as concurrent run
+    // writes (an FK insert key-shares the agent row, then
+    // assertAgentRunWriteAllowed share-locks the run). FOR SHARE on the agent
+    // still serializes with pause/terminate but not with FK key-share locks.
+    await tx.select({ id: agents.id }).from(agents)
+      .where(and(eq(agents.id, actor.agentId), eq(agents.companyId, actor.companyId))).for("share");
+    const [lockedContext] = await contextQuery().for("update", { of: heartbeatRuns });
     const current = validateContext(lockedContext);
     if (current.run.responsibleUserId !== userId) throw forbidden("The responsible human changed before this message was saved");
     await assertCurrentKey(true);
