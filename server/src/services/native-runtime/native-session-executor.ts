@@ -5834,6 +5834,29 @@ function retirementReasonName(kind: keyof typeof RETIREMENT_REASON_NAMES, value:
  * settled journal prove it finished, so the same retirement applies. A local
  * warm Runner, or a resumed sandbox that still holds it, keeps the live path.
  */
+/** A user Stop leaves its owner uncertain when the owner's own events show a
+ * failed turn or session, Pi's escalated abort, an uncertain side effect or
+ * cleanup, or an interrupt with pending tool calls (the markers the settled
+ * Pi interrupt proof rejects, native-retained-pi-source.ts). An unreadable
+ * event log is uncertain too. */
+async function userStopLeftUncertainty(db: Db, run: { id: string; companyId: string }): Promise<boolean> {
+  try {
+    const rows = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
+        inArray(heartbeatRunEvents.eventType, ["harness.diagnostic", "turn.failed", "session.failed"])));
+    return rows.some(row => {
+      if (row.eventType !== "harness.diagnostic") return true;
+      const payload = record(record(record(row.payload).prpEvent).payload);
+      if (payload.code === "provider_interrupt_requested"
+        && !(Array.isArray(payload.pendingCallIds) && payload.pendingCallIds.length === 0)) return true;
+      return [payload.code, record(payload.details).code, record(payload.error).code].some(code =>
+        typeof code === "string" && /pi_abort_escalated|side_effect.*(?:pending|uncertain)|cleanup_uncertain/.test(code));
+    });
+  } catch {
+    return true;
+  }
+}
+
 async function inspectFinishedPerTurnRunnerdOwner(input: {
   db: Db;
   root: string;
@@ -5909,6 +5932,8 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   // also lets a warm Pi owner be retained (retainCancelledSession).
   const stoppedByUser = prior.run.status === "cancelled" && prior.owner.phase === "terminal_failure"
     && prior.owner.failureCode === "native_retry_cancelled" && hasAcknowledgedNativeStopIntent(prior.run);
+  // The receipt says a user asked, not that the interrupt settled cleanly.
+  if (stoppedByUser && await userStopLeftUncertainty(input.db, prior.run)) return refuse("owner_stop_unsettled");
   if (prior.owner.phase !== "committed" && !stoppedByUser) return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
   if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
