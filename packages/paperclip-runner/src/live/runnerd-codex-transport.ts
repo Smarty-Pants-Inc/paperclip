@@ -78,7 +78,7 @@ import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
 } from "../contracts/harness-driver.js";
-import { NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
+import { isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
   inspectStagedRunAttachment,
@@ -4209,6 +4209,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #shutdownSettled = false;
   #probeRetirement: Promise<void> | null = null;
   readonly prepareConversationResume?: CodexAppServerTransport["prepareConversationResume"];
+  #piColdResumeThreadId: string | null = null;
+  #piColdResumeStartParams: Record<string, unknown> | null = null;
   #detachPromise: Promise<void> | null = null;
   #startupOperation: Promise<unknown> | null = null;
   #attachmentOperation: Promise<void> | null = null;
@@ -4312,6 +4314,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     if (options.adoptExistingRunner && !options.stateDirectory?.trim()) {
       throw new Error("native_adopted_runner_state_directory_required");
+    }
+    if (options.provider === "pi_rpc") {
+      this.prepareConversationResume = (params, recovery) => this.#preparePiConversationResume(params, recovery);
     }
     if (options.acpxCandidateAdmission !== undefined) {
       const candidate = options.acpxCandidateAdmission;
@@ -4576,9 +4581,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     if (method === "thread/read") {
       if (this.#core === null) {
-        await this.#trackStartup(() => {
+        await this.#trackStartup(async () => {
           this.#recoveryTurnBindingPending = true;
-          return this.#resume();
+          const coldStart = this.#piColdResumeStartParams;
+          this.#piColdResumeStartParams = null;
+          if (coldStart) await this.#start(coldStart);
+          else await this.#resume();
         });
       }
       // Ask the authenticated runner for its live provider snapshot rather
@@ -6397,6 +6405,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const prepared = await this.#prepareLaunch(params, identity, dynamicTools);
     this.#startupSteps?.end();
     const { runAttachTemplate } = prepared;
+    if (this.#piColdResumeThreadId !== null) {
+      // Reuse runnerd's ordinary thread/resume -> typed missing-file refusal
+      // -> explicit thread/start receipt. A surviving file still restores.
+      record(runAttachTemplate.provider).providerSessionId = this.#piColdResumeThreadId;
+    }
     // Preserve the first generation's provider attachment seed independently
     // of bounded command history. The in-memory copy serves a live warm
     // continuation; the control-plane copy serves a controller/runner resume.
@@ -6503,6 +6516,44 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         modelProvider: openedThreadModelProvider(provider, acpxAgent, params.model),
       },
     };
+  }
+
+  async #preparePiConversationResume(params: Record<string, unknown>, recovery?: {
+    allowMissingProviderState?: true;
+  }): Promise<void> {
+    if (recovery?.allowMissingProviderState !== true || this.options.adoptExistingRunner
+      || existsSync(resolve(this.#root, "control-plane", "control-plane-state.json"))) return;
+    try {
+      this.#recoveryTurnBindingPending = true;
+      await this.#trackStartup(() => this.#resume());
+      return;
+    } catch (error) {
+      // Only the closed missing-state class permits this ladder, never an
+      // identity refusal, uncertain command, timeout, or corrupt checkpoint.
+      const prior = this.options.resumeProviderSession;
+      if (!isRunnerResumeStateUnavailable(error) || this.options.homeMode === "preconfigured"
+        || this.options.adoptExistingRunner || this.options.resumeActiveTurnId !== null
+        || !prior?.driverSessionId || prior.driverSessionId !== prior.providerSessionId
+        || params.threadId !== prior.driverSessionId || this.#core !== null) throw error;
+      // Host preparation is the existing verified-backup-first owner. If it
+      // finds any runner state, do not reset it or guess its outcome here.
+      await this.options.prepareExternalRunnerState?.();
+      if (existsSync(resolve(this.#root, "runner", "runner-state.json"))
+        || await this.options.readRunnerState?.()) throw error;
+      this.#piColdResumeThreadId = prior.driverSessionId;
+      this.#checkpointProviderIdentityExpectation = {
+        driverSessionId: prior.driverSessionId, providerSessionId: prior.providerSessionId,
+        providerIdentity: prior.providerIdentity ? structuredClone(record(prior.providerIdentity)) : null,
+      };
+      this.#recoveryTurnBindingPending = true;
+      // The rejected resume attempt never constructed a control-plane core or
+      // started a process. Release only this proved-empty startup barrier.
+      this.#startupOperation = null;
+      // Start inside the initial thread/read, after its ordinary exact-old-ID
+      // fence. That read returns the authenticated identity-change receipt;
+      // every subsequent request must name the new ID. No alias fence needed.
+      this.#piColdResumeStartParams = { ...params, completionContract: this.options.resumeCompletionContract };
+    }
   }
 
   async #prepareCandidateConversationResume(params: Record<string, unknown>): Promise<void> {

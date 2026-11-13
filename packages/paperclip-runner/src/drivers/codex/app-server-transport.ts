@@ -50,7 +50,10 @@ export interface CodexAppServerTransport {
   notifications(): AsyncIterable<CodexRpcNotification>;
   setServerRequestHandler(handler: CodexServerRequestHandler): void;
   /** Establish a fresh owned provider lifetime before reading a retained conversation. */
-  prepareConversationResume?(params: Record<string, unknown>): Promise<void>;
+  prepareConversationResume?(params: Record<string, unknown>, options?: {
+    /** Driver-proven idle checkpoint; never an active turn or pending request. */
+    allowMissingProviderState?: true;
+  }): Promise<void>;
   /** One-shot requests authenticated by an adopted live provider, never a saved checkpoint alone. */
   takeRestoredRuntimeRequests?(): CodexRpcServerRequest[];
   /**
