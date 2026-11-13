@@ -1,4 +1,5 @@
 import { hasPendingRunCleanup } from "../execution-blocker.js";
+import { environmentStartWait, nextTransientStartNoticeAt, projectTransientStartNotices, transientStartRetryAt, TRANSIENT_START_WAIT_REASON } from "../transient-start-wait.js";
 import { runOwnerFenceHeldSql } from "../remote-workspace-writer-hold.js";
 import { AGENT_DIRECTORY_BUSY_ERROR_CODE, AGENT_DIRECTORY_BUSY_MAX_DEFERRALS, AGENT_DIRECTORY_BUSY_RETRY_REASON, AGENT_DIRECTORY_BUSY_RETRY_WAKE_REASON, agentDirectoryBusyRetryDelayMs, type AgentDirectoryPreparationDeferral } from "./agent-directory-busy.js";
 import { isInterruptedNativePreparation } from "../cancelled-native-startup.js";
@@ -577,9 +578,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const interruptedPreparation = ["interrupted", "failed"].includes(run.status) &&
       preparationRecovery.kind === "bootstrap" && preparationRecovery.providerWorkStarted === false
       && (run.status === "interrupted" || await isInterruptedNativePreparation(db, run));
-    // A run that a server restart or replacement ended did not fail: it
-    // continues in the server-restart lane and never spends the failure budget.
-    const retryReason = opts?.retryReason ??
+    const startWait = await environmentStartWait(db, run, now);
+    // A closed pre-work refusal keeps its wait lane. Restart/replacement
+    // interruptions retain upstream's independent, uncharged restart lane.
+    const retryReason = startWait ? TRANSIENT_START_WAIT_REASON : opts?.retryReason ??
       (usesServerRestartLane(run, interruptedPreparation) ? SERVER_RESTART_RETRY_REASON
         : interruptedPreparation ? INTERRUPTED_PREPARATION_RETRY_REASON : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON);
     const wakeReason =
@@ -591,7 +593,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const maxAttempts = Math.max(
       0,
       Math.floor(
-        opts?.maxAttempts ?? (interruptedPreparationLane
+        (startWait ? Number.MAX_SAFE_INTEGER : opts?.maxAttempts) ?? (interruptedPreparationLane
           ? INTERRUPTED_PREPARATION_RETRY_MAX_ATTEMPTS
           : serverRestartLane ? SERVER_RESTART_RETRY_MAX_ATTEMPTS : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS),
       ),
@@ -607,7 +609,11 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       ? readNonEmptyString(run.contextSnapshot?.issueId) : null;
     const taskCapSpent = transientIssueId !== null
       && !(await transientRetryWithinTaskCap(db, run.companyId, transientIssueId, now));
-    const computedBaseSchedule = failureBudgetSpent || taskCapSpent ? null
+    const computedBaseSchedule = startWait ? {
+      attempt: nextAttempt, baseDelayMs: 300_000,
+      delayMs: transientStartRetryAt(now, run.resultJson?.providerFailure).getTime() - now.getTime(),
+      dueAt: transientStartRetryAt(now, run.resultJson?.providerFailure), maxAttempts,
+    } : failureBudgetSpent || taskCapSpent ? null
       : opts?.delayMs != null
         ? nextAttempt <= maxAttempts
           ? {
@@ -741,7 +747,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         : baseSchedule;
 
     const requiresIssueGate =
-      interruptedPreparation || retryReason === "interrupted_preparation" ||
+      !!startWait || interruptedPreparation || retryReason === "interrupted_preparation" ||
       (run.status === "interrupted" && run.errorCode === "server_shutdown_interrupted") ||
       isTransientWorkspacePreparationCode(run.errorCode) ||
       hasConversationContinuationPolicy(run.resultJson) ||
@@ -807,6 +813,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const retryContextSnapshot: Record<string, unknown> = withRecoveryContext(
       {
         ...contextSnapshot,
+        ...(startWait ? { transientStartWait: startWait } : {}),
         executionRetryAccounting: accountingForScheduledRetry(run, retryReason, schedule.attempt, now),
         retryOfRunId: run.id,
         ...(opts?.preserveWakeContext
@@ -1190,7 +1197,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           }
           const continuation = issueId && (retryReason === "transient_failure" || retryReason === SERVER_RESTART_RETRY_REASON
             || retryReason === INTERRUPTED_PREPARATION_RETRY_REASON || isPreparationWaitRetryReason(retryReason)
-            || retryReason === AGENT_DIRECTORY_BUSY_RETRY_REASON)
+            || retryReason === AGENT_DIRECTORY_BUSY_RETRY_REASON || retryReason === TRANSIENT_START_WAIT_REASON)
             ? await admitExplicitContinuationRetry({
             db: tx as unknown as Db, companyId: run.companyId, issueId, agentId: run.agentId,
             parentRunId: run.id, successorRunId: scheduledRunId, now,
@@ -1958,11 +1965,17 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
   }
 
   async function nextScheduledRetryAt() {
-    return runDispatch.nextScheduledRetryAt({ cutoff: await getWorktreeExecutionCutoff() });
+    const cutoff = await getWorktreeExecutionCutoff();
+    const [retryAt, noticeAt] = await Promise.all([
+      runDispatch.nextScheduledRetryAt({ cutoff }),
+      nextTransientStartNoticeAt(db, cutoff),
+    ]);
+    return retryAt != null && noticeAt ? Math.min(retryAt, noticeAt.getTime()) : retryAt ?? noticeAt?.getTime() ?? null;
   }
 
   async function promoteDueScheduledRetries(now = new Date()) {
     const cutoff = await getWorktreeExecutionCutoff();
+    await projectTransientStartNotices(db, now, cutoff);
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,

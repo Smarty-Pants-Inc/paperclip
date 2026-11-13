@@ -30,7 +30,7 @@ export const SERVER_RESTART_RETRY_WINDOW_MS = 60 * 60_000;
 /** Retry lanes that keep their own counter and never spend failures. */
 const UNCHARGED_RETRY_LANES: ReadonlySet<string> = new Set([
   "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", AGENT_DIRECTORY_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
-  INTERRUPTED_PREPARATION_RETRY_REASON, STORAGE_UNAVAILABLE_WAIT_RETRY_REASON, SERVER_RESTART_RETRY_REASON,
+  INTERRUPTED_PREPARATION_RETRY_REASON, STORAGE_UNAVAILABLE_WAIT_RETRY_REASON, SERVER_RESTART_RETRY_REASON, "transient_start_wait",
 ]);
 
 type RetryRun = {
@@ -58,6 +58,8 @@ export interface ExecutionRetryAccounting {
   serverRestarts?: number;
   /** Start of the current server-restart window (ISO time). Saved with serverRestarts. */
   serverRestartWindowStartedAt?: string;
+  /** Proven pre-provider availability waits; never charge a failed turn. */
+  transientStarts?: number;
 }
 
 function count(value: unknown): number | null {
@@ -77,10 +79,12 @@ function savedAccounting(run: RetryRun): ExecutionRetryAccounting | null {
   const serverRestarts = count(saved.serverRestarts) ?? 0;
   const windowStartedAt = typeof saved.serverRestartWindowStartedAt === "string"
     && Number.isFinite(Date.parse(saved.serverRestartWindowStartedAt)) ? saved.serverRestartWindowStartedAt : null;
+  const transientStarts = count(saved.transientStarts) ?? 0;
   return { version: 1, failureRetries, maxTurnContinuations,
     ...(interruptedPreparations > 0 ? { interruptedPreparations } : {}),
     ...(storageWaits > 0 ? { storageWaits } : {}),
     ...(agentDirectoryWaits > 0 ? { agentDirectoryWaits } : {}),
+    ...(transientStarts > 0 ? { transientStarts } : {}),
     ...(serverRestarts > 0 && windowStartedAt ? { serverRestarts, serverRestartWindowStartedAt: windowStartedAt } : {}) };
 }
 
@@ -108,6 +112,8 @@ export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccountin
     reason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON ? count(run.scheduledRetryAttempt) ?? 0 : 0);
   const agentDirectoryWaits = Math.max(saved?.agentDirectoryWaits ?? 0,
     reason === AGENT_DIRECTORY_WAIT_RETRY_REASON ? count(run.scheduledRetryAttempt) ?? 0 : 0);
+  const transientStarts = Math.max(saved?.transientStarts ?? 0,
+    reason === "transient_start_wait" ? count(run.scheduledRetryAttempt) ?? 0 : 0);
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
@@ -118,6 +124,7 @@ export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccountin
     ...(agentDirectoryWaits > 0 ? { agentDirectoryWaits } : {}),
     ...(saved?.serverRestarts ? { serverRestarts: saved.serverRestarts,
       serverRestartWindowStartedAt: saved.serverRestartWindowStartedAt } : {}),
+    ...(transientStarts > 0 ? { transientStarts } : {}),
   };
 }
 
@@ -140,6 +147,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
 }
 
 export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
+  if (reason === "transient_start_wait") return executionRetryAccounting(run).transientStarts ?? 0;
   if (reason === INTERRUPTED_PREPARATION_RETRY_REASON) return executionRetryAccounting(run).interruptedPreparations ?? 0;
   if (reason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON) return executionRetryAccounting(run).storageWaits ?? 0;
   if (reason === AGENT_DIRECTORY_WAIT_RETRY_REASON) return executionRetryAccounting(run).agentDirectoryWaits ?? 0;
@@ -162,6 +170,7 @@ export function accountingForScheduledRetry(run: RetryRun, reason: string, attem
   else if (reason === INTERRUPTED_PREPARATION_RETRY_REASON) accounting.interruptedPreparations = attempt;
   else if (reason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON) accounting.storageWaits = attempt;
   else if (reason === AGENT_DIRECTORY_WAIT_RETRY_REASON) accounting.agentDirectoryWaits = attempt;
+  else if (reason === "transient_start_wait") accounting.transientStarts = attempt;
   else if (!UNCHARGED_RETRY_LANES.has(reason)) accounting.failureRetries = attempt;
   return accounting;
 }

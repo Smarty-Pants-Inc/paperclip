@@ -114,6 +114,18 @@ describe("native restart recovery classification", () => {
       reason: "execution_recovery_budget_exhausted",
     });
   });
+  it("keeps a proven human-message START wait unbounded without weakening owner or work evidence", () => {
+    const evidence = { runnerPidAlive: false, runnerGroupAlive: false, processStartMatches: false,
+      hasCheckpoint: false, hasProviderEvidence: false, providerAttempt: 64, transientStartWait: true };
+    expect(classifyNativeRunnerRecoveryEvidence(evidence).claimKind).toBe("bootstrap_incomplete");
+    for (const changed of [{ hasCheckpoint: true }, { hasProviderEvidence: true }, { checkpointFailed: true },
+      { runnerPidAlive: true }, { runnerGroupAlive: true }, { knownProviderProcessAlive: true },
+      { knownProviderProcessIdentityAmbiguous: true }, { remoteSandbox: true }]) {
+      expect(classifyNativeRunnerRecoveryEvidence({ ...evidence, ...changed }).claimKind).toBeNull();
+    }
+    expect(classifyNativeRunnerRecoveryEvidence({ ...evidence, transientStartWait: false }))
+      .toMatchObject({ claimKind: null, reason: "execution_recovery_budget_exhausted" });
+  });
   it("keeps controller-only recovery out of the provider retry budget", () => {
     expect(nextNativeProviderAttempt(2, "reattach_existing_runner")).toBe(2);
     expect(nextNativeProviderAttempt(2, "reattach_remote_runner")).toBe(2);

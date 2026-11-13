@@ -13,6 +13,7 @@ import { createHeartbeatRunState } from "./run-state.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import * as extracted from "./retries.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
+import * as startWait from "../transient-start-wait.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -35,7 +36,7 @@ function callbacks() {
     getWorktreeExecutionCutoff: vi.fn(async (): Promise<Date | null> => null),
     applyRunDispatchPostCommitEffects: vi.fn<(effects: PostCommitEffect[]) => void>(),
     runDispatch: {
-      nextScheduledRetryAt: vi.fn(async () => null),
+      nextScheduledRetryAt: vi.fn<HeartbeatRetryDependencies["runDispatch"]["nextScheduledRetryAt"]>(async () => null),
       evaluateScheduledRetryGate: vi.fn<HeartbeatRetryDependencies["runDispatch"]["evaluateScheduledRetryGate"]>(async () => ({ allowed: true })),
       promoteDueScheduledRetries: vi.fn<HeartbeatRetryDependencies["runDispatch"]["promoteDueScheduledRetries"]>(async () => ({ promoted: 0, runIds: [], postCommitEffects: [] })),
       promoteScheduledRetry: vi.fn<HeartbeatRetryDependencies["runDispatch"]["promoteScheduledRetry"]>(async () => ({ outcome: "not_promoted" })),
@@ -67,6 +68,7 @@ function deferral() {
 }
 
 describe("heartbeat retry module callbacks", () => {
+  afterEach(() => vi.restoreAllMocks());
   it("preserves legacy helper and error-class identity", () => {
     expect(legacy.computeBoundedTransientHeartbeatRetrySchedule).toBe(extracted.computeBoundedTransientHeartbeatRetrySchedule);
     expect(legacy.computeWorkspaceBusyRetryDelayMs).toBe(extracted.computeWorkspaceBusyRetryDelayMs);
@@ -157,6 +159,7 @@ describe("heartbeat retry module callbacks", () => {
   });
 
   it("passes the service's worktree cutoff and publishes only returned effects", async () => {
+    const project = vi.spyOn(startWait, "projectTransientStartNotices").mockResolvedValue();
     const database = guardedDatabase();
     const deps = callbacks();
     const now = new Date("2026-10-08T12:00:00Z");
@@ -168,13 +171,32 @@ describe("heartbeat retry module callbacks", () => {
     deps.getWorktreeExecutionCutoff.mockResolvedValue(cutoff);
     deps.runDispatch.promoteDueScheduledRetries.mockResolvedValue({ promoted: 1, runIds: ["retry"], postCommitEffects: [effect] });
     expect(await extracted.createHeartbeatRetries(database.db, deps).promoteDueScheduledRetries(now)).toEqual({ promoted: 1, runIds: ["retry"] });
+    expect(project.mock.calls[0]?.[0]).toBe(database.db);
+    expect(project.mock.calls[0]?.slice(1)).toEqual([now, cutoff]);
     expect(deps.runDispatch.promoteDueScheduledRetries).toHaveBeenCalledWith({ now, cutoff });
     expect(deps.applyRunDispatchPostCommitEffects).toHaveBeenCalledWith([effect]);
     expect(deps.applyRunDispatchPostCommitEffects).toHaveBeenCalledAfter(deps.runDispatch.promoteDueScheduledRetries);
     expect(database.access).not.toHaveBeenCalled();
   });
 
+  it("reconstructs the notice deadline through the existing retry owner without another timer", async () => {
+    const database = guardedDatabase();
+    const deps = callbacks();
+    const cutoff = new Date("2026-11-13T20:00:00Z");
+    deps.getWorktreeExecutionCutoff.mockResolvedValue(cutoff);
+    const projectAt = vi.spyOn(startWait, "nextTransientStartNoticeAt").mockResolvedValue(new Date(cutoff.getTime() + 60_000));
+    deps.runDispatch.nextScheduledRetryAt.mockResolvedValue(cutoff.getTime() + 300_000);
+    const owner = extracted.createHeartbeatRetries(database.db, deps);
+    expect(await owner.nextScheduledRetryAt()).toBe(cutoff.getTime() + 60_000);
+    expect(projectAt.mock.calls[0]?.[0]).toBe(database.db);
+    expect(projectAt.mock.calls[0]?.[1]).toBe(cutoff);
+    projectAt.mockResolvedValue(null);
+    expect(await owner.nextScheduledRetryAt()).toBe(cutoff.getTime() + 300_000);
+    expect(database.access).not.toHaveBeenCalled();
+  });
+
   it("does not publish effects when promotion rejects", async () => {
+    vi.spyOn(startWait, "projectTransientStartNotices").mockResolvedValue();
     const deps = callbacks();
     deps.runDispatch.promoteDueScheduledRetries.mockRejectedValue(new Error("promotion failed"));
     await expect(extracted.createHeartbeatRetries(guardedDatabase().db, deps).promoteDueScheduledRetries()).rejects.toThrow("promotion failed");
