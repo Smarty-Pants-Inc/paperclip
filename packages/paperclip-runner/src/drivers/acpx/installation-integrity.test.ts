@@ -588,7 +588,7 @@ describe("ACPX installation integrity", () => {
         OPENSSL_ENGINES: "/unverified/engines",
         openssl_modules: "/unverified/providers",
       }),
-    ).toEqual({ PATH: "/verified/bin", NODE_COMPILE_CACHE: undefined, NODE_DISABLE_COMPILE_CACHE: "1" });
+    ).toEqual({ PATH: "/verified/bin" });
   });
 
   it("fails closed when the platform cannot atomically open without following symlinks", () => {
