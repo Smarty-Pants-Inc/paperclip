@@ -203,6 +203,70 @@ describe("heartbeat workspace module", () => {
     expect(database.select).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { source: "agent_config", cwd: os.tmpdir() },
+    { source: "run_config", cwd: os.tmpdir() },
+    { source: "agent_config", cwd: "/tmp" },
+    { source: "run_config", cwd: "/tmp" },
+  ])("refuses a temporary root instead of syncing it: %j", async ({ source, cwd }) => {
+    const configured = source === "agent_config" ? { ...agent(), adapterConfig: { cwd } } : agent();
+    await expect(createHeartbeatWorkspaceResolver(databaseWithResults().db).resolveWorkspaceForRun(
+      configured, {}, null, source === "run_config" ? { configuredCwd: cwd } : undefined,
+    )).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: { reason: "unsafe_workspace_root" } },
+    });
+  });
+
+  it("refuses a configured project temporary root", async () => {
+    const database = databaseWithResults([workspace("unsafe", "project-one", os.tmpdir())]);
+    await expect(createHeartbeatWorkspaceResolver(database.db).resolveWorkspaceForRun(
+      agent(), { projectId: "project-one" }, null,
+    )).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: { reason: "unsafe_workspace_root" } },
+    });
+  });
+
+  it("rejects an unsafe saved session and creates the documented agent home", async () => {
+    const result = await createHeartbeatWorkspaceResolver(databaseWithResults().db).resolveWorkspaceForRun(
+      agent(), {}, { cwd: os.tmpdir(), sessionId: "old-session" },
+    );
+    expect(result).toMatchObject({ cwd: resolveDefaultAgentWorkspaceDir(agent().id), source: "agent_home" });
+    expect(result.warnings).toEqual([expect.stringContaining("rejected as untrusted")]);
+    expect((await fs.stat(result.cwd)).isDirectory()).toBe(true);
+  });
+
+  it("refuses a retained execution-workspace anchor at the temporary root", async () => {
+    await expect(createHeartbeatWorkspaceResolver(databaseWithResults().db).resolveWorkspaceForRun(
+      agent(), {}, null, { anchorWorkspace: {
+        cwd: os.tmpdir(), source: "task_session", projectId: null, workspaceId: "retained-workspace",
+        repoUrl: null, repoRef: null, workspaceHints: [], warnings: [], baseCwdFallback: false, materializationFailures: [],
+      } },
+    )).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: { reason: "unsafe_workspace_root" } },
+    });
+  });
+
+  it("creates the existing task-owned fallback when neither project nor session provides a workspace", async () => {
+    const result = await createHeartbeatWorkspaceResolver(databaseWithResults().db).resolveWorkspaceForRun(
+      agent(), { issueId: "issue-one" }, null,
+    );
+    expect(result.cwd).toBe(path.join(testRoot, "instances", "workspace-test", "isolated-workspaces", "company-one", "issue-one"));
+    expect(result.source).toBe("task_session");
+    expect((await fs.stat(result.cwd)).isDirectory()).toBe(true);
+  });
+
+  it("retains an explicit concrete directory beneath the temporary root", async () => {
+    const concrete = path.join(testRoot, "configured-workspace");
+    const result = await createHeartbeatWorkspaceResolver(databaseWithResults().db).resolveWorkspaceForRun(
+      agent(), {}, null, { configuredCwd: concrete },
+    );
+    expect(result.cwd).toBe(concrete);
+    expect((await fs.stat(concrete)).isDirectory()).toBe(true);
+  });
+
   it("shares one in-flight checkout across legacy and direct module callers", async () => {
     const repoUrl = await createRepository("source", "shared checkout\n");
     const started = deferred();

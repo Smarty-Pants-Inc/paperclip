@@ -2473,6 +2473,17 @@ When a local agent run has no resolved project/session workspace, Paperclip fall
 - `~/.paperclip/instances/default/workspaces/<agent-id>`
 
 This path honors `PAPERCLIP_HOME` and `PAPERCLIP_INSTANCE_ID` in non-default setups.
+Task-backed runs without a project/session workspace or an explicit `cwd` use the
+existing task-owned directory at `<instance>/isolated-workspaces/<company-id>/<issue-id>`
+instead; see [task workspaces](plans/2026-10-09-task-workspaces.md).
+
+An explicit `cwd` does not make a system root a workspace. Resolution refuses system
+roots, the runtime's actual temporary root, and its ancestors (including symlink
+aliases) with `workspace_validation_failed` and reason `unsafe_workspace_root`
+in `workspaceValidation`. Choose a concrete directory, or clear `cwd` to use the
+managed task directory or agent home. Concrete descendants of the temporary root
+remain supported. Sandbox archive creation also excludes its own output staging
+and tar entry-list directories if they fall inside the source tree.
 
 For `codex_local`, Paperclip assigns new and updated agents an isolated Codex home under the instance root and blocks shared host/company Codex homes:
 
