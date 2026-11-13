@@ -72,6 +72,19 @@ later reuse receipts within a run. Legacy runs without receipts retain unknown
 layers and a null launch count. Session IDs and follow-up turns never establish
 warmth. These events stay in the local run log; they add no first-party Telemetry.
 
+When a reused warm runner then fails `attachRun`, Core closes that runner and
+resumes the same conversation once from its saved checkpoint on a fresh Runner.
+The run records a `native.warm_attach.failed` warning (schema
+`paperclip.warm-attach-failure.v1`, state `warm_attach_failed_cold_fallback`,
+reason the attach code, and the redacted attach error), `runner` and
+`provider_session` receipts of `fresh` / `resume_failed`, and one scoped server
+`logger.error` owner alarm. If that cold start also fails with an otherwise
+generic cause, the run's code is `native_warm_attach_cold_fallback_failed`. A
+Stop, an uncertain side effect (`native_provider_side_effect_pending`), an
+unproven close, a missing checkpoint or unsettled released-runner state refuses
+the cold start; the warning then has state `warm_attach_failed_refused` and names
+the refusal.
+
 ## Ordinary event persistence
 
 Events without a native source identity or retry-exhaustion receipt use one
