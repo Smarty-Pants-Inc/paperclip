@@ -25,6 +25,7 @@ async function fixture() {
     async request(type: string) {
       requests.push(type);
       return { data: type === "get_state" ? { sessionId: nativeId, sessionFile: nativeFile, model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+        : type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
         : type === "set_model" ? { provider: "neutral", id: "model" }
         : type === "get_available_thinking_levels" ? { levels: ["high"] }
         : type === "prompt" ? { disposition: "handled" } : undefined };
