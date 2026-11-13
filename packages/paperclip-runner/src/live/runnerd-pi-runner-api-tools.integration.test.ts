@@ -109,6 +109,13 @@ async function runtimeReadOnly(directory: string): Promise<void> {
   await chmod(directory, 0o555);
 }
 async function productionRuntime(root: string) {
+  const pack = process.env.PI_TEST_PROVIDER_PACK;
+  if (pack) {
+    const executable = join(pack, "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    expect(execFileSync(process.execPath, [executable, "--version"], { encoding: "utf8", timeout: 10_000 }).trim()).toBe("1.5.2");
+    return { executable, proxy: join(pack, "dist/cli/pi-rpc-app-server-proxy.cjs"),
+      extension: join(pack, "dist/drivers/pi/extension/index.js"), closure: installedPiClosure(executable) };
+  }
   const closure = installedPiClosure(pi!);
   const packageRoot = join(root, "pi-package");
   await mkdir(packageRoot);
@@ -116,29 +123,40 @@ async function productionRuntime(root: string) {
   await runtimeReadOnly(packageRoot);
   const executable = join(packageRoot, "node_modules", closure.executableRelative);
   expect(execFileSync(process.execPath, [executable, "--version"], { encoding: "utf8", timeout: 10_000 }).trim()).toBe("1.5.2");
-  const proxy = join(root, "cli", "pi-rpc-app-server-proxy.cjs");
-  const extension = join(root, "drivers", "pi", "extension", "index.js");
+  const proxy = join(root, "dist", "cli", "pi-rpc-app-server-proxy.cjs");
+  const extension = join(root, "dist", "drivers", "pi", "extension", "index.js");
   const artifacts = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
     import { build } from "esbuild";
     import { builtinModules } from "node:module";
+    import { bundlePiExtensions } from "./scripts/build-verified-provider-entrypoints.mjs";
     const common = { bundle: true, platform: "node", target: "node24", packages: "bundle", splitting: false, sourcemap: false, legalComments: "none", metafile: true, treeShaking: true, write: false, logLevel: "silent" };
     const proxy = await build({ ...common, entryPoints: ["src/cli/pi-rpc-app-server-proxy.ts"], outfile: "cli/pi-rpc-app-server-proxy.cjs", format: "cjs",
       banner: { js: 'const __paperclipVerifiedEntrypointUrl = require("node:url").pathToFileURL(__filename).href;' },
       define: { "import.meta.dirname": "__dirname", "import.meta.url": "__paperclipVerifiedEntrypointUrl" },
     });
-    const extension = await build({ ...common, entryPoints: ["src/drivers/pi/extension/index.ts"], outfile: "drivers/pi/extension/index.js", format: "esm" });
+    const extensions = await bundlePiExtensions({ write: false });
+    const extension = extensions[0].result, childBridge = extensions[1].result;
     const builtins = new Set([...builtinModules, ...builtinModules.map(name => "node:" + name)]);
     for (const result of [proxy, extension]) {
       const entries = Object.values(result.metafile.outputs).filter(output => output.entryPoint !== undefined);
       if (entries.length !== 1 || entries[0].imports.some(dependency => !dependency.external || !builtins.has(dependency.path))) throw new Error("production proof bundle is not self-contained");
     }
-    process.stdout.write(JSON.stringify({ proxy: proxy.outputFiles[0].text, extension: extension.outputFiles[0].text, proxyMetafile: proxy.metafile, extensionMetafile: extension.metafile }));
-  `], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 })) as { proxy: string; extension: string; proxyMetafile: unknown; extensionMetafile: unknown };
+    process.stdout.write(JSON.stringify({ proxy: proxy.outputFiles[0].text, extension: extension.outputFiles[0].text, childBridge: childBridge.outputFiles[0].text, proxyMetafile: proxy.metafile, extensionMetafile: extension.metafile }));
+  `], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 })) as { proxy: string; extension: string; childBridge: string; proxyMetafile: unknown; extensionMetafile: unknown };
   await mkdir(dirname(proxy), { recursive: true });
   await mkdir(dirname(extension), { recursive: true });
   await writeFile(join(root, "package.json"), `${JSON.stringify({ private: true, type: "module" })}\n`);
   await writeFile(proxy, artifacts.proxy, { mode: 0o755 });
   await writeFile(extension, artifacts.extension, { mode: 0o444 });
+  const childBridge = join(dirname(extension), "child-bridge.js");
+  await writeFile(childBridge, artifacts.childBridge, { mode: 0o444 });
+  const hardening = join(dirname(proxy), "linux-process-hardening.node");
+  if (process.platform === "linux") execFileSync(process.execPath, ["--input-type=module", "-e",
+    'import {buildLinuxProcessHardening} from "./scripts/build-linux-process-hardening.mjs"; buildLinuxProcessHardening(process.argv[1]);', hardening]);
+  await writeFile(join(root, "provider-pack.json"), JSON.stringify({ payload: { artifacts: {
+    piChildBridge: { path: relative(root, childBridge), sha256: digest(childBridge) },
+    ...(process.platform === "linux" ? { piProcessHardening: { path: relative(root, hardening), sha256: digest(hardening) } } : {}),
+  } } }));
   await writeFile(join(root, "production-bundle-metafiles.json"), `${JSON.stringify({ proxy: artifacts.proxyMetafile, extension: artifacts.extensionMetafile }, null, 2)}\n`);
   return { executable, proxy, extension, closure };
 }
@@ -146,6 +164,8 @@ async function productionRuntime(root: string) {
 type ModelRequest = { body: Record<string, unknown> };
 async function fauxOpenAi() {
   const requests: ModelRequest[] = [], returnedTools: Record<string, unknown>[] = [];
+  let probeCommand = "", probeOutput = "";
+  const apiCall = () => ({ role: "assistant", tool_calls: [{ index: 0, id: callIds[0], type: "function", function: { name: toolNames[0], arguments: "{}" } }] });
   const server = createServer((request, response) => {
     let body = "";
     request.setEncoding("utf8");
@@ -161,14 +181,20 @@ async function fauxOpenAi() {
         const chunk = (delta: Record<string, unknown>, finish_reason: string | null = null) => {
           response.write(`data: ${JSON.stringify({ id: `local-api-${requests.length}`, object: "chat.completion.chunk", model: "faux", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
         };
-        if (latest.role === "tool") {
+        if (latest.role === "tool" && latest.tool_call_id === "credential-probe") {
+          probeOutput = String(latest.content);
+          chunk(apiCall());
+          chunk({}, "tool_calls");
+        } else if (latest.role === "tool") {
           returnedTools.push(structuredClone(latest));
           chunk({ role: "assistant", content: `Pi consumed Runner API result ${String(latest.tool_call_id)}` });
           chunk({}, "stop");
         } else {
           if (!content.includes("API proof first run") && !content.includes("API proof second run")) throw new Error("unexpected faux model input");
           const index = content.includes("API proof second run") ? 1 : 0;
-          chunk({ role: "assistant", tool_calls: [{ index: 0, id: callIds[index], type: "function", function: { name: toolNames[index], arguments: "{}" } }] });
+          chunk(index === 0
+            ? { role: "assistant", tool_calls: [{ index: 0, id: "credential-probe", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: probeCommand }) } }] }
+            : { role: "assistant", tool_calls: [{ index: 0, id: callIds[index], type: "function", function: { name: toolNames[index], arguments: "{}" } }] });
           chunk({}, "tool_calls");
         }
         response.write(`data: ${JSON.stringify({ id: `local-api-${requests.length}`, choices: [], usage: { prompt_tokens: 7, completion_tokens: 4, total_tokens: 11 } })}\n\n`);
@@ -179,7 +205,8 @@ async function fauxOpenAi() {
   await new Promise<void>(done => server.listen(0, "127.0.0.1", done));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("local faux model did not bind");
-  return { url: `http://127.0.0.1:${address.port}/v1`, requests, returnedTools, close: async () => {
+  return { url: `http://127.0.0.1:${address.port}/v1`, requests, returnedTools,
+    setProbe: (command: string) => { probeCommand = command; }, probeOutput: () => probeOutput, close: async () => {
     server.closeAllConnections();
     await new Promise<void>(done => server.close(() => done()));
   } };
@@ -204,6 +231,17 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
   await mkdir(evidenceDirectory, { recursive: true });
   const root = await mkdtemp(join(evidenceDirectory, "runnerd-pi-api-tools-"));
   const runnerBinary = process.env.PAPERCLIP_RUNNERD_PATH ?? defaultCapabilityRunnerdBinary();
+  // Decoys only. Inject at runnerd exec, after the TS sanitizer, to exercise the
+  // Rust boundary even when a caller bypasses the normal controller builder.
+  // Agent-intended by Paperclip's design: the Ed25519 identity (doc/AGENT-IDENTITY.md:61-71) and the
+  // Langfuse export credentials (doc/architecture/runner-pi-capabilities.md:72-76, :108-111).
+  const identityKeys = ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY"];
+  const decoys = Object.fromEntries([
+    ...identityKeys, "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_API_KEY", "PAPERCLIP_AGENT_JWT_SECRET", "ASCII_TOKEN",
+    "RUNNER_INTERNAL_CANARY",
+  ].map(name => [name, `C44_DECOY_${name}_NOT_A_CREDENTIAL`]));
+  const seededRunner = join(root, "seeded-runnerd.sh");
+  await writeFile(seededRunner, `#!/bin/sh\n${Object.entries(decoys).map(([name, value]) => `export ${name}='${value}'`).join("\n")}\nexport LANGFUSE_TRACING_ENABLED=true\nexport PAPERCLIP_CONFIGURED_ENV_KEYS='["ASCII_TOKEN","LANGFUSE_SECRET_KEY","LANGFUSE_PUBLIC_KEY","RUNNER_INTERNAL_CANARY"]'\nexec '${runnerBinary}' "$@"\n`, { mode: 0o755 });
   const proof: Record<string, unknown> = {
     schema: "paperclip.pi.runner-api-tools.proof.v1", status: "running", root,
     source: "real runnerd -> production CJS proxy -> PiRpcDriver -> owned extension -> installed Pi 1.5.2; local faux model and server-side authority only",
@@ -211,7 +249,10 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
     runnerdSha256: digest(runnerBinary),
     sourceHashes: Object.fromEntries([
       "src/live/runnerd-pi-runner-api-tools.integration.test.ts", "src/live/runnerd-codex-transport.ts",
-      "src/cli/pi-rpc-app-server-proxy.ts", "src/drivers/pi/pi-rpc-driver.ts", "src/drivers/pi/extension/index.ts",
+      "src/cli/pi-rpc-app-server-proxy.ts", "src/cli/linux-process-hardening.ts", "src/drivers/pi/pi-rpc-driver.ts",
+      "src/drivers/pi/pi-process-environment.ts", "scripts/linux-process-hardening.c", "scripts/build-linux-process-hardening.mjs",
+      "runner/crates/runner-core/src/bin/paperclip-runnerd.rs", "runner/crates/runner-core/src/codex_provider.rs",
+      "runner/crates/runner-core/src/process_supervisor.rs", "src/drivers/pi/extension/index.ts",
       "src/drivers/pi/pi-bind-protocol.ts", "src/drivers/pi/pi-rpc-callback-server.ts", "src/catalog/semantic-action-catalog.ts",
     ].map(path => [path, digest(path)])),
   };
@@ -226,7 +267,7 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
   } } }));
   const diagnostics: string[] = [];
   const { transport } = createRunnerdCodexTransport({
-    provider: "pi_rpc", runnerBinary, stateDirectory: join(root, "runner-state"), sourceCodexHome: "",
+    provider: "pi_rpc", runnerBinary: seededRunner, stateDirectory: join(root, "runner-state"), sourceCodexHome: "",
     providerNodeCommand: process.execPath, providerNodeCommandSha256: digest(process.execPath),
     piCommand: runtime.executable, piCommandSha256: digest(runtime.executable), piProxyPath: runtime.proxy, piProxySha256: digest(runtime.proxy),
     piRuntimeDirectory: join(root, "pi-runtime"), baseInstructions: instructions[0], piRpcThinkingLevel: "off",
@@ -269,6 +310,11 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
     runnerPid = transport.processInfo!().pid;
     expect(runnerPid).not.toBeNull();
     owned = [processIdentity(runnerPid!)!, ...descendants(runnerPid!)];
+    const nativePi = piIdentity(runnerPid!);
+    const proxyPid = nativePi.ppid;
+    // Real Pi bash, not a host-side inspection. Capture all three process envs,
+    // including the proxy (which retains the upstream model-broker capability).
+    faux.setProbe(`env > tool-env.txt; cat /proc/${runnerPid}/environ > runner-env.bin 2> runner-env.err; printf 'runner-read-exit=%s\\n' "$?"; cat /proc/${proxyPid}/environ > proxy-env.bin 2> proxy-env.err; printf 'proxy-read-exit=%s\\n' "$?"; cat /proc/${nativePi.pid}/environ > pi-env.bin; printf 'pi-read-exit=%s\\n' "$?"; cat tool-env.txt; tr '\\0' '\\n' < runner-env.bin; tr '\\0' '\\n' < proxy-env.bin; tr '\\0' '\\n' < pi-env.bin; cat runner-env.err proxy-env.err`);
     for (const index of [0, 1]) {
       proof.phase = `run-${index + 1}`;
       if (index === 1) {
@@ -294,8 +340,20 @@ it.skipIf(process.platform !== "linux" || !pi)("real runnerd/Pi returns Runner A
       pids.push(piIdentity(runnerPid!));
     }
     expect(new Set(pids.map(identity => `${identity.pid}:${identity.started}`)).size, "same birth-attested Pi across both runs").toBe(1);
-    expect(faux.requests).toHaveLength(4);
-    for (const [index, request] of faux.requests.entries()) assertNativeCatalog(request, index < 2 ? 0 : 1);
+    expect(faux.requests).toHaveLength(5);
+    for (const [index, request] of faux.requests.entries()) assertNativeCatalog(request, index < 3 ? 0 : 1);
+    const observed = Object.fromEntries(["tool-env.txt", "runner-env.bin", "proxy-env.bin", "pi-env.bin", "runner-env.err", "proxy-env.err"].map(name => [name, readFileSync(join(workspace, name), "utf8")]));
+    const decoyFindings = Object.fromEntries(Object.entries(observed).map(([name, value]) => [name, Object.keys(decoys).filter(key => value.includes(decoys[key]!))]));
+    proof.credentialIsolation = { decoyFindings, permittedIdentityKeys: identityKeys, bashResult: faux.probeOutput(), proxyPid, piPid: nativePi.pid, langfuseEnabled: true };
+    expect(Object.values(decoyFindings).flat().filter(key => !identityKeys.includes(key)), "no runner-only/API decoy reaches Pi, bash, or readable /proc envs").toEqual([]);
+    for (const name of ["tool-env.txt", "pi-env.bin"]) {
+      expect(decoyFindings[name], `agent-intended identity and Langfuse export remain in ${name}`).toEqual(identityKeys);
+    }
+    expect(observed["runner-env.bin"]).toBe("");
+    expect(observed["proxy-env.bin"]).toBe("");
+    expect(observed["runner-env.err"]).toContain("Permission denied");
+    expect(observed["proxy-env.err"]).toContain("Permission denied");
+    expect(faux.probeOutput()).toContain("pi-read-exit=0");
     expect(new Set(turnIds).size).toBe(2);
     proof.status = "passed-runner-api-tools-two-runs";
   } catch (error) {
