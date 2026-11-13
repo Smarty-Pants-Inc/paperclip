@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { contextCompactionService } from "../context-compaction.js";
 import { claimNativeSessionResumptions } from "../native-runtime/native-finalization-reconciler.js";
 import type { Db } from "@paperclipai/db";
-import { authUsers, agents, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { authUsers, agents, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations, plugins } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -966,10 +966,15 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
   it("promotes one deferred plugin wake after a native response-wake run is stranded", async () => {
     const seeded = await strandedMention("native");
     await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.issue.id));
-    await db.update(agentWakeupRequests).set({ agentId: seeded.agent.id, payload: {
-      issueId: seeded.issue.id,
-      _paperclipWakeContext: { issueId: seeded.issue.id, wakeReason: "plugin wake", pluginId: "blocker-relay" },
-    } }).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    const pluginId = randomUUID();
+    await db.insert(plugins).values({ id: pluginId, pluginKey: "blocker-relay", packageName: "blocker-relay",
+      version: "1", status: "ready", manifestJson: { id: "blocker-relay", name: "Blocker Relay", version: "1.0.0",
+        description: "Test plugin", categories: [], capabilities: [] } as never });
+    await db.update(agentWakeupRequests).set({ agentId: seeded.agent.id, requestedByActorType: "system",
+      requestedByActorId: pluginId, payload: {
+        issueId: seeded.issue.id, mutation: "plugin_wakeup", pluginId, pluginKey: "blocker-relay",
+        _paperclipWakeContext: { issueId: seeded.issue.id, wakeReason: "plugin wake", pluginId, pluginKey: "blocker-relay" },
+      } }).where(eq(agentWakeupRequests.id, seeded.pending.id));
     const deps = callbacks(db);
     deps.getAgent.mockResolvedValue(seeded.recipient);
     deps.canStartNewExternalBotWork.mockResolvedValue(false);
