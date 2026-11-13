@@ -1015,20 +1015,13 @@ describe("TaskChatInteractionCard", () => {
     }]);
   });
 
-  it("opens a compact attachment item through the authenticated file endpoint", () => {
-    const interaction = { ...pendingRequestItemVerdictsInteraction, payload: { ...pendingRequestItemVerdictsInteraction.payload,
-      items: [{ id: "file", label: "Reviewed file", target: { type: "issue_attachment" as const, attachmentId: "immutable-file", assetId: "asset", sha256: "hash" } }],
-    } };
-    flushSync(() => root.render(<TooltipProvider><ThemeProvider><TaskChatInteractionCard item={interactionItem(interaction)} presentation="takeover" onSubmitInteractionVerdicts={() => undefined} /></ThemeProvider></TooltipProvider>));
-    expect(container.querySelector('a[href="/api/attachments/immutable-file/content"]')?.getAttribute("target")).toBe("_blank");
-  });
-
-  it.each([undefined, "/stale-display-link"])("opens a compact confirmation's bound attachment when href is %s", href => {
+  it.each([undefined, "/stale-display-link"])("links a compact confirmation's bound attachment in-app when href is %s", href => {
     const interaction = createRequestConfirmation({ payload: { version: 1, prompt: "Review the attached copy", target: {
       type: "issue_attachment", attachmentId: "immutable-file", assetId: "asset", sha256: "hash", href,
     } } });
     flushSync(() => root.render(<TooltipProvider><ThemeProvider><TaskChatInteractionCard item={interactionItem(interaction)} presentation="takeover" onAcceptInteraction={() => undefined} /></ThemeProvider></TooltipProvider>));
-    expect(container.querySelector('a[href="/api/attachments/immutable-file/content"]')?.getAttribute("target")).toBe("_blank");
+    const link = container.querySelector(`a[href="/issues/issue-1#interaction-${interaction.id}&attachment=immutable-file"]`);
+    expect(link?.getAttribute("target")).toBeNull();
   });
 
   it("opens the bound output revision from a compact review item", () => {
