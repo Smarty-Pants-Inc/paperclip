@@ -6,6 +6,7 @@ import path from "node:path";
 import { and, asc, eq, gt, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import {
   agentTaskSessions,
+  companies,
   environmentLeases,
   heartbeatRuns,
   issues,
@@ -26,6 +27,7 @@ import { retireObsoleteNativeHarnessBackup } from "./native-harness-backup-reten
 import type { StorageService } from "../../storage/types.js";
 import { releaseExpiredNativeProviderArtifactRun } from "./native-provider-artifacts.js";
 import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
+import { nativeSetupScopeDigest } from "./native-setup-evidence.js";
 
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS = 60 * 60 * 1000;
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS = 2 * 60 * 1000;
@@ -739,7 +741,11 @@ export function nativeHarnessBackupExpirationService(
       }))
         .filter((name) => SCOPE_PATTERN.test(name))
         .sort();
-      const pending = cursor ? names.filter((name) => name > cursor!) : names;
+      const setupScopes = includeBackups && names.length
+        ? new Set((await db.select({ id: companies.id }).from(companies)).map(({ id }) => nativeSetupScopeDigest(id)))
+        : new Set<string>();
+      const sessionNames = names.filter((name) => !setupScopes.has(name));
+      const pending = cursor ? sessionNames.filter((name) => name > cursor!) : sessionNames;
       for (const name of pending) {
         if (!hasBudget() || result.checked >= maxEntries) {
           result.truncated = true;
