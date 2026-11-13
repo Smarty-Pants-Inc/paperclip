@@ -939,9 +939,6 @@ export async function createTarballFromDirectory(input: {
   followSymlinks?: boolean;
 }): Promise<void> {
   const sourceRoot = await physicalPath(input.localDir);
-  // All callers place output in a dedicated staging directory. If that
-  // directory is beneath the source (e.g. cwd === os.tmpdir()), omit it rather
-  // than packing runtime state or letting tar encounter its own output.
   const archiveDirectory = relativizeUnderGitToplevel({
     toplevel: sourceRoot, localPath: await physicalPath(path.dirname(input.archivePath)),
   });
@@ -956,17 +953,40 @@ export async function createTarballFromDirectory(input: {
   // matches and any named entry it matches.
   await withTempDir("paperclip-tar-list-", async (directory) => {
     const listDirectory = relativizeUnderGitToplevel({ toplevel: sourceRoot, localPath: await physicalPath(directory) });
-    const ownStagingExcludes = [archiveExclude, listDirectory]
-      .filter((entry): entry is string => Boolean(entry))
-      .map(escapeTarExcludeLiteral);
-    const excludeArgs = ["._*", ...(input.exclude ?? []), ...ownStagingExcludes]
-      .flatMap((entry) => ["--exclude", entry]);
+    const ownedPaths = new Set([archiveExclude, listDirectory]
+      .filter((entry): entry is string => Boolean(entry)));
+    const explicitEntries = [...ownedPaths].some(entry => entry.includes("/"));
+    const excludeArgs = ["._*", ...(input.exclude ?? [])]
+      .flatMap((entry) => ["--exclude", entry, ...(explicitEntries ? ["--exclude", `${entry}/*`] : [])]);
     const list = path.join(directory, "entries.nul");
     const file = await fs.open(list, "wx", 0o600);
+    const ancestors = new Set<string>();
+    const writeEntries = async (relative = ""): Promise<void> => {
+      const localPath = path.join(input.localDir, relative);
+      const physicalDirectory = explicitEntries && input.followSymlinks ? await fs.realpath(localPath) : null;
+      if (physicalDirectory && ancestors.has(physicalDirectory)) {
+        throw new Error(`Workspace archive contains a directory symlink cycle at "${relative}"`);
+      }
+      if (physicalDirectory) ancestors.add(physicalDirectory);
+      try {
+        for await (const entry of await fs.opendir(localPath)) {
+          const name = relative ? path.posix.join(relative, entry.name) : entry.name;
+          if (ownedPaths.has(name)) continue;
+          await file.writeFile(`${name}\0`);
+          if (explicitEntries && (entry.isDirectory() || (input.followSymlinks && entry.isSymbolicLink()
+            && (await fs.stat(path.join(input.localDir, name))).isDirectory()))) {
+            await writeEntries(name);
+          }
+        }
+      } finally {
+        if (physicalDirectory) ancestors.delete(physicalDirectory);
+      }
+    };
     try {
-      for await (const entry of await fs.opendir(input.localDir)) await file.writeFile(`${entry.name}\0`);
+      await writeEntries();
     } finally { await file.close(); }
     await execTar(["-c", "--no-xattrs", ...(input.followSymlinks ? ["-h"] : []),
+      ...(explicitEntries ? ["--no-recursion"] : []),
       "-f", input.archivePath, "-C", input.localDir, ...excludeArgs, "--null", "-T", list]);
   });
 }

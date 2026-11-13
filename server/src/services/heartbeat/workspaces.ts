@@ -137,6 +137,15 @@ export class WorkspaceValidationFailure extends Error {
   }
 }
 
+function assertSafeLocalWorkspaceCwd(cwd: string, details: Record<string, unknown>) {
+  if (isUnsafeSessionWorkspaceCwd(cwd)) {
+    throw new WorkspaceValidationFailure(
+      `Workspace root "${cwd}" is a system root or contains runtime temporary staging. Configure a concrete workspace directory, or clear cwd to use the managed task directory or agent home.`,
+      { workspaceValidation: { ...details, reason: "unsafe_workspace_root", cwd } },
+    );
+  }
+}
+
 function hasGithubPrWorkflowSkill(desiredSkills: string[]) {
   return desiredSkills.some((skill) => {
     const normalized = skill.trim();
@@ -704,12 +713,15 @@ export async function resolveAdditionalProjectWorkspace(
     if (!hasConfiguredCwd && !readNonEmptyString(workspace.repoUrl)) {
       continue;
     }
+    const localSource = hasConfiguredCwd ? configuredCwd : workspace.repoUrl ? localRepositoryPath(workspace.repoUrl) : null;
+    if (localSource) assertSafeLocalWorkspaceCwd(localSource, { referencedProjectId: projectId });
     const { cwd } = await deps.resolveConfiguredOrManagedProjectCwd({
       companyId,
       projectId,
       cwd: workspace.cwd,
       repoUrl: workspace.repoUrl,
     });
+    assertSafeLocalWorkspaceCwd(cwd, { referencedProjectId: projectId });
     // A directory that exists but holds no content is not a realized workspace. Accept the row only
     // when the resolved directory has real content, so an empty directory never masks a missing one.
     if (await deps.directoryHasContents(cwd)) {
@@ -736,11 +748,14 @@ export async function resolveAdditionalProjectWorkspace(
       `Referenced project ${projectId} has no workspace checkout or repository URL to realize.`,
     );
   }
+  const localSource = localRepositoryPath(fallbackRepoUrl);
+  if (localSource) assertSafeLocalWorkspaceCwd(localSource, { referencedProjectId: projectId });
   const managed = await deps.ensureManagedProjectWorkspace({
     companyId,
     projectId,
     repoUrl: fallbackRepoUrl,
   });
+  assertSafeLocalWorkspaceCwd(managed.cwd, { referencedProjectId: projectId });
   return {
     cwd: managed.cwd,
     projectId,
@@ -3750,12 +3765,7 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
     // Apply the existing session-root safety rule to every local source, not
     // just restored sessions: operator cwd, project sources and supplied anchors
     // must not hand sandbox sync its own temporary staging tree.
-    if (isUnsafeSessionWorkspaceCwd(anchor.cwd)) {
-      throw new WorkspaceValidationFailure(
-        `Workspace root "${anchor.cwd}" is a system root or contains runtime temporary staging. Configure a concrete workspace directory, or clear cwd to use the managed task directory or agent home.`,
-        { workspaceValidation: { reason: "unsafe_workspace_root", cwd: anchor.cwd, resolvedWorkspaceSource: anchor.source } },
-      );
-    }
+    assertSafeLocalWorkspaceCwd(anchor.cwd, { resolvedWorkspaceSource: anchor.source });
     await retainCurrentWorkspaceSource(anchor.cwd);
     if (!isMultiProjectWorkspaceSyncEnabled()) {
       return {
