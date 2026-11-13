@@ -7,7 +7,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, agentTaskSessions, issues as issueRows } from "@paperclipai/db";
+import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, agentTaskSessions, nativeRunFinalizations, issues as issueRows } from "@paperclipai/db";
 import { expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
@@ -46,8 +46,9 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
-  const replacedRunnerRoot = savedFile === "runner-root";
+it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root", "legacy-pre-spawn"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
+  const legacyPreSpawn = savedFile === "legacy-pre-spawn";
+  const replacedRunnerRoot = savedFile === "runner-root" || legacyPreSpawn;
   const missingFile = savedFile === true || replacedRunnerRoot;
   const invalidFile = savedFile === "invalid" || savedFile === "foreign";
   let preservedBytes: Buffer | undefined;
@@ -78,7 +79,8 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
   const stages: Array<{ at: string; stage: string; detail: unknown }> = [];
   const stage = (name: string, detail: unknown = {}) => {
     const row = { at: new Date().toISOString(), stage: name, detail };
-    stages.push(row); console.log(`[pi-full-server] ${name} ${JSON.stringify(detail)}`);
+    stages.push(row); console.log(`[pi-full-server] ${name} ${JSON.stringify(detail,
+      (key, value) => key === "contextSnapshot" || key === "prompt" ? "[omitted from logs]" : value)}`);
   };
   const bundles: Bundle[] = [];
   const requests: Array<{ path: string; model: unknown; lastMessage: unknown; messages: unknown[]; remembersPrivateFact: boolean; remembersFreshFact: boolean; tools: string[] }> = [];
@@ -87,6 +89,7 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
   let helloProbeRequests = 0;
   let activeTurn = 1;
   const turnProofs: Array<Record<string, unknown>> = [];
+  const expectedPreSpawnFailures = new Set<string>();
   let modelServer: Server | undefined, http: Server | undefined;
   let app: Awaited<ReturnType<typeof import("../app.js").createApp>> | undefined;
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
@@ -114,7 +117,7 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
       const value = await probe(); if (value !== null) return value;
       if (db && agentId) {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-        const failure = runs.find(run => run.status === "failed" || run.status === "timed_out");
+        const failure = runs.find(run => !expectedPreSpawnFailures.has(run.id) && (run.status === "failed" || run.status === "timed_out"));
         if (failure) throw new Error(`${label}: run failed ${JSON.stringify({ id: failure.id, status: failure.status, errorCode: failure.errorCode, error: failure.error })}`);
       }
       await new Promise<void>(resolve => {
@@ -203,7 +206,20 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
           emit("content_block_delta", { index, delta: { type: "text_delta", text } });
           emit("content_block_stop", { index: index++ });
         };
-        if (!isToolResult) {
+        const isFinishResult = isToolResult && latest.content.some((part: { type: string; tool_use_id?: string }) =>
+          part.type === "tool_result" && part.tool_use_id === `finish-${activeTurn}`);
+        const completedReads = new Set((parsed.messages ?? []).filter((message: { role: string }) => message.role === "assistant")
+          .flatMap((message: { content: unknown }) => Array.isArray(message.content) ? message.content : [])
+          .filter((part: { type: string }) => part.type === "tool_use").map((part: { name: string }) => part.name));
+        const nextRead = legacyPreSpawn && activeTurn === 2 ? ["get_task_context", "get_task_history", "read_document"].find(name => !completedReads.has(name)) : undefined;
+        if (nextRead) {
+          // The recovered thread has to execute these real tools before even
+          // private assistant text, never just mention a reread in its answer.
+          const input = nextRead === "read_document" ? { key: "plan" } : {};
+          emit("content_block_start", { index, content_block: { type: "tool_use", id: `cold-read-${nextRead}`, name: nextRead, input: {} } });
+          emit("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
+          emit("content_block_stop", { index });
+        } else if (legacyPreSpawn ? !isFinishResult : !isToolResult) {
           // The fact originates ONLY in the first assistant response and is not
           // published in the first final chat reply or any Paperclip tool result.
           textBlock(activeTurn === 1 ? `Private fact: ${privateFact}` : missingFile && activeTurn === 2 ? `Fresh private fact: ${freshFact}` : "Completing the reopened issue.");
@@ -220,7 +236,7 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
             : missingFile && activeTurn === 3 && remembersFreshFact ? `TURN_3_RECALLED_${freshFact}`
             : remembersPrivateFact ? `TURN_${activeTurn}_RECALLED_${privateFact}` : `TURN_${activeTurn}_HISTORY_LOST`);
         }
-        emit("message_delta", { delta: { stop_reason: isToolResult ? "end_turn" : "tool_use", stop_sequence: null }, usage: { output_tokens: 4 } });
+        emit("message_delta", { delta: { stop_reason: (legacyPreSpawn ? isFinishResult : isToolResult) ? "end_turn" : "tool_use", stop_sequence: null }, usage: { output_tokens: 4 } });
         emit("message_stop", {}); res.end();
       });
     });
@@ -330,6 +346,9 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
       status: "backlog", assigneeAgentId: agentId,
     }, 201);
     issueId = issue.id;
+    if (legacyPreSpawn) await api("PUT", `/issues/${issueId}/documents/plan`, {
+      title: "Recovery acceptance plan", format: "markdown", body: "Read the actual task, history and this plan before answering the recovered turn.",
+    }, 201);
     const { heartbeatService } = await import("../services/heartbeat.js");
     let replayedRecoveryNotices = 0;
     if (missingFile || invalidFile) {
@@ -362,6 +381,29 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
           await rename(join(root, "runner-state"), join(root, "replaced-runner-state"));
           await mkdir(join(root, "runner-state"));
           stage("runner root replaced with empty allocation", { files, previousPids: turnProofs[0]!.pids });
+          if (legacyPreSpawn) {
+            const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, turnProofs[0]!.runId as string));
+            const sourceExecution = source!.runnerProfileJson!.nativeExecutionInput as { binding: Record<string, unknown>; session: Record<string, unknown> };
+            for (let n = 0; n < 2; n++) {
+              const failedId = randomUUID(), failedSessionId = randomUUID();
+              const createdAt = new Date();
+              expectedPreSpawnFailures.add(failedId); previousRuns.push(failedId);
+              const failedProfile = { ...source!.runnerProfileJson, sessionCheckpoint: null, nativeControllerRecovery: null,
+                nativeExecutionInput: { ...sourceExecution, binding: { ...sourceExecution.binding, runId: failedId },
+                  session: { ...sourceExecution.session, normalizedSessionId: failedSessionId } } };
+              await db.insert(heartbeatRuns).values({ id: failedId, companyId, agentId, issueId, nativeIssueId: issueId,
+                status: "failed", runtimeMode: "native", nativePhase: "terminal_failure", nativeSessionId: failedSessionId,
+                runnerInstanceId: randomUUID(), createdAt, finishedAt: createdAt,
+                contextSnapshot: { issueId, conversationSessionGeneration: source!.contextSnapshot?.conversationSessionGeneration },
+                runnerProfileJson: failedProfile, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+                errorCode: "native_continuation_requires_reconciliation" });
+              await db.insert(nativeRunFinalizations).values({ runId: failedId, companyId, issueId, phase: "terminal_failure",
+                attempt: 0, controllerGeneration: 0, failureCode: "native_continuation_requires_reconciliation" });
+              await db.update(agentTaskSessions).set({ lastRunId: failedId, sessionParamsJson: { sessionId: failedSessionId } })
+                .where(eq(agentTaskSessions.taskKey, issueId));
+              stage("SUPPLEMENTARY pre-spawn fixture; not a production coordinator claim", { failedId, failedSessionId, attempt: 0, controllerGeneration: 0 });
+            }
+          }
         } else {
           for (const file of files) await unlink(file); // turn-1 snapshots retain the deleted history
           stage("saved Pi file deleted after resident shutdown", { files, previousPids: turnProofs[0]!.pids });
@@ -439,6 +481,25 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
       const [closed] = await db.select().from(issueRows).where(eq(issueRows.id, issueId));
       const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
       const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, admitted.id));
+      if (legacyPreSpawn && activeTurn === 2) {
+        // Native PRP calls are durably recorded as execution events, not in
+        // the legacy adapter's tool_invocations table.
+        const tools = events.filter(event => event.eventType.startsWith("tool.execution."))
+          .sort((a, b) => a.seq - b.seq).map(event => ({ seq: event.seq, eventType: event.eventType,
+            ...(event.payload?.prpEvent as { payload: { name: string; status: string; executionId: string; output: string } }).payload }));
+        const calls = tools.filter(event => event.eventType === "tool.execution.started");
+        expect(calls.slice(0, 3).map(call => call.name), "fresh thread's FIRST calls reread its actual task/history/plan").toEqual([
+          "get_task_context", "get_task_history", "read_document",
+        ]);
+        const completed = calls.slice(0, 3).map(call => tools.find(event => event.executionId === call.executionId && event.eventType === "tool.execution.completed"));
+        expect(completed.every(call => call?.status === "completed"), "all cold reads must complete before the answer").toBe(true);
+        expect(completed[0]!.output).toContain(issueId);
+        expect(completed[1]!.output).toContain("TURN_1_PUBLISHED");
+        expect(completed[2]!.output).toContain("Recovery acceptance plan");
+        expect(calls[3]!.name).toBe("paperclip_finish");
+        expect(completed.every(call => call!.seq < calls[3]!.seq), "read completions precede finish and final answer").toBe(true);
+        await writeFile(join(root, "cold-first-tool-calls.json"), JSON.stringify(tools, null, 2));
+      }
       const [taskSession] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, issueId));
       const conversation = taskSession?.sessionParamsJson?.__paperclipPiConversation;
       expect(conversation).toMatchObject({ id: settled!.nativeSessionId, generation: 1 });
