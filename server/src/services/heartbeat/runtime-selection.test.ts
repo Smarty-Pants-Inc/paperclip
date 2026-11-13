@@ -200,9 +200,11 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(legacy);
     expect((await read(f.input.run.id)).runnerProfileJson).toMatchObject({ piConversation: { reason: "legacy_binding_unverified" } });
     const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
-    expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: f.run.id,
+    expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: null,
       body: "My earlier conversation could not be restored (it predates conversation records). Starting a new one.",
-      presentation: { kind: "system_notice" } }]);
+      presentation: { kind: "system_notice" },
+      metadata: { authorizationReason: `legacy_binding_unverified:${selected.nativeExecution.session.normalizedSessionId}:${legacy}`,
+        sections: [{ rows: [{ type: "run_link", runId: f.run.id, agentId: f.agent.id }] }] } }]);
     // Selection replay and a later ordinary turn must not repeat the notice.
     await selectHeartbeatRuntime(db, f.input);
     await nextPiTurn(f);
