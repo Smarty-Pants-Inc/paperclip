@@ -91,7 +91,8 @@ export async function materializePiSessionRecoveryNotice(input: {
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
     return true;
   });
-  if (inserted && invalid) logger.error({ companyId, agentId, issueId, runId, code,
-    preservedFile: invalid.preservedFile, normalizedSessionId: event.normalizedSessionId },
-  "Pi saved-history recovery owner alarm: original file preserved; native session restarted fresh");
+  if (inserted) logger.error({ companyId, agentId, issueId, runId, code,
+    ...(invalid ? { preservedFile: invalid.preservedFile } : {}), normalizedSessionId: event.normalizedSessionId },
+  invalid ? "Pi saved-history recovery owner alarm: original file preserved; native session restarted fresh"
+    : "Pi saved-history recovery owner alarm: saved history unavailable; native session restarted fresh");
 }

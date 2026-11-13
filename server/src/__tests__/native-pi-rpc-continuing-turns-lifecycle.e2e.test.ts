@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { mkdir, mkdtemp, unlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, unlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -46,8 +46,9 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each([false, true, "invalid", "foreign"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
-  const missingFile = savedFile === true;
+it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
+  const replacedRunnerRoot = savedFile === "runner-root";
+  const missingFile = savedFile === true || replacedRunnerRoot;
   const invalidFile = savedFile === "invalid" || savedFile === "foreign";
   let preservedBytes: Buffer | undefined;
   let originalSessionFile: string | undefined;
@@ -348,8 +349,17 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign"] as const)(`three do
         // only a warm lifecycle still has an idle Pi to close here.
         expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: lifecycleMode === "per_turn" ? 0 : 1, busy: 0, failed: 0 });
         const files = turnProofs[0]!.sessionFiles as string[];
-        for (const file of files) await unlink(file); // turn-1 snapshots retain the deleted history
-        stage("saved Pi file deleted after resident shutdown", { files, previousPids: turnProofs[0]!.pids });
+        if (replacedRunnerRoot) {
+          // A replacement computer has none of the old runner/controller/Pi
+          // bytes. Preserve the complete old allocation as evidence, never
+          // seed the replacement with its control-plane state or backup.
+          await rename(join(root, "runner-state"), join(root, "replaced-runner-state"));
+          await mkdir(join(root, "runner-state"));
+          stage("runner root replaced with empty allocation", { files, previousPids: turnProofs[0]!.pids });
+        } else {
+          for (const file of files) await unlink(file); // turn-1 snapshots retain the deleted history
+          stage("saved Pi file deleted after resident shutdown", { files, previousPids: turnProofs[0]!.pids });
+        }
       }
       if (invalidFile && activeTurn === 2) {
         originalSessionFile = (turnProofs[0]!.sessionFiles as string[])[0]!;
@@ -393,10 +403,27 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign"] as const)(`three do
         const notices = comments.filter(comment => /^(pi_session_file_missing|pi_session_file_invalid):/.test(comment.metadata?.authorizationReason ?? ""));
         expect(notices, "exactly one durable notice survives the next real admission").toHaveLength(missingFile || invalidFile ? 1 : 0);
       }
-      await waitFor(`turn ${activeTurn} settled`, async () => {
-        const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
-        return run?.status === "succeeded" ? run : null;
-      });
+      try {
+        await waitFor(`turn ${activeTurn} settled`, async () => {
+          const [run] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
+          return run?.status === "succeeded" ? run : null;
+        });
+      } catch (error) {
+        if (replacedRunnerRoot && activeTurn === 2) {
+          // Preserve both real incident observations on RED: the first failed
+          // resume and the plain next message's controller-recovery result.
+          await heartbeatService(db).waitForRunExecutionDrain(admitted.id, { timeoutMs: 15_000 });
+          await api("POST", `/issues/${issueId}/comments`, { body: "Please continue this same conversation.", clientRequestId: randomUUID() }, 201);
+          await vi.waitFor(async () => {
+            const later = (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+              .find(run => run.nativeIssueId === issueId && run.id !== admitted.id && !previousRuns.includes(run.id));
+            expect(later).toBeDefined();
+            expect(["succeeded", "failed", "timed_out"]).toContain(later!.status);
+            stage("next message after failed replacement", { runId: later!.id, status: later!.status, error: later!.error });
+          }, { timeout: 120_000, interval: 250 });
+        }
+        throw error;
+      }
       await heartbeatService(db).waitForRunExecutionDrain(admitted.id, { timeoutMs: 15_000 });
       const reply = await waitFor(`turn ${activeTurn} final reply published`, async () =>
         (await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
@@ -524,6 +551,12 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign"] as const)(`three do
     }
     expect(turnProofs).toHaveLength(3);
     if (missingFile || invalidFile) expect(replayedRecoveryNotices).toBeGreaterThan(0);
+    if (replacedRunnerRoot) {
+      const alarms = ownerAlarm.mock.calls.filter(([detail]) => typeof detail === "object"
+        && detail !== null && "code" in detail && detail.code === "pi_session_file_missing");
+      expect(alarms, "one scoped missing-history owner alarm across recovery and its next turn").toHaveLength(1);
+      expect(alarms[0]![0]).toMatchObject({ companyId, agentId, issueId, code: "pi_session_file_missing" });
+    }
     stage("all three observations retained", { companyId, agentId, issueId, replayedRecoveryNotices, turnProofs });
   } catch (error) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });

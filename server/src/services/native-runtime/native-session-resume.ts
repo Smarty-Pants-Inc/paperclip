@@ -9,6 +9,7 @@ import type {
   PersistedNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
+import { provesNoNativeRunProviderWork } from "./native-provider-work-proof.js";
 
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
@@ -286,15 +287,33 @@ async function isUnstartedInheritedFollowUp(
 ): Promise<boolean> {
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
-  if (run.runtimeMode !== "native" || run.status !== "failed" || run.processPid !== null ||
-      run.processGroupId !== null || run.processStartedAt !== null || run.runnerProfileJson.nativeControllerRecovery != null ||
+  if (run.runtimeMode !== "native" || run.status !== "failed" || run.runnerProfileJson.nativeControllerRecovery != null ||
       identity.runId !== run.id || identity.sessionId !== input.normalizedSessionId || checkpoint.cursor !== null) return false;
+  const noProcess = run.processPid === null && run.processGroupId === null && run.processStartedAt === null;
+  // Pi controller recovery can fail before a transport exists: no bootstrap
+  // receipt is then written. Its inherited checkpoint is not provider work.
+  const piRecovery = checkpoint.driverKind === "pi_rpc" && checkpoint.activeTurnId === null &&
+    Array.isArray(checkpoint.pendingRuntimeRequests) && checkpoint.pendingRuntimeRequests.length === 0 &&
+    Array.isArray(checkpoint.terminalTurns) && checkpoint.terminalTurns.length === 0 &&
+    checkpoint.terminal === null && checkpoint.semanticResult === null && record(checkpoint.goal).status !== "active";
+  if (!noProcess && !piRecovery) return false;
   const [evidence] = await db.select({
     executionRecovery: sql<unknown>`${heartbeatRuns.resultJson}->'executionRecovery'`,
     phase: nativeRunFinalizations.phase,
     resultId: nativeRunFinalizations.resultId,
     leaseOwner: nativeRunFinalizations.leaseOwner,
     controllerPid: nativeRunFinalizations.controllerPid,
+    inheritedProcess: sql<boolean>`exists (select 1 from ${heartbeatRuns} prior
+      where prior.id::text = ${heartbeatRuns.runnerProfileJson}->>'inheritedProcessIdentityRunId'
+        and prior.id <> ${heartbeatRuns.id} and prior.created_at < ${heartbeatRuns.createdAt}
+        and prior.company_id = ${heartbeatRuns.companyId} and prior.agent_id = ${heartbeatRuns.agentId}
+        and prior.native_issue_id = ${heartbeatRuns.nativeIssueId} and prior.native_session_id = ${heartbeatRuns.nativeSessionId}
+        and prior.process_pid is not distinct from ${heartbeatRuns.processPid}
+        and prior.process_group_id is not distinct from ${heartbeatRuns.processGroupId}
+        and prior.process_started_at is not distinct from ${heartbeatRuns.processStartedAt})`,
+    processStart: sql<boolean>`exists (select 1 from ${heartbeatRunEvents} event
+      where event.company_id = ${heartbeatRuns.companyId} and event.run_id = ${heartbeatRuns.id}
+        and event.event_type in ('native.process_identity_recorded', 'native.process_started'))`,
     controllerCheckpoint: sql<boolean>`exists (select 1 from ${nativeRunnerCheckpoints}
       where ${nativeRunnerCheckpoints.companyId} = ${heartbeatRuns.companyId} and ${nativeRunnerCheckpoints.runId} = ${heartbeatRuns.id})`,
     result: sql<boolean>`exists (select 1 from ${nativeRunResults}
@@ -305,10 +324,15 @@ async function isUnstartedInheritedFollowUp(
   )).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId)));
   const recovery = record(evidence?.executionRecovery);
-  return Boolean(evidence && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false &&
-    evidence.phase === "terminal_failure" && evidence.resultId === null && evidence.leaseOwner === null &&
-    evidence.controllerPid === null && !evidence.controllerCheckpoint && !evidence.result &&
-    !(await nativeSessionProviderEvidence(db, [run.id])).has(run.id));
+  if (!evidence || recovery.providerWorkStarted === true || evidence.phase !== "terminal_failure" || evidence.resultId !== null || evidence.leaseOwner !== null ||
+      evidence.controllerCheckpoint || evidence.result || evidence.processStart) return false;
+  const bootstrap = noProcess && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false && evidence.controllerPid === null;
+  if (!bootstrap && !(piRecovery && (noProcess || evidence.inheritedProcess))) return false;
+  // process_start_requested is only pre-launch intent (the real missing-state
+  // failure writes it without spawning). A newly recorded process identity,
+  // controller checkpoint, tool, result, or sourced/provider event is a barrier.
+  // Share cold-start admission's cross-instance durable no-provider-work proof.
+  return provesNoNativeRunProviderWork(db, { companyId: input.companyId, runId: run.id });
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {

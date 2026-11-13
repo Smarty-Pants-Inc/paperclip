@@ -8,7 +8,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunnerCheckpoints, nativeRunResults,
+  nativeRunnerCheckpoints, nativeRunResults, toolInvocations,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
@@ -16,7 +16,7 @@ import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-ho
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
-import { createNativeControllerRecovery } from "./native-controller-recovery.js";
+import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
@@ -669,6 +669,71 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await followUp.start("created")).not.toBe(ADMITTED);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
+
+  it.each(["empty", "inherited"] as const)("recovers past a Pi follow-up that failed before provider recovery (%s process)", async processMode => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const failed = await failUnstartedFollowUp(prior);
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
+    const checkpoint = row.runnerProfileJson!.sessionCheckpoint as Record<string, unknown>;
+    const processIdentity = processMode === "inherited" ? { processPid: 42_424, processGroupId: 42_424, processStartedAt: new Date(1_000) } : {};
+    if (processMode === "inherited") await db.update(heartbeatRuns).set(processIdentity).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ ...processIdentity, resultJson: {},
+      error: "native_session_recovery_failed: NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable",
+      runnerProfileJson: { ...row.runnerProfileJson, inheritedProcessIdentityRunId: processMode === "inherited" ? prior.runId : undefined,
+        sessionCheckpoint: { ...checkpoint, driverKind: "pi_rpc" } } }).where(eq(heartbeatRuns.id, failed));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const sourceCheckpoint = { ...(source.runnerProfileJson!.sessionCheckpoint as Record<string, unknown>), driverKind: "pi_rpc" };
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...source.runnerProfileJson, sessionCheckpoint: sourceCheckpoint,
+      nativeControllerRecovery: createNativeControllerRecovery(sourceCheckpoint as unknown as PersistedNativeSession,
+        { configDigest: `sha256:${"b".repeat(64)}`, processConfigDigest: null },
+        { runId: prior.runId, runnerInstanceId: prior.native.runnerInstanceId, normalizedSessionId: prior.native.normalizedSessionId }) } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    // A failed recovery may have claimed/released its controller, but never
+    // opened a runner, emitted provider events, accepted a result or tool call.
+    await db.update(nativeRunFinalizations).set({ controllerPid: 42_425 }).where(eq(nativeRunFinalizations.runId, failed));
+    // Observed in the full-server RED: this intent is emitted before recovery
+    // discovers that the replacement computer has no runner state.
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100,
+      eventType: "native.process_start_requested", stream: "system", payload: {} });
+    const retry = await admitFollowUp(prior);
+    expect(retry.selectedRunId).toBe(prior.runId);
+    expect((await resolveNativeControllerRecovery(db, { companyId, agentId, issueId: prior.issueId,
+      normalizedSessionId: prior.native.normalizedSessionId, currentRunId: retry.runId })).kind).toBe("recoverable");
+    expect(await retry.start()).toBe(ADMITTED);
+  }, 60_000);
+
+  it.each(["own process", "recorded process", "provider event", "sourced event", "tool invocation", "controller checkpoint", "run result",
+    "active turn", "pending request", "own cursor", "active goal", "provider work receipt", "live lease"] as const)(
+    "keeps Pi's failed-recovery barrier with %s", async scenario => {
+      const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+      const failed = await failUnstartedFollowUp(prior);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
+      const checkpoint = { ...(run.runnerProfileJson!.sessionCheckpoint as Record<string, unknown>), driverKind: "pi_rpc" };
+      const changes = scenario === "active turn" ? { activeTurnId: "uncertain-turn" }
+        : scenario === "pending request" ? { pendingRuntimeRequests: [{ id: "uncertain-tool" }] }
+        : scenario === "own cursor" ? { cursor: { sourceSeq: 1 } }
+        : scenario === "active goal" ? { goal: { status: "active" } } : {};
+      await db.update(heartbeatRuns).set({ resultJson: scenario === "provider work receipt"
+        ? { executionRecovery: { providerWorkStarted: true } } : {},
+        ...(scenario === "own process" ? { processPid: 42_424 } : {}),
+        runnerProfileJson: { ...run.runnerProfileJson, sessionCheckpoint: { ...checkpoint, ...changes } } }).where(eq(heartbeatRuns.id, failed));
+      if (scenario === "recorded process") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed,
+        seq: 100, stream: "system", payload: {}, eventType: "native.process_identity_recorded" });
+      if (scenario === "provider event" || scenario === "sourced event") await db.insert(heartbeatRunEvents).values({
+        companyId, agentId, runId: failed, seq: 100, stream: "system", payload: {},
+        eventType: scenario === "provider event" ? "session.started" : "harness.diagnostic",
+        ...(scenario === "sourced event" ? { sourceInstanceId: "another-runner", sourceEventId: "another:event:1", sourceSeq: 1 } : {}) });
+      if (scenario === "tool invocation") await db.insert(toolInvocations).values({ companyId, agentId, runId: failed,
+        toolName: "paperclip_get_issue", riskLevel: "read", status: "succeeded" } as never);
+      if (scenario === "controller checkpoint") await db.insert(nativeRunnerCheckpoints).values({ companyId,
+        issueId: prior.issueId, runId: failed, part: "header", material: {} });
+      if (scenario === "run result") await db.insert(nativeRunResults).values({ companyId, issueId: prior.issueId,
+        runId: failed, completionContractId: run.completionContractId!, serverFingerprint: randomUUID(), schemaStatus: "accepted",
+        resultJson: {}, canonicalSha256: "b".repeat(64) });
+      if (scenario === "live lease") await db.update(nativeRunFinalizations).set({ leaseOwner: "still-owned" })
+        .where(eq(nativeRunFinalizations.runId, failed));
+      expect((await admitFollowUp(prior)).selectedRunId).toBe(failed);
+    }, 60_000);
 
   it("skips every unstarted follow-up after repeated failed retries", async () => {
     const prior = await seedRecoveredPriorRun();
