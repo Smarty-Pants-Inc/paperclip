@@ -4,6 +4,7 @@ import { join, posix } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import tar from "tar-stream";
+import { isNativePiConversationDirectoryName } from "./native-pi-conversation-evidence.js";
 import { readNativeHarnessBackupSourceInput } from "./native-harness-backup-source.js";
 
 export const MAX_NATIVE_HARNESS_BYTES = 4 * 1024 * 1024 * 1024;
@@ -54,6 +55,7 @@ export async function captureNativeHarnessArchive(root: string, target: string, 
   const output = pipeline(archive, boundedArchive(maxArchiveBytes), createWriteStream(target, { flags: "wx", mode: 0o600 }), { signal });
   void output.catch(error => { outputFailure = error; });
   let count = 0, bytes = 0;
+  let piConversationEvidence = false;
   const links = new Map<string, string>();
   const visit = async (relative: string): Promise<void> => {
     for (const name of (await readNativeHarnessBackupSourceInput(() => readdir(join(root, relative)))).sort()) {
@@ -61,6 +63,7 @@ export async function captureNativeHarnessArchive(root: string, target: string, 
       signal?.throwIfAborted();
       const entry = relative ? `${relative}/${name}` : name;
       if (!safeName(entry) || ++count > MAX_NATIVE_HARNESS_ENTRIES) throw fail();
+      if (entry.split("/").some(isNativePiConversationDirectoryName)) piConversationEvidence = true;
       const file = join(root, entry), stat = await readNativeHarnessBackupSourceInput(() => lstat(file));
       if (stat.isDirectory()) {
         await new Promise<void>((resolve, reject) => archive.entry({ name: entry, type: "directory", mode: stat.mode & 0o777 },
@@ -87,7 +90,7 @@ export async function captureNativeHarnessArchive(root: string, target: string, 
       } else throw fail();
     }
   };
-  try { await visit(""); validateLinks(links); archive.finalize(); await output; }
+  try { await visit(""); validateLinks(links); archive.finalize(); await output; return { piConversationEvidence }; }
   catch (error) {
     archive.destroy((outputFailure ?? error) as Error);
     await output.catch(() => undefined);

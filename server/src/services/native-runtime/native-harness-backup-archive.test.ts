@@ -18,6 +18,16 @@ async function maliciousArchive(root: string, headers: Array<tar.Headers>) {
   for (const header of headers) archive.entry(header, Buffer.alloc(0));
   archive.finalize(); await written; return file;
 }
+it.each(["pi", "pi-agent", "acpx/conversation/pi-home", "legacy/.pi", "codex-home"])(
+  "inventories Pi evidence before durable object expiry (%s)", async directory => {
+    const root = await fixture(), source = join(root, "source");
+    await mkdir(join(source, directory, "sessions"), { recursive: true });
+    await writeFile(join(source, directory, "sessions", "only.jsonl"), "original native history\n");
+    await writeFile(join(source, "manifest.json"), "{}");
+    expect(await captureNativeHarnessArchive(source, join(root, "archive")))
+      .toEqual({ piConversationEvidence: directory !== "codex-home" });
+  },
+);
 it("reserves the full entry budget using real maximum-path PAX encoding", async () => {
   const root = await fixture(), name = "a/".repeat(MAX_NATIVE_HARNESS_PATH_BYTES / 2 - 1) + "aa";
   const file = await maliciousArchive(root, [{ name, type: "symlink", linkname: "b".repeat(MAX_NATIVE_HARNESS_PATH_BYTES) }]);
