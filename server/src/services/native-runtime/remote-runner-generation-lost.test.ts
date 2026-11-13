@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { PREDECESSOR_LONG_STOP_MS, PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE, PREDECESSOR_SANDBOX_READ_TIMEOUT_MS,
-  remoteRunnerGenerationLost, type PredecessorSandboxRecord } from "./native-session-executor.js";
+  createNativeAttemptGenerationLossMemo, remoteRunnerGenerationLost, type PredecessorSandboxRecord } from "./native-session-executor.js";
 
 // RFL F1: a provider "restarted" label is only the trigger to look. The prior
 // Runner is gone only when the box's launch marker names a process that is not
@@ -48,7 +48,7 @@ const fixture = (runnerInstanceId = randomUUID()) => {
       } },
       now: () => Date.parse("2026-11-13T11:00:00.000Z"), ...rest }) };
   };
-  return { owner, mark, lost, lostWith, boot, ticks };
+  return { owner, mark, lost, lostWith, boot, ticks, remoteCwd, runnerInstanceId, normalizedSessionId };
 };
 
 it.skipIf(process.platform !== "linux")("never proves a live owner of the same generation gone", async () => {
@@ -69,6 +69,47 @@ it.skipIf(process.platform !== "linux")("proves the exact owner gone when its pr
   exited.owner.kill("SIGKILL");
   await new Promise(resolve => exited.owner.once("exit", resolve));
   expect(await exited.lost(), "the exact owner process is gone").toBe(true);
+});
+
+// Keep reason: ownership trust boundary. A cached loss must never authorize
+// retiring a different generation/allocation or a later attempt's live owner.
+it.skipIf(process.platform !== "linux")("shares a generation-loss probe within one attempt, but probes a new attempt afresh", async () => {
+  const f = fixture();
+  const execute = vi.fn(runner.execute);
+  const identity = { runId: randomUUID(), normalizedSessionId: f.normalizedSessionId, runnerInstanceId: f.runnerInstanceId,
+    environmentLeaseId: randomUUID(), turnId: randomUUID(), itemId: randomUUID() };
+  const input = { runId: randomUUID(), identity, providerLeaseId: "same-box", remoteCwd: f.remoteCwd };
+  const probe = () => remoteRunnerGenerationLost({ runner: { execute }, remoteCwd: f.remoteCwd, identity });
+  const markerReads = () => execute.mock.calls.filter(([command]) => command.args?.[2] === "paperclip-runner-generation-marker");
+  const attempt = createNativeAttemptGenerationLossMemo();
+  f.mark(`linux:${randomUUID()}:${f.ticks}`);
+  expect(await Promise.all([attempt(input, probe), attempt({ ...input, identity: { ...identity } }, probe)])).toEqual([true, true]);
+  expect(markerReads()).toHaveLength(1);
+  // Same durable identity, now a matching live marker. Reusing the old loss
+  // across attempts would incorrectly permit destructive authority rotation.
+  f.mark();
+  expect(await createNativeAttemptGenerationLossMemo()(input, probe)).toBe(false);
+  expect(markerReads()).toHaveLength(2);
+});
+
+it.skipIf(process.platform !== "linux")("does not share loss across provider leases, current runs, or predecessor durable identities", async () => {
+  const f = fixture();
+  const execute = vi.fn(runner.execute);
+  const identity = { runId: randomUUID(), normalizedSessionId: f.normalizedSessionId, runnerInstanceId: f.runnerInstanceId,
+    environmentLeaseId: randomUUID(), turnId: randomUUID(), itemId: randomUUID() };
+  const input = { runId: randomUUID(), identity, providerLeaseId: "box-a", remoteCwd: f.remoteCwd };
+  const attempt = createNativeAttemptGenerationLossMemo();
+  const prove = (candidate: typeof input) => attempt(candidate,
+    () => remoteRunnerGenerationLost({ runner: { execute }, remoteCwd: candidate.remoteCwd, identity: candidate.identity }));
+  f.mark(`linux:${randomUUID()}:${f.ticks}`);
+  expect(await prove(input)).toBe(true);
+  f.mark();
+  expect(await prove({ ...input, providerLeaseId: "box-b" })).toBe(false);
+  expect(await prove({ ...input, runId: randomUUID() })).toBe(false);
+  for (const field of Object.keys(identity)) {
+    expect(await prove({ ...input, identity: { ...identity, [field]: randomUUID() } }), field).toBe(false);
+  }
+  expect(execute.mock.calls.filter(([command]) => command.args?.[2] === "paperclip-runner-generation-marker")).toHaveLength(9);
 });
 
 const present = (state: string, stoppedAt: string | null = null, lastRebootAt: string | null = null): PredecessorSandboxRecord =>

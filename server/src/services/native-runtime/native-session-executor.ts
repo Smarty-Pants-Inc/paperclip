@@ -442,6 +442,8 @@ type NativeSessionStartup = {
   sessionPublished?: boolean;
   /** One fresh identity exchange per attempt, shared by nested admission checks. */
   resumedSandboxProbeDecision?: Promise<boolean>;
+  /** Owned by one executor attempt, never by the retained warm session. */
+  resumedSandboxGenerationLoss?: ReturnType<typeof createNativeAttemptGenerationLossMemo>;
   warmOwnerIdentitySpan?: NativeRunHistoricalSpan;
   /** Restart recovery reattaches a provider that may already have worked. */
   providerWorkMayPrecede?: boolean;
@@ -5846,6 +5848,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   identity: RunnerdDurableIdentity;
   execution: NativeExecutionInput;
   projectedControlBytes?: string;
+  generationLossMemo?: ReturnType<typeof createNativeAttemptGenerationLossMemo>;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }): Promise<{ finished: true; run: typeof heartbeatRuns.$inferSelect; recheck: () => Promise<string | null> }
@@ -5867,9 +5870,12 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     // restart label. That label is never proof: use the shared exact-generation
     // probe, including on an ordinary resume of a still-running box.
     if (resumedSandboxRunner(target)) {
-      if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
-        return refuse("restarted_sandbox_runner_generation_not_lost");
-      }
+      const probe = () => remoteRunnerGenerationLost({ runner: target.runner!, remoteCwd: target.remoteCwd, identity: input.identity });
+      const lost = input.generationLossMemo
+        ? await input.generationLossMemo({ runId: input.execution.binding.runId, identity: input.identity,
+          providerLeaseId: target.sandboxLeaseAcquisition?.providerLeaseId, remoteCwd: target.remoteCwd }, probe)
+        : await probe();
+      if (!lost) return refuse("restarted_sandbox_runner_generation_not_lost");
     } else if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
@@ -6031,6 +6037,26 @@ async function resumedSandboxRunnerNeedsProbe(input: {
   return startup ? (startup.resumedSandboxProbeDecision ??= check()) : check();
 }
 
+/** Share only the exact-generation probe within one attempt. Mutable result,
+ * controller and journal fences are deliberately re-read by every caller. */
+export function createNativeAttemptGenerationLossMemo() {
+  const proofs = new Map<string, Promise<boolean>>();
+  return (input: { runId: string; identity: Record<string, unknown>; providerLeaseId?: string; remoteCwd: string },
+    probe: () => Promise<boolean>): Promise<boolean> => {
+    const predecessor = ["runId", "normalizedSessionId", "runnerInstanceId", "environmentLeaseId", "turnId", "itemId"]
+      .map(field => input.identity[field]);
+    // An unidentified allocation/owner cannot establish a reusable proof.
+    if (!input.providerLeaseId || predecessor.some(value => typeof value !== "string" || !value)) return probe();
+    const key = JSON.stringify([input.runId, input.providerLeaseId, input.remoteCwd, ...predecessor]);
+    let proof = proofs.get(key);
+    if (!proof) {
+      proof = Promise.resolve().then(probe);
+      proofs.set(key, proof);
+    }
+    return proof;
+  };
+}
+
 /** An idle Runner can exit while its sandbox remains running. A resume from a
  * stopped state is likewise only a trigger, never proof of generation loss.
  * Return its exact identity only after the shared process-generation loss probe
@@ -6043,7 +6069,8 @@ async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof insp
   if (!await resumedSandboxRunnerNeedsProbe(input) || !isSafeNativeStateDirectory(input.root)) return null;
   const identity = readRunnerdDurableIdentity(input.root);
   if (!identity || !durableIdentityMatchesSession(identity, input.execution) || identity.runId === input.execution.binding.runId) return null;
-  const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
+  const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity,
+    generationLossMemo: nativeSessionStartups.get(input.execution.binding.runId)?.resumedSandboxGenerationLoss });
   if (!proof.finished) {
     await input.onLog?.("stderr", `[paperclip-runner] restarted sandbox owner ${String(identity.runId)} not retired: ${proof.refused}\n`);
     return null;
@@ -10466,9 +10493,13 @@ async function executePaperclipNativeSessionWithinScope(
   // never finishes its trace included), without touching a newer attempt's.
   const runId = input.execution.binding.runId;
   const priorFlush = nativeRunRecoveryFlushers.get(runId);
+  const startup = nativeSessionStartups.get(runId);
+  const generationLossMemo = createNativeAttemptGenerationLossMemo();
+  if (startup) startup.resumedSandboxGenerationLoss = generationLossMemo;
   try {
     return await executePaperclipNativeSessionAttempt(input, prepareAfterClaim, cleanupOnly, ownDiagnosticLease);
   } finally {
+    if (startup?.resumedSandboxGenerationLoss === generationLossMemo) delete startup.resumedSandboxGenerationLoss;
     const current = nativeRunRecoveryFlushers.get(runId);
     if (current !== undefined && current !== priorFlush) nativeRunRecoveryFlushers.delete(runId);
   }
