@@ -8510,9 +8510,6 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "native_event_replay_conflict" ||
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
     sourceFailureCode === "runner_remote_provider_verification_unavailable" ||
-    sourceFailureCode === "runner_remote_provider_pack_sandbox_stopped" ||
-    sourceFailureCode === "runner_remote_provider_pack_transfer_timeout" ||
-    sourceFailureCode === "runner_remote_provider_archive_verify_timeout" ||
     sourceFailureCode === "native_provider_terminal_failed" ||
     sourceFailureCode === NATIVE_PROVIDER_STATE_INCOMPATIBLE ||
     sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING ||
@@ -8633,9 +8630,6 @@ export function nativeSessionFailureSourceCode(
   | "native_adopted_runner_authentication_timeout"
   | "runner_remote_provider_artifact_incompatible"
   | "runner_remote_provider_verification_unavailable"
-  | "runner_remote_provider_pack_sandbox_stopped"
-  | "runner_remote_provider_pack_transfer_timeout"
-  | "runner_remote_provider_archive_verify_timeout"
   | "provider_process_exited"
   | "provider_stdout_closed"
   | "provider_process_output_closed"
@@ -8713,11 +8707,6 @@ export function nativeSessionFailureSourceCode(
   if (/runner_remote_provider_artifact_incompatible/i.test(message)) {
     return "runner_remote_provider_artifact_incompatible";
   }
-  const providerPackFailure = message.match(/\b(runner_remote_provider_pack_sandbox_stopped|runner_remote_provider_pack_transfer_timeout|runner_remote_provider_archive_verify_timeout)\b/i);
-  if (providerPackFailure) return providerPackFailure[1]!.toLowerCase() as
-    | "runner_remote_provider_pack_sandbox_stopped"
-    | "runner_remote_provider_pack_transfer_timeout"
-    | "runner_remote_provider_archive_verify_timeout";
   if (/runner_remote_provider_verification_unavailable/i.test(message)) {
     return "runner_remote_provider_verification_unavailable";
   }
@@ -12788,12 +12777,6 @@ async function executePaperclipNativeSessionAttempt(
                   ? nativeCleanupRefusalAction(completedTurnCleanup)
                   : sourceFailureCode === "runner_remote_provider_verification_unavailable"
                     ? "Provider files could not be verified after two read attempts. Inspect the retained workspace and command transport before retrying the original run."
-                  : sourceFailureCode === "runner_remote_provider_pack_sandbox_stopped"
-                    ? "The sandbox stopped while staging the provider pack. Resume or replace the sandbox before retrying provider work."
-                  : sourceFailureCode === "runner_remote_provider_pack_transfer_timeout"
-                    ? "Provider-pack transfer exceeded its bounded deadline. Inspect the upload transport before retrying."
-                  : sourceFailureCode === "runner_remote_provider_archive_verify_timeout"
-                    ? "Provider-pack archive verification exceeded its bounded deadline. Inspect the local archive and retry only after resolving the verification delay."
                   : sourceFailureCode === "runner_task_admission_rejected"
                     ? RUNNER_TASK_ADMISSION_REJECTED_ACTION
                   : sourceFailureCode === "runner_ingress_access_rejected"
