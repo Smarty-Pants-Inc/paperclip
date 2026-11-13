@@ -8467,6 +8467,7 @@ function leaseDb(
   runnerProfileJson: Record<string, unknown> = {},
   runStatus = "running",
   priorAccountingEvents: PrpEvent[] = [],
+  environmentLeaseRows: Array<Record<string, unknown>> = [],
 ): Db {
   const coordinator: LeaseCoordinator = {
     runId: boundExecution.binding.runId,
@@ -8501,7 +8502,9 @@ function leaseDb(
       const rows =
         table === nativeRunFinalizations
           ? [coordinator]
-          : table === heartbeatRuns
+          : table === environmentLeases
+            ? environmentLeaseRows
+            : table === heartbeatRuns
             ? [
                 {
                   id: boundExecution.binding.runId,
@@ -16822,6 +16825,63 @@ describe("runnerd provider runtime wiring", () => {
       session: { ...execution.session, normalizedSessionId: `session-${suffix}` },
     };
   }
+
+  it.each([
+    [false, "direct provider lease predecessor"], [true, "direct provider lease predecessor"],
+    [false, "kept replacement successor"], [true, "kept replacement successor"],
+    [false, "retired replacement predecessor"], [true, "retired replacement predecessor"],
+  ] as const)("abandons a replaced remote reattach claim and takes the cold path (conversation=%s, proof=%s)", async (conversationMode, proof) => {
+    const current = scopedNativeExecution(`replaced-verification-lease-${conversationMode}-${proof}`);
+    const acquiredAt = new Date("2026-11-13T22:00:00.000Z");
+    const previousLease = {
+      id: "previous-environment-lease", companyId: current.binding.companyId, environmentId: "environment",
+      executionWorkspaceId: current.binding.executionWorkspaceId, issueId: current.binding.issueId,
+      heartbeatRunId: current.binding.runId,
+      status: proof === "direct provider lease predecessor" ? "expired"
+        : proof === "kept replacement successor" ? "retained" : "pending_cleanup",
+      leasePolicy: proof === "direct provider lease predecessor" ? "ephemeral" : "reuse_by_environment",
+      provider: "daytona", providerLeaseId: "previous-box", acquiredAt,
+      lastUsedAt: acquiredAt, expiresAt: null, releasedAt: acquiredAt,
+      cleanupStatus: proof === "direct provider lease predecessor" ? "success" : "failed",
+      failureReason: proof === "retired replacement predecessor" ? "resume_failed" : null,
+      metadata: { remoteCwd: "/previous-box",
+        ...(proof === "kept replacement successor" ? { reusableSandboxKeptAfterReplacement: {
+          replacementLeaseId: "replacement-environment-lease" } } : {}),
+        sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "previous-box" } },
+    };
+    const acquisition = { outcome: "replacement" as const, providerLeaseId: "replacement-box",
+      ...(proof === "direct provider lease predecessor"
+        ? { previousProviderLeaseId: "previous-box" }
+        : { reason: "resume_failed" as const }) };
+    const acquiredLease = {
+      ...previousLease, id: "replacement-environment-lease", status: "active", providerLeaseId: "replacement-box",
+      releasedAt: null, cleanupStatus: null, failureReason: null,
+      metadata: { remoteCwd: "/replacement-box", sandboxLeaseAcquisition: acquisition },
+    };
+    const db = leaseDb(current, {}, {}, [], {}, "running", [], [acquiredLease, previousLease] as never);
+    const dispatch = vi.fn(async (_options: unknown) => ({ result: { summary: "verified" },
+      terminal: { runTerminalState: "succeeded" as const }, turnId: "fresh-turn",
+      normalizedSessionId: current.session.normalizedSessionId, providerSessionId: "fresh-provider-session",
+      driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 }));
+    state.execute.mockReset().mockImplementationOnce(dispatch as never);
+    const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: "environment",
+      leaseId: acquiredLease.id, providerKey: "daytona", remoteCwd: "/replacement-box",
+      sandboxLeaseAcquisition: acquisition, runner: { execute: vi.fn() } };
+    const restartRecovery = { kind: "reattach_remote_runner" as const, runId: current.binding.runId,
+      leaseOwner: "restart-controller", controllerGeneration: 2, providerAttempt: 2, restartKind: "hard" as const,
+      recoveryRequestId: null, remote: { providerLeaseId: "previous-box", remoteCwd: "/previous-box" } };
+    try {
+      await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: "replacement-controller",
+        leaseOwner: "restart-controller", useRunnerd: true, backend: { kind: "cold-restore-test" } as never,
+        conversationMode, restartRecovery, runnerIngressAuthorized: true,
+        runnerExecutionTarget: target as never });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch.mock.calls[0]![0]).toMatchObject({ resumeInterruptedTurn: false,
+        retainedRunnerReattachment: false, input: { binding: { runId: current.binding.runId } } });
+    } finally {
+      state.execute.mockReset();
+    }
+  });
 
   it.each(["reuse", "unsettled-describe", "claim-delay", "claim-expired", "claim-rollback", "unsupported", "fallback-clear-failed", "fallback-clear-expired", "fallback-clear-stopped"])("owns retained plugin startup through %s", async mode => {
     const first = { ...scopedNativeExecution(`plugin-cold-then-warm-${mode}`),
