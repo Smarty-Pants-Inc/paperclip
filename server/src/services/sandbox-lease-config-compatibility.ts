@@ -1,8 +1,18 @@
-// Allocation identity is deliberately fail-closed: only these creation/timing
-// settings may drain. Unknown provider fields, accounts, regions, endpoints,
-// mounts, environment variables and credential scopes remain identity fields.
+// Boot sources are allocation identity, never compatible creation settings.
+// Even clearing an explicit source must not resume an older snapshot.
+const BOOT_SOURCE_KEYS = ["from", "snapshot", "image", "rootfs"] as const;
+
+export function sandboxLeaseSourceMatches(
+  current: Record<string, unknown>,
+  admitted: Record<string, unknown>,
+): boolean {
+  return BOOT_SOURCE_KEYS.every(key => JSON.stringify(current[key] ?? null) === JSON.stringify(admitted[key] ?? null));
+}
+
+// Allocation identity is deliberately fail-closed: only these sizing/timing
+// settings may drain. Unknown provider fields, boot sources, accounts, regions,
+// endpoints, mounts, environment variables and credentials remain identity fields.
 const COMPATIBLE_SCALAR_KEYS = new Set([
-  "from", "snapshot", "image", "rootfs",
   "cpu", "memory", "disk", "gpu", "size", "shape",
   "timeoutMs", "bridgeRequestTimeoutMs", "livenessTimeoutMs", "ttlMinutes",
   "autoStopInterval", "autoArchiveInterval", "autoDeleteInterval", "runnerIdleTimeoutMs",

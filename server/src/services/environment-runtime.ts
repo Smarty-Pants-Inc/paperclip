@@ -11,7 +11,7 @@ import {
   reusableSandboxConfigurationChangeIsSafe,
   sandboxStateTransitionFailure,
 } from "./reusable-sandbox-resume-replacement.js";
-import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig } from "./sandbox-lease-config-compatibility.js";
+import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
 import { captureEnvironmentAcquisitionDiagnostic } from "./environment-acquisition-diagnostics.js";
@@ -26,7 +26,7 @@ import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
 import { ownedWorkspaceRecoveryLease, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
-import { hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
+import { hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -1087,6 +1087,7 @@ function reusableSandboxLeaseScopeMatches(input: {
   fingerprintKey?: "leaseFingerprint" | "leaseIdentityFingerprint";
 }): boolean {
   if ((!input.executionWorkspaceId && !input.issueId) || !input.agentId) return false;
+  if (!sandboxLeaseSourceMatches(input.config, input.lease.metadata ?? {})) return false;
   const scope = input.lease.metadata?.reusableSandboxLease;
   if (!isRecord(scope)) return false;
   const adapterType = input.adapterType ?? null;
@@ -1603,23 +1604,25 @@ function createSandboxEnvironmentDriver(
     const exactIds = new Set(input.exactMatches.map(lease => lease.id));
     for (const lease of input.candidates) {
       if (exactIds.has(lease.id)) continue;
+      if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) continue;
       const admittedConfig = admittedSandboxLeaseConfig(input.config, lease.metadata ?? {});
       const scope = { ...input, lease };
       const hasIdentityFingerprint = isRecord(lease.metadata?.reusableSandboxLease)
         && readLeaseFingerprint(lease.metadata.reusableSandboxLease.leaseIdentityFingerprint) !== null;
-      const compatible = hasIdentityFingerprint
-        ? reusableSandboxLeaseScopeMatches({ ...scope, leaseFingerprint: input.fingerprints.leaseIdentityFingerprint,
-            fingerprintKey: "leaseIdentityFingerprint" })
-        // Pre-upgrade leases store only the full digest. Reproduce that digest
-        // with their admitted creation settings and TODAY's security context.
-        // Account/secret/plugin/mount drift therefore still fails closed.
-        : reusableSandboxLeaseScopeMatches({ ...scope, config: admittedConfig,
+      const compatible = (hasIdentityFingerprint
+        && reusableSandboxLeaseScopeMatches({ ...scope, leaseFingerprint: input.fingerprints.leaseIdentityFingerprint,
+            fingerprintKey: "leaseIdentityFingerprint" }))
+        // Pre-upgrade leases may omit identity or exclude boot sources from it.
+        // Reproduce their full digest with admitted sizing/timing settings and
+        // TODAY's security context. Source drift was rejected above; account,
+        // secret, plugin and mount drift therefore still fail closed.
+        || reusableSandboxLeaseScopeMatches({ ...scope, config: admittedConfig,
             leaseFingerprint: input.fingerprints.fingerprintForConfig(admittedConfig),
             allowLegacyRuntimeFingerprint: lease.status === "active" && lease.heartbeatRunId === input.heartbeatRunId });
       if (!compatible) continue;
       compatibleLeases.push(lease);
       if (input.exactMatches.length === 0 && !rolloverLease && await reusableSandboxConfigurationChangeIsSafe({
-        db, lease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
+        db, lease, config: input.config, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
         executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType,
       })) rolloverLease = lease;
       else pinnedConfigs.set(lease.id, admittedConfig);
@@ -1640,6 +1643,7 @@ function createSandboxEnvironmentDriver(
   }
 
   async function cleanupObsoleteReusableSandboxLeases(input: {
+    config: Record<string, unknown>;
     environment: Environment;
     leases: EnvironmentLease[];
     reusableLeases: EnvironmentLease[];
@@ -1648,6 +1652,17 @@ function createSandboxEnvironmentDriver(
     for (const lease of input.leases) {
       if (reusableIds.has(lease.id)) continue;
       if (!reusableLeaseCanBeCleanedUp(lease)) continue;
+      // A stale boot source must not serve the next run, but may hold its only
+      // workspace/session copy. Use the existing durable stop-only intent, not
+      // destruction; the cleanup sweep can stop it even after a worker restart.
+      if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) {
+        const [stale] = await db.select().from(environmentLeases).where(and(
+          eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id),
+        ));
+        if (stale?.status === "retained") await prepareSupersededWarmSandboxStop(db, stale, { reason: "sandbox_source_changed" });
+        else if (stale?.status === "released") await prepareHistoricalSandboxStopVerification(db, stale);
+        continue;
+      }
       await destroyReusableSandboxLease({
         environment: input.environment,
         lease,
@@ -1822,8 +1837,10 @@ function createSandboxEnvironmentDriver(
         // We also filter out leases whose policy is not reuse_by_environment
         // and whose status is not reusable so non-reusable, cleanup-pending,
         // or terminal rows cannot be matched.
+        // Stale-source cleanup must still record a stop-only intent when a
+        // restarted worker no longer verifies reuse. Resume stays gated below.
         const reusableCandidateLeases =
-          supportsReusableLeases &&
+          declaredReusableLeases &&
           parsed.config.reuseLease &&
           input.heartbeatRunId !== null &&
           (input.executionWorkspaceId !== null || input.issueId !== null) &&
@@ -1870,6 +1887,7 @@ function createSandboxEnvironmentDriver(
         reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
         if (reusableCandidateLeases.length > reusableExistingLeases.length) {
           await cleanupObsoleteReusableSandboxLeases({
+            config: providerConfigForLease,
             environment: input.environment,
             leases: reusableCandidateLeases,
             reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
@@ -2248,6 +2266,7 @@ function createSandboxEnvironmentDriver(
       reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
       if (reusableCandidateLeases.length > reusableExistingLeases.length) {
         await cleanupObsoleteReusableSandboxLeases({
+          config: providerConfigForLease,
           environment: input.environment,
           leases: reusableCandidateLeases,
           reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],

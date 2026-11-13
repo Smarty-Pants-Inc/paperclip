@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import type {
   EnvironmentLeaseStatus,
   EnvironmentProbeResult,
@@ -316,6 +317,7 @@ export function findReusableSandboxProviderLeaseId(input: {
         typeof lease.providerLeaseId === "string" &&
         lease.providerLeaseId.length > 0 &&
         metadata.provider === input.config.provider &&
+        sandboxLeaseSourceMatches({ ...input.config }, metadata) &&
         metadataMatchesPluginSandboxConfig(input.config, metadata)
       ) {
         return lease.providerLeaseId;
@@ -324,7 +326,8 @@ export function findReusableSandboxProviderLeaseId(input: {
     return null;
   }
   for (const lease of input.leases) {
-    if (provider.matchesReusableLease({ config: input.config, lease })) {
+    if (sandboxLeaseSourceMatches({ ...input.config }, lease.metadata ?? {})
+      && provider.matchesReusableLease({ config: input.config, lease })) {
       return lease.providerLeaseId;
     }
   }

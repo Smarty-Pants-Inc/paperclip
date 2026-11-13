@@ -4694,12 +4694,84 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     });
   });
 
-  // Incident 2026-11-12 22:04Z: changing only a snapshot's `from` retired a
-  // warm conversation. Keep: recorded real catch + provider-state data safety.
-  it.each(["active", "released", "legacy active", "legacy released", "stale checkpoint", "source changed during create"])(
-    "drains a compatible from change after the owner settles and checkpoints: %s", async state => {
+  // Rung-6 incident 6c0d4025: a new run resumed a two-snapshots-old box.
+  // Keep: recorded real catch + provider-state data safety. Exercise the real
+  // DB-backed admission path, including pre-upgrade scope fingerprints.
+  it.each(["from", "snapshot", "image", "rootfs"].flatMap(key =>
+    ["same", "changed", "legacy changed", "old identity changed", "unset", "released", "stale lifecycle"].map(change => ({ key, change }))))(
+    "never reuses a retained allocation across a boot source change: $key / $change", async ({ key, change }) => {
     const pluginId = randomUUID();
-    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", region: "eu", reuseLease: true, timeoutMs: 1234 };
+    const providerConfig = { provider: "fake-plugin", [key]: "snap-A", reuseLease: true, timeoutMs: 1234 };
+    const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Snapshot reuse regression", status: "in_progress", assigneeAgentId: agentId });
+    await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{
+      driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Source identity fixture",
+      supportsReusableLeases: true, configSchema: { type: "object" },
+    }] });
+    let acquisitions = 0;
+    const workerManager = {
+      isRunning: () => true,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") return {
+          providerLeaseId: `source-${++acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" },
+        };
+        if (method === "environmentResumeLease") return {
+          providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" },
+        };
+        if (method === "environmentReleaseLease" || method === "environmentDestroyLease") return undefined;
+        if (method === "environmentExecute") return { exitCode: 0, stdout: `served:${params.config[key]}`, stderr: "" };
+        throw new Error(`Unexpected source identity method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const service = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const acquire = (selectedEnvironment: Environment, heartbeatRunId: string) => service.acquireRunLease({
+      companyId, environment: selectedEnvironment, issueId, agentId, adapterType: "paperclip_runner",
+      heartbeatRunId, persistedExecutionWorkspace: null,
+    });
+    const first = await acquire(environment, runId);
+    if (change.startsWith("legacy") || change.startsWith("old identity")) {
+      const scope = { ...(first.lease.metadata?.reusableSandboxLease as Record<string, unknown>) };
+      if (change.startsWith("legacy")) delete scope.leaseIdentityFingerprint;
+      else scope.leaseIdentityFingerprint = { ...(scope.leaseIdentityFingerprint as object), fingerprint: "0".repeat(64) };
+      await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata, reusableSandboxLease: scope });
+    }
+    await db.update(environmentLeases).set({ status: change === "released" ? "released" : "retained" }).where(eq(environmentLeases.id, first.lease.id));
+    if (change === "stale lifecycle") vi.spyOn(workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentExecute"] } as never);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    const nextRunId = randomUUID();
+    await insertRunningManualRun(nextRunId, companyId, agentId);
+    const config = { ...providerConfig, [key]: change === "same" ? "snap-A" : change === "unset" ? null : "snap-B" };
+    await environmentService(db).update(environment.id, { config });
+    vi.mocked(workerManager.call).mockClear();
+    const next = await acquire({ ...environment, config }, nextRunId);
+    expect(next.lease.metadata?.[key]).toBe(config[key]);
+    if (change === "same") {
+      expect(next.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
+      expect(acquisitions).toBe(1);
+    } else {
+      expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
+      expect(acquisitions).toBe(2);
+      expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
+      await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+        status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
+        metadata: { [key]: "snap-A", sandboxStopAndRetain: {
+          schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId: first.lease.providerLeaseId, pluginId,
+        } },
+      });
+      expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+    }
+    await expect(service.execute({ environment: { ...environment, config }, lease: next.lease, command: "verify source" }))
+      .resolves.toMatchObject({ stdout: `served:${config[key]}` });
+  });
+
+  // Compatible sizing changes still preserve a warm conversation until its
+  // checkpoint is verifiable. Keep: provider-state data safety.
+  it.each(["active", "released", "legacy active", "legacy released", "old identity", "stale checkpoint", "source changed during create"])(
+    "drains a compatible sizing change after the owner settles and checkpoints: %s", async state => {
+    const pluginId = randomUUID();
+    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", cpu: 1, region: "eu", reuseLease: true, timeoutMs: 1234 };
     const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
     const issueId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Warm Pi conversation", status: "in_progress", assigneeAgentId: agentId });
@@ -4729,7 +4801,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" },
         };
         if (method === "environmentReleaseLease" || method === "environmentDestroyLease") return undefined;
-        if (method === "environmentExecute") return { exitCode: 0, stdout: `served:${params.config.from}:${params.command}`, stderr: "" };
+        if (method === "environmentExecute") return { exitCode: 0, stdout: `served:${params.config.cpu}:${params.command}`, stderr: "" };
         throw new Error(`Unexpected compatible-source method: ${method}`);
       }),
     } as unknown as PluginWorkerManager;
@@ -4747,22 +4819,24 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     first.lease = (await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata,
       anonymousGitHubLaunchers: launcherPreparation, nativeWorkspaceRealizationPreparation: realizationPreparation }))!;
     const admittedFingerprint = (first.lease.metadata?.reusableSandboxLease as any).leaseFingerprint;
-    if (state.startsWith("legacy")) {
+    if (state.startsWith("legacy") || state === "old identity") {
       const scope = { ...(first.lease.metadata?.reusableSandboxLease as Record<string, unknown>) };
-      delete scope.leaseIdentityFingerprint;
+      if (state.startsWith("legacy")) delete scope.leaseIdentityFingerprint;
+      else scope.leaseIdentityFingerprint = { ...(scope.leaseIdentityFingerprint as object), fingerprint: "0".repeat(64) };
       await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata, reusableSandboxLease: scope });
     }
     if (state.endsWith("released")) await runtimeWithPlugin.releaseRunLeases(runId);
-    const changed = { ...environment, config: { ...providerConfig, from: "snapshot-b" } };
+    const changed = { ...environment, config: { ...providerConfig, cpu: 2 } };
     await environmentService(db).update(environment.id, { config: changed.config });
 
     const duringRun = await acquire(changed);
     expect(duringRun.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
     expect(duringRun.lease.metadata?.from).toBe("snapshot-a");
+    expect(duringRun.lease.metadata?.cpu).toBe(1);
     expect((duringRun.lease.metadata?.reusableSandboxLease as any).leaseFingerprint).toEqual(admittedFingerprint);
     expect(calls).not.toContain("environmentDestroyLease");
     await expect(runtimeWithPlugin.execute({ environment: changed, lease: duringRun.lease, command: "next message" }))
-      .resolves.toMatchObject({ exitCode: 0, stdout: "served:snapshot-a:next message" });
+      .resolves.toMatchObject({ exitCode: 0, stdout: "served:1:next message" });
 
     await runtimeWithPlugin.releaseRunLeases(runId);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
@@ -4812,7 +4886,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         expect(stale.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
         expect(calls).not.toContain("environmentDestroyLease");
         await expect(runtimeWithPlugin.execute({ environment: changed, lease: stale.lease, command: "after stale checkpoint" }))
-          .resolves.toMatchObject({ stdout: "served:snapshot-a:after stale checkpoint" });
+          .resolves.toMatchObject({ stdout: "served:1:after stale checkpoint" });
         sourceLease = stale.lease;
         // F7 finally covers the later provider event before the drain proceeds.
         await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"content":"next message"}\n{"content":"after stale checkpoint"}\n');
@@ -4853,14 +4927,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(replacement.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
       expect(replacement.lease.metadata?.anonymousGitHubLaunchers).toBeUndefined();
       expect(replacement.lease.metadata?.nativeWorkspaceRealizationPreparation).toBeUndefined();
-      expect(replacement.lease.metadata).toMatchObject({ from: "snapshot-b", nativeHarnessBackup: stamp,
+      expect(replacement.lease.metadata).toMatchObject({ from: "snapshot-a", cpu: 2, nativeHarnessBackup: stamp,
         sandboxLeaseAcquisition: { outcome: "replacement", reason: "compatible_environment_change", previousProviderLeaseId: first.lease.providerLeaseId } });
       // Recording the replacement (with the backup) precedes retirement.
       const old = await environmentService(db).getLeaseById(sourceLease.id);
       expect(old).toMatchObject({ status: "pending_cleanup", failureReason: "compatible_environment_change" });
       expect(calls).not.toContain("environmentDestroyLease");
       await expect(runtimeWithPlugin.execute({ environment: changed, lease: replacement.lease, command: "after settle" }))
-        .resolves.toMatchObject({ exitCode: 0, stdout: "served:snapshot-b:after settle" });
+        .resolves.toMatchObject({ exitCode: 0, stdout: "served:2:after settle" });
     } finally {
       if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
       else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
