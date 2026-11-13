@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
+import { buildLinuxProcessHardening } from "./build-linux-process-hardening.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -81,6 +82,7 @@ function assertSelfContainedBundle(entrypoint, result) {
 
 export async function bundleVerifiedProviderEntrypoints({ write = true } = {}) {
   if (write) {
+    buildLinuxProcessHardening();
     await mkdir(resolve(packageRoot, "dist/providers"), { recursive: true });
     await cp(resolve(packageRoot, "src/providers"), resolve(packageRoot, "dist/providers"), { recursive: true });
     await copyFile(resolve(packageRoot, "cursor-distributions.json"), resolve(packageRoot, "dist/cursor-distributions.json"));
