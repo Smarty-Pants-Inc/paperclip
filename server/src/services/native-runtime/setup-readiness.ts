@@ -1,6 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, realpath, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, mkdir, open, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join, posix } from "node:path";
 import { CODEX_CHATGPT_MODEL_REJECTION_RE, codexChatGptRetirementHint } from "@paperclipai/adapter-codex-local";
 import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
@@ -12,6 +11,7 @@ import { readLocalAiCredentialFile } from "../local-ai-credential-file.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { resolvePaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
 import { createNativeRunnerExecutionDriver } from "./native-runner-execution-driver.js";
+import { cleanupNativeSetupRuntime, createNativeSetupRuntime } from "./native-setup-evidence.js";
 
 
 const PROBE_TRANSPORT_ENV_KEYS = ["PATH", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy"];
@@ -72,7 +72,7 @@ async function probePreparedNativeRuntime(runtimeDirectory: string, prepare: () 
     return await probeNativeRunnerEnvironment(options);
   } catch (error) {
     if (!handedOff) {
-      try { await rm(runtimeDirectory, { recursive: true, force: true }); }
+      try { await cleanupNativeSetupRuntime(runtimeDirectory); }
       catch (cleanupError) {
         const message = error instanceof Error ? error.message : "Native setup preparation failed.";
         throw new AggregateError([error, cleanupError], `${message}; Native setup preparation cleanup is incomplete.`, { cause: error });
@@ -95,7 +95,7 @@ async function probeRemoteNativeRuntime(options: {
 }) {
   const target = options.context.executionTarget;
   if (target?.kind !== "remote") throw new Error("Native setup requires the selected remote execution target.");
-  const { createRemoteNativeArtifactPreparation, createRemoteRunnerProcessLauncher, stageRemoteRunnerFile, readRemoteRunnerState } = await import("./native-session-executor.js");
+  const { createRemoteNativeArtifactPreparation, createRemoteRunnerProcessLauncher, stageRemoteRunnerFile, readRemoteRunnerState, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
   const runner = target.transport === "ssh" ? createNativeSshCommandRunner({ spec: target.spec, defaultCwd: target.remoteCwd }) : target.runner;
   if (!runner) throw new Error("runner_transport_ineligible: remote process runner is unavailable");
   const id = crypto.randomUUID();
@@ -132,7 +132,7 @@ async function probeRemoteNativeRuntime(options: {
       piCommand: posix.join(pack.root, piRpcExecutable.path), piCommandSha256: piRpcExecutable.sha256,
       piProxyPath: posix.join(pack.root, piRpcProxy.path), piProxySha256: piRpcProxy.sha256, providerPackAuthorityDigest: pack.manifest.digest };
   })() : {};
-  const runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-native-setup-")));
+  const runtimeDirectory = await createNativeSetupRuntime(options.context.companyId);
   return probePreparedNativeRuntime(runtimeDirectory, async () => {
     const sourceCodexHome = await prepareProbeCodexSource(runtimeDirectory, options.sourceCodexHome, options.sourceAuthJson);
     let remoteDirectoryCreated = false;
@@ -193,10 +193,16 @@ async function probeRemoteNativeRuntime(options: {
       } } : {}),
       onCleanupConfirmed: async () => {
         if (remoteDirectoryCreated) {
+          if (options.provider === "pi_rpc") {
+            await syncRemoteRunnerDirectoryOut({ runner, sourcePath: remoteRoot,
+              targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700 });
+            await cleanupNativeSetupRuntime(runtimeDirectory, true);
+          }
           const cleaned = await runner.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 10_000 });
           requireSuccess(cleaned, "Native setup cleanup is incomplete; private recovery state was retained.");
+          remoteDirectoryCreated = false;
         }
-        await rm(runtimeDirectory, { recursive: true, force: true });
+        await cleanupNativeSetupRuntime(runtimeDirectory, options.provider === "pi_rpc");
       },
     };
   });
@@ -252,12 +258,12 @@ export async function testNativeRunnerAuthentication(context: AdapterEnvironment
       const runnerBinary = resolvePaperclipRunnerBinary();
       const piArtifacts = provider === "pi_rpc"
         ? await (await import("./native-session-executor.js")).resolveLocalPiLaunchArtifacts(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH) : {};
-      runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-native-setup-")));
+      runtimeDirectory = await createNativeSetupRuntime(context.companyId);
       receipt = await probePreparedNativeRuntime(runtimeDirectory, async () => {
         const probeSourceCodexHome = await prepareProbeCodexSource(runtimeDirectory!, sourceCodexHome ?? "", sourceAuthJson);
         return { runtimeDirectory: runtimeDirectory!, provider, model, environment, timeoutMs,
           ...(provider === "codex" && typeof effort === "string" && effort ? { reasoningEffort: effort } : {}),
-          onCleanupConfirmed: async () => { await rm(runtimeDirectory!, { recursive: true, force: true }); },
+          onCleanupConfirmed: async () => { await cleanupNativeSetupRuntime(runtimeDirectory!, provider === "pi_rpc"); },
           transportOptions: { runnerBinary, sourceCodexHome: probeSourceCodexHome, externallySandboxed: false, ...piArtifacts,
             ...(provider === "pi_rpc" ? { piRpcThinkingLevel: context.config.piRpcThinkingLevel as PiThinkingLevel | undefined,
               piRuntimeDirectory: join(runtimeDirectory!, "pi") } : {}) },

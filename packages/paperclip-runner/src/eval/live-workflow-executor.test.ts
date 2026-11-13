@@ -1,4 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { OpenCodeServerDriver } from "../drivers/opencode/opencode-server-driver.js";
+import { createLiveWorkflowRuntime, retainLiveWorkflowRuntime } from "./live-workflow-evidence.js";
 
 type MockTurnEvent =
   | {
@@ -99,7 +105,9 @@ import {
 } from "./live-workflow-matrix.js";
 
 describe("live workflow executor infrastructure failures", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    const evidence = await mkdtemp(join(tmpdir(), "eval-retention-test-"));
+    vi.stubEnv("PAPERCLIP_RUNNER_EVAL_EVIDENCE_DIR", join(evidence, "evidence"));
     liveSessionMocks.shutdown.mockReset();
     liveSessionMocks.createOptions.length = 0;
     liveSessionMocks.subscribedSessionIds.length = 0;
@@ -128,6 +136,68 @@ describe("live workflow executor infrastructure failures", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  // Keep: sole-copy data safety (#20417). The executor's authority is a test
+  // double, but a real provider subprocess and production driver write the raw
+  // trace at the executor-selected path; cleanup and all filesystem I/O are real.
+  it.each([false, true])("retains actual provider trace bytes after eval cleanup (failure=%s)", async failure => {
+    let before = Buffer.alloc(0);
+    liveSessionMocks.sendMessage.mockImplementationOnce(async () => {
+      const environment = liveSessionMocks.createOptions.at(-1)!.transportOptions!.environment!;
+      const tracePath = environment.PAPERCLIP_PROVIDER_TRACE_PATH!;
+      const command = join(dirname(tracePath), "fake-opencode-server.mjs");
+      await copyFile(resolve("test/fixtures/fake-opencode-server.mjs"), command);
+      await chmod(command, 0o700);
+      const driver = new OpenCodeServerDriver({ model: "openrouter/test-model", command,
+        runtimeDirectory: dirname(tracePath), environment: { PATH: process.env.PATH, PAPERCLIP_PROVIDER_TRACE_PATH: tracePath } });
+      const session = await driver.openSession({ runId: "retention-proof", normalizedSessionId: "retention-proof", workingDirectory: dirname(tracePath) });
+      try {
+        await session.startTurn({ message: { role: "user", text: "hello" } });
+        for await (const event of session.events()) if (["turn.completed", "turn.failed"].includes(event.eventType)) break;
+      } finally { await session.close({ reason: "retention proof" }); }
+      before = await readFile(tracePath);
+      expect(before.length).toBeGreaterThan(0);
+      if (failure) throw new Error("failure after provider trace capture");
+      return { status: "completed", turnId: "retention-proof" };
+    });
+    const candidate = RUNNER_LIVE_CANDIDATE_SLOTS[0]!.candidates[0]!;
+    const entry: RunnerLiveScheduleEntry = { executionId: `trace-retention-${failure}`, caseId: "final-response",
+      candidateId: candidate.id, slotId: candidate.slotId, repetition: 1, providerTrace: "raw", budget: candidate.budget };
+    const pending = executeLiveRunnerWorkflow({ entry, candidate, evalCase: runnerWorkflowCase("final-response") });
+    if (failure) await expect(pending).rejects.toThrow("failure after provider trace capture");
+    else await pending;
+    const evidence = process.env.PAPERCLIP_RUNNER_EVAL_EVIDENCE_DIR!;
+    const files: string[] = [];
+    async function visit(root: string): Promise<void> {
+      for (const item of await readdir(root, { withFileTypes: true }).catch(() => [])) {
+        const filename = join(root, item.name);
+        if (item.isDirectory()) await visit(filename);
+        else if (item.name === "provider-trace.ndjson") files.push(filename);
+      }
+    }
+    await visit(evidence);
+    const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+    const retained = await Promise.all(files.map(async path => ({ path, sha256: hash(await readFile(path)) })));
+    const receipt = { failure, beforeBytes: before.length, beforeSha256: hash(before), retained };
+    // Preserve actual pre-cleanup bytes even in RED; this proof copy is not in
+    // the production evidence namespace and cannot make its assertion pass.
+    const proof = join(dirname(evidence), "proof"); await mkdir(proof, { mode: 0o700 });
+    await writeFile(join(proof, "provider-trace.ndjson"), before, { mode: 0o600 });
+    await writeFile(join(proof, "receipt.json"), JSON.stringify(receipt, null, 2));
+    console.log("eval raw byte retention", JSON.stringify(receipt));
+    expect(retained.some(file => file.sha256 === receipt.beforeSha256)).toBe(true);
+  }, 30_000);
+
+  it("leaves pending eval trace bytes intact when evidence permissions are unsafe", async () => {
+    const root = await createLiveWorkflowRuntime("unsafe-evidence");
+    const trace = join(root, "provider-trace.ndjson");
+    await writeFile(trace, "opaque original\n");
+    await chmod(dirname(root), 0o755);
+    await expect(retainLiveWorkflowRuntime(root)).rejects.toThrow("live_eval_evidence_directory_unsafe");
+    expect(await readFile(trace, "utf8")).toBe("opaque original\n");
+    await chmod(dirname(root), 0o700);
+    await retainLiveWorkflowRuntime(root);
   });
 
   it("allows read-only context support without permitting extra effects", () => {

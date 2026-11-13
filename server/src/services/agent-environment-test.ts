@@ -1,6 +1,5 @@
 import { join } from "node:path";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { cleanupNativeSetupRuntime, createNativeSetupRuntime } from "./native-runtime/native-setup-evidence.js";
 import { probeManagedNativePiRunner } from "./native-runtime/pi-runner-probe.js";
 import { probePluginRunnerEnvironment } from "./native-runtime/plugin-runner-probe.js";
 import { pluginRunnerAiConnectionRequiredTestResult } from "./plugin-runner-ai-connection.js";
@@ -39,7 +38,7 @@ async function probeManagedPiRunnerHello(context: AdapterEnvironmentTestContext)
   const model = typeof context.config.model === "string" ? context.config.model : null;
   if (!model) return { adapterType: "paperclip_runner", status: "fail", testedAt,
     checks: [{ code: "pi_hello_probe_failed", level: "error", message: "Select a Pi model before testing this connection." }] };
-  const runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-managed-pi-probe-")));
+  const runtimeDirectory = await createNativeSetupRuntime(context.companyId);
   let cleanupConfirmed = false;
   let cleanupTransferred = false;
   try {
@@ -49,7 +48,7 @@ async function probeManagedPiRunnerHello(context: AdapterEnvironmentTestContext)
         prpIdentity: { runnerInstanceId: `setup-runner-${randomUUID()}`, runId: `setup-${randomUUID()}`,
           normalizedSessionId: `setup-${randomUUID()}`, environmentLeaseId: `setup-${randomUUID()}`,
           turnId: `setup-turn-${randomUUID()}`, itemId: `setup-item-${randomUUID()}` } },
-      onCleanupConfirmed: async () => { await rm(runtimeDirectory, { recursive: true, force: true }); cleanupConfirmed = true; },
+      onCleanupConfirmed: async () => { await cleanupNativeSetupRuntime(runtimeDirectory, true); cleanupConfirmed = true; },
     });
     return { adapterType: "paperclip_runner", status: result.helloProbePassed ? "pass" : "fail", testedAt,
       checks: [{ code: result.helloProbePassed ? "pi_hello_probe_passed" : "pi_hello_probe_failed",
@@ -60,7 +59,7 @@ async function probeManagedPiRunnerHello(context: AdapterEnvironmentTestContext)
     return { adapterType: "paperclip_runner", status: "fail", testedAt,
       checks: [{ code: "pi_hello_probe_failed", level: "error", message: "Runner Pi did not complete the managed connection hello turn." }] };
   } finally {
-    if (!cleanupConfirmed && !cleanupTransferred) await rm(runtimeDirectory, { recursive: true, force: true });
+    if (!cleanupConfirmed && !cleanupTransferred) await cleanupNativeSetupRuntime(runtimeDirectory, true);
   }
 }
 

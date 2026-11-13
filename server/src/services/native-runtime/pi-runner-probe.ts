@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
+import { cleanupNativeSetupRuntime, createNativeSetupRuntime } from "./native-setup-evidence.js";
 import { resolvePaperclipRunnerPiRpcThinkingLevel, type AdapterEnvironmentTestContext, type AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
 import { PI_RPC_BUILTIN_THINKING_CATALOG, NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment } from "../../vendor/paperclip-runner/index.js";
 import { resolvePaperclipRunnerProviderProfile, PaperclipRunnerProviderProfileError } from "./provider-profile.js";
@@ -42,7 +41,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     if (target?.kind !== "remote" || target.transport === "sandbox" && target.runnerTask) throw new Error("Native Pi setup requires a remote command factory");
     const runner = target.transport === "ssh" ? createNativeSshCommandRunner({ spec: target.spec, defaultCwd: target.remoteCwd }) : target.runner;
     if (!runner) throw new Error("The selected factory has no process runner");
-    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState } = await import("./native-session-executor.js");
+    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
     const source = resolveRemoteProviderPackSource(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH);
     // Validate native entries before staging or acquiring an inference authority.
     nativePiRemoteLaunchOptions("/unused", source.manifest, "/unused");
@@ -56,7 +55,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     };
     const probe = async (admissionOnly: boolean) => {
       const id = `setup-${randomUUID()}`, runnerInstanceId = `runner-${id}`;
-      const runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-native-pi-setup-")));
+      const runtimeDirectory = await createNativeSetupRuntime(context.companyId);
       const remoteRoot = posix.join(target!.remoteCwd, ".paperclip-runtime", id);
       const remoteFilesystemRoot = posix.join(remoteRoot, "filesystem"), runnerStateDirectory = posix.join(remoteRoot, "runner");
       const remoteBinary = posix.join(remoteRoot, "bin", "paperclip-runnerd");
@@ -71,8 +70,17 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
         prepared = true;
       };
       const cleanup = async () => {
-        if (remoteCreated) requireSuccess(await runner!.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 10_000 }));
-        await rm(runtimeDirectory, { recursive: true, force: true });
+        if (remoteCreated) {
+          // Reuse the retained-backup sync-out path, without exclusions. A
+          // failed/partial pull must never authorize removal of the sole copy.
+          await syncRemoteRunnerDirectoryOut({ runner: runner!, sourcePath: remoteRoot,
+            targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700 });
+          // Commit the pulled bytes to permanent evidence BEFORE remote rm.
+          await cleanupNativeSetupRuntime(runtimeDirectory, true);
+          requireSuccess(await runner!.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 10_000 }));
+          remoteCreated = false;
+        }
+        await cleanupNativeSetupRuntime(runtimeDirectory, true);
       };
       try {
         await prepareNativeRemoteRunner({ ...connectivity, runId: id, prepareRemote });
