@@ -179,7 +179,6 @@
     "check:pi-rpc-profile": "node scripts/generate-pi-rpc-profile.mjs --check"
   },
   "dependencies": {
-    "@paperclipai/adapter-utils": "workspace:*",
     "@agentclientprotocol/claude-agent-acp": "0.73.0",
     "@agentclientprotocol/codex-acp": "1.6.2",
     "@openai/codex": "0.160.0",

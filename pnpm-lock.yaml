@@ -521,9 +521,6 @@ importers:
       '@openai/codex':
         specifier: 0.160.0
         version: 0.160.0
-      '@paperclipai/adapter-utils':
-        specifier: workspace:*
-        version: link:../adapter-utils
       acpx:
         specifier: 0.22.0
         version: 0.22.0(patch_hash=7cirnxnu5r6knlf33oxlyqv52u)

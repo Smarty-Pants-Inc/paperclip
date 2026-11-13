@@ -1,4 +1,4 @@
-import { resolveDefaultPiRpcThinkingLevel } from "@paperclipai/adapter-utils/pi-rpc-default-thinking";
+import { resolveDefaultPiRpcThinkingLevel } from "../pi-rpc-default-thinking.js";
 import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
 import { admitPiProbeSession, probePiNativeEnvironment, PiEnvironmentProbeCleanupError } from "../drivers/pi/pi-environment-probe.js";
 import { resolvePiNativeConfig } from "../drivers/pi/pi-native-config.js";
