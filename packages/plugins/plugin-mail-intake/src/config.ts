@@ -10,6 +10,15 @@ export interface MailConfig {
   routineFireSecretRef: SecretRef;
   routineOrigin: string;
   routinePublicId: string;
+  scanWindowDays: number;
+}
+// PluginContext has no instance URL (SDK types.ts:2210–2318), and the host's
+// worker env has none (plugin-loader.ts:155–179). Build-time fallback only:
+// HQ is the sole supplied real origin; no undocumented TEST hostname is guessed.
+export const ROUTINE_ORIGINS: readonly string[] = Object.freeze(["https://hq.smartypants.ai"]);
+export function assertRoutineOrigin(origin: string): void {
+  // Exact spelling also rejects explicit :443, userinfo and URL normalization.
+  if (!ROUTINE_ORIGINS.includes(origin)) fail();
 }
 export const SAFE_ERROR = "could not read mail";
 export function fail(): never { throw new Error(SAFE_ERROR); }
@@ -34,7 +43,8 @@ export const configSchema = {
     enabled: { type: "boolean", default: false },
     mailbox: { type: "string", format: "email", default: "smarty@smartypants.ai" },
     gmailGrantRef: refSchema, routineFireSecretRef: refSchema,
-    routineOrigin: { type: "string", format: "uri" },
+    routineOrigin: { type: "string", format: "uri", enum: ROUTINE_ORIGINS },
+    scanWindowDays: { type: "integer", minimum: 1, maximum: 30, default: 7 },
     routinePublicId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,200}$" },
   },
 };
@@ -53,14 +63,12 @@ export function parseConfig(v: unknown): MailConfig {
   if (typeof v.mailbox !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.mailbox) ||
       typeof v.routinePublicId !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(v.routinePublicId) ||
       typeof v.routineOrigin !== "string") fail();
-  let origin: URL;
-  try { origin = new URL(v.routineOrigin); } catch { fail(); }
-  if (origin.protocol !== "https:" || origin.username || origin.password || origin.port ||
-      origin.search || origin.hash || origin.pathname !== "/" || !origin.hostname ||
-      ["gmail.googleapis.com", "oauth2.googleapis.com"].includes(origin.hostname)) fail();
+  assertRoutineOrigin(v.routineOrigin);
+  const scanWindowDays = v.scanWindowDays === undefined ? 7 : v.scanWindowDays;
+  if (typeof scanWindowDays !== "number" || !Number.isInteger(scanWindowDays) || scanWindowDays < 1 || scanWindowDays > 30) fail();
   return {
     enabled: v.enabled === true, mailbox: v.mailbox.toLowerCase(),
     gmailGrantRef: secretRef(v.gmailGrantRef), routineFireSecretRef: secretRef(v.routineFireSecretRef),
-    routineOrigin: origin.origin, routinePublicId: v.routinePublicId,
+    routineOrigin: v.routineOrigin, routinePublicId: v.routinePublicId, scanWindowDays,
   };
 }

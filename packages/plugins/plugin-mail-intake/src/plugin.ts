@@ -1,6 +1,7 @@
 import type { PluginDefinition } from "@paperclipai/plugin-sdk";
 import { fail, only, parseConfig, SAFE_ERROR } from "./config.js";
-import { runTick, seenKey } from "./intake.js";
+import { readMailbox, runTick, safeHttp, seenKey } from "./intake.js";
+import { cutoff, emptyState, isId } from "./state.js";
 
 export function createMailDefinition(): PluginDefinition {
   let companyId: string | null = null;
@@ -19,11 +20,17 @@ export function createMailDefinition(): PluginDefinition {
               context.actor.companyId !== companyId || params.companyId !== companyId) fail();
           const config = parseConfig(await ctx.config.get(companyId));
           if (config.enabled || params.mailbox !== config.mailbox || !Array.isArray(params.seenIds) ||
-              !params.seenIds.every(id => typeof id === "string" && /^[0-9a-f]{1,64}$/.test(id)) ||
+              !params.seenIds.every(isId) ||
               new Set(params.seenIds).size !== params.seenIds.length) fail();
           const key = seenKey(companyId, config.mailbox);
           if (await ctx.state.get(key) !== null) fail();
-          await ctx.state.set(key, [...params.seenIds]);
+          const since = cutoff(config.scanWindowDays);
+          const messages = (await readMailbox(ctx, companyId, config,
+            safeHttp(ctx, config, AbortSignal.timeout(240_000)))).filter(m => m.internalDate > since);
+          // Baseline only explicitly approved IDs in the same complete query window.
+          const dates = new Map(messages.map(m => [m.id, m.internalDate]));
+          if (params.seenIds.some(id => !dates.has(id))) fail();
+          await ctx.state.set(key, { ...emptyState(), seen: params.seenIds.map(id => ({ id, internalDate: dates.get(id)! })) });
           return { initialized: true };
         } catch { fail(); }
         finally { running = false; }

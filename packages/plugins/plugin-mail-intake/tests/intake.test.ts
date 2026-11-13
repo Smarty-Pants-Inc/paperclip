@@ -10,16 +10,19 @@ const config: MailConfig = {
   enabled: true, mailbox: "smarty@smartypants.ai",
   gmailGrantRef: { type: "secret_ref", secretId: "22222222-2222-2222-2222-222222222222" },
   routineFireSecretRef: { type: "secret_ref", secretId: "33333333-3333-3333-3333-333333333333", version: "latest" },
-  routineOrigin: "https://paperclip.example.com", routinePublicId: "test-mail",
+  routineOrigin: "https://hq.smartypants.ai", routinePublicId: "test-mail", scanWindowDays: 7,
 };
 const access = "ACCESS_SECRET_SENTINEL", refresh = "REFRESH_SECRET_SENTINEL", bearer = "FIRE_SECRET_SENTINEL";
 const message = (id: string) => ({ id, threadId: "ff" });
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
+const state = (ids: string[] = []) => ({ version: 2, seen: ids.map(id => ({ id, internalDate: 1700000000000 })), failures: [] });
 function fixture(initial: unknown = []) {
-  let saved: unknown = structuredClone(initial);
+  let saved: unknown = Array.isArray(initial) && initial.every(id => typeof id === "string" && /^[0-9a-f]{1,64}$/.test(id)) && new Set(initial).size === initial.length
+    ? state(initial) : structuredClone(initial);
   const pages: unknown[] = [{ messages: [message("aa"), message("bb")] }];
   const writes: unknown[] = [], fires: { payload: unknown; key: string }[] = [], order: string[] = [];
   const ctx = {
+    logger: { warn: vi.fn() },
     state: {
       get: vi.fn(async () => structuredClone(saved)),
       set: vi.fn(async (_key: unknown, value: unknown) => {
@@ -44,8 +47,11 @@ function fixture(initial: unknown = []) {
   };
   return { ctx, pages, writes, fires, order, saved: () => saved };
 }
-beforeEach(() => vi.stubGlobal("fetch", vi.fn(() => { throw new Error("network forbidden"); })));
-afterEach(() => { expect(globalThis.fetch).not.toHaveBeenCalled(); vi.unstubAllGlobals(); });
+beforeEach(() => {
+  vi.spyOn(Date, "now").mockReturnValue(1700000000001);
+  vi.stubGlobal("fetch", vi.fn(() => { throw new Error("network forbidden"); }));
+});
+afterEach(() => { expect(globalThis.fetch).not.toHaveBeenCalled(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 // Keep reasons: egress/secret trust boundary, IDs-only data safety, and failure paths
 // (later-page error / accepted HTTP then lost KV) that live flows cannot cheaply seed.
@@ -64,17 +70,17 @@ describe("mail-intake job", () => {
       { messageId: "aa", threadId: "ff", receivedTime: "2023-11-14T22:13:20.000Z" },
       { messageId: "bb", threadId: "ff", receivedTime: "2023-11-14T22:13:20.000Z" },
     ]);
-    expect(f.writes).toEqual([["aa"], ["aa", "bb"]]);
+    expect(f.writes).toEqual([state(["aa"]), state(["aa", "bb"])]);
     expect(f.order).toEqual(["fire", "save", "fire", "save"]);
     for (const [url, init] of f.ctx.http.fetch.mock.calls) {
       const u = new URL(url);
-      expect(ALLOWED_HOSTS(config.routineOrigin)).toContain(u.hostname);
+      expect(ALLOWED_HOSTS).toContain(u.hostname);
       expect(init?.redirect).toBe("error");
       if (u.hostname === "gmail.googleapis.com") {
         expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer ${access}`);
         expect(u.pathname).toContain("/users/smarty%40smartypants.ai/messages");
         if (u.pathname.endsWith("/messages")) {
-          expect(u.searchParams.get("q")).toBe(INCOMING_QUERY);
+          expect(u.searchParams.get("q")).toBe(`${INCOMING_QUERY} newer_than:7d`);
           expect(u.searchParams.get("fields")).toBe("messages(id,threadId),nextPageToken,resultSizeEstimate");
         } else {
           expect(u.searchParams.get("format")).toBe("metadata");
@@ -99,13 +105,15 @@ describe("mail-intake job", () => {
     await runTick(f.ctx, company, config);
     expect(f.fires.map(x => x.payload)).toEqual([{ messageId: "bb", threadId: "ff", receivedTime: "2023-11-14T22:13:20.000Z" }]);
     const urls = f.ctx.http.fetch.mock.calls.map(([u]) => new URL(u));
+    expect(urls.filter(u => u.pathname.endsWith("/messages")).every(u =>
+      u.searchParams.get("q") === `${INCOMING_QUERY} newer_than:7d`)).toBe(true);
     expect(urls[2]!.searchParams.get("pageToken")).toBe("page-two");
     expect(urls[3]!.pathname).toMatch(/\/messages\/bb$/);
   });
   it("complete empty read creates no fires and no state writes", async () => {
     const f = fixture(); f.pages.splice(0, 1, {});
     await runTick(f.ctx, company, config);
-    expect(f.saved()).toEqual([]); expect(f.fires).toEqual([]); expect(f.writes).toEqual([]);
+    expect(f.saved()).toEqual(state()); expect(f.fires).toEqual([]); expect(f.writes).toEqual([]);
   });
   it("disabled is a strict no-op even with missing state", async () => {
     const f = fixture(null);
@@ -135,7 +143,7 @@ describe("mail-intake job", () => {
     const f = fixture();
     f.pages.splice(0, 1, { messages: [message("aa")], nextPageToken: "repeat" }, bad);
     await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
-    expect(f.saved()).toEqual([]); expect(f.fires).toEqual([]); expect(f.writes).toEqual([]);
+    expect(f.saved()).toEqual(state()); expect(f.fires).toEqual([]); expect(f.writes).toEqual([]);
   });
   it.each(["token", "page", "metadata", "secret"])("redacts %s failures; state stays unchanged", async step => {
     const f = fixture(); const original = f.ctx.http.fetch.getMockImplementation()!;
@@ -150,14 +158,14 @@ describe("mail-intake job", () => {
     const error = await runTick(f.ctx, company, config).catch(e => e);
     expect(error.message).toBe(SAFE_ERROR); expect(error.cause).toBeUndefined();
     expect(String(error.stack)).not.toContain("SECRET_SENTINEL");
-    expect(f.saved()).toEqual([]); expect(f.fires).toEqual([]); expect(f.writes).toEqual([]);
+    expect(f.saved()).toEqual(state()); expect(f.fires).toEqual([]); expect(f.writes).toEqual([]);
   });
   it.each([302, 401, 429, 500])("later-page HTTP %s is not a quiet scan", async status => {
     const f = fixture(); const original = f.ctx.http.fetch.getMockImplementation()!;
     f.pages.splice(0, 1, { messages: [message("aa")], nextPageToken: "later" });
     f.ctx.http.fetch.mockImplementation(async (url, init) => url.includes("pageToken=") ? json({ error: access }, status) : original(url, init));
     await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
-    expect(f.saved()).toEqual([]); expect(f.fires).toEqual([]);
+    expect(f.saved()).toEqual(state()); expect(f.fires).toEqual([]);
   });
   it("bad JSON and metadata shape failures never advance seen", async () => {
     for (const bad of [new Response("{truncated"), json({ id: "aa", threadId: "ff", internalDate: "no" }),
@@ -166,7 +174,7 @@ describe("mail-intake job", () => {
       const f = fixture(); const original = f.ctx.http.fetch.getMockImplementation()!;
       f.ctx.http.fetch.mockImplementation(async (url, init) => url.includes("/aa?") ? bad : original(url, init));
       await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
-      expect(f.saved()).toEqual([]); expect(f.fires).toEqual([]);
+      expect(f.saved()).toEqual(state()); expect(f.fires).toEqual([]);
     }
   });
   it("page cap is a failed read", async () => {
@@ -179,13 +187,15 @@ describe("mail-intake job", () => {
     const f = fixture(); const original = f.ctx.http.fetch.getMockImplementation()!;
     f.ctx.http.fetch.mockImplementation(async (url, init) => url.endsWith("/fire") && JSON.parse(String(init?.body)).messageId === "bb"
       ? json({ error: bearer }, 503) : original(url, init));
-    await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
-    expect(f.saved()).toEqual(["aa"]); expect(f.fires).toHaveLength(1);
+    await runTick(f.ctx, company, config);
+    expect(f.saved()).toMatchObject({ seen: state(["aa"]).seen, failures: [{ id: "bb", attempts: 1 }] });
+    expect(f.fires).toHaveLength(1);
+    vi.mocked(Date.now).mockReturnValue(1700000120001);
     f.ctx.http.fetch.mockImplementation(original);
     f.pages.push({ messages: [message("aa"), message("bb")] });
     await runTick(f.ctx, company, config);
     expect(f.fires.map(fire => (fire.payload as { messageId: string }).messageId)).toEqual(["aa", "bb"]);
-    expect(f.saved()).toEqual(["aa", "bb"]);
+    expect(f.saved()).toEqual(state(["aa", "bb"]));
   });
   it.each(["lost-response", "lost-kv"])("reuses receiver key across %s without duplicate admission", async mode => {
     const f = fixture(); f.pages.splice(0, 1, { messages: [message("aa")] });
@@ -199,27 +209,33 @@ describe("mail-intake job", () => {
       return json({ accepted: true }, 202);
     });
     if (mode === "lost-kv") f.ctx.state.set.mockRejectedValueOnce(new Error(access));
-    await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
-    expect(f.saved()).toEqual([]);
+    if (mode === "lost-kv") {
+      await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
+      expect(f.saved()).toEqual(state());
+    } else {
+      await runTick(f.ctx, company, config);
+      expect(f.saved()).toMatchObject({ seen: [], failures: [{ id: "aa", attempts: 1 }] });
+      vi.mocked(Date.now).mockReturnValue(1700000120001);
+    }
     f.pages.push({ messages: [message("aa")] });
     await runTick(f.ctx, company, config);
     expect(keys).toHaveLength(2); expect(keys[0]).toBe(keys[1]); expect(accepted.size).toBe(1);
-    expect(f.saved()).toEqual(["aa"]);
+    expect(f.saved()).toEqual(state(["aa"]));
   });
 });
 
 describe("egress trust boundary", () => {
-  it("exports exactly the two Google hosts and configured routine host", () => {
-    const hosts = ALLOWED_HOSTS(config.routineOrigin);
-    expect(hosts).toEqual(["gmail.googleapis.com", "oauth2.googleapis.com", "paperclip.example.com"]);
+  it("exports exactly the two Google hosts and frozen HQ routine host", () => {
+    const hosts = ALLOWED_HOSTS;
+    expect(hosts).toEqual(["gmail.googleapis.com", "oauth2.googleapis.com", "hq.smartypants.ai"]);
     expect(Object.isFrozen(hosts)).toBe(true);
   });
   it.each([
     "https://evil.example/token", "https://gmail.googleapis.com.evil.example/token",
     "http://gmail.googleapis.com/gmail/v1/users/me/messages", "https://oauth2.googleapis.com:444/token",
     "https://user:password@gmail.googleapis.com/gmail/v1/users/me/messages", "https://gmail.googleapis.com/upload",
-    "https://paperclip.example.com/api/companies", "https://paperclip.example.com/api/routine-triggers/public/other/fire",
-    "https://paperclip.example.com/api/routine-triggers/public/test-mail/fire?redirect=evil",
+    "https://hq.smartypants.ai/api/companies", "https://hq.smartypants.ai/api/routine-triggers/public/other/fire",
+    "https://hq.smartypants.ai/api/routine-triggers/public/test-mail/fire?redirect=evil",
   ])("refuses %s before invoking host HTTP", async url => {
     const f = fixture();
     await expect(safeHttp(f.ctx, config, new AbortController().signal)(url, { method: "POST" })).rejects.toThrow(SAFE_ERROR);
@@ -266,10 +282,33 @@ describe("registered job and explicit company binding", () => {
     await expect(f.seed({ ...params, mailbox: "other@example.com" })).rejects.toThrow(SAFE_ERROR);
     expect(f.saved()).toBeNull();
     await expect(f.seed(params)).resolves.toEqual({ initialized: true });
-    expect(f.saved()).toEqual(["aa"]);
+    expect(f.saved()).toEqual(state(["aa"]));
+    expect(f.ctx.http.fetch.mock.calls.some(([url]) => new URL(url).searchParams.get("q") === `${INCOMING_QUERY} newer_than:7d`)).toBe(true);
     await expect(f.seed({ ...params, seenIds: [] })).rejects.toThrow(SAFE_ERROR);
     f.ctx.config.get.mockResolvedValue({ ...config });
-    await f.tick(); expect(f.fires).toHaveLength(1); expect(f.saved()).toEqual(["aa", "bb"]);
+    f.pages.push({ messages: [message("aa"), message("bb")] });
+    await f.tick(); expect(f.fires).toHaveLength(1); expect(f.saved()).toEqual(state(["aa", "bb"]));
+  });
+  it("initialization uses the configured window and rejects IDs outside it", async () => {
+    const f = await worker(null);
+    const disabled = { ...config, enabled: false, scanWindowDays: 3 };
+    await f.plugin.onConfigChanged!(disabled, { companyId: company });
+    f.ctx.config.get.mockResolvedValue(disabled);
+    const original = f.ctx.http.fetch.getMockImplementation()!;
+    f.ctx.http.fetch.mockImplementation(async (url, init) => url.includes("/aa?")
+      ? json({ id: "aa", threadId: "ff", internalDate: String(1700000000001 - 4 * 86_400_000) }) : original(url, init));
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: ["aa"] })).rejects.toThrow(SAFE_ERROR);
+    expect(f.saved()).toBeNull(); expect(f.fires).toEqual([]);
+    expect(f.ctx.http.fetch.mock.calls.some(([url]) => new URL(url).searchParams.get("q") === `${INCOMING_QUERY} newer_than:3d`)).toBe(true);
+  });
+  it("initialization does not write on an incomplete bounded scan", async () => {
+    const f = await worker(null);
+    const disabled = { ...config, enabled: false };
+    await f.plugin.onConfigChanged!(disabled, { companyId: company });
+    f.ctx.config.get.mockResolvedValue(disabled);
+    f.pages.splice(0, 1, { nextPageToken: "repeat" }, { nextPageToken: "repeat" });
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow(SAFE_ERROR);
+    expect(f.saved()).toBeNull(); expect(f.ctx.state.set).not.toHaveBeenCalled();
   });
   it("cannot initialize while enabled", async () => {
     const f = await worker(null);
