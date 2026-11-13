@@ -15,7 +15,7 @@ import { and, eq } from "drizzle-orm";
 import { agents, assets, agentConfigRevisions, agentTaskSessions, agentRuntimeState, type Db } from "@paperclipai/db";
 import { normalizeAgentUrlKey, extractAgentMentionIds } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { agentRecordQueries, type UpdateAgentOptions, type AgentConfigurationPatch, type AgentConfigurationRecord, isPlainRecord, buildConfigSnapshot,
   hasConfigPatchFields, changedPendingApprovalConfigFields, diffConfigSnapshot, jsonEqual } from "../lib/agent-records.js";
 import { CEO_HIRING_DENIAL_KEY, ceoHiringDenial, normalizeAgentPermissions } from "../lib/agent-permissions.js";
@@ -24,6 +24,7 @@ import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
 import { agentCredentialService } from "./agent-credentials.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { budgetServiceInTransaction } from "./budgets.js";
+import { assertSubordinateBudgetChange } from "./agent-subtree-management.js";
 
 export async function lockAgentConfigurationInteractions(tx: Db, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions) {
   const pluginOrigin = currentPluginInteractionOrigin();
@@ -44,7 +45,8 @@ export async function prepareAgentConfiguration(db: Db, existing: AgentConfigura
     operation: "mention", texts: changedConfigurationText(data, existing) });
   if (data.permissions !== undefined) data = { ...data, permissions: preserveAgentInteractionPermissions(existing.permissions, data.permissions) };
   if (options?.recordRevision?.createdByAgentId && data.budgetMonthlyCents !== undefined && data.budgetMonthlyCents !== existing.budgetMonthlyCents) {
-    throw forbidden("Only board operators can change agent budgets");
+    await assertSubordinateBudgetChange(db, { type: "agent", agentId: options.recordRevision.createdByAgentId,
+      companyId: existing.companyId }, existing, data.budgetMonthlyCents);
   }
   await notifyAttentionRetentionWork(db, { companyId: existing.companyId });
   const id = existing.id;
@@ -89,7 +91,7 @@ export async function prepareAgentConfiguration(db: Db, existing: AgentConfigura
     }
   }
   const normalizedPatch = { ...data } as AgentConfigurationPatch;
-  if (options?.recordRevision?.createdByAgentId) delete normalizedPatch.budgetMonthlyCents;
+  if (options?.recordRevision?.createdByAgentId && data.budgetMonthlyCents === existing.budgetMonthlyCents) delete normalizedPatch.budgetMonthlyCents;
   if (data.permissions !== undefined) {
     // Only the permissions control records a CEO hiring restriction. Keep an
     // existing one unless this write turns hiring on, and never take one from input.
@@ -180,7 +182,7 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
     await budgetServiceInTransaction(txDb, publications).upsertPolicy(existing.companyId, {
       scopeType: "agent", scopeId: id, amount: normalizedPatch.budgetMonthlyCents,
       isActive: normalizedPatch.budgetMonthlyCents > 0, windowKind: "calendar_month_utc",
-    }, options?.recordRevision?.createdByUserId ?? null);
+    }, options?.recordRevision?.createdByUserId ?? null, options?.recordRevision?.createdByAgentId ?? undefined);
   }
   const normalizedUpdated = await agentRecordQueries(txDb).getById(updated.id);
   if (!normalizedUpdated) {

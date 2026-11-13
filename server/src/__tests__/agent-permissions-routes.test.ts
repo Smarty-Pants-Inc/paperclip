@@ -1202,7 +1202,7 @@ describe("agent permission routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   }, 15_000);
 
-  it("blocks agent-authenticated instructions-path updates", async () => {
+  it("blocks agent-authenticated instructions-path updates on self", async () => {
     const app = await createApp({
       type: "agent",
       agentId,
@@ -1216,7 +1216,7 @@ describe("agent permission routes", () => {
       .send({ path: "/etc/passwd" }));
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("instructions path or bundle configuration");
+    expect(res.body.error).toContain("current reporting subtree");
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
@@ -2278,6 +2278,7 @@ describe("agent permission routes", () => {
       "tasks:assign",
       true,
       "board-user",
+      null,
     );
     expect(res.body.access.canAssignTasks).toBe(true);
     expect(res.body.access.taskAssignSource).toBe("agent_creator");
@@ -2309,7 +2310,7 @@ describe("agent permission routes", () => {
     expect(res.body.permissions.canCreateSkills).toBe(false);
   });
 
-  it("does not let a CEO denied hiring restore it for itself or grant it to another agent", async () => {
+  it("blocks CEO permission writes on self and outside its subtree before any hiring restoration", async () => {
     const ceo = { ...baseAgent, id: "ceo-agent", role: "ceo", permissions: { canCreateAgents: false, canCreateSkills: true,
       ceoHiringDeniedBy: { actorType: "user", actorId: "board-user", at: "2026-11-08T00:00:00.000Z" } } };
     const worker = { ...baseAgent, permissions: { canCreateAgents: false, canCreateSkills: true } };
@@ -2327,7 +2328,7 @@ describe("agent permission routes", () => {
         .patch(`/api/agents/${target}/permissions`)
         .send({ canCreateAgents: true, canAssignTasks: true }));
       expect(res.status, JSON.stringify(res.body)).toBe(403);
-      expect(res.body.error).toContain("Missing permission: agents:create.");
+      expect(res.body.error).toContain("current reporting subtree");
     }
     expect(mockAgentService.updatePermissions).not.toHaveBeenCalled();
     expect(mockAccessService.setPrincipalPermission).not.toHaveBeenCalled();
@@ -2647,7 +2648,7 @@ describe("agent permission routes", () => {
   it.each([
     ["its own budget", agentId, 0],
     ["its own budget", agentId, 5000],
-    ["another agent's budget as a CEO", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 5000],
+    ["an outside-subtree agent's budget as a CEO", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 5000],
   ])("budget authority: PATCH /agents/:id never lets an agent change %s (%s, %i)", async (_case, actorAgentId, amount) => {
     mockAgentService.getById.mockImplementation(async (id: string) => id === agentId
       ? { ...baseAgent, budgetMonthlyCents: 500 }
@@ -2655,9 +2656,7 @@ describe("agent permission routes", () => {
     const app = createApp({ type: "agent", agentId: actorAgentId, companyId, source: "agent_key", runId: "run-1" });
     const response = await requestApp(app, url => request(url).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: amount }));
     expect(response.status, JSON.stringify(response.body)).toBe(403);
-    expect(response.body.code).toBe("board_access_required");
-    expect(response.body.remediation).toContain("this denial is final");
-    expect(response.body.remediation).toContain(`[Open the agent's budget](/<prefix>/agents/${agentId}/budgets)`);
+    expect(response.body.error).toContain("current reporting subtree");
     expect(mockAgentService.update).not.toHaveBeenCalled();
     expect(mockBudgetService.upsertPolicy).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
@@ -2675,11 +2674,12 @@ describe("agent permission routes", () => {
     expect(response.body.remediation).toContain(`[Open the agent's budget](/<prefix>/agents/${agentId}/budgets)`);
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
-  it("budget authority: accepts an unchanged legacy amount with an unrelated title edit", async () => {
+  it("budget authority: does not let a self-budget field piggyback on an unrelated title edit", async () => {
     const app = createApp({ type: "agent", agentId, companyId, source: "agent_key" });
     const response = await requestApp(app, url => request(url).patch(`/api/agents/${agentId}`).send({ budgetMonthlyCents: 0, title: "New title" }));
-    expect(response.status).toBe(200);
-    expect(mockAgentService.update).toHaveBeenCalled();
+    expect(response.status).toBe(403);
+    expect(response.body.error).toContain("current reporting subtree");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
   });
   it.each(["agents", "agent-hires"])("budget authority: rejects agent immediate creation budgets through %s", async route => {
     mockAccessService.hasPermission.mockResolvedValue(true);
