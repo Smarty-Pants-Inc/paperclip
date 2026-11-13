@@ -75,3 +75,15 @@ describe("Pi RPC default thinking", () => {
     } finally { warn.mockRestore(); }
   });
 });
+
+// The Runner keeps its own copy because its image builds from the Runner's own
+// inputs only (Dockerfile runner-artifacts-context). Fail until both match.
+describe("Runner copy of the Pi thinking defaults", () => {
+  it("stays byte-identical to this module below its header", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const ours = await readFile(new URL("./pi-rpc-default-thinking.ts", import.meta.url), "utf8");
+    const runner = await readFile(new URL("../../paperclip-runner/src/pi-rpc-default-thinking.ts", import.meta.url), "utf8");
+    const body = runner.split("\n").filter((line, index, lines) => index >= lines.findIndex(l => !l.startsWith("//"))).join("\n");
+    expect(body).toBe(ours);
+  });
+});
