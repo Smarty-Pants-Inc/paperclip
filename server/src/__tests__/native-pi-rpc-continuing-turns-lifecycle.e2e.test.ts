@@ -397,11 +397,18 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root", "leg
                 contextSnapshot: { issueId, conversationSessionGeneration: source!.contextSnapshot?.conversationSessionGeneration },
                 runnerProfileJson: failedProfile, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
                 errorCode: "native_continuation_requires_reconciliation" });
+              // Platform-lead-confirmed babee269/bb6091b6 coordinator shape:
+              // claimed, but terminal-complete with no execution-start evidence.
+              // Claims alone are not dispatch; P2 requires this durable log end.
               await db.insert(nativeRunFinalizations).values({ runId: failedId, companyId, issueId, phase: "terminal_failure",
-                attempt: 0, controllerGeneration: 0, failureCode: "native_continuation_requires_reconciliation" });
+                attempt: 1, controllerGeneration: 1, recoveryState: "blocked", leaseOwner: null, leaseExpiresAt: null,
+                failureCode: "native_continuation_requires_reconciliation" });
+              await db.insert(heartbeatRunEvents).values({ runId: failedId, companyId, agentId, seq: 1, stream: "system",
+                eventType: "lifecycle", message: "task.run.measured",
+                payload: { phase: "task.run.measured", outcome: "failed", durableSettlement: true } });
               await db.update(agentTaskSessions).set({ lastRunId: failedId, sessionParamsJson: { sessionId: failedSessionId } })
                 .where(eq(agentTaskSessions.taskKey, issueId));
-              stage("SUPPLEMENTARY pre-spawn fixture; not a production coordinator claim", { failedId, failedSessionId, attempt: 0, controllerGeneration: 0 });
+              stage("confirmed claimed/no-start legacy failure shape (scrubbed ids)", { failedId, failedSessionId, attempt: 1, controllerGeneration: 1 });
             }
           }
         } else {
