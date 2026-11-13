@@ -114,6 +114,14 @@ function redactEnvironmentLeaseForResponse<T extends { metadata?: Record<string,
     : lease;
 }
 
+/** Probe details can embed resolved provider config and leases, not just metadata. */
+function redactEnvironmentProbeForResponse<T extends { details: Record<string, unknown> | null }>(probe: T): T {
+  return {
+    ...probe,
+    details: isPlainRecord(probe.details) ? redactSecretLikeConfigKeys(probe.details) : probe.details,
+  };
+}
+
 /**
  * Floor view of a platform-provisioned environment on a cloud-managed
  * instance: credential-shaped config keys are never echoed — to ANY actor,
@@ -1512,7 +1520,7 @@ export function environmentRoutes(
         summary: probe.summary,
       },
     });
-    res.json(probe);
+    res.json(redactEnvironmentProbeForResponse(probe));
   });
 
   router.post(
@@ -1570,7 +1578,7 @@ export function environmentRoutes(
           configTopLevelKeyCount: Object.keys(environment.config).length,
         },
       });
-      res.json(probe);
+      res.json(redactEnvironmentProbeForResponse(probe));
     },
   );
 

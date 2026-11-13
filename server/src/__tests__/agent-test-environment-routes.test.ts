@@ -299,6 +299,27 @@ describe("agent test-environment route", () => {
     await unregisterTestAdapter("external_test");
   });
 
+  // Keep: adapter diagnostics cross the same credential-bearing HTTP trust boundary as probes.
+  it("redacts credentials in adapter test result metadata without losing diagnostic structure", async () => {
+    testEnvironmentSpy.mockResolvedValue({
+      adapterType: "external_test", status: "pass", testedAt: new Date(0).toISOString(),
+      checks: [{ code: "provider_ready", level: "info", message: "Provider is ready.",
+        metadata: { apiKey: "sk-test-SECRET", lease: { id: "lease-test", nested: [[{ token: "nested-test-SECRET", region: "test-region" }]] } } }],
+    });
+    const response = await request(await createApp())
+      .post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({ adapterConfig: {} });
+
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(response.body)).not.toContain("sk-test-SECRET");
+    expect(JSON.stringify(response.body)).not.toContain("nested-test-SECRET");
+    expect(response.body).toMatchObject({
+      adapterType: "external_test", status: "pass", testedAt: new Date(0).toISOString(),
+      checks: [{ code: "provider_ready", level: "info", message: "Provider is ready.",
+        metadata: { lease: { id: "lease-test", nested: [[{ region: "test-region" }]] } } }],
+    });
+  });
+
   it("tests the saved Cursor API controller without allocating a Computer under managed-only policy", async () => {
     const { registerServerAdapter, unregisterServerAdapter, getServerAdapter } = await import("../adapters/index.js");
     const previous = getServerAdapter("paperclip_runner");
