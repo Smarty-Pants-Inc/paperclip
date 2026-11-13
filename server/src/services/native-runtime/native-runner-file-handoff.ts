@@ -971,6 +971,16 @@ export async function stageNativeRunnerWakeAttachments(input: {
     return { attachments: [], cleanup: async () => undefined };
   }
 
+  const authorizationRevoked = new Error("paperclip_runner_attachment_staging_not_authorized");
+  const assertCurrentSelections = async () => {
+    const current = await resolveNativeRunnerWakeAttachmentSelections(input).catch(() => {
+      throw authorizationRevoked;
+    });
+    if (selections.some(selection => !current.some(candidate =>
+      candidate.id === selection.id && candidate.commentId === selection.commentId))) {
+      throw authorizationRevoked;
+    }
+  };
   const rows = await input.db
     .select({
       id: issueAttachments.id,
@@ -1010,6 +1020,7 @@ export async function stageNativeRunnerWakeAttachments(input: {
       .map((row) => [row.id, row] as const),
   );
   if (input.binding.executionTargetKind === "remote" && !input.stageRemoteAttachment && !input.downloadRemoteAttachment) {
+    await assertCurrentSelections();
     return {
       attachments: selections.map((selection) => {
         const row = rowById.get(selection.id);
@@ -1029,11 +1040,22 @@ export async function stageNativeRunnerWakeAttachments(input: {
   if (!workspaceRoot && !input.stageRemoteAttachment && !input.downloadRemoteAttachment) {
     throw new Error("paperclip_runner_attachment_staging_path_denied");
   }
+  const cleanups: Array<() => Promise<void>> = [];
+  const cleanup = async () => {
+    try {
+      const results = await Promise.allSettled(cleanups.map(clear => clear()));
+      if (results.some(result => result.status === "rejected")) {
+        throw new Error("paperclip_runner_attachment_staging_cleanup_failed");
+      }
+    } finally {
+      releaseActiveStage();
+    }
+  };
   try {
     const storage = input.storage ?? getStorageService();
     const staged: NativeRunnerStagedAttachment[] = [];
-    const cleanups: Array<() => Promise<void>> = [];
     for (const [selectionIndex, selection] of selections.entries()) {
+      await assertCurrentSelections();
       const row = rowById.get(selection.id);
       if (!row) {
         staged.push({
@@ -1055,6 +1077,7 @@ export async function stageNativeRunnerWakeAttachments(input: {
           byteSize: row.byteSize,
           sha256: row.sha256,
         });
+        await assertCurrentSelections();
         if (runnerLocalPath) {
           staged.push({
             id: row.id, filename: row.filename?.trim() || "attachment",
@@ -1071,10 +1094,12 @@ export async function stageNativeRunnerWakeAttachments(input: {
           expectedByteSize: row.byteSize,
           expectedSha256: row.sha256,
         });
+        await assertCurrentSelections();
         const written = workspaceRoot
           ? await writeStagedAttachment({ workspaceRoot, destination: stagingDestinations[selectionIndex]!, body })
           : await input.stageRemoteAttachment!({ body, contentType: row.contentType }).then(stage => ({ relativePath: stage.workspaceRelativePath, cleanup: stage.cleanup }));
         cleanups.push(written.cleanup);
+        await assertCurrentSelections();
         staged.push({
           id: row.id,
           filename: row.filename?.trim() || "attachment",
@@ -1083,7 +1108,9 @@ export async function stageNativeRunnerWakeAttachments(input: {
           workspaceRelativePath: written.relativePath,
           unavailableReason: null,
         });
-      } catch {
+      } catch (error) {
+        if (error === authorizationRevoked) throw error;
+        await assertCurrentSelections();
         staged.push({
           id: row.id,
           filename: row.filename?.trim() || "attachment",
@@ -1094,25 +1121,10 @@ export async function stageNativeRunnerWakeAttachments(input: {
         });
       }
     }
-    return {
-      attachments: staged,
-      cleanup: async () => {
-        try {
-          const results = await Promise.allSettled(
-            cleanups.map((cleanup) => cleanup()),
-          );
-          if (results.some((result) => result.status === "rejected")) {
-            throw new Error(
-              "paperclip_runner_attachment_staging_cleanup_failed",
-            );
-          }
-        } finally {
-          releaseActiveStage();
-        }
-      },
-    };
+    await assertCurrentSelections();
+    return { attachments: staged, cleanup };
   } catch (error) {
-    releaseActiveStage();
+    await cleanup();
     throw error;
   }
 }
