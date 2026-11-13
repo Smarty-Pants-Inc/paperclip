@@ -189,6 +189,13 @@ Manual, budget, and company pause holds are independent.
 A manual resume does not remove a budget or company hold.
 Restoring a company does not remove a manual hold.
 Budget and company policy still prevent admission while the pause work runs.
+Startup scans, direct claims, and saved verification-wait recovery honor explicit
+`manual`, `budget`, `company_paused`, and `company_archived` stop markers in
+`pauseReason`, `lifecycleHolds`, or the saved `lifecycleOperation.pauseCause.holds`.
+These markers do not block stop or cleanup work. Legacy startup `status: paused`
+(including `pauseReason: setup`) is not itself a Stop and remains claimable;
+the wizard's separate setup hold still waits for setup completion. Resume clears
+the relevant holds through the existing command path. No status migration is needed.
 
 The legacy `status` field remains available to existing clients.
 It shows `paused` during preparation, verification, pause, and resume.
