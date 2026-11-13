@@ -6,9 +6,9 @@ import { decideIssueReviewPathRecovery, REVIEW_PATH_RECOVERY_INSTRUCTION } from 
 
 const issueSummary = { id: "task-1", identifier: "TEST-1", title: "Finish the pull request review", description: "Check CI and the external review.", status: "in_review", priority: "medium", workMode: "standard" };
 
-async function buildWake(contextSnapshot: Record<string, unknown>) {
+async function buildWake(contextSnapshot: Record<string, unknown>, wakeCommentRows?: Awaited<ReturnType<typeof import("./run-preparation.js").readHeartbeatWakeComments>>) {
   const db = { select: vi.fn(() => ({ from: () => ({ where: () => Promise.resolve([]) }) })) } as unknown as Db;
-  return buildPaperclipWakePayload({ db, companyId: "company-1", issueSummary, contextSnapshot });
+  return buildPaperclipWakePayload({ db, companyId: "company-1", issueSummary, contextSnapshot, wakeCommentRows });
 }
 
 function recoveryContext() {
@@ -16,6 +16,31 @@ function recoveryContext() {
   if (decision.kind !== "enqueue") throw new Error("Expected the bounded review repair");
   return decision.contextSnapshot;
 }
+
+describe("plugin wake fallback fetching", () => {
+  it("requires fetching the thread for a plugin wake without comment ids", async () => {
+    const wake = await buildWake({ issueId: issueSummary.id, pluginId: "plugin-1", wakeReason: "Child X-5 moved to blocked" });
+    expect(wake?.fallbackFetchNeeded).toBe(true);
+    expect(renderPaperclipWakePrompt(wake)).toContain("- fallback fetch needed: yes");
+  });
+
+  it("leaves non-plugin wakes without comments unchanged", async () => {
+    const wake = await buildWake({ issueId: issueSummary.id, wakeReason: "issue_assigned" });
+    expect(wake?.fallbackFetchNeeded).toBe(false);
+  });
+
+  it("does not require fallback fetching for a plugin wake with included comment ids", async () => {
+    const row = {
+      id: "comment-1", companyId: "company-1", issueId: issueSummary.id,
+      body: "A plugin wake with a delivered comment.", origin: null, deletedAt: null,
+      createdAt: new Date(), authorAgentId: null, authorUserId: null, sourceTrust: null,
+    } as unknown as Awaited<ReturnType<typeof import("./run-preparation.js").readHeartbeatWakeComments>>[number];
+    const wake = await buildWake({ pluginId: "plugin-1", wakeCommentIds: ["comment-1"] }, [row]);
+    expect(wake?.commentIds).toEqual(["comment-1"]);
+    expect(wake?.truncated).toBe(false);
+    expect(wake?.fallbackFetchNeeded).toBe(false);
+  });
+});
 
 describe("review-path recovery prompt delivery", () => {
   it("delivers the bounded durable-follow-up instruction through serialization and fresh or resumed prompts", async () => {

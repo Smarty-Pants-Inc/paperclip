@@ -2880,7 +2880,14 @@ export async function buildPaperclipWakePayload(input: {
       missingCount: missingCommentCount,
     },
     truncated: payloadTruncated,
-    fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    // A plugin's requestWakeup carries no comment ids; coalesced plugin wakes keep only the last
+    // reason. The run must read the thread so no earlier notice is lost.
+    fallbackFetchNeeded:
+      payloadTruncated ||
+      missingCommentCount > 0 ||
+      (typeof input.contextSnapshot.pluginId === "string" &&
+        input.contextSnapshot.pluginId.trim().length > 0 &&
+        commentIds.length === 0),
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(
