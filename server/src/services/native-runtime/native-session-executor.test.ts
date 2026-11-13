@@ -15953,6 +15953,52 @@ describe("runnerd provider runtime wiring", () => {
     },
   );
 
+  it("REG-03 never reuses a proven-lost warm entry when retirement is refused", async () => {
+    const first = { ...scopedNativeExecution("lost-warm-held"), schema: "paperclip.native-execution-input.v5" as const,
+      provider: { kind: "codex" as const, model: null, approvalPolicy: "never" as const },
+      executionMode: "default" as const, planningContext: null, runtimeContext: nativeRuntimeContextFixture() };
+    first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
+    const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
+    const environmentId = "lost-warm-held";
+    const identity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId!,
+      runnerInstanceId: "lost-warm-runner", environmentLeaseId: first.binding.executionWorkspaceId,
+      turnId: "turn-held", itemId: "item-held" };
+    const execute = vi.fn(async (request: unknown) => {
+      const text = JSON.stringify(request);
+      if (text.includes("paperclip-runner-generation-marker")) return { exitCode: 0, timedOut: false,
+        stdout: `nonce1\n4242\n2026-11-13T10:00:00.000Z\n${identity.runnerInstanceId}\nlinux:0b5e6c2a-1111-4222-8333-944455556666:12345\n`, stderr: "" };
+      if (text.includes("paperclip-runner-generation-check")) return { exitCode: 45, timedOut: false, stdout: "", stderr: "" };
+      throw new Error("unexpected sandbox operation");
+    });
+    const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId,
+      remoteCwd: "/home/daytona/workspace", runner: { execute } };
+    const root = await initializeScopedRunnerRoot(first, identity.runnerInstanceId);
+    await writeRunnerAuthority(root, identity, "ready");
+    const close = vi.fn(async () => undefined);
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.({ close });
+      return { result: { summary: "Completed" }, terminal: { runTerminalState: "succeeded" },
+        turnId: identity.turnId, normalizedSessionId: first.session.normalizedSessionId!, providerSessionId: "provider",
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: identity.runnerInstanceId,
+        useRunnerd: true, runnerExecutionTarget: target as never });
+      const onEvent = vi.fn(async (_event: AdapterRuntimeEvent) => undefined);
+      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: identity.runnerInstanceId,
+        useRunnerd: true, onEvent, runnerExecutionTarget: { ...target,
+          sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box", restarted: true } } as never }))
+        .rejects.toThrow("prior_owner_terminal_state_indeterminate; retirement_refused=");
+      expect(execute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-generation-check"))).toBe(true);
+      expect(state.execute).toHaveBeenCalledOnce();
+      expect(close).not.toHaveBeenCalled();
+      expect(onEvent.mock.calls).not.toContainEqual([expect.objectContaining({ eventType: "run.startup.reuse",
+        payload: expect.objectContaining({ layer: "runner", state: "reused", reason: "verified_reuse" }) })]);
+    } finally {
+      await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "REG-03 held entry cleanup" });
+    }
+  });
+
   it.each((["codex", "claude"] as const).flatMap(provider => (["unchanged", "external-checkpoint", "suspension-receipt", "suspension-active-owner", "changed", "runtime-context", "retirement-failed", "stale-owner", "active-owner", "missing-owner", "foreign-environment", "plugin-replaced", "plugin-managed-github"] as const).filter(scenario => provider === "codex" || scenario.startsWith("plugin-")).map(scenario => [provider, scenario] as const)))("rotates an owned warm %s remote runner before checking changed configuration: %s", async (provider, scenario) => {
     const plugin = scenario === "plugin-replaced" || scenario === "plugin-managed-github";
     const suspensionReceipt = scenario.startsWith("suspension-");

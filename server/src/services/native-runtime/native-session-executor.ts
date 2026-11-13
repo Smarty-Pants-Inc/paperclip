@@ -122,6 +122,7 @@ import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
 import { hasAcknowledgedNativeLifecycleStopIntent, hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, hasAcknowledgedNativeRunStopReceipt } from "../acknowledged-native-stop.js";
 import { stoppedCodexTurnIsTextOnly } from "./stopped-codex-turn.js";
+import { completedWorkspaceRecoveryCondition } from "../workspace-recovery-receipt.js";
 import { prepareVerifiedRemoteProviderPack, useVerifiedPreinstalledRemoteProviderPack, shouldUseBundledAcpxImageAssets } from "./remote-provider-pack.js";
 import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
@@ -252,6 +253,7 @@ import {
   heartbeatRuns,
   issueDocuments,
   issueThreadInteractions,
+  issueRecoveryActions,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -5875,7 +5877,7 @@ async function userStopLeftUncertainty(db: Db, run: { id: string; companyId: str
   }
 }
 
-async function inspectFinishedPerTurnRunnerdOwner(input: {
+export async function inspectFinishedPerTurnRunnerdOwner(input: {
   db: Db;
   root: string;
   identity: RunnerdDurableIdentity;
@@ -5884,11 +5886,12 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }): Promise<{ finished: true; run: typeof heartbeatRuns.$inferSelect; recheck: () => Promise<string | null> }
-  | { finished: false; refused: string }> {
+  | { finished: false; refused: string; generationLost: boolean }> {
   const target = input.runnerExecutionTarget;
   // A resumed sandbox still holds the prior Runner's own lifecycle, which its
   // existing recovery path reads. Plugin tasks own a separate saved checkpoint.
-  const refuse = (refused: string) => ({ finished: false as const, refused });
+  let generationLost = false;
+  const refuse = (refused: string) => ({ finished: false as const, refused, generationLost });
   const lifecycle = input.execution.session.lifecyclePolicy.mode;
   const localRunner = !target || target.kind === "local";
   // Lost warm owners use the same settled-result and exact process/provider
@@ -5905,6 +5908,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
       if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
         return refuse("restarted_sandbox_runner_generation_not_lost");
       }
+      generationLost = true;
     } else if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
@@ -5958,6 +5962,19 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
   if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
+  const cancellationRecoveryHeld = async () => {
+    const [held] = await input.db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, binding.companyId), eq(issueRecoveryActions.sourceIssueId, binding.issueId),
+      or(sql`${issueRecoveryActions.evidence}->>'runId' = ${identity.runId}`,
+        sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${identity.runId}`,
+        sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,sourceRunId}' = ${identity.runId}`),
+      or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        sql`(${issueRecoveryActions.evidence}#>>'{automaticRecovery,replay}' = 'blocked'
+          and not coalesce((${completedWorkspaceRecoveryCondition(identity.runId)}), false))`),
+    )).limit(1);
+    return !!held;
+  };
+  if (stoppedByUser && await cancellationRecoveryHeld()) return refuse("owner_recovery_action_pending");
   // A durable controller is fenced by its released database lease; a legacy
   // controller still needs process evidence, exactly as for warm recovery.
   const finishedHere = () => isCurrentNativeControllerProcess(prior!.owner) &&
@@ -6009,6 +6026,17 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     // Database reads can await. Retire only the exact evidence proven above.
     if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8") !== originalBytes
       || readSettledRunnerdProjection(input.root, identity, projectionOptions).bytes !== controlBytes) return "journal_changed";
+    if (stoppedByUser) {
+      const [current] = await input.db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+        .innerJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+          eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId)))
+        .where(and(eq(heartbeatRuns.id, identity.runId), eq(heartbeatRuns.companyId, binding.companyId))).limit(1);
+      if (!current || current.run.status !== "cancelled" || current.owner.phase !== "terminal_failure"
+        || current.owner.failureCode !== "native_retry_cancelled" || !hasAcknowledgedNativeStopIntent(current.run)
+        || current.owner.leaseOwner || current.owner.recoveryState) return "owner_changed";
+      if (await userStopLeftUncertainty(input.db, current.run) || stopJournalLeftUndeliveredTool(controlBytes)) return "owner_stop_unsettled";
+      if (await cancellationRecoveryHeld()) return "owner_recovery_action_pending";
+    }
     if (provenFinishedHere && !finishedHere()) return "controller_restarted_here";
     if (localRunner && !(await proveLocalRunnerStopped()).stopped) return "runner_process_restarted";
     return null;
@@ -6051,7 +6079,8 @@ function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined)
  * released lease, stopped controller, settled journal). The existing authority
  * rotation keeps Pi's history and archives the old Runner; no third retirement
  * rule is introduced. */
-async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
+async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">,
+  holdLostOwner = false)
   : Promise<DurableRecoveryIdentity | null> {
   if (!resumedSandboxRunner(input.runnerExecutionTarget) || !isSafeNativeStateDirectory(input.root)) return null;
   const identity = readRunnerdDurableIdentity(input.root);
@@ -6059,9 +6088,16 @@ async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof insp
   const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
   if (!proof.finished) {
     await input.onLog?.("stderr", `[paperclip-runner] restarted sandbox owner ${String(identity.runId)} not retired: ${proof.refused}\n`);
+    if (holdLostOwner && proof.generationLost) {
+      throw new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=${proof.refused}`);
+    }
     return null;
   }
-  return await proof.recheck() ? null : identity as unknown as DurableRecoveryIdentity;
+  const changed = await proof.recheck();
+  if (changed && holdLostOwner) {
+    throw new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=${changed}`);
+  }
+  return changed ? null : identity as unknown as DurableRecoveryIdentity;
 }
 
 async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
@@ -10238,7 +10274,7 @@ export async function executePaperclipNativeSession(input: {
       const root = scopedRunnerdStateRoot(input.execution);
       await restoreWarmRunnerdController(input);
       if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
-        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })) {
+        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog }, true)) {
         // Idle close may have suspended the box's Runner but failed its final
         // controller/checkpoint cleanup. Do not ask that dead owner to close a
         // second time. Only detach the local controller; ordinary admission and
