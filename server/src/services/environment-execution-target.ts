@@ -377,6 +377,9 @@ export async function resolveEnvironmentExecutionTarget(input: {
     // The endpoint-gated startup tracer (no-op when tracing is off). Tests inject
     // a recording tracer.
     const tracer = input.tracer ?? getStartupTracer();
+    // One opaque cache owner per runner/target, never shared across handoffs.
+    // Only read-only recovery observations may reuse resolved credentials.
+    const probeRuntimeConfigScope = {};
 
     // Resolve the read-only effective capability snapshot for this lease
     // through the general resolver. Freeze it so a consumer reads it but
@@ -597,6 +600,8 @@ export async function resolveEnvironmentExecutionTarget(input: {
                     // command on the persistent session. An explicit bypass wins
                     // over `forceSession` and over the active-step selection.
                     bypassSession: commandInput.bypassSession,
+                    probeRuntimeConfigScope,
+                    readOnlyProbe: commandInput.readOnlyProbe,
                   });
                 } catch (error) {
                   // The provider execution threw. Mark the span failed with the
