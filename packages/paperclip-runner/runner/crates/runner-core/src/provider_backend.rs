@@ -3064,6 +3064,7 @@ impl CodexCommandExecutor {
                     ))
                 })?;
             }
+            let resumed_thread_id = provider.thread_id().to_owned();
             let resumed_provider_session_id = provider.provider_session_id().map(str::to_owned);
             let resumed_process_id = provider.process_id();
             {
@@ -3072,6 +3073,7 @@ impl CodexCommandExecutor {
                     .as_mut()
                     .expect("Codex state remains available during recovery");
                 state.provider_process_generation = process_generation;
+                state.thread_id = Some(resumed_thread_id.clone());
                 state.provider_session_id = resumed_provider_session_id.clone();
                 state.thread_id = Some(thread_id.clone());
                 state.settled_provider_turn_ids = settled_provider_turn_ids;
@@ -3091,7 +3093,7 @@ impl CodexCommandExecutor {
                 }
                 let mut resumed_payload = json!({
                     "provider": provider_label,
-                    "providerSessionId": thread_id.clone(),
+                    "providerSessionId": resumed_thread_id,
                     "providerAccountSessionId": resumed_provider_session_id,
                     "processId": resumed_process_id,
                 });

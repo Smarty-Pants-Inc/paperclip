@@ -133,7 +133,7 @@ export class CodexHarnessSession
     let settle!: () => void;
     this.pendingRunAttachment = { runId: input.runId, settled: new Promise<void>(resolve => { settle = resolve; }) };
     try {
-      await this.transport.attachRun?.({
+      const attached = await this.transport.attachRun?.({
         runId: input.runId,
         turnId: `turn_attachment_${randomUUID().replaceAll("-", "")}`,
         itemId: `item_attachment_${randomUUID().replaceAll("-", "")}`,
@@ -141,6 +141,23 @@ export class CodexHarnessSession
         ...(input.completionContract ? { completionContract: structuredClone(input.completionContract) } : {}),
       });
       this.assertProtocolIntegrity();
+      let piSessionRecovery: Record<string, unknown> | undefined;
+      if (attached) {
+        const admission = attached.piNativeAdmission;
+        const recovery = record(admission.sessionRecovery);
+        if (this.driverKind !== "pi_rpc" || admission.provider !== "pi_rpc" || recovery.reason !== "pi_session_file_invalid"
+          || recovery.normalizedSessionId !== this.normalizedSessionId
+          || admission.model !== this.opened.context.model
+          || admission.piRpcThinkingLevel !== record(this.opened.context).piRpcThinkingLevel
+          || attached.threadId !== attached.providerSessionId || admission.providerSessionId !== attached.threadId
+          || (attached.threadId !== this.opened.threadId && (recovery.previousSessionId !== this.opened.threadId
+            || recovery.previousSessionId !== this.opened.providerSessionId))) throw new Error("pi_session_recovery_identity_refused");
+        // Identity caches must reflect real native readback before the next
+        // notification is reduced. The normalized conversation never changes.
+        this.opened.threadId = attached.threadId;
+        this.opened.providerSessionId = attached.providerSessionId;
+        piSessionRecovery = recovery;
+      }
       if (transportOwnsQuiescence) {
         // Runnerd's attachment contract performs two durable readiness probes,
         // drains the settled provider tail, and rotates authority atomically.
@@ -174,7 +191,7 @@ export class CodexHarnessSession
         this.#deferredNotificationPump = false;
         void pumpNotifications(this);
       }
-      this.emit("run.attached", { runId: input.runId, sameSession: true });
+      this.emit("run.attached", { runId: input.runId, sameSession: true, ...(piSessionRecovery ? { piSessionRecovery } : {}) });
     } finally {
       this.pendingRunAttachment = null;
       settle();

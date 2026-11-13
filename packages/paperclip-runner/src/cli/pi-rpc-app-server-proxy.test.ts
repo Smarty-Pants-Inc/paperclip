@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -135,18 +135,49 @@ it("thread/resume passes the saved native identity and execution-host cwd to dri
   } finally { await proxy.close(); }
 });
 
-it("thread/resume refuses an invalid saved Pi file with its typed code and never opens a fresh one", async () => {
-  const code = "pi_session_file_invalid";
+// Keep reason: data safety at the provider recovery/identity boundary.
+it("thread/resume preserves invalid Pi bytes aside, starts fresh under the same C, and warns once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-invalid-proxy-"));
+  const bytes = Buffer.from("foreign or corrupt history\n\u0000original bytes");
+  await writeFile(join(root, "conversation.jsonl"), bytes);
   const sink = new FakeSink(); const driver = makeDriver(new FakeSession());
   driver.openSession = vi.fn(driver.openSession);
-  driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("Saved Pi history could not be loaded"), { code }); });
+  driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("Saved Pi history could not be loaded"), { code: "pi_session_file_invalid" }); });
+  const alarm = vi.fn();
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, writeStderr: alarm,
+    environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "conversation", PAPERCLIP_RUN_ID: "run-new" }, createDriver: () => driver });
+  try {
+    for (const id of [1, 2]) {
+      proxy.acceptLine(JSON.stringify({ id, method: "thread/resume", params: { threadId: "native-id", cwd: root, model: "neutral/model" } }));
+      await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === id)).toBe(true));
+      expect(sink.decoded().find(frame => frame.id === id)).toMatchObject({ result: { thread: { id: "pi-session" }, piNativeAdmission: {
+        sessionRecovery: { reason: "pi_session_file_invalid", normalizedSessionId: "conversation", previousSessionId: "native-id" },
+      } } });
+    }
+    const files = await readdir(root);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^conversation\.jsonl\.invalid-\d{4}-\d{2}-\d{2}T/);
+    expect(await readFile(join(root, files[0]!))).toEqual(bytes);
+    expect(driver.openSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: "run-new", normalizedSessionId: "conversation", workingDirectory: root }));
+    expect(sink.decoded().filter(frame => frame.method === "warning")).toHaveLength(0);
+    await request(proxy, sink, 3, "turn/start", { input: [{ type: "text", text: "Continue fresh" }] });
+    expect(sink.decoded().filter(frame => frame.method === "warning")).toHaveLength(1);
+    expect(alarm.mock.calls[0]?.[0]).toContain("owner alarm: pi_session_file_invalid");
+  } finally { await proxy.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+it("never starts fresh when invalid Pi history could not be quarantined", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-invalid-preserve-failed-"));
+  const sink = new FakeSink(); const driver = makeDriver(new FakeSession());
+  driver.openSession = vi.fn(driver.openSession);
+  driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("invalid"), { code: "pi_session_file_invalid" }); });
   const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "conversation" }, createDriver: () => driver });
   try {
-    proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: "native-id", cwd: "/workspace", model: "neutral/model" } }));
-    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 1)).toBe(true));
-    expect(sink.decoded().find(frame => frame.id === 1)).toMatchObject({ error: { code: -32000, data: { code } } });
+    await request(proxy, sink, 1, "thread/resume", { threadId: "native-id", cwd: root, model: "neutral/model" });
+    expect(lastResult(sink, 1)).toHaveProperty("error");
     expect(driver.openSession).not.toHaveBeenCalled();
-  } finally { await proxy.close(); }
+    expect(sink.decoded().filter(frame => frame.method === "warning")).toHaveLength(0);
+  } finally { await proxy.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 it("thread/resume reports a typed missing-file rejection, then admits an explicit fresh thread/start under the same conversation id", async () => {

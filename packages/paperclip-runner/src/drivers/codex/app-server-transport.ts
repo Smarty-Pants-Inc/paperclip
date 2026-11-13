@@ -83,6 +83,8 @@ export interface CodexAppServerTransport {
   detachControllerForRestart?(): Promise<void>;
   processInfo?(): CodexTransportProcessInfo;
   beginRunAttachment?(input: { runId: string }): boolean;
+  /** Only an explicitly admitted Pi history reset returns a replacement identity.
+   * Void preserves all existing provider/run-attachment behavior. */
   attachRun?(input: {
     runId: string;
     turnId: string;
@@ -91,7 +93,7 @@ export interface CodexAppServerTransport {
     dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     /** The attaching run's own completion contract. */
     completionContract?: { revision: string; criterionIds: readonly string[] };
-  }): Promise<void>;
+  }): Promise<void | { threadId: string; providerSessionId: string; piNativeAdmission: Record<string, unknown> }>;
   /** Records post-rehydration driver mapping without affecting run authority. */
   recordTraceInterpretation?(input: CodexTraceInterpretation): void;
 }

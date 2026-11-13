@@ -4971,7 +4971,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     currentRunGrant?: NativeRunRuntimeGrant;
     dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     completionContract?: { revision: string; criterionIds: readonly string[] };
-  }): Promise<void> {
+  }): Promise<void | { threadId: string; providerSessionId: string; piNativeAdmission: Record<string, unknown> }> {
     if (input.dynamicTools !== undefined && this.options.provider !== "pi_rpc") {
       return Promise.reject(new Error("native_runner_tool_replacement_requires_pi"));
     }
@@ -4986,7 +4986,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       return this.#attachRun(requested, earlyClaim);
     }).finally(() => { this.#attachmentOperation = null; });
     this.#attachmentOperation = operation;
-    return operation;
+    return operation.then(() => {
+      if (this.options.provider === "pi_rpc" && record(this.#observedPiAdmission?.sessionRecovery).reason === "pi_session_file_invalid") {
+        if (!this.#threadId || !this.#sessionId) throw new Error("pi_session_recovery_identity_refused");
+        return { threadId: this.#threadId, providerSessionId: this.#sessionId,
+          piNativeAdmission: structuredClone(this.#observedPiAdmission!) };
+      }
+    });
   }
 
   async #attachRun(input: {
@@ -8615,6 +8621,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (checkpointExpectation === null) return;
     const { threadId, sessionId } = resolveRunnerdSessionIdentity(input);
     const providerIdentity = record(record(input).providerIdentity);
+    const recovery = record(this.#observedPiAdmission?.sessionRecovery);
+    if (this.options.provider === "pi_rpc" && recovery.reason === "pi_session_file_invalid"
+      && recovery.previousSessionId === checkpointExpectation.driverSessionId
+      && recovery.previousSessionId === checkpointExpectation.providerSessionId
+      && recovery.normalizedSessionId === this.#eventIdentity?.normalizedSessionId
+      && typeof recovery.preservedFile === "string" && !/[\\/]/u.test(recovery.preservedFile)
+      && recovery.preservedFile.startsWith(`${recovery.normalizedSessionId}.jsonl.invalid-`)
+      && threadId !== null && threadId === sessionId && threadId === this.#observedPiAdmission?.providerSessionId) {
+      // The trusted adapter explicitly preserved invalid history and admitted
+      // a fresh native identity. Keep C; update only its provider checkpoint.
+      checkpointExpectation.driverSessionId = threadId;
+      checkpointExpectation.providerSessionId = sessionId;
+    }
     if (
       threadId === null &&
       sessionId === null &&

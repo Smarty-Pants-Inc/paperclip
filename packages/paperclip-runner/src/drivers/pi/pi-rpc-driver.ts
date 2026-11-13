@@ -23,7 +23,7 @@ import { PiIdentityTombstones } from "./pi-identity-tombstones.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcCommandError, PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
-import { piSessionFileInvalid, verifyPiSessionFile } from "./pi-session-file.js";
+import { piSessionFileInvalid, piSessionName as safeSessionName, verifyPiSessionFile } from "./pi-session-file.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -1780,11 +1780,6 @@ function piProcessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.Process
   for (const key of SAFE_PI_ENV_KEYS) if (process.env[key] !== undefined) environment[key] = process.env[key];
   for (const [key, value] of Object.entries(overrides)) if (value !== undefined) environment[key] = value;
   return environment;
-}
-
-function safeSessionName(value: string): string {
-  const cleaned = value.replace(/[^A-Za-z0-9._-]/gu, "_").replace(/^\.+/u, "").slice(0, 160);
-  return cleaned || "pi-session";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -488,26 +488,34 @@ export class CodexAppServerDriver implements HarnessDriver {
         transport.request("thread/read", { threadId: snapshot.driverSessionId, includeTurns: false }),
       );
       const existingThread = record(existing.thread);
-      const piRecovery = record(record(existing.piNativeAdmission).sessionRecovery);
-      // A missing Pi transcript is an explicit fresh native thread, not a
-      // successful history restore. Only the authenticated runner receipt and
-      // an idle checkpoint authorize dropping old native-turn bookkeeping.
+      const piAdmission = record(existing.piNativeAdmission);
+      const piRecovery = record(piAdmission.sessionRecovery);
+      const preservedInvalid = piRecovery.reason === "pi_session_file_invalid"
+        && piRecovery.normalizedSessionId === snapshot.normalizedSessionId
+        && typeof piRecovery.preservedFile === "string" && !/[\\/]/u.test(piRecovery.preservedFile)
+        && piRecovery.preservedFile.startsWith(`${snapshot.normalizedSessionId}.jsonl.invalid-`);
+      const missingHistory = piRecovery.code === "pi_session_file_missing";
+      const previousPiId = missingHistory ? piRecovery.previousDriverSessionId : piRecovery.previousSessionId;
+      const freshPiId = missingHistory ? piRecovery.driverSessionId : piAdmission.providerSessionId;
+      // Missing or explicitly preserved invalid history starts a fresh native
+      // thread, not a successful restore. Only the authenticated runner receipt
+      // and an idle checkpoint authorize dropping old turn bookkeeping.
       // Never apply this to Codex or replay an input with uncertain effects.
       if (this.#options.driverIdentity?.kind === "pi_rpc"
-        && piRecovery.code === "pi_session_file_missing"
+        && (missingHistory || preservedInvalid)
         && existing.normalizedSessionId === snapshot.normalizedSessionId
-        && piRecovery.previousDriverSessionId === snapshot.driverSessionId
-        && piRecovery.previousDriverSessionId === snapshot.providerSessionId
-        && typeof piRecovery.driverSessionId === "string" && piRecovery.driverSessionId.length > 0
-        && piRecovery.driverSessionId !== snapshot.driverSessionId
-        && piRecovery.driverSessionId === existingThread.id
-        && piRecovery.driverSessionId === existingThread.sessionId
+        && previousPiId === snapshot.driverSessionId
+        && previousPiId === snapshot.providerSessionId
+        && typeof freshPiId === "string" && freshPiId.length > 0
+        && freshPiId !== snapshot.driverSessionId
+        && freshPiId === existingThread.id
+        && freshPiId === existingThread.sessionId
         && !persistedSessionInFlight(snapshot) && snapshot.goal?.status !== "active") {
         snapshot = {
           driverKind: snapshot.driverKind, runId: snapshot.runId,
           normalizedSessionId: snapshot.normalizedSessionId,
           workingDirectory: snapshot.workingDirectory,
-          driverSessionId: piRecovery.driverSessionId, providerSessionId: piRecovery.driverSessionId,
+          driverSessionId: freshPiId, providerSessionId: freshPiId,
           providerIdentity: snapshot.providerIdentity, lastSourceSequence: snapshot.lastSourceSequence,
           providerRecoveryPolicy: snapshot.providerRecoveryPolicy, activeTurnId: null,
         };

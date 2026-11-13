@@ -1,11 +1,32 @@
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, realpath } from "node:fs/promises";
+import { lstat, open, realpath, rename } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { PersistedHarnessSession } from "../../contracts/harness-driver.js";
 import { PiNativeAdmissionError } from "./pi-native-config.js";
 
 export function piSessionFileInvalid(): PiNativeAdmissionError {
   return new PiNativeAdmissionError("pi_session_file_invalid", "Saved Pi session file is corrupt, foreign, or has a different identity; refusing replacement.");
+}
+
+/** Quarantine only the server-named entry in the execution-host runtime root.
+ * Rename, never unlink/truncate/copy through a symlink. Failure is fail-closed:
+ * the caller must not launch fresh until the original entry is safely aside. */
+export async function quarantineInvalidPiSessionFile(runtimeDirectory: string, normalizedSessionId: string): Promise<string> {
+  const directory = await realpath(runtimeDirectory);
+  const filename = piSessionName(normalizedSessionId) + ".jsonl";
+  const file = join(directory, filename);
+  const before = await lstat(file);
+  if (!before.isFile() && !before.isSymbolicLink()) throw piSessionFileInvalid();
+  const preserved = `${filename}.invalid-${new Date().toISOString().replace(/[:.]/gu, "-")}-${randomUUID()}`;
+  await rename(file, join(directory, preserved));
+  const after = await lstat(join(directory, preserved));
+  if (after.dev !== before.dev || after.ino !== before.ino) throw piSessionFileInvalid();
+  return preserved;
+}
+
+export function piSessionName(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/gu, "_").replace(/^\.+/u, "").slice(0, 160) || "pi-session";
 }
 
 /** Validate before Pi sees --session: Pi may otherwise silently create a new

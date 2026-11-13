@@ -100,6 +100,42 @@ describe("Codex app-server Codex driver", () => {
     },
   );
 
+  // Keep reason: data safety at the idle persisted-checkpoint trust boundary.
+  it.each(["fresh", "wrong-conversation", "wrong-prior", "wrong-new", "unsafe-file", "busy", "goal", "codex"])(
+    "admits only scoped preserved-invalid Pi recovery after a controller restart: %s", async mode => {
+      const first = new FakeCodexTransport("old-pi", "old-pi");
+      const second = new FakeCodexTransport("new-pi", "new-pi");
+      const driver = makeDriver([first, second], mode === "codex" ? {} : {
+        driverIdentity: { kind: "pi_rpc", displayName: "Pi", version: "1.5.2" },
+      });
+      const original = await driver.openSession({ runId: "pi-run", normalizedSessionId: "same-conversation", workingDirectory: WORKSPACE });
+      if (mode === "goal") await original.goal?.({ action: "set", objective: "Still active" });
+      const snapshot = await original.snapshot();
+      if (mode === "busy") snapshot.activeTurnId = "unsettled-old-turn";
+      await original.close({ reason: "controller restart" });
+      const preservedFile = "same-conversation.jsonl.invalid-2026-11-13T05-00-00-000Z-00000000-0000-4000-8000-000000000000";
+      second.readResponse = { normalizedSessionId: "same-conversation", piNativeAdmission: {
+        provider: "pi_rpc", providerSessionId: mode === "wrong-new" ? "other" : "new-pi", sessionRecovery: {
+          reason: "pi_session_file_invalid", previousSessionId: mode === "wrong-prior" ? "other" : "old-pi",
+          normalizedSessionId: mode === "wrong-conversation" ? "other" : "same-conversation",
+          preservedFile: mode === "unsafe-file" ? `../${preservedFile}` : preservedFile,
+        } }, thread: { id: "new-pi", sessionId: "new-pi", cwd: WORKSPACE, turns: [] } };
+      const request = second.request.bind(second);
+      vi.spyOn(second, "request").mockImplementation(async (method, params) => {
+        const response = await request(method, params);
+        return method === "thread/resume" ? { ...response, piNativeAdmission: second.readResponse!.piNativeAdmission } : response;
+      });
+      const recovery = await driver.recoverSession(snapshot);
+      expect(recovery.recovered).toBe(mode === "fresh");
+      expect(second.calls.some(call => call.method === "turn/start")).toBe(false);
+      if (recovery.session) {
+        expect(await recovery.session.snapshot()).toMatchObject({ normalizedSessionId: "same-conversation",
+          driverSessionId: "new-pi", providerSessionId: "new-pi", activeTurnId: null });
+        await recovery.session.close({ reason: "fixture complete" });
+      }
+    },
+  );
+
   it("keeps one disposition request after a restart continuation completes without a result", async () => {
     const transport = new FakeCodexTransport();
     const session = await makeDriver([transport]).openSession({

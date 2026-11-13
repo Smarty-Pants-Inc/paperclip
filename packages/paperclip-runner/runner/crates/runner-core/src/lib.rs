@@ -389,3 +389,4 @@ mod tests {
 pub mod runtime_notifications;
 
 pub mod generated_pi_rpc_profile;
+mod pi_rpc_recovery;
