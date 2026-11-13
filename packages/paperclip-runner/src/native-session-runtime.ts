@@ -3,6 +3,7 @@ import type { NativeWakeAttachmentInput } from "./contracts/types.js";
 import { nativeSystemInstructions } from "./backends/runtime-context.js";
 
 import type {
+  AppendedEventReceipt,
   CheckpointControlPlaneSessionOptions,
   ControlPlanePort,
 } from "./contracts/control-plane-port.js";
@@ -66,6 +67,8 @@ const REUSABLE_SESSION_CANCELLATION_SETTLEMENT_GRACE_MS = 10_000;
 // elapsed time or a cancellation acknowledgement as usage/terminal evidence.
 const GOVERNED_ACCOUNTING_DRAIN_MS = 15_000;
 const MAX_GOVERNED_ACCOUNTING_DRAIN_MS = 30_000;
+// Text delta receipts a turn may leave unsettled before it waits for them.
+const MAX_PENDING_DELTA_RECEIPTS = 256;
 const DEFAULT_NATIVE_CHECKPOINT_TIMEOUT_MS = 30_000;
 /**
  * A retained cleanup owner can only still hold resources it was bound to.
@@ -1237,7 +1240,16 @@ async function consumeTurn(
     if (inputTimer !== undefined) clearTimeout(inputTimer);
     inputTimers.delete(requestId);
   };
-  const consumer = (async () => {
+  // Delta appends the consumer started and that have not settled. The consumer
+  // joins them before it settles, whatever way it ends, so their observers
+  // never outlive the turn's cleanup.
+  const outstandingDeltas = new Set<Promise<unknown>>();
+  const joinOutstandingDeltas = async () => {
+    if (outstandingDeltas.size === 0) return;
+    controlPlane.flushStreamingEvents?.();
+    await Promise.allSettled([...outstandingDeltas]);
+  };
+  const consumerBody = (async () => {
     let eventCount = 0;
     let highestContiguousSourceSeq = 0;
     let governedResult: PrpStructuredRunResult | null = null;
@@ -1248,11 +1260,30 @@ async function consumeTurn(
     let latestSessionGoal: HarnessThreadGoal | null = null;
     let resultSource: "semantic_result" | "governed_wait" | null = null;
     let providerFailure: NativeProviderTerminalFailure | null = null;
+    // A port that batches text deltas lets the next event start before a
+    // delta's receipt settles. Every other event, and every result, waits for
+    // the receipts of the deltas before it.
+    const pipelinesDeltas = controlPlane.pipelinesStreamingEvents === true;
+    let pendingDeltas: Promise<AppendedEventReceipt>[] = [];
+    let deltaFailure = null as { error: unknown } | null;
+    const settlePendingDeltas = async () => {
+      // Queued deltas commit now: the next event must not wait for the batch timer.
+      if (pendingDeltas.length > 0) controlPlane.flushStreamingEvents?.();
+      while (pendingDeltas.length > 0) {
+        const pending = pendingDeltas;
+        pendingDeltas = [];
+        for (const receipt of await Promise.all(pending)) {
+          eventCount += receipt.disposition === "committed" ? 1 : 0;
+          highestContiguousSourceSeq = Math.max(highestContiguousSourceSeq, receipt.highestContiguousSourceSeq);
+        }
+      }
+    };
     const settleDurableResult = async (
       event: PrpEvent,
       result: PrpStructuredRunResult,
       reason: string,
     ) => {
+      await settlePendingDeltas();
       if (session.cancel === undefined) {
         throw new Error("native_governed_wait_cancellation_unavailable");
       }
@@ -1393,15 +1424,30 @@ async function consumeTurn(
       // the timer stayed live until the receipt returned, both settlement
       // and a durable handoff could commit for the same request.
       if (settlingRequestId !== null) clearInputTimer(settlingRequestId);
-      const receipt = await controlPlane.appendEvent(event, {
-        signal: appendAbort.signal,
-      });
+      // A failed delta stops the turn before any later event is appended.
+      if (deltaFailure) throw deltaFailure.error;
+      let receipt: AppendedEventReceipt | null = null;
+      if (pipelinesDeltas && event.eventType === "item.delta") {
+        const pending = controlPlane.appendEvent(event, { signal: appendAbort.signal, streaming: true });
+        const settled = pending.then(() => undefined, (error: unknown) => { deltaFailure ??= { error }; });
+        outstandingDeltas.add(settled);
+        void settled.finally(() => outstandingDeltas.delete(settled));
+        pendingDeltas.push(pending);
+        if (pendingDeltas.length >= MAX_PENDING_DELTA_RECEIPTS) await settlePendingDeltas();
+      } else {
+        await settlePendingDeltas();
+        receipt = await controlPlane.appendEvent(event, {
+          signal: appendAbort.signal,
+        });
+      }
       if (stopConsumer) throw new Error("native event consumer stopped");
-      eventCount += receipt.disposition === "committed" ? 1 : 0;
-      highestContiguousSourceSeq = Math.max(
-        highestContiguousSourceSeq,
-        receipt.highestContiguousSourceSeq,
-      );
+      if (receipt !== null) {
+        eventCount += receipt.disposition === "committed" ? 1 : 0;
+        highestContiguousSourceSeq = Math.max(
+          highestContiguousSourceSeq,
+          receipt.highestContiguousSourceSeq,
+        );
+      }
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
         goalLifecycleFingerprint(eventGoal) !== goalLifecycleFingerprint(previousGoal);
@@ -1439,7 +1485,7 @@ async function consumeTurn(
           typeof failure.message === "string" ? failure.message : undefined,
           readProviderFailure(failure.providerFailure),
         );
-        if ((receipt.disposition === "committed" || receipt.disposition === "duplicate") && !providerFailure.recoverable && failure.code === "provider_exited"
+        if ((receipt?.disposition === "committed" || receipt?.disposition === "duplicate") && !providerFailure.recoverable && failure.code === "provider_exited"
           && failure.expected === false && failure.completedByExitedProcess === false
           && failure.previousTurnCompleted === false && failure.provider === input.provider.kind
           && event.runId === input.binding.runId && event.normalizedSessionId === session.identity().sessionId) {
@@ -1453,7 +1499,7 @@ async function consumeTurn(
           ? (payload.request as Record<string, unknown>)
           : null;
       if (
-        receipt.disposition === "committed" &&
+        receipt?.disposition === "committed" &&
         event.eventType === "runtime_request.created" &&
         request?.schema === "paperclip.runtime_request.v2" &&
         request.type === "input" &&
@@ -1564,6 +1610,7 @@ async function consumeTurn(
           goalStatus(eventGoal) !== "active" &&
           payload.workingNow !== true
         ) {
+          await settlePendingDeltas();
           return {
             event,
             eventCount,
@@ -1583,6 +1630,7 @@ async function consumeTurn(
             latestSessionGoal !== null &&
             goalStatus(latestSessionGoal) !== "active"
           ) {
+            await settlePendingDeltas();
             return {
               event,
               eventCount,
@@ -1612,6 +1660,7 @@ async function consumeTurn(
         if (await supersededTerminal?.(event, appendAbort.signal)) continue;
         if (providerFailure) throw providerFailure;
         if (compactionResult && event.eventType === "turn.completed") {
+          await settlePendingDeltas();
           return {
             event,
             eventCount,
@@ -1621,6 +1670,7 @@ async function consumeTurn(
         }
         if (semanticResultProposal === null && governedResult === null &&
             inputTimers.size === 0 && await resumeInterruptedTurn?.(event, appendAbort.signal)) continue;
+        await settlePendingDeltas();
         return {
           event,
           eventCount,
@@ -1630,13 +1680,17 @@ async function consumeTurn(
       }
     }
   })();
+  // The race below sees the consumer's own outcome, so a failure reaches abort
+  // and provider cancellation at once. Teardown waits, within its bound, for
+  // the consumer together with its pending delta appends.
+  const consumer = consumerBody.finally(joinOutstandingDeltas);
   // A timeout can win the race while an iterator is still waiting for data.
   // Observe any later consumer rejection so it cannot become process-fatal.
   void consumer.catch(() => undefined);
   let consumptionFailed = false;
   try {
     return await Promise.race([
-      consumer,
+      consumerBody,
       new Promise<never>((_, reject) => {
         if (timeoutMs <= 0) return;
         // Node timers overflow above ~24.8 days. Keep explicit long deadlines
