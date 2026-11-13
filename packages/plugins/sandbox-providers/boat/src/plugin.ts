@@ -525,6 +525,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       if (sandbox.id !== id) throw new Error("Boat resume returned a different allocation.");
     }
     const resumedFromState = sandbox?.state ?? null;
+    let ttlRefresh: { status: "failed"; category: RequestErrorCategory; httpStatus: number | null } | undefined;
     if (!sandbox || !["ready", "idle", "running"].includes(sandbox.state)) {
       // boatdocs-0110c/api_reference_sandboxes_resume-sandbox.md:35-75,147-172.
       const response = await request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
@@ -532,13 +533,24 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       assertSandboxId(sb, id);
       sandbox = await waitReady(c, id, true);
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
-    } else if (effectiveTtlSeconds(c) > c.ttlSeconds) {
-      // Boat TTL is relative to its last write, not Daytona's SDK activity clock.
-      // Renew only on an authorized warm handoff, never with an idle timer.
-      // out/runner/boat-docs/update-sandbox.md:84-93.
-      const refreshed = await request(c, `/sandboxes/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c) }) });
-      sandbox = refreshed.sandbox ?? refreshed;
-      if (sandbox.id !== id) throw new Error("Boat TTL refresh returned a different allocation.");
+    } else {
+      // Boat auto-stop counts from create/last resume, not activity:
+      // https://docs.boat.dev/long-running-tasks/auto-stop.md:14-16.
+      // PATCH ttlSeconds sets the deadline to now + ttlSeconds:
+      // https://docs.boat.dev/api/reference/sandboxes/update-sandbox.md:91-93.
+      // Renew every authorized warm handoff, never with an idle timer.
+      const path = `/sandboxes/${encodeURIComponent(id)}`;
+      try {
+        const refreshed = await request(c, path, { method: "PATCH", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c) }) }, false, { requireJson: true });
+        const candidate = refreshed?.sandbox ?? refreshed;
+        if (candidate?.id !== id) throw requestError(c, "PATCH", path, 200, "parse_error");
+        sandbox = candidate;
+      } catch (error) {
+        // request and the exact-ID check expose only our safe error fields.
+        // Keep the pre-PATCH observation: neither owner nor deadline is renewed.
+        const failure = error as ReturnType<typeof requestError>;
+        ttlRefresh = { status: "failed", category: failure.category, httpStatus: failure.httpStatus };
+      }
     }
     const workspaceSentinel = sentinel ? await verifyWorkspaceSentinel(sentinel, { request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout) }) : undefined;
     if (workspaceSentinel && workspaceSentinel.result !== "matched") return { providerLeaseId: null, metadata: { expired: true, workspaceSentinel } };
@@ -547,12 +559,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }, metadata);
     // A disabled carrier must not inherit an earlier lease's usable receipt.
     const { guardianPreflight: _previousGuardian, runnerGuardianVersion: _previousVersion,
-      boatOrgId: _previousOrg, boatOwner: _previousOwner, ...retainedMetadata } = metadata ?? {};
+      boatOrgId: _previousOrg, boatOwner: _previousOwner, ttlRefresh: _previousTtlRefresh, ...retainedMetadata } = metadata ?? {};
     await bindDuplexLease(params, id, guardianPreflight);
     const ownership = boatOwnershipForLease(sandbox, id);
     return { providerLeaseId: id, expiresAt: sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
-        ...ownership,
+        ...ownership, ...(ttlRefresh ? { ttlRefresh } : {}),
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {

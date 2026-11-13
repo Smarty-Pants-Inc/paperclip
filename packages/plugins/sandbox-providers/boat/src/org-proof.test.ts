@@ -138,8 +138,8 @@ describe("Boat ownership is the latest exact allocation observation", () => {
     await expect(plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: id, leaseMetadata: { ...warmMetadata, boatOrgId: undefined, ...prior, boatOwner: { kind: "personal" } } })).rejects.toThrow("personal lease absence is not proven");
     expect(fetch).toHaveBeenCalledTimes(1);
   });
-  it.each(ownershipCases)("already-running resume records only its new GET's %s ownership", async (_name, latest, expected) => {
-    const fetch = lifecycleFixture(latest);
+  it.each(ownershipCases)("already-running resume records only its new PATCH's %s ownership", async (_name, latest, expected) => {
+    const fetch = lifecycleFixture({ team: { id: "team_before_patch" } }, { patch: latest });
     const lease = await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: id, leaseMetadata: warmMetadata });
     expectOwnership(lease.metadata, expected);
     expect(lease.metadata?.preserved).toBe("yes");
@@ -154,9 +154,12 @@ describe("Boat ownership is the latest exact allocation observation", () => {
     const lease = await plugin.definition.onEnvironmentResumeLease!({ ...scope, config: { ...scope.config, ttlSeconds: 60, runnerReconnectGraceMs: 600_000 }, providerLeaseId: id, leaseMetadata: warmMetadata });
     expectOwnership(lease.metadata, expected);
   });
-  it("TTL-refresh resume rejects a foreign patch", async () => {
-    lifecycleFixture({ team: { id: orgId } }, { patch: { id: "bx_33333333", team: { id: "team_foreign" } } });
-    await expect(plugin.definition.onEnvironmentResumeLease!({ ...scope, config: { ...scope.config, ttlSeconds: 60, runnerReconnectGraceMs: 600_000 }, providerLeaseId: id, leaseMetadata: warmMetadata })).rejects.toThrow("different allocation");
+  it("TTL-refresh resume ignores a foreign patch, preserving read ownership with a safe warning", async () => {
+    const fetch = lifecycleFixture({ team: { id: orgId }, archiveAfter: "2030-01-01T00:00:00Z" }, { patch: { id: "bx_33333333", team: { id: "team_foreign" }, archiveAfter: "2030-01-02T00:00:00Z" } });
+    const lease = await plugin.definition.onEnvironmentResumeLease!({ ...scope, config: { ...scope.config, ttlSeconds: 60, runnerReconnectGraceMs: 600_000 }, providerLeaseId: id, leaseMetadata: warmMetadata });
+    expectOwnership(lease.metadata, { boatOrgId: orgId });
+    expect(lease).toMatchObject({ providerLeaseId: id, expiresAt: "2030-01-01T00:00:00Z", metadata: { ttlRefresh: { status: "failed", category: "parse_error", httpStatus: 200 } } });
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(1);
   });
 });
 describe("Native HTTP org confirmation timeout", () => {
