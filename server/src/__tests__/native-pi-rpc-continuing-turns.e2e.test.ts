@@ -21,7 +21,10 @@ import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
 // native_restart_recovery_blocked/native_retry_source_superseded, then turn 3
 // with native_session_recovery_failed: runner_remote_authority_archive_failed.
 // Default: b13 deliberately creates a new conversation after Done. STRICT adds
-// identity/history continuity for I-2' images; it never weakens default checks.
+// identity/history and physical warm-process continuity for I-2' images;
+// it never weakens default checks. Healthy warm turns retain both processes
+// (doc/execution-semantics.md:4828); reuse receipts are documented in
+// doc/run-log-events.md:23-53. Logical session IDs alone do not prove warmth.
 // Real HTTP, Postgres, runnerd, official provider pack, Pi and home fixture;
 // only the credential-free loopback model is scripted. Not a Boat transport proof.
 const enabled = process.env.PAPERCLIP_PI_FULL_SERVER_E2E === "1";
@@ -29,6 +32,32 @@ const strict = process.env.PAPERCLIP_PI_E2E_CONTINUING_STRICT === "1";
 const thinking = process.env.PAPERCLIP_PI_E2E_THINKING_LEVEL ?? "xhigh";
 const protocol = process.env.PAPERCLIP_PI_E2E_PROTOCOL ?? "messages";
 type Bundle = ReturnType<typeof import("../vendor/paperclip-runner/index.js").createRunnerdCodexTransport>;
+// Same physical evidence source as native-pi-rpc-full-server.e2e.test.ts:
+// transport.processInfo() identifies runnerd; /proc descendants identify Pi.
+function piDescendant(runnerPid: number): number | null {
+  const children = new Map<number, number[]>();
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+      const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+      children.set(ppid, [...children.get(ppid) ?? [], Number(entry)]);
+    } catch { /* process exited during snapshot */ }
+  }
+  const visit = (pid: number): number | null => {
+    for (const child of children.get(pid) ?? []) {
+      try {
+        const command = readFileSync(`/proc/${child}/cmdline`, "utf8").replaceAll("\0", " ");
+        const comm = readFileSync(`/proc/${child}/comm`, "utf8").trim().toLowerCase();
+        if (comm === "pi" || (command.includes("--mode rpc") && /(?:cli|bundle)\.js/.test(command))) return child;
+      } catch { /* process exited during snapshot */ }
+      const found = visit(child); if (found) return found;
+    }
+    return null;
+  };
+  return visit(runnerPid);
+}
+
 
 it.skipIf(!enabled)(`Done/comment continuing turns and a fresh turn after failure (strict=${strict}, thinking=${thinking})`, async () => {
   expect(thinking).toBe("xhigh"); expect(protocol).toBe("messages");
@@ -334,7 +363,13 @@ it.skipIf(!enabled)(`Done/comment continuing turns and a fresh turn after failur
       if (expectReopened) expect(wake?.reason, `turn ${number} uses the real Done -> comment reopen wake`).toBe("issue_reopened_via_comment");
       const modelRequests = requests.slice(requestStart);
       expect(modelRequests.length, "real model work happened").toBeGreaterThan(0);
+      // Observe the current transport, not just the first retained bundle: a
+      // replacement runner must not pass because the old warm Pi is still alive.
+      // Turns 4/5 deliberately exercise failure/recovery and are exempt.
+      const runnerPid = strict && number <= 3 ? bundles.at(-1)?.transport.processInfo?.()?.pid ?? null : null;
+      const piPid = runnerPid ? piDescendant(runnerPid) : null;
       const proof = { turn: number, runId: settled.id, status: settled.status, nativeSessionId: settled.nativeSessionId,
+        runnerPid, piPid,
         wakeReason: wake?.reason, replyId: replies[0]!.id, reply: replies[0]!.body,
         remembersPrivateFact: modelRequests[0]!.remembersPrivateFact, strict };
       turnProofs.push(proof); stage("continuing turn passed", proof);
@@ -351,7 +386,31 @@ it.skipIf(!enabled)(`Done/comment continuing turns and a fresh turn after failur
     // strict RED still retains the complete ordinary-turn evidence.
     stage("THREE_TURNS_GREEN", { strict, turnProofs });
     if (strict) {
+      expect(first.runnerPid, "STRICT: turn 1 has a real runnerd PID").toBeGreaterThan(0);
+      expect(first.piPid, "STRICT: turn 1 has a real Pi descendant PID").toBeGreaterThan(0);
       for (const proof of turnProofs.slice(1)) {
+        expect(proof.runnerPid, `STRICT: turn ${proof.turn} reuses the same runnerd process`).toBe(first.runnerPid);
+        expect(proof.piPid, `STRICT: turn ${proof.turn} reuses the same Pi process`).toBe(first.piPid);
+        const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, String(proof.runId)));
+        // native.process_start_requested is an execution-attempt fence, emitted
+        // even on warm run.attach (provider-attempt-outcome.ts:47-51), NOT a
+        // physical launch receipt. Keep it in the evidence; prohibit actual
+        // runner launch, checkpoint restore and provider resume instead.
+        for (const operation of ["process_start_requested", "runner.process.launch", "session.checkpoint.restore", "provider.session.resume"]) {
+          const operations = events.flatMap(event => [event.eventType, event.payload?.span,
+            event.payload?.code, (event.payload?.prpEvent as { eventType?: string } | undefined)?.eventType]);
+          expect(operations, `STRICT: turn ${proof.turn} must not perform ${operation}`).not.toContain(operation);
+        }
+        for (const layer of ["runner", "provider_session"]) {
+          const receipts = events.filter(event => event.eventType === "run.startup.reuse" && event.payload?.layer === layer);
+          expect(receipts.length, `STRICT: turn ${proof.turn} has ${layer} startup reuse evidence`).toBeGreaterThan(0);
+          for (const receipt of receipts) expect(receipt.payload).toMatchObject({
+            schema: "paperclip.startup-reuse.v1", layer, state: "reused", reason: "verified_reuse",
+          });
+        }
+        stage("STRICT warm reuse passed", { turn: proof.turn, runId: proof.runId, runnerPid: proof.runnerPid,
+          piPid: proof.piPid, startupReuse: events.filter(event => event.eventType === "run.startup.reuse").map(event => event.payload),
+          nativeDispatchRequests: events.filter(event => event.eventType === "native.process_start_requested").length });
         expect(proof.nativeSessionId, "STRICT: same logical native conversation across Done/reopen").toBe(first.nativeSessionId);
         expect(proof.remembersPrivateFact, "STRICT: Pi retained the first assistant-only fact").toBe(true);
         expect(proof.reply).toContain("RECALL_OK");
