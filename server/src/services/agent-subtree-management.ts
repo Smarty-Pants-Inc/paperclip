@@ -21,20 +21,27 @@ export async function assertCanManageSubordinateAgent(db: Db, actor: Actor, targ
     resource: { type: "agent", companyId: target.companyId, agentId: target.id },
     scope: { targetAgentId: target.id, requiresChangeGrant: true },
   });
-  if (!decision.allowed) throw forbidden(decision.explanation);
+  if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
 }
 
-/** Recheck lifecycle authority inside the company-locked writer transaction.
- * Unlike administrative grants/budgets, legacy unscoped configure stays valid. */
-export async function assertAgentLifecycleAuthority(db: Db, actor: Actor, target: Target) {
+/** Recheck the strict reporting-subtree boundary inside the company-locked writer.
+ * A configure grant, even unscoped or naming the target, never widens that tree. */
+export async function assertAgentLifecycleAuthority(
+  db: Db, actor: Actor, target: Target, command?: "pause" | "resume" | "terminate",
+) {
   if (actor.type !== "agent") return;
   if (actor.agentId === target.id) throw forbidden("Agents cannot manage their own lifecycle.");
-  const decision = await authorizationService(db).decide({
-    actor, action: "agent_config:update",
-    resource: { type: "agent", companyId: target.companyId, agentId: target.id },
-    scope: { targetAgentId: target.id, requiresChangeGrant: true },
-  });
-  if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+  await assertCanManageSubordinateAgent(db, actor, target);
+  if (command === "terminate") {
+    const [current] = await db.select({ status: agents.status }).from(agents).where(and(
+      eq(agents.id, target.id), eq(agents.companyId, target.companyId),
+    ));
+    // Check the saved state, not the route's pre-lock snapshot. Every termination
+    // entry point must preserve the same board-only pending-hire boundary.
+    if (current?.status === "pending_approval") {
+      throw forbidden("Only a board user can reject a pending hire; agent approval deciders are not supported.");
+    }
+  }
 }
 
 /** Internal managed-work writers join the same company mutex as reportsTo.

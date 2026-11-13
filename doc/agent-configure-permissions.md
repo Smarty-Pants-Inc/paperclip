@@ -11,7 +11,10 @@ The default is independent of the creator: board-created agents should not
 silently receive broader authority than agent-created hires. Board users retain
 their existing configuration authority and can explicitly grant broader access.
 Existing principal grants are **not migrated or backfilled**; existing unscoped
-configure grants, including principal agents' grants, continue to work.
+configure grants, including principal agents' grants, continue to work for
+configuration. Agent lifecycle, recovery and cross-agent work controls additionally
+require a strict reporting descendant; an unscoped or target-naming grant cannot
+extend those controls outside the caller's current subtree.
 
 Configuration checks name the target agent. A subtree includes its root and
 transitive reports through `reportsTo`, not siblings, managers or unrelated
@@ -97,17 +100,20 @@ Descendant budget, permission, instruction-path and lifecycle writes recheck
 management authority inside their writer transaction, after acquiring the same
 company-row accounting lock as `reportsTo` updates. Moving an intermediate
 manager therefore cannot race a stale descendant check. The lock order is
-company, then target/task/run rows. Board behavior and explicitly unscoped legacy
-lifecycle grants remain unchanged.
+company, then target/task/run rows. Board behavior remains unchanged. Agent
+lifecycle authority requires a strict reporting descendant even with an explicitly
+unscoped legacy grant or a grant naming an outside target.
 
 Managed wakes and run cancellation use that boundary when saving their durable
 wake receipt or Stop intent. Execution/provider cleanup may finish after a later
 reparent; that completes the already-accepted request, not a new grant of access.
 Self-wake remains separate from cross-agent lifecycle management.
 
-An agent cannot terminate a pending hire: that operation rejects its hire
-approval, whose decider schema currently records only a user ID. It returns 403
-and leaves both approval and hire unchanged. A board user can still reject the
+An agent cannot terminate a pending hire through either `POST /terminate` or
+`PATCH /agents/:id` with `status: "terminated"`: hire rejection is a board
+approval decision, whose decider schema currently records only a user ID. Both
+entry points return 403 and leave approval and hire unchanged; the pending state
+is checked again inside the company-locked lifecycle writer. A board user can still reject the
 hire, recording that user's ID. Approved hires retain delegated lifecycle control.
 
 ## Named follow-up: target-manager consent-card eligibility
