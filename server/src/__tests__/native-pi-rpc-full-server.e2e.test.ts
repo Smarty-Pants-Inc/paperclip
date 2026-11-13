@@ -70,6 +70,7 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
   const expectFinishRed = process.env.PAPERCLIP_PI_E2E_EXPECT_FINISH_RED === "1";
   const includeFinish = process.env.PAPERCLIP_PI_E2E_FINISH !== "0";
   const nativeProbeProofs: Array<Record<string, unknown>> = [{ type: "fixture_adjustment", note: "Finish model tool args now match the ordinary final agent-message fallback summary/evidence. This removes a fixture-only native_event_replay_conflict; no product code or callback path is mocked." }];
+  let observedRunnerPid: number | undefined;
   const snapshotFinishState = async (label: string) => {
     const files: string[] = [];
     const walk = (directory: string) => {
@@ -79,7 +80,9 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
         else if (["codex-provider-state.json", "runner-state.json"].includes(entry.name)) files.push(path);
       }
     };
-    try { walk(join(root, "runner-state")); } catch { /* not launched yet */ }
+    const liveBundle = bundles.find(bundle => bundle.transport.processInfo?.()?.pid === observedRunnerPid);
+    const liveRuntimeDirectory = liveBundle && runtimeDirectories.get(liveBundle);
+    try { if (liveRuntimeDirectory) walk(liveRuntimeDirectory); } catch { /* not launched yet */ }
     const states = files.map(path => {
       const state = JSON.parse(readFileSync(path, "utf8"));
       if (path.endsWith("codex-provider-state.json")) return { path, pending: state.toolBridge?.pending, completed: state.toolBridge?.completed, settledResults: state.toolBridge?.settledResults };
@@ -420,6 +423,7 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
       for (const bundle of bundles) { const process = bundle.transport.processInfo?.(); if (process?.pid) { const pid = piDescendant(process.pid); if (pid) return { runnerPid: process.pid, piPid: pid }; } }
       return null;
     });
+    observedRunnerPid = pid.runnerPid;
     stage("runnerd session up", { runnerPid: pid.runnerPid }); stage("Pi PID", { pid: pid.piPid });
     const readPiEnvironment = () => Object.fromEntries(readFileSync(`/proc/${pid.piPid}/environ`, "utf8").split("\0").filter(Boolean).map(entry => { const at = entry.indexOf("="); return [entry.slice(0, at), entry.slice(at + 1)]; }));
     const launchEnvironment = readPiEnvironment();
