@@ -95,7 +95,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     const sessionId = randomUUID();
     await db.update(heartbeatRuns).set({ error: "Fixture failure", nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, runId));
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
-      .toBe("Saved work recovered. Send a message to continue.");
+      .toBe("Saved work recovered.");
     await db.transaction(tx => writePiSessionHistoryLossNotice(db, tx, { companyId, issueId, runId, agentId,
       authorizationReason: `native_prior_owner_held:${sessionId}`, body: HELD_PREDECESSOR_NOTICE }));
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)).toMatchObject({
@@ -112,7 +112,7 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
     await succeed(sessionId);
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
-      .toBe("Saved work recovered. Send a message to continue.");
+      .toBe("Saved work recovered.");
   });
   it("shows the notice text, without Retry, for a successor refused behind a succeeded owner that wrote no notice", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();

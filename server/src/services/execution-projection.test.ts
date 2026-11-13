@@ -143,7 +143,7 @@ describe("execution truth projection", () => {
       expect(projectExecution({ ...source, status: "timed_out" }, coordinator({ phase: "terminal_failure" }), [], action, now)
         .nextAction).toBe("Saved work recovered.");
       expect(projectExecution({ ...source, errorCode: "native_session_cleanup_quarantined" },
-        coordinator({ phase: "terminal_failure" }), [], action, now).nextAction).toBe("Saved work recovered.");
+        coordinator({ phase: "terminal_failure" }), [], action, now).nextAction).toBe(HELD_PREDECESSOR_NOTICE);
     }
     expect(projectExecution(source, undefined, [], { ...action,
       evidence: { ...action.evidence, workspaceRecovery: { ...action.evidence.workspaceRecovery,
@@ -172,7 +172,7 @@ describe("execution truth projection", () => {
     expect(project(true)).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"],
       nextAction: HELD_PREDECESSOR_NOTICE });
     // No standing notice (none, or superseded) and no refusal code: the ordinary wording.
-    expect(project(false).nextAction).toBe("Saved work recovered. Send a message to continue.");
+    expect(project(false).nextAction).toBe("Saved work recovered.");
     // Files not yet recovered are not called kept.
     expect(project(true, "recovering").nextAction).toBe("Recovering saved work…");
   });
@@ -201,7 +201,7 @@ describe("execution truth projection", () => {
   it("keeps the ordinary recovered wording for the no-replay hold code alone", () => {
     const { source, action } = recoveredHold(ordinary);
     expect(projectExecution(source, coordinator({ phase: "terminal_failure" }), [], action("recovered"), now).nextAction)
-      .toBe("Saved work recovered. Send a message to continue.");
+      .toBe("Saved work recovered.");
   });
 
   it("keeps cleanup quarantine visible without a coordinator or recovery row", () => {
