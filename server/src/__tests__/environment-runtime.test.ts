@@ -27,6 +27,7 @@ import {
   companies,
   companySecretVersions,
   companySecrets,
+  secretAccessEvents,
   createDb,
   environmentLeases,
   sandboxCreationOperations,
@@ -3512,6 +3513,37 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       timeoutMs: 1234,
       sandboxId: "sandbox-1",
     });
+    // Keep reason: measured production audit amplification; inspect real rows.
+    await flushSecretResolutionWrites();
+    const auditCount = async () => (await db.select().from(secretAccessEvents)
+      .where(eq(secretAccessEvents.companyId, companyId))).length;
+    const acquiredAuditCount = await auditCount();
+    expect(acquiredAuditCount).toBe(1);
+    const probeRuntimeConfigScope = {};
+    // A normal launch/turn handoff seeds this runner's probe config and audits
+    // exactly once; the five later observations must not emit five more rows.
+    await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+      command: "true", probeRuntimeConfigScope });
+    await flushSecretResolutionWrites();
+    const handoffAuditCount = await auditCount();
+    expect(handoffAuditCount).toBe(acquiredAuditCount + 1);
+    for (let poll = 0; poll < 5; poll++) {
+      await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+        command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
+    }
+    await flushSecretResolutionWrites();
+    expect(await auditCount()).toBe(handoffAuditCount);
+    // The handle still has its old snapshot: a persisted revision change must
+    // invalidate it anyway. A fresh runner/lease owner must not borrow it either.
+    await environmentService(db).update(environment.id, { name: "Revised secure sandbox" });
+    await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+      command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
+    await flushSecretResolutionWrites();
+    expect(await auditCount()).toBe(handoffAuditCount + 1);
+    await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+      command: "true", probeRuntimeConfigScope: {}, readOnlyProbe: true });
+    await flushSecretResolutionWrites();
+    expect(await auditCount()).toBe(handoffAuditCount + 2);
     const executed = await runtimeWithPlugin.execute({
       environment,
       lease: acquired.lease,

@@ -36,7 +36,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { currentControllerProcess } from "./controller-process-identity.js";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecrets, companySecretVersions, environmentLeases, heartbeatRuns } from "@paperclipai/db";
+import { companySecrets, companySecretVersions, environments, environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type {
   Environment,
   EnvironmentLease,
@@ -593,6 +593,10 @@ export interface EnvironmentDriverRealizeWorkspaceInput extends EnvironmentDrive
 }
 
 export interface EnvironmentDriverExecuteInput extends EnvironmentDriverLeaseInput {
+  /** Opaque owner created per runner. Normal commands seed the config with
+   * ordinary auditing; only host read-only recovery probes may reuse it. */
+  probeRuntimeConfigScope?: object;
+  readOnlyProbe?: boolean;
   command: string;
   args?: string[];
   cwd?: string;
@@ -1539,6 +1543,41 @@ function createSandboxEnvironmentDriver(
     }
 
     return { state: "worker_unavailable" as const, resolved: installed };
+  }
+
+  const probeRuntimeConfigs = new WeakMap<object, { key: string; config: Promise<Record<string, unknown>> }>();
+
+  async function resolvePluginSandboxExecutionConfig(input: EnvironmentDriverExecuteInput, provider: string) {
+    const scope = input.probeRuntimeConfigScope!;
+    // Read only the non-secret revision/raw config, never resolved credentials.
+    // Handles retain snapshots, so checking input.environment.updatedAt alone
+    // would miss an operator's edit while a warm runner remains alive.
+    // Environment definitions are instance-wide; the cache identity below and
+    // the ordinary secret resolver retain the lease's company boundary.
+    const [current] = await db.select({ updatedAt: environments.updatedAt, driver: environments.driver,
+      config: environments.config }).from(environments).where(eq(environments.id, input.environment.id));
+    if (!current || current.driver !== input.environment.driver) {
+      probeRuntimeConfigs.delete(scope);
+      throw new Error("environment_missing_or_driver_changed");
+    }
+    const environment = { ...input.environment, config: current.config };
+    const key = JSON.stringify([input.lease.companyId, environment.id, current.updatedAt,
+      environment.driver, environment.config, input.lease.id, input.lease.providerLeaseId,
+      input.lease.heartbeatRunId, input.lease.metadata, provider]);
+    const cached = probeRuntimeConfigs.get(scope);
+    if (input.readOnlyProbe && cached?.key === key) return await cached.config;
+    // Ordinary commands still own their audited handoff. They seed/refresh the
+    // runner's probe config, so subsequent observations do not resolve secrets.
+    // A cold scope or revision change is also audited; never borrow the signed
+    // Cloud inspection path to suppress runtime audit writes.
+    const config = resolvePluginSandboxRuntimeConfig({ environment, lease: input.lease, provider });
+    const entry = { key, config };
+    probeRuntimeConfigs.set(scope, entry);
+    try { return await config; }
+    catch (error) {
+      if (probeRuntimeConfigs.get(scope) === entry) probeRuntimeConfigs.delete(scope);
+      throw error;
+    }
   }
 
   async function resolvePluginSandboxRuntimeConfig(input: {
@@ -2834,11 +2873,13 @@ function createSandboxEnvironmentDriver(
         const pluginId = readString(input.lease.metadata?.pluginId);
         const providerKey = readString(input.lease.metadata?.provider);
         if (pluginId && providerKey) {
-          const config = await resolvePluginSandboxRuntimeConfig({
-            environment: input.environment,
-            lease: input.lease,
-            provider: providerKey,
-          });
+          const config = input.probeRuntimeConfigScope
+            ? await resolvePluginSandboxExecutionConfig(input, providerKey)
+            : await resolvePluginSandboxRuntimeConfig({
+                environment: input.environment,
+                lease: input.lease,
+                provider: providerKey,
+              });
           const sanitizedConfig = stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig);
           return await pluginWorkerManager.call(pluginId, "environmentExecute", {
             driverKey: providerKey,
