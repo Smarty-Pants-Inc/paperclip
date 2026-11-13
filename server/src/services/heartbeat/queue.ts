@@ -116,6 +116,8 @@ import {
   caseHandoffs,
   cases,
   agentWakeupRequests,
+  plugins,
+  pluginCompanySettings,
   activityLog,
   budgetIncidents,
   chatConversations,
@@ -2157,7 +2159,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
           sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`,
-          sql`nullif(btrim(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}'), '') is not null`)))
+          sql`(${agentWakeupRequests.payload}->>'mutation' = 'plugin_wakeup'
+            and ${agentWakeupRequests.payload}->>'pluginId' = ${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}'
+            and ${agentWakeupRequests.payload}->>'pluginKey' = ${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginKey}'
+            and ${agentWakeupRequests.payload}->>'pluginId' is not null
+            and ${agentWakeupRequests.payload}->>'pluginKey' is not null
+            and ${agentWakeupRequests.requestedByActorType} = 'system'
+            and ${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.payload}->>'pluginId')`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
         scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
@@ -2167,7 +2175,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
-        sql`nullif(btrim(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}'), '') is not null`,
+        sql`(${agentWakeupRequests.payload}->>'mutation' = 'plugin_wakeup'
+          and ${agentWakeupRequests.payload}->>'pluginId' = ${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}'
+          and ${agentWakeupRequests.payload}->>'pluginKey' = ${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginKey}'
+          and ${agentWakeupRequests.payload}->>'pluginId' is not null
+          and ${agentWakeupRequests.payload}->>'pluginKey' is not null
+          and ${agentWakeupRequests.requestedByActorType} = 'system'
+          and ${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.payload}->>'pluginId')`,
         dependencyResolvedWakePayloadSql, assignmentWakePayloadSql),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
@@ -2180,9 +2194,42 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
       const ownerWake = isDependencyResolvedWakePayload(wake.payload) || isAssignmentWakePayload(wake.payload);
-      const pluginWake = readNonEmptyString(parseObject(wake.payload?._paperclipWakeContext).pluginId) !== null;
+      const payload = parseObject(wake.payload);
+      const context = parseObject(payload._paperclipWakeContext);
+      const pluginId = readNonEmptyString(payload.pluginId);
+      const pluginKey = readNonEmptyString(payload.pluginKey);
+      const pluginWake = payload.mutation === "plugin_wakeup" && pluginId !== null && pluginKey !== null &&
+        context.pluginId === pluginId && context.pluginKey === pluginKey &&
+        wake.requestedByActorType === "system" && wake.requestedByActorId === pluginId;
       if (!pluginWake && !ownerWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
+      if (pluginWake) {
+        const [plugin] = await db.select({ id: plugins.id, pluginKey: plugins.pluginKey, status: plugins.status })
+          .from(plugins).where(sql`${plugins.id}::text = ${pluginId}`);
+        const [companySetting] = plugin ? await db.select({ enabled: pluginCompanySettings.enabled })
+          .from(pluginCompanySettings).where(and(eq(pluginCompanySettings.pluginId, plugin.id),
+            eq(pluginCompanySettings.companyId, wake.companyId))) : [];
+        if (!plugin || plugin.pluginKey !== pluginKey || plugin.status !== "ready" || companySetting?.enabled === false) {
+          await db.update(agentWakeupRequests).set({ status: "cancelled", error: "plugin_wakeup_origin_unavailable",
+            finishedAt: new Date(), updatedAt: new Date() }).where(and(eq(agentWakeupRequests.id, wake.id),
+            eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          continue;
+        }
+        if (wake.idempotencyKey) {
+          const [priorRun] = await db.select({ id: heartbeatRuns.id }).from(agentWakeupRequests)
+            .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
+            .where(and(eq(agentWakeupRequests.companyId, wake.companyId),
+              eq(agentWakeupRequests.agentId, wake.agentId), eq(agentWakeupRequests.idempotencyKey, wake.idempotencyKey),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${String(payload.issueId)}`,
+              sql`${agentWakeupRequests.id} <> ${wake.id}`)).limit(1);
+          if (priorRun) {
+            await db.update(agentWakeupRequests).set({ status: "coalesced", error: "plugin_wakeup_already_delivered",
+              finishedAt: new Date(), updatedAt: new Date() }).where(and(eq(agentWakeupRequests.id, wake.id),
+              eq(agentWakeupRequests.status, "deferred_issue_execution")));
+            continue;
+          }
+        }
+      }
       const [latest] = await db.select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
