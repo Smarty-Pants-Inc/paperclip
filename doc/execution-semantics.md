@@ -3859,7 +3859,12 @@ not convert the no-op acknowledgement into a dispatched interrupt receipt or
 permission to continue the cancelled turn.
 Terminal release preserves a selected warm (`keep_running`) reusable sandbox
 for ordinary adapter failure, native session interruption, or completed cancellation,
-as well as success. The failed provider session is still retired; retaining its
+as well as success. An `adapter_failed` preparation explicitly recorded with
+`executionRecovery.providerWorkStarted: false` instead uses stop-and-retain. The
+existing provider stop must confirm the exact allocation before Paperclip records
+its termination receipt and admits the next user turn. An unconfirmed or failed
+stop remains pending cleanup; cancelled and interrupted warm runs keep their
+selected retention policy. The failed provider session is still retired; retaining its
 allocation does not grant permission to continue that session. Warm retention is
 bounded: the second consecutive ordinary non-successful turn on the same provider
 allocation stops and retains it. Lease metadata records `warmFailureStreak` and the

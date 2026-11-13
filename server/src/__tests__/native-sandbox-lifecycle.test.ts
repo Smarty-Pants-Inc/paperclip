@@ -120,6 +120,17 @@ describe("paperclip_runner sandbox lifecycle", () => {
     expect(providerResourceDispositionForTerminalRun("stop_and_retain", "failed", "adapter_failed")).toBe("stop_and_retain");
   });
 
+  it("stops a selected warm sandbox only for a never-started adapter_failed preparation", () => {
+    expect(providerResourceDispositionForTerminalRun("keep_running", "failed", "adapter_failed", false)).toBe("stop_and_retain");
+    for (const workStarted of [undefined, null, true, "false", 0, {}]) {
+      expect(providerResourceDispositionForTerminalRun("keep_running", "failed", "adapter_failed", workStarted)).toBe("keep_running");
+    }
+    expect(providerResourceDispositionForTerminalRun("destroy", "failed", "adapter_failed", false)).toBe("destroy");
+    expect(providerResourceDispositionForTerminalRun(undefined, "failed", "adapter_failed", false)).toBeUndefined();
+    expect(providerResourceDispositionForTerminalRun("keep_running", "cancelled", "adapter_failed", false)).toBe("keep_running");
+    expect(providerResourceDispositionForTerminalRun("keep_running", "interrupted", "native_session_interrupted", false)).toBe("keep_running");
+  });
+
   it.each(["native_restart_recovery_blocked", "native_continuation_requires_reconciliation",
     "native_event_replay_conflict", "native_session_cleanup_quarantined", "lease_released_before_terminal", "unknown_failure"])(
     "does not earn warm retention for an untrusted or unclassified failure: %s", errorCode => {
