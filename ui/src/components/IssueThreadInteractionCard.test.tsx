@@ -1177,23 +1177,14 @@ describe("IssueThreadInteractionCard", () => {
     );
   });
 
-  it("opens a bound attachment directly without experimental panel routing", () => {
-    const host = renderCard({ interaction: { ...pendingRequestItemVerdictsInteraction,
-      payload: { ...pendingRequestItemVerdictsInteraction.payload, items: [{ id: "file", label: "Reviewed file", target: {
-        type: "issue_attachment", attachmentId: "immutable-file", assetId: "asset", sha256: "hash",
-      } }] },
-    } });
-    const link = host.querySelector('a[href="/api/attachments/immutable-file/content"]');
-    expect(link?.getAttribute("target")).toBe("_blank");
-  });
-
-  it.each([undefined, "/stale-display-link"])("opens a confirmation's bound attachment in Classic when href is %s", href => {
+  it.each([undefined, "/stale-display-link"])("links a confirmation's bound attachment in-app when href is %s", href => {
     const host = renderCard({ interaction: { ...pendingRequestConfirmationInteraction, payload: {
       version: 1, prompt: "Review the attached copy", target: {
         type: "issue_attachment", attachmentId: "immutable-file", assetId: "asset", sha256: "hash", href,
       },
     } } });
-    expect(host.querySelector('a[href="/api/attachments/immutable-file/content"]')?.getAttribute("target")).toBe("_blank");
+    const link = host.querySelector('a[href="/issues/issue-thread-interactions#interaction-interaction-confirmation-default&attachment=immutable-file"]');
+    expect(link?.getAttribute("target")).toBeNull();
   });
 
   it("links a bound review item to its exact document without requiring href", () => {
