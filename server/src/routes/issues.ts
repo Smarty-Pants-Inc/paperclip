@@ -393,6 +393,7 @@ import {
   type TrustPresetResolution,
 } from "../services/trust-preset-resolver.js";
 import { externalObjectService } from "../services/external-objects.js";
+import { directParentReportDisabledForIssue } from "../services/direct-parent-report.js";
 import { getExternalChannelBindingSummary } from "../services/chat-channel-binding.js";
 import { deliverAgentUnblockNotification } from "../services/routable-blocked.js";
 import {
@@ -4165,41 +4166,6 @@ export function issueRoutes(
         trustBoundary: trust.boundary,
       },
     });
-  }
-
-  async function directParentReportDisabledForIssue(issue: {
-    companyId: string;
-    projectId?: string | null;
-    executionPolicy?: unknown;
-    assigneeAgentId?: string | null;
-    checkoutRunId?: string | null;
-    executionRunId?: string | null;
-  }) {
-    const resolution = issue.assigneeAgentId
-      ? await resolveAgentTrustForIssue(
-          {
-            agentId: issue.assigneeAgentId,
-            runId: issue.checkoutRunId ?? issue.executionRunId,
-          },
-          issue.companyId,
-          issue,
-        )
-      : null;
-    if (resolution) return resolution.kind !== "standard";
-
-    const project = issue.projectId
-      ? await projectsSvc.getById(issue.projectId)
-      : null;
-    return (
-      resolveCoreTrustPreset({
-        companyId: issue.companyId,
-        project: project?.companyId === issue.companyId ? project : null,
-        issue: {
-          companyId: issue.companyId,
-          executionPolicy: issue.executionPolicy,
-        },
-      }).kind !== "standard"
-    );
   }
 
   async function assertLowTrustControlPlaneDenied(
@@ -15675,7 +15641,7 @@ export function issueRoutes(
         existing.status !== updateFields.status &&
         (updateFields.status === "blocked" ||
           updateFields.status === "cancelled") &&
-        (await directParentReportDisabledForIssue({
+        (await directParentReportDisabledForIssue(db, {
           companyId: existing.companyId,
           projectId:
             updateFields.projectId === undefined

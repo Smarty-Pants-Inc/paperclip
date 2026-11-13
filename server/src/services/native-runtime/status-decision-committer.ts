@@ -73,6 +73,7 @@ import {
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
+import { directParentReportDisabledForIssue } from "../direct-parent-report.js";
 import { companySkillService } from "../company-skills.js";
 import { syncRoutineRunStatusForIssue } from "../routine-run-status.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -2390,6 +2391,82 @@ export async function commitNativeStatusDecision(input: {
           reasonCode,
         },
       });
+    }
+
+    if (
+      issue.status !== updated.status &&
+      (updated.status === "blocked" || updated.status === "cancelled") &&
+      updated.parentId &&
+      (await directParentReportDisabledForIssue(tx as unknown as Db, updated))
+    ) {
+      const stopRelay = await issueService(tx as unknown as Db).addStopRelayCommentIfNeeded(
+        updated,
+        tx,
+      );
+      if (stopRelay) {
+        materialized.push({
+          effectKind: "child_stop_relay_comment",
+          targetType: "issue_comment",
+          targetId: stopRelay.comment.id,
+          payload: {
+            parentIssueId: stopRelay.parent.id,
+            childIssueId: updated.id,
+            childStatus: updated.status,
+          },
+        });
+        const { publication } = await persistActivity(tx as unknown as Db, {
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "issue_stop_relay",
+          runId: input.runId,
+          action: "issue.comment_added",
+          entityType: "issue",
+          entityId: stopRelay.parent.id,
+          issueId: stopRelay.parent.id,
+          details: {
+            commentId: stopRelay.comment.id,
+            source: "child_stop_relay",
+            childIssueId: updated.id,
+            childIdentifier: updated.identifier,
+            childStatus: updated.status,
+          },
+        });
+        publications.push(publication);
+
+        if (
+          stopRelay.parent.assigneeAgentId &&
+          !["done", "cancelled"].includes(stopRelay.parent.status)
+        ) {
+          const wakeId = await enqueueWake({
+            tx: tx as unknown as Db,
+            companyId: input.companyId,
+            issueId: stopRelay.parent.id,
+            agentId: stopRelay.parent.assigneeAgentId,
+            reason: "issue_commented",
+            idempotencyKey: `issue-stop-relay:${updated.id}:${updated.status}`,
+            payload: {
+              commentId: stopRelay.comment.id,
+              mutation: "comment",
+            },
+            contextSnapshot: {
+              commentId: stopRelay.comment.id,
+              wakeCommentId: stopRelay.comment.id,
+              childIssueId: updated.id,
+              childStatus: updated.status,
+            },
+          });
+          materialized.push({
+            effectKind: "child_stop_relay_wake",
+            targetType: "agent_wakeup_request",
+            targetId: wakeId,
+            payload: {
+              parentIssueId: stopRelay.parent.id,
+              childIssueId: updated.id,
+              childStatus: updated.status,
+            },
+          });
+        }
+      }
     }
 
     if (input.decision.statusAction === "done" && issue.status !== "done") {

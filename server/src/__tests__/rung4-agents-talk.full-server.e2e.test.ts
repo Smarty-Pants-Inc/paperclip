@@ -599,7 +599,7 @@ describe("rung 4 agent talk: full-server Pi RPC proofs", () => {
     stage("mention plus assignment proof passed", { issueId: target.id, bRunId: bRun.id, wakeReason: (bRun.contextSnapshot as any)?.wakeReason, commentId: bComment.id });
   }, 240_000);
 
-  it.skipIf(!enabled)("blocked child relays to B, whose run reads and quotes A's exact child comment", async () => {
+  it.skipIf(!enabled)("standard-trust blocked child keeps its comment without a core parent stop relay", async () => {
     const nonce = `r4-blocker-${randomUUID()}`;
     const managerMarker = `R4_BLOCKER_PARENT_${nonce}`;
     const workerMarker = `R4_BLOCKER_CHILD_${nonce}`;
@@ -635,22 +635,23 @@ describe("rung 4 agent talk: full-server Pi RPC proofs", () => {
     });
     const { issueService } = await import("../services/issues.js");
     expect((await issueService(db!).getDependencyReadiness(child.id)).blockerIssueIds).toContain(dependency.id);
-    const relayAndReply = await waitFor("system relay, B's issue_commented run, and exact quote", async () => {
-      const [parentComments, runs] = await Promise.all([
-        db!.select().from(issueComments).where(eq(issueComments.issueId, parent.id)),
-        db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentBId)),
-      ]);
-      const relay = parentComments.find(comment => comment.authorType === "system" && comment.body.includes(child.identifier) && comment.body.includes("transitioned to `blocked`"));
-      const run = runs.find(candidate => candidate.nativeIssueId === parent.id && (candidate.contextSnapshot as any)?.wakeReason === "issue_commented"
-        && (candidate.contextSnapshot as any)?.childIssueId === child.id && (candidate.contextSnapshot as any)?.childStatus === "blocked");
-      const reply = parentComments.find(comment => comment.authorAgentId === agentBId && comment.body === blockerLine);
-      return relay && run?.startedAt && reply ? { relay, run, reply } : null;
-    });
-    expect(relayAndReply.reply.createdByRunId).toBe(relayAndReply.run.id);
-    stage("blocked-child relay proof passed", { parentId: parent.id, childId: child.id, dependencyId: dependency.id,
-      relayId: relayAndReply.relay.id, managerRunId: relayAndReply.run.id, wakeReason: (relayAndReply.run.contextSnapshot as any)?.wakeReason,
-      childStatus: (relayAndReply.run.contextSnapshot as any)?.childStatus, managerReplyId: relayAndReply.reply.id,
-      quotedExactChildComment: relayAndReply.reply.body });
+    // The blocked projection is committed before these reads. Core stop relays
+    // are low-trust-only; the separate blocker-relay plugin is not installed here.
+    const [parentComments, wakes, runs] = await Promise.all([
+      db!.select().from(issueComments).where(eq(issueComments.issueId, parent.id)),
+      db!.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentBId)),
+      db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentBId)),
+    ]);
+    const relays = parentComments.filter(comment => comment.authorType === "system" && comment.body.includes(child.identifier) && comment.body.includes("transitioned to `blocked`"));
+    const relayWakes = wakes.filter(wake => wake.idempotencyKey === `issue-stop-relay:${child.id}:blocked`);
+    const relayRuns = runs.filter(run => run.nativeIssueId === parent.id && (run.contextSnapshot as any)?.wakeReason === "issue_commented"
+      && (run.contextSnapshot as any)?.childIssueId === child.id && (run.contextSnapshot as any)?.childStatus === "blocked");
+    expect(relays).toEqual([]);
+    expect(relayWakes).toEqual([]);
+    expect(relayRuns).toEqual([]);
+    expect(parentComments.filter(comment => comment.authorAgentId === agentBId && comment.body === blockerLine)).toEqual([]);
+    stage("standard-trust blocked-child relay absence verified", { parentId: parent.id, childId: child.id, dependencyId: dependency.id,
+      childStatus: childAfter.status, relayCount: relays.length, relayWakeCount: relayWakes.length, relayRunCount: relayRuns.length });
   }, 240_000);
 
   it.skipIf(!enabled)("B steers the same active pi_rpc run; A adopts the marker without a successor run", async () => {
