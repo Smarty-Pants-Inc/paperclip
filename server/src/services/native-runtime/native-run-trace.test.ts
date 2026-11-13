@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { writeFile } from "node:fs/promises";
 
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
+import { measureRunnerOperation } from "./runner-operation-timing.js";
 import type { StartupTraceContextHandle } from "../../instrumentation.js";
 import {
   buildNativeHeartbeatPreparationSpans,
@@ -69,6 +71,32 @@ function createRecordingTraceContext(): {
 }
 
 describe("native runner performance trace", () => {
+  it("persists Pi RPC spans and retained transport attach for the current run without OTLP", async () => {
+    const events = new Map<string, AdapterRuntimeEvent[]>();
+    const traces = ["old-run", "warm-run"].map(runId => createNativeRunTrace({ runId,
+      onEvent: async event => { const rows = events.get(runId) ?? []; rows.push(event); events.set(runId, rows); } }));
+    const attach = () => measureRunnerOperation("runner.transport.attach", async () => "attached");
+    for (const trace of traces) {
+      const scope = trace.start("native.session.execute");
+      expect(await trace.run(scope, attach)).toBe("attached");
+      const now = Date.now();
+      await recordNativeProviderPerformanceSpans(trace, [
+        { name: "runner.pi.admission.get_state", startedAtMs: now - 5, endedAtMs: now },
+        { name: "runner.pi.prompt_to_started", startedAtMs: now - 3, endedAtMs: now },
+      ]);
+      await trace.end(scope);
+      await trace.finish("ok");
+    }
+    for (const runId of ["old-run", "warm-run"]) {
+      const rows = events.get(runId)!.filter(event => event.eventType === NATIVE_RUN_SPAN_EVENT_TYPE);
+      expect(rows.map(event => event.payload?.span))
+        .toEqual(expect.arrayContaining(["runner.transport.attach", "runner.pi.admission.get_state", "runner.pi.prompt_to_started"]));
+      expect(rows.filter(event => event.payload?.span === "runner.transport.attach")).toHaveLength(1);
+      for (const row of rows) expect(row.payload?.durationMs).toBeGreaterThanOrEqual(0);
+    }
+    if (process.env.PI_WARM_RUN_LOG_OUT) await writeFile(process.env.PI_WARM_RUN_LOG_OUT,
+      JSON.stringify(Object.fromEntries(events), null, 2));
+  });
   it("projects a full durable diagnostic batch without waiting on duplicate run-log writes", async () => {
     const {traceContext, spans}=createRecordingTraceContext();
     let release!: () => void;

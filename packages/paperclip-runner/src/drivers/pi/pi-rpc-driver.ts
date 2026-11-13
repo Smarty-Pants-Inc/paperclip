@@ -36,6 +36,7 @@ import type {
 import { HarnessCapabilityUnavailableError, HarnessOperationAlreadyTerminalError, HarnessStaleTurnError } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
+import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase } from "../../contracts/provider-performance.js";
 
 export interface PiRpcDriverOptions {
   /** Proxy/backend integration options currently forwarded by the native factory. */
@@ -389,10 +390,14 @@ interface PiSessionState {
 
 const PI_PROCESS_STARTUP_TIMEOUT_MS = 60_000;
 
-function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
+function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000,
+  measure?: <T>(name: ProviderPerformancePhase, work: () => Promise<T>) => Promise<T>): PiRpcAdmissionPort {
   return { request: async ({ type, ...params }, signal) => {
-    const response = await withAbort(withTimeout(transport.request(type, params), timeoutMs, "Pi RPC admission timed out"), signal);
-    return response.data;
+    const work = async () => {
+      const response = await withAbort(withTimeout(transport.request(type, params), timeoutMs, "Pi RPC admission timed out"), signal);
+      return response.data;
+    };
+    return measure ? measure(`runner.pi.admission.${type}` as ProviderPerformancePhase, work) : work();
   } };
 }
 
@@ -408,6 +413,8 @@ interface PiTurnState extends PiEventOrigin {
   lastAssistantStopReason?: string | null;
   settled: boolean;
   cancelRequested?: boolean;
+  /** Cleared at Pi's first agent_start, not the facade's optimistic turn.started. */
+  promptStartedAtMs?: number;
 }
 
 /** Carries the projector's captured owner across the pump's async failure path. */
@@ -564,8 +571,8 @@ export class PiRpcHarnessSession implements HarnessSession {
     dynamicTools?: readonly Readonly<Record<string, unknown>>[];
     runtimeContext?: unknown;
   }): Promise<void> {
-    return this.#serialize(async () => {
-      await this.#interrupting;
+    return this.#measure("runner.pi.attach", () => this.#serialize(async () => {
+      await this.#waitForInterrupt(input.runId);
       if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
       if (this.#resident) {
         const previous = this.#resident.context;
@@ -576,7 +583,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // same-run post-claim admission. Do not consume INITIAL or rotate twice.
         if (this.#resident.binding) {
           if (input.runId !== this.#runId || JSON.stringify(context) !== JSON.stringify(previous)) throw new Error("Pi prepared binding context cannot change before its turn");
-          await this.#admit(input.signal);
+          await this.#admit(input.signal, input.runId);
         } else await this.#prepareBinding(input.runId, context, input.signal);
       } else {
         // Direct env/native providers retain their existing behavior. They do
@@ -586,14 +593,14 @@ export class PiRpcHarnessSession implements HarnessSession {
           input.dynamicTools,
           input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
         if (JSON.stringify(context.tools) !== JSON.stringify(previous.tools)) throw new Error("Pi RPC tool refresh requires a provider bind receipt");
-        await this.#admit(input.signal);
+        await this.#admit(input.signal, input.runId);
         await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
         await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
         this.#initialContext = context;
       }
       this.#runId = input.runId;
       for (const diagnostic of (this.#resident?.context ?? this.#initialContext).diagnostics) this.#emit("harness.diagnostic", diagnostic);
-    });
+    }), { runId: input.runId });
   }
 
   /** Runner's post-claim hook; shared HarnessSession has no claim contract. */
@@ -612,6 +619,25 @@ export class PiRpcHarnessSession implements HarnessSession {
     return result;
   }
 
+  #recordTiming(name: ProviderPerformancePhase, startedAtMs: number, endedAtMs: number,
+    outcome: "ok" | "failed", origin: { runId: string; turnId?: string }): void {
+    try {
+      this.#emit("harness.diagnostic", { code: PROVIDER_PERFORMANCE_DIAGNOSTIC,
+        spans: [{ name, startedAtMs, endedAtMs: Math.max(startedAtMs, endedAtMs), outcome }] }, origin);
+    } catch { /* Diagnostics must not replace the operation's result. */ }
+  }
+
+  async #measure<T>(name: ProviderPerformancePhase, work: () => Promise<T>, origin = { runId: this.#runId }): Promise<T> {
+    const startedAtMs = Date.now();
+    let outcome: "ok" | "failed" = "failed";
+    try { const result = await work(); outcome = "ok"; return result; }
+    finally { this.#recordTiming(name, startedAtMs, Date.now(), outcome, origin); }
+  }
+
+  async #waitForInterrupt(runId = this.#runId): Promise<void> {
+    if (this.#interrupting) await this.#measure("runner.pi.interrupt_wait", () => this.#interrupting!, { runId });
+  }
+
   #effectiveContext(): Record<string, unknown> {
     return { model: this.#identity.model, piRpcThinkingLevel: this.#identity.piRpcThinkingLevel, piMetadata: this.#piMetadata };
   }
@@ -625,12 +651,13 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  async #admit(signal?: AbortSignal): Promise<void> {
+  async #admit(signal?: AbortSignal, runId = this.#runId): Promise<void> {
     if (this.#closed) throw new Error("Pi RPC session is closed");
     if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
     this.#admitted = false;
     try {
-      const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
+      const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs,
+        (name, work) => this.#measure(name, work, { runId })), this.#config, signal);
       if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
       if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
       this.#recordAdmission(identity);
@@ -661,7 +688,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       // Never retry a lost ACK: its native state is uncertain, so retire it.
       await this.#sendBind(request, signal);
       resident.epoch = origin.epoch;
-      await this.#admit(signal);
+      await this.#admit(signal, runId);
       await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
       await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
       resident.context = context;
@@ -672,10 +699,14 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async #sendBind<C extends PiBindCommand>(request: C, signal?: AbortSignal): Promise<PiBindResponse<C>> {
-    const timeoutMs = this.#admissionTimeoutMs ?? 5000;
-    const receipt = await withAbort(withTimeout(this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal }), timeoutMs, "Pi private receipt timed out"), signal);
-    if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
-    return receipt;
+    const work = async () => {
+      const timeoutMs = this.#admissionTimeoutMs ?? 5000;
+      const receipt = await withAbort(withTimeout(this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal }), timeoutMs, "Pi private receipt timed out"), signal);
+      if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
+      return receipt;
+    };
+    return request.type === "bind" || request.type === "begin_turn"
+      ? this.#measure(`runner.pi.${request.type}`, work, { runId: request.runId }) : work();
   }
 
   async #revokeBinding(): Promise<void> {
@@ -696,7 +727,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]): Promise<{ turnId: string }> {
     piRpcUserInput(input.message);
     return this.#serialize(async () => {
-      await this.#interrupting;
+      await this.#waitForInterrupt();
       if (this.#closed) throw new Error("Pi RPC session is closed");
       if (this.#failure) throw this.#failure;
       if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
@@ -746,6 +777,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // only by this host prompt, never attach/bind or callback arrival.
         if (binding) this.#callbacks?.activate(binding.origin, this.#resident!.context.toolNames);
         this.#pendingInput++;
+        turn.promptStartedAtMs = Date.now();
         const response = await this.#transport.request("prompt", message, { timeoutMs: this.#promptTimeoutMs }).finally(() => { this.#pendingInput--; });
         const disposition = stringValue(record(response.data).disposition);
         if (disposition === "handled") {
@@ -1190,6 +1222,9 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   async #consume(event: PiRpcRecord): Promise<void> {
+    // Capture receipt before the acceptance gate: a slow prompt ACK must not
+    // inflate Pi's actual first-start latency.
+    const observedAtMs = event.type === "agent_start" ? Date.now() : 0;
     if (event.type === "extension_error" && event.event === "session_start") {
       // Startup diagnostics precede any turn. Publish at session scope instead
       // of losing them to the turn-origin gate below. Transport bounds count.
@@ -1249,7 +1284,12 @@ export class PiRpcHarnessSession implements HarnessSession {
         this.#emit("session.failed", { code: "pi_unrequested_agent_start" });
         void this.close().catch(() => undefined);
       } else {
-        this.#agentTurn = this.#activeTurn;
+        const turn = this.#activeTurn;
+        if (turn.promptStartedAtMs !== undefined) {
+          this.#recordTiming("runner.pi.prompt_to_started", turn.promptStartedAtMs, observedAtMs, "ok", turn);
+          turn.promptStartedAtMs = undefined;
+        }
+        this.#agentTurn = turn;
         this.#activeTurn.agentEnded = false;
       }
       return;

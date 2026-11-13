@@ -141,8 +141,9 @@ it("keeps real Pi 1.5.2 usable after a third-party home session_start exception"
     expect(diagnostics[0].extensionPath).toBe(thirdPartyPath);
     expect(String(diagnostics[0].error)).toHaveLength(2048);
     expect(JSON.stringify(diagnostics[0]).length).toBeLessThan(3300);
-    expect(sessionDiagnostics).toHaveLength(1);
-    expect(sessionDiagnostics[0]).toMatchObject({ code: "pi_extension_startup_failed", event: "session_start", extensionPath: thirdPartyPath, message: diagnostics[0].error });
+    const nonTimingDiagnostics = sessionDiagnostics.filter(diagnostic => diagnostic.code !== "provider_performance_spans");
+    expect(nonTimingDiagnostics).toHaveLength(1);
+    expect(nonTimingDiagnostics[0]).toMatchObject({ code: "pi_extension_startup_failed", event: "session_start", extensionPath: thirdPartyPath, message: diagnostics[0].error });
   } catch (error) { failure = String(error); throw error; }
   finally {
     if (timer) clearTimeout(timer);
