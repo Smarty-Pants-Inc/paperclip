@@ -36,11 +36,10 @@ import type {
   BudgetThresholdType,
   BudgetWindowKind,
 } from "@paperclipai/shared";
-import { HttpError, forbidden, notFound, unprocessable } from "../errors.js";
+import { HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { withAccountingReadSnapshot, withAccountingTransaction, withOperationAccountingTransaction } from "./accounting-transaction.js";
 import { logActivity, type LogActivityInput, type ActivityPublication } from "./activity-log.js";
-import { assertSubordinateBudgetChange } from "./agent-subtree-management.js";
 import { computeObservedSpend, computeObservedSpends, type ObservedSpend } from "./budget-exposure.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { listPendingBudgetCancellationScopes } from "./heartbeat/budget-cancellation.js";
@@ -838,22 +837,10 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
       companyId: string,
       input: BudgetPolicyUpsertInput,
       actorUserId: string | null,
-      actorAgentId?: string,
     ): Promise<BudgetPolicySummary> => {
       const scope = await resolveScopeRecord(db, input.scopeType, input.scopeId);
       if (scope.companyId !== companyId) {
         throw unprocessable("Budget scope does not belong to company");
-      }
-      if (actorAgentId) {
-        if (input.scopeType !== "agent" || input.amount === undefined) {
-          throw forbidden("Agents may edit only subordinate agent budgets");
-        }
-        // Recheck under the writer transaction and lock the target against reparenting.
-        await db.select({ id: agents.id }).from(agents).where(and(
-          eq(agents.companyId, companyId), eq(agents.id, input.scopeId),
-        )).for("update");
-        await assertSubordinateBudgetChange(db, { type: "agent", agentId: actorAgentId, companyId },
-          { id: input.scopeId, companyId }, input.amount);
       }
 
       if (input.reservationCents !== undefined && compareCents(input.reservationCents, 0) < 0) throw unprocessable("Reservation cannot be negative");
@@ -973,9 +960,8 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
 
       await recordActivity({
         companyId,
-        actorType: actorAgentId ? "agent" : "user",
-        actorId: actorAgentId ?? actorUserId ?? "board",
-        agentId: actorAgentId,
+        actorType: "user",
+        actorId: actorUserId ?? "board",
         action: "budget.policy_upserted",
         entityType: "budget_policy",
         entityId: row.id,
@@ -1386,8 +1372,8 @@ export function budgetService(db: Db, _hooks: BudgetServiceHooks = {}) {
     reconcileScope: (companyId: string, scopeType: BudgetScopeType, scopeId: string) =>
       mutate(companyId, service => service.reconcileScope(companyId, scopeType, scopeId), { scopeType, scopeId }),
     reconcilePolicies: () => reconcileDueBudgetPolicies(db, { startup: true }),
-    upsertPolicy: (companyId: string, input: BudgetPolicyUpsertInput, actorUserId: string | null, actorAgentId?: string) =>
-      mutate(companyId, service => service.upsertPolicy(companyId, input, actorUserId, actorAgentId), input),
+    upsertPolicy: (companyId: string, input: BudgetPolicyUpsertInput, actorUserId: string | null) =>
+      mutate(companyId, service => service.upsertPolicy(companyId, input, actorUserId), input),
     evaluateCostEvent: (event: typeof costEvents.$inferSelect) => withOperationAccountingTransaction(db, event.companyId, tx => queueBudgetEvaluation(tx, { companyId: event.companyId, agentId: event.agentId, projectId: event.projectId })),
     getInvocationBlock: (companyId: string, agentId: string | null, context?: AdmissionContext) =>
       withBudgetSpan("budget.admission.inspect", () => withAccountingReadSnapshot(db, companyId,

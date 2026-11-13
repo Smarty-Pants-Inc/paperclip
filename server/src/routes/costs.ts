@@ -34,7 +34,6 @@ import {
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { badRequest, forbidden } from "../errors.js";
-import { assertSubordinateBudgetChange } from "../services/agent-subtree-management.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const reportDateSchema = z.union([z.iso.datetime({ offset: true }), z.iso.date()]);
@@ -411,8 +410,7 @@ export function costRoutes(
     const agent = await getAccessibleResource(req, res, agents.getById(agentId), "Agent not found");
     if (!agent) return;
 
-    if (req.actor.type === "agent") await assertSubordinateBudgetChange(db, req.actor, agent, req.body.budgetMonthlyCents);
-    else assertBoard(req);
+    assertBoard(req);
 
     await budgets.upsertPolicy(
       agent.companyId,
@@ -424,7 +422,6 @@ export function costRoutes(
         windowKind: "calendar_month_utc",
       },
       req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-      req.actor.type === "agent" ? req.actor.agentId : undefined,
     );
 
     res.json(await agents.getById(agentId));
