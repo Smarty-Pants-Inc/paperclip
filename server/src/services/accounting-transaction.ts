@@ -12,19 +12,13 @@ export async function withAccountingTransaction<T>(db: Db, companyId: string, wo
   const publications: ActivityPublication[] = [];
   const result = await withBudgetSpan("budget.accounting.transaction", () => db.transaction(async (transaction) => {
     const tx = transaction as unknown as Db;
-    await lockAccountingCompany(tx, companyId);
+    const [company] = await withBudgetSpan("budget.accounting.lock_wait", () => tx.select({ id: companies.id }).from(companies)
+      .where(eq(companies.id, companyId)).for("no key update"));
+    if (!company) throw notFound("Company not found");
     return work(tx, publications);
   }));
   publishAccountingActivities(companyId, publications);
   return result;
-}
-
-/** Reuse the reporting-tree/accounting mutex inside an existing writer transaction.
- * Call before any agent, task or run row locks. */
-export async function lockAccountingCompany(tx: Db, companyId: string) {
-  const [company] = await withBudgetSpan("budget.accounting.lock_wait", () => tx.select({ id: companies.id }).from(companies)
-    .where(eq(companies.id, companyId)).for("no key update"));
-  if (!company) throw notFound("Company not found");
 }
 
 /** Independent paid operations share a consistent snapshot, never a company

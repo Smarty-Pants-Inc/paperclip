@@ -1,5 +1,3 @@
-import { withAccountingTransaction } from "../accounting-transaction.js";
-import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
 import { preservePiConversation } from "../native-runtime/pi-conversation-record.js";
 import { preservedAccountRuntimeState } from "../agent-provider-rate-limits.js";
@@ -1955,16 +1953,10 @@ export function createHeartbeatRunState(db: Db) {
 
     resetRuntimeSession: async (
       agentId: string,
-      opts?: { taskKey?: string | null; managementActor?: import("../authorization.js").AuthorizationActor },
-    ): Promise<(typeof agentRuntimeState.$inferSelect & { sessionDisplayId: null; sessionParamsJson: null; clearedTaskSessions: number }) | null> => {
+      opts?: { taskKey?: string | null },
+    ) => {
       const agent = await getAgent(agentId);
       if (!agent) throw notFound("Agent not found");
-      if (opts?.managementActor) {
-        return withAccountingTransaction(db, agent.companyId, async tx => {
-          await assertAgentLifecycleAuthority(tx, opts.managementActor!, agent);
-          return createHeartbeatRunState(tx).resetRuntimeSession(agentId, { taskKey: opts.taskKey });
-        });
-      }
       const runtimeBefore = await ensureRuntimeState(agent);
       const taskKey = readNonEmptyString(opts?.taskKey);
       const clearedTaskSessions = await clearTaskSessions(

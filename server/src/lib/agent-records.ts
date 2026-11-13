@@ -74,7 +74,6 @@ export interface ClaudeLoginContext {
 }
 
 export interface UpdateAgentOptions {
-  requireSubordinateManagement?: boolean;
   expectedConfigurationRevision?: string;
   expectedConfiguration?: Pick<AgentConfigurationRecord, "adapterType" | "adapterConfig" | "runtimeConfig" | "defaultEnvironmentId">;
   recordRevision?: RevisionMetadata;

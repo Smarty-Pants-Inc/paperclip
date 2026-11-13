@@ -5,8 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { accessService } from "../services/access.js";
-import { logActivity } from "../services/activity-log.js";
-import { withAccountingTransaction } from "../services/accounting-transaction.js";
+import { logActivity, publishActivity, type ActivityPublication } from "../services/activity-log.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { assertCanManageSubordinateAgent, subordinatePermissionScope } from "../services/agent-subtree-management.js";
 
@@ -19,11 +18,8 @@ export function agentPermissionGrantRoutes(db: Db) {
     const id = req.params.id as string;
     if (!isUuidLike(id)) throw badRequest("Agent ID must be a UUID");
     const { permissionKey, enabled, scope } = req.body;
-    // Match reportsTo updates: company lock first, then the target row, then
-    // re-evaluate the entire reporting relation inside the write transaction.
-    const [target] = await db.select({ companyId: agents.companyId }).from(agents).where(eq(agents.id, id));
-    if (!target || !hasCompanyAccess(req, target.companyId)) throw notFound("Agent not found");
-    const result = await withAccountingTransaction(db, target.companyId, async (tx, publications) => {
+    const publications: ActivityPublication[] = [];
+    const result = await db.transaction(async (tx) => {
       const agent = await tx.select({ id: agents.id, companyId: agents.companyId, status: agents.status })
         .from(agents).where(eq(agents.id, id)).for("update").then(rows => rows[0]);
       if (!agent || !hasCompanyAccess(req, agent.companyId)) throw notFound("Agent not found");
@@ -88,6 +84,7 @@ export function agentPermissionGrantRoutes(db: Db) {
       }, publications);
       return { agentId: agent.id, companyId: agent.companyId, permissionKey, enabled };
     });
+    for (const publication of publications) publishActivity(publication);
     res.json(result);
   });
 
