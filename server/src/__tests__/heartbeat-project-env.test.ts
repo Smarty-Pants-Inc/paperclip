@@ -1270,6 +1270,7 @@ describe("resolveAdditionalProjectWorkspace", () => {
         warning: null,
       }),
       directoryHasContents: async () => true,
+      realpath: async (cwd) => cwd,
       ...overrides,
     };
   }

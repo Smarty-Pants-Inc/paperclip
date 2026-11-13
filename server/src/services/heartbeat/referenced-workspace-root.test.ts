@@ -30,7 +30,8 @@ function dependencies(cwd: string | null, repoUrl: string | null = null) {
     loadProjectWorkspaceRows: vi.fn(async () => [{ id: "source", cwd, repoUrl, repoRef: null }] as typeof projectWorkspaces.$inferSelect[]),
     resolveConfiguredOrManagedProjectCwd: vi.fn(async () => ({ cwd: cwd ?? path.join(root, "managed"), warning: null })),
     ensureManagedProjectWorkspace: vi.fn(async () => ({ cwd: path.join(root, "managed"), warning: null })),
-    directoryHasContents: vi.fn(async () => true),
+    directoryHasContents: vi.fn(async (_cwd: string) => true),
+    realpath: (cwd: string) => fs.realpath(cwd),
   } satisfies ResolveAdditionalProjectWorkspaceDeps;
   return deps;
 }
@@ -57,6 +58,37 @@ describe("referenced local workspace roots", () => {
     const deps = dependencies(cwd);
     deps.directoryHasContents.mockImplementation(async () => (await fs.readdir(cwd)).length > 0);
     await expect(resolveAdditionalProjectWorkspace(input, deps)).resolves.toMatchObject({ cwd, projectId: project.projectId });
+  });
+
+  it.each(["configured", "managed"])("retains the physical %s source after its alias is retargeted", async (kind) => {
+    const safe = path.join(root, "safe");
+    const alias = path.join(root, "mutable-reference");
+    await fs.mkdir(safe);
+    await fs.writeFile(path.join(safe, "task.txt"), "authorized project");
+    await fs.writeFile(path.join(runtime, "other-run.txt"), "unrelated run");
+    await fs.symlink(safe, alias);
+    const deps = dependencies(kind === "configured" ? alias : null, kind === "managed" ? "https://example.test/repo.git" : null);
+    if (kind === "managed") {
+      deps.directoryHasContents.mockResolvedValue(false);
+      deps.ensureManagedProjectWorkspace.mockResolvedValue({ cwd: alias, warning: null });
+    } else {
+      deps.directoryHasContents.mockImplementation(async (cwd: string) => {
+        expect(cwd).toBe(safe);
+        return (await fs.readdir(cwd)).length > 0;
+      });
+    }
+    const result = await resolveAdditionalProjectWorkspace(input, deps);
+    expect(result.cwd).toBe(await fs.realpath(safe));
+    await fs.unlink(alias);
+    await fs.symlink(runtime, alias);
+    expect(await fs.readFile(path.join(result.cwd, "task.txt"), "utf8")).toBe("authorized project");
+    await expect(fs.readFile(path.join(result.cwd, "other-run.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("never admits an unresolved source even when content inspection would succeed", async () => {
+    const deps = dependencies(path.join(root, "missing"));
+    await expect(resolveAdditionalProjectWorkspace(input, deps)).rejects.toThrow("has no workspace checkout");
+    expect(deps.directoryHasContents).not.toHaveBeenCalled();
   });
 
   it("validates a resolved source before inspecting its contents", async () => {

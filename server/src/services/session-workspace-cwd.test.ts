@@ -41,6 +41,26 @@ describe("isUnsafeSessionWorkspaceCwd", () => {
     }
   });
 
+  it.each([false, true])("resolves symlinks before interpreting parent traversal (relative=%s)", async (relative) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cwd-traversal-"));
+    try {
+      const temporary = path.join(root, "runtime-tmp");
+      const safe = path.join(root, "safe");
+      await fs.mkdir(path.join(temporary, "child"), { recursive: true });
+      await fs.mkdir(safe);
+      const alias = path.join(safe, "runtime-child");
+      await fs.symlink(path.join(temporary, "child"), alias);
+      vi.stubEnv("TMPDIR", temporary);
+      const cwd = `${relative ? path.relative(process.cwd(), alias) : alias}/..`;
+      expect(path.resolve(cwd)).toBe(safe);
+      expect(await fs.realpath(cwd)).toBe(temporary);
+      expect(isUnsafeSessionWorkspaceCwd(cwd)).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("allows concrete workspace descendants", () => {
     expect(isUnsafeSessionWorkspaceCwd("/tmp/paperclip-workspace")).toBe(false);
     expect(isUnsafeSessionWorkspaceCwd("/Users/dotta/paperclip")).toBe(false);
