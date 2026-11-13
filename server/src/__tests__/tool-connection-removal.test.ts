@@ -43,6 +43,7 @@ import { toolAccessService } from "../services/tool-access.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessRoutes } from "../routes/tool-access.js";
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { errorHandler } from "../middleware/index.js";
 
@@ -174,6 +175,7 @@ describeEmbeddedPostgres("tool connection removal", () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    await flushSecretResolutionWrites(db);
     await db.delete(toolGatewaySessions);
     await db.delete(toolMcpGatewayTokens);
     await db.delete(toolMcpGateways);
