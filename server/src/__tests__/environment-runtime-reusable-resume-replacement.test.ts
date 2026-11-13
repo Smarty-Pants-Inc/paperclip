@@ -308,6 +308,46 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     });
   });
 
+  // REG-26: Boat refuses file transfer to a stopped box at once (409, body code
+  // machine_not_running, "is stopped"). syncIn must surface that as the same
+  // typed sandbox_stopped failure, not an untyped error that startup retries.
+  it.each([
+    ["PUT", "files"], ["POST", "files/upload-url"], ["POST", "commands"],
+  ] as const)("REG-26: a stopped refusal of %s /%s during syncIn fails at once as sandbox_stopped", async (verb, route) => {
+    const seeded = await seed({ backupStamp: false });
+    let stopped = false;
+    const call = vi.fn(async (_plugin: string, method: string) => {
+      if (method === "environmentResumeLease") {
+        return { providerLeaseId: seeded.providerLeaseId, metadata: { remoteCwd: "/home/daytona/paperclip-workspace" } };
+      }
+      if (method === "environmentSyncIn") {
+        if (stopped) throw new JsonRpcCallError({ code: -32000, message: `Boat ${verb} /sandboxes/${seeded.providerLeaseId}/${route} failed (409): Sandbox ${seeded.providerLeaseId} is stopped. Run \`boat resume ${seeded.providerLeaseId}\`, then retry.` });
+        return { ok: true };
+      }
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease",
+        "environmentExecute", "environmentSyncIn", "environmentSyncOut"] }),
+    } as unknown as PluginWorkerManager });
+    const acquired = await acquire(seeded, runtime);
+    stopped = true; // Archived after admission.
+    const sync = () => runtime.syncIn({ environment: seeded.environment, lease: acquired.lease, minimumTimeoutMs: 300_000,
+      operations: [{ operationId: "provider-pack", files: [{ kind: "file", sourcePath: "/tmp/pack.tar.zst", targetPath: "/home/user/pack.tar.zst", mode: 0o600 }] }] });
+    const started = Date.now();
+    await expect(sync()).rejects.toMatchObject({ name: "SandboxStoppedError", code: "sandbox_stopped" });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(call.mock.calls.filter(([, method]) => method === "environmentSyncIn")).toHaveLength(1);
+    // Another allocation's refusal, or other text, keeps its original error.
+    call.mockImplementation(async (_plugin: string, method: string) => {
+      if (method === "environmentSyncIn") throw new JsonRpcCallError({ code: -32000,
+        message: `Boat ${verb} /sandboxes/bx_other/${route} failed (409): Sandbox bx_other is stopped. Run boat resume, then retry.` });
+      throw new Error(`Unexpected plugin method: ${method}`);
+    });
+    await expect(sync()).rejects.toMatchObject({ name: "JsonRpcCallError" });
+  });
+
   it.each([
     ["unsaved work on the sandbox", { dirty: true }, undefined],
     ["no saved workspace version", { snapshot: null }, undefined],

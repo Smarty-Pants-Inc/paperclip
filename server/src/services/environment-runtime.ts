@@ -4,7 +4,7 @@ import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
-import { isStoppedSandboxCommandRejection, SANDBOX_STOPPED_RESUME_BUDGET_MS, SandboxStoppedError } from "./sandbox-stopped-error.js";
+import { isStoppedSandboxCommandRejection, isStoppedSandboxSyncRejection, SANDBOX_STOPPED_RESUME_BUDGET_MS, SandboxStoppedError } from "./sandbox-stopped-error.js";
 import {
   REUSABLE_SANDBOX_RESUME_BUDGET_MS,
   retireReplacedReusableSandboxLease,
@@ -1715,6 +1715,12 @@ function createSandboxEnvironmentDriver(
       operations: input.operations,
       ...(input.minimumTimeoutMs === undefined ? {} : { minimumTimeoutMs: input.minimumTimeoutMs }),
     }, rpcTimeoutMs).catch((error: unknown) => {
+      // A stopped allocation refuses the transfer at once; name it so startup
+      // fails now instead of retrying other staging paths into its budget.
+      if (method === "environmentSyncIn" && input.lease.providerLeaseId
+        && isStoppedSandboxSyncRejection(error, input.lease.providerLeaseId)) {
+        throw new SandboxStoppedError("sync_rejected", error);
+      }
       throw method === "environmentSyncOut" ? preserveEnvironmentSyncOutErrorDiagnostic(error) : error;
     });
   }
