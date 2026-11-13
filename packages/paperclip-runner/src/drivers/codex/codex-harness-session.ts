@@ -145,7 +145,9 @@ export class CodexHarnessSession
       if (attached) {
         const admission = attached.piNativeAdmission;
         const recovery = record(admission.sessionRecovery);
-        if (this.driverKind !== "pi_rpc" || admission.provider !== "pi_rpc" || recovery.reason !== "pi_session_file_invalid"
+        const partial = recovery.reason === "pi_session_file_partial" && recovery.historyLost === true
+          && recovery.previousSessionId === attached.threadId && attached.threadId === this.opened.threadId;
+        if (this.driverKind !== "pi_rpc" || admission.provider !== "pi_rpc" || (recovery.reason !== "pi_session_file_invalid" && !partial)
           || recovery.normalizedSessionId !== this.normalizedSessionId
           || admission.model !== this.opened.context.model
           || admission.piRpcThinkingLevel !== record(this.opened.context).piRpcThinkingLevel

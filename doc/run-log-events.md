@@ -803,6 +803,24 @@ external pager, inbox delivery or a restored transcript. The fresh native
 identity is accepted only with the adapter's explicit scoped recovery receipt;
 normal model, thinking and run-attachment checks remain in force.
 
+An unterminated final JSONL record is repairable only if it is a genuine prefix
+of valid JSON. Definite malformed syntax (for example `{"type":!!!}`), a corrupt
+complete line, or a foreign header uses the invalid-file ladder above. Repair
+stages and syncs the exact complete byte prefix before preserving the original
+inode under `conversation-evidence/<scope>/<unique id>/pi/`, outside ordinary
+backup and quarantine expiry. Publication or preservation failure refuses fresh
+history. The native Pi identity remains unchanged after a successful repair.
+
+If the dropped record might already have been shown as a message or tool result,
+`pi_session_file_partial` projects the same single persistent warning and scoped
+owner diagnostic. It accurately says earlier complete history was restored but
+some displayed content may be missing from the model's memory; it does not claim
+a fresh thread or complete restoration. Only positively identified non-message
+model/thinking metadata can be dropped without that notice. Unknown fragments
+are conservative. JSON-prefix classification uses the pinned Node runtime's
+strict parser and accepts only recognized EOF syntax errors; unrecognized
+parser diagnostics fail closed, never silently repair malformed saved data.
+
 ## ACP terminal failure diagnostics
 
 The shared ACP adapter engine preserves typed terminal session failures in the

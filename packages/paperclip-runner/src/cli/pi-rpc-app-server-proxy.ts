@@ -648,6 +648,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       piNativeAdmission = { ...piNativeAdmission, sessionRecovery };
       recoveryNoticePending = true;
     }
+    const prefixRepair = record(piNativeAdmission?.sessionRecovery);
+    if (prefixRepair.reason === "pi_session_file_partial" && prefixRepair.historyLost === true) recoveryNoticePending = true;
     eventPump = pumpEvents(opened).finally(() => {
       // Stop/failure physically retires Pi. Never advertise that dead thread on
       // the next thread/start, and never clear a newer session's authority.
@@ -742,7 +744,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           // Publish under the next active run, not the settled run whose idle
           // runner was restored. Runner's normal provider notice is durable.
           send({ method: "warning", params: { threadId: session.ids().driverSessionId, turnId: turn.turnId,
-            message: "My earlier Pi conversation could not be restored (pi_session_file_invalid: the saved file is corrupt, foreign, or has a different identity). The original file was preserved. Starting fresh in this conversation." } });
+            message: record(piNativeAdmission?.sessionRecovery).reason === "pi_session_file_partial"
+              ? "Part of my saved Pi conversation was interrupted (pi_session_file_partial). Earlier complete history was restored, but some already-shown messages or tool results may be missing from my memory. The original file was preserved."
+              : "My earlier Pi conversation could not be restored (pi_session_file_invalid: the saved file is corrupt, foreign, or has a different identity). The original file was preserved. Starting fresh in this conversation." } });
         }
         queueMicrotask(() => {
           if (session) announceTurnStarted(session, turn.turnId);

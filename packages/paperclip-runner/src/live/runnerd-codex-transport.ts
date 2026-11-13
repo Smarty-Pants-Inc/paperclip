@@ -4998,7 +4998,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }).finally(() => { this.#attachmentOperation = null; });
     this.#attachmentOperation = operation;
     return operation.then(() => {
-      if (this.options.provider === "pi_rpc" && record(this.#observedPiAdmission?.sessionRecovery).reason === "pi_session_file_invalid") {
+      const recovery = record(this.#observedPiAdmission?.sessionRecovery);
+      if (this.options.provider === "pi_rpc" && (recovery.reason === "pi_session_file_invalid"
+        || recovery.reason === "pi_session_file_partial" && recovery.historyLost === true)) {
         if (!this.#threadId || !this.#sessionId) throw new Error("pi_session_recovery_identity_refused");
         return { threadId: this.#threadId, providerSessionId: this.#sessionId,
           piNativeAdmission: structuredClone(this.#observedPiAdmission!) };

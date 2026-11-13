@@ -305,15 +305,16 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       event: { ...event, runId: f.input.run.id, sourceEventId: randomUUID() } });
     expect(await notices()).toHaveLength(1);
   });
-  it("projects a preserved invalid-Pi-file restart once, with the same authority and replay fences as missing history", async () => {
+  it.each(["invalid", "partial"])("projects a preserved %s-Pi-file recovery once, with the same authority and replay fences as missing history", async kind => {
     // Keep reason: data safety and scoped ownership on the real DB projection.
     const f = await piFixture();
     const selected = await selectHeartbeatRuntime(db, f.input);
     if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
     const execution = selected.nativeExecution;
     const conversation = execution.session.normalizedSessionId;
-    const previousId = randomUUID(), id = randomUUID();
-    const recovery = { reason: "pi_session_file_invalid", normalizedSessionId: conversation, previousSessionId: previousId,
+    const previousId = randomUUID(), id = kind === "partial" ? previousId : randomUUID();
+    const code = `pi_session_file_${kind}`;
+    const recovery = { reason: code, ...(kind === "partial" ? { historyLost: true } : {}), normalizedSessionId: conversation, previousSessionId: previousId,
       preservedFile: `${conversation}.jsonl.invalid-2026-11-13T05-00-00-000Z-${randomUUID()}` };
     const event = { schema: "paperclip.prp.event.v3", schemaVersion: 3, sourceEventId: randomUUID(), sourceSeq: 1,
       sourceInstanceId: "runner", sourceKind: "runner", priority: 0, emittedAt: new Date().toISOString(),
@@ -327,7 +328,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     const alarm = vi.spyOn((await import("../../middleware/logger.js")).logger, "error");
     const alarms = () => alarm.mock.calls.filter(([detail]) => typeof detail === "object"
-      && detail !== null && "code" in detail && detail.code === "pi_session_file_invalid");
+      && detail !== null && "code" in detail && detail.code === code);
     try {
       for (const invalid of [
         { ...event, normalizedSessionId: randomUUID() },
@@ -348,8 +349,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect(alarms()).toHaveLength(0);
       await Promise.all([facade, event, attached, facade].map(event => materializePiSessionRecoveryNotice({ db, execution, event })));
       expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: null,
-        body: expect.stringContaining("pi_session_file_invalid"), presentation: { kind: "system_notice", tone: "warning" },
-        metadata: { authorizationReason: expect.stringMatching(new RegExp(`^pi_session_file_invalid:${conversation}:[a-f0-9]{64}$`)),
+        body: expect.stringContaining(code), presentation: { kind: "system_notice", tone: "warning" },
+        metadata: { authorizationReason: expect.stringMatching(new RegExp(`^${code}:${conversation}:[a-f0-9]{64}$`)),
           sections: [{ rows: [{ type: "run_link", runId: f.run.id, agentId: execution.binding.agentId }] }] } }]);
       expect(alarms()).toHaveLength(1);
       await nextPiTurn(f);

@@ -23,7 +23,7 @@ import { PiIdentityTombstones } from "./pi-identity-tombstones.js";
 import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type PiNativeAdmittedIdentity, type PiNativeConfig, type PiNativeThinkingLevel, type PiRpcAdmissionPort } from "./pi-native-config.js";
 import { PiRpcCommandError, PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
-import { piSessionFileInvalid, piSessionName as safeSessionName, verifyPiSessionFile } from "./pi-session-file.js";
+import { piSessionFileInvalid, piSessionName as safeSessionName, verifyPiSessionFile, type PiSessionPrefixRepair } from "./pi-session-file.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -139,10 +139,12 @@ export class PiRpcDriver implements HarnessDriver {
       || !snapshot.driverSessionId || !snapshot.workingDirectory
       || (snapshot.providerSessionId != null && snapshot.providerSessionId !== snapshot.driverSessionId)) throw piSessionFileInvalid();
     const cwd = await realpath(snapshot.workingDirectory).catch(() => { throw piSessionFileInvalid(); });
+    let sessionRecovery: PiSessionPrefixRepair | undefined;
     const sessionFile = await verifyPiSessionFile({ snapshot, runtimeDirectory: this.#options.runtimeDirectory,
-      filename: `${safeSessionName(snapshot.normalizedSessionId)}.jsonl`, workingDirectory: cwd, signal: options.signal });
+      filename: `${safeSessionName(snapshot.normalizedSessionId)}.jsonl`, workingDirectory: cwd, signal: options.signal,
+      onRepair: receipt => { sessionRecovery = receipt; } });
     const session = await this.#open({ runId: snapshot.runId, normalizedSessionId: snapshot.normalizedSessionId,
-      workingDirectory: cwd, signal: options.signal }, { snapshot, sessionFile });
+      workingDirectory: cwd, signal: options.signal }, { snapshot, sessionFile, sessionRecovery });
     return { recovered: true, session };
   }
 
@@ -150,7 +152,7 @@ export class PiRpcDriver implements HarnessDriver {
     return this.#open(input);
   }
 
-  async #open(input: OpenHarnessSessionInput, recovery?: { snapshot: PersistedHarnessSession; sessionFile: string }): Promise<HarnessSession> {
+  async #open(input: OpenHarnessSessionInput, recovery?: { snapshot: PersistedHarnessSession; sessionFile: string; sessionRecovery?: PiSessionPrefixRepair }): Promise<HarnessSession> {
     if (input.signal?.aborted) throw input.signal.reason ?? new Error("Pi RPC session startup aborted");
     if (this.#options.toolSocketPath !== undefined) throw new Error("Pi semantic callbacks require the live guarded host bridge");
     const cwd = await realpath(input.workingDirectory);
@@ -314,6 +316,7 @@ export class PiRpcDriver implements HarnessDriver {
         sourceSequence: recovery?.snapshot.lastSourceSequence,
         identity,
         sessionFile,
+        sessionRecovery: recovery?.sessionRecovery,
         config,
         piMetadata,
         systemInstructions: this.#options.systemInstructions,
@@ -365,6 +368,7 @@ interface PiResidentState {
   binding: { origin: Origin; close(): Promise<void>; initial: boolean } | null;
 }
 interface PiSessionState {
+  sessionRecovery?: PiSessionPrefixRepair;
   transport: PiRpcTransport;
   runId: string;
   normalizedSessionId: string;
@@ -472,6 +476,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #normalizedSessionId: string;
   readonly #providerSessionId: string;
   readonly #sessionFile: string;
+  readonly #sessionRecovery?: PiSessionPrefixRepair;
   readonly #workingDirectory: string;
   readonly #runnerInstanceId: string;
   readonly #now: () => Date;
@@ -534,6 +539,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#providerSessionId = state.providerSessionId;
     this.#sourceSequence = state.sourceSequence ?? 0;
     this.#sessionFile = state.sessionFile;
+    this.#sessionRecovery = state.sessionRecovery;
     this.#workingDirectory = state.workingDirectory;
     this.#runnerInstanceId = state.runnerInstanceId;
     this.#now = state.now;
@@ -561,7 +567,8 @@ export class PiRpcHarnessSession implements HarnessSession {
   }
 
   piNativeAdmission(): Record<string, unknown> {
-    return structuredClone({ ...this.#config, ...this.#effectiveContext(), providerSessionId: this.#providerSessionId });
+    return structuredClone({ ...this.#config, ...this.#effectiveContext(), providerSessionId: this.#providerSessionId,
+      ...(this.#sessionRecovery ? { sessionRecovery: this.#sessionRecovery } : {}) });
   }
 
   ids(): ReturnType<HarnessSession["ids"]> {

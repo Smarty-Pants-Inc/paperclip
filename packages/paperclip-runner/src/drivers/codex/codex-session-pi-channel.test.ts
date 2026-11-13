@@ -6,12 +6,14 @@ import { rehydrateRunnerdItemNotification } from "../../live/runnerd-codex-trans
 // a streamed start was cached before its authoritative Pi completion arrived.
 describe("Pi authoritative completion channel", () => {
   // Keep reason: fresh native identity must reach every live owner cache.
-  it.each(["valid", "wrong-provider", "wrong-conversation", "wrong-previous", "wrong-model", "wrong-thinking", "wrong-readback"]) (
+  it.each(["valid", "valid-partial", "wrong-partial-native", "wrong-provider", "wrong-conversation", "wrong-previous", "wrong-model", "wrong-thinking", "wrong-readback"]) (
     "adopts only a scoped, disclosed invalid-history replacement (%s)", async fault => {
-      const recovery = { reason: "pi_session_file_invalid", previousSessionId: "old-native", normalizedSessionId: "conversation",
+      const partial = fault.includes("partial");
+      const nativeId = fault === "valid-partial" ? "old-native" : "fresh-native";
+      const recovery = { reason: partial ? "pi_session_file_partial" : "pi_session_file_invalid", ...(partial ? { historyLost: true } : {}), previousSessionId: "old-native", normalizedSessionId: "conversation",
         preservedFile: "conversation.jsonl.invalid-2026-11-13T00-00-00Z-00000000-0000-4000-8000-000000000000" };
-      const receipt = { threadId: "fresh-native", providerSessionId: "fresh-native", piNativeAdmission: {
-        provider: "pi_rpc", providerSessionId: "fresh-native", model: "gpt-test", piRpcThinkingLevel: "off", sessionRecovery: recovery,
+      const receipt = { threadId: nativeId, providerSessionId: nativeId, piNativeAdmission: {
+        provider: "pi_rpc", providerSessionId: nativeId, model: "gpt-test", piRpcThinkingLevel: "off", sessionRecovery: recovery,
       } };
       if (fault === "wrong-conversation") recovery.normalizedSessionId = "other-conversation";
       if (fault === "wrong-previous") recovery.previousSessionId = "someone-else";
@@ -30,19 +32,19 @@ describe("Pi authoritative completion channel", () => {
         runId: "old-run", normalizedSessionId: "conversation", workingDirectory: WORKSPACE,
       });
       try {
-        if (fault !== "valid") {
+        if (fault !== "valid" && fault !== "valid-partial") {
           await expect(session.attachRun!({ runId: "new-run" })).rejects.toThrow("pi_session_recovery_identity_refused");
           expect(session.ids().driverSessionId).toBe("old-native");
         } else {
           await session.attachRun!({ runId: "new-run" });
-          expect(session.ids()).toMatchObject({ driverSessionId: "fresh-native", providerSessionId: "fresh-native" });
+          expect(session.ids()).toMatchObject({ driverSessionId: nativeId, providerSessionId: nativeId });
           await session.startTurn({ message: { role: "user", text: "Fresh input" } });
-          transport.push("turn/started", { threadId: "fresh-native", turn: { id: "turn-1", status: "inProgress" } });
+          transport.push("turn/started", { threadId: nativeId, turn: { id: "turn-1", status: "inProgress" } });
           await new Promise(resolve => setTimeout(resolve, 0));
         }
       } finally { await session.close({ reason: "test complete" }); }
       const events: PrpEvent[] = []; for await (const event of session.events()) events.push(event);
-      if (fault === "valid") {
+      if (fault === "valid" || fault === "valid-partial") {
         expect(events.find(event => event.eventType === "run.attached")?.payload.piSessionRecovery).toEqual(recovery);
         expect(events.some(event => event.eventType === "session.failed")).toBe(false);
       }
