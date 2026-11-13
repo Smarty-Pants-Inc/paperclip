@@ -570,8 +570,11 @@ Native Pi uses closed environment allowlists at the controller, verified Rust
 proxy launch, and final Pi spawn. Explicit task-environment markers cannot widen
 these boundaries. The three `PAPERCLIP_AGENT_{KEY_ID,PUBLIC_KEY,PRIVATE_KEY}`
 Ed25519 identity values remain available by design; they do not authenticate
-Paperclip API requests. API bearer/JWT secrets, `ASCII_TOKEN`, `LANGFUSE_*`,
-tracing headers, and unknown runner variables do not reach Pi or its shell tools.
+Paperclip API requests. The exact Langfuse export names listed in
+`PI_LANGFUSE_ENVIRONMENT_KEYS` also reach Pi through the agent's configured secret
+environment (see `doc/architecture/runner-pi-capabilities.md`). API bearer/JWT
+secrets, `ASCII_*`, tracing headers, and unknown runner variables do not reach Pi
+or its shell tools.
 Paperclip tools use the existing run-bound host callback instead of an API key
 in the child environment.
 
@@ -580,15 +583,16 @@ proxy also disables it after exec, before opening its model broker, so same-uid
 children cannot read either process's environment or ptrace it. This is not a
 filesystem sandbox or protection against root/capabilities. Linux provider-pack
 builds require a target-host C compiler (`cc`) for the small, pack-hashed Node-API
-initializer; a missing or modified initializer fails proxy startup closed. Pi
-remains dumpable so ordinary child process inspection and its own `/proc` reads
+initializer. Runnerd verifies its controller-supplied digest and passes an
+immutable descriptor to the proxy; changing the guest addon and its manifest
+together cannot change the loaded bytes. Missing or modified code fails startup
+closed. Pi remains dumpable so ordinary child process inspection and its own `/proc` reads
 continue to work. The proxy's own `/proc/self/fd` verified launch still works.
 
-For a plugin-private Langfuse config pathname, extend the exported exact-name
-`PI_PROCESS_ENVIRONMENT_KEYS` list in `src/drivers/pi/pi-process-environment.ts`
-and mirror the approved name in Rust's `PI_RPC_PROVIDER_ENVIRONMENT_KEYS`.
-Do not re-enable `LANGFUSE_*` inheritance. Existing agent-home files are retained;
-the tracing proxy owns the run-scoped configuration and token lifecycle.
+Langfuse uses the existing configured secret environment and the exact names in
+`PI_LANGFUSE_ENVIRONMENT_KEYS`. Do not enable wildcard `LANGFUSE_*` inheritance:
+only those export settings are forwarded. Existing agent-home files are retained; the
+tracing integration owns its configuration and token lifecycle.
 
 Claude Managed resolves its API key from the company secret bound to the
 selected profile. AWS AgentCore uses workload identity only; long-lived static

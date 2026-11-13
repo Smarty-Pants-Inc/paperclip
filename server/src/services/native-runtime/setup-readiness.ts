@@ -130,7 +130,9 @@ async function probeRemoteNativeRuntime(options: {
     if (!piRpcExecutable || !piRpcProxy) throw new Error("Native Pi setup requires the qualified Pi provider pack.");
     return { providerNodeCommand: posix.join(pack.root, nodeCommand.path), providerNodeCommandSha256: nodeCommand.sha256,
       piCommand: posix.join(pack.root, piRpcExecutable.path), piCommandSha256: piRpcExecutable.sha256,
-      piProxyPath: posix.join(pack.root, piRpcProxy.path), piProxySha256: piRpcProxy.sha256, providerPackAuthorityDigest: pack.manifest.digest };
+      piProxyPath: posix.join(pack.root, piRpcProxy.path), piProxySha256: piRpcProxy.sha256,
+      piProcessHardeningSha256: pack.manifest.payload.artifacts.piProcessHardening?.sha256,
+      providerPackAuthorityDigest: pack.manifest.digest };
   })() : {};
   const runtimeDirectory = await realpath(await mkdtemp(join(tmpdir(), "paperclip-native-setup-")));
   return probePreparedNativeRuntime(runtimeDirectory, async () => {

@@ -114,6 +114,9 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   if (provider?.kind === "pi_rpc" && !nativePi) {
     throw new Error("runner_remote_provider_artifact_incompatible: native provider pi_rpc is missing");
   }
+  if (nativePi && manifest.payload.target.platform === "linux" && !manifest.payload.artifacts.piProcessHardening) {
+    throw new Error("runner_remote_provider_artifact_incompatible: native Pi process hardening artifact is missing");
+  }
   if (nativePi && (!manifest.payload.artifacts.piRpcProxy || !manifest.payload.artifacts.piRpcExecutable)) {
     throw new Error("runner_remote_provider_artifact_incompatible: native Pi proxy or executable artifact is missing");
   }
@@ -149,7 +152,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "const hash=(p)=>'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(path.join(root,p))).digest('hex')",
     "const tree=(treeRoot)=>{const digest=crypto.createHash('sha256');const visit=(directory,prefix='')=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true}).sort((a,b)=>a.name<b.name?-1:a.name>b.name?1:0)){const relative=prefix?prefix+'/'+entry.name:entry.name;const absolute=path.join(directory,entry.name);if(entry.isDirectory()){digest.update('directory\\0'+relative+'\\n');visit(absolute,relative)}else if(entry.isFile()){digest.update('file\\0'+relative+'\\0'+'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex')+'\\n')}else if(entry.isSymbolicLink()){digest.update('symlink\\0'+relative+'\\0'+fs.readlinkSync(absolute)+'\\n')}else throw new Error('unsupported dist entry '+relative)}};visit(treeRoot);return 'sha256:'+digest.digest('hex')}",
     "for(const name of ['nodeCommand','productionLock','opencodeCommand','opencodeExecutable','opencodeProxy','acpxSidecar','grokLauncher']){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)throw new Error(name+' digest mismatch')}",
-    "if(manifest.payload.nativeProviders?.pi_rpc){for(const name of ['piRpcProxy','piRpcExecutable']){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)throw new Error(name+' digest mismatch')}const native=manifest.payload.nativeProviders.pi_rpc;if(tree(path.join(root,native.path))!==native.sha256)throw new Error('native Pi asset tree digest mismatch')}",
+    "if(manifest.payload.nativeProviders?.pi_rpc){for(const name of ['piRpcProxy','piRpcExecutable',...(manifest.payload.target.platform==='linux'?['piProcessHardening']:[])]){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)throw new Error(name+' digest mismatch')}const native=manifest.payload.nativeProviders.pi_rpc;if(tree(path.join(root,native.path))!==native.sha256)throw new Error('native Pi asset tree digest mismatch')}",
     "if(tree(path.join(root,'dist'))!==manifest.payload.distDigest)throw new Error('dist tree digest mismatch')",
     `const selectedProvider=${JSON.stringify(provider?.kind === "acpx" ? provider.agent : provider ? null : undefined) ?? "undefined"}`,
     "const verifiedTrees=new Map()",

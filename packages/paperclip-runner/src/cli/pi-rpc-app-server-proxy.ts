@@ -198,7 +198,7 @@ function runtimeDirectory(environment: NodeJS.ProcessEnv): string {
 export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   const environment = options.environment ?? process.env;
   const launchBinding = options.createDriver ? null : trustedPiLaunchBinding(options.argv ?? process.argv.slice(2));
-  if (launchBinding) protectPiProxyProcess(launchBinding.trustedProxyEntrypointUrl);
+  if (launchBinding) protectPiProxyProcess(launchBinding.trustedProxyEntrypointUrl, launchBinding.processHardeningDescriptor);
   const stdoutFrames = createBackpressuredFrameWriter(options.stdout);
   const output = createOpenCodeProxyOutput((frame, frameOptions) => stdoutFrames.write(frame, frameOptions));
   const send = output.send;

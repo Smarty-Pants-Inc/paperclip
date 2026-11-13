@@ -13,6 +13,8 @@ export interface TrustedPiLaunchBinding {
   commandFd?: number;
   /** Original proxy path attested against the currently compiled proxy FD. */
   trustedProxyEntrypointUrl?: string;
+  /** Runner-verified sealed descriptor; never a guest-controlled pathname. */
+  processHardeningDescriptor?: string;
   commandLifecycle?: {
     beforeSpawn(): void;
     afterSpawn(): void;
@@ -33,7 +35,8 @@ export function withoutAmbientPiCommand(environment: NodeJS.ProcessEnv): NodeJS.
  * fallback; the macOS lifecycle keeps the verified inode bound across spawn.
  */
 export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunchBinding {
-  const resourceBinding = process.platform === "linux" && args.length === 6 && args[2] === "--paperclip-pi-executable-path"
+  const hardeningBinding = process.platform === "linux" && args.length === 8 && args[6] === "--paperclip-pi-process-hardening";
+  const resourceBinding = process.platform === "linux" && (args.length === 6 || hardeningBinding) && args[2] === "--paperclip-pi-executable-path"
     && args[4] === "--paperclip-pi-proxy-path";
   const command = (args.length === 2 || (args.length === 4 && args[2] === "--paperclip-pi-executable-path") || resourceBinding)
     && args[0] === TRUSTED_PI_EXECUTABLE_ARG ? args[1]! : "";
@@ -77,7 +80,13 @@ export function trustedPiLaunchBinding(args: readonly string[]): TrustedPiLaunch
         const realProxy = trustedFile(proxyPath);
         if (createHash("sha256").update(readFileSync(realProxy)).digest("hex")
           !== createHash("sha256").update(readFileSync(proxyDescriptor)).digest("hex")) throw unavailable();
-        return { command: realExecutable, trustedProxyEntrypointUrl: pathToFileURL(realProxy).href };
+        const processHardeningDescriptor = hardeningBinding ? args[7]! : undefined;
+        if (processHardeningDescriptor !== undefined) {
+          const match = processHardeningDescriptor.match(/^\/proc\/self\/fd\/([1-9]\d*)$/);
+          const fd = Number(match?.[1]);
+          if (!match || fd < 3 || fd > 255 || fd === proxyFd || fd === commandFd || !fstatSync(fd).isFile()) throw unavailable();
+        }
+        return { command: realExecutable, trustedProxyEntrypointUrl: pathToFileURL(realProxy).href, processHardeningDescriptor };
       }
       return { command: realExecutable };
     } catch {

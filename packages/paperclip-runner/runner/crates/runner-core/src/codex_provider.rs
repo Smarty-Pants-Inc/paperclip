@@ -111,6 +111,10 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
 ];
 const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "AGENT_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
     // Pi's Langfuse observability plugin reads these from the configured secret
     // environment, as Paperclip documents (runner-pi-capabilities.md:72-76,
     // :108-111).
@@ -1277,8 +1281,9 @@ impl CodexProvider {
             } else {
                 GITHUB_CREDENTIAL_ENVIRONMENT_KEYS
             };
-        // Pi uses the host broker and run-scoped callbacks. Proxy credentials,
-        // OTEL/Langfuse headers and GitHub login state are not shell settings.
+        // Pi uses an exact-name environment ceiling. Outbound proxy routing
+        // and configured Langfuse exports are included there; arbitrary OTEL
+        // headers and GitHub login state are not shell settings.
         let common_environment_keys = if config.provider == "pi_rpc" {
             &[][..]
         } else {
@@ -4538,6 +4543,20 @@ fn verified_native_facade_launch(
             profile.proxy_script.path.to_string_lossy().into_owned(),
         ));
     }
+    if include_executable_path
+        && cfg!(target_os = "linux")
+        && is_node_interpreter(&profile.command.path)
+    {
+        let artifact = profile.process_hardening.as_ref().ok_or_else(|| {
+            LocalRunnerError::invalid("Pi proxy requires controller-pinned process hardening")
+        })?;
+        let verified = verify_launch_artifact(artifact, "Pi process hardening")
+            .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        args.push(VerifiedProcessArgument::Literal(
+            "--paperclip-pi-process-hardening".to_owned(),
+        ));
+        args.push(VerifiedProcessArgument::Artifact(verified));
+    }
     Ok(VerifiedProcessLaunch::new(command, args))
 }
 
@@ -7141,7 +7160,10 @@ done
         fs::write(&command, b"qualified node").unwrap();
         fs::write(&proxy, b"module.exports = {};\n").unwrap();
         fs::write(&executable, b"qualified pi").unwrap();
+        let hardening = directory.join("hardening.node");
+        fs::write(&hardening, b"qualified hardening").unwrap();
         let profile = OpenCodeLaunchProfile {
+            process_hardening: Some(qualified_artifact(&hardening)),
             command: qualified_artifact(&command),
             proxy_script: qualified_artifact(&proxy),
             executable: qualified_artifact(&executable),
@@ -7156,22 +7178,44 @@ done
         .unwrap();
         // A CommonJS snapshot's __filename is its descriptor, not this resource root.
         // Keep descriptor execution and pass the original path only as Pi metadata.
-        assert!(matches!(
-            launch.arguments(),
-            [
-                VerifiedProcessArgument::CommonJsArtifact(_),
-                VerifiedProcessArgument::Literal(trusted_flag),
-                VerifiedProcessArgument::ExecutableArtifact(_),
-                VerifiedProcessArgument::Literal(executable_flag),
-                VerifiedProcessArgument::Literal(executable_path),
-                VerifiedProcessArgument::Literal(proxy_flag),
-                VerifiedProcessArgument::Literal(proxy_path),
-            ] if trusted_flag == "--paperclip-trusted-pi-executable"
-                && executable_flag == "--paperclip-pi-executable-path"
-                && executable_path == executable.to_str().unwrap()
-                && proxy_flag == "--paperclip-pi-proxy-path"
-                && proxy_path == proxy.to_str().unwrap()
-        ));
+        if cfg!(target_os = "linux") {
+            assert!(matches!(
+                launch.arguments(),
+                [
+                    VerifiedProcessArgument::CommonJsArtifact(_),
+                    VerifiedProcessArgument::Literal(trusted_flag),
+                    VerifiedProcessArgument::ExecutableArtifact(_),
+                    VerifiedProcessArgument::Literal(executable_flag),
+                    VerifiedProcessArgument::Literal(executable_path),
+                    VerifiedProcessArgument::Literal(proxy_flag),
+                    VerifiedProcessArgument::Literal(proxy_path),
+                    VerifiedProcessArgument::Literal(hardening_flag),
+                    VerifiedProcessArgument::Artifact(_),
+                ] if hardening_flag == "--paperclip-pi-process-hardening"
+                    && trusted_flag == "--paperclip-trusted-pi-executable"
+                    && executable_flag == "--paperclip-pi-executable-path"
+                    && executable_path == executable.to_str().unwrap()
+                    && proxy_flag == "--paperclip-pi-proxy-path"
+                    && proxy_path == proxy.to_str().unwrap()
+            ));
+            fs::write(
+                &hardening,
+                b"replacement addon and a matching guest manifest",
+            )
+            .unwrap();
+            assert!(
+                verified_native_facade_launch(
+                    &profile,
+                    "Pi",
+                    "--paperclip-trusted-pi-executable",
+                    true
+                )
+                .is_err(),
+                "guest replacement cannot change the controller's hardening digest"
+            );
+        } else {
+            assert_eq!(launch.arguments().len(), 7);
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -7194,6 +7238,7 @@ done
         fs::write(&proxy, b"module.exports = {};\n").unwrap();
         fs::write(&executable, b"qualified opencode").unwrap();
         let profile = OpenCodeLaunchProfile {
+            process_hardening: None,
             command: qualified_artifact(&command),
             proxy_script: qualified_artifact(&proxy),
             executable: qualified_artifact(&executable),
