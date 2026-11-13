@@ -429,6 +429,12 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
 
   async function open(params: Record<string, unknown>, resume: boolean): Promise<Record<string, unknown>> {
     if (session) return threadResponse(session.ids().providerSessionId ?? session.ids().driverSessionId);
+    // Only the server owns conversation identity. Refuse before constructing a
+    // driver or touching its runtime files; Pi's native thread id is distinct.
+    const normalizedSessionId = environment.PAPERCLIP_NORMALIZED_SESSION_ID;
+    if (!normalizedSessionId?.trim()) {
+      throw new Error(`Pi RPC thread/${resume ? "resume" : "start"} requires PAPERCLIP_NORMALIZED_SESSION_ID`);
+    }
     cwd = resolve(text(params.cwd, process.cwd()));
     const model = text(params.model).trim();
     if (!model) throw new Error("Pi RPC proxy requires a model");
@@ -489,8 +495,6 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       if (!driver.recoverSession) throw new Error("Pi RPC driver does not implement session recovery");
       // The conversation's file is named by the server-owned normalized id; a
       // thread id is Pi's own session id and never names the file.
-      const normalizedSessionId = environment.PAPERCLIP_NORMALIZED_SESSION_ID;
-      if (!normalizedSessionId) throw new Error("Pi RPC thread/resume requires PAPERCLIP_NORMALIZED_SESSION_ID");
       const snapshot: PersistedHarnessSession = {
         driverKind: "pi_rpc",
         workingDirectory: cwd,
@@ -523,7 +527,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     } else {
       opened = await driver.openSession({
         runId: activeRunId,
-        normalizedSessionId: environment.PAPERCLIP_NORMALIZED_SESSION_ID ?? `runnerd-${Date.now()}`,
+        normalizedSessionId,
         workingDirectory: cwd,
       });
     }

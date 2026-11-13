@@ -157,17 +157,41 @@ it("thread/resume with the saved Pi file missing on this box continues in a fres
   } finally { stderr.mockRestore(); await proxy.close(); }
 });
 
-it("thread/resume refuses without the server-owned conversation id (no thread-id fallback)", async () => {
+it.each(["thread/start", "thread/resume"])("%s refuses without the server-owned conversation id (no minted or thread-id fallback)", async method => {
   const sink = new FakeSink(); const driver = makeDriver(new FakeSession());
   driver.openSession = vi.fn(driver.openSession);
   driver.recoverSession = vi.fn(async () => ({ recovered: false, reason: "unused" }));
-  const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => driver });
+  const createDriver = vi.fn(() => driver);
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: {}, createDriver });
   try {
-    proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/resume", params: { threadId: "native-id", cwd: "/workspace", model: "neutral/model" } }));
+    proxy.acceptLine(JSON.stringify({ id: 1, method, params: { threadId: "native-id", cwd: "/workspace", model: "neutral/model" } }));
     await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 1)).toBe(true));
     expect(sink.decoded().find(frame => frame.id === 1)).toMatchObject({ error: { code: -32000 } });
+    expect(createDriver).not.toHaveBeenCalled();
     expect(driver.recoverSession).not.toHaveBeenCalled();
     expect(driver.openSession).not.toHaveBeenCalled();
+  } finally { await proxy.close(); }
+});
+
+it.each(["", "   "])("thread/start refuses an empty conversation id (%j)", async normalizedSessionId => {
+  const sink = new FakeSink();
+  const createDriver = vi.fn(() => makeDriver(new FakeSession()));
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver, environment: { PAPERCLIP_NORMALIZED_SESSION_ID: normalizedSessionId } });
+  try {
+    expect(await request(proxy, sink, 1, "thread/start", { model: "neutral/model" })).toMatchObject({
+      error: { code: -32000, message: "Pi RPC thread/start requires PAPERCLIP_NORMALIZED_SESSION_ID" },
+    });
+    expect(createDriver).not.toHaveBeenCalled();
+  } finally { await proxy.close(); }
+});
+
+it("thread/start passes the exact server-owned conversation id without minting", async () => {
+  const sink = new FakeSink(); const driver = makeDriver(new FakeSession());
+  driver.openSession = vi.fn(driver.openSession);
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_RUN_ID: "run-new", PAPERCLIP_NORMALIZED_SESSION_ID: "server-conversation" }, createDriver: () => driver });
+  try {
+    expect(await request(proxy, sink, 1, "thread/start", { cwd: "/workspace", model: "neutral/model" })).toHaveProperty("result");
+    expect(driver.openSession).toHaveBeenCalledExactlyOnceWith({ runId: "run-new", normalizedSessionId: "server-conversation", workingDirectory: "/workspace" });
   } finally { await proxy.close(); }
 });
 
@@ -211,7 +235,7 @@ describe("Pi RPC app-server facade proxy", () => {
   it("adapts real Pi usage to Rust total/last without double counting warm turns", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1", PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     try {
       await request(proxy, sink, 101, "thread/start", { model: "neutral/model" });
       for (const [index, runId] of ["run-1", "run-2"].entries()) {
@@ -237,7 +261,7 @@ describe("Pi RPC app-server facade proxy", () => {
   it("deduplicates re-sent message usage at the facade, including after another turn", async () => {
     const sink = new FakeSink();
     const session = new FakeSession();
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     try {
       await request(proxy, sink, 120, "thread/start", { model: "neutral/model" });
       const payload = { providerRequestId: "receipt-1", runDelta: { inputTokens: 11, outputTokens: 0 }, runDeltaAvailable: true, accountingComplete: true };
@@ -256,7 +280,7 @@ describe("Pi RPC app-server facade proxy", () => {
   it("reconciles T1-T4 turn snapshots to the sum of native Pi message receipts", async () => {
     const sink = new FakeSink();
     const session = Object.assign(new FakeSession(), { async attachRun() {} });
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     const turns = [[11, 11], [3, 7], [5], [2, 4, 8]];
     let sessionInput = 0;
     try {
@@ -292,7 +316,7 @@ describe("Pi RPC app-server facade proxy", () => {
   it.each(["first", "last"])("does not label a turn complete when its %s message lacks usage", async missing => {
     const sink = new FakeSink();
     const session = new FakeSession();
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     try {
       await request(proxy, sink, 140, "thread/start", { model: "neutral/model" });
       const projector = createPiEventProjector({ runId: "run-1", turnId: "incomplete" });
@@ -315,7 +339,7 @@ describe("Pi RPC app-server facade proxy", () => {
   it("preserves explicit incomplete accounting even when the message has all token fields", async () => {
     const sink = new FakeSink();
     const session = new FakeSession();
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     try {
       await request(proxy, sink, 150, "thread/start", { model: "neutral/model" });
       session.push("usage.reported", { providerRequestId: "partial", runDelta: { inputTokens: 11 }, runDeltaAvailable: true, accountingComplete: false }, "partial", "partial");
@@ -333,7 +357,7 @@ describe("Pi RPC app-server facade proxy", () => {
   it("emits Pi usage.reported as thread/tokenUsage/updated with non-zero total and last", async () => {
     const sink = new FakeSink();
     const session = new FakeSession();
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1", PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     try {
       await request(proxy, sink, 110, "thread/start", { model: "neutral/model" });
       const cumulative = { inputTokens: 24, outputTokens: 6, totalTokens: 30 };
@@ -363,7 +387,7 @@ describe("Pi RPC app-server facade proxy", () => {
       async attachRun() {},
       async startTurn() { return { turnId: "current-turn" }; },
     });
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1", PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     try {
       await request(proxy, sink, 80, "thread/start", { model: "neutral/model" });
       await request(proxy, sink, 81, "run.attach", { runId: "run-2" });
@@ -397,7 +421,7 @@ describe("Pi RPC app-server facade proxy", () => {
   it.each(["plain", "\\u0000\\u0001\\n\\\"\\\\", "😀漢字"])("bounds projected partial facade frames with a visible marker (%s) and leaves final/short text untouched", async alphabet => {
     const sink = new FakeSink();
     const session = new FakeSession();
-    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1" } });
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session), environment: { PAPERCLIP_RUN_ID: "run-1", PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" } });
     try {
       await request(proxy, sink, 90, "thread/start", { model: "neutral/model" });
       const large = alphabet.repeat(Math.ceil(4 * 1024 * 1024 / alphabet.length));
@@ -484,6 +508,7 @@ describe("Pi RPC app-server facade proxy", () => {
     const sink = new FakeSink();
     const proxy = createPiRpcAppServerProxy({
       stdout: sink,
+      environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "session-1" },
       createDriver: () => ({
         async descriptor() { throw new Error("unused"); },
         async openSession() { throw new Error("pi bootstrap failed"); },
