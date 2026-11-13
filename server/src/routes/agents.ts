@@ -1784,6 +1784,18 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * Terminating an agent is a board-only governed action. The denial gives
+   * other actors a ready profile link, so they can send a person to the control.
+   */
+  async function assertBoardCanTerminateAgent(req: Request, target: { id: string; companyId: string }) {
+    if (req.actor.type === "board") return;
+    const [company] = await db.select({ issuePrefix: companies.issuePrefix }).from(companies)
+      .where(eq(companies.id, target.companyId));
+    const profile = company?.issuePrefix ? `[the agent's profile](/${company.issuePrefix}/agents/${target.id})` : "the agent's profile";
+    throw forbidden(`Board access required: only a board user can terminate an agent. Ask a person with board access to open ${profile} and choose Terminate from its actions menu.`);
+  }
+
   async function assertCanUpdateAgent(req: Request, targetAgent: { id: string; companyId: string }) {
     if (!hasCompanyAccess(req, targetAgent.companyId)) {
       throw notFound("Agent not found");
@@ -2605,19 +2617,11 @@ export function agentRoutes(
     );
   }
 
-  async function assertCanManageAgentLifecycle(
+  async function assertCanResumeAgent(
     req: Request,
     targetAgent: { id: string; companyId: string },
   ) {
-    if (req.actor.type !== "agent") {
-      assertBoard(req);
-      return;
-    }
-    // Configuration scopes include their root; lifecycle control must not let
-    // an agent stop itself or release its own pause holds.
-    if (req.actor.agentId === targetAgent.id) {
-      throw forbidden("Agents cannot manage their own lifecycle.");
-    }
+    if (req.actor.type !== "agent") return;
 
     const decision = await access.decide({
       actor: req.actor,
@@ -5615,8 +5619,10 @@ export function agentRoutes(
     if (requestedStatus !== undefined && !["paused", "idle", "terminated"].includes(String(requestedStatus))) throw badRequest("Use an agent lifecycle command to change status");
     // Status changes are lifecycle commands. Apply the authority of the dedicated
     // routes (POST /terminate, /pause, /resume) so PATCH is never a way around them.
-    if (requestedStatus !== undefined) await assertCanManageAgentLifecycle(req, existing);
+    if (requestedStatus === "terminated") await assertBoardCanTerminateAgent(req, existing);
+    if (requestedStatus === "paused") assertBoard(req);
     if (requestedStatus === "idle") {
+      await assertCanResumeAgent(req, existing);
       if (existing.orgChainHealth?.status === "invalid_org_chain") {
         throw conflict(existing.orgChainHealth.repairGuidance ?? "Repair this agent's reporting chain before resuming it");
       }
@@ -5934,12 +5940,11 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
+    assertBoard(req);
     const id = req.params.id as string;
-    const existing = await getAccessibleAgent(req, res, id);
-    if (!existing) {
+    if (!(await getAccessibleAgent(req, res, id))) {
       return;
     }
-    await assertCanManageAgentLifecycle(req, existing);
     const agent = await svcLifecycle.pauseAgent(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5948,14 +5953,10 @@ export function agentRoutes(
 
     await heartbeat.cancelActiveForAgent(id);
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
@@ -5970,7 +5971,7 @@ export function agentRoutes(
     if (!existing) {
       return;
     }
-    await assertCanManageAgentLifecycle(req, existing);
+    await assertCanResumeAgent(req, existing);
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before resuming it",
@@ -6073,7 +6074,7 @@ export function agentRoutes(
     if (!existing) {
       return;
     }
-    await assertCanManageAgentLifecycle(req, existing);
+    await assertBoardCanTerminateAgent(req, existing);
 
     const agent = existing.status === "pending_approval"
       ? (await approvalsSvc.rejectHire(id, req.actor.userId ?? "board"))?.agent
@@ -6099,14 +6100,10 @@ export function agentRoutes(
       AGENT_TERMINATED_STOP_REASON,
     );
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
+      actorType: "user",
+      actorId: req.actor.userId ?? "board",
       action: "agent.terminated",
       entityType: "agent",
       entityId: agent.id,
