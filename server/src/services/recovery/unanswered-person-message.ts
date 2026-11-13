@@ -1,11 +1,15 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
   agentWakeupRequests,
+  approvals,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
+  nativeRunResults,
   type Db,
 } from "@paperclipai/db";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
@@ -222,6 +226,18 @@ export async function settleUnansweredPersonMessage(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt))).limit(1);
   if (answer) return { kind: "answered" };
+  // The agent answered with a card the person must resolve (a question or a
+  // confirmation), or the task waits on a pending approval: the person's move,
+  // already visible (upstream's waiting reasons "question" and "approval").
+  const [asked] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+    eq(issueThreadInteractions.status, "pending"), gt(issueThreadInteractions.createdAt, message.createdAt))).limit(1);
+  if (asked) return { kind: "answered" };
+  const [approval] = await db.select({ id: approvals.id }).from(issueApprovals)
+    .innerJoin(approvals, and(eq(approvals.id, issueApprovals.approvalId), eq(approvals.companyId, issueApprovals.companyId)))
+    .where(and(eq(issueApprovals.companyId, issue.companyId), eq(issueApprovals.issueId, issue.id), eq(approvals.status, "pending")))
+    .limit(1);
+  if (approval) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
@@ -285,6 +301,21 @@ export async function settleUnansweredPersonMessage(
         && (!coordinator.nextAttemptAt || coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime())) {
         return { kind: "pending", recheckAt: Math.max(now.getTime() + 30_000, (coordinator.nextAttemptAt?.getTime() ?? 0) + OVERDUE_NATIVE_RETRY_MS) };
       }
+    }
+    if (run.status === "succeeded") {
+      // A succeeded run that this message did not start says nothing about it.
+      if (!runCarriesMessage(run.contextSnapshot, message.id)) return { kind: "none" };
+      // An accepted native result that declared a blocker or asked for
+      // attention is the agent's answer: it named whose move it is
+      // (upstream's waiting reason "assignee_declared_block").
+      // (the stored envelope is { result, terminal }, recovery/service.ts:1572).
+      const [accepted] = await db.select({ resultJson: nativeRunResults.resultJson }).from(nativeRunResults).where(and(
+        eq(nativeRunResults.companyId, issue.companyId), eq(nativeRunResults.runId, run.id),
+        eq(nativeRunResults.schemaStatus, "accepted"))).limit(1);
+      const envelope = (accepted?.resultJson ?? {}) as Record<string, unknown>;
+      const result = (envelope.result && typeof envelope.result === "object" ? envelope.result : envelope) as Record<string, unknown>;
+      if (result.blocker || result.reportedWorkDisposition === "blocked"
+        || (Array.isArray(result.attentionRequests) && result.attentionRequests.length > 0)) return { kind: "answered" };
     }
     code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
