@@ -535,6 +535,16 @@ async function rotateAuthorityEpoch(
   return resumedState ?? controlPlaneState;
 }
 
+/** The box still holds exactly `prior`'s own suspended runner state, so a
+ * rotation of `prior` stopped after its control plane moved into the epoch and
+ * before the box state was archived. An unreadable or absent box state, or
+ * any other owner's state, is not that interruption. */
+async function interruptedSuspendedRotation(archive: RunnerStateArchive, prior: DurableRecoveryIdentity): Promise<boolean> {
+  let state: Record<string, unknown>;
+  try { state = await archive.read(); } catch { return false; }
+  return state.schema === "paperclip.runner.durable.state.v1" && recoveryIdentityMatches(state, prior) && state.lifecycle === "suspended";
+}
+
 /** Pi restores its transcript through session.open, not provider thread/resume.
  * Retire only the suspended PRP epoch; the sibling pi/ session file stays put.
  * Reuse the ordinary rotation markers so an interrupted open is retryable. */
@@ -6343,18 +6353,22 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const directory = resolve(this.#root, "control-plane");
     const active = existsSync(resolve(directory, "control-plane-state.json")) ? readControlPlaneState(directory) : null;
     if (active && controlPlaneIdentity(active).runId === desired.runId) return;
-    // Without active authority only the exact lost owner's interrupted
-    // rotation resumes from its archive; a completed one belongs to a newer
-    // Runner whose own state now sits on the box.
     const source = active
       ? takeCommittedRotation(this.#root, active) ?? active
-      : lost ? latestArchivedControlPlaneState(this.#root, desired) : null;
+      : latestArchivedControlPlaneState(this.#root, desired);
     if (!source) return;
     if (source.warmTransition !== undefined || source.stagedRunAttachment !== undefined)
       throw new Error("native_runner_authority_archive_conflict");
-    const exactLost = lost && recoveryIdentityMatches(controlPlaneIdentity(source), lost) ? lost : undefined;
-    if (!active && !exactLost) return;
-    await rotateAuthorityEpoch(this.#root, source, desired, this.#externalRunnerStateArchive(), exactLost);
+    const prior = controlPlaneIdentity(source);
+    const exactLost = lost && recoveryIdentityMatches(prior, lost) ? lost : undefined;
+    const archive = this.#externalRunnerStateArchive();
+    // Without active authority the latest epoch is resumed only for the exact
+    // lost owner, or when its rotation was interrupted (RFL F1): the control
+    // plane already moved into the epoch, but the box still holds that same
+    // owner's own suspended runner state. A completed epoch (the box holds a
+    // newer owner's state, or none) never retires anything.
+    if (!active && !exactLost && !await interruptedSuspendedRotation(archive, prior)) return;
+    await rotateAuthorityEpoch(this.#root, source, desired, archive, exactLost);
   }
 
   /** Runner state held by an external Runner host (a plugin task or a sandbox). */
