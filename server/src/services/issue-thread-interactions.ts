@@ -18,6 +18,7 @@ import {
   currentContinuationOrigins,
   deliveredContinuationCommentIds,
 } from "./execution-continuation.js";
+import { firstTurnDeliveredCommentIds } from "./queued-comment-delivery.js";
 import { parseQuestionInteractionAnswers } from "./question-interaction-answers.js";
 import { bindQualityReview, requiredQualityReview } from "./required-quality-review.js";
 import { resolveChatTaskAssignment } from "./chat-task-assignment.js";
@@ -3948,6 +3949,7 @@ export function issueThreadInteractionService(
       let sourceIdentityContextId: string | null = null;
       let sourceRunContext: Record<string, unknown> | null = null;
       let sourceRunCreatedAt: Date | null = null;
+      let sourceRunAgentId: string | null = null;
       if (data.sourceRunId) {
         const sourceRun = await db
           .select({
@@ -3980,6 +3982,7 @@ export function issueThreadInteractionService(
         }
         sourceRunContext = sourceRun.contextSnapshot;
         sourceRunCreatedAt = sourceRun.createdAt;
+        sourceRunAgentId = sourceRun.agentId;
         originCommentIds = [...new Set([...originCommentIds, ...await currentContinuationOrigins(db, issue.companyId, issue.id, sourceRun.contextSnapshot)])];
         sourceIdentityContextId = actor.identityContextId ?? sourceRun.activeIdentityContextId;
         if (sourceIdentityContextId) {
@@ -4060,6 +4063,8 @@ export function issueThreadInteractionService(
           }
           if (
             data.kind === "ask_user_questions" &&
+            data.sourceRunId &&
+            sourceRunAgentId &&
             sourceRunContext &&
             sourceRunCreatedAt
           ) {
@@ -4081,9 +4086,15 @@ export function issueThreadInteractionService(
                     gte(issueComments.createdAt, sourceRunCreatedAt),
                   ),
                 );
-              const undelivered = newerHumanComments.filter(
-                (comment) => !delivered.ids.has(comment.id),
-              );
+              const notInContinuation = newerHumanComments.filter((comment) => !delivered.ids.has(comment.id));
+              // The run can take queued input after its initial wake was built.
+              // Reuse the queue's accepted-turn/revision proof, but only for
+              // this source run: another run's consumption is not its context.
+              const firstTurnDelivered = await firstTurnDeliveredCommentIds(tx, {
+                companyId: issue.companyId, issueId: issue.id, agentId: sourceRunAgentId,
+                runId: data.sourceRunId, commentIds: notInContinuation.map((comment) => comment.id),
+              });
+              const undelivered = notInContinuation.filter((comment) => !firstTurnDelivered.has(comment.id));
               if (undelivered.length > 0) {
                 throw conflict(
                   "New user comments arrived after this run's context; continue after queued comments are delivered",
