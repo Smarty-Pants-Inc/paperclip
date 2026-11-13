@@ -128,6 +128,7 @@ import {
   issueComments,
   issueRecoveryActions,
   issueRelations,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -2925,7 +2926,62 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const durableReceiptFields = receiptRequest
       ? { id: receiptRequest.id, requestedAt: receiptRequest.requestedAt }
       : {};
+    const pendingInteractionWake = opts.idempotencyKey?.startsWith("interaction-pending:") === true ||
+      reason === "interaction_pending" || enrichedContextSnapshot.wakeReason === "interaction_pending";
     const existingDurableReceipt = async (queryDb: Db) => {
+      if (pendingInteractionWake) {
+        const interactionId = readNonEmptyString(enrichedContextSnapshot.interactionId);
+        const denied = () => conflict("Pending interaction wake does not match its card binding.",
+          { code: "interaction_pending_wakeup_binding_denied" });
+        if (!issueId || !isUuidLike(issueId) || !interactionId || !isUuidLike(interactionId) ||
+            opts.idempotencyKey !== `interaction-pending:${interactionId}` ||
+            reason !== "interaction_pending" || source !== "automation" || triggerDetail !== "system" ||
+            enrichedContextSnapshot.source !== "issue.interaction.created" ||
+            enrichedContextSnapshot.wakeReason !== reason || enrichedContextSnapshot.nativeReviewInteractionId ||
+            receiptRequest || opts.taskRetryRequestId || opts.failedRunId) throw denied();
+        const [interaction] = await queryDb.select().from(issueThreadInteractions).where(and(
+          eq(issueThreadInteractions.companyId, agent.companyId), eq(issueThreadInteractions.issueId, issueId),
+          eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.addresseeAgentId, agentId),
+          isNull(issueThreadInteractions.addresseeUserId),
+        )).limit(1);
+        // Identity checks only: a saved receipt is never a cached resolver grant.
+        // Native bootstrap, dispatch, reads and tools still check live authority.
+        const matchesContext = (value: Record<string, unknown>) => Boolean(interaction &&
+          value.issueId === issueId && value.interactionId === interaction.id &&
+          value.interactionKind === interaction.kind &&
+          (value.sourceCommentId ?? null) === interaction.sourceCommentId &&
+          (value.sourceRunId ?? null) === interaction.sourceRunId);
+        const matchesSnapshot = (value: Record<string, unknown>) => matchesContext(value) &&
+          value.taskId === issueId && value.wakeReason === reason && value.source === "issue.interaction.created" &&
+          value.wakeSource === source && value.wakeTriggerDetail === triggerDetail;
+        if (!interaction || !matchesContext(payload ?? {}) || payload?.mutation !== "interaction" ||
+            !matchesSnapshot(enrichedContextSnapshot) ||
+            !(opts.requestedByActorType === "agent" && opts.requestedByActorId === interaction.createdByAgentId ||
+              opts.requestedByActorType === "user" && opts.requestedByActorId === interaction.createdByUserId)) throw denied();
+        const receipt = await queryDb.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, agent.companyId),
+          eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+        )).orderBy(asc(agentWakeupRequests.createdAt), asc(agentWakeupRequests.id)).limit(1).then(rows => rows[0] ?? null);
+        if (!receipt) {
+          if (interaction.status !== "pending") throw denied();
+          return null;
+        }
+        if (receipt.agentId !== agentId || receipt.source !== source || receipt.triggerDetail !== triggerDetail ||
+            receipt.requestedByActorType !== opts.requestedByActorType || receipt.requestedByActorId !== opts.requestedByActorId ||
+            !matchesContext(receipt.payload ?? {}) || receipt.payload?.mutation !== "interaction" ||
+            !matchesSnapshot(parseObject(receipt.payload?.[DEFERRED_WAKE_CONTEXT_KEY]))) throw denied();
+        if (receipt.runId) {
+          const [run] = await queryDb.select().from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, receipt.runId), eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agentId),
+          )).limit(1);
+          if (!run || run.wakeupRequestId !== receipt.id || !matchesSnapshot(parseObject(run.contextSnapshot)) ||
+              (run.issueId !== null && run.issueId !== issueId) ||
+              (run.nativeIssueId !== null && run.nativeIssueId !== issueId)) throw denied();
+        }
+        // All statuses are receipts, including terminal ones; redelivery cannot
+        // reopen work or call the dispatch/staging paths again.
+        return receipt;
+      }
       if (!receiptRequest) return null;
       const receipt = await queryDb
         .select()
@@ -2966,7 +3022,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
       return receipt;
     };
-    const priorReceipt = await existingDurableReceipt(db);
+    const priorReceipt = pendingInteractionWake
+      ? await db.transaction(async tx => {
+          await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
+          // Use the same issue admission lock as insertion below. The second
+          // lookup there closes the race between concurrent first deliveries.
+          if (!issueId || !isUuidLike(issueId))
+            throw conflict("Invalid pending interaction task binding.", { code: "interaction_pending_wakeup_binding_denied" });
+          await tx.execute(sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`);
+          return existingDurableReceipt(tx as unknown as Db);
+        })
+      : await existingDurableReceipt(db);
     if (priorReceipt) {
       // Replaying an admission receipt is not fresh authority to dispatch it.
       // The normal queue owns dispatch and its current execution-policy checks.
