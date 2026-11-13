@@ -76,10 +76,12 @@ function toBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-// Provider-defined stopped states: a resume from one restarted the machine, so
-// no earlier process survived (Boat archiving/archived per docs.boat.dev/
-// readiness.md "Ready, in one table"; Daytona stopped/archived). Error,
-// starting and unknown states prove nothing.
+// Provider-defined stopped states. A resume from one does NOT prove that the
+// machine restarted or that earlier processes ended: Boat usually resumes the
+// same machine with memory and processes alive within 10 minutes
+// (docs.boat.dev/snapshots/stop.md, "Resume within 10 minutes"; the API names
+// a stopped sandbox archived). `restarted` only triggers the proven-gone check
+// (remoteRunnerGenerationLost); it is never proof by itself.
 const STOPPED_SANDBOX_STATES = new Set(["stopped", "archiving", "archived"]);
 
 function sandboxLeaseAcquisitionFromMetadata(

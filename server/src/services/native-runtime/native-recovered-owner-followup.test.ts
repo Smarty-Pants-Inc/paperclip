@@ -691,8 +691,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   // Part 1 intentionally leaves resumed-sandbox rotation to the separate
   // adoption lane; a provider restart label alone never relaxes this fence.
   // REG-26 (I-8h run 90a2d958): the provider stopped the box under the idle
-  // warm Runner, and the resume restarted the machine. That owner is lost, not
-  // live: admission keeps its journal in place for the backend's authority
+  // warm Runner. The resume alone proves nothing; here the box's generation
+  // probe proves that Runner's process gone, so the owner is lost, not live:
+  // admission keeps its journal in place for the backend's authority
   // rotation, which archives its unsuspended state and resumes the same
   // conversation (native-pi-rpc-restarted-sandbox.e2e).
   it("admits a settled warm owner of a resumed sandbox whose provider restarted it, leaving its journal for rotation", async () => {

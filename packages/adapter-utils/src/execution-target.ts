@@ -179,8 +179,9 @@ export interface SandboxLeaseAcquisition {
   providerLeaseId: string;
   previousProviderLeaseId?: string;
   reason?: "not_found" | "expired" | "identity_mismatch" | "resume_failed" | "compatible_environment_change";
-  /** A resume woke a stopped or archived allocation (provider `resumedFromState`):
-   * its machine restarted, so no process from an earlier run survived. */
+  /** A resume woke a stopped or archived allocation (provider `resumedFromState`).
+   * A trigger to check, never proof: the provider may resume the same machine
+   * with its earlier processes still running (docs.boat.dev/snapshots/stop.md). */
   restarted?: true;
 }
 
