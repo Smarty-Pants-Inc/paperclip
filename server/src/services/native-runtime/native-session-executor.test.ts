@@ -14752,6 +14752,16 @@ describe("native session bounded recovery", () => {
     });
   });
 
+  it("maps provider-pack staging codes to their run error codes", () => {
+    for (const code of [
+      "runner_remote_provider_pack_sandbox_stopped",
+      "runner_remote_provider_pack_transfer_timeout",
+      "runner_remote_provider_archive_verify_timeout",
+    ]) {
+      expect(nativeSessionFailureSourceCode(new Error(`${code}: staging failed`))).toBe(code);
+    }
+  });
+
   it("holds exhausted verification without renewing the unchanged reattachment attempt", () => {
     const cause = nativeSessionFailureSourceCode(new Error(
       "runner_remote_provider_verification_unavailable: pack unavailable after 2 verification attempts (exitCode=null; timedOut=true)",
