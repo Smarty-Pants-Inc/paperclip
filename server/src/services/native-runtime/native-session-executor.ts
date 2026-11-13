@@ -267,6 +267,7 @@ import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.
 import { dispatchToolCallback, recoverToolCallback, type SemanticInputAdmission } from "../../vendor/paperclip-runner/index.js";
 import { createAssignedMcpTools, getAssignedMcpGateway } from "./assigned-mcp-tools.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import { getNativeAddressedInteractionGrant, readNativeAddressedInteractionId } from "./native-addressed-interaction.js";
 import { NativeChatAttachmentReadScope } from "./chat-attachment-read.js";
 import {
   assertCurrentWakeCommentsRead,
@@ -12450,6 +12451,7 @@ async function executePaperclipNativeSessionAttempt(
         input.db,
         input.execution.binding,
         expectedCurrentWakeComments,
+        native.result,
       );
     }
     await trace.record({
@@ -15736,12 +15738,17 @@ async function createRunnerdBackendWithinSessionClaim(
     input.execution.binding,
   ));
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
-  const connectorAssignments = input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
-  const reviewRun = await timeController("review_binding", async () => input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
-    .from(heartbeatRuns).where(and(
+  const reviewRun = await timeController("review_binding", async () => input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot,
+    assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId })
+    .from(heartbeatRuns).innerJoin(issues, and(eq(issues.id, heartbeatRuns.nativeIssueId), eq(issues.companyId, heartbeatRuns.companyId))).where(and(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
     )).limit(1).then((rows) => rows[0]));
+  const addressedParticipant = Boolean(readNativeAddressedInteractionId(reviewRun?.contextSnapshot)
+    && (reviewRun?.assigneeAgentId !== input.execution.binding.agentId || reviewRun?.executionRunId !== input.execution.binding.runId));
+  if (addressedParticipant && !await getNativeAddressedInteractionGrant(input.db, input.execution.binding))
+    throw new Error("native_addressed_interaction_no_longer_available");
+  const connectorAssignments = !addressedParticipant && input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
   const nativeReview = readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
   if (nativeReview && !await getNativeReviewAssignment(input.db, {
     ...input.execution.binding, contextSnapshot: nativeReview,
@@ -15786,7 +15793,7 @@ async function createRunnerdBackendWithinSessionClaim(
     : Promise.resolve(null);
   const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner, preparedSnapshot] = await Promise.allSettled([
     Promise.resolve().then(() => input.prepareRunnerEnvironment?.() ?? input.runnerEnvironment),
-    Promise.resolve().then(() => relayAssignedMcp && !nativeReview && assignedMcpUrl && assignedMcpToken
+    Promise.resolve().then(() => relayAssignedMcp && !nativeReview && !addressedParticipant && assignedMcpUrl && assignedMcpToken
       ? timeController("assigned_mcp", () => createAssignedMcpTools({
         gateway: getAssignedMcpGateway(input.db),
         gatewayPublicId: assignedGatewayPublicId!,
@@ -15837,7 +15844,7 @@ async function createRunnerdBackendWithinSessionClaim(
     executionTargetKind: target.kind,
     installRemoteArtifact: !pluginTask && remoteTarget && remoteCommandRunner
       ? createArtifactInstaller(remoteTarget.remoteCwd, remoteCommandRunner) : undefined,
-    imageGeneration: nativeReview || pluginTask ? undefined
+    imageGeneration: nativeReview || addressedParticipant || pluginTask ? undefined
       : imageGenerationBindingForRun({ providerKind: input.execution.provider.kind, contextSnapshot: reviewRun?.contextSnapshot }),
     readRemoteWorkspaceFile: !pluginTask && remoteTarget && remoteCommandRunner
       ? (file) => readVerifiedRemoteWorkspaceFile({ runner: remoteCommandRunner, workspaceRoot: remoteTarget.remoteCwd, ...file })

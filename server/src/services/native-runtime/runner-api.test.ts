@@ -494,6 +494,63 @@ describe("runner API request boundary", () => {
     expect(JSON.stringify(result)).not.toContain("private-fixture-value");
     expect(request).toHaveBeenCalledOnce();
   });
+  it("accepts same-run settlement after an addressed interaction resolves during dispatch", async () => {
+    let resolution: { status: "pending" } | { status: "resolved"; resolvedByRunId: string } = { status: "pending" };
+    const request = vi.fn<typeof fetch>(async () => {
+      resolution = { status: "resolved", resolvedByRunId: context.runId };
+      return Response.json({ interactionId: "interaction-a", status: "accepted", resolvedByRunId: context.runId });
+    });
+    const beforeDispatch = vi.fn(async () => {
+      if (resolution.status !== "pending") throw new Error("Run revoked before dispatch");
+    });
+    const beforeResponseCapture = vi.fn(async () => {
+      if (resolution.status !== "resolved" || resolution.resolvedByRunId !== context.runId) {
+        throw new Error("Response settlement is not attributable to this run");
+      }
+    });
+
+    const result = await executeRunnerApi({
+      operationId: "POST /api/issues/{id}/interactions/{interactionId}/accept",
+      pathParams: { id: context.issueId, interactionId: "interaction-a" },
+      body: {},
+    }, context, { ...io(request), beforeDispatch, beforeResponseCapture });
+
+    expect(result).toMatchObject({ ok: true, status: 200, data: { interactionId: "interaction-a", status: "accepted", resolvedByRunId: context.runId } });
+    expect(beforeDispatch).toHaveBeenCalledOnce();
+    expect(beforeResponseCapture).toHaveBeenCalled();
+    expect(request).toHaveBeenCalledOnce();
+  });
+  it.each([
+    ["revoked before settlement", { status: "revoked" }],
+    ["resolved by another run", { status: "resolved", resolvedByRunId: "run-other" }],
+  ] as const)("withholds an addressed interaction response when settlement is %s", async (_label, rejectedResolution) => {
+    type Resolution = { status: "pending" } | { status: "resolved"; resolvedByRunId: string } | { status: "revoked" };
+    let resolution: Resolution = { status: "pending" };
+    const request = vi.fn<typeof fetch>(async () => {
+      resolution = rejectedResolution;
+      return Response.json({ interactionId: "interaction-a", status: "accepted", value: "private-settlement-fixture" });
+    });
+    const beforeDispatch = vi.fn(async () => {
+      if (resolution.status !== "pending") throw new Error("Run revoked before dispatch");
+    });
+    const beforeResponseCapture = vi.fn(async () => {
+      if (resolution.status !== "resolved" || resolution.resolvedByRunId !== context.runId) {
+        throw new Error("Response settlement is not attributable to this run");
+      }
+    });
+
+    const result = await executeRunnerApi({
+      operationId: "POST /api/issues/{id}/interactions/{interactionId}/accept",
+      pathParams: { id: context.issueId, interactionId: "interaction-a" },
+      body: {},
+    }, context, { ...io(request), beforeDispatch, beforeResponseCapture });
+
+    expect(result).toMatchObject({ ok: false, error: "api_transport_failure", outcome: "unknown" });
+    expect(JSON.stringify(result)).not.toContain("private-settlement-fixture");
+    expect(beforeDispatch).toHaveBeenCalledOnce();
+    expect(beforeResponseCapture).toHaveBeenCalled();
+    expect(request).toHaveBeenCalledOnce();
+  });
   it("forwards only server-owned authentication and preserves API denials", async () => {
     const request = vi.fn<typeof fetch>(async () =>
       Response.json({ error: "Board access required" }, { status: 403 }),

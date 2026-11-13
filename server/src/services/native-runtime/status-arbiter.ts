@@ -173,6 +173,7 @@ export function arbitrateNativeStatus(input: {
   reviewOwnerUserId?: string | null;
   /** Review decisions own task state; a reviewer's finish report cannot override them. */
   nativeReviewOutcome?: "resolved" | "pending" | "stale";
+  nativeAddressedInteractionOutcome?: "resolved" | "pending" | "stale";
   /**
    * This run, as the configured participant, recorded the approval that
    * completed the task's final execution-policy stage. That durable decision is
@@ -230,6 +231,13 @@ export function arbitrateNativeStatus(input: {
       ],
     };
   }
+  if (input.nativeAddressedInteractionOutcome) return {
+    policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+    statusAction: "preserve", toStatus: input.priorIssueStatus,
+    reasonCode: input.nativeAddressedInteractionOutcome === "resolved"
+      ? "native_addressed_interaction_finished" : "native_addressed_interaction_unresolved",
+    unblockDescriptor: null, effects: [],
+  };
   if (input.providerFailureSuperseded) return {
     policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
     statusAction: "preserve", toStatus: input.priorIssueStatus,

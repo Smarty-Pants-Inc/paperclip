@@ -142,6 +142,30 @@ describe("native status authority", () => {
     }
   });
 
+  it("preserves addressed responders' source status for every interaction outcome", () => {
+    const reports = [
+      assessment({ reportedDisposition: "done" }),
+      assessment({ reportedDisposition: "yielded", objectiveSatisfied: false, allCriteriaSatisfied: false,
+        continuation: { kind: "same_agent", summary: "Continue task work", idempotencyKey: "model-yield" } }),
+      assessment({ reportedDisposition: "blocked", hasBlockingRemainingWork: true,
+        blocker: { unblockAction: "Resolve the reported blocker", boardOwned: false, scope: "task_wide" } }),
+    ];
+    for (const nativeAddressedInteractionOutcome of ["resolved", "pending", "stale"] as const) {
+      for (const priorIssueStatus of ["todo", "in_progress", "in_review", "blocked"] as const) {
+        for (const modelAssessment of reports) {
+          expect(arbitrate({ nativeAddressedInteractionOutcome, priorIssueStatus, assessment: modelAssessment })).toMatchObject({
+            statusAction: "preserve",
+            toStatus: priorIssueStatus,
+            reasonCode: nativeAddressedInteractionOutcome === "resolved"
+              ? "native_addressed_interaction_finished"
+              : "native_addressed_interaction_unresolved",
+            effects: [],
+          });
+        }
+      }
+    }
+  });
+
   it("routes an unfinished reviewer action to bounded recovery instead of retrying the worker task", () => {
     const decision = arbitrate({ priorIssueStatus: "in_review", nativeReviewOutcome: "pending" });
     expect(decision).toMatchObject({ statusAction: "preserve", toStatus: "in_review" });
