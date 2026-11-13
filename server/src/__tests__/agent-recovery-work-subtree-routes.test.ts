@@ -208,9 +208,12 @@ describe("target-scoped agent recovery and work", () => {
       const f = await seed(operation);
       await assertMutation(operation, f, f.ids.outside, true);
     }, 60_000);
-    it(`${operation}: a legacy unscoped configure grant retains its broader authority`, async () => {
+    it(`${operation}: a legacy unscoped configure grant cannot manage outside the subtree`, async () => {
       const f = await seed(operation, "unscoped");
-      await assertMutation(operation, f, f.ids.outside);
+      const before = await snapshot(f.ids.outside);
+      const response = await f.post(f.ids.outside);
+      expect.soft(response.status, response.text).toBe(403);
+      expect.soft(await snapshot(f.ids.outside)).toEqual(before);
     }, 60_000);
     it(`${operation}: the lead cannot manage its own manager`, async () => {
       const f = await seed(operation);

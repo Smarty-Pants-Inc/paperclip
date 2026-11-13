@@ -127,6 +127,31 @@ describe("subtree-scoped agent lifecycle", () => {
     }, 60_000);
   }
 
+  for (const grant of ["unscoped", "peer-worker"] as const) {
+    for (const command of ["pause", "resume", "terminate"] as const) {
+      it(`${grant}: denies ${command} on a peer's worker through POST and PATCH without writes`, async () => {
+        const f = await seed();
+        const workerId = await f.hire();
+        await db.update(agents).set({ reportsTo: f.ids.sibling }).where(eq(agents.id, workerId));
+        if (command === "resume") {
+          await db.update(agents).set({ status: "paused", lifecycleState: "paused", lifecycleHolds: ["manual"] })
+            .where(eq(agents.id, workerId));
+        }
+        await db.update(principalPermissionGrants).set({ scope: grant === "unscoped" ? null : { agentIds: [workerId] } })
+          .where(and(eq(principalPermissionGrants.principalId, f.ids.lead), eq(principalPermissionGrants.permissionKey, "agents:configure")));
+        const before = await f.current(workerId);
+        const events = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+        const post = await f.post(workerId, command);
+        const patch = await request(f.api).patch(`/api/agents/${workerId}`).set("Authorization", `Bearer ${f.token}`)
+          .send({ status: command === "pause" ? "paused" : command === "resume" ? "idle" : "terminated" });
+        expect.soft(post.status, post.text).toBe(403);
+        expect.soft(patch.status, patch.text).toBe(403);
+        expect.soft(await f.current(workerId)).toEqual(before);
+        expect.soft(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual(events);
+      }, 60_000);
+    }
+  }
+
   it("allows transitive descendants, but loses lifecycle authority after a worker leaves the subtree", async () => {
     const f = await seed();
     const workerId = await f.hire();
@@ -181,6 +206,15 @@ describe("subtree-scoped agent lifecycle", () => {
     expect(denied.body.error).toContain("board user");
     expect(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toEqual(before);
     expect((await f.current(workerId)).status).toBe("pending_approval");
+    const pending = await f.current(workerId);
+    const events = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    const patch = await request(f.api).patch(`/api/agents/${workerId}`).set("Authorization", `Bearer ${f.token}`)
+      .send({ status: "terminated" });
+    expect.soft(patch.status, patch.text).toBe(403);
+    expect.soft(patch.body.error).toContain("board user");
+    expect.soft(await f.current(workerId)).toEqual(pending);
+    expect.soft(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toEqual(before);
+    expect.soft(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual(events);
     const allowed = await request(f.board).post(`/api/agents/${workerId}/terminate`).send({});
     expect(allowed.status, allowed.text).toBe(200);
     const [decided] = await db.select().from(approvals).where(eq(approvals.companyId, f.companyId));

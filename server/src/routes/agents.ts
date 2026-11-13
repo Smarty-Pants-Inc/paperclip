@@ -2609,31 +2609,21 @@ export function agentRoutes(
   async function assertCanManageAgentLifecycle(
     req: Request,
     targetAgent: { id: string; companyId: string },
+    command?: "pause" | "resume" | "terminate",
   ) {
     if (req.actor.type !== "agent") {
       assertBoard(req);
       return;
     }
-    // Configuration scopes include their root; lifecycle control must not let
-    // an agent stop itself or release its own pause holds.
-    if (req.actor.agentId === targetAgent.id) {
-      throw forbidden("Agents cannot manage their own lifecycle.");
-    }
-
-    const decision = await access.decide({
-      actor: req.actor,
-      action: "agent_config:update",
-      resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
-      scope: { targetAgentId: targetAgent.id, requiresChangeGrant: true },
-    });
-    if (decision.allowed) return;
-    throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+    await assertAgentLifecycleAuthority(db, req.actor, targetAgent, command);
   }
 
-  function lifecycleForRequest(req: Request, target: { id: string; companyId: string }) {
+  function lifecycleForRequest(
+    req: Request, target: { id: string; companyId: string }, command?: "pause" | "resume" | "terminate",
+  ) {
     if (req.actor.type !== "agent") return svcLifecycle;
     return createAgentLifecycle(db, { cancelWorkForScope: scope => heartbeat.cancelBudgetScopeWork(scope) },
-      tx => assertAgentLifecycleAuthority(tx, req.actor, target));
+      tx => assertAgentLifecycleAuthority(tx, req.actor, target, command));
   }
 
   function assertNoAgentInstructionsConfigMutation(
@@ -5636,7 +5626,8 @@ export function agentRoutes(
     if (requestedStatus !== undefined && !["paused", "idle", "terminated"].includes(String(requestedStatus))) throw badRequest("Use an agent lifecycle command to change status");
     // Status changes are lifecycle commands. Apply the authority of the dedicated
     // routes (POST /terminate, /pause, /resume) so PATCH is never a way around them.
-    if (requestedStatus !== undefined) await assertCanManageAgentLifecycle(req, existing);
+    if (requestedStatus !== undefined) await assertCanManageAgentLifecycle(req, existing,
+      requestedStatus === "terminated" ? "terminate" : undefined);
     if (requestedStatus === "idle") {
       if (existing.orgChainHealth?.status === "invalid_org_chain") {
         throw conflict(existing.orgChainHealth.repairGuidance ?? "Repair this agent's reporting chain before resuming it");
@@ -5916,7 +5907,7 @@ export function agentRoutes(
     };
     const command = requestedStatus === "paused" ? "pause" : requestedStatus === "idle" ? "resume" : requestedStatus === "terminated" ? "terminate" : null;
     const agent = command
-      ? await lifecycleForRequest(req, existing).updateAndTransition(id, command, patchData, updateOptions)
+      ? await lifecycleForRequest(req, existing, command).updateAndTransition(id, command, patchData, updateOptions)
       : await svc.update(id, patchData, updateOptions);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -6100,16 +6091,12 @@ export function agentRoutes(
     if (!existing) {
       return;
     }
-    await assertCanManageAgentLifecycle(req, existing);
+    await assertCanManageAgentLifecycle(req, existing, "terminate");
 
-    // Approval decisions have only decidedByUserId. Do not invent a board
-    // identity for an agent; pending-hire rejection remains a real user action.
-    if (existing.status === "pending_approval" && req.actor.type === "agent") {
-      throw forbidden("Only a board user can reject a pending hire; agent approval deciders are not supported.");
-    }
+    // Approval decisions have only decidedByUserId; agents cannot reject hires.
     const agent = existing.status === "pending_approval"
       ? (await approvalsSvc.rejectHire(id, req.actor.userId ?? "board"))?.agent
-      : await lifecycleForRequest(req, existing).terminateAgent(id);
+      : await lifecycleForRequest(req, existing, "terminate").terminateAgent(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;

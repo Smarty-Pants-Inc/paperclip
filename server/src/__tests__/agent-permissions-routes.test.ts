@@ -70,6 +70,8 @@ const mockAccessService = vi.hoisted(() => ({
   setPrincipalPermission: vi.fn(),
 }));
 
+const mockIsAgentInSubtree = vi.hoisted(() => vi.fn());
+
 const mockApprovalService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
@@ -162,6 +164,12 @@ function registerModuleMocks() {
 
   vi.doMock("../services/access.js", () => ({
     accessService: () => mockAccessService,
+  }));
+
+  vi.doMock("../services/authorization.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../services/authorization.js")>()),
+    authorizationService: () => mockAccessService,
+    isAgentInSubtree: mockIsAgentInSubtree,
   }));
 
   vi.doMock("../services/approvals.js", () => ({
@@ -310,6 +318,7 @@ describe("agent permission routes", () => {
 
   beforeEach(() => {
     vi.resetAllMocks();
+    mockIsAgentInSubtree.mockResolvedValue(false);
     mockAgentService.getById.mockReset();
     mockAgentService.getConfigRevision.mockReset();
     mockAgentService.listConfigRevisions.mockReset();
@@ -1753,6 +1762,7 @@ describe("agent permission routes", () => {
     ["PATCH status", (base: string) => request(base).patch(`/api/agents/${agentId}`).send({ status: "terminated" })],
     ["POST terminate", (base: string) => request(base).post(`/api/agents/${agentId}/terminate`).send({})],
   ])("refuses agent termination through %s when configure does not cover the target", async (_route, send) => {
+    mockIsAgentInSubtree.mockResolvedValue(true);
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "idle" });
     mockAccessService.decide.mockResolvedValue({ allowed: false, action: "agent_config:update", reason: "deny_scope", explanation: "Configure permission does not cover this target." });
     const app = await createApp({
@@ -1801,6 +1811,7 @@ describe("agent permission routes", () => {
     ["PATCH status", (base: string) => request(base).patch(`/api/agents/${agentId}`).send({ status: "paused" })],
     ["POST pause", (base: string) => request(base).post(`/api/agents/${agentId}/pause`).send({})],
   ])("refuses pausing an agent through %s when configure does not cover the target", async (_route, send) => {
+    mockIsAgentInSubtree.mockResolvedValue(true);
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "running" });
     mockAccessService.decide.mockResolvedValue({ allowed: false, action: "agent_config:update", reason: "deny_scope", explanation: "Configure permission does not cover this target." });
     const app = await createApp({
@@ -1845,6 +1856,7 @@ describe("agent permission routes", () => {
   });
 
   it("applies the resume change-grant decision to PATCH status idle from an agent", async () => {
+    mockIsAgentInSubtree.mockResolvedValue(true);
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "paused" });
     mockAccessService.decide.mockImplementation(async (input: { action?: string; scope?: { requiresChangeGrant?: boolean } }) => {
       const allowed = !input.scope?.requiresChangeGrant;
@@ -1876,7 +1888,8 @@ describe("agent permission routes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("lets a granted agent resume through PATCH status idle", async () => {
+  it("lets a granted agent resume its report through PATCH status idle", async () => {
+    mockIsAgentInSubtree.mockResolvedValue(true);
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "paused" });
     mockAgentService.updateAndTransition.mockResolvedValue({ ...baseAgent, status: "idle" });
     const app = await createApp({

@@ -16,13 +16,15 @@ agent.
 | `/api/agents/:id/heartbeat/invoke` | The agent being invoked, when different from the caller |
 | `/api/heartbeat-runs/:runId/cancel` | The agent named by the saved run, not a request-body agent ID |
 
-The boundary is the existing [configuration grant scope](agent-configure-permissions.md).
-For a lead with `scope: { subtreeRootAgentId: "<lead UUID>" }`, direct and
-transitive reports match; siblings, managers and unrelated agents do not. The
-boundary follows current `reportsTo` links, not who created or hired the target.
-Reparenting a worker out of the lead's reporting subtree removes this authority.
-Existing explicitly unscoped grants retain their broader same-company authority;
-this change does not backfill or widen any grant.
+Agent callers must satisfy both the existing
+[configuration grant scope](agent-configure-permissions.md) and the strict
+reporting-subtree check. Direct and transitive reports qualify; self, siblings,
+managers and unrelated agents do not. The boundary follows current `reportsTo`
+links, not who created or hired the target. Reparenting a worker out of the
+lead's reporting subtree removes this authority. An explicitly unscoped grant
+or a grant naming an outside target never overrides that boundary. Authority is
+rechecked under the reporting-tree mutex at the durable write. No grants are
+backfilled or widened.
 
 Board callers retain their existing route-specific checks. Normal self-wake
 remains available without a configuration grant. Session reset does not grant

@@ -71,6 +71,8 @@ const mockAccessService = vi.hoisted(() => ({
   setPrincipalPermission: vi.fn(),
 }));
 
+const mockIsAgentInSubtree = vi.hoisted(() => vi.fn());
+
 const mockApprovalService = vi.hoisted(() => ({
   create: vi.fn(),
   getById: vi.fn(),
@@ -222,6 +224,12 @@ vi.mock("../services/index.js", () => ({
   workspaceOperationService: () => mockWorkspaceOperationService,
 }));
 
+vi.mock("../services/authorization.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/authorization.js")>()),
+  authorizationService: () => mockAccessService,
+  isAgentInSubtree: mockIsAgentInSubtree,
+}));
+
 vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => ({
     getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
@@ -288,6 +296,8 @@ async function requestApp(
 
 function resetMockDefaults() {
   vi.clearAllMocks();
+  // Grant-focused cases use a strict report unless testing the tree denial itself.
+  mockIsAgentInSubtree.mockResolvedValue(true);
   for (const mock of Object.values(mockAgentService)) mock.mockReset();
   for (const mock of Object.values(mockAccessService)) mock.mockReset();
   for (const mock of Object.values(mockApprovalService)) mock.mockReset();
@@ -507,7 +517,7 @@ describe("agent cross-tenant route authorization", () => {
     }));
   });
 
-  it("allows a same-company agent with a direct agents:configure grant to resume", async () => {
+  it("allows a same-company agent with a direct agents:configure grant to resume its report", async () => {
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       action: "agent_config:update",
@@ -538,7 +548,7 @@ describe("agent cross-tenant route authorization", () => {
   });
 
   it.each([
-    ["an ungranted peer", "44444444-4444-4444-8444-444444444444"],
+    ["an ungranted report", "44444444-4444-4444-8444-444444444444"],
     ["an ungranted self", agentId],
   ])("denies resume for %s", async (_label, actorAgentId) => {
     mockAccessService.decide.mockResolvedValue({
@@ -574,6 +584,20 @@ describe("agent cross-tenant route authorization", () => {
         scope: { targetAgentId: agentId, requiresChangeGrant: true },
       }));
     }
+    expect(mockAgentService.resume).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("denies a granted agent outside its subtree before considering its configure grant", async () => {
+    mockIsAgentInSubtree.mockResolvedValue(false);
+    mockAccessService.decide.mockResolvedValue({ allowed: true });
+    const app = await createApp({
+      type: "agent", agentId: "44444444-4444-4444-8444-444444444444", companyId, source: "agent_key",
+    });
+    const res = await requestApp(app, base => request(base).post(`/api/agents/${agentId}/resume`).send({}));
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("reporting subtree");
+    expect(mockAccessService.decide).not.toHaveBeenCalled();
     expect(mockAgentService.resume).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
