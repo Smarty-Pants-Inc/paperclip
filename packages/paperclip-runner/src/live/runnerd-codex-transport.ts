@@ -7203,9 +7203,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ));
     const providerNodeCommand =
       this.options.providerNodeCommand ?? process.execPath;
-    const piProxyPath = provider === "pi_rpc"
+    const piProxyPath = provider === "pi_rpc" && preparesProviderLaunch
       ? this.options.piProxyPath ?? resolveBuildOwnedCliArtifact("pi-rpc-app-server-proxy.cjs") : undefined;
-    const runnerPiLaunchProfile = provider === "pi_rpc"
+    const runnerPiLaunchProfile = provider === "pi_rpc" && preparesProviderLaunch
       ? piRunnerLaunchProfile(this.options, providerNodeCommand, piProxyPath!) : undefined;
     const cursorCloudProxyPath = provider === "cursor_cloud"
       ? this.options.cursorCloudProxyPath ?? resolveBuildOwnedCliArtifact("cursor-cloud-app-server-proxy.cjs") : undefined;
