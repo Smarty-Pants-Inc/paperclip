@@ -39,6 +39,27 @@ export const lifecycleSignalWait = and(
   sql`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') <> 'true'`,
 );
 
+/** Older operator parks may predate the diagnostic; recovery adds visibility,
+ * never a deadline or a new attempt. */
+export const lifecycleStopParkWithoutError = and(
+  inArray(agents.lifecycleState, ["pausing", "terminating", "cleaning_up"]),
+  sql`${agents.lifecycleOperation}->>'retryRequired' = 'true'`,
+  sql`nullif(btrim(coalesce(${agents.lifecycleError}, '')), '') is null`,
+);
+
+export async function surfaceAgentLifecycleStopParkInTransaction(
+  tx: Pick<Db, "update">, input: { companyId: string; agentId: string; expectedVersion: number },
+): Promise<boolean> {
+  if (!("nestedIndex" in tx)) throw new AgentLifecycleConflict("Lifecycle park diagnostics require the producer transaction");
+  const rows = await tx.update(agents).set({
+    lifecycleError: sql`'Automatic stop work is paused in ' || ${agents.lifecycleState}
+      || ' (lifecycle operation ' || coalesce(nullif(${agents.lifecycleOperation}->>'id', ''), 'unknown')
+      || '). Recheck the outstanding stop or cleanup evidence, then use Retry.'`,
+  }).where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId),
+    eq(agents.lifecycleVersion, input.expectedVersion), lifecycleStopParkWithoutError)).returning({ id: agents.id });
+  return rows.length > 0;
+}
+
 /** The producer owns this outer transaction. Register its intent before either
  * the recheck write or the corresponding external fact commits. */
 /**
