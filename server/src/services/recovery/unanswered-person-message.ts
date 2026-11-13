@@ -1,12 +1,9 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
   agentWakeupRequests,
-  approvals,
   heartbeatRuns,
-  issueApprovals,
   issueComments,
   issueRecoveryActions,
-  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -16,6 +13,7 @@ import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
+import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 
 /**
@@ -156,11 +154,38 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
           and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at)
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text))
-    or exists (select 1 from ${issueComments} n where n.company_id = ${companyId} and n.issue_id = ${issueId}
+    or exists (select 1 from ${issueComments} n
+      join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
+        and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
+      where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and exists (select 1 from ${issueComments} a where a.company_id = n.company_id and a.issue_id = n.issue_id
-        and a.author_type = 'agent' and a.deleted_at is null and a.created_at > n.created_at)))`;
+        and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at)))`;
+}
+
+/**
+ * SQL over issue_comments rows (the outer table): a person's message within the
+ * lookback that no agent answered and that has no notice yet, or a live
+ * unanswered-message notice whose message an agent has since answered. The
+ * recovery worker runs ONE batched query with it per page of visited tasks.
+ */
+export function unansweredPersonMessageCommentCondition(): SQL {
+  const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
+  return sql`((${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
+      and ${issueComments.createdAt} > ${since}::timestamptz
+      and not exists (select 1 from ${issueComments} a where a.company_id = ${issueComments.companyId}
+        and a.issue_id = ${issueComments.issueId} and a.author_type = 'agent' and a.deleted_at is null
+        and a.created_at > ${issueComments.createdAt})
+      and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
+        and n.issue_id = ${issueComments.issueId}
+        and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text))
+    or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
+      and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+      and exists (select 1 from ${issueComments} m join ${issueComments} a on a.company_id = m.company_id
+          and a.issue_id = m.issue_id and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at
+        where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
+          and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1}))))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -170,8 +195,13 @@ export type UnansweredMessageOutcome =
 
 function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean {
   const context = (contextSnapshot ?? {}) as Record<string, unknown>;
+  // A comment that arrived while the run prepared is delivered as its first-turn
+  // input (first-turn-queued-input.ts; queued-comment-delivery.ts:21-60): that
+  // run carries it, and its deferred wake is cancelled as delivered.
+  const firstTurn = (context.firstTurnQueuedInput ?? {}) as Record<string, unknown>;
   const ids = [
     ...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
+    ...(Array.isArray(firstTurn.commentIds) ? firstTurn.commentIds : []),
     context.wakeCommentId, context.commentId, context.conversationReplyBoundaryCommentId,
   ];
   return ids.includes(messageId);
@@ -186,32 +216,37 @@ function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
 /** One task: answer, supersede or notice its person's last message. Idempotent. */
 export async function settleUnansweredPersonMessage(
   db: Db,
-  input: { companyId: string; issueId: string; now?: Date },
+  input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null },
 ): Promise<UnansweredMessageOutcome> {
   const now = input.now ?? new Date();
   const [issue] = await db.select({
     id: issues.id, companyId: issues.companyId, status: issues.status, hiddenAt: issues.hiddenAt,
-    assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId,
+    assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, createdAt: issues.createdAt,
   }).from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
   if (!issue) return { kind: "none" };
+  if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
 
-  // A later answer supersedes every unanswered-message notice before it.
-  const live = await db.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+  // An answer to a message supersedes that message's notice (and its
+  // retrying line): the relation is message -> answer, not the notice's time.
+  // Written under the same issue fence, in the same order (issue row, then its
+  // comments) as the notice writers.
+  const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
     or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
-      sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`)));
-  if (live.length) {
-    const [latestAnswer] = await db.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
-      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-      eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt)))
-      .orderBy(desc(issueComments.createdAt)).limit(1);
-    const answered = latestAnswer ? live.filter(notice => notice.createdAt < latestAnswer.createdAt).map(notice => notice.id) : [];
-    if (answered.length) {
-      await db.update(issueComments).set({ deletedAt: now, updatedAt: now })
-        .where(and(eq(issueComments.companyId, issue.companyId), inArray(issueComments.id, answered), isNull(issueComments.deletedAt)));
-    }
-  }
+      sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
+  if (liveNotice) await db.transaction(async tx => {
+    await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+    await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+    where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
+      and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+        or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
+      and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
+        and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
+        and exists (select 1 from ${issueComments} a where a.company_id = n.company_id and a.issue_id = n.issue_id
+          and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at))`);
+  });
 
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
@@ -226,18 +261,6 @@ export async function settleUnansweredPersonMessage(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt))).limit(1);
   if (answer) return { kind: "answered" };
-  // The agent answered with a card the person must resolve (a question or a
-  // confirmation), or the task waits on a pending approval: the person's move,
-  // already visible (upstream's waiting reasons "question" and "approval").
-  const [asked] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
-    eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
-    eq(issueThreadInteractions.status, "pending"), gt(issueThreadInteractions.createdAt, message.createdAt))).limit(1);
-  if (asked) return { kind: "answered" };
-  const [approval] = await db.select({ id: approvals.id }).from(issueApprovals)
-    .innerJoin(approvals, and(eq(approvals.id, issueApprovals.approvalId), eq(approvals.companyId, issueApprovals.companyId)))
-    .where(and(eq(issueApprovals.companyId, issue.companyId), eq(issueApprovals.issueId, issue.id), eq(approvals.status, "pending")))
-    .limit(1);
-  if (approval) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
@@ -273,8 +296,18 @@ export async function settleUnansweredPersonMessage(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000))))
     .orderBy(desc(heartbeatRuns.createdAt)).limit(20);
-  const run = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id))
-    ?? runs.find(candidate => candidate.createdAt >= message.createdAt) ?? null;
+  // Only a run that carries THIS message is evidence about it. An unrelated
+  // run (a timer, or the continuation that replaced a cancelled deferred wake
+  // with no comment ids) is not: the message's own wake path decides.
+  const run = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
+  // native-governance.ts conversationTurnAnswered): only a pending question or
+  // confirmation card that the message's OWN run created stands in for its
+  // reply. A card from an earlier turn or one the board addressed to someone
+  // else, and any approval, can hold the task but do not answer the message.
+  if (run && !(await conversationTurnAnswered({ db, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) {
+    return { kind: "answered" };
+  }
 
   let code: string;
   if (!run) {
@@ -303,8 +336,6 @@ export async function settleUnansweredPersonMessage(
       }
     }
     if (run.status === "succeeded") {
-      // A succeeded run that this message did not start says nothing about it.
-      if (!runCarriesMessage(run.contextSnapshot, message.id)) return { kind: "none" };
       // An accepted native result that declared a blocker or asked for
       // attention is the agent's answer: it named whose move it is
       // (upstream's waiting reason "assignee_declared_block").
@@ -349,12 +380,36 @@ export async function settleUnansweredPersonMessage(
     failureCode: run ? undefined : code,
   });
   const commentId = await db.transaction(async tx => {
+    // The issue fence that comment writers, the executor's held-notice writer
+    // and execution admission take. Everything decided above is re-checked
+    // under it: an answer, a held notice, a newer message or a new run that
+    // committed while this sweep waited means no notice.
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    const q = tx as unknown as Db;
+    const [existing] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
       eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
       sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
     if (existing) return null;
+    const [newest] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
+      .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+    if (newest?.id !== message.id) return null;
+    const [answeredNow] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt))).limit(1);
+    if (answeredNow) return null;
+    if (run && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) return null;
+    const [liveNow] = await q.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
+      or(inArray(heartbeatRuns.status, LIVE), and(gt(heartbeatRuns.createdAt, message.createdAt),
+        sql`(${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${message.id}
+          or coalesce(${heartbeatRuns.contextSnapshot}->'wakeCommentIds', '[]'::jsonb) @> ${JSON.stringify([message.id])}::jsonb
+          or coalesce(${heartbeatRuns.contextSnapshot}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) @> ${JSON.stringify([message.id])}::jsonb)`,
+        ...(run ? [sql`${heartbeatRuns.id} <> ${run.id}`] : []))))).limit(1);
+    if (liveNow) return null;
+    if (await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id })) return null;
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, notice.body, {}, {
       authorType: "system",
       presentation: notice.presentation,
@@ -365,7 +420,19 @@ export async function settleUnansweredPersonMessage(
   return commentId ? { kind: "noticed", code, commentId } : { kind: "noticed_before" };
 }
 
-/** The sweep's pass: every task in scope with a person's message to settle. */
+/** One task the recovery worker already flagged (its batched page query found
+ * a person's message to settle): no candidate lookup of its own. */
+export async function settleUnansweredPersonMessagesForTask(
+  db: Db,
+  input: { companyId: string; issueId: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date },
+): Promise<{ noticed: number; pending: number }> {
+  const outcome = await settleUnansweredPersonMessage(db, input);
+  if (outcome.kind === "pending") input.onDeferredDeadline?.(outcome.recheckAt);
+  return { noticed: outcome.kind === "noticed" ? 1 : 0, pending: outcome.kind === "pending" ? 1 : 0 };
+}
+
+/** The sweep's pass outside the worker (startup, a direct call): every task in
+ * scope with a person's message to settle, found with one candidate query. */
 export async function settleUnansweredPersonMessages(
   db: Db,
   input: { companyId?: string; issueId?: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date },

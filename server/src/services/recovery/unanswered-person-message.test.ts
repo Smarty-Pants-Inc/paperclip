@@ -17,6 +17,7 @@ import { and, eq, gt, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
+import { noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -327,12 +328,96 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  it("no false notice: a later run the message did not start (a timer run) succeeding says nothing about the message", async () => {
+  it("RFL F4: an unrelated timer run's success is not evidence; the message's own path gives exactly one notice", async () => {
     const f = await fixture();
     await f.message();
     await f.run({ commentId: null, status: "succeeded", wakeReason: "heartbeat_timer" });
     await f.sweep();
-    expect(await f.visible()).toHaveLength(0);
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(NO_RUN);
+  });
+
+  it("fabric-v2 (21:40Z): a comment delivered as a run's FIRST-TURN input is carried by that run: no notice while it runs or after it answers; one if it fails", async () => {
+    for (const outcome of ["answers", "fails"] as const) {
+      const f = await fixture();
+      await f.reply(await f.run({ commentId: await f.message("first"), status: "succeeded" }));
+      const running = await f.run({ commentId: null, status: "running", wakeReason: "issue_assigned" });
+      const commentId = await f.message("A follow-up while you prepare.");
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_assigned",
+        firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1", runId: running, commentIds: [commentId],
+          claimedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, running));
+      // Its deferred wake was cancelled AS DELIVERED: not "nothing pending".
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+        reason: "issue_execution_deferred", status: "cancelled", finishedAt: new Date(), payload: { issueId: f.issueId, commentId } });
+      await f.sweep();
+      expect(await f.visible(), `${outcome}: running`).toHaveLength(0);
+      if (outcome === "answers") {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, running));
+        await f.reply(running);
+        await f.sweep();
+        expect(await f.visible(), "answered").toHaveLength(0);
+      } else {
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost",
+          finishedAt: f.at() }).where(eq(heartbeatRuns.id, running));
+        await f.sweep();
+        await f.sweep();
+        const notices = await f.visible();
+        expect(notices).toHaveLength(1);
+        expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+        expect(notices[0]!.body).toBe(NOT_ANSWERED);
+      }
+    }
+  });
+
+  it("RFL F3: an approval requested BEFORE the new message does not answer that message's failed run", async () => {
+    const f = await fixture({ status: "blocked" });
+    const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "deploy", requestedByAgentId: f.agentId,
+      status: "pending", payload: { summary: "An earlier deployment" }, createdAt: f.at() }).returning();
+    await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.issueId, approvalId: approval!.id, linkedByAgentId: f.agentId });
+    await f.run({ commentId: await f.message("What is the status?"), status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(1);
+  });
+
+  it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
+    for (let round = 0; round < 4; round++) {
+      const f = await fixture();
+      const sessionId = randomUUID();
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "failed", runtimeMode: "native",
+        nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId }, createdAt: f.at(), finishedAt: f.at() });
+      const refused = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
+        error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate" });
+      await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, refused));
+      const [late] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
+        nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId } }).returning();
+      const writer = () => noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
+        binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: late!.id },
+        session: { normalizedSessionId: sessionId } } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
+      const sweep = () => heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
+      await expect(Promise.all(round % 2 ? [writer(), sweep()] : [sweep(), writer()])).resolves.toBeDefined();
+      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, late!.id));
+      await sweep();
+      expect(await f.visible(), `round ${round}`).toHaveLength(1);
+    }
+  });
+
+  it("RFL F2, the other order: the sweep's notice first, then the executor's held-notice writer adds none (same issue fence)", async () => {
+    const f = await fixture();
+    const sessionId = randomUUID();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "failed", runtimeMode: "native",
+      nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId }, createdAt: f.at(), finishedAt: f.at() });
+    const refused = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
+      error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate" });
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, refused));
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(1);
+    const [late] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId } }).returning();
+    await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
+      binding: { companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, runId: late!.id },
+      session: { normalizedSessionId: sessionId } } as never }, new Error("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate"));
+    expect(await f.visible()).toHaveLength(1);
   });
 
   it("a later answer supersedes the notice", async () => {
@@ -395,4 +480,80 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     expect(await f.visible()).toHaveLength(1);
   });
+  // RFL second judge (21:33Z), cases copied unchanged from .local/rfl-bprime/bprime2-judge-cases.ts.
+
+  it("JUDGE: a pending approval from BEFORE the latest failed message does not answer that message", async () => {
+    const f = await fixture({ status: "blocked" });
+    const prior = await f.run({ commentId: await f.message("Deploy when approved."), status: "succeeded" });
+    await f.reply(prior);
+    const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "deploy", requestedByAgentId: f.agentId,
+      status: "pending", payload: { summary: "Deploy to production" }, createdAt: f.at() }).returning();
+    await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.issueId, approvalId: approval!.id,
+      linkedByAgentId: f.agentId, createdAt: f.at() });
+    const message = await f.message("Never mind the deploy. What is the current version?");
+    const failed = await f.run({ commentId: message, status: "failed", errorCode: "adapter_failed", error: "Native session failed" });
+    await f.boardHold("native_continuation_requires_reconciliation", failed);
+    await f.sweep();
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+  });
+
+  it("JUDGE: a question card from BEFORE the latest failed message does not answer that message", async () => {
+    const f = await fixture({ status: "blocked" });
+    const prior = await f.run({ commentId: await f.message("Deploy it."), status: "succeeded" });
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions",
+      status: "pending", createdByAgentId: f.agentId, sourceRunId: prior, addresseeUserId: f.userId,
+      payload: { version: 1, questions: [{ id: "region", prompt: "Which region?", selectionMode: "single",
+        options: [{ id: "eu", label: "EU" }, { id: "us", label: "US" }] }] } as never, createdAt: f.at() });
+    const message = await f.message("Never mind the deploy. What is the current version?");
+    const failed = await f.run({ commentId: message, status: "failed", errorCode: "adapter_failed" });
+    await f.boardHold("native_continuation_requires_reconciliation", failed);
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+  });
+
+  it("JUDGE: a newer board-created confirmation for someone else does not answer the latest failed message", async () => {
+    const f = await fixture({ status: "blocked" });
+    const message = await f.message("What is the current version?");
+    const failed = await f.run({ commentId: message, status: "failed", errorCode: "adapter_failed" });
+    await f.boardHold("native_continuation_requires_reconciliation", failed);
+    await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "request_confirmation", status: "pending", sourceRunId: null, continuationPolicy: "none",
+      requestedResolverPolicy: "human_only", effectiveResolverPolicy: "human_only", resolverPolicyProvenance: "explicit",
+      addresseeUserId: "someone-else", createdByUserId: f.userId, title: "Other person's decision", createdAt: f.at(),
+      payload: { version: 1, prompt: "Approve the unrelated deploy?" } });
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+  });
+
+  it("JUDGE: a succeeded message-owned run with no reply stays visible despite a later succeeded timer", async () => {
+    const f = await fixture({ status: "in_review" });
+    const message = await f.message();
+    await f.run({ commentId: message, status: "succeeded" });
+    await f.run({ status: "succeeded", wakeReason: "heartbeat_timer" });
+    await f.sweep();
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(NO_REPLY);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+  });
+
+  it.each(["wakeCommentIds", "wakeCommentId", "commentId", "conversationReplyBoundaryCommentId"])(
+    "JUDGE: succeeded-without-reply carries message through %s", async key => {
+      const f = await fixture({ status: "in_review" });
+      const message = await f.message();
+      const run = await f.run({ status: "succeeded" });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, [key]: key === "wakeCommentIds" ? [message] : message } })
+        .where(eq(heartbeatRuns.id, run));
+      await f.sweep();
+      const notices = await f.visible();
+      expect(notices).toHaveLength(1);
+      expect(notices[0]!.body).toBe(NO_REPLY);
+    });
 });
