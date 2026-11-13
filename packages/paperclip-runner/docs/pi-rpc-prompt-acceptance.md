@@ -31,21 +31,28 @@ are in `pi-rpc-prompt.test.ts` and `pi-rpc-resident-binding.test.ts`.
 ## Timing diagnostics
 
 Pi admission and prompt-start timings use the existing
-`provider_performance_spans` diagnostic array. The driver buffers measured
-intervals instead of publishing one PRP event per RPC. After the first admitted
-`agent_start`, it publishes the batch behind the host's already-emitted
-`turn.started`; measurement never delays that lifecycle event. Turn settlement
-also drains the buffer for handled or rejected prompts without `agent_start`,
-and session failure/close drains unused admission intervals before closing the
-event stream. A failure that closes the session inside a measured operation
-captures that interval as failed before the queue closes.
+`provider_performance_spans` diagnostic array. The driver batches measured
+intervals instead of publishing one PRP event per RPC. Successful external
+attachment, post-claim validation and reconnect each drain their measurements
+without waiting for a turn; repeated admissions cannot retain an idle timing
+history. Manual compaction also drains its admission measurements when it ends.
+These diagnostics retain their captured run without inventing a turn.
+
+A turn's own admission and prompt-start measurements stay buffered until its
+first admitted `agent_start`, behind the host's already-emitted `turn.started`;
+measurement never delays that lifecycle event. Turn settlement also drains the
+buffer for handled or rejected prompts without `agent_start`, and session
+failure/close drains remaining intervals before closing the event stream. A
+failure that closes the session inside a measured operation captures that
+interval as failed before the queue closes.
 
 Span names, timestamps and outcomes keep the existing reader contract. Batches
 retain captured run/turn identities; run-scoped admission is associated only
 with its matching admitted turn, or stays run-scoped if no turn was created.
-The existing reader's batch-size limit still applies. These diagnostics explain
-local intervals, not deployed latency improvement; use a real warm-turn trace
-for that claim. Ordering and failure-path regressions live in
+Each diagnostic contains at most 128 spans and at most 16 occurrences of any
+one span name, matching both existing reader limits without discarding rows.
+These diagnostics explain local intervals, not deployed latency improvement;
+use a real warm-turn trace for that claim. Ordering and failure-path regressions live in
 `pi-rpc-resident-binding.test.ts` and `pi-rpc-stop.test.ts`.
 
 ## Late receipts and bounded identity history

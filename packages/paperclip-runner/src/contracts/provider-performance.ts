@@ -2,6 +2,7 @@
 export const PROVIDER_PERFORMANCE_DIAGNOSTIC = "provider_performance_spans";
 export const PROVIDER_PERFORMANCE_ENV = "PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS";
 export const MAX_PROVIDER_PERFORMANCE_SPANS = 128;
+export const MAX_PROVIDER_PERFORMANCE_SPANS_PER_NAME = 16;
 export const PROVIDER_PERFORMANCE_PHASES = [
   "provider.context.environment", "provider.context.instructions", "provider.skills.discovery",
   "provider.tools.resolve", "provider.model.resolve", "provider.model.stream",
@@ -40,7 +41,7 @@ export function parseProviderPerformanceSpans(payload: unknown, observedAtMs: nu
       || endedAtMs < startedAtMs || endedAtMs - startedAtMs > maxDurationMs
       || (name === "pi.request.sent" && endedAtMs !== startedAtMs)) return [];
     const count = counts.get(name) ?? 0;
-    if (count >= 16) return [];
+    if (count >= MAX_PROVIDER_PERFORMANCE_SPANS_PER_NAME) return [];
     counts.set(name, count + 1);
     return [{ name: name as ProviderPerformancePhase, startedAtMs, endedAtMs,
       outcome: row.outcome === "failed" ? "failed" : "ok" }];

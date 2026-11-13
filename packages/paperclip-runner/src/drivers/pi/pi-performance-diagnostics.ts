@@ -1,8 +1,26 @@
 import {
   parseProviderPerformanceSpans,
+  MAX_PROVIDER_PERFORMANCE_SPANS,
+  MAX_PROVIDER_PERFORMANCE_SPANS_PER_NAME,
   PROVIDER_PERFORMANCE_DIAGNOSTIC,
   type ProviderPerformanceSpan,
 } from "../../contracts/provider-performance.js";
+
+/** Partition owned spans without losing rows at the diagnostic reader's caps. */
+export function* piPerformanceSpanBatches(spans: readonly ProviderPerformanceSpan[]): Generator<ProviderPerformanceSpan[]> {
+  let batch: ProviderPerformanceSpan[] = [];
+  const counts = new Map<ProviderPerformanceSpan["name"], number>();
+  for (const span of spans) {
+    const count = counts.get(span.name) ?? 0;
+    if (batch.length >= MAX_PROVIDER_PERFORMANCE_SPANS || count >= MAX_PROVIDER_PERFORMANCE_SPANS_PER_NAME) {
+      yield batch;
+      batch = []; counts.clear();
+    }
+    batch.push(span);
+    counts.set(span.name, (counts.get(span.name) ?? 0) + 1);
+  }
+  if (batch.length) yield batch;
+}
 
 /** Owned data on Pi's existing custom-entry seam, not a separate transport. */
 export const PI_PERFORMANCE_ENTRY = "paperclip.provider-performance.v1";
