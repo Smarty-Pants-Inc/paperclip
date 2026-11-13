@@ -17,6 +17,7 @@ import {
   toolCatalogEntries,
   toolCallEvents,
   toolConnections,
+  toolConnectionInstalls,
   toolInvocations,
   toolMcpGateways,
   toolPolicies,
@@ -33,6 +34,7 @@ import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { canonicalToolArguments, signToolArguments } from "../services/tool-content-guards.js";
+import { createAssignedMcpTools } from "../services/native-runtime/assigned-mcp-tools.js";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 const externalDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_TOOL_POLICY_TEST_DATABASE_URL");
@@ -236,6 +238,7 @@ describeEmbeddedPostgres("tool access policy service", () => {
     await db.delete(toolMcpGateways);
     await db.delete(toolProfiles);
     await db.delete(toolCatalogEntries);
+    await db.delete(toolConnectionInstalls);
     await db.delete(toolConnections);
     await db.delete(toolApplications);
     await db.delete(companySecrets);
@@ -251,6 +254,121 @@ describeEmbeddedPostgres("tool access policy service", () => {
   afterAll(async () => {
     await db?.$client.end({ timeout: 1 });
     await tempDb?.cleanup();
+  });
+
+  // Trust-boundary regression: an agent's tools:use grant is not an install.
+  it.each(["unscoped grant", "targeted grant", "allow policy", "trust rule", "profile"] as const)(
+    "denies a connection installed only for another agent despite an %s",
+    async (authorization) => {
+      const company = await createCompany(db);
+      const owner = await createAgent(db, company.id);
+      const caller = await createAgent(db, company.id);
+      const { connection, catalogEntry } = await createTool(db, company.id);
+      await db.insert(toolConnectionInstalls).values({
+        companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: owner.id,
+      });
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "agent", principalId: caller.id,
+        permissionKey: "tools:use", scope: authorization === "targeted grant" ? { connectionId: connection.id } : null,
+      });
+      if (authorization === "allow policy" || authorization === "trust rule") {
+        await db.insert(toolPolicies).values({
+          companyId: company.id, name: authorization,
+          policyType: authorization === "trust rule" ? "trust_rule" : "allow",
+          selectors: { connectionId: connection.id },
+          config: authorization === "trust rule" ? { trustRule: { argumentFilters: { allowAny: true } } } : null,
+        });
+      }
+      if (authorization === "profile") {
+        const [profile] = await db.insert(toolProfiles).values({
+          companyId: company.id, profileKey: `allow-${randomUUID()}`, name: "Allow all", defaultAction: "allow",
+        }).returning();
+        await db.insert(toolProfileBindings).values(agentProfileBindingRow(company, profile!, caller));
+      }
+      const result = await toolAccessPolicyService(db).decide(sendEmailDecisionInput(company, caller, connection, catalogEntry));
+      expect(result).toMatchObject({ allowed: false, decision: "deny", reasonCode: "deny_not_installed_for_agent" });
+    },
+  );
+
+  it.each(["agent", "company", "none", "wrong company"] as const)(
+    "keeps existing authorization for %s installs, requiring an exact target match",
+    async (target) => {
+      const company = await createCompany(db);
+      const caller = await createAgent(db, company.id);
+      const { connection, catalogEntry } = await createTool(db, company.id);
+      if (target !== "none") {
+        await db.insert(toolConnectionInstalls).values({
+          companyId: company.id, connectionId: connection.id,
+          targetType: target === "agent" ? "agent" : "company",
+          targetId: target === "agent" ? caller.id : target === "company" ? company.id : randomUUID(),
+        });
+      }
+      const svc = toolAccessPolicyService(db);
+      const input = sendEmailDecisionInput(company, caller, connection, catalogEntry);
+      // Being installed is necessary, not sufficient: it never grants an action.
+      expect((await svc.decide(input)).allowed).toBe(false);
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id, principalType: "agent", principalId: caller.id, permissionKey: "tools:use", scope: null,
+      });
+      expect(await svc.decide(input)).toMatchObject(target === "wrong company"
+        ? { allowed: false, reasonCode: "deny_not_installed_for_agent" }
+        : { allowed: true, reasonCode: "allow_explicit_grant" });
+    },
+  );
+
+  it("does not apply agent install restrictions to board users", async () => {
+    const company = await createCompany(db);
+    const owner = await createAgent(db, company.id);
+    const { connection, catalogEntry } = await createTool(db, company.id);
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: owner.id,
+    });
+    const userId = randomUUID();
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id, principalType: "user", principalId: userId, permissionKey: "tools:use", scope: null,
+    });
+    expect(await toolAccessPolicyService(db).decide({
+      ...sendEmailDecisionInput(company, owner, connection, catalogEntry),
+      actor: { actorType: "user", actorId: userId, agentId: owner.id },
+    })).toMatchObject({ allowed: true, reasonCode: "allow_explicit_grant" });
+  });
+
+  it("filters agent-only installs from gateway and assigned MCP tools and denies guessed calls", async () => {
+    const company = await createCompany(db);
+    const owner = await createAgent(db, company.id);
+    const caller = await createAgent(db, company.id);
+    const { connection, catalogEntry } = await createTool(db, company.id);
+    await db.update(toolConnections).set({ healthStatus: "ok" }).where(eq(toolConnections.id, connection.id));
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id, principalType: "agent", principalId: caller.id, permissionKey: "tools:use", scope: null,
+    });
+    const [profile] = await db.insert(toolProfiles).values({
+      companyId: company.id, profileKey: `gateway-${randomUUID()}`, name: "Run tools", defaultAction: "allow",
+    }).returning();
+    const run = await createRun(db, company.id, caller.id);
+    const gateway = createToolGatewayService(db);
+    const named = await gateway.createNamedGateway({ companyId: company.id,
+      body: { name: "Install scope regression", profileId: profile!.id, agentId: caller.id } });
+    const token = await gateway.createNamedGatewayToken({ companyId: company.id, gatewayId: named.id,
+      body: { name: "Run", subjectType: "heartbeat_run", subjectId: run.id, clientLabel: "test", ownerNote: "test" } });
+    const listing = { gatewayPublicId: named.gatewayPublicId, bearerToken: token.token };
+    const before = await gateway.listToolsForNamedGateway(listing);
+    const beforeAssigned = await createAssignedMcpTools({ gateway, ...listing });
+    const descriptor = before.find(tool => tool.catalogEntryId === catalogEntry.id);
+    expect(descriptor).toBeDefined();
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: owner.id,
+    });
+    expect((await gateway.listToolsForNamedGateway(listing)).some(tool => tool.catalogEntryId === catalogEntry.id)).toBe(false);
+    const assigned = await createAssignedMcpTools({ gateway, ...listing });
+    expect(assigned.definitions()).toHaveLength(beforeAssigned.definitions().length - 1);
+    await expect(gateway.executeTool({ gatewayPublicId: named.gatewayPublicId, sessionToken: token.token,
+      tool: descriptor!.name, parameters: {} })).rejects.toMatchObject({ status: 403, reasonCode: "deny_not_installed_for_agent" });
+    // A matching install restores exposure without overriding action authorization.
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: caller.id,
+    });
+    expect((await gateway.listToolsForNamedGateway(listing)).some(tool => tool.catalogEntryId === catalogEntry.id)).toBe(true);
   });
 
   it("denies direct execution without an effective profile or grant", async () => {
