@@ -751,14 +751,20 @@ that task's existing normalized conversation identity. A typed
 `pi_session_file_invalid` refusal first renames the exact saved entry aside as
 `<conversation>.jsonl.invalid-<UTC timestamp>-<unique id>`; it never deletes the
 entry or follows a foreign symlink. If preservation fails, recovery fails closed.
-Other admission failures do not authorize a fresh thread.
+Other admission failures do not authorize a fresh thread. Local cold wakes,
+including `per_turn` retirement, use the same validating resume path; an existing
+nonempty file is not permission to bypass its native identity and JSONL checks.
 
 Both cases project one warning `system_notice` through the existing committed
 and duplicate-event observer. The current company, agent, issue, run and
 conversation generation must still authorize the projection. An issue lock and
 stable recovery provenance key deduplicate event replay and later run rotation.
-The notice is progress, not a final reply; it states that earlier history was
-lost rather than claiming a successful restore.
+For missing, corrupt and foreign saved files alike, the notice is a lasting
+issue transcript item, not run status or a final reply. It uses the same
+`system_notice` presentation with its source run linked in the details rather
+than as its creator. It remains visible after Done, later turns and chat reloads;
+replay of the same receipt does not add another notice. It states that earlier
+history was lost rather than claiming a successful restore.
 
 Invalid-history recovery also records a standard `provider.notice.recorded`
 warning in durable run diagnostics and one scoped server `logger.error` owner

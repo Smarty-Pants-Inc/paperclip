@@ -240,9 +240,11 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     ]) await materializePiSessionRecoveryNotice({ db, execution, event: invalid });
     expect(await notices()).toHaveLength(0);
     await Promise.all([1, 2].map(() => materializePiSessionRecoveryNotice({ db, execution, event: facadeEvent })));
-    expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: f.run.id,
+    expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: null,
       body: "My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.",
-      presentation: { kind: "system_notice", tone: "warning" } }]);
+      presentation: { kind: "system_notice", tone: "warning" },
+      metadata: { authorizationReason: `pi_session_file_missing:${execution.session.normalizedSessionId}:${previousId}`,
+        sections: [{ rows: [{ type: "run_link", runId: f.run.id, agentId: execution.binding.agentId }] }] } }]);
     await materializePiSessionRecoveryNotice({ db, execution, event: { ...event, sourceEventId: randomUUID() } });
     await nextPiTurn(f);
     const next = await selectHeartbeatRuntime(db, f.input);
@@ -268,6 +270,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         providerDescriptor: { piNativeAdmission: { providerSessionId: id, sessionRecovery: recovery } } },
     } as Parameters<typeof materializePiSessionRecoveryNotice>[0]["event"];
     const attached = { ...event, eventType: "run.attached" as const, payload: { piSessionRecovery: recovery } };
+    const facade = { ...event, payload: { driverSessionId: id, providerSessionId: id,
+      context: { piNativeAdmission: { provider: "pi_rpc", providerSessionId: id, sessionRecovery: recovery } } } };
     const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     const alarm = vi.spyOn((await import("../../middleware/logger.js")).logger, "error");
     const alarms = () => alarm.mock.calls.filter(([detail]) => typeof detail === "object"
@@ -282,12 +286,19 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         { ...attached, payload: { piSessionRecovery: { ...recovery, normalizedSessionId: randomUUID() } } },
         { ...attached, payload: { piSessionRecovery: { ...recovery, preservedFile: `../${recovery.preservedFile}` } } },
         { ...attached, payload: { piSessionRecovery: { ...recovery, preservedFile: `${randomUUID()}.jsonl.invalid-${randomUUID()}` } } },
+        { ...facade, payload: { ...facade.payload, provider: "codex" } },
+        { ...facade, payload: { ...facade.payload, driverSessionId: randomUUID() } },
+        { ...facade, payload: { ...facade.payload, providerSessionId: randomUUID() } },
+        { ...facade, payload: { ...facade.payload, context: { piNativeAdmission: {
+          ...facade.payload.context.piNativeAdmission, provider: "codex" } } } },
       ]) await materializePiSessionRecoveryNotice({ db, execution, event: invalid });
       expect(await notices()).toHaveLength(0);
       expect(alarms()).toHaveLength(0);
-      await Promise.all([event, attached, event].map(event => materializePiSessionRecoveryNotice({ db, execution, event })));
-      expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: f.run.id,
-        body: expect.stringContaining("pi_session_file_invalid"), presentation: { kind: "system_notice", tone: "warning" } }]);
+      await Promise.all([facade, event, attached, facade].map(event => materializePiSessionRecoveryNotice({ db, execution, event })));
+      expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: null,
+        body: expect.stringContaining("pi_session_file_invalid"), presentation: { kind: "system_notice", tone: "warning" },
+        metadata: { authorizationReason: expect.stringMatching(new RegExp(`^pi_session_file_invalid:${conversation}:[a-f0-9]{64}$`)),
+          sections: [{ rows: [{ type: "run_link", runId: f.run.id, agentId: execution.binding.agentId }] }] } }]);
       expect(alarms()).toHaveLength(1);
       await nextPiTurn(f);
       const next = await selectHeartbeatRuntime(db, f.input);
