@@ -1442,7 +1442,8 @@ fn admit_host_claim(
     if control.is_some_and(|control| control.claiming.is_some())
         && !(matches!(
             command.command_type.as_str(),
-            "session.snapshot"
+            "runner.identity"
+                | "session.snapshot"
                 | "runner.drain"
                 | "runner.suspend"
                 | "runner.shutdown"
@@ -2403,7 +2404,17 @@ fn process_command<E: CommandExecutor>(
     // in the effect window, recovery remains indeterminate unless the provider
     // explicitly supports exact, idempotent semantic result delivery above.
     store.save(state)?;
-    let mut execution = match executor.execute(command) {
+    // Runner-owned read: no provider restoration, polling, attachment or drain.
+    // The ordinary result envelope also echoes this fresh commandId (the nonce).
+    let executed = if command.command_type == "runner.identity" {
+        Ok(CommandExecution::result(json!({
+            "runnerInstanceId": config.runner_instance_id,
+            "nonce": command.command_id,
+        })))
+    } else {
+        executor.execute(command)
+    };
+    let mut execution = match executed {
         Ok(execution) => execution,
         Err(error) => {
             // Failure facts may follow a full retained provider backlog. Only
@@ -3102,6 +3113,44 @@ mod tests {
             precondition: None,
             payload: json!({}),
         }
+    }
+
+    #[test]
+    fn runner_identity_is_answered_before_attachment_without_touching_the_provider() {
+        struct NoProvider;
+        impl CommandExecutor for NoProvider {
+            fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                panic!("identity must not restore, poll, or call the provider");
+            }
+            fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                panic!("identity must not drain provider events");
+            }
+        }
+        let directory =
+            std::env::temp_dir().join(format!("runner-identity-{}", uuid::Uuid::new_v4()));
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let before = state.clone();
+        let request = command("runner.identity");
+        let (result, lifecycle) =
+            process_command(&mut state, &store, &config, &mut NoProvider, &request).unwrap();
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.command_id, request.command_id);
+        assert_eq!(result.command_type, "runner.identity");
+        assert_eq!(
+            result.result,
+            json!({"runnerInstanceId": config.runner_instance_id, "nonce": request.command_id})
+        );
+        assert_eq!(lifecycle, CommandLifecycle::Continue);
+        assert_eq!(state.lifecycle, before.lifecycle);
+        assert_eq!(state.outbox, before.outbox);
+        assert_eq!(state.run_id, before.run_id);
+        assert_eq!(state.normalized_session_id, before.normalized_session_id);
+        let (replayed, _) =
+            process_command(&mut state, &store, &config, &mut NoProvider, &request).unwrap();
+        assert_eq!(replayed, result);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

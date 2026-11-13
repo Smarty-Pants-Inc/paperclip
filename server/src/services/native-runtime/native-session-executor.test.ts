@@ -15953,8 +15953,8 @@ describe("runnerd provider runtime wiring", () => {
   });
 
   // Keep reason: F1 recorded a remote generation exec on every ordinary warm
-  // turn. Exercise real executor admission and its retained backend connection
-  // signal; lease labels alone must not add remote work or retire a live owner.
+  // turn. Exercise real executor admission and its retained backend identity
+  // exchange; lease labels alone must not add remote work or retire a live owner.
   it.each([
     { connected: true, resumedFromState: undefined, probe: false, lost: false },
     { connected: true, resumedFromState: "running", probe: false, lost: false },
@@ -15963,7 +15963,7 @@ describe("runnerd provider runtime wiring", () => {
     { connected: true, resumedFromState: "archived", probe: true, lost: false },
     { connected: false, resumedFromState: undefined, probe: true, lost: false },
     { connected: false, resumedFromState: undefined, probe: true, lost: true },
-  ])("gates idle-owner generation probes on free signals: $connected / $resumedFromState / lost=$lost", async ({ connected, resumedFromState, probe, lost }) => {
+  ])("gates idle-owner generation probes on runner identity: $connected / $resumedFromState / lost=$lost", async ({ connected, resumedFromState, probe, lost }) => {
     const name = `probe-gate-${connected}-${resumedFromState}-${lost}`;
     const first = scopedNativeExecution(name);
     first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
@@ -15993,14 +15993,14 @@ describe("runnerd provider runtime wiring", () => {
     const result = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
       normalizedSessionId: first.session.normalizedSessionId!, providerSessionId: "retained-history",
       driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    const identityCheck = vi.fn(async (runnerInstanceId: string) => connected && runnerInstanceId === identity.runnerInstanceId);
+    const events: AdapterRuntimeEvent[] = [];
     state.execute.mockReset().mockImplementationOnce(async options => {
-      // beforeConnect is the production callback that binds this backend to
-      // its live control plane. No probe is used to obtain the connection count.
+      // beforeConnect records the retained generation; the identity command
+      // must prove that same generation before the next run attaches.
       await driver.mock.calls.at(-1)![0].beforeConnect?.(identity as never,
-        // Since RFL F2 a counted socket alone is not liveness: a connected row
-        // here means connected AND fresh from that same runner generation.
         { activeRunnerConnectionCount: () => connected ? 1 : 0,
-          runnerFreshlyAlive: (runnerInstanceId: string) => connected && runnerInstanceId === identity.runnerInstanceId } as never);
+          checkRunnerIdentity: identityCheck } as never);
       await options.onSession?.(session);
       return result;
     }).mockImplementationOnce(async options => {
@@ -16041,10 +16041,23 @@ describe("runnerd provider runtime wiring", () => {
       execute.mockClear(); restore.mockClear();
       target.sandboxLeaseAcquisition.outcome = "resumed";
       await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
-        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target })).resolves.toMatchObject({ exitCode: 0 });
+        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target,
+        onEvent: async event => { events.push(event); } })).resolves.toMatchObject({ exitCode: 0 });
+      const spans = events.filter(event => event.eventType === "run.performance.span"
+        && event.payload?.span === "native.controller.warm_owner_identity_check");
+      expect(spans).toHaveLength(resumedFromState === "stopped" || resumedFromState === "archived" ? 0 : 1);
+      if (spans.length) {
+        expect(spans[0]!.payload).toMatchObject({ outcome: probe ? "failed" : "ok", parentSpan: "task.prepare" });
+        expect(spans[0]!.payload!.durationMs).toBeGreaterThanOrEqual(0);
+      }
       const probes = execute.mock.calls.filter(([request]) => request.args?.[2] === "paperclip-runner-generation-marker");
       if (probe) expect(probes.length).toBeGreaterThan(0);
-      else expect(probes).toHaveLength(0);
+      else {
+        expect(probes).toHaveLength(0);
+        expect(execute).not.toHaveBeenCalled();
+        expect(identityCheck).toHaveBeenCalledExactlyOnceWith(identity.runnerInstanceId);
+      }
+      if (resumedFromState === "stopped" || resumedFromState === "archived") expect(identityCheck).not.toHaveBeenCalled();
       if (!lost) expect(restore).not.toHaveBeenCalled();
       expect(session.close).not.toHaveBeenCalled();
       expect(session.detachControllerForRestart).toHaveBeenCalledTimes(lost ? 1 : 0);
@@ -16056,16 +16069,20 @@ describe("runnerd provider runtime wiring", () => {
   });
 
   // Keep reason: F2's stale-positive socket can hide a lost generation and
-  // reuse a dead session. Count membership is deliberately independent of
-  // authenticated generation freshness in these real executor admissions.
+  // reuse a dead session. Neither recent pongs nor counted sockets answer the
+  // runner-owned identity command; retain each old gate row's safety intent.
   it.each([
-    { name: "stale-positive lost generation", connected: true, ageMs: 20_001, sameGeneration: true, lost: true, probe: true },
-    { name: "fresh same generation", connected: true, ageMs: 1, sameGeneration: true, lost: false, probe: false },
-    { name: "fresh different generation", connected: true, ageMs: 1, sameGeneration: false, lost: true, probe: true },
-    { name: "disconnected lost generation", connected: false, ageMs: 1, sameGeneration: true, lost: true, probe: true },
-    { name: "fresh stopped resume", connected: true, ageMs: 1, sameGeneration: true, lost: false, probe: true, resumedFromState: "stopped" },
-    { name: "fresh archived resume", connected: true, ageMs: 1, sameGeneration: true, lost: false, probe: true, resumedFromState: "archived" },
-  ])("requires fresh authenticated generation liveness: $name", async ({ name, connected, ageMs, sameGeneration, lost, probe, resumedFromState }) => {
+    { name: "stale-positive lost generation", connected: true, answersIdentity: false, sameGeneration: true, lost: true, probe: true },
+    { name: "fresh same generation", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false },
+    { name: "fresh different generation", connected: true, answersIdentity: true, sameGeneration: false, lost: true, probe: true },
+    { name: "disconnected lost generation", connected: false, answersIdentity: false, sameGeneration: true, lost: true, probe: true },
+    { name: "fresh stopped resume", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: true, resumedFromState: "stopped" },
+    { name: "fresh archived resume", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: true, resumedFromState: "archived" },
+    { name: "fresh pong but frozen runner", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
+    { name: "identity command error", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
+    { name: "missing control plane", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
+    { name: "old inbound but current identity answer", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false },
+  ])("requires a current authenticated runner identity answer: $name", async ({ name, connected, answersIdentity, sameGeneration, lost, probe, resumedFromState }) => {
     const first = scopedNativeExecution(`fresh-probe-${name.replaceAll(" ", "-")}`);
     first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
     const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
@@ -16097,13 +16114,14 @@ describe("runnerd provider runtime wiring", () => {
       driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     const existingSessions: unknown[] = [];
     const authenticatedRunnerInstanceId = sameGeneration ? identity.runnerInstanceId : `${identity.runnerInstanceId}-other`;
-    let lastInboundAtMs = 0;
+    const identityCheck = vi.fn(async (expectedRunnerInstanceId: string) => {
+      if (name === "identity command error") throw new Error("identity unavailable");
+      return connected && answersIdentity && authenticatedRunnerInstanceId === expectedRunnerInstanceId;
+    });
     state.execute.mockReset().mockImplementationOnce(async options => {
       await driver.mock.calls.at(-1)![0].beforeConnect?.(identity as never, {
         activeRunnerConnectionCount: () => connected ? 1 : 0,
-        runnerFreshlyAlive: (expectedRunnerInstanceId: string, nowMs: number) => connected
-          && authenticatedRunnerInstanceId === expectedRunnerInstanceId
-          && nowMs >= lastInboundAtMs && nowMs - lastInboundAtMs <= 20_000,
+        ...(name !== "missing control plane" ? { checkRunnerIdentity: identityCheck } : {}),
       } as never);
       await options.onSession?.(session);
       return result;
@@ -16142,13 +16160,16 @@ describe("runnerd provider runtime wiring", () => {
       }
       execute.mockClear(); restore.mockClear();
       target.sandboxLeaseAcquisition.outcome = "resumed";
-      lastInboundAtMs = Date.now() - ageMs;
       await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
         runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target })).resolves.toMatchObject({ exitCode: 0 });
       const probes = execute.mock.calls.filter(([request]) => request.args?.[2] === "paperclip-runner-generation-marker");
-      console.info(`[fresh-probe] ${name}: markers=${probes.length}, totalRemoteExecs=${execute.mock.calls.length}, reused=${existingSessions[0] === session}`);
+      console.info(`[identity-probe] ${name}: markers=${probes.length}, totalRemoteExecs=${execute.mock.calls.length}, identityChecks=${identityCheck.mock.calls.length}, reused=${existingSessions[0] === session}`);
       if (probe) expect(probes.length).toBeGreaterThan(0);
-      else expect(probes).toHaveLength(0);
+      else {
+        expect(probes).toHaveLength(0);
+        expect(execute).not.toHaveBeenCalled();
+        expect(identityCheck).toHaveBeenCalledExactlyOnceWith(identity.runnerInstanceId);
+      }
       expect(existingSessions).toEqual([lost ? undefined : session]);
       if (!lost) expect(restore).not.toHaveBeenCalled();
       expect(session.close).not.toHaveBeenCalled();

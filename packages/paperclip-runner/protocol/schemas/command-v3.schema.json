@@ -41,6 +41,7 @@
         "session.budget.increase",
         "session.destroy",
         "run.cancel",
+        "runner.identity",
         "runner.drain",
         "runner.suspend",
         "runner.shutdown",
