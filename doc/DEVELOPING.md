@@ -2584,8 +2584,20 @@ roots, the runtime's actual temporary root, and its ancestors (including symlink
 aliases) with `workspace_validation_failed` and reason `unsafe_workspace_root`
 in `workspaceValidation`. Choose a concrete directory, or clear `cwd` to use the
 managed task directory or agent home. Concrete descendants of the temporary root
-remain supported. Sandbox archive creation also excludes its own output staging
-and tar entry-list directories if they fall inside the source tree.
+remain supported. Referenced local project sources use the same rule before they
+are retained, inspected, or materialized. An unsafe reference drops only that
+project, records a resolution failure, and adds the existing visible warning;
+other valid references and the anchor remain available. Plugin-owned remote
+project scopes do not become local sources.
+
+Sandbox archive creation omits only the exact source-relative paths of its own
+output staging and tar entry-list directories. An output in the source root omits
+only the archive file. Same-named nested user artifacts remain in the archive.
+Direct-child owned paths are removed from the top-level entry list. If an owned
+path is deeper, the helper lists each entry explicitly and disables tar recursion
+so it can omit that exact path without an unanchored exclude pattern. Caller
+exclude patterns still go to tar. With explicit entries, matching descendant
+patterns also preserve the exclusion of an entire directory.
 
 For `codex_local`, Paperclip assigns new and updated agents an isolated Codex home under the instance root and blocks shared host/company Codex homes:
 
