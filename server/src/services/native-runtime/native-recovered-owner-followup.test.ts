@@ -191,7 +191,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
 
   /** Mirrors runtime selection: the follow-up inherits the selected source's
    * provider checkpoint before the executor admits its durable root. */
-  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, expectBareBarrier = false) {
     const runId = randomUUID();
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
       nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId, contextSnapshot: { issueId: prior.issueId } }).returning();
@@ -203,7 +203,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       normalizedSessionId: prior.native.normalizedSessionId, currentRunId: runId, beforeCreatedAt: row.createdAt });
     const admission = buildNativeExecutionWithCheckpoint({ previousRun: selected, normalizedSessionId: prior.native.normalizedSessionId,
       executionTargetKind: "remote", buildExecution: () => execution });
-    expect(admission.checkpoint).not.toBeNull();
+    if (expectBareBarrier) expect(admission.checkpoint).toBeNull();
+    else expect(admission.checkpoint).not.toBeNull();
     const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson, nativeExecutionInput: execution,
       nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("remote", execution.provider.kind),
@@ -762,7 +763,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
 
   // Keep reason: F2 is a data-safety boundary. A live process plus lost spawn
   // telemetry must never be confused with a run that did not dispatch.
-  it.each([false, true])("holds RFL's live-child lost-telemetry shape (launch intent=%s)", async launchIntent => {
+  it.each([
+    { launchIntent: false, inheritedCheckpoint: true }, { launchIntent: true, inheritedCheckpoint: true },
+    { launchIntent: false, inheritedCheckpoint: false }, { launchIntent: true, inheritedCheckpoint: false },
+  ])("holds RFL's live-child lost-telemetry shape (%j)", async ({ launchIntent, inheritedCheckpoint }) => {
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
     try {
@@ -772,14 +776,14 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       const failed = await failUnstartedFollowUp(prior);
       const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
       await db.update(heartbeatRuns).set({ resultJson: {}, runnerProfileJson: { ...row.runnerProfileJson,
-        sessionCheckpoint: { ...(row.runnerProfileJson!.sessionCheckpoint as object), driverKind: "pi_rpc" } } })
+        sessionCheckpoint: inheritedCheckpoint ? { ...(row.runnerProfileJson!.sessionCheckpoint as object), driverKind: "pi_rpc" } : null } })
         .where(eq(heartbeatRuns.id, failed));
       await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, failed));
       await db.update(nativeRunFinalizations).set({ attempt: 1, controllerGeneration: 1, controllerPid: child.pid! })
         .where(eq(nativeRunFinalizations.runId, failed));
       if (launchIntent) await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100,
         eventType: "native.process_start_requested", stream: "system", payload: {} });
-      expect((await admitFollowUp(prior)).selectedRunId).toBe(failed);
+      expect((await admitFollowUp(prior, !inheritedCheckpoint)).selectedRunId).toBe(failed);
       expect(() => process.kill(child.pid!, 0)).not.toThrow();
     } finally {
       child.kill("SIGKILL");
@@ -787,16 +791,24 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     }
   }, 60_000);
 
-  it.each(["pre-claim", "claimed", "launch-intent"] as const)("requires affirmative pre-spawn proof (%s)", async scenario => {
+  it.each([
+    { scenario: "pre-claim", inheritedCheckpoint: true }, { scenario: "claimed", inheritedCheckpoint: true },
+    { scenario: "launch-intent", inheritedCheckpoint: true }, { scenario: "pre-claim", inheritedCheckpoint: false },
+    { scenario: "claimed", inheritedCheckpoint: false }, { scenario: "launch-intent", inheritedCheckpoint: false },
+  ] as const)("requires affirmative pre-spawn proof (%j)", async ({ scenario, inheritedCheckpoint }) => {
     const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
     const failed = await failUnstartedFollowUp(prior);
+    if (!inheritedCheckpoint) {
+      const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { ...row.runnerProfileJson, sessionCheckpoint: null } }).where(eq(heartbeatRuns.id, failed));
+    }
     await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, failed));
     await db.update(nativeRunFinalizations).set({ attempt: scenario === "claimed" ? 1 : 0,
       controllerGeneration: scenario === "claimed" ? 1 : 0, controllerPid: null })
       .where(eq(nativeRunFinalizations.runId, failed));
     if (scenario === "launch-intent") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: failed, seq: 100,
       eventType: "native.process_start_requested", stream: "system", payload: {} });
-    expect((await admitFollowUp(prior)).selectedRunId).toBe(scenario === "pre-claim" ? prior.runId : failed);
+    expect((await admitFollowUp(prior, !inheritedCheckpoint && scenario !== "pre-claim")).selectedRunId).toBe(scenario === "pre-claim" ? prior.runId : failed);
   }, 60_000);
 
   it.each(["own process", "recorded process", "provider event", "sourced event", "tool invocation", "controller checkpoint", "run result",
