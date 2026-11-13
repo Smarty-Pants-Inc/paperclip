@@ -179,15 +179,13 @@ function endpointHeaders(endpoint: RunnerIngressEndpoint): Record<string, string
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return;
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 
@@ -234,9 +232,17 @@ async function closeOwnedWire(wire: WsJsonWireConnection): Promise<void> {
 async function openEndpoint(input: {
   endpoint: RunnerIngressEndpoint;
   signal: AbortSignal;
+  deadline: number;
   onWire: (wire: WsJsonWireConnection) => void;
 }): Promise<{ wire: WsJsonWireConnection; statusCode: number | null }> {
   validateEndpoint(input.endpoint);
+  const remaining = input.deadline - Date.now();
+  if (remaining <= 0) {
+    throw new RunnerIngressConnectionError(
+      "runner_ingress_unavailable",
+      "Runner ingress connection failed.",
+    );
+  }
   return await new Promise((resolve, reject) => {
     let statusCode: number | null = null;
     const socket = new WebSocket(input.endpoint.websocketUrl, {
@@ -244,7 +250,7 @@ async function openEndpoint(input: {
       followRedirects: false,
       perMessageDeflate: false,
       maxPayload: MAX_FRAME_BYTES,
-      handshakeTimeout: 15_000,
+      handshakeTimeout: Math.min(15_000, remaining),
     });
     const wire = new WsJsonWireConnection(socket);
     const onAbort = () => {
@@ -369,6 +375,7 @@ export function connectRunnerPrpIngress(input: {
         const opened = await openEndpoint({
           endpoint,
           signal: abort.signal,
+          deadline: recoveryDeadline,
           onWire: (wire) => {
             ownedWires.add(wire);
             wire.socket.once("close", () => ownedWires.delete(wire));
@@ -448,38 +455,44 @@ export function connectRunnerPrpIngress(input: {
             failure = refreshError;
           }
         }
-        if (Date.now() >= recoveryDeadline) {
-          // A lapsed lease is the root cause even when a later reconnect
-          // fails authentication; keep that failure as the cause.
-          const terminal =
-            leaseFailureCode !== null
-              ? new RunnerIngressConnectionError(
-                  leaseFailureCode,
-                  "The runner's connection lease expired before it was renewed.",
-                  { cause: failure },
-                )
-              : failure instanceof RunnerIngressConnectionError
-              ? failure
-              : new RunnerIngressConnectionError(
-                  statusCode === 401 || statusCode === 403
-                    ? "runner_ingress_auth_failed"
-                    : "runner_ingress_unavailable",
-                  "Runner ingress connection failed.",
-                  { cause: failure },
-                );
-          if (!readySettled) {
-            readySettled = true;
-            readyReject(terminal);
-          }
-          input.onStateChange?.("failed", terminal.code);
-          failureReject(terminal);
-          return;
+        if (Date.now() < recoveryDeadline) {
+          const base = RECONNECT_DELAYS_MS[
+            Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)
+          ]!;
+          attempt += 1;
+          await delay(
+            Math.min(
+              Math.max(1, Math.round(base * (0.75 + random() * 0.5))),
+              Math.max(1, recoveryDeadline - Date.now()),
+            ),
+            abort.signal,
+          );
+          if (abort.signal.aborted) return;
+          if (Date.now() < recoveryDeadline) continue;
         }
-        const base = RECONNECT_DELAYS_MS[
-          Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)
-        ]!;
-        attempt += 1;
-        await delay(Math.max(1, Math.round(base * (0.75 + random() * 0.5))), abort.signal);
+        const terminal =
+          leaseFailureCode !== null
+            ? new RunnerIngressConnectionError(
+                leaseFailureCode,
+                "The runner's connection lease expired before it was renewed.",
+                { cause: failure },
+              )
+            : failure instanceof RunnerIngressConnectionError
+            ? failure
+            : new RunnerIngressConnectionError(
+                statusCode === 401 || statusCode === 403
+                  ? "runner_ingress_auth_failed"
+                  : "runner_ingress_unavailable",
+                "Runner ingress connection failed.",
+                { cause: failure },
+              );
+        if (!readySettled) {
+          readySettled = true;
+          readyReject(terminal);
+        }
+        input.onStateChange?.("failed", terminal.code);
+        failureReject(terminal);
+        return;
       }
     }
   })();

@@ -183,6 +183,23 @@ describe("shared Runner execution driver", () => {
     expect(transport.connect.mock.results[0].value.close).toHaveBeenCalledOnce();
   });
 
+  it("does not connect after release while the process readiness gate is pending", async () => {
+    const ingress = endpoint();
+    let started!: () => void;
+    const processStarted = new Promise<void>(resolve => { started = resolve; });
+    const driver = createNativeRunnerExecutionDriver({
+      target: { ...sandbox(), getRunnerIngressEndpoint: async () => ingress } as AdapterExecutionTarget,
+      binding, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted,
+    });
+    const connection = await driver.controlPlaneRegistration!(authority);
+    await connection.activate!();
+    await connection.release();
+    started();
+    await expect(connection.ready!()).rejects.toThrow("runner_ingress_unavailable");
+    expect(ingress.close).toHaveBeenCalledOnce();
+    expect(transport.connect).not.toHaveBeenCalled();
+  });
+
   it("does not fall back to outbound WSS when sandbox ingress is unauthorized", async () => {
     const prepare = vi.fn();
     const acquire = vi.fn();
