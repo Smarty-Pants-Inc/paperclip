@@ -4,6 +4,7 @@ import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
+import { isStoppedSandboxCommandRejection, SANDBOX_STOPPED_RESUME_BUDGET_MS, SandboxStoppedError } from "./sandbox-stopped-error.js";
 import {
   REUSABLE_SANDBOX_RESUME_BUDGET_MS,
   retireReplacedReusableSandboxLease,
@@ -577,6 +578,8 @@ export interface EnvironmentDriverLeaseInput {
 
 export interface EnvironmentDriverResumeInput extends EnvironmentDriverLeaseInput {
   requestedCwd?: string;
+  /** Optional host-side RPC cap for a definite pre-execution rejection. */
+  timeoutMs?: number;
   /** The run's warm runner idle window, forwarded to the provider worker only. */
   warmRunnerIdleTimeoutMs?: number;
   /** The run's remote runner reconnect grace, forwarded to the provider worker only. */
@@ -2771,7 +2774,7 @@ function createSandboxEnvironmentDriver(
         issueId: input.lease.issueId, config, providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
         ...(input.requestedCwd !== undefined ? { requestedCwd: input.requestedCwd } : {}),
-      }, resolvePluginSandboxRpcTimeoutMs(config) ?? 60_000);
+      }, Math.min(resolvePluginSandboxRpcTimeoutMs(config) ?? 60_000, input.timeoutMs ?? Infinity));
       if (resumed?.providerLeaseId !== input.lease.providerLeaseId) {
         if (resumeReplyConfirmsAbsence(resumed)) throw new RetainedSandboxAbsentError();
         throw new Error("The provider did not confirm the exact retained sandbox. No replacement was acquired.");
@@ -3846,6 +3849,7 @@ export function environmentRuntimeService(
 ) {
   const environmentsSvc = environmentService(db);
   let orphanRecoveryFlush: Promise<{ recovered: number; pending: number }> | null = null;
+  const stoppedCommandResumes = new Map<string, Promise<EnvironmentLease>>();
   const drivers = new Map<string, EnvironmentRuntimeDriver>();
 
   const defaultDrivers = [
@@ -4658,7 +4662,63 @@ export function environmentRuntimeService(
       if (!driver.execute) {
         throw new Error(`Environment driver "${driver.driver}" does not support command execution.`);
       }
-      return await driver.execute(input);
+      try {
+        return await driver.execute(input);
+      } catch (error) {
+        if (driver.driver !== "sandbox" || !input.lease.providerLeaseId
+          || !input.lease.metadata?.sandboxProviderPlugin
+          || !isStoppedSandboxCommandRejection(error, input.lease.providerLeaseId)) throw error;
+        if (!driver.resumeRunLease) throw new SandboxStoppedError("resume_unavailable", error);
+        // environmentResumeLease is the existing wake contract (capabilities
+        // doc, reusableLeases). A successful admission can race an external
+        // archive, so the exact command rejection gets ONE wake + replay. No
+        // timeout/unknown RPC outcome or partial command output reaches here.
+        const key = JSON.stringify([input.lease.companyId, input.environment.id, input.lease.providerLeaseId,
+          input.lease.executionWorkspaceId, input.lease.issueId, input.lease.metadata.agentId, input.lease.metadata.pluginId]);
+        let resume = stoppedCommandResumes.get(key);
+        if (!resume) {
+          resume = (async () => {
+            // Cached warm runners can still hold the prior run's released row.
+            // Use its exact active successor, never resurrect a terminal/cleanup
+            // lease or acquire a fresh allocation (its conversation may be unique).
+            const candidates = (await environmentsSvc.listLeases(input.environment.id)).filter(lease =>
+              lease.companyId === input.lease.companyId && lease.provider === input.lease.provider
+              && lease.providerLeaseId === input.lease.providerLeaseId && lease.status === "active"
+              && lease.releasedAt === null && lease.cleanupStatus === null && !hasStopOnlyCleanup(lease)
+              && lease.executionWorkspaceId === input.lease.executionWorkspaceId && lease.issueId === input.lease.issueId
+              && lease.metadata?.agentId === input.lease.metadata?.agentId
+              && lease.metadata?.pluginId === input.lease.metadata?.pluginId);
+            const lease = candidates.length === 1 ? candidates[0] : undefined;
+            const owner = lease?.heartbeatRunId ? await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns)
+              .where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId))).limit(1) : [];
+            if (!lease || owner[0]?.status !== "running"
+              || await nativeWorkspaceExportPendingForLease(db, lease)
+              || await legacyShutdownWorkspaceResourceProtected(db, lease)) {
+              throw new SandboxStoppedError("lease_not_active", error);
+            }
+            try {
+              const resumed = await driver.resumeRunLease!({ environment: input.environment, lease,
+                requestedCwd: typeof lease.metadata?.remoteCwd === "string" ? lease.metadata.remoteCwd : undefined,
+                timeoutMs: SANDBOX_STOPPED_RESUME_BUDGET_MS });
+              if (!resumed || resumed.providerLeaseId !== lease.providerLeaseId || resumed.metadata?.expired === true) {
+                throw new Error("exact sandbox resume was not confirmed");
+              }
+            } catch (cause) { throw new SandboxStoppedError("resume_failed", cause); }
+            return lease;
+          })();
+          stoppedCommandResumes.set(key, resume);
+          // Both branches remove only this attempt. No detached rejecting
+          // finally promise; all original callers await the same ownership check.
+          void resume.then(() => { if (stoppedCommandResumes.get(key) === resume) stoppedCommandResumes.delete(key); },
+            () => { if (stoppedCommandResumes.get(key) === resume) stoppedCommandResumes.delete(key); });
+        }
+        const lease = await resume;
+        try { return await driver.execute({ ...input, lease }); }
+        catch (cause) {
+          if (isStoppedSandboxCommandRejection(cause, input.lease.providerLeaseId)) throw new SandboxStoppedError("still_stopped", cause);
+          throw cause; // A lost retry acknowledgement is still ambiguous. Never replay again.
+        }
+      }
     },
 
     supportsSync(input: EnvironmentDriverLeaseInput): boolean {
