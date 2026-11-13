@@ -44,6 +44,7 @@ export interface RunnerApiIo {
   responseTextPageBytes?: number;
   /** Revalidate server-owned authority after asynchronous file preparation. */
   beforeDispatch?(): Promise<void>;
+  beforeResponseCapture?(): Promise<void>;
   /** Reserve before spilling. Settle completed bytes; failed captures retain their reservation. */
   reserveResponseCapture?(): Promise<(completedBytes?: number, cleanupSucceeded?: boolean) => Promise<void>>;
   readFile(file: RunnerApiFile): Promise<{ bytes: Buffer; filename: string; contentType: string }>;
@@ -274,12 +275,12 @@ export async function executeRunnerApi(input: RunnerApiCall, context: RunnerApiC
     if (sensitiveResponse) {
       timeout = setTimeout(() => controller.abort(), RUNNER_API_TIMEOUT_MS);
       bytes = await readBoundedResponse(response);
-      await io.beforeDispatch?.();
+      await (io.beforeResponseCapture ?? io.beforeDispatch)?.();
     } else if (assetTextRange && response.ok) {
       timeout = setTimeout(() => controller.abort(), RUNNER_API_TIMEOUT_MS);
       bytes = await readBoundedResponse(response, textLimit + 2);
     } else {
-      captured = await captureRunnerApiResponse(response, inlineBytes, controller, RUNNER_API_TIMEOUT_MS, io.beforeDispatch, {
+      captured = await captureRunnerApiResponse(response, inlineBytes, controller, RUNNER_API_TIMEOUT_MS, io.beforeResponseCapture ?? io.beforeDispatch, {
         beforeSpill: async () => { settleCapture = await io.reserveResponseCapture?.(); },
       });
       // Read only the requested window (+ one UTF-8 lookahead byte) into memory.
