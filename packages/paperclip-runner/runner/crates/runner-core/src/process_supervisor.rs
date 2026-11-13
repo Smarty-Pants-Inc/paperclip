@@ -944,6 +944,75 @@ impl BoundedLogBuffer {
     }
 }
 
+// git-config(1), ENVIRONMENT: validate every zero-indexed pair before filtering
+// and renumbering. Keep in sync with pi-process-environment.ts; no credential
+// namespaces or executable core settings may cross the native Pi boundary.
+// https://git-scm.com/docs/git-config#ENVIRONMENT
+fn pi_git_config_environment(
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let Some(raw) = lookup("GIT_CONFIG_COUNT") else {
+        return vec![];
+    };
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return vec![];
+    }
+    let Some(count) = raw
+        .parse::<u64>()
+        .ok()
+        .filter(|count| *count <= 9_007_199_254_740_991)
+        .and_then(|count| usize::try_from(count).ok())
+    else {
+        return vec![];
+    };
+    let mut pairs = Vec::new();
+    for index in 0..count {
+        let (Some(key), Some(value)) = (
+            lookup(&format!("GIT_CONFIG_KEY_{index}")),
+            lookup(&format!("GIT_CONFIG_VALUE_{index}")),
+        ) else {
+            return vec![];
+        };
+        let normalized = key.to_ascii_lowercase();
+        let safe = matches!(
+            normalized.as_str(),
+            "safe.directory"
+                | "user.name"
+                | "user.email"
+                | "gc.auto"
+                | "init.defaultbranch"
+                | "pull.rebase"
+                | "fetch.prune"
+        ) || ["advice.", "color."]
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix) && normalized.len() > prefix.len())
+            || (normalized.starts_with("core.")
+                && normalized.len() > "core.".len()
+                && !matches!(
+                    normalized.as_str(),
+                    "core.sshcommand"
+                        | "core.askpass"
+                        | "core.gitproxy"
+                        | "core.hookspath"
+                        | "core.fsmonitor"
+                        | "core.pager"
+                        | "core.editor"
+                ));
+        if safe {
+            pairs.push((key, value));
+        }
+    }
+    if pairs.is_empty() {
+        return vec![];
+    }
+    let mut environment = vec![("GIT_CONFIG_COUNT".to_owned(), pairs.len().to_string())];
+    for (index, (key, value)) in pairs.into_iter().enumerate() {
+        environment.push((format!("GIT_CONFIG_KEY_{index}"), key));
+        environment.push((format!("GIT_CONFIG_VALUE_{index}"), value));
+    }
+    environment
+}
+
 pub struct SupervisedProcess {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -1164,6 +1233,7 @@ impl SupervisedProcess {
                 std::env::var(key).ok()
             })?;
         } else {
+            command.envs(pi_git_config_environment(|key| std::env::var(key).ok()));
             // Locale values are nonsecret runtime settings, unlike arbitrary task
             // vars. Native Pi must not regain secrets through the configured marker.
             for (key, value) in std::env::vars_os() {
@@ -1594,6 +1664,180 @@ fn exit_fact(status: ExitStatus) -> ProcessExitFact {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Keep reason: the native Pi subprocess credential trust boundary. These
+    // tests cover complete-set validation and the actual env_clear/spawn path.
+    fn git_environment(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        let mut environment = std::collections::BTreeMap::from([(
+            "GIT_CONFIG_COUNT".to_owned(),
+            pairs.len().to_string(),
+        )]);
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            environment.insert(format!("GIT_CONFIG_KEY_{index}"), (*key).to_owned());
+            environment.insert(format!("GIT_CONFIG_VALUE_{index}"), (*value).to_owned());
+        }
+        environment
+    }
+
+    fn project_git_environment(
+        source: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        pi_git_config_environment(|key| source.get(key).cloned())
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn pi_git_safe_directory_passes_and_is_renumbered() {
+        assert_eq!(
+            project_git_environment(&git_environment(&[
+                (
+                    "http.https://github.com/.extraheader",
+                    "Authorization: decoy"
+                ),
+                ("safe.directory", "/work/project"),
+            ])),
+            git_environment(&[("safe.directory", "/work/project")])
+        );
+    }
+
+    #[test]
+    fn pi_git_credentials_only_leave_no_config_environment() {
+        assert!(project_git_environment(&git_environment(&[(
+            "http.https://github.com/.extraheader",
+            "Authorization: decoy"
+        ),]))
+        .is_empty());
+    }
+
+    #[test]
+    fn pi_git_mixed_set_keeps_only_safe_pairs() {
+        let allowed = [
+            "safe.directory",
+            "UsEr.NaMe",
+            "user.email",
+            "gc.auto",
+            "init.defaultbranch",
+            "pull.rebase",
+            "fetch.prune",
+            "advice.detachedHead",
+            "CoLoR.ui",
+            "CoRe.autocrlf",
+        ];
+        let denied = [
+            "http.proxy",
+            "credential.helper",
+            "url.https://github.com/.insteadof",
+            "remote.origin.url",
+            "core.SSHCommand",
+            "core.askPass",
+            "core.gitProxy",
+            "core.hooksPath",
+            "core.fsMonitor",
+            "core.pager",
+            "core.editor",
+            "include.path",
+            "filter.foo.clean",
+            "user.signingkey",
+            "safe.directory.extra",
+            "core",
+            "core.",
+            "advice.",
+            "color.",
+        ];
+        let pairs = allowed
+            .iter()
+            .chain(denied.iter())
+            .map(|key| (*key, "value"))
+            .collect::<Vec<_>>();
+        let mut source = git_environment(&pairs);
+        source.insert("GIT_CONFIG_KEY_99".into(), "user.name".into());
+        source.insert("GIT_CONFIG_VALUE_99".into(), "orphan".into());
+        assert_eq!(
+            project_git_environment(&source),
+            git_environment(&pairs[..allowed.len()])
+        );
+    }
+
+    #[test]
+    fn pi_git_malformed_count_drops_every_pair() {
+        for count in [
+            None,
+            Some(""),
+            Some("-1"),
+            Some("+1"),
+            Some("1.0"),
+            Some(" 1"),
+            Some("1x"),
+            Some("NaN"),
+            Some("1\n"),
+            Some("9007199254740992"),
+        ] {
+            let mut source = git_environment(&[("safe.directory", "/work")]);
+            source.remove("GIT_CONFIG_COUNT");
+            if let Some(count) = count {
+                source.insert("GIT_CONFIG_COUNT".into(), count.into());
+            }
+            assert!(project_git_environment(&source).is_empty(), "{count:?}");
+        }
+    }
+
+    #[test]
+    fn pi_git_incomplete_pair_drops_even_preceding_safe_pairs() {
+        for missing in ["GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1"] {
+            let mut source =
+                git_environment(&[("safe.directory", "/work"), ("http.extraheader", "decoy")]);
+            source.remove(missing);
+            assert!(project_git_environment(&source).is_empty(), "{missing}");
+        }
+    }
+
+    #[test]
+    fn pi_git_empty_values_and_leading_zeroes_preserve_git_semantics() {
+        let expected = git_environment(&[("user.name", "")]);
+        let mut source = expected.clone();
+        source.insert("GIT_CONFIG_COUNT".into(), "01".into());
+        assert_eq!(project_git_environment(&source), expected);
+        source.insert("GIT_CONFIG_COUNT".into(), "0".into());
+        assert!(project_git_environment(&source).is_empty());
+    }
+
+    #[test]
+    fn pi_spawn_keeps_safe_git_and_langfuse_tuning_but_drops_planted_secrets() {
+        const GUARD: &str = "PAPERCLIP_TEST_PI_GIT_ENV_CHILD";
+        if std::env::var_os(GUARD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process_supervisor::tests::pi_spawn_keeps_safe_git_and_langfuse_tuning_but_drops_planted_secrets"])
+                .env(GUARD, "1")
+                .envs(git_environment(&[("http.https://github.com/.extraheader", "Authorization: decoy"), ("safe.directory", "/work/project")]))
+                .env("LANGFUSE_FLUSH_AT", "1")
+                .env("ASCII_TOKEN", "decoy")
+                .env("GH_TOKEN", "decoy")
+                .env("PAPERCLIP_AGENT_API_KEY", "decoy")
+                .env("LANGFUSE_UNKNOWN_SECRET", "decoy")
+                .env("PAPERCLIP_CONFIGURED_ENV_KEYS", "[\"ASCII_TOKEN\",\"GH_TOKEN\",\"PAPERCLIP_AGENT_API_KEY\",\"LANGFUSE_UNKNOWN_SECRET\"]")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut process = SupervisedProcess::spawn_command(
+            Path::new("/bin/sh"),
+            &["-c".into(), "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$GIT_CONFIG_COUNT\" \"$GIT_CONFIG_KEY_0\" \"$GIT_CONFIG_VALUE_0\" \"$GIT_CONFIG_KEY_1\" \"$LANGFUSE_FLUSH_AT\" \"$ASCII_TOKEN\" \"$GH_TOKEN\" \"$PAPERCLIP_AGENT_API_KEY\" \"$LANGFUSE_UNKNOWN_SECRET\"".into()],
+            Duration::from_millis(500), 1024, &["LANGFUSE_FLUSH_AT"], None, None, true, false,
+        ).unwrap();
+        let observed = process.receive_stdout_line(Duration::from_secs(5)).unwrap();
+        process.terminate_group().unwrap();
+        assert_eq!(
+            observed.as_deref(),
+            Some("1|safe.directory|/work/project||1||||")
+        );
+    }
 
     /// Plays a provider whose tool runs `nohup job &` in a new session, the
     /// way Claude Code runs a Bash tool command. The wrapper reports the job's

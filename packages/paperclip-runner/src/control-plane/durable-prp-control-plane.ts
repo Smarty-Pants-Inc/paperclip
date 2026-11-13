@@ -1,6 +1,6 @@
 import { safeErrorCauseCode } from "./safe-error-cause.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../drivers/agent-observability.js";
-import { PI_LANGFUSE_ENVIRONMENT_KEYS } from "../drivers/pi/pi-process-environment.js";
+import { PI_LANGFUSE_ENVIRONMENT_KEYS, piGitConfigEnvironment } from "../drivers/pi/pi-process-environment.js";
 import { configuredEnvironment } from "../configured-environment.js";
 import { nodeCompileCacheEnvironment } from "../node-compile-cache-environment.js";
 import { spawn } from "node:child_process";
@@ -4913,6 +4913,14 @@ export function spawnRunner(options: {
     ...runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment),
     ...nodeCompileCacheEnvironment(options.stateDirectory),
   };
+  // Native Pi settings are not GitHub credentials (whose legacy projection is
+  // limited to 32 entries). Rebuild only validated safe pairs for this profile.
+  if (options.piLaunchProfile) {
+    for (const key of Object.keys(environment)) {
+      if (key.startsWith("GIT_CONFIG_")) delete environment[key];
+    }
+    Object.assign(environment, piGitConfigEnvironment(options.environment ?? {}));
+  }
   // Only the explicitly prepared native Pi launch may carry this run's executionRoot.
   if (options.piLaunchProfile && options.environment?.AGENT_HOME !== undefined) environment.AGENT_HOME = options.environment.AGENT_HOME;
   const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => handle.restart === null ? handle : ({

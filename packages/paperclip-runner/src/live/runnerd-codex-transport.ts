@@ -96,7 +96,7 @@ import {
   type QualifiedAcpxAgent,
 } from "../drivers/acpx/qualified-profiles.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createSanitizedAcpxSpawnInput } from "../drivers/acpx/environment.js";
-import { piProxyEnvironment } from "../drivers/pi/pi-process-environment.js";
+import { piGitConfigEnvironment, piProxyEnvironment } from "../drivers/pi/pi-process-environment.js";
 import { PI_SIDECAR_PROVIDER_ROUTE_NAMES } from "../drivers/acpx/pi-provider-config.js";
 import {
   createSanitizedAwsAgentCoreEnvironment,
@@ -3825,7 +3825,10 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     return selected;
   }
   if (input.provider === "pi_rpc") {
-    const selected = { ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env };
+    const selected = {
+      ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env,
+      ...piGitConfigEnvironment(input.options.environment ?? {}),
+    };
     // Match Claude's explicit managed-command projection without widening ACPX
     // Pi's child allowlist. The launcher installs Git isolation per operation.
     if (input.options.environment?.PAPERCLIP_GITHUB_LAUNCHER_DIR?.trim()) {

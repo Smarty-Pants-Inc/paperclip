@@ -126,6 +126,7 @@ const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "LANGFUSE_TRACING_ENABLED",
     "LANGFUSE_TRACING_ENVIRONMENT",
     "LANGFUSE_RELEASE",
+    "LANGFUSE_FLUSH_AT",
     "PI_LANGFUSE_DEBUG",
     // Agent-readable Ed25519 identity, not Paperclip API bearer credentials.
     "PAPERCLIP_AGENT_KEY_ID",
@@ -7902,6 +7903,7 @@ done
 
     #[test]
     fn pi_native_mcp_environment_is_bounded_and_keeps_safe_ordering() {
+        assert!(PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&"LANGFUSE_FLUSH_AT"));
         let keys = [
             "PAPERCLIP_NATIVE_MCP_NAME",
             "PAPERCLIP_NATIVE_MCP_URL",
