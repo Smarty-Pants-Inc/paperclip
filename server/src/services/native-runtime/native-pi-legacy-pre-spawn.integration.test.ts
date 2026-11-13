@@ -90,6 +90,21 @@ describe.skipIf(!recoveryPostgresSupport.supported)("legacy Pi setup failures th
       currentRunId: h.current.id, beforeCreatedAt: h.current.createdAt })).toBeNull();
   }, 60_000);
 
+  it.each(["conversation-generation", "issue-binding", "session-binding"] as const)("never crosses a legacy %s fence", async fence => {
+    const h = await seed("SMA-43", "pre-claim");
+    const source = h.rows[0]!;
+    const profile = source.runnerProfileJson;
+    const execution = profile.nativeExecutionInput as { binding: Record<string, unknown>; session: Record<string, unknown> };
+    await db.update(heartbeatRuns).set(fence === "conversation-generation"
+      ? { contextSnapshot: { ...source.contextSnapshot, conversationSessionGeneration: source.contextSnapshot.conversationSessionGeneration + 1 } }
+      : { runnerProfileJson: { ...profile, nativeExecutionInput: { ...execution,
+        ...(fence === "issue-binding" ? { binding: { ...execution.binding, issueId: randomUUID() } }
+          : { session: { ...execution.session, normalizedSessionId: randomUUID() } }) } } })
+      .where(eq(heartbeatRuns.id, source.id));
+    await expect(selectPiConversation(db, h.input)).rejects.toThrow("pi_conversation_legacy_predecessor_unproven");
+    expect(await h.notices()).toHaveLength(0);
+  }, 60_000);
+
   it.each(["SMA-43", "SMAA-143"] as const)("keeps %s held if the supplementary coordinator was claimed", async chat => {
     const h = await seed(chat, "claimed");
     await expect(selectPiConversation(db, h.input)).rejects.toThrow("pi_conversation_legacy_predecessor_unproven");

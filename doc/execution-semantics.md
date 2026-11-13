@@ -5105,6 +5105,28 @@ Holds recorded by earlier releases take this path. The successor is marked
 `nativePreClaimContinuationOf`; if it also fails, it keeps the ordinary
 reconciliation hold instead of chaining another continuation.
 
+Failed native predecessor selection uses that same affirmative pre-claim fact,
+not missing spawn telemetry. A terminal-failure coordinator must be unowned and
+have no result, with either the untouched attempt-0/generation-0 bootstrap proof
+or the durable server-owned prior-owner fence-refusal event. A launch intent,
+runner launch/dispatch span, recorded process start, controller checkpoint or
+provider/tool/result evidence keeps the predecessor held. Selection has no box
+to probe and does not invent another process-death predicate: dispatched remote
+owners still use `remoteRunnerGenerationLost` for the exact recorded runner.
+The same rule applies to admitted failures without a saved session checkpoint.
+
+Some older Pi task-session pointers name a different normalized session after
+each setup failure. Their bounded legacy lookup walks back only over these
+proved pre-spawn failures, within the same company, agent, issue and explicit
+conversation generation. An unproved or incompatible predecessor is a named
+`pi_conversation_legacy_predecessor_unproven` hold, not silent permission to
+start another history. A proved chain can retain the last successful
+conversation/checkpoint; normal workspace, provider, checkpoint and cold-start
+admission fences still apply. If every supplied predecessor is proved pre-spawn
+and no checkpoint exists, one transactional legacy-history warning accompanies
+the new recorded conversation. Missing historical coordinator records are not
+backfilled or interpreted as affirmative proof.
+
 Historical replacement discovery reads at most 100 candidates per pass and
 keeps a cursor only for the remaining scan. A work notification preserves forward
 progress and requests a final rescan, so held earlier rows cannot hide a later
