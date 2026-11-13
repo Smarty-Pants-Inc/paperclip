@@ -5,9 +5,9 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { eq } from "drizzle-orm";
-import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, agentTaskSessions } from "@paperclipai/db";
+import { agents, authUsers, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, agentWakeupRequests, agentTaskSessions, nativeRunFinalizations } from "@paperclipai/db";
 import { expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
@@ -20,6 +20,9 @@ const enabled = process.env.PAPERCLIP_PI_FULL_SERVER_E2E === "1";
 const thinking = process.env.PAPERCLIP_PI_E2E_THINKING_LEVEL ?? "xhigh";
 const protocol = process.env.PAPERCLIP_PI_E2E_PROTOCOL ?? "messages";
 const loseIdleOwner = process.env.PAPERCLIP_PI_E2E_LOSE_IDLE_OWNER === "1";
+const flushAfterStop = true;
+const refusalCases = process.env.PAPERCLIP_PI_E2E_FORCE_CHECKPOINT_REFUSAL === undefined
+  ? [false, true] : [process.env.PAPERCLIP_PI_E2E_FORCE_CHECKPOINT_REFUSAL === "1"];
 
 type Bundle = ReturnType<typeof import("../vendor/paperclip-runner/index.js").createRunnerdCodexTransport>;
 function piDescendant(runnerPid: number): number | null {
@@ -46,7 +49,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm turn, and later ${loseIdleOwner ? "lost owner" : "controller restart"} (thinking=${thinking})`, async () => {
+it.skipIf(!enabled).each(refusalCases)(`Stop preserves Pi-only history through warm and cold turns (forced checkpoint refusal=%s, thinking=${thinking})`, async forceRefusal => {
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -73,6 +76,10 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
     stages.push(row); console.log(`[pi-full-server] ${name} ${JSON.stringify(detail)}`);
   };
   const bundles: Bundle[] = [];
+  const authorities: import("../vendor/paperclip-runner/index.js").DurablePrpControlPlane[] = [];
+  let postStopCheckpointError: unknown;
+  let rejectCheckpoints = false;
+  const expectedRefusals = new Set<string>();
   const requests: Array<{ path: string; model: unknown; lastMessage: unknown; messages: unknown[]; remembersPrivateFact: boolean; tools: string[] }> = [];
   const packVerificationCommands: Array<Record<string, unknown>> = [];
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
@@ -105,7 +112,7 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
       const value = await probe(); if (value !== null) return value;
       if (db && agentId) {
         const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-        const failure = runs.find(run => run.status === "failed" || run.status === "timed_out");
+        const failure = runs.find(run => !expectedRefusals.has(run.id) && (run.status === "failed" || run.status === "timed_out"));
         if (failure) throw new Error(`${label}: run failed ${JSON.stringify({ id: failure.id, status: failure.status, errorCode: failure.errorCode, error: failure.error })}`);
       }
       await new Promise<void>(resolve => {
@@ -222,12 +229,38 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
       import("../vendor/paperclip-runner/index.js"), import("../realtime/runner-prp-ws.js"), import("../services/live-events.js"),
     ]);
     const realFactory = runner.createRunnerdCodexTransport;
-    // Observation only: every invocation enters the unmodified production
-    // transport with its actual arguments and retains its actual process owner.
+    // Keep the real production transport and process owner. The harness adds
+    // the real remote DB checkpoint writer to local execution; the refusal
+    // variant injects only a bounded storage outage, never a replay result.
     vi.spyOn(runner, "createRunnerdCodexTransport").mockImplementation(options => {
       stage("transport kind=pi_rpc", { provider: options?.provider, thinking: options?.piRpcThinkingLevel });
       expect(options?.provider).toBe("pi_rpc"); expect(options?.piRpcThinkingLevel).toBe(thinking);
-      const bundle = realFactory(options); bundles.push(bundle); return bundle;
+      const registration = options?.controlPlaneRegistration;
+      const bundle = realFactory(!flushAfterStop ? options : { ...options, controlPlaneRegistration: async (authority, identity, signal) => {
+        // Local transport normally persists only files. Install the exact real
+        // remote DB writer to exercise REG-30 without a sandbox or paid model.
+        // No result/fence is forged: the full server owns these coordinators.
+        if (!authorities.includes(authority)) {
+          authorities.push(authority);
+          // Remote admission restores a local projection from the DB. This
+          // local-process harness instead mirrors each *committed* checkpoint
+          // so its ordinary local prior-owner verifier can inspect that state.
+          const install = authority.setCheckpointPersistence.bind(authority);
+          vi.spyOn(authority, "setCheckpointPersistence").mockImplementation(persist => install(async checkpoint => {
+            if (rejectCheckpoints) throw Object.assign(new Error("REG-30 forced checkpoint outage"), { code: "ECONNREFUSED" });
+            await persist(checkpoint);
+            checkpoint.restoreSessionDirectory(dirname(dirname(authority.store.path)));
+          }));
+        }
+        const current = (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+          .find(run => run.status === "running");
+        if (!current) throw new Error("REG-30: no active server authority");
+        const [owner] = await db!.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, current.id));
+        const { registerNativeRunnerCheckpoint } = await import("../services/native-runtime/native-runner-checkpoint.js");
+        await registerNativeRunnerCheckpoint({ db: db!, authority, bootId: owner!.controllerBootId!, authorityRunId: current.id,
+          binding: { companyId, issueId, runId: identity?.runId ?? current.id } });
+        return registration ? registration(authority, identity, signal) : { release: () => undefined };
+      } }); bundles.push(bundle); return bundle;
     });
     app = await createApp(db, {
       uiMode: "none", serverPort: 0, storageService: createStorageService(createLocalDiskStorageProvider(join(root, "storage"))),
@@ -343,13 +376,45 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
     expect(readFileSync(originalSessionFile, "utf8")).toContain(privateFact);
     stage("Pi session file intact after Stop", { sessionFile: originalSessionFile, nativeSessionId: stopped.nativeSessionId,
       taskSessions: await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, agentId)) });
+    if (flushAfterStop) {
+      const authority = authorities.at(-1)!;
+      expect(authority, "the retained runner has the real fenced DB checkpoint writer").toBeDefined();
+      authority.issueBootstrapTicket(5_000); // maintenance write, no provider work
+      try { await authority.flushCheckpoint(); }
+      catch (error) { postStopCheckpointError = error; }
+      stage("post-Stop real checkpoint flush", { error: postStopCheckpointError instanceof Error ? postStopCheckpointError.message : null,
+        connections: authority.activeRunnerConnectionCount() });
+    }
+    if (forceRefusal) {
+      rejectCheckpoints = true;
+      const authority = authorities.at(-1)!;
+      authority.issueBootstrapTicket(5_000);
+      await expect(authority.flushCheckpoint()).rejects.toThrow("REG-30 forced checkpoint outage");
+      await waitFor("real repeated checkpoint failure latches integrity refusal", async () =>
+        bundles.at(-1)!.evidence().diagnostics.some(text => text.includes("runner_event_commit_stalled")) ? true : null, 90_000);
+      await api("POST", `/issues/${issueId}/comments`, { body: "First message during the checkpoint outage: recall your private fact." }, 201);
+      const refused = await waitFor("actual checkpoint-stall integrity refusal", async () => {
+        const run = (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+          .find(run => run.id !== admitted.id && run.status === "failed");
+        return run ?? null;
+      });
+      expect(refused.errorCode).toBe("native_event_replay_conflict");
+      expect(refused.error).toContain("runner_event_commit_stalled");
+      await heartbeatService(db).waitForRunExecutionDrain(refused.id, { timeoutMs: 30_000 });
+      expectedRefusals.add(refused.id);
+      rejectCheckpoints = false;
+      stage("forced integrity refusal preserved; NEXT message must recover", { runId: refused.id, errorCode: refused.errorCode,
+        originalRunnerAlive: alive(pid.runnerPid), originalPiAlive: alive(pid.piPid) });
+      expect(alive(pid.runnerPid)).toBe(false);
+      expect(alive(pid.piPid)).toBe(false);
+    }
     await api("POST", `/issues/${issueId}/comments`, { body: "Recall the private memory fact you said before Stop. Reply with that fact only; no tool needed." }, 201);
     const reply = await waitFor("NEW turn after Stop completes", async () => {
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       return rows.find(row => row.authorAgentId === agentId && (row.body.includes(privateFact) || row.body.includes("HISTORY_LOST"))) ?? null;
     });
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    const next = runs.find(run => run.id !== admitted.id)!;
+    const next = runs.find(run => run.id !== admitted.id && !expectedRefusals.has(run.id))!;
     expect(next, "a NEW run, not continuation of stopped run").toBeDefined();
     await heartbeatService(db).waitForRunExecutionDrain(next.id, { timeoutMs: 15_000 });
     const final = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id)))[0]!;
@@ -357,16 +422,22 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
     stage("NEW turn completed after Stop", { runId: final.id, status: final.status, old: pid, newPids, reply: reply.body,
       oldNativeSessionId: stopped.nativeSessionId, nativeSessionId: final.nativeSessionId, originalSessionFile });
     expect(final.status).toBe("succeeded");
+    expect(postStopCheckpointError, "retained-idle maintenance persists after Stop without disconnecting the runner").toBeUndefined();
     const replacement = newPids.find(value => value.piPid !== null)!;
-    expect(replacement, "new wake attaches to the original healthy resident").toBeDefined();
-    expect(replacement.piPid).toBe(pid.piPid);
-    expect(replacement.runnerPid).toBe(pid.runnerPid);
+    expect(replacement, "the new wake owns a real resident Pi").toBeDefined();
+    if (forceRefusal) {
+      expect(replacement.piPid).not.toBe(pid.piPid);
+      expect(replacement.runnerPid).not.toBe(pid.runnerPid);
+    } else {
+      expect(replacement.piPid).toBe(pid.piPid);
+      expect(replacement.runnerPid).toBe(pid.runnerPid);
+    }
     const replacementSessionFile = readSessionFile(replacement.piPid!);
     stage("history continuity proof", { oldNativeSessionId: stopped.nativeSessionId, nativeSessionId: final.nativeSessionId,
       originalSessionFile, replacementSessionFile, remembersPrivateFact: requests[1]?.remembersPrivateFact, reply: reply.body });
     await writeFile(join(root, "pi-session-after-reopen.jsonl"), readFileSync(replacementSessionFile));
     expect(final.nativeSessionId, "Stop preserves the logical Pi conversation").toBe(stopped.nativeSessionId);
-    expect(replacementSessionFile, "the same Pi keeps the exact original file").toBe(originalSessionFile);
+    expect(replacementSessionFile, "warm reuse or proven cold recovery keeps the exact original file").toBe(originalSessionFile);
     expect(requests[1]?.remembersPrivateFact, "resident Pi sends its private assistant history to the model").toBe(true);
     expect(JSON.stringify(requests[1]?.lastMessage), "Paperclip did not replay the secret into the new wake").not.toContain(privateFact);
     expect(reply.body).toContain(privateFact);
@@ -376,7 +447,7 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       return rows.find(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_2")) ?? null;
     });
-    const warm = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find(run => run.id !== admitted.id && run.id !== final.id)!;
+    const warm = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find(run => run.id !== admitted.id && run.id !== final.id && !expectedRefusals.has(run.id))!;
     expect(warm).toBeDefined();
     await heartbeatService(db).waitForRunExecutionDrain(warm.id, { timeoutMs: 15_000 });
     const settledWarm = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, warm.id)))[0]!;
@@ -406,7 +477,7 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
         (row.body.includes(privateFact) || row.body.includes("HISTORY_LOST"))) ?? null;
     });
     const coldRun = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
-      .find(run => ![admitted.id, final.id, warm.id].includes(run.id))!;
+      .find(run => ![admitted.id, final.id, warm.id].includes(run.id) && !expectedRefusals.has(run.id))!;
     expect(coldRun).toBeDefined();
     await heartbeatService(db).waitForRunExecutionDrain(coldRun.id, { timeoutMs: 15_000 });
     const settledCold = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, coldRun.id)))[0]!;
@@ -423,7 +494,9 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
     expect(requests.every(request => request.model === "faux")).toBe(true);
     stage("idle/restart cold-open continuity", { ...coldPids, closure, nativeSessionId: settledCold.nativeSessionId,
       sessionFile: readSessionFile(coldPids.piPid!), reply: coldReply.body });
-    stage("GREEN", { companyId, agentId, issueId, requests: requests.length, cancelMs, retired: pid, replacement, coldPids, bashPid, sleepPid });
+    const finalClosure = await closeIdleWarmNativeSessionsForRestart();
+    expect(finalClosure, "release this case's final warm owner before closing its database").toEqual({ closed: 1, busy: 0, failed: 0 });
+    stage("GREEN", { companyId, agentId, issueId, requests: requests.length, cancelMs, retired: pid, replacement, coldPids, bashPid, sleepPid, finalClosure });
   } catch (error) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;

@@ -2296,6 +2296,42 @@ export class DurablePrpControlPlane {
     return pending;
   }
 
+  /** Preserve both sides of a checkpoint-only stall. Never an execution grant:
+   * callers must independently retire the exact process and fence its owner.
+   * Replay/digest conflicts, uncommitted source events and new work stay held. */
+  preserveCheckpointOnlyStall(directory: string): boolean {
+    const failure = this.#protocolIntegrityError;
+    const committed = this.#lastCheckpoint;
+    if (failure?.reason !== "runner_event_commit_stalled" || !failure.detail?.startsWith("checkpoint_flush_failed:")
+      || !this.#checkpointPersistenceFailed || !committed || !this.semanticToolResultsSettled()
+      || this.#store.state.stagedRunAttachment || this.#store.state.warmTransition) return false;
+    const pending = captureCheckpoint(this.#store.state, this.#expectedRunnerVersion, this.#expectedRunnerDigest);
+    const before = checkpointState(committed.records).state;
+    const after = this.#store.state;
+    if (canonicalJson(before.identity) !== canonicalJson(after.identity) || before.ackedSourceSeq !== after.ackedSourceSeq
+      || canonicalJson(committed.workCommandIds) !== canonicalJson(pending.workCommandIds)) return false;
+    const events = (checkpoint: DurablePrpCheckpoint) => [...checkpoint.records].filter(([key]) => key.startsWith("event:"));
+    const maintenance = new Set(["turn.stop", "runner.drain", "runner.suspend", "session.snapshot", "session.close"]);
+    const work = (checkpoint: DurablePrpCheckpoint) => [...checkpoint.records].filter(([key, value]) =>
+      key.startsWith("command:") && !maintenance.has(String(JSON.parse(value).type)));
+    if (canonicalJson(events(committed)) !== canonicalJson(events(pending))
+      || canonicalJson(work(committed)) !== canonicalJson(work(pending))) return false;
+    // Create, never replace, the caller's evidence directory. A repeated or
+    // racing request cannot overwrite even an incomplete earlier capture.
+    mkdirSync(dirname(directory), { recursive: true, mode: 0o700 });
+    verifyPrivateDirectory(dirname(directory));
+    try { mkdirSync(directory, { mode: 0o700 }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
+    committed.restoreSessionDirectory(resolve(directory, "committed"));
+    pending.restoreSessionDirectory(resolve(directory, "uncommitted"));
+    atomicPrivateWrite(resolve(directory, "receipt.json"), JSON.stringify({
+      schema: "paperclip.checkpoint-only-stall.v1", identity: before.identity,
+      ackedSourceSeq: before.ackedSourceSeq, reason: failure.reason, detail: failure.detail,
+      committedSha256: createHash("sha256").update(readFileSync(resolve(directory, "committed", "control-plane", "control-plane-state.json"))).digest("hex"),
+    }));
+    return true;
+  }
+
   #sendJson(connection: AuthorityConnection, value: unknown): void {
     if (!this.#persistCheckpoint) {
       connection.sendJson(value);

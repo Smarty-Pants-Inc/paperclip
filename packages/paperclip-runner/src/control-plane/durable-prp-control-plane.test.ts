@@ -1410,6 +1410,7 @@ it("fails closed at once when the journal cannot record a runner event", async (
     const failure = onProtocolIntegrityError.mock.calls[0]![0] as Error & { reason: string; detail: string };
     expect(failure).toMatchObject({ reason: "runner_event_commit_stalled", detail: "journal_write_failed:ENOSPC at source seq 1" });
     expect(failure.message).not.toContain("/private/disk");
+    expect(core.preserveCheckpointOnlyStall(resolve(root, "must-not-promote-event-loss"))).toBe(false);
     client.socket.destroy();
   } finally {
     await core.stop();
@@ -1445,6 +1446,19 @@ it("fails closed when checkpoint storage keeps failing before a reconnect authen
     expect(failure.reason).toBe("runner_event_commit_stalled");
     expect(failure.detail).toMatch(/^checkpoint_flush_failed:ECONNREFUSED at source seq 1$/);
     expect(failure.message).not.toContain("private-db-host");
+    const evidence = resolve(root, "checkpoint-only-evidence");
+    expect(core.preserveCheckpointOnlyStall(evidence)).toBe(true);
+    const saved = JSON.parse(readFileSync(resolve(evidence, "receipt.json"), "utf8"));
+    expect(saved).toMatchObject({ schema: "paperclip.checkpoint-only-stall.v1", identity, ackedSourceSeq: 0,
+      reason: "runner_event_commit_stalled" });
+    const committed = readFileSync(resolve(evidence, "committed", "control-plane", "control-plane-state.json"), "utf8");
+    const uncommitted = readFileSync(resolve(evidence, "uncommitted", "control-plane", "control-plane-state.json"), "utf8");
+    expect(saved.committedSha256).toBe(createHash("sha256").update(committed).digest("hex"));
+    expect(uncommitted).not.toBe(committed);
+    // The evidence is not authority and cannot clear the original refusal.
+    expect(() => core.rotateRunIdentity({ ...identity, runId: "must-still-refuse" }, {})).toThrow("native_event_replay_conflict");
+    core.queueCommand("turn.start", { prompt: "uncommitted work must keep the hold" });
+    expect(core.preserveCheckpointOnlyStall(resolve(root, "must-not-drop-work"))).toBe(false);
   } finally {
     now.mockRestore();
     await core.stop();

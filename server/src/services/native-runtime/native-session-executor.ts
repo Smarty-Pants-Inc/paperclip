@@ -125,6 +125,7 @@ import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
 import { scheduledResumeContinuationAllowed } from "./scheduled-resume-continuation.js";
 import { readNativeLocalProcessStop, recordedLocalExecutionStopped, PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
+import { readCheckpointStallEvidence } from "./native-checkpoint-stall-evidence.js";
 import { remoteLeaseCleanupScope } from "../remote-execution-termination.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
@@ -5903,15 +5904,37 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   }
   if (!prior || prior.run.runtimeMode !== "native") return refuse("owner_missing");
   if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(prior.run.status)) return refuse("owner_run_not_terminal");
-  if (prior.owner.phase !== "committed") return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
-  if (!prior.owner.resultId) return refuse("owner_result_missing");
+  const profile = record(prior.run.runnerProfileJson);
+  const evidenceRoot = basename(dirname(input.root)) === "continuity-breaks" ? resolve(input.root, "../..") : input.root;
+  const stall = localRunner ? readCheckpointStallEvidence(evidenceRoot, identity) : null;
+  const recovery = record(profile.nativeCheckpointStallRecovery);
+  const idle = record(profile.nativeRetainedIdleCheckpoint);
+  let checkpointOnlyStop = !!stall && prior.run.status === "cancelled" && hasAcknowledgedNativeStopIntent(prior.run)
+    && prior.owner.phase === "terminal_failure" && prior.owner.failureCode === "native_retry_cancelled"
+    && idle.schema === "paperclip.native-retained-idle-checkpoint.v1"
+    && idle.companyId === binding.companyId && idle.issueId === binding.issueId && idle.runId === identity.runId
+    && idle.sessionId === identity.normalizedSessionId
+    && idle.bootId === prior.owner.controllerBootId && idle.generation === prior.owner.controllerGeneration
+    && recovery.schema === "paperclip.native-checkpoint-stall-recovery.v1"
+    && recovery.evidenceName === stall.name && recovery.committedSha256 === stall.sha256
+    && recovery.runnerPid === stall.runnerPid && recovery.bootId === idle.bootId && recovery.generation === idle.generation
+    && createHash("sha256").update(controlBytes).digest("hex") === stall.sha256;
+  if (checkpointOnlyStop) {
+    const [refused] = typeof recovery.refusedRunId === "string" ? await input.db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, recovery.refusedRunId), eq(heartbeatRuns.companyId, binding.companyId),
+      eq(heartbeatRuns.agentId, binding.agentId), eq(heartbeatRuns.nativeIssueId, binding.issueId),
+      eq(heartbeatRuns.nativeSessionId, identity.normalizedSessionId), eq(heartbeatRuns.status, "failed"),
+      eq(heartbeatRuns.errorCode, "native_event_replay_conflict"))) : [];
+    checkpointOnlyStop = !!refused;
+  }
+  if (prior.owner.phase !== "committed" && !checkpointOnlyStop) return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
+  if (!prior.owner.resultId && !checkpointOnlyStop) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
   if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
   // A durable controller is fenced by its released database lease; a legacy
   // controller still needs process evidence, exactly as for warm recovery.
   const finishedHere = () => isCurrentNativeControllerProcess(prior!.owner) &&
     !activeNativeSessions.has(identity.runId) && !nativeSessionStartups.has(identity.runId);
-  const profile = record(prior.run.runnerProfileJson);
   const stopped: NativeControllerTakeoverDecision = finishedHere() ? { allowed: true, reason: "finished_here" } : await evaluateNativeControllerTakeover({ owner: prior.owner,
     now: new Date(), requireStoppedController: true,
     remoteLeaseFenced: readNativeControllerRecovery(profile.nativeControllerRecovery, profile.sessionCheckpoint) !== null });
@@ -5924,16 +5947,16 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     // server-authored stop receipt; that receipt is the identity to check.
     const released = run.processPid === null && run.processGroupId === null && run.processStartedAt === null;
     const receipt = released ? await readNativeLocalProcessStop(input.db, run.companyId, run.id) : null;
-    if (released && !receipt) return { stopped: false, reason: "runner_process_identity_missing" };
+    if (released && !receipt && !checkpointOnlyStop) return { stopped: false, reason: "runner_process_identity_missing" };
     const providerEvents = await input.db.select({ payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
       .where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
         inArray(heartbeatRunEvents.eventType, [...NATIVE_PROVIDER_PROCESS_EVENT_TYPES])))
       .orderBy(desc(heartbeatRunEvents.id)).limit(100);
     return proveNativeLocalRunnerStopped({
-      processPid: receipt?.processPid ?? run.processPid,
-      processGroupId: receipt?.processGroupId ?? run.processGroupId,
-      processStartedAt: receipt ? null : run.processStartedAt,
-      runnerStopRecorded: receipt !== null,
+      processPid: receipt?.processPid ?? run.processPid ?? (checkpointOnlyStop ? stall!.runnerPid : null),
+      processGroupId: receipt?.processGroupId ?? run.processGroupId ?? (checkpointOnlyStop ? stall!.runnerPid : null),
+      processStartedAt: receipt || checkpointOnlyStop ? null : run.processStartedAt,
+      runnerStopRecorded: receipt !== null || checkpointOnlyStop,
       providerProcesses: nativeProviderProcessIdentities(record(profile.sessionCheckpoint), providerEvents),
     });
   };
@@ -5959,6 +5982,13 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8") !== originalBytes
       || readSettledRunnerdProjection(input.root, identity, projectionOptions).bytes !== controlBytes) return "journal_changed";
     if (provenFinishedHere && !finishedHere()) return "controller_restarted_here";
+    if (checkpointOnlyStop) {
+      const [owner] = await input.db.select().from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.runId, identity.runId), eq(nativeRunFinalizations.companyId, binding.companyId),
+        eq(nativeRunFinalizations.issueId, binding.issueId)));
+      if (!owner || owner.leaseOwner || owner.recoveryState || owner.controllerBootId !== idle.bootId
+        || owner.controllerGeneration !== idle.generation || owner.phase !== "terminal_failure" || owner.failureCode !== "native_retry_cancelled") return "checkpoint_owner_changed";
+    }
     if (localRunner && !(await proveLocalRunnerStopped()).stopped) return "runner_process_restarted";
     return null;
   };
@@ -12056,12 +12086,49 @@ async function executePaperclipNativeSessionAttempt(
         await reportWarmAttachFailure(code, text, "side_effect_pending");
         throw new NativeProviderSideEffectPendingError(code);
       }
-      // REG-30: events the controller could not commit (for example a
-      // checkpoint_flush_failed stall) may record the stopped turn's effects. A
-      // cold resume from the last committed checkpoint would drop them, so keep
-      // the integrity refusal and its native_event_replay_conflict code.
+      // REG-30: keep this message's integrity refusal. Uncommitted source
+      // events may contain effects and cannot be replayed speculatively. Only
+      // Core's exact checkpoint-only evidence can qualify a later message;
+      // neither the public error code nor its text is such evidence.
       if (protocolIntegrityCause(error)) {
         await reportWarmAttachFailure(code, text, "protocol_integrity");
+        // Keep THIS message's refusal. A later message may retire only an exact
+        // checkpoint-only stall whose original stopped owner is still fenced.
+        // close preserves both checkpoints and contains the journalled local
+        // process tree; conflicting source bytes and effects cannot qualify.
+        const root = scopedRunnerdStateRoot(input.execution);
+        const pendingEvidence = readCheckpointStallEvidence(root, undefined, false);
+        if (!pendingEvidence || pendingEvidence.identity.normalizedSessionId !== nativeSessionKey(input.execution)) return false;
+        try {
+          await retained.close({ reason: "checkpoint integrity refusal" });
+          const evidence = readCheckpointStallEvidence(root);
+          if (evidence) await input.db.transaction(async tx => {
+            const [source] = await tx.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+              .innerJoin(nativeRunFinalizations, eq(nativeRunFinalizations.runId, heartbeatRuns.id)).where(and(
+                eq(heartbeatRuns.id, String(evidence.identity.runId)), eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+                eq(heartbeatRuns.agentId, input.execution.binding.agentId), eq(heartbeatRuns.nativeIssueId, input.execution.binding.issueId),
+                eq(nativeRunFinalizations.issueId, input.execution.binding.issueId))).for("update");
+            const idle = record(record(source?.run.runnerProfileJson).nativeRetainedIdleCheckpoint);
+            if (!source || !hasAcknowledgedNativeStopIntent(source.run) || source.owner.leaseOwner || source.owner.recoveryState
+              || source.owner.phase !== "terminal_failure" || source.owner.failureCode !== "native_retry_cancelled"
+              || idle.schema !== "paperclip.native-retained-idle-checkpoint.v1" || idle.bootId !== source.owner.controllerBootId
+              || idle.generation !== source.owner.controllerGeneration || source.run.nativeSessionId !== evidence.identity.normalizedSessionId
+              || source.run.nativeSessionId !== nativeSessionKey(input.execution)) return;
+            const recovery = { schema: "paperclip.native-checkpoint-stall-recovery.v1", evidenceName: evidence.name,
+              committedSha256: evidence.sha256, runnerPid: evidence.runnerPid, refusedRunId: input.execution.binding.runId,
+              bootId: idle.bootId, generation: idle.generation };
+            // The uncommitted version is already immutable evidence. Restore
+            // only after containment, never during the refusing attachment.
+            const canonical = resolve(root, "control-plane", "control-plane-state.json");
+            const temporary = `${canonical}.${randomUUID()}.restore`;
+            writeFileSync(temporary, evidence.bytes, { mode: 0o600, flag: "wx" });
+            renameSync(temporary, canonical);
+            await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+              || ${JSON.stringify({ nativeCheckpointStallRecovery: recovery })}::jsonb` }).where(eq(heartbeatRuns.id, source.run.id));
+          });
+        } catch (recoveryError) {
+          logger.error({ err: recoveryError, runId: input.execution.binding.runId }, "Checkpoint-stall recovery remains held: containment or evidence unproven");
+        }
         return false;
       }
       // These keep their existing owners: the proven released-runner path, a

@@ -2844,6 +2844,20 @@ receipt does not replace a result or bypass task, source-consumption, successor,
 recovery or controller-generation fences. An absent or foreign receipt keeps the
 ordinary `native_runner_checkpoint_owner_lost` refusal.
 
+A local retained Pi owner can also preserve a checkpoint-only commit-stall for a
+later message. Core must prove that the committed source-event records, source
+cursor and non-maintenance commands are unchanged; a differing replay, uncertain
+new work or unsettled callback cannot qualify. Both committed and uncommitted
+controller checkpoints are kept in a unique diagnostics directory. The first
+message keeps its `native_event_replay_conflict` refusal and owner alarm. After
+L3's exact local process-lineage containment, the server records the evidence
+hash under the original cancelled owner's controller epoch. A later message
+rechecks that owner, the failed attachment, the journal and the stopped processes
+before archiving the old authority and reopening the same Pi file through
+`recoverSession`. This path requires readable original Pi history. A remote
+process or missing history cannot be certified by this local containment proof
+and keeps its existing recovery gates.
+
 ### Provider continuity and bounded finalization
 
 A permanently unusable native runner session may be replaced only with evidence that its predecessor is stopped and fenced, completed results and workspace state are preserved, required task history is available, and pending effects have been reconciled. A provider-native shell command or external write without a reliable outcome receipt is unknown. Unknown effects, integrity failures, and unverified process ownership never authorize speculative replay. Once automatic recovery is ruled out, Paperclip selects a conservative default: preserve recorded work, stop the affected task, and retain a durable no-replay hold. Unknown action outcomes remain unknown. No reconciliation form or user diagnosis is required.

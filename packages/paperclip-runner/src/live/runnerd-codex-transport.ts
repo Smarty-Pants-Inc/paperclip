@@ -4065,6 +4065,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #handle: RunnerProcessHandle | null = null;
   /** The runnerd handle that exited on its own while the session was open. */
   #lostRunnerHandle: RunnerProcessHandle | null = null;
+  #checkpointStallEvidence: string | null = null;
   #adoptedRunnerMonitor: NodeJS.Timeout | null = null;
   #adoptedRunnerAuthenticated = false;
   /** Events are delivered only between session start and release, retirement, failure or close. */
@@ -5668,6 +5669,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       return;
     }
     const adoptedRunner = this.options.adoptExistingRunner;
+    // A checkpoint-only integrity stall is not a differing replay. Preserve
+    // both journals before containing our own local process. Never turn a
+    // timeout kill, foreign owner or uncommitted source event into this proof.
+    let checkpointStallEvidence: string | undefined;
+    if (this.options.provider === "pi_rpc" && this.#handle && !this.options.runnerProcessLauncher && !adoptedRunner) {
+      if (this.#checkpointStallEvidence) {
+        checkpointStallEvidence = this.#checkpointStallEvidence;
+        this.#handle.child.kill("SIGKILL");
+        await waitForProcess(this.#handle, 5_000);
+      }
+    }
     // `settled` is a durable-state assertion, not merely the absence of a
     // process handle. Registration can install a remote checkpoint callback
     // before process launch; a synchronous launch failure must therefore stay
@@ -5705,7 +5717,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // Later, only an independently signalled exit observed before containment
       // qualifies; our suspend/timeout exits never replace suspension proof.
       runnerLost = this.#handle !== null && (
-        this.#lostRunnerHandle === this.#handle || (exitedBeforeCloseCommands && !(
+        checkpointStallEvidence !== undefined || this.#lostRunnerHandle === this.#handle || (exitedBeforeCloseCommands && !(
           this.#handle.child.exitCode === 0 && this.#core.store.state.committedEvents.some(
             (event) => event.eventType === "runner.suspending",
           )
@@ -5961,8 +5973,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (!preparationConfirmed) {
       throw new Error(`Native runner ${attachmentPending ? "attachment" : "startup"} cleanup is unconfirmed; recovery state retained.`);
     }
+    if (checkpointStallEvidence && runnerLossReaped && finalProviderState !== "unreadable") {
+      writeFileSync(resolve(checkpointStallEvidence, "contained.json"), JSON.stringify({
+        schema: "paperclip.checkpoint-only-stall-contained.v1", runnerPid: this.#handle!.child.pid,
+        identity: this.#core!.store.state.identity,
+      }), { mode: 0o600, flag: "wx" });
+    }
     this.#shutdownSettled = runnerSettled;
-    if (this.#ownsRoot && !adoptedRunner) {
+    if (this.#ownsRoot && !adoptedRunner && !checkpointStallEvidence) {
       rmSync(this.#root, { recursive: true, force: true });
     }
     this.#publish();
@@ -9191,6 +9209,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #failTransport(error: Error): void {
     if (this.#failure !== null || this.#closed) return;
     this.#failure = error;
+    if (this.options.provider === "pi_rpc" && this.#core) {
+      try {
+        const directory = resolve(this.#root, "diagnostics", `checkpoint-stall-${Date.now()}-${randomUUID()}`);
+        if (this.#core.preserveCheckpointOnlyStall(directory)) this.#checkpointStallEvidence = directory;
+      } catch (evidenceError) {
+        this.#diagnostic(`checkpoint-stall evidence unconfirmed: ${String(evidenceError)}`);
+      }
+    }
     this.#rejectFailureSignal(error);
     this.#stopPump();
     try {
