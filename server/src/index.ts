@@ -132,7 +132,6 @@ import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
 import { loadCloudBootstrapConfig, loadConfig, type Config } from "./config.js";
 import { logger } from "./middleware/logger.js";
-import { drainSecretResolutionWrites } from "./services/secret-resolution-writes.js";
 import { startEventLoopStallMonitor } from "./event-loop-stall-monitor.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
@@ -2221,8 +2220,7 @@ async function startServerWithDatabaseTeardown(
       drainPendingRunFailureReports: waitForPendingRunFailureReports,
       // Mark the pool as ending before `sql.end()` rejects the first query,
       // so the error handler recognizes a request that outlived the drain.
-      closeDatabase: async () => {
-        await drainSecretResolutionWrites();
+      closeDatabase: () => {
         (app.locals as { paperclipDatabaseClosing?: boolean }).paperclipDatabaseClosing = true;
         return closeDatabaseClients();
       },

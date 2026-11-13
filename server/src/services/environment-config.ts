@@ -1,6 +1,5 @@
 import { z } from "zod";
-import { createHash, randomUUID } from "node:crypto";
-import { resolveCachedEnvironmentProviderSecret } from "./environment-provider-secret-cache.js";
+import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import type {
   Environment,
@@ -312,43 +311,22 @@ async function resolveConfigSecretRefsForRuntime(input: {
     if (!input.context.consumerId) {
       throw unprocessable("Runtime secret resolution requires an environment id");
     }
-    if (input.readOnlyInspection) {
-      // Inspection has its own signed authorization/audit contract; never share
-      // normal runtime plaintext or bypass its read-only resolver.
-      nextConfig = writeConfigValueAtPath(nextConfig, path,
-        await secrets.resolveSecretValueForReadOnlyEnvironmentInspection(input.companyId, trimmed, "latest", {
-          environmentId: input.context.consumerId, configPath: path,
-          issueId: input.context.issueId, heartbeatRunId: input.context.heartbeatRunId,
-        }));
-      continue;
-    }
-    const context = {
-      consumerType: "environment" as const,
-      consumerId: input.context.consumerId,
-      actorType: "system" as const,
-      actorId: null,
-      issueId: input.context.issueId ?? null,
-      heartbeatRunId: input.context.heartbeatRunId ?? null,
-      configPath: path,
-    };
-    // Existing metadata-only identity validation checks the live binding,
-    // scope/status and version revocation on EVERY call, including cache hits.
-    // DB-backed revisions invalidate across processes, not only local writers.
-    const [identity, metadata] = await Promise.all([
-      secrets.resolveSecretVersionIdentity(input.companyId, trimmed, "latest", context),
-      secrets.getById(trimmed),
-    ]);
-    if (!metadata || metadata.scope !== "company") throw unprocessable("Environment secrets must be company-scoped");
-    const providerConfig = metadata.providerConfigId ? await secrets.getProviderConfigById(metadata.providerConfigId) : null;
-    const revision = createHash("sha256").update(JSON.stringify([
-      input.config, input.schema, identity, metadata.updatedAt, metadata.providerConfigId, providerConfig,
-    ])).digest("hex");
-    nextConfig = writeConfigValueAtPath(nextConfig, path, await resolveCachedEnvironmentProviderSecret({
-      db: input.db,
-      key: JSON.stringify([input.companyId, input.context.consumerId, path, trimmed]),
-      revision,
-      resolve: () => secrets.resolveSecretValue(input.companyId, trimmed, "latest", context),
-    }));
+    nextConfig = writeConfigValueAtPath(
+      nextConfig,
+      path,
+      input.readOnlyInspection ? await secrets.resolveSecretValueForReadOnlyEnvironmentInspection(input.companyId, trimmed, "latest", {
+        environmentId: input.context.consumerId, configPath: path,
+        issueId: input.context.issueId, heartbeatRunId: input.context.heartbeatRunId,
+      }) : await secrets.resolveSecretValue(input.companyId, trimmed, "latest", {
+        consumerType: "environment",
+        consumerId: input.context.consumerId,
+        actorType: "system",
+        actorId: null,
+        issueId: input.context.issueId ?? null,
+        heartbeatRunId: input.context.heartbeatRunId ?? null,
+        configPath: path,
+      }),
+    );
   }
   return nextConfig;
 }

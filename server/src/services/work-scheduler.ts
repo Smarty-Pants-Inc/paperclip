@@ -3,7 +3,6 @@ export function createWorkScheduler() {
   const tasks = new Map<string, { at: number; run: () => void }>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
-  let keepAlive = false;
   const nextWakeAt = () => tasks.size ? Math.min(...Array.from(tasks.values(), task => task.at)) : null;
 
   function arm() {
@@ -24,17 +23,11 @@ export function createWorkScheduler() {
       }
       arm();
     }, Math.min(2_147_483_647, Math.max(0, next - Date.now())));
-    if (!keepAlive) timer.unref?.();
+    timer.unref?.();
   }
 
   return {
     nextWakeAt,
-    // A shutdown drain may own unfinished in-memory obligations. Keep only
-    // their existing deadline alive until they settle, never an idle timer.
-    setKeepAlive(value: boolean) {
-      keepAlive = value;
-      if (timer) { if (value) timer.ref?.(); else timer.unref?.(); }
-    },
     schedule(key: string, at: number, run: () => void) {
       if (stopped) return;
       if (!Number.isFinite(at)) throw new Error("Work deadline must be finite");

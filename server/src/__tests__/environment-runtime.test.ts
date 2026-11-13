@@ -10,7 +10,6 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import { eq, sql } from "drizzle-orm";
 import {
   buildSshEnvLabFixtureConfig,
@@ -227,7 +226,6 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   });
 
   afterEach(async () => {
-    await flushSecretResolutionWrites(db);
     vi.unstubAllEnvs();
     if (orphanCleanupSpoolDir) {
       await rm(orphanCleanupSpoolDir, { recursive: true, force: true }).catch(() => undefined);
