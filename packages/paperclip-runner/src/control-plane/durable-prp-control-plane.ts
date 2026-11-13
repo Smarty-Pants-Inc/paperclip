@@ -79,6 +79,10 @@ const EVENT_DELIVERY_STALL_FAILURES = 20;
 const EVENT_DELIVERY_STALL_MS = 45_000;
 const maxStateBytes = 256 * 1024 * 1024;
 const authChallengeTtlMs = 5_000;
+// One outbound WebSocket ping interval: DEFAULT_LIVENESS_INTERVAL_MS in
+// server/src/realtime/runner-prp-outbound.ts. Socket membership can outlive a
+// lost runner by its separate 90-second transport timeout; it is not freshness.
+export const RUNNER_FRESH_LIVENESS_WINDOW_MS = 20_000;
 const stableIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,239}$/;
 const runnerDigestPattern = /^sha256:[0-9a-f]{64}$/;
 export function isRunnerRecoveryMaintenanceCommand(type: string): boolean {
@@ -1844,9 +1848,10 @@ export interface DurablePrpConnectionLeaseFailure {
   readonly observedAtUnixMs: number;
 }
 
-type SerializedFrame =
+type SerializedFrame = (
   | { readonly raw: unknown }
-  | { readonly decrypted: Record<string, unknown> };
+  | { readonly decrypted: Record<string, unknown> }
+) & { readonly receivedAtMs: number };
 
 /** Reason supplied when a transport-neutral PRP peer closes. */
 export interface TransportCloseReason {
@@ -1861,6 +1866,8 @@ export interface PrpWireConnection {
   close(code?: number): void;
   onJson(listener: (value: unknown) => void): void;
   onClose(listener: (reason: TransportCloseReason) => void): void;
+  /** An actually received WebSocket pong, never a timer/liveness reset. */
+  onPong?(listener: () => void): void;
 }
 
 /** Read-only authentication state for an attached PRP peer. */
@@ -1880,6 +1887,7 @@ class RawWebSocketWireConnection implements PrpWireConnection {
   #closed = false;
   #onJson: (value: unknown) => void = () => undefined;
   #onClose: (reason: TransportCloseReason) => void = () => undefined;
+  #onPong: () => void = () => undefined;
 
   constructor(socket: Duplex) {
     this.socket = socket;
@@ -1906,6 +1914,10 @@ class RawWebSocketWireConnection implements PrpWireConnection {
 
   onClose(listener: (reason: TransportCloseReason) => void): void {
     this.#onClose = listener;
+  }
+
+  onPong(listener: () => void): void {
+    this.#onPong = listener;
   }
 
   acceptInitialData(data: Buffer<ArrayBufferLike>): void {
@@ -1996,7 +2008,9 @@ class RawWebSocketWireConnection implements PrpWireConnection {
         return;
       } else if (opcode === 0x9) {
         this.#sendControl(0x0a, payload);
-      } else if (opcode !== 0x0a) {
+      } else if (opcode === 0x0a) {
+        this.#onPong();
+      } else {
         this.close();
         return;
       }
@@ -2019,26 +2033,33 @@ class AuthorityConnection {
   terminalLifecycleCommandId: string | null = null;
   warmTransitionVersion: 1 | null = null;
   identity: DurableRecoveryIdentity | null = null;
+  lastAuthenticatedInboundAtMs: number | null = null;
   replayOnly = false;
   activationReceipt: DurableWarmRunTransition | null = null;
   readonly wire: PrpWireConnection;
   #closed = false;
   #onClose: () => void;
   #onJson: (value: unknown) => void;
+  #onPong: () => void;
 
   constructor(input: {
     wire: PrpWireConnection;
     onJson: (value: unknown) => void;
     onClose: () => void;
+    onPong: () => void;
   }) {
     this.wire = input.wire;
     this.#onClose = input.onClose;
     this.#onJson = input.onJson;
+    this.#onPong = input.onPong;
   }
 
   start(): void {
     this.wire.onClose(() => this.#markClosed());
-    if (!this.#closed) this.wire.onJson(this.#onJson);
+    if (!this.#closed) {
+      this.wire.onPong?.(this.#onPong);
+      this.wire.onJson(this.#onJson);
+    }
   }
 
   sendJson(value: unknown): void {
@@ -2494,6 +2515,21 @@ export class DurablePrpControlPlane {
     return [...this.#connections].filter(
       (connection) => connection.secureChannel !== null,
     ).length;
+  }
+
+  /** Local, synchronous evidence for this exact authenticated runner generation.
+   * No persistence, timer, outbound frame or socket count refreshes the age. */
+  runnerFreshlyAlive(expectedRunnerInstanceId: string, nowMs = Date.now()): boolean {
+    return [...this.#connections].some(connection => {
+      const receivedAtMs = connection.lastAuthenticatedInboundAtMs;
+      const lease = connection.lease;
+      return connection.secureChannel !== null
+        && connection.identity?.runnerInstanceId === expectedRunnerInstanceId
+        && receivedAtMs !== null && nowMs >= receivedAtMs
+        && nowMs - receivedAtMs <= RUNNER_FRESH_LIVENESS_WINDOW_MS
+        && lease !== null && lease.revokedAt === null && lease.expiresAtUnixMs > nowMs
+        && canonicalJson(this.#store.state.leases[lease.credentialId]) === canonicalJson(lease);
+    });
   }
 
   /**
@@ -3056,6 +3092,7 @@ export class DurablePrpControlPlane {
     connection = new AuthorityConnection({
       wire,
       onJson: (value) => {
+        const receivedAtMs = Date.now();
         let frame: SerializedFrame;
         if (connection.secureChannel !== null && undecryptedFrames === 0) {
           const decrypted = this.#decryptOnArrival(connection, value);
@@ -3067,21 +3104,21 @@ export class DurablePrpControlPlane {
             // renewed expiry durably before its reply, and its admission is
             // checked against persisted authority exactly as before.
             try {
-              this.#handleDecrypted(connection, decrypted);
+              this.#handleDecrypted(connection, decrypted, receivedAtMs);
             } catch {
               connection.close();
             }
             return;
           }
-          frame = { decrypted };
+          frame = { decrypted, receivedAtMs };
         } else {
           undecryptedFrames += 1;
-          frame = { raw: value };
+          frame = { raw: value, receivedAtMs };
         }
         processing = processing
           .then(() => "raw" in frame
-            ? this.#handleJson(connection, frame.raw).finally(() => { undecryptedFrames -= 1; })
-            : this.#handleDecryptedFrame(connection, frame.decrypted))
+            ? this.#handleJson(connection, frame.raw, frame.receivedAtMs).finally(() => { undecryptedFrames -= 1; })
+            : this.#handleDecryptedFrame(connection, frame.decrypted, frame.receivedAtMs))
           .catch(() => connection.close());
         const tail = processing;
         this.#connectionProcessing.set(connection, tail);
@@ -3090,6 +3127,9 @@ export class DurablePrpControlPlane {
             this.#connectionProcessing.delete(connection);
         };
         void tail.then(release, release);
+      },
+      onPong: () => {
+        if (connection.secureChannel !== null) this.#admitAuthenticatedFrame(connection, Date.now());
       },
       onClose: () => {
         this.#recordLeaseFailureIfLapsed(connection);
@@ -3110,6 +3150,7 @@ export class DurablePrpControlPlane {
   async #handleJson(
     connection: AuthorityConnection,
     wire: unknown,
+    receivedAtMs: number,
   ): Promise<void> {
     this.#store.assertWritable();
     let envelope: Record<string, unknown>;
@@ -3124,7 +3165,7 @@ export class DurablePrpControlPlane {
       connection.close();
       return;
     }
-    await this.#handleDecryptedFrame(connection, envelope);
+    await this.#handleDecryptedFrame(connection, envelope, receivedAtMs);
   }
 
   /** Decrypt one secure frame in arrival order; null when it closed the connection. */
@@ -3150,10 +3191,11 @@ export class DurablePrpControlPlane {
   #handleDecrypted(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
+    receivedAtMs: number,
   ): void {
     this.#store.assertWritable();
     if (!this.#admitEnvelopeVersion(connection, envelope)) return;
-    if (!this.#admitAuthenticatedFrame(connection)) return;
+    if (!this.#admitAuthenticatedFrame(connection, receivedAtMs)) return;
     if (envelope.kind === "lease_renew") this.#renewLease(connection, envelope);
   }
 
@@ -3186,7 +3228,7 @@ export class DurablePrpControlPlane {
    * expired credential or bypass changes to its persisted binding. An expired
    * lease is recorded so the owner can report why the runner left.
    */
-  #admitAuthenticatedFrame(connection: AuthorityConnection): boolean {
+  #admitAuthenticatedFrame(connection: AuthorityConnection, receivedAtMs: number): boolean {
     if (
       connection.secureChannel === null ||
       connection.lease === null ||
@@ -3199,6 +3241,7 @@ export class DurablePrpControlPlane {
       connection.close();
       return false;
     }
+    connection.lastAuthenticatedInboundAtMs = Math.max(connection.lastAuthenticatedInboundAtMs ?? receivedAtMs, receivedAtMs);
     return true;
   }
 
@@ -3230,6 +3273,7 @@ export class DurablePrpControlPlane {
   async #handleDecryptedFrame(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
+    receivedAtMs: number,
   ): Promise<void> {
     this.#store.assertWritable();
     if (!this.#admitEnvelopeVersion(connection, envelope)) return;
@@ -3239,10 +3283,10 @@ export class DurablePrpControlPlane {
       return;
     }
     if (connection.secureChannel === null && kind === "auth_response") {
-      await this.#authResponse(connection, envelope);
+      await this.#authResponse(connection, envelope, receivedAtMs);
       return;
     }
-    if (!this.#admitAuthenticatedFrame(connection)) return;
+    if (!this.#admitAuthenticatedFrame(connection, receivedAtMs)) return;
     // After admission the lease is non-null; keep the narrowed reference.
     if (connection.lease === null) return;
     if (kind === "lease_renew") {
@@ -3687,6 +3731,7 @@ export class DurablePrpControlPlane {
   async #authResponse(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
+    receivedAtMs: number,
   ): Promise<void> {
     const pending = connection.pendingChallenge;
     const payload = envelope.payload as Record<string, unknown> | undefined;
@@ -3880,6 +3925,7 @@ export class DurablePrpControlPlane {
       pending.serverProof,
       clientProof,
     );
+    connection.lastAuthenticatedInboundAtMs = receivedAtMs;
     this.#runnerDisconnectedAt = null;
     this.#eventOwner = connection;
     for (const active of this.#connections) {

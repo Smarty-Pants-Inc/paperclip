@@ -5010,6 +5010,16 @@ admitted lifecycle, including when recovery acquires a lease after the agent or
 environment lifecycle setting changes. Recovery uses the persisted execution
 input for both lease acquisition and lifecycle validation.
 
+For an ordinary resumed sandbox lease, the cached warm Runner can avoid the
+process-generation loss probe only when its authenticated connection has
+received a frame or pong within 20 seconds, one outbound WebSocket ping
+interval. The authenticated Runner instance must match the generation captured
+for that warm backend. This is synchronous controller-local evidence, not a
+remote check. A counted but silent connection is insufficient; a missing or
+mismatched generation, stale inbound evidence, or an explicit stopped/archived
+resume keeps the existing loss probe and finished-owner recovery proofs. No
+freshness timestamp is persisted or restored across controller restarts.
+
 Controller shutdown and warm idle expiry detach confirmed released plugin
 Runners without stopping them. The host owns parked Runner retention. The next
 turn uses the existing adoption and process-configuration checks to decide

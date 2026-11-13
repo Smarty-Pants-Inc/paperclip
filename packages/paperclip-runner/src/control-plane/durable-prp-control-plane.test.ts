@@ -1765,6 +1765,90 @@ it("reports an expired connection lease instead of closing silently", async () =
   }
 });
 
+// Keep reason: F2's counted-but-silent socket is a data-safety admission
+// failure. Use real authenticated PRP sockets, not connection-count mocks.
+it.each(["frame", "pong"] as const)("bounds authenticated generation liveness from an inbound %s", async kind => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-fresh-liveness-"));
+  let now = Date.now();
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  let client: AuthenticatedClient | null = null;
+  try {
+    await core.start();
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(false);
+    let unauthenticatedPong = () => {};
+    core.attachWireConnection({ sendJson: () => {}, close: () => {}, onJson: () => {}, onClose: () => {},
+      onPong: listener => { unauthenticatedPong = listener; } });
+    unauthenticatedPong();
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(false);
+    client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    expect(core.activeRunnerConnectionCount()).toBe(1);
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(true);
+    expect(core.runnerFreshlyAlive("different-authenticated-generation", now)).toBe(false);
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now - 1)).toBe(false);
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now + 20_000)).toBe(true);
+    now += 20_001;
+    expect(core.activeRunnerConnectionCount()).toBe(1);
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(false);
+    if (kind === "frame") {
+      sendSecure(client, renewalRequest(client, Number((client.welcome.payload as Record<string, unknown>).connectionLeaseExpiresAtUnixMs)));
+      expect(await receiveSecure(client)).toMatchObject({ kind: "lease_renewed" });
+    } else {
+      // Empty masked WebSocket pong on the already authenticated raw socket.
+      client.socket.write(Buffer.from([0x8a, 0x80, 0x11, 0x22, 0x33, 0x44]));
+      await vi.waitFor(() => expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(true));
+    }
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(true);
+    expect(core.runnerFreshlyAlive("different-authenticated-generation", now)).toBe(false);
+    now += 20_001;
+    expect(core.activeRunnerConnectionCount()).toBe(1);
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(false);
+    client.socket.destroy();
+    await vi.waitFor(() => expect(core.activeRunnerConnectionCount()).toBe(0));
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(false);
+  } finally {
+    client?.socket.destroy();
+    clock.mockRestore();
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it("does not turn delayed authentication completion into fresh inbound evidence", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-delayed-freshness-"));
+  let now = Date.now();
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>(resolveGate => { release = resolveGate; });
+  const waiting = new Promise<void>(resolveEntered => { entered = resolveEntered; });
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest,
+    beforeAuthenticatedConnection: async () => { entered(); await gate; } });
+  let authenticating: Promise<AuthenticatedClient | null> | undefined;
+  let client: AuthenticatedClient | null = null;
+  try {
+    await core.start();
+    authenticating = authenticate(core, core.issueBootstrapTicket(60_000));
+    await waiting;
+    // Stay within the existing authentication challenge deadline. The window
+    // must still expire 20 seconds after arrival, not after this callback.
+    now += 1_000;
+    release();
+    client = await authenticating;
+    expect(client).not.toBeNull();
+    expect(core.activeRunnerConnectionCount()).toBe(1);
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now)).toBe(true);
+    expect(core.runnerFreshlyAlive(identity.runnerInstanceId, now + 19_001)).toBe(false);
+  } finally {
+    release();
+    client?.socket.destroy();
+    await core.stop();
+    await authenticating?.catch(() => undefined);
+    clock.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("reports how long the authenticated Runner has been disconnected", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "runner-disconnect-age-"));
   const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });

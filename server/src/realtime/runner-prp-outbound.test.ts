@@ -822,6 +822,30 @@ describe("runner provider-ingress WebSocket wire", () => {
       vi.useRealTimers();
     }
   });
+  it("reports only received pongs as fresh evidence, not liveness timer resets", () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeSocket();
+      const wire = new WsJsonWireConnection(socket as unknown as WebSocket);
+      const receivedPong = vi.fn();
+      wire.onPong(receivedPong);
+      const stop = wire.monitorLiveness({ intervalMs: 10_000, timeoutMs: 30_000 });
+      expect(receivedPong).not.toHaveBeenCalled();
+      vi.setSystemTime(Date.now() + 5 * 60_000);
+      vi.advanceTimersByTime(10_000);
+      expect(socket.terminate).not.toHaveBeenCalled();
+      expect(receivedPong).not.toHaveBeenCalled();
+      socket.emit("pong", Buffer.alloc(0));
+      expect(receivedPong).toHaveBeenCalledOnce();
+      socket.emit("close", 1000, Buffer.alloc(0));
+      socket.emit("pong", Buffer.alloc(0));
+      expect(receivedPong).toHaveBeenCalledOnce();
+      stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not blame the runner for a server event-loop stall", () => {
     vi.useFakeTimers();
     try {
