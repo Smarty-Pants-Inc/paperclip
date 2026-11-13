@@ -144,9 +144,12 @@ last conversation evidence.
 Setup probes follow the same permanent-retention rule. Their scope is the SHA-256
 of the JSON array `[companyId, "setup-probe"]`, since setup has no agent or
 conversation yet. Probes allocate under that scope on the durable state volume,
-not the OS temporary directory. On Pi retirement, the whole runtime (including
-metadata-only and failed-admission diagnostics) moves into `conversation-evidence`.
-A remote Pi probe first pulls the complete retired remote root through the existing
+not the OS temporary directory. On retirement for every provider (including Codex
+and Pi), the whole runtime (including metadata-only and failed-admission diagnostics)
+moves into `conversation-evidence`. This also applies to preparation failures before
+probe handoff. A still-existing probe with no resolvable evidence scope blocks cleanup
+with `native_setup_evidence_not_retained`; it is never treated as disposable scratch.
+A remote probe first pulls the complete retired remote root through the existing
 runner backup sync-out path, without exclusions, and commits that local tree into
 permanent evidence **before** removing the remote root. A pull or evidence move
 failure blocks remote deletion; pending physical cleanup keeps its original owner.
@@ -162,6 +165,15 @@ Directories are owner-only and partitioned by the execution ID's SHA-256. A
 UUID in the same scope. Neither form expires. The observation's `traceRef` remains
 the content digest, not a claim that telemetry stores the original bytes. No raw
 provider data or new cross-company retrieval API is added to the observation.
+
+Each successful preservation emits a structured info event `native_evidence_retained`
+with `source`, `destination`, `scope`, `totalBytes`, and `fileCount`. Actual setup
+scratch deletion emits `native_scratch_removed` with `path`, `totalBytes`, and
+`fileCount` only after removal succeeds. The server uses its normal logger; Runner
+evaluations use structured stderr. Inventories use filesystem metadata only, count
+non-directory entries (including symlinks without following them), and never read
+or log file contents. Walks are capped at 100,000 entries and 128 directory levels;
+an incomplete inventory blocks cleanup rather than reporting partial totals.
 
 | Environment variable | Default | Effect |
 | --- | --- | --- |
