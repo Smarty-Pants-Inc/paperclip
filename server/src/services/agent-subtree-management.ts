@@ -10,13 +10,31 @@ type Actor = Parameters<ReturnType<typeof authorizationService>["decide"]>[0]["a
 type Target = { id: string; companyId: string };
 
 /** Same direct, target-scoped configure decision as resume; no suggestion/consent fallback. */
-export async function assertCanManageSubordinateAgent(db: Db, actor: Actor, target: Target) {
+export async function assertCanManageSubordinateAgent(
+  db: Db, actor: Actor, target: Target, options: { allowCompanyWideRoot?: boolean } = {},
+) {
   if (actor.type !== "agent") return;
-  if (!actor.agentId || actor.companyId !== target.companyId || actor.agentId === target.id
-    || !await isAgentInSubtree(db, target.companyId, actor.agentId, target.id)) {
+  if (!actor.agentId || actor.companyId !== target.companyId || actor.agentId === target.id) {
     throw forbidden("Agents may manage only other agents inside their current reporting subtree");
   }
-  const decision = await authorizationService(db).decide({
+  const authorization = authorizationService(db);
+  let companyWideRoot = false;
+  if (options.allowCompanyWideRoot) {
+    const [caller] = await db.select({ reportsTo: agents.reportsTo }).from(agents).where(and(
+      eq(agents.id, actor.agentId), eq(agents.companyId, target.companyId),
+    ));
+    if (caller?.reportsTo === null) {
+      const direct = await authorization.decidePrincipalGrant({
+        companyId: target.companyId, principalType: "agent", principalId: actor.agentId,
+        permissionKey: "agents:configure", action: "agent_config:update", scope: { targetAgentId: target.id },
+      });
+      companyWideRoot = direct.allowed && direct.grant?.scope === null;
+    }
+  }
+  if (!companyWideRoot && !await isAgentInSubtree(db, target.companyId, actor.agentId, target.id)) {
+    throw forbidden("Agents may manage only other agents inside their current reporting subtree");
+  }
+  const decision = await authorization.decide({
     actor, action: "agent_config:update",
     resource: { type: "agent", companyId: target.companyId, agentId: target.id },
     scope: { targetAgentId: target.id, requiresChangeGrant: true },

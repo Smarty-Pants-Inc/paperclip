@@ -250,7 +250,7 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         resource.selfServiceUserId = connection.createdByUserId;
         if (req.method !== "GET") {
           const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id));
-          if (!replacesInstalls) addSelectors(installs);
+          if (!replacesInstalls || req.actor.type !== "agent") addSelectors(installs);
           if (replacesInstalls && Array.isArray(body.installs)) {
             // PUT replaces the set, but retained recipients are not mutations.
             // Recompute on every authorization, including writer revalidation.
