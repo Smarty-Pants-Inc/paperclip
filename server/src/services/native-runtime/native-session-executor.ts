@@ -5899,8 +5899,13 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   }
   if (!prior || prior.run.runtimeMode !== "native") return refuse("owner_missing");
   if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(prior.run.status)) return refuse("owner_run_not_terminal");
-  if (prior.owner.phase !== "committed") return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
-  if (!prior.owner.resultId) return refuse("owner_result_missing");
+  // A board Stop settles its run without a result: the Stop path writes
+  // native_retry_cancelled only after the acknowledged user Stop receipt that
+  // also lets a warm Pi owner be retained (retainCancelledSession).
+  const stoppedByUser = prior.run.status === "cancelled" && prior.owner.phase === "terminal_failure"
+    && prior.owner.failureCode === "native_retry_cancelled" && hasAcknowledgedNativeStopIntent(prior.run);
+  if (prior.owner.phase !== "committed" && !stoppedByUser) return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
+  if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
   if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
   // A durable controller is fenced by its released database lease; a legacy
@@ -12084,7 +12089,28 @@ async function executePaperclipNativeSessionAttempt(
         }
         await reportWarmAttachFailure(code, text);
         persistedWarmSession = checkpoint;
-        if (runnerdBackend !== null) runnerdBackend = await createExecutionBackend();
+        if (runnerdBackend !== null) {
+          // Closing proves the old process stopped, not that its durable state
+          // was retired: a lost Runner never suspended. The run's state
+          // migration skipped the prior-owner fence for the retained owner, so
+          // run it now as for any cold run. It rotates a suspended owner,
+          // retires a verifiably lost one into continuity-breaks (the same Pi
+          // conversation then reopens), and refuses anything unproven.
+          retainedTransition = await timeController("state_migration", () => migrateRunnerdStateRootForExecution({
+            db: input.db,
+            execution: input.execution,
+            preparedExecutionAdmission: input.preparedExecutionAdmission,
+            allowVerifiedBackup: input.runnerExecutionTarget?.kind === "remote",
+            retainedWarmOwnerRunId: undefined,
+            allowLocalRecovery: input.runnerExecutionTarget?.kind !== "remote",
+            onLog: input.onLog,
+            restartRecovery: input.restartRecovery,
+            runnerExecutionTarget: input.runnerExecutionTarget,
+            bootstrapRetryLeaseOwner: input.leaseOwner,
+            managedAiAccountIdentity: input.managedAiAccountIdentity, managedAiCredentialIdentity: input.managedAiCredentialIdentity,
+          }));
+          runnerdBackend = await createExecutionBackend();
+        }
         remoteCleanupLease = await readRemoteCleanupLease();
       } catch (coldError) {
         throw markWarmAttachColdFallbackFailure(coldError);
