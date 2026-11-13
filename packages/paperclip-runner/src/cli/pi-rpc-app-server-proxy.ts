@@ -234,6 +234,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   const turnAnswers = new Map<string, { summary?: string; nativeFinal?: boolean }>();
   const answerKey = (runId: string, turnId: string) => JSON.stringify([runId, turnId]);
   const usageTotals: Record<string, number> = {};
+  const summaryUsageUnknownRuns = new Set<string>();
   const usageByTurn = new Map<string, {
     receipts: Map<string, string>;
     total: Record<string, number>;
@@ -297,6 +298,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   function reportUsage(opened: PiRpcProxySession, event: {
     runId: string; turnId?: string; itemId?: string;
   }, payload: Record<string, unknown>, accountingOnly = false): void {
+    if (payload.summaryUsage === "unknown") summaryUsageUnknownRuns.add(event.runId);
+    const summaryAccounting = summaryUsageUnknownRuns.has(event.runId)
+      ? { summaryUsage: "unknown", accountingUsageLost: true } : {};
     const delta = record(payload.runDelta);
     const cumulative = record(payload.cumulative);
     let total = cumulative;
@@ -342,6 +346,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       method: "thread/tokenUsage/updated",
       params: {
         ...payload,
+        ...summaryAccounting,
         threadId: opened.ids().driverSessionId,
         ...(typeof event.turnId === "string" ? { turnId: event.turnId } : {}),
         // Rust derives runDeltaAvailable from last's presence. Never put a
@@ -386,7 +391,8 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         // complete turn even without another assistant usage receipt.
         if (payload.kind === "usage" && record(payload.usage).runDeltaComplete === false) {
           // This is a snapshot invalidation, not a missing message receipt.
-          reportUsage(opened, { runId: event.runId, turnId: event.turnId }, { runDeltaAvailable: false, accountingComplete: false }, true);
+          reportUsage(opened, { runId: event.runId, turnId: event.turnId }, { runDeltaAvailable: false, accountingComplete: false,
+            ...(record(payload.usage).summaryUsage === "unknown" ? { summaryUsage: "unknown", accountingUsageLost: true } : {}) }, true);
         }
         if (event.eventType === "item.completed" && payload.kind === "agentMessage" &&
             payload.channel === "final" && text(payload.text).trim()) {
@@ -635,6 +641,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     // run.attach/turn.start must not reset its cumulative total.
     for (const key of Object.keys(usageTotals)) delete usageTotals[key];
     usageByTurn.clear();
+    summaryUsageUnknownRuns.clear();
     session = opened;
     missingResumeNeedsAttachment = false;
     piNativeAdmission = (opened as PiRpcProxySession & { piNativeAdmission?(): Record<string, unknown> }).piNativeAdmission?.();

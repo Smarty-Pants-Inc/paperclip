@@ -8,7 +8,7 @@ import { priceCodexReceipt } from "../codex-pricing.js";
 import { liveRunUsageCostCents } from "../budget-live-usage.js";
 import { receiptFingerprint } from "../receipt-fingerprint.js";
 import { persistUsageReceipt, type UsageReceiptEnvelope } from "../usage-receipts.js";
-import { createNativeTurnAccounting, NATIVE_LOST_TURN_USAGE_EVIDENCE, NATIVE_TURN_LOST_ON_RESTORE, nativeUsageCostUsd, normalizeNativeUsage } from "./native-usage-accounting.js";
+import { createNativeTurnAccounting, nativeUsageLowerBoundEvidence, NATIVE_TURN_LOST_ON_RESTORE, nativeUsageCostUsd, normalizeNativeUsage } from "./native-usage-accounting.js";
 
 const terminal = new Set(["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]);
 const uuid = (identity: string) => {
@@ -171,6 +171,7 @@ function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sour
       sourceEventId: event.sourceEventId, turnId: event.turnId, eventType: event.eventType,
       ...(typeof payload.providerTurnId === "string" ? { providerTurnId: payload.providerTurnId } : {}),
       ...(event.eventType === "usage.reported" ? { usage: { runDelta: payload.runDelta, runDeltaComplete: payload.runDeltaAvailable === true, runDeltaBasis: payload.runDeltaBasis,
+        ...(payload.summaryUsage === "unknown" ? { summaryUsage: "unknown", accountingUsageLost: true } : {}),
         ...(payload.reconciliation && typeof payload.reconciliation === "object" ? { reconciliation: payload.reconciliation } : {}) } } : {}),
       ...(event.eventType === "turn.failed" && payload.error && typeof payload.error === "object"
         && (payload.error as Record<string, unknown>).code === NATIVE_TURN_LOST_ON_RESTORE ? { lostOnRestore: true as const } : {}),
@@ -198,7 +199,7 @@ function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sour
           : input.provider.kind === "aws_agentcore" ? "estimated" : undefined,
         ...(snapshot.usage?.accountingUsageLost === true ? { pricingProvenance: {
           source: typeof snapshot.usage.accountingCostUsdExact === "string" ? "provider_reported" as const : "unknown" as const,
-          version: "accounting-receipt/v1", evidence: NATIVE_LOST_TURN_USAGE_EVIDENCE } } : {}),
+          version: "accounting-receipt/v1", evidence: nativeUsageLowerBoundEvidence(snapshot.usage) } } : {}),
       }));
       envelope.liveCostCents = liveRunUsageCostCents(envelope.receipt as AdapterUsageCheckpoint);
       pending = envelope;
