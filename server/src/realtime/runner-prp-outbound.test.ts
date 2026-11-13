@@ -8,13 +8,13 @@ import {
   WsJsonWireConnection,
 } from "./runner-prp-outbound.js";
 
-const sockets = vi.hoisted(() => ({ create: null as (() => unknown) | null }));
+const sockets = vi.hoisted(() => ({ create: null as ((options: { handshakeTimeout: number }) => unknown) | null }));
 
 vi.mock("ws", async (importOriginal) => {
   const actual = await importOriginal<typeof import("ws")>();
   return {
     ...actual,
-    default: Object.assign(vi.fn(function () { return sockets.create!(); }), {
+    default: Object.assign(vi.fn(function (_url: string, options: { handshakeTimeout: number }) { return sockets.create!(options); }), {
       CONNECTING: actual.default.CONNECTING,
       OPEN: actual.default.OPEN,
       CLOSING: actual.default.CLOSING,
@@ -50,6 +50,87 @@ function openingSocket(socket = new FakeSocket()): FakeSocket {
 sockets.create = () => openingSocket();
 
 describe("runner provider-ingress WebSocket wire", () => {
+  it.each(["fresh", "permanently unreachable"] as const)("retries a %s listener only within the startup budget", async mode => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const startedAt = Date.now();
+    const attempts: number[] = [];
+    const wires: FakeSocket[] = [];
+    sockets.create = () => {
+      attempts.push(Date.now() - startedAt);
+      const socket = new FakeSocket();
+      wires.push(socket);
+      if (mode === "fresh" && Date.now() - startedAt >= 900) return openingSocket(socket);
+      socket.readyState = WebSocket.CONNECTING;
+      queueMicrotask(() => {
+        socket.readyState = WebSocket.CLOSED;
+        socket.emit("error", Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+        socket.emit("close", 1006, Buffer.alloc(0));
+      });
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-cold",
+      secretHeaders: [], generation: "cold", refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    const attach = vi.fn((wire: WsJsonWireConnection) => {
+      wire.onJson(value => { if (value === "run.prepare") wire.sendJson("run.prepared"); });
+      return { isAuthenticated: () => true };
+    });
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: attach } as unknown as DurablePrpControlPlane,
+      endpoint, startupDeadlineMs: 2_000, random: () => 0.5 });
+    let result: unknown;
+    void handle.ready.then(() => { result = "ready"; }, error => { result = error; });
+    try {
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(attempts.every(at => at < 2_000)).toBe(true);
+      if (mode === "fresh") {
+        await handle.ready;
+        expect(result).toBe("ready");
+        const live = wires.at(-1)!;
+        live.emit("message", Buffer.from(JSON.stringify("run.prepare")), false);
+        expect(live.send).toHaveBeenCalledWith(JSON.stringify("run.prepared"));
+        expect(attach).toHaveBeenCalledOnce();
+      } else {
+        expect(result).toMatchObject({ code: "runner_ingress_unavailable", cause: { code: "ECONNREFUSED" } });
+        await expect(handle.failure).rejects.toMatchObject({ code: "runner_ingress_unavailable" });
+        expect(attach).not.toHaveBeenCalled();
+      }
+    } finally { await handle.close(); sockets.create = create; vi.useRealTimers(); }
+  });
+
+  it("bounds an in-flight TLS/upgrade handshake by the remaining startup budget", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const handshakeTimeouts: number[] = [];
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const socket = new FakeSocket();
+    sockets.create = options => {
+      handshakeTimeouts.push(options.handshakeTimeout);
+      socket.readyState = WebSocket.CONNECTING;
+      timeout = setTimeout(() => {
+        socket.readyState = WebSocket.CLOSED;
+        socket.emit("error", new Error("Opening handshake has timed out"));
+        socket.emit("close", 1006, Buffer.alloc(0));
+      }, options.handshakeTimeout);
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-stalled",
+      secretHeaders: [], generation: "stalled", refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    const attach = vi.fn();
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: attach } as unknown as DurablePrpControlPlane,
+      endpoint, startupDeadlineMs: 1_000 });
+    let result: unknown;
+    void handle.ready.catch(error => { result = error; });
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(result).toMatchObject({ code: "runner_ingress_unavailable" });
+      expect(handshakeTimeouts).toEqual([1_000]);
+      expect(socket.readyState).toBe(WebSocket.CLOSED);
+      expect(attach).not.toHaveBeenCalled();
+    } finally { if (timeout) clearTimeout(timeout); await handle.close(); sockets.create = create; vi.useRealTimers(); }
+  });
+
   it("bounds credential refresh by the fixed deadline and cancellation", async () => {
     const signal = new AbortController().signal;
     await expect(

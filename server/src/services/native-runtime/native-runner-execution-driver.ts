@@ -291,7 +291,9 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           let outbound: ReturnType<typeof connectRunnerPrpIngress> | null =
             null;
           let activation: Promise<void> | null = null;
+          let released = false;
           const closeRoute = async () => {
+            released = true;
             if (outbound) await outbound.close();
             else await transport.ingress.close();
           };
@@ -313,6 +315,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                     "runner.ingress.wait_for_process",
                     () => input.processStarted!,
                   );
+                  if (released) return;
                   outbound = connectRunnerPrpIngress({
                     authority,
                     endpoint: transport.ingress,
