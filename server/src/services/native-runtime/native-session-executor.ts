@@ -10227,21 +10227,6 @@ export async function executePaperclipNativeSession(input: {
     // checkpoint is still being saved. The scope reservation also prevents
     // a later sweep from closing an owner this turn is about to acquire.
     await closingWarmNativeSessions.get(sessionScopeId);
-    const idleOwner = warmNativeSessions.get(sessionScopeId);
-    if (idleOwner && !idleOwner.busy && !idleOwner.preparingRunId && !idleOwner.instructionPreparationRunId
-      && idleOwner.runId !== input.execution.binding.runId && await resumedSandboxRunnerNeedsProbe(input)) {
-      const root = scopedRunnerdStateRoot(input.execution);
-      await restoreWarmRunnerdController(input);
-      if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
-        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })) {
-        // Idle close may have suspended the box's Runner but failed its final
-        // controller/checkpoint cleanup. Do not ask that dead owner to close a
-        // second time. Only detach the local controller; ordinary admission and
-        // authority rotation below still fence and preserve the saved history.
-        await detachReleasedWarmNativeSession(idleOwner);
-        forgetWarmNativeSession(sessionScopeId, idleOwner);
-      }
-    }
 
     if (input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8") {
       return await executePaperclipNativeSessionWithinScope(input, undefined, false, ownDiagnosticLease);
@@ -11038,6 +11023,29 @@ async function executePaperclipNativeSessionAttempt(
     // must prove its same-controller successor. Shared staging stays after
     // strict predecessor suspension; it cannot run on a failed claim/Stop.
     const ingress = nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget);
+    const warmScope = nativeSessionScopeKey(input.execution);
+    const idleOwner = input.useRunnerd && !claimedStopCleanup ? warmNativeSessions.get(warmScope) : undefined;
+    // The identity command is durable maintenance: the completed source writer
+    // needs this successor's claimed lease before it may persist that command.
+    // Keep the check before warm reattach/provider work, not before the claim.
+    if (idleOwner && !idleOwner.busy && !idleOwner.preparingRunId && !idleOwner.instructionPreparationRunId
+      && idleOwner.runId !== input.execution.binding.runId && await resumedSandboxRunnerNeedsProbe(input)) {
+      const root = scopedRunnerdStateRoot(input.execution);
+      await restoreWarmRunnerdController(input);
+      if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
+        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })) {
+        // Idle close may have suspended the box's Runner but failed its final
+        // controller/checkpoint cleanup. Only detach this proven-dead owner;
+        // ordinary backend authority rotation still fences/preserves history.
+        await detachReleasedWarmNativeSession(idleOwner);
+        forgetWarmNativeSession(warmScope, idleOwner);
+      }
+    }
+    const claimedIdentityCheckSpan = startup?.warmOwnerIdentitySpan;
+    if (claimedIdentityCheckSpan && claimedIdentityCheckSpan !== identityCheckSpan) {
+      preparationSpans.push(claimedIdentityCheckSpan);
+      await trace.record({ ...claimedIdentityCheckSpan, parentName: "task.prepare" }, { deferRunLog: true });
+    }
     if (input.useRunnerd && !claimedStopCleanup) await retireSupersededWarmNativeSessions(
       nativeSessionOwnerScope(input.execution, input.runnerExecutionTarget?.environmentId ?? null),
       nativeSessionScopeKey(input.execution), nativeSessionKey(input.execution), input.execution.binding.runId,
@@ -15992,6 +16000,7 @@ async function createRunnerdBackendWithinSessionClaim(
       ...(input.executionContext?.active && startupOperation ? { executionContext: input.executionContext } : {}) });
   } : rawPluginTask;
   let runnerControlPlane: DurablePrpControlPlane | undefined;
+  let runnerEnsureConnected: ((input: { deadline: number; signal: AbortSignal }) => Promise<void>) | undefined;
   // Captured once for this backend/warm entry, not read back from a potentially
   // replaced control-plane identity on the next turn.
   let warmRunnerInstanceId: string | undefined;
@@ -18170,8 +18179,10 @@ async function createRunnerdBackendWithinSessionClaim(
     },
     beforeConnect: async (identity, authority) => {
       runnerControlPlane = authority;
-      // Missing identity cannot establish ownership (including legacy callers).
-      warmRunnerInstanceId ??= identity?.runnerInstanceId;
+      // Cold registration omits the optional attachment identity. Capture the
+      // initialized controller's expected generation once, before authentication;
+      // only a fresh authenticated runner.identity answer can prove it live.
+      warmRunnerInstanceId ??= (identity ?? authority.store?.state.identity)?.runnerInstanceId;
       await input.remoteWarmRecovery?.revalidate();
       if (stagedRecovery && authority.store.state.stagedRunAttachment) {
         const current = await verifyStagedAttachmentRestart(input, stagedRecovery);
@@ -18487,6 +18498,11 @@ async function createRunnerdBackendWithinSessionClaim(
             }
           : undefined,
         ...nonTaskExecutionDriver,
+        controlPlaneRegistration: nonTaskExecutionDriver.controlPlaneRegistration ? async (...args) => {
+          const registration = await nonTaskExecutionDriver.controlPlaneRegistration!(...args);
+          runnerEnsureConnected = registration.ensureConnected;
+          return registration;
+        } : undefined,
         get authorityRunId() { return nonTaskExecutionDriver.authorityRunId; },
       });
       return antigravityCredential?.home ? bindAntigravityTransportRetirement(bundle) : bundle.transport;
@@ -18557,10 +18573,34 @@ async function createRunnerdBackendWithinSessionClaim(
     runnerConnectionLive: () => replacementBackend
       ? replacementBackend.runnerConnectionLive?.() ?? false
       : (runnerControlPlane?.activeRunnerConnectionCount() ?? 0) > 0,
-    runnerIdentityCheck: async () => replacementBackend
-      ? await replacementBackend.runnerIdentityCheck?.() ?? false
-      : warmRunnerInstanceId !== undefined
-        && await runnerControlPlane?.checkRunnerIdentity?.(warmRunnerInstanceId) === true,
+    runnerIdentityCheck: async () => {
+      if (replacementBackend) return await replacementBackend.runnerIdentityCheck?.() ?? false;
+      const core = runnerControlPlane, expected = warmRunnerInstanceId;
+      if (!core || expected === undefined) return false;
+      if (core.activeRunnerConnectionCount() !== 0 || !runnerEnsureConnected) {
+        return await core.checkRunnerIdentity?.(expected) === true;
+      }
+      // A parked ingress is not evidence of a lost generation. Reopen only the
+      // existing authenticated route, never launch/attach or issue provider work.
+      // Reconnect and the nonce'd command share one total admission deadline.
+      const deadline = Date.now() + 1_500;
+      const abort = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          (async () => {
+            await runnerEnsureConnected!({ deadline, signal: abort.signal });
+            const remainingMs = deadline - Date.now();
+            if (abort.signal.aborted || remainingMs <= 0 || core.activeRunnerConnectionCount() !== 1) return false;
+            return await core.checkRunnerIdentity?.(expected, remainingMs) === true;
+          })(),
+          new Promise<boolean>(resolve => {
+            timer = setTimeout(() => { abort.abort(); resolve(false); }, Math.max(0, deadline - Date.now()));
+          }),
+        ]);
+      } catch { return false; }
+      finally { clearTimeout(timer); abort.abort(); }
+    },
     sandboxRetention,
     bindManagedSession: (session, options) => replacementBackend
       ? replacementBackend.bindManagedSession(session, options) : wrapManagedSession(session),
