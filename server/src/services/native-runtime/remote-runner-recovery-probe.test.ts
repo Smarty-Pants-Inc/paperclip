@@ -2,6 +2,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { readRemoteRunnerRecoveryProbe } from "./remote-runner-recovery-probe.js";
+import { SandboxStoppedError } from "../sandbox-stopped-error.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -77,6 +78,22 @@ it("never retries a signal when its acknowledgement is lost", async () => {
   }).catch(readRemoteRunnerRecoveryError);
   expect(result).toEqual({ stage: "process_verification", reason: "probe_transport_failed" });
   expect(execute).toHaveBeenCalledTimes(1);
+});
+
+it("does not poll a definite stopped-box failure after its one resume attempt", async () => {
+  vi.useFakeTimers();
+  const stopped = new SandboxStoppedError("still_stopped", new Error("provider rejected command"));
+  const wrapped = new Error("remote process failed", { cause: stopped });
+  const execute = vi.fn().mockRejectedValue(wrapped);
+  const started = Date.now();
+  const outcome = readRemoteRunnerRecoveryProbe({
+    runner: { execute }, request: { command: "sh" }, stage: "process_verification",
+    readOnly: true, deadline: started + 30_000,
+  }).catch(error => error);
+  await vi.runAllTimersAsync();
+  expect(await outcome).toBe(wrapped);
+  expect(execute).toHaveBeenCalledTimes(1);
+  expect(Date.now() - started).toBe(0);
 });
 
 it("returns a definitive ownership conflict without retrying it", async () => {
