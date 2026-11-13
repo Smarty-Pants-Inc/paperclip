@@ -627,6 +627,7 @@ export interface ResolveAdditionalProjectWorkspaceDeps {
   resolveConfiguredOrManagedProjectCwd: typeof resolveConfiguredOrManagedProjectCwd;
   ensureManagedProjectWorkspace: typeof ensureManagedProjectWorkspace;
   directoryHasContents: (cwd: string) => Promise<boolean>;
+  realpath: (cwd: string) => Promise<string>;
 }
 
 /** Build the real dependencies for {@link resolveAdditionalProjectWorkspace}. */
@@ -665,6 +666,7 @@ function defaultAdditionalProjectWorkspaceDeps(
           resolveGitAuth ??
           createGitRemoteAuthProvider(db, input.companyId),
       }),
+    realpath: (cwd) => fs.realpath(cwd),
     // A realized workspace must hold real content. An empty directory gives the agent an empty
     // referenced workspace, so treat an empty directory the same as a missing one.
     directoryHasContents: async (cwd) => {
@@ -715,12 +717,16 @@ export async function resolveAdditionalProjectWorkspace(
     }
     const localSource = hasConfiguredCwd ? configuredCwd : workspace.repoUrl ? localRepositoryPath(workspace.repoUrl) : null;
     if (localSource) assertSafeLocalWorkspaceCwd(localSource, { referencedProjectId: projectId });
-    const { cwd } = await deps.resolveConfiguredOrManagedProjectCwd({
+    const resolved = await deps.resolveConfiguredOrManagedProjectCwd({
       companyId,
       projectId,
       cwd: workspace.cwd,
       repoUrl: workspace.repoUrl,
     });
+    // Carry the admitted physical source into staging, not a mutable alias that
+    // could point at another root by the time the archive reader uses it.
+    const cwd = await deps.realpath(resolved.cwd).catch(() => null);
+    if (!cwd) continue;
     assertSafeLocalWorkspaceCwd(cwd, { referencedProjectId: projectId });
     // A directory that exists but holds no content is not a realized workspace. Accept the row only
     // when the resolved directory has real content, so an empty directory never masks a missing one.
@@ -755,9 +761,10 @@ export async function resolveAdditionalProjectWorkspace(
     projectId,
     repoUrl: fallbackRepoUrl,
   });
-  assertSafeLocalWorkspaceCwd(managed.cwd, { referencedProjectId: projectId });
+  const cwd = await deps.realpath(managed.cwd);
+  assertSafeLocalWorkspaceCwd(cwd, { referencedProjectId: projectId });
   return {
-    cwd: managed.cwd,
+    cwd,
     projectId,
     workspaceId: fallbackRow.id,
     repoUrl: fallbackRow.repoUrl,

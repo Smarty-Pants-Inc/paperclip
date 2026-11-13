@@ -21,12 +21,12 @@ const SESSION_CWD_SYSTEM_ROOTS = new Set([
 export function isUnsafeSessionWorkspaceCwd(cwd: string | null | undefined): boolean {
   const value = typeof cwd === "string" && cwd.trim().length > 0 ? cwd.trim() : null;
   if (!value) return false;
-  const normalized = path.resolve(value);
-  if (SESSION_CWD_SYSTEM_ROOTS.has(normalized)) return true;
   const physicalPath = (input: string) => {
-    try { return realpathSync(input); } catch { return path.resolve(input); }
+    // Resolve the original traversal first: lexical normalization would erase
+    // symlink-sensitive `..` segments before the filesystem can interpret them.
+    try { return realpathSync.native(input); } catch { return path.resolve(input); }
   };
-  const workspace = physicalPath(normalized);
+  const workspace = physicalPath(value);
   if (SESSION_CWD_SYSTEM_ROOTS.has(workspace)) return true;
   // Snapshots and sandbox-sync staging live under the actual runtime temp root.
   // A workspace may be a concrete child, but never that root or its ancestor,

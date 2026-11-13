@@ -2581,12 +2581,15 @@ instead; see [task workspaces](plans/2026-10-09-task-workspaces.md).
 
 An explicit `cwd` does not make a system root a workspace. Resolution refuses system
 roots, the runtime's actual temporary root, and its ancestors (including symlink
-aliases) with `workspace_validation_failed` and reason `unsafe_workspace_root`
-in `workspaceValidation`. Choose a concrete directory, or clear `cwd` to use the
-managed task directory or agent home. Concrete descendants of the temporary root
+aliases and symlink-sensitive `..` traversal) with `workspace_validation_failed`
+and reason `unsafe_workspace_root` in `workspaceValidation`. Physical resolution
+happens before lexical normalization. Choose a concrete directory, or clear `cwd`
+to use the managed task directory or agent home. Concrete descendants of the temporary root
 remain supported. Referenced local project sources use the same rule before they
-are retained, inspected, or materialized. An unsafe reference drops only that
-project, records a resolution failure, and adds the existing visible warning;
+are retained, inspected, or materialized. A realized reference carries its resolved
+physical path into sync/archive staging, so retargeting its configured symlink
+after admission cannot select a different source. An unsafe reference drops only
+that project, records a resolution failure, and adds the existing visible warning;
 other valid references and the anchor remain available. Plugin-owned remote
 project scopes do not become local sources.
 
