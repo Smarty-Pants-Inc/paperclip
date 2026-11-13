@@ -5,6 +5,10 @@ import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { retainNativePiConversationEvidence, retainNativeRuntimeEvidence, summarizeNativeRuntimeTree } from "./native-pi-conversation-evidence.js";
 import { logger } from "../../middleware/logger.js";
 
+// Only the creator may retire setup scratch. A scope-shaped name is evidence
+// attribution, not authority to move a live/durable session (or a replaced root).
+const setupRuntimeOwners = new Map<string, { dev: number; ino: number }>();
+
 /** Setup has no agent/conversation yet. Bind its private evidence to the company
  * and purpose instead, on the same filesystem as the permanent evidence move. */
 export async function createNativeSetupRuntime(companyId: string): Promise<string> {
@@ -16,21 +20,37 @@ export async function createNativeSetupRuntime(companyId: string): Promise<strin
   const metadata = await lstat(directory);
   if (!metadata.isDirectory() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0
     || process.geteuid && metadata.uid !== process.geteuid()) throw new Error("native_setup_evidence_scope_unsafe");
-  return mkdtemp(join(directory, "paperclip-native-setup-"));
+  const root = await mkdtemp(join(directory, "paperclip-native-setup-"));
+  const { dev, ino } = await lstat(root);
+  setupRuntimeOwners.set(resolve(root), { dev, ino });
+  return root;
 }
 
 /** Called only after physical retirement. A failed move leaves the source and
  * blocks cleanup. All providers' metadata/failure diagnostics are evidence too.
- * piProbe is the historical name for whole-tree retention, not a provider gate. */
+ * piProbe is the historical name for whole-tree retention, not a provider gate.
+ * Unknown/replaced roots stay intact; only this process's created scratch can move. */
 export async function cleanupNativeSetupRuntime(root: string, piProbe = false): Promise<void> {
-  if (piProbe ? await retainNativeRuntimeEvidence(root) : await retainNativePiConversationEvidence(root)) return;
+  const key = resolve(root);
   const source = await lstat(root).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
     throw error;
   });
-  if (!source) return; // A repeated confirmed cleanup has nothing left to remove.
+  if (!source) {
+    setupRuntimeOwners.delete(key);
+    return; // A repeated confirmed cleanup has nothing left to remove.
+  }
+  const owner = setupRuntimeOwners.get(key);
+  if (!owner || !source.isDirectory() || source.isSymbolicLink() || source.dev !== owner.dev || source.ino !== owner.ino) {
+    throw new Error("native_setup_evidence_not_owned");
+  }
+  if (piProbe ? await retainNativeRuntimeEvidence(root) : await retainNativePiConversationEvidence(root)) {
+    setupRuntimeOwners.delete(key);
+    return;
+  }
   if (piProbe) throw new Error("native_setup_evidence_not_retained");
   const inventory = await summarizeNativeRuntimeTree(root);
   await rm(root, { recursive: true, force: true });
+  setupRuntimeOwners.delete(key);
   logger.info({ event: "native_scratch_removed", path: root, ...inventory });
 }
