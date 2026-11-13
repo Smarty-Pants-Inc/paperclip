@@ -120,10 +120,14 @@ describe("Boat lease snapshot qualification", () => {
     expect(calls.map(c => c.method)).toEqual(["GET"]);
   });
 
-  it("uses the create response's team when GET omits it", async () => {
-    fixture({ ready: { team: undefined } });
-    const lease = await plugin.definition.onEnvironmentAcquireLease!(params);
-    expect(lease.metadata?.snapshotIdentity).toEqual(identity);
+  it.each([undefined, null])("refuses stale create ownership when GET team is %s", async team => {
+    const calls = fixture({ ready: { team } });
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toThrow(/snapshot.*(team|organization)/i);
+    expect(calls.slice(-2)).toMatchObject([
+      { method: "POST", path: "/sandboxes/bx_qualification/stop", body: {} },
+      { method: "GET", path: "/sandboxes/bx_qualification/stops/stop_qualification" },
+    ]);
+    expect(calls.some(c => c.method === "DELETE")).toBe(false);
   });
 
   it("uses the GET response's team when create omits it", async () => {

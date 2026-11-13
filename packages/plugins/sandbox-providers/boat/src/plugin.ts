@@ -96,23 +96,26 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     throw requestError(config, init.method ?? "GET", path, httpStatus, category);
   }
 }
-/** The API key's active org, not the user's identity or merely a valid key.
+/** Conservative inventory guard, NOT key-scope detection. Count Personal and
+ * inactive rows too; active is only the default wallet for new sandboxes.
  * https://docs.boat.dev/api/reference/account/list-organizations.md */
-async function activeBoatOrgId(config: Config): Promise<string | undefined> {
+async function soleBoatOrgId(config: Config): Promise<string | undefined> {
   const result = await request(config, "/orgs", { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, false, { requireJson: true });
-  if (result?.ok !== true || !Array.isArray(result.orgs)) return undefined;
-  const active = result.orgs.filter((org: { active?: unknown } | null) => org?.active === true);
-  const id = active.length === 1 ? active[0].id : undefined;
-  return typeof id === "string" && id.trim() ? id : undefined;
+  if (result?.ok !== true || !Array.isArray(result.orgs) || result.orgs.length !== 1) return undefined;
+  const org = result.orgs[0];
+  return org?.type === "org" && typeof org.id === "string" && org.id.trim() ? org.id : undefined;
 }
-async function boatOrgIdForLease(config: Config, ...sandboxes: any[]): Promise<string | undefined> {
-  for (const sandbox of sandboxes) {
-    const id = sandbox?.team?.id;
-    if (typeof id === "string" && id.trim()) return id;
-  }
-  // Older/partial sandbox responses may omit team. An unavailable org lookup
-  // must not invent ownership; such a lease cannot later prove 404 retirement.
-  return activeBoatOrgId(config).catch(() => undefined);
+function assertSandboxId(sandbox: any, id: string): void {
+  if (sandbox?.id !== id) throw new Error("Boat response returned a different allocation.");
+}
+/** Only the latest exact-ID observation can authorize retirement. team:null is
+ * personal billing; omission is unknown, never the account's current wallet.
+ * https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md (Sandbox.team) */
+function boatOwnershipForLease(sandbox: any, id: string): { boatOrgId?: string; boatOwner?: { kind: "personal" } } {
+  assertSandboxId(sandbox, id);
+  if (sandbox.team === null) return { boatOwner: { kind: "personal" } };
+  const orgId = sandbox.team?.id;
+  return typeof orgId === "string" && orgId.trim() ? { boatOrgId: orgId } : {};
 }
 export type BoatSnapshotIdentity = { provider: "boat"; requestedRef: string; id: string; name: string; createdAt: string };
 /** Resolve the mutable create name to its immutable artifact; never use the UUID as create.from. */
@@ -180,6 +183,7 @@ async function waitReady(config: Config, id: string, allowArchived = false): Pro
   while (Date.now() < until) {
     const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
     const s = result.sandbox ?? result;
+    assertSandboxId(s, id);
     if (["ready", "idle", "running"].includes(s.state)) return s;
     if (s.state === "error" || (!allowArchived && s.state === "archived")) throw new Error(`Boat sandbox ${id} entered ${s.state}`);
     // Bounded transition observation only; no idle worker poller. Ready webhook
@@ -188,12 +192,13 @@ async function waitReady(config: Config, id: string, allowArchived = false): Pro
   }
   throw new Error(`Boat sandbox ${id} readiness timed out`);
 }
-async function waitSetup(config: Config, id: string): Promise<void> {
+async function waitSetup(config: Config, id: string): Promise<any> {
   const until = Date.now() + config.setupTimeoutSeconds * 1000;
   while (Date.now() < until) {
     const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
     const s = result.sandbox ?? result;
-    if (s.setupStatus === "done") return;
+    assertSandboxId(s, id);
+    if (s.setupStatus === "done") return s;
     if (s.setupStatus === "failed") {
       const detail = typeof s.setupError === "string" ? s.setupError : typeof s.setupErrorText === "string" ? s.setupErrorText : typeof s.error === "string" ? s.error : s.error?.message;
       throw new Error(`Boat sandbox ${id} setup failed${detail ? `: ${detail}` : "."}`);
@@ -417,10 +422,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       id = sb.id;
       idleActivity.resource(activityKey(c, sb.id));
       const ready = await waitReady(c, sb.id);
-      if (c.setupScript !== undefined) await waitSetup(c, sb.id);
+      const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
+      const ownership = boatOwnershipForLease(ownershipObservation, sb.id);
       let snapshotIdentity: BoatLeaseSnapshotIdentity | undefined;
       if (params.resolveSnapshotIdentity === true && snapshot) {
-        const organizationId = ready.team?.id ?? sb.team?.id;
+        const organizationId = ownership.boatOrgId;
         if (typeof organizationId !== "string" || !organizationId.trim()) {
           throw new Error("Boat snapshot identity requires a team organizationId on the created sandbox.");
         }
@@ -434,9 +440,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, sb.id, command, timeout),
       });
       await bindDuplexLease(params, sb.id, guardianPreflight);
-      const boatOrgId = await boatOrgIdForLease(c, ready, sb);
       return { providerLeaseId: sb.id, expiresAt: expiry, metadata: { provider: c.provider, sandboxId: sb.id, remoteCwd,
-        ...(boatOrgId ? { boatOrgId } : {}),
+        ...ownership,
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}),
         ...(c.snapshot === undefined ? {} : { snapshot: c.snapshot }),
         ...(snapshotIdentity ? { snapshotIdentity } : {}),
@@ -470,16 +475,21 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     idleActivity.resource(activityKey(c, params.providerLeaseId));
     const proof = idleActivity.proof(activityKey(c, params.providerLeaseId));
     let observedAt: string | null = null;
-    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true, strictMissing: true, onHeaders: headers => {
+    const personal = (params.leaseMetadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal";
+    const boatOrgId = personal ? undefined : params.leaseMetadata?.boatOrgId;
+    // Explicit request scope, never an inference from the mutable active wallet.
+    // https://docs.boat.dev/api-keys.md (organization/account key table)
+    const orgHeaders = typeof boatOrgId === "string" && boatOrgId.trim() ? { "X-Boat-Org": boatOrgId } : undefined;
+    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, { method: "GET", headers: orgHeaders, cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true, strictMissing: true, onHeaders: headers => {
       observedAt = parseHttpDate(headers.get("Date"));
     } });
     if (result === null) {
-      // A valid key in a different Boat org also sees 404 for a live lease.
-      // Retirement requires the active org to match acquisition's ownership.
-      if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(params.providerLeaseId)) throw new Error("Boat inspection id is not a sandbox id; refusing to report it destroyed");
-      const boatOrgId = params.leaseMetadata?.boatOrgId;
-      if (typeof boatOrgId !== "string" || !boatOrgId.trim()) throw new Error("Boat lease has no recorded boatOrgId; refusing to report it destroyed");
-      if (await activeBoatOrgId(c) !== boatOrgId) throw new Error("Boat could not confirm the lease organization; refusing to report it destroyed");
+      // Even a valid key can see a foreign org's lease as missing. The read
+      // above must name the recorded org, and the whole inventory must match.
+      if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(params.providerLeaseId)) throw new Error("Boat lease absence is not proven: inspection id is not a sandbox id");
+      if (personal) throw new Error("Boat personal lease absence is not proven; refusing to report it destroyed");
+      if (typeof boatOrgId !== "string" || !boatOrgId.trim()) throw new Error("Boat lease absence is not proven: no recorded boatOrgId; refusing to report it destroyed");
+      if (await soleBoatOrgId(c) !== boatOrgId) throw new Error("Boat lease absence is not proven: could not confirm the lease organization; inventory is not exclusively the recorded org");
       idleActivity.confirm(proof, true);
       return { providerLeaseId: params.providerLeaseId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt };
     }
@@ -505,21 +515,21 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     // Existing unscoped non-Runner callers retain their SDK behavior. Every new
     // acquired scoped lease carries proof; a Runner lease never uses this branch.
     let sandbox: any;
-    const foundSandboxes: any[] = [];
     if (requiresProof) {
       const found = await request(c, `/sandboxes/${encodeURIComponent(id)}`, {}, true);
-      if (!found) return { providerLeaseId: null, metadata: { expired: true } };
+      if (!found) {
+        if ((metadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal") throw new Error("Boat personal lease absence is not proven; refusing to expire it");
+        return { providerLeaseId: null, metadata: { expired: true } };
+      }
       sandbox = found.sandbox ?? found;
       if (sandbox.id !== id) throw new Error("Boat resume returned a different allocation.");
-      foundSandboxes.push(sandbox);
     }
     const resumedFromState = sandbox?.state ?? null;
     if (!sandbox || !["ready", "idle", "running"].includes(sandbox.state)) {
       // boatdocs-0110c/api_reference_sandboxes_resume-sandbox.md:35-75,147-172.
       const response = await request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
       const sb = response.sandbox ?? response;
-      if (sb.id !== undefined && sb.id !== id) throw new Error("Boat resume returned a different allocation.");
-      foundSandboxes.push(sb);
+      assertSandboxId(sb, id);
       sandbox = await waitReady(c, id, true);
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
     } else if (effectiveTtlSeconds(c) > c.ttlSeconds) {
@@ -536,12 +546,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, id, command, timeout),
     }, metadata);
     // A disabled carrier must not inherit an earlier lease's usable receipt.
-    const { guardianPreflight: _previousGuardian, runnerGuardianVersion: _previousVersion, ...retainedMetadata } = metadata ?? {};
+    const { guardianPreflight: _previousGuardian, runnerGuardianVersion: _previousVersion,
+      boatOrgId: _previousOrg, boatOwner: _previousOwner, ...retainedMetadata } = metadata ?? {};
     await bindDuplexLease(params, id, guardianPreflight);
-    const boatOrgId = await boatOrgIdForLease(c, sandbox, ...foundSandboxes);
+    const ownership = boatOwnershipForLease(sandbox, id);
     return { providerLeaseId: id, expiresAt: sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
-        ...(boatOrgId ? { boatOrgId } : {}),
+        ...ownership,
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {

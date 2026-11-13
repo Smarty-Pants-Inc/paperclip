@@ -8,20 +8,36 @@ only a confirmed sandbox-not-found or Boat's terminal `cancelled` state reports
 `destroyed`. A missing sandbox requires a JSON 404 envelope with
 `code: "not_found"` and no `error.details.path`, an ID matching Boat's
 `^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$` pattern, and a fresh, uncached
-`GET /orgs` with the same key returning `ok: true` and exactly one `active: true`
-organization whose `id` equals the lease's recorded `metadata.boatOrgId` (also
-bounded to 10 seconds). A bare, malformed, route-style, or otherwise ambiguous
-404, an invalid ID, missing recorded org, failed org lookup, or different or
-ambiguous active org throws instead. A valid key alone cannot prove absence:
-keys switched to another Boat org also receive 404 for the original org's leases.
-Boat's [API error contract](https://docs.boat.dev/api/v1.md) says `not_found`
+`GET /orgs` with the same key returning `ok: true` and exactly **one entry total**,
+which must be an organization whose `id` equals the lease's recorded
+`metadata.boatOrgId` (also bounded to 10 seconds). In addition, the sandbox read
+explicitly sends `X-Boat-Org: <recorded boatOrgId>`: this is the documented
+[account-key request scope](https://docs.boat.dev/api-keys.md), not an inference
+about key type. An organization key naming another org is refused by Boat.
+The inventory guard counts Personal, inactive, and duplicate rows too; it does
+not filter by `active`. Boat defines `active` as the default billing wallet for
+new sandboxes, not key scope ([list organizations](https://docs.boat.dev/api/reference/account/list-organizations.md),
+[active wallet](https://docs.boat.dev/organizations/active-wallet.md)). Thus even
+a scoped request with a multi-entry inventory is conservatively refused.
+A bare, malformed, route-style, or otherwise ambiguous 404, an invalid ID,
+missing recorded org, personal ownership, failed org lookup, or a different or
+ambiguous inventory throws instead: absence is **not proven**. Boat's
+[API error contract](https://docs.boat.dev/api/v1.md#error-model) says `not_found`
 can also mean a missing key or saved snapshot, so a 404 alone is not sufficient.
 
-Acquire and successful resume record `boatOrgId` from the created/found sandbox's
-`team.id`, preserving other lease metadata. If absent, they fall back to the
-[single active organization](https://docs.boat.dev/api/reference/account/list-organizations.md)
-from `GET /orgs`; unavailable or ambiguous ownership is never invented. A lease
-without recorded ownership (including older leases) cannot prove 404 retirement.
+Acquire and successful resume record `boatOrgId` only from the latest exact-ID
+sandbox observation's `team.id`. Explicit `team: null` means personal billing
+and records `boatOwner: {kind: "personal"}` with no `boatOrgId`; omitted or
+invalid `team` means unknown and records neither. There is **no `/orgs` fallback**
+for ownership. Readiness and setup observations must match the expected sandbox
+ID, as must resume reads, POST responses and TTL refreshes. On resume, both old
+ownership fields are removed before the new observation's ownership is recorded;
+unrelated metadata is retained. An earlier create/read/POST response never
+supplies ownership missing or contradicted in the final observation. See Boat's
+[`Sandbox.team` contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).
+Personal and unknown leases (including unbound older leases) cannot prove 404
+retirement. Positive inspection does not migrate or persist ownership for an
+older lease; rollout/backfill remains a separate operational requirement.
 `archived` reports `stopped` only when `stoppedAt` is non-null. `ready`, `idle`,
 and `running` report `active`; all other states report `unknown`, including
 `archived` without a stop timestamp. See Boat's [GET contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).

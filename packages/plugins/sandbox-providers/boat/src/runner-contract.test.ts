@@ -251,7 +251,7 @@ describe("Boat Runner contract", () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date("2040-01-01T00:00:00Z"));
     const network = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify(sandboxNotFound), { status: 404, headers: { Date: "Fri, 13 Nov 2026 12:00:00 GMT" } }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, orgs: [{ id: "team_lease", active: true }] }), { headers: { Date: "Fri, 13 Nov 2026 12:01:00 GMT" } }));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, orgs: [{ id: "team_lease", type: "org", active: true }] }), { headers: { Date: "Fri, 13 Nov 2026 12:01:00 GMT" } }));
     vi.stubGlobal("fetch", network);
     expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toEqual({ providerLeaseId: inspectId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: "2026-11-13T12:00:00.000Z" });
     expect(network.mock.calls).toEqual([
@@ -318,7 +318,7 @@ describe("Boat Runner contract", () => {
     await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("different allocation");
   });
   it("does not report a deleted lease as active or erase a transient inspection failure", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(reply(sandboxNotFound, 404)).mockResolvedValueOnce(reply({ ok: true, orgs: [{ id: "team_lease", active: true }] })));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(reply(sandboxNotFound, 404)).mockResolvedValueOnce(reply({ ok: true, orgs: [{ id: "team_lease", type: "org", active: true }] })));
     expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toEqual({ providerLeaseId: inspectId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: null });
     vi.stubGlobal("fetch", vi.fn(async () => reply({}, 503)));
     await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow();
