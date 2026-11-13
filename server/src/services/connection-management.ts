@@ -6,7 +6,8 @@ import { forbidden } from "../errors.js";
 import { authorizationService, authorizationDeniedDetails, canActorReadIssuePrivacy, canActorReadProjectPrivacy, type AuthorizationActor, type AuthorizationDecision } from "./authorization.js";
 import { captureRunIdentity, runIdentityTaskFields, type RunIdentityCapture } from "./run-identity.js";
 import type { LogActivityInput } from "./activity-log.js";
-import type { ConnectionManagementAction, ConnectionManagementResource } from "./connection-management-policy.js";
+import { isToolAssignmentOperation, type ConnectionManagementAction, type ConnectionManagementResource } from "./connection-management-policy.js";
+import { assertCanManageSubordinateAgent } from "./agent-subtree-management.js";
 
 export type ConnectionManagementContext = {
   actor: AuthorizationActor;
@@ -49,8 +50,14 @@ export async function assertAgentConnectionInstallAccess(db: Db, actor: Authoriz
     const [agent] = await db.select({ id: agents.id }).from(agents)
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId))).limit(1);
     if (!agent) throw forbidden("The target agent is not available in this company");
+    // Self-service keeps its existing boundary. Cross-agent
+    // assignments additionally require a strict *current* reporting descendant,
+    // even when a legacy grant is unscoped or explicitly names an outside agent.
+    if (actor.type === "agent" && actor.agentId !== agentId) {
+      await assertCanManageSubordinateAgent(db, actor, { id: agentId, companyId });
+    }
     const decision = await authorization.decide({
-      actor, action: "agent_config:update", resource: { type: "agent", companyId, agentId }, scope: { targetAgentId: agentId },
+      actor, action: "agent_config:update", resource: { type: "agent", companyId, agentId }, scope: { targetAgentId: agentId, ...(actor.type === "agent" && actor.agentId !== agentId ? { requiresChangeGrant: true } : {}) },
     });
     if (!decision.allowed) throw forbidden(`You cannot edit agent ${agentId}, so you cannot change its connection installs`, authorizationDeniedDetails(decision));
   }
@@ -136,7 +143,8 @@ export function connectionManagementService(db: Db) {
       // Managed installation profiles can be empty while their labels still
       // identify the connection they administer.
       if (profile.profileKey.startsWith("app:") && isUuidLike(profile.profileKey.slice(4))) referencedConnections.push(profile.profileKey.slice(4));
-      const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
+      const bindings = isToolAssignmentOperation(resource.operation) ? []
+        : await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
       for (const binding of bindings) {
         if (binding.targetType === "agent") expandedTargets.add(binding.targetId);
         if (binding.targetType === "company") {
@@ -148,7 +156,8 @@ export function connectionManagementService(db: Db) {
         }
 
       }
-      const linkedGateways = await db.select({ id: toolMcpGateways.id }).from(toolMcpGateways).where(and(eq(toolMcpGateways.companyId, resource.companyId), eq(toolMcpGateways.profileId, profile.id)));
+      const linkedGateways = isToolAssignmentOperation(resource.operation) ? []
+        : await db.select({ id: toolMcpGateways.id }).from(toolMcpGateways).where(and(eq(toolMcpGateways.companyId, resource.companyId), eq(toolMcpGateways.profileId, profile.id)));
       for (const gateway of linkedGateways) await authorizeBindingTarget(actor, action, resource, { targetType: "gateway", targetId: gateway.id }, options);
       const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
       for (const entry of entries) if (entry.connectionId) referencedConnections.push(entry.connectionId);
@@ -194,7 +203,7 @@ export function connectionManagementService(db: Db) {
       };
       if (options.mutation ?? action !== "connections:read") {
         const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id));
-        for (const install of installs) {
+        for (const install of isToolAssignmentOperation(resource.operation) ? [] : installs) {
           if (install.targetType === "agent") expandedTargets.add(install.targetId);
           if (install.targetType === "company") {
             const rows = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, resource.companyId));
@@ -295,7 +304,11 @@ export function connectionManagementService(db: Db) {
       const principals: AuthorizationActor[] = actor.type === "agent" || resource.selfServiceAgentInstalls ? [actor] : [];
       if (actor.type === "agent") principals.push({ type: "board", userId: responsibleUserId, source: "session", ignoreInstanceAdmin: true });
       for (const principal of principals) {
-        const targetDecision = await authorization.decide({ actor: principal, action: "agent_config:update", resource: { type: "agent", companyId: resource.companyId, agentId: targetAgentId }, scope: { targetAgentId } }, { interactionPolicy: "defer_to_mutation" });
+        const assignmentOnly = isToolAssignmentOperation(resource.operation);
+        if (assignmentOnly && principal.type === "agent" && principal.agentId !== targetAgentId) {
+          await assertCanManageSubordinateAgent(db, principal, { id: targetAgentId, companyId: resource.companyId });
+        }
+        const targetDecision = await authorization.decide({ actor: principal, action: "agent_config:update", resource: { type: "agent", companyId: resource.companyId, agentId: targetAgentId }, scope: { targetAgentId, ...(assignmentOnly && principal.type === "agent" && principal.agentId !== targetAgentId ? { requiresChangeGrant: true } : {}) } }, { interactionPolicy: "defer_to_mutation" });
         if (!targetDecision.allowed) throw forbidden(targetDecision.explanation, authorizationDeniedDetails(targetDecision));
       }
     }

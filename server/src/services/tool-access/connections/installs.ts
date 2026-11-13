@@ -1,4 +1,5 @@
-import { assertAgentToolAssignmentInteractions } from "../../connection-management.js";
+import { assertAgentConnectionInstallAccess, assertAgentToolAssignmentInteractions } from "../../connection-management.js";
+import { lockAccountingCompany } from "../../accounting-transaction.js";
 import { connectionActorUserId } from "../actor.js";
 import { toConnection, toConnectionInstall } from "./projection.js";
 import { actorBinding } from "../actor.js";
@@ -179,7 +180,14 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
         profileId: string;
       }> = [];
       await db.transaction(async (tx) => {
+        if (actor?.managementContext?.actor.type === "agent") {
+          // Same mutex/order as reportsTo writers; also protects indirect paths.
+          await lockAccountingCompany(tx as unknown as Db, connection.companyId);
+        }
         await lockToolConnectionRuntimeInputs(tx, connection.companyId, connection.id);
+        // A concurrent replace-set writer may have changed the delta since the
+        // HTTP guard. Check its latest committed set after the connection lock.
+        await actor?.managementContext?.reauthorize();
         if (markMcpAccessConfigured) {
           // Preserve an explicit zero-agent selection through OAuth. Merge the
           // marker in SQL so concurrent credential/config changes are retained.
@@ -215,7 +223,11 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
         const changedAgentIds = [...existing.filter(install => !requested.has(`${install.targetType}:${install.targetId}`)),
           ...[...requested.entries()].filter(([key]) => !existingKeys.has(key)).map(([, install]) => install)]
           .filter(install => install.targetType === "agent").map(install => install.targetId);
-        await assertAgentToolAssignmentInteractions(tx as unknown as Db, sourceAgentId, connection.companyId, changedAgentIds, false);
+        if (actor?.managementContext) {
+          await assertAgentConnectionInstallAccess(tx as unknown as Db, actor.managementContext.actor, connection.companyId, changedAgentIds);
+        } else {
+          await assertAgentToolAssignmentInteractions(tx as unknown as Db, sourceAgentId, connection.companyId, changedAgentIds, false);
+        }
         const removals = existing.filter(
           (install) =>
             !requested.has(`${install.targetType}:${install.targetId}`),
