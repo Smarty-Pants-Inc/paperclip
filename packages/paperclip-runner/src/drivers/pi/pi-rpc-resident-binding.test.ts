@@ -250,7 +250,9 @@ describe("resident Pi model binding", () => {
     expect(events[0]).toMatchObject({ eventType: "turn.started" });
     expect(diagnostics[0]).toMatchObject({ turnId: events[0]!.turnId });
     expect(events.at(-1)).toMatchObject({ eventType: disposition === "rejected" ? "turn.failed" : "turn.completed" });
-    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(13);
+    // Warm reattach admits once; pre-prompt proof adds only get_state, not
+    // another full admission batch. No agent_start means no prompt-to-start span.
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(9);
     await f.session.close(); await tick();
     expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(1);
   });
