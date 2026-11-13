@@ -16363,7 +16363,15 @@ describe("runnerd provider runtime wiring", () => {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: identity.runnerInstanceId,
         useRunnerd: true, runnerExecutionTarget: target as never });
       const onEvent = vi.fn(async (_event: AdapterRuntimeEvent) => undefined);
-      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: identity.runnerInstanceId,
+      const nextDb = leaseDb(next);
+      const ordinarySelect = nextDb.select.bind(nextDb);
+      // The pre-claim migration now reads the completed warm predecessor.
+      // Keep the successor running, but model that predecessor as terminal.
+      nextDb.select = ((fields?: Record<string, unknown>) => fields?.status === heartbeatRuns.status
+        && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
+        ? priorNativeRunDb(first).select(fields as never)
+        : ordinarySelect(fields as never)) as Db["select"];
+      await expect(executePaperclipNativeSession({ db: nextDb, execution: next, runnerInstanceId: identity.runnerInstanceId,
         useRunnerd: true, onEvent, runnerExecutionTarget: { ...target,
           sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "same-box", restarted: true } } as never }))
         .rejects.toThrow("prior_owner_terminal_state_indeterminate; retirement_refused=");
