@@ -4228,6 +4228,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     ((settlement: "settled" | "unsettled") => Promise<void> | void) | null =
     null;
   #controlPlaneRelease: ((reason?: "detach") => Promise<void> | void) | null = null;
+  #controlPlaneEnsureConnected: ((input: { deadline: number; signal: AbortSignal }) => Promise<void>) | null = null;
   #nextTraceDebugSequence = 1;
   #traceRehydrationSpoolOverflow = false;
   #traceRehydrationRetriesExhausted = false;
@@ -4940,6 +4941,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         throw error;
       }
       this.#controlPlaneCheckpoint = registration.checkpoint;
+      this.#controlPlaneEnsureConnected = registration.ensureConnected ?? null;
       this.#controlPlaneRelease = registration?.release ?? null;
       await registration?.activate?.();
       await this.#awaitRegistrationReady(registration?.ready);
@@ -5206,6 +5208,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#wakePump();
       if (!previousReleased) await previousRelease?.();
       previousReleased = true;
+      this.#controlPlaneEnsureConnected = registration?.ensureConnected ?? null;
       this.#controlPlaneRelease = registration?.release ?? null;
       this.#releaseEpisode = null;
       this.#authorizedTools = authorizedTools;
@@ -5682,6 +5685,31 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // fresh run authority never inherits the prior run's pending events.
 
       if (!(await this.#runnerHasExited())) {
+        // A warm ingress may have lost its socket (or stopped reconnecting
+        // while parked). Restore the SAME authenticated route before sending
+        // lifecycle commands; never infer process death from a missing socket.
+        const reconnect = this.#controlPlaneEnsureConnected;
+        if (reconnect && this.#core.activeRunnerConnectionCount() === 0) {
+          const deadline = Math.min(preparationDeadline,
+            Date.now() + (this.options.runnerReconnectGraceMs ?? 5_000));
+          const abort = new AbortController();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            this.#diagnostic("reopening warm runner ingress before suspension");
+            await Promise.race([
+              reconnect({ deadline, signal: abort.signal }),
+              new Promise<never>((_resolve, reject) => {
+                timer = setTimeout(() => {
+                  abort.abort(); reject(new Error("runner ingress reopen deadline exceeded"));
+                }, Math.max(0, deadline - Date.now()));
+              }),
+            ]);
+            if (this.#core.activeRunnerConnectionCount() !== 1) throw new Error("runner ingress did not authenticate one owner");
+            this.#diagnostic("warm runner ingress re-authenticated before suspension");
+          } catch (error) {
+            this.#diagnostic(`warm runner ingress reopen unconfirmed: ${String(error)}`);
+          } finally { clearTimeout(timer); abort.abort(); }
+        }
         if (this.options.recoveryPurpose === "stop_cleanup") {
           cleanupProviderStopConfirmed = await this.#stopProviderBeforeSuspend(preparationDeadline);
         }
@@ -5848,7 +5876,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             : this.#controlPlaneCheckpoint,
         forceKill: async () => {
           const handle = this.#handle;
-          if (!handle || this.#evidence.runnerExited || runnerRetained) return;
+          if (!handle || runnerRetained) return;
+          // Exit delivery can race next-turn close. Re-sample BEFORE our own
+          // kill, so an independently lost owner can use the lineage receipt;
+          // our containment of a potentially live owner is never crash proof.
+          if (!runnerSuspended) runnerLost ||= await this.#runnerHasExited();
+          if (this.#evidence.runnerExited) return;
           handle.child.kill("SIGKILL");
           // A remote kill dispatches an asynchronous, ownership-fenced RPC.
           // Do not release the session for reuse until its process monitor has
@@ -5875,7 +5908,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     const runnerLossReaped = suspensionRequired && !runnerSettled && preparationConfirmed
       && !runnerSuspended && runnerLost
       && await this.#reapLostLocalRunnerLineage(closeDeadline);
-    if (suspensionRequired && !runnerSettled && !runnerLossReaped) {
+    if (suspensionRequired && !runnerSettled && (!runnerLossReaped || finalProviderState === "unreadable")) {
       const settlement = {
         runnerSuspended,
         runnerRetained,
@@ -6351,6 +6384,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (registration === null) await core.start();
     else {
       this.#controlPlaneCheckpoint = registration.checkpoint ?? null;
+      this.#controlPlaneEnsureConnected = registration.ensureConnected ?? null;
       this.#controlPlaneRelease = registration.release;
     }
     if (this.#closed && this.#startupDrainTimedOut) {
@@ -7151,6 +7185,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     else {
       this.#controlPlaneCheckpoint = registration.checkpoint ?? null;
+      this.#controlPlaneEnsureConnected = registration.ensureConnected ?? null;
       this.#controlPlaneRelease =
         oldTransitionRegistration && newTransitionRegistration
           ? async () => {
@@ -7374,6 +7409,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         await oldTransitionRegistration.release();
         this.#assertStartupOpen();
         this.#controlPlaneRelease = newTransitionRegistration.release;
+        this.#controlPlaneEnsureConnected = newTransitionRegistration.ensureConnected ?? null;
         this.#controlPlaneCheckpoint = newTransitionRegistration.checkpoint ?? null;
         void newTransitionRegistration.failure?.catch(error => this.#failTransport(error instanceof Error ? error : new Error(String(error))));
       }
