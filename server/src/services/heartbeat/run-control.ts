@@ -1,5 +1,3 @@
-import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
-import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -287,8 +285,6 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 export type CancelRunOptions = {
-    /** Authenticated route actor only; rechecked with the durable Stop fence. */
-    managementActor?: import("../authorization.js").AuthorizationActor;
     /** Return null if a parked retry was promoted or settled before this cancellation. */
     expectedStatus?: "scheduled_retry";
     budgetEnforcement?: BudgetEnforcementScope;
@@ -1241,22 +1237,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (options.expectedStatus && run.status !== options.expectedStatus) return null;
-    if (options.managementActor) {
-      const actor = options.managementActor;
-      // Accept Stop durably under the same mutex as reportsTo. Provider cleanup
-      // follows this already-authorized intent, not a fresh management request.
-      run = await withAccountingTransaction(db, run.companyId, async tx => {
-        await assertAgentLifecycleAuthority(tx, actor, { id: run!.agentId, companyId: run!.companyId });
-        const [accepted] = await tx.update(heartbeatRuns).set({ resultJson: runCancellationFenceSql({
-          cancellation: requestedRunCancellation(options.resultJson ?? {}, reason),
-          errorCode: options.errorCode ?? "cancelled",
-          attribution: { cancelledByActorType: options.resultJson?.cancelledByActorType,
-            cancelledByUserId: options.resultJson?.cancelledByUserId },
-        }) }).where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]))).returning();
-        return accepted ?? run!;
-      });
-      options = { ...options, managementActor: undefined };
-    }
+
 
     const attribution = {
       cancelledByActorType: options.resultJson?.cancelledByActorType,

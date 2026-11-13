@@ -1,9 +1,6 @@
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { type BudgetServiceHooks } from "./budgets.js";
-import { withAccountingTransaction } from "./accounting-transaction.js";
-import type { ActivityPublication } from "./activity-log.js";
-import { assertCanManageSubordinateAgent, subordinatePermissionScope } from "./agent-subtree-management.js";
 
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -47,7 +44,7 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
 
     getById,
 
-    updatePermissions: async (id: string, permissions: Record<string, unknown> & { canCreateAgents: boolean }, options?: { actorAgentId?: string | null; afterUpdate?: (tx: Db, agent: typeof agents.$inferSelect, publications: ActivityPublication[]) => Promise<void> }) => {
+    updatePermissions: async (id: string, permissions: Record<string, unknown> & { canCreateAgents: boolean }, options?: { actorAgentId?: string | null }) => {
       const existing = await getById(id);
       if (!existing) return null;
       if (existing.status === "pending_approval") {
@@ -58,14 +55,7 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         });
       }
 
-      const updated = await withAccountingTransaction(db, existing.companyId, async (tx, publications) => {
-        if (options?.actorAgentId) {
-          const actor = { type: "agent" as const, agentId: options.actorAgentId, companyId: existing.companyId };
-          await assertCanManageSubordinateAgent(tx, actor, existing);
-          if (existing.role === "ceo" || permissions.canCreateAgents || permissions.canAssignTasks) {
-            await subordinatePermissionScope(tx, actor, existing, "tasks:assign", undefined);
-          }
-        }
+      const updated = await db.transaction(async tx => {
         await assertAgentInteraction(tx, { companyId: existing.companyId, actorAgentId: options?.actorAgentId,
           operation: "configure", targetAgentId: id, lock: "update" });
         const [current] = await tx.select().from(agents).where(eq(agents.id, id)).for("update");
@@ -73,7 +63,7 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         if (current.status === "pending_approval") throw conflict("Pending approval agent permissions cannot be changed before board approval");
         const protectedPermissions = preserveAgentInteractionPermissions(current.permissions, permissions);
         await notifyAttentionRetentionWork(tx, { companyId: current.companyId });
-        const result = await tx
+        return tx
         .update(agents)
         .set({
           permissions: normalizeAgentPermissions({ ...current.permissions, ...protectedPermissions }, { role: current.role }),
@@ -82,8 +72,6 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         .where(eq(agents.id, id))
         .returning()
         .then((rows) => rows[0] ?? null);
-        if (result) await options?.afterUpdate?.(tx, result, publications);
-        return result;
       });
 
       return updated ? getById(updated.id) : null;

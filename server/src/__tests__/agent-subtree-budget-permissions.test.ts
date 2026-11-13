@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { and, eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, agentApiKeys, authUsers, budgetPolicies, budgetReservations, companies, companyMemberships, costEvents, createDb,
-  principalPermissionGrants, heartbeatRuns, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  principalPermissionGrants, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -15,9 +15,6 @@ import { costRoutes } from "../routes/costs.js";
 import { agentPermissionGrantRoutes } from "../routes/agent-permission-grants.js";
 import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { closeProcessRunAdmission, resetProcessRunAdmissionForTests } from "../services/heartbeat/run-admission.js";
-import { withAccountingTransaction } from "../services/accounting-transaction.js";
-import { updateAgentConfigurationInTransaction } from "../services/agent-configuration-transaction.js";
 
 // Trust boundary: real bearer authentication, routes, authorization and persisted Postgres writes.
 describe("lead budget and permission management inside its current subtree", () => {
@@ -30,11 +27,9 @@ describe("lead budget and permission management inside its current subtree", () 
     process.env.PAPERCLIP_HOME = home;
     database = await startEmbeddedPostgresTestDatabase("subtree-management-");
     db = createDb(database.connectionString);
-    closeProcessRunAdmission();
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   afterAll(async () => {
     await db?.$client.end(); await database?.cleanup();
-    resetProcessRunAdmissionForTests();
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
     else process.env.PAPERCLIP_HOME = previousHome;
     if (home) await fs.rm(home, { recursive: true, force: true });
@@ -67,79 +62,10 @@ describe("lead budget and permission management inside its current subtree", () 
     board.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId, companyIds: [companyId], isInstanceAdmin: true }; next(); });
     board.use("/api", agentPermissionGrantRoutes(db)); board.use("/api", costRoutes(db)); board.use("/api", agentRoutes(db)); board.use(errorHandler);
     const boardPatch = (id: string, suffix: string, body: object) => request(board).patch(`/api/agents/${id}${suffix}`).send(body);
-    const post = (id: string, suffix: string) => request(api).post(`/api/agents/${id}${suffix}`).set("Authorization", `Bearer ${token}`).send({});
-    const putInstructions = (id: string) => request(api).put(`/api/agents/${id}/instructions-bundle/file`)
-      .set("Authorization", `Bearer ${token}`).send({ path: "AGENTS.md", content: "# Instructions from the hirer\n", baseRevisionId: null });
-    const cancel = (runId: string) => request(api).post(`/api/heartbeat-runs/${runId}/cancel`).set("Authorization", `Bearer ${token}`).send({});
-    return { ids, companyId, userId, patch, boardPatch, post, putInstructions, cancel };
+    return { ids, companyId, userId, patch, boardPatch };
   }
   const readAgent = async (id: string) => (await db.select().from(agents).where(eq(agents.id, id)))[0]!;
   const grantBody = (root: string) => ({ permissionKey: "agents:configure", enabled: true, scope: { subtreeRootAgentId: root } });
-
-  it("lets a hirer edit its strict descendant's instruction content, not an outside agent's", async () => {
-    const f = await seed();
-    const allowed = await f.putInstructions(f.ids.descendant);
-    expect(allowed.status, allowed.text).toBe(200);
-    const denied = await f.putInstructions(f.ids.outside);
-    expect(denied.status, denied.text).toBe(403);
-  }, 60_000);
-
-  for (const operation of ["budget", "budget-alias", "grant", "permissions", "instructions-path", "pause", "resume", "terminate", "status", "clear-error", "retry", "reset-session", "wakeup", "invoke", "cancel"] as const) {
-    it(`${operation}: revalidates a descendant mutation after a concurrent intermediate-manager reparent`, async () => {
-      const f = await seed();
-      if (operation === "resume") await f.boardPatch(f.ids.descendant, "", { status: "paused" });
-      if (operation === "clear-error") await db.update(agents).set({ status: "error", errorReason: "test" }).where(eq(agents.id, f.ids.descendant));
-      if (operation === "retry") await db.update(agents).set({ status: "paused", lifecycleState: "verifying", lifecycleError: "test",
-        lifecycleOperation: { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 1, retryRequired: true },
-      }).where(eq(agents.id, f.ids.descendant));
-      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.ids.descendant, status: "queued" }).returning();
-      let release!: () => void, ready!: (pid: number) => void;
-      const gate = new Promise<void>(resolve => { release = resolve; });
-      const locked = new Promise<number>(resolve => { ready = resolve; });
-      const before = await readAgent(f.ids.descendant);
-      const activityBefore = await db.select().from(activityLog).where(eq(activityLog.entityId, f.ids.descendant));
-      const grantsBefore = await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.ids.descendant));
-      const reparent = withAccountingTransaction(db, f.companyId, async tx => {
-        await updateAgentConfigurationInTransaction(tx, f.ids.worker, { reportsTo: f.ids.outside });
-        const [row] = await tx.execute(sql`select pg_backend_pid() as pid`);
-        ready(Number(row!.pid));
-        await gate;
-      });
-      let mutation: Promise<request.Response> | undefined;
-      try {
-        const pid = await locked;
-        const id = f.ids.descendant;
-        const call = operation === "budget" ? f.patch(id, "/budgets", { budgetMonthlyCents: 500 })
-          : operation === "budget-alias" ? f.patch(id, "", { budgetMonthlyCents: 500 })
-          : operation === "grant" ? f.patch(id, "/permission-grants", grantBody(id))
-          : operation === "permissions" ? f.patch(id, "/permissions", { canCreateAgents: true, canAssignTasks: true })
-          : operation === "instructions-path" ? f.patch(id, "/instructions-path", { path: path.join(resolveManagedInstructionsRoot(await readAgent(id)), "LEAD.md"), adapterConfigKey: "instructionsFilePath" })
-          : operation === "status" ? f.patch(id, "", { status: "paused" })
-          : operation === "cancel" ? f.cancel(run!.id)
-          : f.post(id, operation === "retry" ? "/lifecycle/retry" : operation === "reset-session" ? "/runtime-state/reset-session"
-            : operation === "invoke" ? "/heartbeat/invoke" : `/${operation}`);
-        mutation = call.then(response => response);
-        // A real PostgreSQL lock wait proves the mutation reached its write boundary
-        // while the reparent was uncommitted; no scheduler sleep stands in for overlap.
-        await vi.waitFor(async () => {
-          const rows = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
-            and ${pid} = any(pg_blocking_pids(pid))`);
-          expect(rows.length).toBeGreaterThan(0);
-        }, { timeout: 5_000, interval: 20 });
-      } finally {
-        release();
-        await reparent;
-        await mutation;
-      }
-      const response = await mutation!;
-      expect(response.status, response.text).toBe(403);
-      expect((await readAgent(f.ids.worker)).reportsTo).toBe(f.ids.outside);
-      expect(await readAgent(f.ids.descendant)).toEqual(before);
-      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.ids.descendant))).toEqual(grantsBefore);
-      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)))[0]).toEqual(run);
-      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, f.ids.descendant))).toEqual(activityBefore);
-    }, 60_000);
-  }
 
   it("allows non-CEO lead budget writes through both routes, with agent-attributed policy audit", async () => {
     const f = await seed();
