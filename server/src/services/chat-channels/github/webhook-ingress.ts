@@ -89,6 +89,16 @@ export type GitHubRecoveryReceipt = GitHubRecoveryWindow & {
   original: GitHubAppWebhookDeliveryDetail;
 };
 
+const GITHUB_RECOVERY_DELIVERED_MEANWHILE = "github_webhook_recovery_delivered_meanwhile";
+const GITHUB_RECOVERY_ATTEMPT_NOT_ELIGIBLE = "github_webhook_recovery_attempt_not_eligible";
+
+// These are recorded observations, not provenance denials or authorizations
+// for a recovered callback. They must never fence genuine ingress.
+function githubRecoveryReceiptIsNonCancelling(result: Record<string, unknown> | null) {
+  return result?.code === GITHUB_RECOVERY_DELIVERED_MEANWHILE ||
+    result?.code === GITHUB_RECOVERY_ATTEMPT_NOT_ELIGIBLE;
+}
+
 export type GitHubWebhookIngressPayload = {
   version: 1;
   body: string;
@@ -360,6 +370,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
                 endpointId: chatActions.endpointId,
                 payload: chatActions.payload,
                 status: chatActions.status,
+                result: chatActions.result,
               })
               .from(chatActions)
               .innerJoin(
@@ -377,6 +388,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
                   ),
                 ),
               )
+              .then(rows => rows.filter(receipt => !githubRecoveryReceiptIsNonCancelling(receipt.result)))
           : [];
         for (const receipt of recoveryReceipts) {
           const fence = githubRecoveryWindow(receipt.payload);
@@ -844,7 +856,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         }, [record.endpoint.status]);
         if (!current) return null;
         const receipt = await tx
-          .select({ id: chatActions.id, payload: chatActions.payload, status: chatActions.status })
+          .select({ id: chatActions.id, payload: chatActions.payload, status: chatActions.status, result: chatActions.result })
           .from(chatActions)
           .where(
             and(
@@ -855,7 +867,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             ),
           )
           .then((rows) => rows[0] ?? null);
-        if (!receipt) return null;
+        if (!receipt || githubRecoveryReceiptIsNonCancelling(receipt.result)) return null;
         const admission = await tx
           .select({ payload: chatActions.payload })
           .from(chatActions)
@@ -1060,8 +1072,10 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
     context: LifecycleRuntimeFence,
     window: GitHubRecoveryWindow,
     original: GitHubAppWebhookDelivery,
-    code: string,
+    code: "not_eligible_for_recovery" | "source_changed_or_unavailable" |
+      typeof GITHUB_RECOVERY_DELIVERED_MEANWHILE | typeof GITHUB_RECOVERY_ATTEMPT_NOT_ELIGIBLE,
   ) {
+    const nonCancelling = githubRecoveryReceiptIsNonCancelling({ code });
     await db.transaction(async (tx) => {
       const current = await runtimeCallbackEndpoint(tx, endpoint.id, context, [
         "active",
@@ -1069,13 +1083,14 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
       if (
         !current ||
         !original.repositoryId ||
-        (await githubRecoveryAlreadyReceived(tx, current, original.guid)) ||
+        (!nonCancelling && await githubRecoveryAlreadyReceived(tx, current, original.guid)) ||
         !(await githubRecoveryResource(tx, current, original.repositoryId))
       )
         return;
-      // Only the deny tombstone is needed, not the rejected detail or source
-      // contents. Remembering it lets the next bounded scan reach older valid
-      // messages instead of repeatedly inspecting the same five bot callbacks.
+      // Keep only the decision and identity, never rejected content. A denial
+      // must recheck local admission under the endpoint fence above. A mutable
+      // outcome is non-cancelling and is recorded even if the original arrived
+      // meanwhile. Both decisions let the bounded scan move to older GUIDs.
       await tx
         .insert(chatActions)
         .values({
@@ -1280,6 +1295,9 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
     let outcome = "scanned";
     let requested = 0;
     let inspected = 0;
+    let recovered = 0;
+    let deliveredMeanwhile = 0;
+    let rejected = 0;
     try {
       if (!epochMatches) {
         outcome = "epoch_initialized";
@@ -1401,7 +1419,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             ? receipt.result.attempts
             : 0;
         const receiptWindow = githubRecoveryWindow(receipt?.payload);
-        const latest = [...group].sort(
+        let latest = [...group].sort(
           (left, right) =>
             Date.parse(right.deliveredAt) - Date.parse(left.deliveredAt),
         )[0]!;
@@ -1468,16 +1486,37 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             original,
             "not_eligible_for_recovery",
           );
+          rejected += 1;
           continue;
         }
-        // Delivery outcome fields are mutable while GitHub completes an
-        // attempt. A list/detail race is not permanent rejection: leave this
-        // GUID unclaimed so the next tick can observe a consistent snapshot.
+        // The list is only candidate discovery. Decide from the fresh detail,
+        // replacing its stale list snapshot when selecting the latest attempt.
+        // Never spend this GUID's detail budget again just to seek agreement.
+        latest = [detail, ...group.filter(attempt => attempt.id !== detail.id)].sort(
+          (left, right) => Date.parse(right.deliveredAt) - Date.parse(left.deliveredAt),
+        )[0]!;
+        if (detail.statusCode !== null && detail.statusCode >= 200 && detail.statusCode < 500) {
+          await rememberGitHubRecoverySkip(endpoint, context, window, original, GITHUB_RECOVERY_DELIVERED_MEANWHILE);
+          deliveredMeanwhile += 1;
+          logger.info({ endpointId: endpoint.id, guid, listStatus: original.statusCode,
+            detailStatus: detail.statusCode }, "GitHub webhook recovery delivered meanwhile");
+          continue;
+        }
         if (
-          detail.statusCode !== original.statusCode ||
-          detail.deliveredAt !== original.deliveredAt ||
-          detail.throttledAt !== original.throttledAt
-        ) continue;
+          (detail.statusCode !== null && detail.statusCode !== 0 && detail.statusCode < 500) ||
+          Date.parse(detail.deliveredAt) < floor ||
+          Date.parse(detail.deliveredAt) > now.getTime() - 10_000 ||
+          detail.throttledAt !== null ||
+          (latest.statusCode !== null && latest.statusCode !== 0 && latest.statusCode < 500) ||
+          latest.throttledAt !== null ||
+          Date.parse(latest.deliveredAt) > now.getTime() - 10_000 ||
+          (receipt && (receipt.result?.latestAttemptId === latest.id || !latest.redelivery ||
+            Date.parse(latest.deliveredAt) < Date.parse(String(receipt.result?.requestedAt))))
+        ) {
+          await rememberGitHubRecoverySkip(endpoint, context, window, original, GITHUB_RECOVERY_ATTEMPT_NOT_ELIGIBLE);
+          rejected += 1;
+          continue;
+        }
         if (!(await githubRecoveryCurrentSource(detail, credentials, recoveryFetch))) {
           await rememberGitHubRecoverySkip(
             endpoint,
@@ -1486,6 +1525,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             original,
             "source_changed_or_unavailable",
           );
+          rejected += 1;
           continue;
         }
         await withCredentialMutationLease(endpoint, async (lease) => {
@@ -1616,8 +1656,9 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
                 return fetchImpl(input, init);
               },
               appToken,
-              deliveryId: original.id,
+              deliveryId: detail.id,
             });
+            recovered += 1;
             await db
               .update(chatActions)
               .set({ status: "processed", updatedAt: new Date() })
@@ -1668,6 +1709,10 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           nextScanAt: new Date(Date.now() + nextDelay).toISOString(),
           outcome,
           requested,
+          inspected,
+          recovered,
+          deliveredMeanwhile,
+          rejected,
         },
         expiresAt: null,
       });
