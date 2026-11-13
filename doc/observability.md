@@ -398,40 +398,45 @@ attempt or owning phase:
 | `response.resolve`, `.authorize`, `.add_comment`, `.transaction*`, `.row_lock`, `.write`, `.publish` | Response selection, existing authorization, comment transaction including commit or rollback, row wait, insert, and external publication enqueue. |
 | `execution.realtime` | Synchronous live-event and plugin publication dispatch. It does not measure browser receipt or paint. |
 
-For bounded native OpenCode diagnosis, set
-`PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS=1` as an agent/environment variable.
-The existing configured-environment projection carries it into the native Runner.
-It defaults off. The Runner creates an authenticated loopback OTLP sink and enables
-the pinned OpenCode runtime's internal tracing. The sink discards logs, resource
-attributes, span attributes, events, and unknown span names. It retains only closed
-phase names, wall timestamps, and success/failure, with a 1 MiB request limit,
-128 retained measurements, and 16 measurements per phase. No operator OTLP endpoint
-or ingestion credential is passed to OpenCode.
+For native OpenCode diagnosis, set the agent/environment variable
+`PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS=1` (default off). Runner enables the
+pinned runtime's tracing behind an authenticated loopback OTLP sink: 1 MiB per
+request, 128 retained measurements, 16 per phase. Only fixed phase names, wall
+timestamps and outcomes survive; logs, attributes and events are discarded.
+Never send raw OpenCode OTLP to the operator endpoint: it can contain prompts
+and authorization data. No operator endpoint or ingestion credential goes to OpenCode.
 
-For fresh remote diagnostic runs, the selected pack must contain the current
-build's OpenCode proxy. An otherwise compatible image pack can predate the
-collector. Such a pack cannot satisfy the diagnostic request. The existing
-verified pack preparation path selects or stages the current proxy; it can add
-startup time or fail admission when matching runtime assets are unavailable.
-Ordinary runs retain compatible image-pack reuse. Recovery retains the pack
-identity already admitted for that session.
+Fresh remote diagnostic runs require the current build's proxy. Verified pack
+preparation selects or stages it, which can add startup time or fail admission
+if assets are unavailable. Ordinary runs retain compatible pack reuse; recovery
+retains its admitted pack identity.
 
-Available phases cover context/instruction loading, skill discovery, tool and model
-resolution, model streaming (`ai.streamText`, including stream consumption), Git
-discovery/default branch, snapshots, dependency installation, and plugin startup.
-These intervals overlap; do not sum them as elapsed time. At each terminal turn,
-already-received measurements travel in one `harness.diagnostic` event through the
-existing durable PRP channel. Late exports may be absent; collection never waits
-for a provider flush or delays terminal publication to complete the diagnostic.
-Late spans from a prior completed turn are discarded at the next boundary.
+OpenCode phases cover context/instructions, skills, tools, model resolution and
+stream consumption, Git discovery/default branch, snapshots, dependencies and
+plugins. Each terminal turn forwards received measurements in one durable PRP
+`harness.diagnostic` batch, without waiting for exports or delaying the terminal.
+Late exports may be absent; prior-turn spans are discarded at the next boundary.
+OpenCode remains batch-only in the run log: its OTel projection adds no phase rows.
 
-The server validates the closed fields again and records them under a foldable
-`provider.runtime` group inside `native.session.execute`. The normal operator
-endpoint gate controls Honeycomb export. The single diagnostic batch stays in the instance run log. Its OTel projection
-does not write duplicate phase rows or await additional database work before
-terminal consumption. Without an endpoint, no provider child spans are exported. Raw OpenCode OTLP must
-never be sent directly to the operator endpoint: it can contain prompts and
-authorization attributes before the loopback sink removes them.
+Native Pi uses the same four-field carrier and finite allowlists, not OpenCode's
+OTLP sink or opt-in variable. Its observed startup/admission operations additionally
+produce deferred `run.performance.span` rows even without an operator endpoint.
+The [Pi measurement contract](run-log-events.md#native-pi-performance-measurements)
+defines the names and boundaries. `initialize` is a facade hello, not an inference
+probe. Actual each-extension import timing is **not instrumented** for qualified
+Pi 1.5.2; `PI_TIMING` text is checkpoint diagnostics, not paired spans. Early failed
+thread opens can lose buffered diagnostics before root binding. This latency-success
+instrumentation slice does not provide complete startup-failure coverage or prove
+task completion; routing and authority gates are unchanged.
+
+For both providers, validated leaves are siblings under `provider.runtime`, whose
+real parent is `native.session.execute` when that scope exists (otherwise the
+trace's current/root parent). Its min/max envelope includes gaps and overlaps,
+not cumulative work; do not sum leaves or infer nesting from overlapping times.
+The original diagnostic stays durable; Pi's extra row writes do not block ingestion
+and are settled by trace finish. The normal operator endpoint gate alone controls
+OTel export; no endpoint means no exported provider spans. No attributes or
+first-party Telemetry events are added.
 
 Detail phases emit at most 16 spans of each name per attempt. Larger receipt and
 asset inventories continue under the containing group without unbounded per-row

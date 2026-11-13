@@ -771,15 +771,20 @@ export type RestartRecoveryMeasurement = {
   disposition: string;
 };
 
-/** Group already-normalized provider measurements without exporting provider attributes. */
+/** Group normalized provider measurements; only Pi phases also get deferred run-log rows. */
 export async function recordNativeProviderPerformanceSpans(trace: NativeRunTrace, spans: NativeRunHistoricalSpan[]): Promise<void> {
   if (!spans.length) return;
   try {
     const scope = trace.start("provider.runtime", { parentName: "native.session.execute",
       startedAtMs: Math.min(...spans.map(span => span.startedAtMs)), persistRunLog: false });
     try {
+      // Names have already passed the finite provider-performance allowlist.
+      // OpenCode retains its durable batch only; Pi additionally projects each
+      // row without waiting for the sink. The existing trace.defer queue is
+      // drained by finish, before the root closes.
       for (const span of spans) await trace.record({ name: span.name, parentName: "provider.runtime",
-        startedAtMs: span.startedAtMs, endedAtMs: span.endedAtMs, outcome: span.outcome }, { persistRunLog: false });
+        startedAtMs: span.startedAtMs, endedAtMs: span.endedAtMs, outcome: span.outcome },
+        { persistRunLog: span.name.startsWith("provider.pi."), deferRunLog: true });
     } finally {
       await trace.end(scope, { endedAtMs: Math.max(...spans.map(span => span.endedAtMs)),
         outcome: spans.some(span => span.outcome === "failed") ? "failed" : "ok" });

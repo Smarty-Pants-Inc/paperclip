@@ -14,6 +14,8 @@ import type {
 import { HarnessStaleTurnError } from "../contracts/harness-driver.js";
 import { parsePiUserInput } from "../drivers/pi/pi-user-input.js";
 import { PiRpcDriver } from "../drivers/pi/pi-rpc-driver.js";
+import { PiPerformance, piPerformanceProcessStartedAtMs } from "../drivers/pi/pi-performance.js";
+import { MAX_PROVIDER_PERFORMANCE_SPANS, PROVIDER_PERFORMANCE_DIAGNOSTIC, parseProviderPerformanceSpans, type ProviderPerformanceSpan } from "../contracts/provider-performance.js";
 import { parseNativeRuntimeContext } from "../contracts/runtime-context.js";
 import {
   openCodeProxyItemNotification,
@@ -202,6 +204,10 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   const send = output.send;
   const controller = createOpenCodeProxyControllerRequests(send);
   const requestController = controller.request;
+  const performance = new PiPerformance();
+  // Node process start -> first handled facade initialize, including imports and
+  // input wait. This is Node readiness, not an OS fork or native Pi hello.
+  const proxyReady = performance.start("provider.pi.proxy.ready", piPerformanceProcessStartedAtMs);
   let session: PiRpcProxySession | null = null;
   let eventPump: Promise<void> | null = null;
   let pendingInput = Promise.resolve();
@@ -234,6 +240,14 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
 
   function threadResponse(id: string): Record<string, unknown> {
     return { thread: { id, sessionId: id, cwd }, model: activeModel, ...(piNativeAdmission ? { piNativeAdmission } : {}) };
+  }
+
+  function sendPerformance(opened: PiRpcProxySession, spans: ProviderPerformanceSpan[], turnId?: string): void {
+    // Do not grow a diagnostic backlog behind a blocked operational stream.
+    if (!spans.length || stdoutFrames.queuedFrames >= MAX_PROVIDER_PERFORMANCE_SPANS) return;
+    try { send({ method: "paperclip/providerPerformance", params: {
+      threadId: opened.ids().driverSessionId, ...(turnId ? { turnId } : {}), spans,
+    } }); } catch { /* Diagnostic sink failures never replace provider results. */ }
   }
 
   function announceTurnStarted(opened: HarnessSession, turnId: string): void {
@@ -479,6 +493,11 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (event.turnId) turnFailures.delete(event.turnId);
         if (event.runId === activeRunId && event.turnId === activeTurnId) activeTurnId = null;
       } else if (event.eventType === "harness.diagnostic") {
+        if (payload.code === PROVIDER_PERFORMANCE_DIAGNOSTIC) {
+          const spans = parseProviderPerformanceSpans(payload, Date.now());
+          sendPerformance(opened, spans, event.turnId);
+          continue;
+        }
         send({
           method: "warning",
           params: {
@@ -611,6 +630,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       // the next thread/start, and never clear a newer session's authority.
       if (session === opened) {
         session = null;
+        performance.setSink();
         activeTurnId = null;
         piNativeAdmission = undefined;
         announcedTurnIds.clear();
@@ -625,6 +645,23 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   }
 
   async function handle(message: RpcMessage): Promise<void> {
+    const phase = message.method === "initialize" ? "provider.pi.facade.initialize"
+      : message.method === "thread/start" ? "provider.pi.thread.start"
+      : message.method === "thread/resume" ? "provider.pi.thread.resume" : undefined;
+    if (message.id === undefined || !phase) return handleRequest(message);
+    if (message.method === "initialize") proxyReady("ok");
+    const finish = performance.start(phase);
+    try {
+      await handleRequest(message);
+      finish("ok");
+    } catch (error) { finish("failed"); throw error; }
+    // The successful thread result has been emitted and real native root
+    // identity now exists. Never send startup spans with invented/unbound IDs.
+    const opened = session;
+    if (opened) performance.setSink(span => sendPerformance(opened, [span]));
+  }
+
+  async function handleRequest(message: RpcMessage): Promise<void> {
     if (message.method === undefined && message.id !== undefined) {
       controller.respond({ id: message.id, result: message.result, error: message.error });
       return;
@@ -720,6 +757,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         if (session) {
           const closing = session;
           session = null;
+          performance.setSink();
           await closing.close({ reason: "thread_close" });
           await eventPump?.catch(() => {});
           eventPump = null;
@@ -778,6 +816,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     }
     const closing = session;
     session = null;
+    performance.setSink();
     try { await closing?.close({ reason: "proxy_shutdown", force: true }); }
     finally {
       await eventPump?.catch(() => {});

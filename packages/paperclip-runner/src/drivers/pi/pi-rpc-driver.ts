@@ -24,6 +24,8 @@ import { admitPiRpcSession, PiNativeAdmissionError, resolvePiNativeConfig, type 
 import { PiRpcRequestTimeoutError, PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { normalizePiRuntimeDialog, piRuntimeDialogReply, PI_RUNTIME_DIALOG_ORIGIN, type PiRuntimeDialog } from "./pi-runtime-dialog.js";
 import { piSessionFileInvalid, verifyPiSessionFile } from "./pi-session-file.js";
+import { PiPerformance } from "./pi-performance.js";
+import { PROVIDER_PERFORMANCE_DIAGNOSTIC } from "../../contracts/provider-performance.js";
 import type {
   HarnessDriver,
   HarnessDriverDescriptor,
@@ -261,6 +263,7 @@ export class PiRpcDriver implements HarnessDriver {
         environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
       }
     }
+    const performance = new PiPerformance();
     const transportOptions: PiRpcTransportOptions = {
       command: this.#options.command ?? "pi",
       args,
@@ -269,6 +272,7 @@ export class PiRpcDriver implements HarnessDriver {
       commandFd: this.#options.commandFd,
       commandLifecycle: this.#options.commandLifecycle,
       fatalSessionStartExtensionPaths,
+      onPerformanceSpan: span => performance.record(span),
       shutdownTimeoutMs: this.#options.shutdownTimeoutMs,
       killTimeoutMs: this.#options.killTimeoutMs,
     };
@@ -277,13 +281,13 @@ export class PiRpcDriver implements HarnessDriver {
       transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
       // --session loads an existing file too: no saved selection bypasses live
       // admission. The broker/models.json bootstrap above remains first.
-            const port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
+      const port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
       if (recovery) {
         // Check native readback before model/config mutation, not just the argv.
         const live = record(await port.request({ type: "get_state" }, input.signal));
         if (live.sessionId !== recovery.snapshot.driverSessionId || live.sessionFile !== sessionFile) throw piSessionFileInvalid();
       }
-      const identity = await admitPiRpcSession(port, config, input.signal);
+      const identity = await measuredPiAdmission(performance, port, config, input.signal);
       if (recovery && identity.providerSessionId !== recovery.snapshot.driverSessionId) throw piSessionFileInvalid();
       // Discovery is separate from inference. Keep catalog/auth contents private;
       // the receipt exposes only qualified version, provider names and auth shape.
@@ -295,6 +299,7 @@ export class PiRpcDriver implements HarnessDriver {
         authShape: { mode: credentialMode, source: usesPiProviderLoopback(config.model, this.#options.environment ?? {}) ? "managed-provider" : "configured-provider" } };
       return new PiRpcHarnessSession({
         transport,
+        performance,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
         providerSessionId: identity.providerSessionId,
@@ -351,6 +356,7 @@ interface PiResidentState {
 }
 interface PiSessionState {
   transport: PiRpcTransport;
+  performance?: PiPerformance;
   runId: string;
   normalizedSessionId: string;
   providerSessionId: string;
@@ -375,6 +381,15 @@ interface PiSessionState {
   promptTimeoutMs?: number;
   turnIdleTimeoutMs?: number;
   abortTimeoutMs?: number;
+}
+
+async function measuredPiAdmission(performance: PiPerformance, port: PiRpcAdmissionPort, config: PiNativeConfig, signal?: AbortSignal): Promise<PiNativeAdmittedIdentity> {
+  const finish = performance.start("provider.pi.admission");
+  try {
+    const identity = await admitPiRpcSession(port, config, signal);
+    finish("ok");
+    return identity;
+  } catch (error) { finish("failed"); throw error; }
 }
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000): PiRpcAdmissionPort {
@@ -445,6 +460,7 @@ class EventQueue implements AsyncIterable<PrpEvent> {
 
 export class PiRpcHarnessSession implements HarnessSession {
   readonly #transport: PiRpcTransport;
+  readonly #performance: PiPerformance;
   #runId: string;
   readonly #normalizedSessionId: string;
   readonly #providerSessionId: string;
@@ -502,6 +518,7 @@ export class PiRpcHarnessSession implements HarnessSession {
 
   constructor(state: PiSessionState) {
     this.#transport = state.transport;
+    this.#performance = state.performance ?? new PiPerformance();
     this.#runId = state.runId;
     this.#normalizedSessionId = state.normalizedSessionId;
     this.#providerSessionId = state.providerSessionId;
@@ -530,6 +547,8 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
     for (const diagnostic of state.initialContext.diagnostics) this.#emit("harness.diagnostic", diagnostic);
+    // Startup observations cannot acquire routing authority until native admission exists.
+    this.#performance.setSink(span => this.#emit("harness.diagnostic", { code: PROVIDER_PERFORMANCE_DIAGNOSTIC, spans: [span] }));
     void this.#pump();
   }
 
@@ -617,7 +636,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
     this.#admitted = false;
     try {
-      const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
+      const identity = await measuredPiAdmission(this.#performance, piAdmissionPort(this.#transport, this.#admissionTimeoutMs), this.#config, signal);
       if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
       if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
       this.#recordAdmission(identity);
@@ -1379,6 +1398,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       ...(origin.debug === undefined ? {} : { debug: structuredClone(origin.debug) }),
     };
     if (!this.#events.push(event)) {
+      if (eventType === "harness.diagnostic" && payload.code === PROVIDER_PERFORMANCE_DIAGNOSTIC) return;
       this.#events.close(new Error("Pi RPC PRP event queue exceeded its limit"));
       void this.close().catch(() => undefined);
     }

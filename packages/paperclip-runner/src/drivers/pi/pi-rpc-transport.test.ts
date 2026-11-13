@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createPiEventProjector } from "./pi-event-projector.js";
+import type { ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 import { PiRpcTransport, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import { realpathSync } from "node:fs";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
@@ -63,6 +64,47 @@ async function queuedRecords(child: PiRpcTransport): Promise<PiRpcRecord[]> {
   for await (const record of child.events()) records.push(record);
   return records;
 }
+
+describe("PiRpcTransport performance observations", () => {
+  it("observes async spawn and actual correlated RPC outcomes without changing IDs, errors or requests when the sink throws", async () => {
+    const spans: ProviderPerformanceSpan[] = [];
+    const child = transport(`
+      const { createInterface } = require("node:readline");
+      const requests = [];
+      createInterface({ input: process.stdin }).on("line", line => {
+        const request = JSON.parse(line); requests.push(request);
+        if (request.type === "get_commands") return;
+        process.stdout.write(JSON.stringify({ type: "response", id: request.id,
+          success: request.type !== "set_model", error: "exact native error",
+          data: request.type === "get_log" ? requests : { exact: true } }) + "\\n");
+      }).on("close", () => process.exit(0));
+    `, { onPerformanceSpan(span) { spans.push(span); throw new Error("sink sentinel"); } });
+    try {
+      await expect(child.request("get_state")).resolves.toMatchObject({ data: { exact: true } });
+      await expect(child.request("set_model")).rejects.toMatchObject({ name: "PiRpcCommandError", message: "exact native error", command: "set_model" });
+      await expect(child.request("get_commands", {}, { timeoutMs: 20 })).rejects.toMatchObject({ name: "PiRpcRequestTimeoutError", command: "get_commands" });
+      const log = await child.request("get_log");
+      expect(log.data).toEqual([
+        { id: "paperclip-pi-1", type: "get_state" }, { id: "paperclip-pi-2", type: "set_model" },
+        { id: "paperclip-pi-3", type: "get_commands" }, { id: "paperclip-pi-4", type: "get_log" },
+      ]);
+      expect(spans.map(({ name, outcome }) => [name, outcome])).toEqual([
+        ["provider.pi.process.spawn", "ok"], ["provider.pi.rpc.get_state", "ok"],
+        ["provider.pi.rpc.set_model", "failed"], ["provider.pi.rpc.get_commands", "failed"],
+      ]);
+      expect(spans.every(span => Number.isFinite(span.startedAtMs) && span.endedAtMs >= span.startedAtMs)).toBe(true);
+    } finally { await child.close(); }
+  });
+
+  it("does not mistake spawn() returning for asynchronous executable-start success", async () => {
+    const spans: ProviderPerformanceSpan[] = [];
+    const child = transport("", { command: join(process.cwd(), "nonexistent-pi-performance-executable"), onPerformanceSpan: span => { spans.push(span); } });
+    try {
+      await expect(child.request("get_state")).rejects.toThrow("Pi RPC process could not start:");
+      expect(spans.filter(span => span.name === "provider.pi.process.spawn").map(span => span.outcome)).toEqual(["failed"]);
+    } finally { await child.close(); }
+  });
+});
 
 describe("PiRpcTransport large tool output and lagging consumers", () => {
   it("retains an oversized control input for bounded projection before a safe same-ID update", async () => {

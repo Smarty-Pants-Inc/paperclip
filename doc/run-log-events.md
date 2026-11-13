@@ -178,6 +178,52 @@ own `runner.runtime.stage` and `runner.process.launch` spans. These rows stay in
 the instance run log; with an operator OTLP endpoint they are also Observability
 spans. They are not Telemetry.
 
+## Native Pi performance measurements
+
+Pi forwards observed startup/admission intervals through the existing
+`paperclip/providerPerformance` notification and durable `harness.diagnostic`
+code `provider_performance_spans`. Each row contains only `name`, `startedAtMs`,
+`endedAtMs` and `outcome` (`ok` or `failed`). The fixed names are:
+
+- `provider.pi.proxy.ready`: Node process start to first handled facade initialize,
+  including imports and input wait; not OS process birth or Pi readiness.
+- `provider.pi.facade.initialize`: handling the static facade hello through its
+  response, **not** a Pi inference probe.
+- `provider.pi.thread.start` / `provider.pi.thread.resume`: handling the existing
+  open/resume through its response; includes launch/admission when needed.
+- `provider.pi.process.spawn`: actual Pi spawn attempt through observed spawn/error.
+- `provider.pi.admission`: the existing awaited admission, without extra requests.
+- `provider.pi.rpc.get_state`, `provider.pi.rpc.set_model`,
+  `provider.pi.rpc.get_available_thinking_levels`, `provider.pi.rpc.set_thinking_level`,
+  `provider.pi.rpc.get_commands`: each existing correlated request wait.
+
+Repeated requests have separate samples. Failure means the observed wait failed;
+a timeout does not prove native work stopped. Missing bounds or unobserved work
+produce no sample. Pi uses a captured process epoch anchor plus monotonic elapsed
+time; existing outer local Runner startup steps still use `Date.now()`. Epoch
+values do not synchronize hosts. The server rejects starts older than 24 h, ends
+more than 1 s ahead, nonfinite/reversed bounds and durations over 24 h; clock skew
+can therefore drop samples. Both carrier validators inspect at most 128 rows and
+retain at most 16 per name per batch, stripping all other fields.
+
+After diagnostic commit, Pi leaves also project into deferred `run.performance.span`
+rows with their own `wallStartedAtMs`, duration and outcome, parented as siblings
+under `provider.runtime`. No extra row is written for the group. Its min/max
+interval includes gaps/overlaps, not summed work or inferred leaf parentage.
+Writes use the existing trace diagnostic queue: ingestion does not wait on the
+sink, and finish settles pending rows before closing the trace. A crash or failed
+diagnostic sink can leave projections absent; this is not an exactly-once replay
+contract. OpenCode retains only its diagnostic batch, without these extra rows.
+Local rows need no OTLP endpoint; optional OTel export retains its existing gate.
+No content, paths, raw identities, credentials or new attributes are added.
+
+Actual each-extension import timing is **not instrumented** for qualified Pi 1.5.2.
+`PI_TIMING` text is checkpoint diagnostics, not paired start/end spans; session-start
+handlers are not import observers. Early failed thread opens can lose buffered
+diagnostics before root binding. This latency-success instrumentation slice neither
+covers every startup failure nor proves task completion, and does not relax root,
+descendant or foreign-thread authority fences to recover missing measurements.
+
 ## Native PRP Run-Log Events
 
 Provider startup command failures and failed provider turns can carry a

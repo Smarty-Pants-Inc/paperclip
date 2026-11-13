@@ -921,7 +921,12 @@ fn provider_performance_spans(params: &Value) -> Vec<Value> {
             | "provider.tools.resolve" | "provider.model.resolve" | "provider.model.stream"
             | "provider.workspace.snapshot.track" | "provider.workspace.snapshot.patch" | "provider.workspace.snapshot.diff"
             | "provider.workspace.git.discover" | "provider.workspace.git.default_branch"
-            | "provider.dependencies.install" | "provider.plugins.initialize") { return None; }
+            | "provider.dependencies.install" | "provider.plugins.initialize"
+            | "provider.pi.proxy.ready" | "provider.pi.facade.initialize"
+            | "provider.pi.thread.start" | "provider.pi.thread.resume" | "provider.pi.process.spawn"
+            | "provider.pi.admission" | "provider.pi.rpc.get_state" | "provider.pi.rpc.set_model"
+            | "provider.pi.rpc.get_available_thinking_levels" | "provider.pi.rpc.set_thinking_level"
+            | "provider.pi.rpc.get_commands") { return None; }
         let start = span.get("startedAtMs")?.as_f64()?;
         let end = span.get("endedAtMs")?.as_f64()?;
         if !start.is_finite() || !end.is_finite() || start < 0.0 || end < start || end - start > 86_400_000.0 { return None; }
@@ -2686,6 +2691,46 @@ mod tests {
             ]})
         )
         .is_empty());
+    }
+
+    #[test]
+    fn pi_performance_diagnostics_admit_only_the_fixed_phases_and_four_fields() {
+        let names = [
+            "provider.pi.proxy.ready", "provider.pi.facade.initialize",
+            "provider.pi.thread.start", "provider.pi.thread.resume", "provider.pi.process.spawn",
+            "provider.pi.admission", "provider.pi.rpc.get_state", "provider.pi.rpc.set_model",
+            "provider.pi.rpc.get_available_thinking_levels", "provider.pi.rpc.set_thinking_level",
+            "provider.pi.rpc.get_commands",
+        ];
+        let mut spans: Vec<Value> = names.iter().map(|name| json!({
+            "name": name, "startedAtMs": 1000, "endedAtMs": 1010, "outcome": "failed",
+            "prompt": "private-sentinel", "path": "private-sentinel",
+            "threadId": "private-sentinel", "attributes": {"token": "private-sentinel"}
+        })).collect();
+        for name in ["provider.pi.rpc.unknown", "provider.pi.extension.import", "private-sentinel"] {
+            spans.push(json!({"name":name,"startedAtMs":1000,"endedAtMs":1010}));
+        }
+        let events = normalize_pi_notification_in("paperclip/providerPerformance", &json!({
+            "spans": spans, "authorization": "private-sentinel"
+        }), None);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "harness.diagnostic");
+        assert_eq!(events[0].priority, EventPriority::P1);
+        let rows = events[0].payload["spans"].as_array().unwrap();
+        assert_eq!(rows.len(), names.len());
+        for (row, name) in rows.iter().zip(names) {
+            assert_eq!(*row, json!({"name":name,"startedAtMs":1000.0,"endedAtMs":1010.0,"outcome":"failed"}));
+        }
+        assert!(!events[0].payload.to_string().contains("private-sentinel"));
+        let capped = normalize_pi_notification_in("paperclip/providerPerformance", &json!({
+            "spans": vec![json!({"name":"provider.pi.rpc.get_state","startedAtMs":1,"endedAtMs":2}); 200]
+        }), None);
+        assert_eq!(capped[0].payload["spans"].as_array().unwrap().len(), 16);
+        assert!(normalize_pi_notification_in("paperclip/providerPerformance", &json!({"spans":[
+            {"name":"provider.pi.process.spawn","startedAtMs":-1,"endedAtMs":2},
+            {"name":"provider.pi.process.spawn","startedAtMs":10,"endedAtMs":1},
+            {"name":"provider.pi.admission","startedAtMs":0,"endedAtMs":86400001}
+        ]}), None).is_empty());
     }
 
     #[test]

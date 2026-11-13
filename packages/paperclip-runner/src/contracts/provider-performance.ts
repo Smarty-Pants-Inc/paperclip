@@ -8,6 +8,11 @@ export const PROVIDER_PERFORMANCE_PHASES = [
   "provider.workspace.snapshot.track", "provider.workspace.snapshot.patch", "provider.workspace.snapshot.diff",
   "provider.workspace.git.discover", "provider.workspace.git.default_branch",
   "provider.dependencies.install", "provider.plugins.initialize",
+  "provider.pi.proxy.ready", "provider.pi.facade.initialize",
+  "provider.pi.thread.start", "provider.pi.thread.resume", "provider.pi.process.spawn",
+  "provider.pi.admission", "provider.pi.rpc.get_state", "provider.pi.rpc.set_model",
+  "provider.pi.rpc.get_available_thinking_levels", "provider.pi.rpc.set_thinking_level",
+  "provider.pi.rpc.get_commands",
 ] as const;
 export type ProviderPerformancePhase = typeof PROVIDER_PERFORMANCE_PHASES[number];
 export interface ProviderPerformanceSpan {

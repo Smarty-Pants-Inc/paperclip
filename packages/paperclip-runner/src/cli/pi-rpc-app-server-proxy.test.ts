@@ -215,6 +215,103 @@ async function request(
 }
 
 describe("Pi RPC app-server facade proxy", () => {
+  it("carries real transport/driver measurements to structured root-bound startup wire without adding native calls", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-performance-wire-"));
+    const sink = new FakeSink();
+    let native!: PiRpcTransport;
+    const calls: string[] = [];
+    const proxy = createPiRpcAppServerProxy({ stdout: sink,
+      environment: { PAPERCLIP_RUN_ID: "run-1", PAPERCLIP_NORMALIZED_SESSION_ID: "conversation" },
+      createDriver: config => new PiRpcDriver({ ...config, runtimeDirectory: root, piRpcThinkingLevel: "high",
+        environment: { PI_CODING_AGENT_DIR: join(root, "agent") },
+        transportFactory: options => {
+          native = new PiRpcTransport({ ...options, command: process.execPath, args: ["-e", `
+            const { createInterface } = require("node:readline");
+            createInterface({ input: process.stdin }).on("line", line => {
+              const request = JSON.parse(line);
+              const data = request.type === "get_state" ? { sessionId: "real-root", model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+                : request.type === "set_model" ? { provider: "neutral", id: "model" }
+                : request.type === "get_available_thinking_levels" ? { levels: ["high"] }
+                : request.type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
+                : request.type === "get_commands" ? { commands: ["PRIVATE_COMMAND_SENTINEL"] } : undefined;
+              process.stdout.write(JSON.stringify({ type: "response", id: request.id, success: true, data }) + "\\n");
+            }).on("close", () => process.exit(0));
+          `] });
+          const request = native.request.bind(native);
+          vi.spyOn(native, "request").mockImplementation((command, params, options) => { calls.push(command); return request(command, params, options); });
+          return native;
+        },
+      }),
+    });
+    const measurements = () => sink.decoded().filter(frame => frame.method === "paperclip/providerPerformance")
+      .flatMap(frame => (frame.params as { spans: Array<{ name: string; startedAtMs: number; endedAtMs: number; outcome: string }> }).spans);
+    try {
+      await request(proxy, sink, 901, "initialize");
+      expect(sink.decoded().some(frame => frame.method === "paperclip/providerPerformance")).toBe(false);
+      await request(proxy, sink, 902, "thread/start", { cwd: root, model: "neutral/model", baseInstructions: "PRIVATE_INSTRUCTION_SENTINEL" });
+      await vi.waitFor(() => expect(measurements()).toHaveLength(10));
+      expect(calls).toEqual(["get_state", "set_model", "get_available_thinking_levels", "set_thinking_level", "get_state", "get_available_models"]);
+      expect(measurements().filter(row => row.name === "provider.pi.rpc.get_state")).toHaveLength(2);
+      expect(measurements().map(row => row.name)).toEqual(expect.arrayContaining([
+        "provider.pi.proxy.ready", "provider.pi.facade.initialize", "provider.pi.thread.start", "provider.pi.process.spawn", "provider.pi.admission",
+      ]));
+      await request(proxy, sink, 903, "thread/resume", { threadId: "real-root" });
+      await native.request("get_commands");
+      await vi.waitFor(() => expect(measurements()).toHaveLength(12));
+      expect(calls).toHaveLength(7); // Warm resume is not another launch/admission.
+      expect(measurements().filter(row => row.name === "provider.pi.thread.resume")).toHaveLength(1);
+      expect(sink.decoded().filter(frame => frame.method === "paperclip/providerPerformance").every(frame => {
+        const params = frame.params as Record<string, unknown>;
+        return params.threadId === "real-root" && !("turnId" in params);
+      })).toBe(true);
+      expect(measurements().every(row => Object.keys(row).sort().join() === "endedAtMs,name,outcome,startedAtMs"
+        && Number.isFinite(row.startedAtMs) && row.endedAtMs >= row.startedAtMs && row.outcome === "ok")).toBe(true);
+      expect(JSON.stringify(measurements())).not.toMatch(/PRIVATE_|real-root|conversation/);
+    } finally { await proxy.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("retains operational results when the diagnostic sink throws, and never releases unbound failed-bootstrap rows", async () => {
+    for (const failBootstrap of [false, true]) {
+      const sink = new FakeSink(); const session = new FakeSession();
+      const write = sink.write.bind(sink);
+      sink.write = chunk => {
+        if (JSON.parse(chunk).method === "paperclip/providerPerformance") throw new Error("diagnostic sink sentinel");
+        return write(chunk);
+      };
+      const driver = makeDriver(session);
+      if (failBootstrap) driver.openSession = async () => { throw new Error("exact bootstrap failure"); };
+      const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => driver });
+      try {
+        expect(await request(proxy, sink, 921, "initialize")).toHaveProperty("result.serverInfo.name", "pi_rpc");
+        const response = await request(proxy, sink, 922, "thread/start", { model: "neutral/model" });
+        if (failBootstrap) expect(response).toMatchObject({ error: { message: "exact bootstrap failure" } });
+        else expect(response).toHaveProperty("result.thread.id", session.id);
+        expect(sink.decoded().some(frame => frame.method === "paperclip/providerPerformance")).toBe(false);
+      } finally { await proxy.close(); }
+    }
+  });
+
+  it("validates structured diagnostics instead of converting them to warning strings", async () => {
+    const sink = new FakeSink(); const session = new FakeSession();
+    const proxy = createPiRpcAppServerProxy({ stdout: sink, createDriver: () => makeDriver(session) });
+    try {
+      await request(proxy, sink, 911, "thread/start", { model: "neutral/model" });
+      const now = Date.now();
+      session.push("harness.diagnostic", { code: "provider_performance_spans", message: "PRIVATE_MESSAGE", spans: [
+        { name: "provider.pi.rpc.get_commands", startedAtMs: now - 10, endedAtMs: now, outcome: "failed", path: "PRIVATE_PATH", token: "PRIVATE_TOKEN" },
+        { name: "provider.pi.extension.import", startedAtMs: now - 10, endedAtMs: now },
+        { name: "provider.pi.rpc.get_state", startedAtMs: NaN, endedAtMs: now },
+      ] });
+      session.push("harness.diagnostic", { code: "ordinary", message: "ordinary warning" });
+      await vi.waitFor(() => expect(sink.decoded().some(frame => frame.method === "warning")).toBe(true));
+      const frames = sink.decoded().filter(frame => frame.method === "paperclip/providerPerformance");
+      expect(frames.at(-1)).toEqual({ method: "paperclip/providerPerformance", params: { threadId: session.id, spans: [
+        { name: "provider.pi.rpc.get_commands", startedAtMs: now - 10, endedAtMs: now, outcome: "failed" },
+      ] } });
+      expect(JSON.stringify(frames)).not.toMatch(/PRIVATE_|extension.import/);
+    } finally { await proxy.close(); }
+  });
+
   // Keep reason: real Pi 1.5.2 -> Rust lost 14/8 usage at this wire boundary.
   // provider_events.rs:1146-1171 reads tokenUsage.total/last (not cumulative/runDelta).
   it.each([false, true])("maps exact receipt totals and deltas for Rust, including warm model metadata (%s)", async warm => {

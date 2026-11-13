@@ -73,6 +73,30 @@ async function inputProxyFixture() {
   return { ...f, frames, request, async close() { await proxy.close(); await f.close(); } };
 }
 describe("PiRpcDriver", () => {
+  it("measures each admission without extra native calls, retains both get_state reads and preserves exact failed-call errors", async () => {
+    const f = await failureFixture();
+    const admission = ["get_state", "set_model", "get_available_thinking_levels", "set_thinking_level", "get_state"];
+    try {
+      expect(f.transport.requests.map(request => request.type)).toEqual([...admission, "get_available_models"]);
+      await f.session.attachRun!({ runId: "run-new" });
+      expect(f.transport.requests.map(request => request.type)).toEqual([...admission, "get_available_models", ...admission]);
+      const nativeError = new Error("exact native rejection sentinel");
+      const nativeRequest = f.transport.request.bind(f.transport);
+      vi.spyOn(f.transport, "request").mockImplementation(async (type, input) => {
+        if (type === "set_model") { f.transport.requests.push({ type, input }); throw nativeError; }
+        return nativeRequest(type, input);
+      });
+      await expect(f.session.attachRun!({ runId: "run-failed" })).rejects.toBe(nativeError);
+      await flushFailure();
+      const diagnostics = f.events.filter(event => event.eventType === "harness.diagnostic" && event.payload.code === "provider_performance_spans");
+      expect(diagnostics.flatMap(event => event.payload.spans as Array<{ name: string; outcome: string }>).map(span => [span.name, span.outcome]))
+        .toEqual([["provider.pi.admission", "ok"], ["provider.pi.admission", "ok"], ["provider.pi.admission", "failed"]]);
+      expect(diagnostics.every(event => event.turnId === undefined)).toBe(true);
+      expect(f.transport.requests.slice(-2).map(request => request.type)).toEqual(["get_state", "set_model"]);
+      expect(f.transport.requests.some(request => ["prompt", "get_commands"].includes(request.type))).toBe(false);
+      expect(f.transport.closed).toBe(false);
+    } finally { await f.close(); }
+  });
   it.each(["native", "data-url", "mixed-native", "mixed-data-url"])("passes %s images through the facade into prompt and steer RPC images", async shape => {
     const f = await inputProxyFixture();
     const image = shape.endsWith("native") ? { type: "image", data: "aGVsbG8=", mimeType: "image/png" } : { type: "image", url: "data:image/png;base64,aGVsbG8=" };

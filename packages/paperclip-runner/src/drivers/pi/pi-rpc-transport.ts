@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
 import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
+import { PiPerformance, piRpcPerformancePhase, type PiPerformanceSink } from "./pi-performance.js";
 
 export type PiRpcRecord = Record<string, unknown>;
 
@@ -18,6 +19,7 @@ export interface PiRpcTransportOptions {
   env?: NodeJS.ProcessEnv;
   commandFd?: number;
   commandLifecycle?: { beforeSpawn(): void; afterSpawn(): void; afterExit(): void };
+  onPerformanceSpan?: PiPerformanceSink;
   /** Canonical owned host/child paths already resolved and verified by the driver. */
   fatalSessionStartExtensionPaths?: readonly string[];
   maxRecordBytes?: number;
@@ -121,6 +123,7 @@ class AsyncRecordQueue implements AsyncIterable<PiRpcRecord> {
 export class PiRpcTransport {
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #records = new AsyncRecordQueue();
+  readonly #performance = new PiPerformance();
   readonly #pending = new Map<string, { command: string; resolve: (value: PiRpcRecord) => void; reject: (error: Error) => void }>();
   readonly #exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
   readonly #maxRecordBytes: number;
@@ -156,15 +159,22 @@ export class PiRpcTransport {
       while (stdio.length <= options.commandFd) stdio.push("ignore");
       stdio[options.commandFd] = options.commandFd;
     }
+    if (options.onPerformanceSpan) this.#performance.setSink(options.onPerformanceSpan);
     options.commandLifecycle?.beforeSpawn();
-    this.#child = spawn(options.command, [...(options.args ?? [])], {
-      cwd: options.cwd,
-      env: options.env ?? process.env,
-      stdio,
-      // Never signal the runner's group. Escalation owns Pi and its tool children.
-      detached: process.platform !== "win32",
-      windowsHide: true,
-    }) as ChildProcessWithoutNullStreams;
+    const spawned = this.#performance.start("provider.pi.process.spawn");
+    try {
+      this.#child = spawn(options.command, [...(options.args ?? [])], {
+        cwd: options.cwd,
+        env: options.env ?? process.env,
+        stdio,
+        // Never signal the runner's group. Escalation owns Pi and its tool children.
+        detached: process.platform !== "win32",
+        windowsHide: true,
+      }) as ChildProcessWithoutNullStreams;
+    } catch (error) { spawned("failed"); throw error; }
+    // spawn() returning is not success: observe Node's asynchronous OS-spawn receipt.
+    this.#child.once("spawn", () => spawned("ok"));
+    this.#child.once("error", () => spawned("failed"));
     options.commandLifecycle?.afterSpawn();
     let resolveExit!: (value: { code: number | null; signal: NodeJS.Signals | null }) => void;
     this.#exit = new Promise((resolve) => { resolveExit = resolve; });
@@ -243,6 +253,8 @@ export class PiRpcTransport {
     // behind a pending request or timer.
     const line = `${JSON.stringify({ ...params, id, type: command })}\n`;
     const timeoutMs = requestTimeout(options.timeoutMs ?? this.#requestTimeoutMs);
+    const phase = piRpcPerformancePhase(command);
+    const measured = phase ? this.#performance.start(phase) : undefined;
     let cancelDrain = () => {};
     const response = new Promise<PiRpcRecord>((resolve, reject) => {
       const cleanup = () => {
@@ -254,8 +266,8 @@ export class PiRpcTransport {
         this.#pending.get(id)?.reject(new PiRpcRequestTimeoutError(command, timeoutMs));
       }, timeoutMs);
       this.#pending.set(id, { command,
-        resolve: value => { cleanup(); resolve(value); },
-        reject: error => { cleanup(); reject(error); },
+        resolve: value => { cleanup(); measured?.("ok"); resolve(value); },
+        reject: error => { cleanup(); measured?.("failed"); reject(error); },
       });
     });
     try {

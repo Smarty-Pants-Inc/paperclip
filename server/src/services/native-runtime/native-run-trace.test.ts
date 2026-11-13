@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { trace as otelTrace } from "@opentelemetry/api";
 
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 import { getActiveStepContext } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
@@ -73,7 +74,7 @@ describe("native runner performance trace", () => {
     const {traceContext, spans}=createRecordingTraceContext();
     let release!: () => void;
     const barrier = new Promise<void>(resolve => { release=resolve; });
-    const write=vi.fn(async()=>barrier);
+    const write=vi.fn(async(_event: AdapterRuntimeEvent)=>barrier);
     const trace=createNativeRunTrace({runId:"provider-perf-blocked-log",startedAtMs:1000,traceContext,onEvent:write});
     const names=["provider.model.stream","provider.context.environment","provider.tools.resolve","provider.model.resolve",
       "provider.workspace.snapshot.track","provider.workspace.snapshot.patch","provider.workspace.snapshot.diff","provider.skills.discovery"];
@@ -87,7 +88,79 @@ describe("native runner performance trace", () => {
       expect(write).not.toHaveBeenCalled();
       expect(spans.filter(span=>span.parentName==="provider.runtime")).toHaveLength(128);
     } finally {release();await work;await trace.finish("ok");}
+    expect(write.mock.calls.map(([event]) => event.payload?.span)).toEqual(["task.provider_session.measured"]);
   });
+
+  it("persists each Pi row's own timing and outcome without blocking ingestion, then drains before finish", async () => {
+    const { traceContext, spans } = createRecordingTraceContext();
+    const events: AdapterRuntimeEvent[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const trace = createNativeRunTrace({ runId: "pi-performance", startedAtMs: 1_000, traceContext,
+      onEvent: async event => { await gate; events.push(event); } });
+    trace.start("native.session.execute", { startedAtMs: 1_000 });
+    const measurements = [
+      { name: "provider.pi.thread.start", startedAtMs: 1_100, endedAtMs: 1_500, outcome: "ok" as const },
+      { name: "provider.pi.rpc.get_state", startedAtMs: 1_200, endedAtMs: 1_230, outcome: "failed" as const },
+      { name: "provider.pi.rpc.get_state", startedAtMs: 1_300, endedAtMs: 1_340, outcome: "ok" as const },
+    ];
+    let finished = false;
+    let finish: Promise<void> | undefined;
+    try {
+      await recordNativeProviderPerformanceSpans(trace, measurements.map(span => ({ ...span,
+        parentName: "private-sentinel", attributes: { reason: "private-sentinel" } })));
+      // The ingestion callback returned while its first database row is stalled.
+      expect(events).toEqual([]);
+      expect(spans.filter(span => span.parentName === "provider.runtime")).toHaveLength(3);
+      expect(spans.find(span => span.name === "provider.runtime")).toMatchObject({
+        parentName: "native.session.execute", endedAtMs: 1_500,
+      });
+      finish = trace.finish("failed").then(() => { finished = true; });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(finished).toBe(false);
+      expect(spans.find(span => span.name === "task.provider_session")?.endedAtMs).toBeNull();
+    } finally {
+      release();
+      await (finish ?? trace.finish("failed"));
+    }
+    const rows = events.filter(event => typeof event.payload?.span === "string" && event.payload.span.startsWith("provider.pi."));
+    expect(rows).toHaveLength(3);
+    for (const [index, span] of measurements.entries()) {
+      expect(rows[index]).toMatchObject({ eventType: NATIVE_RUN_SPAN_EVENT_TYPE,
+        level: span.outcome === "failed" ? "warn" : "info", payload: {
+          span: span.name, parentSpan: "provider.runtime", wallStartedAtMs: span.startedAtMs,
+          startOffsetMs: span.startedAtMs - 1_000, durationMs: span.endedAtMs - span.startedAtMs,
+          outcome: span.outcome,
+        } });
+    }
+    expect(events.some(event => event.payload?.span === "provider.runtime")).toBe(false);
+    expect(events.at(-1)?.payload?.span).toBe("task.provider_session.measured");
+    expect(JSON.stringify(events)).not.toContain("private-sentinel");
+  });
+
+  it("writes Pi rows without an OTLP endpoint or tracer lookup, retaining OpenCode batch-only behavior", async () => {
+    vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "");
+    const lookup = vi.spyOn(otelTrace, "getTracer");
+    const events: AdapterRuntimeEvent[] = [];
+    try {
+      const trace = createNativeRunTrace({ runId: "pi-no-otlp", startedAtMs: 1_000,
+        onEvent: async event => { events.push(event); } });
+      await recordNativeProviderPerformanceSpans(trace, [
+        { name: "provider.pi.admission", startedAtMs: 1_100, endedAtMs: 1_200, outcome: "failed" },
+        { name: "provider.model.stream", startedAtMs: 1_200, endedAtMs: 1_500 },
+      ]);
+      await trace.finish("ok");
+      expect(events.map(event => event.payload?.span)).toEqual([
+        "provider.pi.admission", "task.provider_session.measured",
+      ]);
+      expect(events[0]?.payload).toMatchObject({ wallStartedAtMs: 1_100, durationMs: 100, outcome: "failed" });
+      expect(lookup).not.toHaveBeenCalled();
+    } finally {
+      lookup.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("groups normalized provider phases under their real native execution parent", async () => {
     const {traceContext, spans}=createRecordingTraceContext();
     const trace=createNativeRunTrace({runId:"provider-perf",startedAtMs:1000,traceContext});
