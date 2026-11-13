@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { contextCompactionService } from "../context-compaction.js";
 import { claimNativeSessionResumptions } from "../native-runtime/native-finalization-reconciler.js";
 import type { Db } from "@paperclipai/db";
-import { authUsers, agents, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations, plugins } from "@paperclipai/db";
+import { authUsers, agents, agentWakeupRequests, budgetIncidents, budgetPolicies, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations, plugins, pluginCompanySettings } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -963,17 +963,90 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     }
   }
 
+  async function runStrandedPluginWake(opts: { pluginStatus?: string | null; companyEnabled?: boolean; mutation?: string;
+    requester?: "plugin" | "other"; idempotencyKey?: string; priorRunWithSameKey?: boolean } = {}) {
+    const seeded = await strandedMention("native");
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.issue.id));
+    const pluginId = randomUUID();
+    const pluginKey = `blocker-relay-${pluginId.slice(0, 8)}`;
+    if (opts.pluginStatus !== null) {
+      await db.insert(plugins).values({ id: pluginId, pluginKey, packageName: pluginKey,
+        version: "1", status: (opts.pluginStatus ?? "ready") as never, manifestJson: { id: "blocker-relay", name: "Blocker Relay", version: "1.0.0",
+          description: "Test plugin", categories: [], capabilities: [] } as never });
+      if (opts.companyEnabled === false) {
+        await db.insert(pluginCompanySettings).values({ companyId: seeded.company.id, pluginId, enabled: false } as never);
+      }
+    }
+    if (opts.priorRunWithSameKey) {
+      await db.insert(agentWakeupRequests).values({ companyId: seeded.company.id, agentId: seeded.agent.id,
+        source: "assignment", status: "completed", runId: seeded.run.id, idempotencyKey: opts.idempotencyKey,
+        requestedByActorType: "system", requestedByActorId: pluginId,
+        payload: { issueId: seeded.issue.id, mutation: "plugin_wakeup", pluginId, pluginKey } } as never);
+    }
+    await db.update(agentWakeupRequests).set({ agentId: seeded.agent.id, idempotencyKey: opts.idempotencyKey ?? null,
+      requestedByActorType: "system", requestedByActorId: opts.requester === "other" ? randomUUID() : pluginId, payload: {
+        issueId: seeded.issue.id, mutation: opts.mutation ?? "plugin_wakeup", pluginId, pluginKey,
+        _paperclipWakeContext: { issueId: seeded.issue.id, wakeReason: "plugin wake", pluginId, pluginKey },
+      } }).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(seeded.recipient);
+    deps.canStartNewExternalBotWork.mockResolvedValue(false);
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => "responsible-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    }), recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+    const controlDeps = runControlCallbacks(db);
+    vi.mocked(controlDeps.wakeQueue.releaseIssueExecution).mockImplementation(release);
+    deps.releaseIssueExecutionAndPromote.mockImplementation(createHeartbeatRunControl(db, controlDeps).releaseIssueExecutionAndPromote);
+    await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+    const queued = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, seeded.agent.id)))
+      .filter(run => run.status === "queued");
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    return { queued, wake };
+  }
+
+  it.each([
+    ["uninstalled (missing)", { pluginStatus: null }],
+    ["disabled", { pluginStatus: "disabled" }],
+    ["errored", { pluginStatus: "error" }],
+    ["disabled for the company", { companyEnabled: false }],
+  ] as const)("F1: a %s plugin's deferred wake is cancelled, not promoted", async (_label, opts) => {
+    const { queued, wake } = await runStrandedPluginWake(opts as never);
+    expect(queued).toHaveLength(0);
+    expect(wake.status).toBe("cancelled");
+  });
+
+  it("F2: a wake that only carries plugin metadata (not the plugin's own requestWakeup) does not newly qualify", async () => {
+    const timer = await runStrandedPluginWake({ mutation: "timer" });
+    expect(timer.queued).toHaveLength(0);
+    expect(timer.wake.status).toBe("deferred_issue_execution");
+  });
+
+  it("F2: a plugin-shaped wake requested by someone other than the plugin does not qualify", async () => {
+    const forged = await runStrandedPluginWake({ requester: "other" });
+    expect(forged.queued).toHaveLength(0);
+    expect(forged.wake.status).toBe("deferred_issue_execution");
+  });
+
+  it("F3: a plugin wake whose idempotency key already produced a run coalesces instead of queueing another", async () => {
+    const { queued, wake } = await runStrandedPluginWake({ idempotencyKey: "paperclip-plugin-blocker-relay:evt-1", priorRunWithSameKey: true });
+    expect(queued).toHaveLength(0);
+    expect(wake.status).toBe("coalesced");
+  });
+
   it("promotes one deferred plugin wake after a native response-wake run is stranded", async () => {
     const seeded = await strandedMention("native");
     await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.issue.id));
     const pluginId = randomUUID();
-    await db.insert(plugins).values({ id: pluginId, pluginKey: "blocker-relay", packageName: "blocker-relay",
+    const pluginKey = `blocker-relay-${pluginId.slice(0, 8)}`;
+    await db.insert(plugins).values({ id: pluginId, pluginKey, packageName: pluginKey,
       version: "1", status: "ready", manifestJson: { id: "blocker-relay", name: "Blocker Relay", version: "1.0.0",
         description: "Test plugin", categories: [], capabilities: [] } as never });
     await db.update(agentWakeupRequests).set({ agentId: seeded.agent.id, requestedByActorType: "system",
       requestedByActorId: pluginId, payload: {
-        issueId: seeded.issue.id, mutation: "plugin_wakeup", pluginId, pluginKey: "blocker-relay",
-        _paperclipWakeContext: { issueId: seeded.issue.id, wakeReason: "plugin wake", pluginId, pluginKey: "blocker-relay" },
+        issueId: seeded.issue.id, mutation: "plugin_wakeup", pluginId, pluginKey,
+        _paperclipWakeContext: { issueId: seeded.issue.id, wakeReason: "plugin wake", pluginId, pluginKey },
       } }).where(eq(agentWakeupRequests.id, seeded.pending.id));
     const deps = callbacks(db);
     deps.getAgent.mockResolvedValue(seeded.recipient);
