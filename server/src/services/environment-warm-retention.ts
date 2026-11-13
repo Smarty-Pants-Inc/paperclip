@@ -28,7 +28,8 @@ export async function settleWarmRetention(db: Db, lease: typeof environmentLease
   if (lease.leasePolicy !== "reuse_by_environment" || !lease.heartbeatRunId) return { lease, disposition: desired };
   return db.transaction(async tx => {
     // Run -> lease matches terminalization's ownership lock order.
-    const [run] = await tx.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+    const [run] = await tx.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+      providerWorkStarted: sql<unknown>`${heartbeatRuns.resultJson}#>'{executionRecovery,providerWorkStarted}'` })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, lease.heartbeatRunId!),
         eq(heartbeatRuns.companyId, lease.companyId))).for("update");
     if (!run || !["succeeded", "failed", "cancelled", "interrupted", "timed_out"].includes(run.status)) {
@@ -37,7 +38,7 @@ export async function settleWarmRetention(db: Db, lease: typeof environmentLease
     const [current] = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
       eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!))).for("update");
     if (!current || !["active", "pending_cleanup"].includes(current.status)) return null;
-    let disposition = providerResourceDispositionForTerminalRun(desired, run.status, run.errorCode);
+    let disposition = providerResourceDispositionForTerminalRun(desired, run.status, run.errorCode, run.providerWorkStarted);
     // Safety stops and explicit stop/destroy choices never become warm retention.
     if (run.status !== "succeeded" && disposition !== "keep_running") return { lease: current, disposition };
     const metadata = { ...current.metadata };
