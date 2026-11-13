@@ -526,7 +526,7 @@ function LegacyIssuesToolbar({ context, search, controls }: CollectionToolbarPro
   );
 }
 
-function IssueSearchInput({
+export function IssueSearchInput({
   value,
   onDebouncedChange,
 }: {
@@ -537,6 +537,7 @@ function IssueSearchInput({
   const lastCommittedValueRef = useRef(value);
 
   useEffect(() => {
+    if (value === lastCommittedValueRef.current) return;
     setDraftValue(value);
     lastCommittedValueRef.current = value;
   }, [value]);
