@@ -61,7 +61,7 @@ export function transientStartRetryAt(now: Date, failure?: unknown, freeAttempt?
   return new Date(Math.max(now.getTime() + delay, Number.isFinite(retryAt) ? retryAt : 0));
 }
 
-function noticeKey(messageId: string) { return `transient_start_retry:${messageId}`; }
+function noticeKey(messageId: string) { return `retrying_message:${messageId}`; }
 
 /** The existing scheduled-retry deadline owner also owns the 60s projection.
  * Reconstructible from durable waiting rows, including same-run native waits. */
@@ -88,8 +88,9 @@ async function pendingNotices(db: Db, runId?: string, cutoff: Date | null = null
         coalesce(${heartbeatRuns.contextSnapshot}#>>'{transientStartWait,messageId}', ${heartbeatRuns.resultJson}#>>'{transientStartWait,messageId}')
         and message.author_type = 'user' and message.author_user_id is not null and message.deleted_at is null)`,
       sql`not exists (select 1 from issue_comments notice where notice.company_id = ${heartbeatRuns.companyId}
-        and notice.issue_id = ${heartbeatRuns.issueId} and notice.metadata->>'authorizationReason' =
-        'transient_start_retry:' || coalesce(${heartbeatRuns.contextSnapshot}#>>'{transientStartWait,messageId}', ${heartbeatRuns.resultJson}#>>'{transientStartWait,messageId}'))`,
+        and notice.issue_id = ${heartbeatRuns.issueId} and notice.metadata->>'authorizationReason' in (
+        'retrying_message:' || coalesce(${heartbeatRuns.contextSnapshot}#>>'{transientStartWait,messageId}', ${heartbeatRuns.resultJson}#>>'{transientStartWait,messageId}'),
+        'transient_start_retry:' || coalesce(${heartbeatRuns.contextSnapshot}#>>'{transientStartWait,messageId}', ${heartbeatRuns.resultJson}#>>'{transientStartWait,messageId}')))`,
     ));
 }
 

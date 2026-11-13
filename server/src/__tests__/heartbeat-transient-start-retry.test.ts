@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { projectTransientStartNotices } from "../services/transient-start-wait.js";
+import { nextTransientStartNoticeAt, projectTransientStartNotices } from "../services/transient-start-wait.js";
 import { closeIdleWarmNativeSessionsForRestart } from "../services/native-runtime/native-session-executor.js";
 import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart-fixture.js";
 import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.js";
@@ -137,6 +137,16 @@ describe.skipIf(!support.supported)("human-message transient start retries", () 
       const notices = await f.notices();
       expect(notices).toHaveLength(1);
       expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice" });
+      expect(notices[0]!.metadata).toMatchObject({ authorizationReason: `retrying_message:${f.message.id}` });
+      // A persisted notice from the first version must not become a duplicate
+      // after upgrading the durable authorization key. Reconstruct the deadline
+      // from PostgreSQL as a restarted scheduler does, with no process memory.
+      await f.db.update(issueComments).set({ metadata: { ...notices[0]!.metadata!,
+        authorizationReason: `transient_start_retry:${f.message.id}` } }).where(eq(issueComments.id, notices[0]!.id));
+      expect(await nextTransientStartNoticeAt(f.db)).toBeNull();
+      await projectTransientStartNotices(f.db, new Date(began + 120_000));
+      expect(await f.notices()).toHaveLength(1);
+      await f.db.update(issueComments).set({ metadata: notices[0]!.metadata }).where(eq(issueComments.id, notices[0]!.id));
       expect(f.leaseCalls()).toBe(1);
       // The failure/recovery observer and scheduler race on the same source.
       await Promise.all([f.heartbeat.scheduleBoundedRetry(f.run.id), f.heartbeat.scheduleBoundedRetry(f.run.id)]);
@@ -242,7 +252,8 @@ describe.skipIf(!support.supported)("human-message transient start retries", () 
       expect((await f.read()).contextSnapshot?.wakeCommentId).toBe(f.message.id);
       expect(f.startup.starts).toBe(3);
       expect(f.startup.turns).toBe(0);
-      expect(await f.notices()).toHaveLength(1);
+      expect(await f.notices()).toEqual([expect.objectContaining({
+        metadata: expect.objectContaining({ authorizationReason: `retrying_message:${f.message.id}` }) })]);
       vi.setSystemTime(Date.now() + 3_600_000);
       await f.heartbeat.reapOrphanedRuns();
       await f.heartbeat.promoteDueScheduledRetries();
