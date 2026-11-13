@@ -114,6 +114,7 @@ export function connectionManagementService(db: Db) {
         if ((options.mutation ?? action !== "connections:read") && issue && issue.workMode !== "standard") throw forbidden("Connection changes are unavailable in Ask and Plan modes");
       }
     }
+    const finishesApp = resource.operation === "POST /companies/:companyId/tools/apps/:connectionId/finish";
     const expandedTargets = new Set(options.targetAgentIds ?? []);
     const referencedConnections: string[] = [];
     let currentGatewayResource: ConnectionManagementResource | undefined;
@@ -143,6 +144,9 @@ export function connectionManagementService(db: Db) {
       const bindings = isToolAssignmentOperation(resource.operation) ? []
         : await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
       for (const binding of bindings) {
+        // Finish's route adapter has resolved additions/removals. Do not widen
+        // them back to the profile's retained agent or company recipients.
+        if (finishesApp && (binding.targetType === "agent" || binding.targetType === "company")) continue;
         if (binding.targetType === "agent") expandedTargets.add(binding.targetId);
         if (binding.targetType === "company") {
           const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, resource.companyId));
@@ -200,7 +204,7 @@ export function connectionManagementService(db: Db) {
       };
       if (options.mutation ?? action !== "connections:read") {
         const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id));
-        for (const install of isToolAssignmentOperation(resource.operation) && actor.type === "agent" ? [] : installs) {
+        for (const install of finishesApp || (isToolAssignmentOperation(resource.operation) && actor.type === "agent") ? [] : installs) {
           if (install.targetType === "agent") expandedTargets.add(install.targetId);
           if (install.targetType === "company") {
             const rows = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, resource.companyId));
@@ -307,6 +311,9 @@ export function connectionManagementService(db: Db) {
         }
         const targetDecision = await authorization.decide({ actor: principal, action: "agent_config:update", resource: { type: "agent", companyId: resource.companyId, agentId: targetAgentId }, scope: { targetAgentId, ...(assignmentOnly && principal.type === "agent" && principal.agentId !== targetAgentId ? { requiresChangeGrant: true } : {}) } }, { interactionPolicy: "defer_to_mutation" });
         if (!targetDecision.allowed) throw forbidden(targetDecision.explanation, authorizationDeniedDetails(targetDecision));
+        if (resource.operation === "POST /companies/:companyId/tools/apps/:connectionId/finish" && principal.type === "agent" && principal.agentId !== targetAgentId) {
+          await assertCanManageSubordinateAgent(db, principal, { id: targetAgentId, companyId: resource.companyId });
+        }
       }
     }
     return decision;
