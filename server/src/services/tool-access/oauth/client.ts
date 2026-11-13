@@ -381,7 +381,11 @@ export function createOAuthClientProtocol({ fetchRemoteHttpUrl, assertOAuthEndpo
     });
     const payload = (await response.json().catch(() => ({}))) as unknown;
     const record = asRecord(payload);
-    if (!response.ok || record.ok === false) {
+    // GitHub reports a rejected code or refresh token as HTTP 200 with an error field.
+    const errorInSuccessfulResponse =
+      response.ok && record.ok !== false && typeof record.error === "string";
+    if (!response.ok || record.ok === false || errorInSuccessfulResponse) {
+      const failureStatus = errorInSuccessfulResponse ? 400 : response.status;
       const providerError = normalizeOAuthProviderError(record.error);
       const message = oauthProviderErrorMessage(
         providerError,
@@ -389,7 +393,7 @@ export function createOAuthClientProtocol({ fetchRemoteHttpUrl, assertOAuthEndpo
       );
       if (
         input.grantType === "refresh_token" &&
-        providerError === "invalid_grant"
+        (providerError === "invalid_grant" || record.error === "bad_refresh_token")
       ) {
         throw new HttpError(
           422,
@@ -397,14 +401,14 @@ export function createOAuthClientProtocol({ fetchRemoteHttpUrl, assertOAuthEndpo
           {
             code: "oauth_reauthorization_required",
             providerError,
-            status: response.status,
+            status: failureStatus,
           },
         );
       }
       throw new HttpError(502, message, {
         code: "oauth_token_exchange_failed",
         providerError,
-        status: response.status,
+        status: failureStatus,
       });
     }
     const accessToken =
