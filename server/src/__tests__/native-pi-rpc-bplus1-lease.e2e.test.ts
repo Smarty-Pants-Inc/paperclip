@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, rename, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import https, { createServer as createHttpsServer } from "node:https";
 import { tmpdir } from "node:os";
@@ -24,7 +24,7 @@ import { registerLocalRuntimeApiServer } from "../runtime-api.js";
 import { environmentService } from "../services/environments.js";
 import { remoteTerminationReceipt, hasRemoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
-import { createRunnerdBackend, nativeControllerMigrationDescriptor, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
+import { createRunnerdBackend, nativeControllerMigrationDescriptor, scopedRunnerdStateRoot, verifyNativeHarnessBackupStreamed } from "../services/native-runtime/native-session-executor.js";
 import { createNativeControllerRecovery } from "../services/native-runtime/native-controller-recovery.js";
 import { loadNativeRunnerCheckpoint } from "../services/native-runtime/native-runner-checkpoint.js";
 import { currentNativeControllerIdentity } from "../services/native-runtime/native-restart-recovery.js";
@@ -86,7 +86,7 @@ function sessionFile(pi: Birth): string {
   return join(env.PAPERCLIP_PI_RUNTIME_DIR, `${env.PAPERCLIP_NORMALIZED_SESSION_ID}.jsonl`);
 }
 
-it.skipIf(!enabled)("retires a simulated sandbox lease, admits its safe DB successor and really recovers Pi-only history", async () => {
+it.skipIf(!enabled).each(["intact", "missing", "invalid", "foreign", "symlink"] as const)("retires a simulated sandbox lease, admits its safe DB successor and really recovers Pi-only history (transcript=%s)", async transcriptState => {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -413,6 +413,37 @@ it.skipIf(!enabled)("retires a simulated sandbox lease, admits its safe DB succe
     const snapshot = admission.checkpoint as PersistedNativeSession;
     await db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
       || ${JSON.stringify({ sessionCheckpoint: snapshot })}::jsonb` }).where(eq(heartbeatRuns.id, next.runId));
+    let damagedBytes: Buffer | undefined;
+    let foreignTarget: string | undefined;
+    if (transcriptState !== "intact") {
+      const backup = await verifyNativeHarnessBackupStreamed({ root: scopedRunnerdStateRoot(first.execution),
+        execution: first.execution, runnerInstanceId: first.native.runnerInstanceId });
+      expect(backup, "the controller holds a verified backup before the interrupted restore").not.toBeNull();
+      const backedUpTranscript = join(backup!.root, "pi", `${first.native.normalizedSessionId}.jsonl`);
+      expect(await readFile(backedUpTranscript, "utf8")).toContain(fact);
+      const piDirectory = join(remoteSessionRoot, "filesystem", "pi");
+      if (transcriptState === "missing") {
+        // Preserve removed bytes/cache as evidence, outside the allocation's
+        // admitted runtime path. The controller may recover only its backup.
+        await rename(piDirectory, join(root, "interrupted-restore-removed-pi"));
+        await mkdir(piDirectory, { mode: 0o700 });
+        expect(readdirSync(piDirectory)).toEqual([]);
+      } else if (transcriptState === "symlink") {
+        foreignTarget = join(root, "foreign-transcript.jsonl");
+        damagedBytes = Buffer.from("FOREIGN TARGET MUST NOT BE READ OR OVERWRITTEN\n");
+        await writeFile(foreignTarget, damagedBytes);
+        await rename(initial.file, join(root, "original-before-foreign-symlink.jsonl"));
+        await symlink(foreignTarget, initial.file);
+      } else {
+        const original = before.toString("utf8");
+        const [header, ...entries] = original.split("\n");
+        damagedBytes = transcriptState === "foreign"
+          ? Buffer.from([JSON.stringify({ ...JSON.parse(header!), id: randomUUID() }), ...entries].join("\n"))
+          : Buffer.concat([before, Buffer.from("{corrupt Pi history}\n")]);
+        await writeFile(initial.file, damagedBytes);
+      }
+      stage("cold-resume file needs repair; full history remains in verified backup", { transcriptState, backedUpTranscript, file: initial.file });
+    }
     const nextBackend = await backend(next, "resumed");
     // This is the real returned production backend, not a spy or a fake result.
     if (!nextBackend.recoverSession) throw new Error("native backend has no recoverSession");
@@ -428,6 +459,23 @@ it.skipIf(!enabled)("retires a simulated sandbox lease, admits its safe DB succe
     expect(requests).toHaveLength(2);
     expect(requests[1]).toMatchObject({ historyHasFact: true, latestPromptHasFact: false, reply: `RECALLED_${fact}` });
     expect(JSON.stringify(continued.events)).toContain(fact);
+    expect(JSON.stringify(continued.events), "backup recovery must not fork or emit a history-loss receipt").not.toMatch(/pi_session_file_(missing|invalid)/);
+    let preservedFile: string | undefined;
+    if (damagedBytes) {
+      const liveDirectory = join(initial.file, "..");
+      const evidenceDirectory = foreignTarget ? `${liveDirectory}.quarantined-links` : liveDirectory;
+      const aside = readdirSync(evidenceDirectory).filter(name => name.startsWith(`${first.native.normalizedSessionId}.jsonl.invalid-`));
+      expect(aside, "invalid and foreign originals are preserved even when backup recovery succeeds").toHaveLength(1);
+      preservedFile = join(evidenceDirectory, aside[0]!);
+      if (foreignTarget) {
+        expect((await lstat(preservedFile)).isSymbolicLink()).toBe(true);
+        expect(await readlink(preservedFile)).toBe(foreignTarget);
+        expect(await readFile(foreignTarget)).toEqual(damagedBytes);
+        const inertEvidence = join(liveDirectory, aside[0]! + ".evidence.json");
+        expect((await lstat(inertEvidence)).isFile()).toBe(true);
+        expect(JSON.parse(await readFile(inertEvidence, "utf8"))).toMatchObject({ original: preservedFile, target: foreignTarget });
+      } else expect(await readFile(preservedFile)).toEqual(damagedBytes);
+    }
     await cancelThenClose(recovered.session!, "lease continuity proof complete");
     await vi.waitFor(() => {
       expect(sameBirth(processPairs[1]!.runner)).toBe(false); expect(sameBirth(processPairs[1]!.pi)).toBe(false);
@@ -465,7 +513,7 @@ it.skipIf(!enabled)("retires a simulated sandbox lease, admits its safe DB succe
       environmentLeaseId: first.lease.id, normalizedSessionId: first.native.normalizedSessionId, runnerInstanceId: first.native.runnerInstanceId });
     expect((await readFile(initial.file, "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(line => line.type === "session")).toHaveLength(1);
     await writeFile(join(root, "proof.json"), JSON.stringify({ scope: "actual DB admission + split filesystem, same simulated allocation/new sandbox lease; no Boat service",
-      oldLeaseId: first.lease.id, newLeaseId: next.lease.id, providerLeaseId, normalizedSessionId: first.native.normalizedSessionId,
+      transcriptState, preservedFile, oldLeaseId: first.lease.id, newLeaseId: next.lease.id, providerLeaseId, normalizedSessionId: first.native.normalizedSessionId,
       sessionFile: initial.file, providerSessionId: continued.snapshot.providerSessionId, selectedRunId: selected!.id,
       processPairs, requests, actualRecoverSession: { tracePath, resume, response }, receipt, controllerRoot, controllerArchive, runnerArchive, fact,
       sha256Before: createHash("sha256").update(before).digest("hex") }, null, 2));
