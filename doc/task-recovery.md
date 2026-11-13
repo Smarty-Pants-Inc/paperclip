@@ -140,6 +140,26 @@ The normal dispatch queue rechecks task eligibility and claims saved input.
 An accepted native result goes back to its existing finalizer. Recovery does
 not create a second agent to reproduce that result.
 
+### Ordinary addressed-card turns
+
+A native run woken only to answer another agent's ordinary confirmation card is
+response-only: it does not acquire the assignee's task execution or checkout.
+Any failure in that turn ends it with `native_addressed_interaction_failed`,
+without scheduling a session retry or changing the assignee's task. An accepted
+native result still goes to its finalizer. Unverified physical ownership keeps
+its stronger ownership fence and diagnostics.
+
+If the card is still pending under the failure transaction's lock, the system
+adds one safe issue comment saying it could not handle the card and the card
+remains pending. Closed cards are neither reopened nor described as pending.
+A new authorized user card event can start a separate response turn; it is not
+an automatic retry or resend of the failed card. Assignee and native-review
+recovery retain their existing behavior.
+
+This classification uses existing persisted run/card identity, without a schema
+migration. It does not rewrite historical failed coordinators or enable
+response-only session resumption.
+
 ## Files, ownership and effects
 
 The source recovery action holds a validated `systemRecovery` record. Its

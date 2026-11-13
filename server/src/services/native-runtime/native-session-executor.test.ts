@@ -16462,6 +16462,7 @@ describe("native process ownership", () => {
       expect.anything(),
       execution.binding,
       expectedBinding,
+      { summary: "must not become authoritative" },
     );
   });
 

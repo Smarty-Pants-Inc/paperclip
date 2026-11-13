@@ -78,6 +78,7 @@ import {
 } from "../native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
 import { nativeCleanupHoldsAdmission } from "../native-runtime/native-cleanup-admission-hold.js";
+import { classifyAddressedInteractionExecutionCandidate } from "../native-runtime/native-addressed-interaction.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { preserveTaskRemoteWorkspaceWriter } from "../native-runtime/native-failed-workspace-recovery.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
@@ -4335,7 +4336,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .where(eq(issues.id, issue.id));
           }
 
-          if (!activeExecutionRun) {
+          const excludedResponseRunIds: string[] = [];
+          while (!activeExecutionRun) {
             const legacyRun = await tx
               .select()
               .from(heartbeatRuns)
@@ -4346,6 +4348,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES,
                   ]),
                   sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+                  excludedResponseRunIds.length ? notInArray(heartbeatRuns.id, excludedResponseRunIds) : undefined,
                 ),
               )
               .orderBy(
@@ -4355,6 +4358,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .limit(1)
               .then((rows) => rows[0] ?? null);
 
+            if (!legacyRun) break;
+            const executionCandidate = await classifyAddressedInteractionExecutionCandidate(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, agentId: legacyRun.agentId, runId: legacyRun.id,
+            }, legacyRun.contextSnapshot);
+            if (executionCandidate !== "ordinary") {
+              excludedResponseRunIds.push(legacyRun.id);
+              continue;
+            }
             if (legacyRun) {
               if (await cancelStaleScheduledRetry(legacyRun)) {
                 activeExecutionRun = null;
@@ -4379,6 +4390,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .where(eq(issues.id, issue.id));
               }
             }
+            break;
           }
 
           // Availability is advisory: competing clicks may both read it before

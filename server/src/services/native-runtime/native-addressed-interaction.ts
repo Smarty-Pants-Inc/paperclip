@@ -6,6 +6,7 @@ import { budgetServiceInTransaction } from "../budgets.js";
 import { evaluateIssueThreadInteractionResolverAudience } from "../issue-thread-interaction-resolution.js";
 import { isIssueReviewVerdictInteraction, resolveIssueReviewRequester } from "../issue-review-policy.js";
 import { nativeRunKeyScope } from "./native-skill-test-scope.js";
+import { readNativeReviewAssignmentContext } from "./native-review-participant.js";
 
 export type NativeAddressedInteractionBinding = {
   companyId: string; issueId: string; agentId: string; runId: string;
@@ -24,13 +25,13 @@ export function readNativeAddressedInteractionId(snapshot: unknown): string | nu
     ? value.interactionId : null;
 }
 
-export async function getNativeAddressedInteractionGrant(db: Db, binding: NativeAddressedInteractionBinding, options: {
+async function getAddressedInteractionAuthority(db: Db, binding: NativeAddressedInteractionBinding, options: {
   requireRunning?: boolean;
   phase?: "pending" | "settlement" | "resolved";
   expectedStatus?: "accepted" | "rejected";
-} = {}): Promise<NativeAddressedInteractionGrant | null> {
+} = {}, requireNativeBinding = true): Promise<NativeAddressedInteractionGrant | null> {
   const [row] = await db.select({ run: {
-    runtimeMode: heartbeatRuns.runtimeMode, status: heartbeatRuns.status,
+    runtimeMode: heartbeatRuns.runtimeMode, nativeIssueId: heartbeatRuns.nativeIssueId, status: heartbeatRuns.status,
     contextSnapshot: heartbeatRuns.contextSnapshot, responsibleUserId: heartbeatRuns.responsibleUserId,
   }, issue: {
     id: issues.id, companyId: issues.companyId, status: issues.status, hiddenAt: issues.hiddenAt,
@@ -38,12 +39,14 @@ export async function getNativeAddressedInteractionGrant(db: Db, binding: Native
     createdByAgentId: issues.createdByAgentId, createdByUserId: issues.createdByUserId,
   }, agent: { status: agents.status }, company: { status: companies.status } })
     .from(heartbeatRuns)
-    .innerJoin(issues, and(eq(issues.id, heartbeatRuns.nativeIssueId), eq(issues.companyId, heartbeatRuns.companyId)))
+    .innerJoin(issues, and(eq(issues.id, requireNativeBinding ? heartbeatRuns.nativeIssueId : binding.issueId), eq(issues.companyId, heartbeatRuns.companyId)))
     .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId)))
     .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
     .where(and(eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
-      eq(heartbeatRuns.agentId, binding.agentId), eq(heartbeatRuns.nativeIssueId, binding.issueId))).limit(1);
-  if (!row || row.run.runtimeMode !== "native"
+      eq(heartbeatRuns.agentId, binding.agentId), requireNativeBinding ? eq(heartbeatRuns.nativeIssueId, binding.issueId) : undefined)).limit(1);
+  if (!row || (requireNativeBinding ? row.run.runtimeMode !== "native"
+    : row.run.contextSnapshot?.issueId !== binding.issueId
+      || (row.run.nativeIssueId !== null && row.run.nativeIssueId !== binding.issueId))
     || !(options.phase === "resolved" ? ["running", "succeeded", "failed"]
       : options.requireRunning === false ? ["queued", "running"] : ["running"]).includes(row.run.status)
     || ["paused", "terminated", "pending_approval", "error"].includes(row.agent.status)
@@ -55,6 +58,15 @@ export async function getNativeAddressedInteractionGrant(db: Db, binding: Native
     eq(issueThreadInteractions.issueId, binding.issueId))).limit(1);
   if (!interaction || interaction.kind !== "request_confirmation" || interaction.addresseeAgentId !== binding.agentId
     || interaction.addresseeUserId) return null;
+  if ((row.run.contextSnapshot?.sourceRunId ?? null) !== interaction.sourceRunId) return null;
+  if (interaction.sourceRunId) {
+    const [sourceRun] = await db.select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+      issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, interaction.sourceRunId),
+        eq(heartbeatRuns.companyId, binding.companyId))).limit(1);
+    if (!sourceRun || (sourceRun.nativeIssueId ?? sourceRun.issueId ?? sourceRun.contextSnapshot?.issueId) !== binding.issueId
+      || (interaction.createdByAgentId && sourceRun.agentId !== interaction.createdByAgentId)) return null;
+  }
   const payload = interaction.payload as unknown as Record<string, unknown> | null;
   if (!payload || payload.target != null || payload.toolAction !== undefined || payload.secretProposal !== undefined) return null;
   const phase = options.phase ?? "pending";
@@ -82,6 +94,25 @@ export async function getNativeAddressedInteractionGrant(db: Db, binding: Native
   if (await budgetServiceInTransaction(db).getInvocationBlock(binding.companyId, binding.agentId,
     { issueId: binding.issueId, runId: binding.runId, admittedRecovery: true })) return null;
   return { ...binding, interaction };
+}
+
+export async function getNativeAddressedInteractionGrant(db: Db, binding: NativeAddressedInteractionBinding, options: {
+  requireRunning?: boolean;
+  phase?: "pending" | "settlement" | "resolved";
+  expectedStatus?: "accepted" | "rejected";
+} = {}): Promise<NativeAddressedInteractionGrant | null> {
+  return getAddressedInteractionAuthority(db, binding, options);
+}
+
+export async function classifyAddressedInteractionExecutionCandidate(db: Db, binding: NativeAddressedInteractionBinding,
+  persistedContextSnapshot: unknown): Promise<"ordinary" | "response_only" | "denied"> {
+  if (!persistedContextSnapshot || typeof persistedContextSnapshot !== "object") return "ordinary";
+  const context = persistedContextSnapshot as Record<string, unknown>;
+  if (context.wakeReason !== "interaction_pending") return "ordinary";
+  if (context.nativeReviewInteractionId) return readNativeReviewAssignmentContext(context) ? "ordinary" : "denied";
+  if (!readNativeAddressedInteractionId(context)) return "denied";
+  const authority = await getAddressedInteractionAuthority(db, binding, { requireRunning: false }, false);
+  return authority ? "response_only" : "denied";
 }
 
 export async function getNativeAddressedInteractionAttachmentSelections(db: Db, binding: NativeAddressedInteractionBinding, options: {
