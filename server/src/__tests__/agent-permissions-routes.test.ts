@@ -1752,8 +1752,9 @@ describe("agent permission routes", () => {
   it.each([
     ["PATCH status", (base: string) => request(base).patch(`/api/agents/${agentId}`).send({ status: "terminated" })],
     ["POST terminate", (base: string) => request(base).post(`/api/agents/${agentId}/terminate`).send({})],
-  ])("keeps agent termination board-only through %s, even for an agent allowed to configure the target", async (_route, send) => {
+  ])("refuses agent termination through %s when configure does not cover the target", async (_route, send) => {
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "idle" });
+    mockAccessService.decide.mockResolvedValue({ allowed: false, action: "agent_config:update", reason: "deny_scope", explanation: "Configure permission does not cover this target." });
     const app = await createApp({
       type: "agent",
       agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1765,8 +1766,11 @@ describe("agent permission routes", () => {
     const res = await requestApp(app, send);
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("only a board user can terminate an agent");
-    expect(res.body.error).toContain(`[the agent's profile](/PAP/agents/${agentId})`);
+    expect(res.body.error).toBe("Configure permission does not cover this target.");
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "agent_config:update",
+      scope: { targetAgentId: agentId, requiresChangeGrant: true },
+    }));
     expect(mockAgentService.terminate).not.toHaveBeenCalled();
     expect(mockAgentService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.cancelInvocationsForAgents).not.toHaveBeenCalled();
@@ -1796,8 +1800,9 @@ describe("agent permission routes", () => {
   it.each([
     ["PATCH status", (base: string) => request(base).patch(`/api/agents/${agentId}`).send({ status: "paused" })],
     ["POST pause", (base: string) => request(base).post(`/api/agents/${agentId}/pause`).send({})],
-  ])("keeps pausing an agent board-only through %s, even for an agent allowed to configure the target", async (_route, send) => {
+  ])("refuses pausing an agent through %s when configure does not cover the target", async (_route, send) => {
     mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "running" });
+    mockAccessService.decide.mockResolvedValue({ allowed: false, action: "agent_config:update", reason: "deny_scope", explanation: "Configure permission does not cover this target." });
     const app = await createApp({
       type: "agent",
       agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1809,10 +1814,11 @@ describe("agent permission routes", () => {
     const res = await requestApp(app, send);
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toBe("Board access required");
-    expect(res.body.code).toBe("board_access_required");
-    expect(res.body.remediation).toContain("this denial is final");
-    expect(res.body.remediation).toContain(`[Open the agent's profile](/<prefix>/agents/${agentId})`);
+    expect(res.body.error).toBe("Configure permission does not cover this target.");
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "agent_config:update",
+      scope: { targetAgentId: agentId, requiresChangeGrant: true },
+    }));
     expect(mockAgentService.updateAndTransition).not.toHaveBeenCalled();
     expect(mockAgentService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.cancelActiveForAgent).not.toHaveBeenCalled();
