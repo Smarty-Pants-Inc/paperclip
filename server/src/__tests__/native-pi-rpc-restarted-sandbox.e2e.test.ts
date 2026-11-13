@@ -91,7 +91,7 @@ function sessionFile(pi: Birth): string {
 // running, so the restarted label alone never retires an owner. The owner
 // stays alive, its close never happens, and the successor must refuse
 // without rotating or replacing it.
-it.skipIf(!enabled).each(["recover", "open", "alive"] as const)("REG-26: a provider stop kills the idle warm Runner; the restarted box's successor retires the dead owner and continues the same Pi file, never a live one (%s)", async mode => {
+it.skipIf(!enabled).each(["recover", "recover-no-restart", "open", "alive"] as const)("REG-26: a provider stop kills the idle warm Runner; the restarted box's successor retires the dead owner and continues the same Pi file, never a live one (%s)", async mode => {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -436,11 +436,12 @@ it.skipIf(!enabled).each(["recover", "open", "alive"] as const)("REG-26: a provi
       stage("GREEN: a live owner on a restarted label was neither rotated nor replaced");
       return;
     }
-    // The provider woke the same box from its stopped state (resumedFromState archived).
-    const nextBackend = await backend(next, "resumed", true);
+    // An ordinary running-box resume can also have lost its idle Runner.
+    // Only exact generation loss, never the restart label, admits replacement.
+    const nextBackend = await backend(next, "resumed", mode !== "recover-no-restart");
     // This is the real returned production backend, not a spy or a fake result.
     if (!nextBackend.recoverSession) throw new Error("native backend has no recoverSession");
-    const recovered = mode === "recover"
+    const recovered = mode.startsWith("recover")
       ? await nextBackend.recoverSession(snapshot, { signal: AbortSignal.timeout(120_000) })
       : { recovered: true, reason: undefined, session: await nextBackend.openSession({ identity: { companyId, agentId, issueId,
           runId: next.runId, sessionId: next.native.normalizedSessionId }, workingDirectory: remoteCwd }) };
@@ -473,7 +474,7 @@ it.skipIf(!enabled).each(["recover", "open", "alive"] as const)("REG-26: a provi
     const resume = resumes[0];
     const response = resume ? frames.find(entry => entry.direction !== resume.direction
       && entry.frame.id === resume.frame.id && entry.frame.result !== undefined) : undefined;
-    if (mode === "recover") {
+    if (mode.startsWith("recover")) {
       expect(resumes, "exactly one real Rust -> Pi proxy resume required; no replay").toHaveLength(1);
       expect(resume!.frame.params?.threadId).toBe(initial.snapshot.providerSessionId);
       expect(response, "matching successful real proxy resume response required").toBeDefined();
