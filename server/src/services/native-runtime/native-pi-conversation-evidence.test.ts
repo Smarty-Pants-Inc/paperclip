@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, lstat, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +20,35 @@ async function fixture(directory = "pi") {
 }
 
 // Data safety + private owner scope: actual shared cleanup, not mocked deletion.
+it("retains a renamed Pi JSONL session by its first-line header and preserves its bytes", async () => {
+  const f = await fixture();
+  await rm(join(f.source, f.directory), { recursive: true, force: true });
+  const bytes = Buffer.from('{"type":"session","version":3,"id":"abc123","timestamp":"2026-11-13T09:00:00.000Z","cwd":"/tmp"}\n{"type":"message","id":"m1"}\n');
+  const file = join(f.source, "renamed.data");
+  await writeFile(file, bytes);
+  const before = createHash("sha256").update(bytes).digest("hex");
+
+  await removeNativeHarnessBackup(f.source);
+
+  await expect(lstat(f.source)).rejects.toMatchObject({ code: "ENOENT" });
+  const [leaf] = await readdir(join(f.evidence, scope));
+  expect(createHash("sha256").update(await readFile(join(f.evidence, scope, leaf!, "renamed.data"))).digest("hex")).toBe(before);
+});
+
+it("fails closed and retains bytes when a candidate first line exceeds the scan bound", async () => {
+  const f = await fixture();
+  await rm(join(f.source, f.directory), { recursive: true, force: true });
+  const bytes = Buffer.alloc(4 * 1024 + 8, 0x61);
+  await writeFile(join(f.source, "opaque.bin"), bytes);
+
+  await removeNativeHarnessBackup(f.source);
+
+  await expect(lstat(f.source)).rejects.toMatchObject({ code: "ENOENT" });
+  const [leaf] = await readdir(join(f.evidence, scope));
+  expect(createHash("sha256").update(await readFile(join(f.evidence, scope, leaf!, "opaque.bin"))).digest("hex"))
+    .toBe(createHash("sha256").update(bytes).digest("hex"));
+});
+
 it.each(["pi", "pi-agent", "acpx/conversation/pi-home", "legacy/.pi"])(
   "retains a scoped %s history on shared publication cleanup", async directory => {
     const f = await fixture(directory);

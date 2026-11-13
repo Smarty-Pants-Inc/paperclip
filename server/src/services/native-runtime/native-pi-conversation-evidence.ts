@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, opendir, readdir, readFile, rename } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { lstat, mkdir, opendir, open, rename } from "node:fs/promises";
 import path from "node:path";
 import { logger } from "../../middleware/logger.js";
 
@@ -30,25 +31,78 @@ export function isNativePiConversationDirectoryName(name: string): boolean {
   return PI_HISTORY_DIRECTORIES.has(name);
 }
 
-/** Identify the provider-owned history, not its contents. Invalid, unreadable,
- * foreign and symlink asides are evidence too; never parse or follow them. */
+/** Pi writes one JSON record per line; session-manager.ts creates the first
+ * record with `type: "session"` (see the installed pi runtime source). */
+const MAX_EVIDENCE_ENTRIES = 100_000;
+const MAX_EVIDENCE_DEPTH = 128;
+const MAX_EVIDENCE_HEADER_BYTES = 4 * 1024;
+
+async function hasPiSessionHeader(filename: string): Promise<boolean> {
+  let file;
+  try {
+    file = await open(filename, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await file.stat();
+    if (!stat.isFile()) return true;
+    const buffer = Buffer.alloc(MAX_EVIDENCE_HEADER_BYTES);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    const bytes = buffer.subarray(0, bytesRead);
+    const newline = bytes.indexOf(0x0a);
+    if (newline < 0 && stat.size > MAX_EVIDENCE_HEADER_BYTES) return true;
+    const firstLine = bytes.subarray(0, newline < 0 ? bytes.length : newline).toString("utf8");
+    return (JSON.parse(firstLine) as { type?: unknown })?.type === "session";
+  } catch {
+    // An unreadable or malformed candidate cannot authorize its deletion.
+    return true;
+  } finally {
+    await file?.close().catch(() => undefined);
+  }
+}
+
+/** Keep existing name/manifest rules and also recognize renamed raw Pi sessions.
+ * Bound traversal and reads; never follow symlinks. Incomplete scans fail closed. */
 export async function hasNativePiConversationEvidence(root: string): Promise<boolean> {
   const stat = await lstat(root).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
     throw error;
   });
   if (!stat?.isDirectory() || stat.isSymbolicLink()) return false;
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    if (isNativePiConversationDirectoryName(entry.name)) return true;
-    if (entry.name === "manifest.json" && entry.isFile()) {
-      // A failed/partial transfer may have a Pi manifest but no history directory.
-      const manifest = JSON.parse(await readFile(path.join(root, entry.name), "utf8"));
-      if (manifest?.providerKind === "pi_rpc" || manifest?.driverKind === "pi_rpc"
-        || manifest?.directories?.some((directory: { name?: unknown }) => isNativePiConversationDirectoryName(String(directory?.name)))) return true;
+  let entriesSeen = 0;
+  async function visit(directory: string, depth: number): Promise<boolean> {
+    if (depth > MAX_EVIDENCE_DEPTH) return true;
+    try {
+      for await (const entry of await opendir(directory)) {
+        if (++entriesSeen > MAX_EVIDENCE_ENTRIES) return true;
+        if (isNativePiConversationDirectoryName(entry.name)) return true;
+        const filename = path.join(directory, entry.name);
+        if (entry.name === "manifest.json" && entry.isFile()) {
+          let manifestFile;
+          try {
+            manifestFile = await open(filename, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+            const manifestStat = await manifestFile.stat();
+            if (!manifestStat.isFile() || manifestStat.size > MAX_EVIDENCE_HEADER_BYTES) return true;
+            const buffer = Buffer.alloc(MAX_EVIDENCE_HEADER_BYTES);
+            const { bytesRead } = await manifestFile.read(buffer, 0, buffer.length, 0);
+            const manifest = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+            if (manifest?.providerKind === "pi_rpc" || manifest?.driverKind === "pi_rpc"
+              || manifest?.directories?.some((child: { name?: unknown }) => isNativePiConversationDirectoryName(String(child?.name)))) return true;
+          } catch {
+            return true;
+          } finally {
+            await manifestFile?.close().catch(() => undefined);
+          }
+        }
+        if (entry.isDirectory()) {
+          if (await visit(filename, depth + 1)) return true;
+        } else if (entry.isFile() && await hasPiSessionHeader(filename)) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return true;
     }
-    if (entry.isDirectory() && await hasNativePiConversationEvidence(path.join(root, entry.name))) return true;
   }
-  return false;
+  return visit(root, 0);
 }
 
 function sourceScope(root: string): { base: string; scope: string } | null {
