@@ -1,7 +1,7 @@
 import type { PluginDefinition } from "@paperclipai/plugin-sdk";
 import { parseConfig, type G12Config } from "./config.js";
 import { runTick } from "./backstop.js";
-import { errorCode, G12ErrorCode as Code } from "./errors.js";
+import { errorCode, G12Error, G12ErrorCode as Code } from "./errors.js";
 
 export function createG12Definition(): PluginDefinition {
   let companyId: string | null = null;
@@ -10,7 +10,7 @@ export function createG12Definition(): PluginDefinition {
   return {
     async setup(ctx) {
       ctx.jobs.register("g12-backstop", async () => {
-        if (running) throw new Error(Code.JobAlreadyRunning);
+        if (running) throw new G12Error(Code.JobAlreadyRunning);
         running = true;
         try {
           if (!companyId) {
@@ -20,10 +20,10 @@ export function createG12Definition(): PluginDefinition {
           // Always re-read the explicit company: rejected/stale config delivery
           // must not leave a worker scanning with an older, enabled config.
           const current = parseConfig(await ctx.config.get(companyId));
-          if (!config || current.companyId !== companyId) throw new Error(Code.CompanyBindingMismatch);
+          if (!config || current.companyId !== companyId) throw new G12Error(Code.CompanyBindingMismatch);
           await runTick(ctx, current);
         } catch (error) {
-          throw new Error(errorCode(error, Code.JobFailed));
+          throw new G12Error(errorCode(error, Code.JobFailed));
         } finally { running = false; }
       });
     },
@@ -32,7 +32,7 @@ export function createG12Definition(): PluginDefinition {
       const next = parseConfig(raw);
       if (!context?.companyId || next.companyId !== context.companyId ||
           (companyId !== null && companyId !== context.companyId)) {
-        throw new Error(Code.CompanyBindingMismatch);
+        throw new G12Error(Code.CompanyBindingMismatch);
       }
       companyId = context.companyId;
       config = next;

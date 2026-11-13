@@ -34,9 +34,15 @@ export enum G12ErrorCode {
   WakeFailed = "G12_WAKE_FAILED",
   WakeRefused = "G12_WAKE_REFUSED",
   WakeReceiptInvalid = "G12_WAKE_RECEIPT_INVALID",
+  WakeRetryInvalid = "G12_WAKE_RETRY_INVALID",
+  WakeReconcileInvalid = "G12_WAKE_RECONCILE_INVALID",
+  WakeUnresolved = "G12_WAKE_UNRESOLVED",
 }
 
-const codes = new Set<string>(Object.values(G12ErrorCode));
+/** Only locally constructed, typed failures can carry a code across boundaries. */
+export class G12Error extends Error {
+  constructor(readonly code: G12ErrorCode) { super(code); }
+}
 export function errorCode(error: unknown, fallback: G12ErrorCode): G12ErrorCode {
-  return error instanceof Error && codes.has(error.message) ? error.message as G12ErrorCode : fallback;
+  return error instanceof G12Error ? error.code : fallback;
 }

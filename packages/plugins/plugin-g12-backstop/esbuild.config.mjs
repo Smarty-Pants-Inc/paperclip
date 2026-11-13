@@ -1,7 +1,7 @@
 import { build } from "esbuild";
 
 await build({
-  entryPoints: ["src/manifest.ts", "src/worker.ts"],
+  entryPoints: ["src/manifest.ts", "src/worker.ts", "src/reconcile.ts"],
   outdir: "dist",
   bundle: true,
   platform: "node",

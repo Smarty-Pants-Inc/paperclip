@@ -59,7 +59,8 @@ unresolved blockers or an active budget hard stop.
 The plugin reads the mapped issue with `issues.get(issueId, companyId)` immediately
 before requesting a wake. Missing, cross-company, unassigned or differently assigned
 issues are refused with `G12_ISSUE_ASSIGNEE_MISMATCH` in the warning log and job error;
-no wake receipt is recorded, so the next tick retries after correction.
+no acceptance/pending receipt is recorded. The key retries after correction and
+its per-key backoff deadline (initially five minutes); later PRs are still scanned.
 
 **Remaining SDK race limit:** `issues.requestWakeup` targets the issue's current
 assignee and has no atomic expected-agent argument. The preflight read detects an
@@ -80,7 +81,9 @@ pnpm --filter @smarty-pants/plugin-g12-backstop typecheck
 ```
 
 The build emits `dist/manifest.js` and `dist/worker.js`, with the shipped SDK as
-an external runtime dependency, following the SDK's bundler shape. No lockfile
+an external runtime dependency, following the SDK's bundler shape. It also emits
+`dist/reconcile.js`, an admin-only single-key reconciliation helper (below), not
+a registered worker tool, route or scheduled job. No lockfile
 is changed by this patch; dependency/lockfile refresh follows repository policy.
 
 Using an existing authorized board/admin session, install through Settings →
@@ -190,31 +193,50 @@ acceptance was performed by the implementation task.
   Editable names never participate in dedupe: renamed checks do not double-wake,
   while same-name checks from distinct apps/runs remain distinct. The same key is
   passed as both wake `reason` and SDK `idempotencyKey`.
-- **Acknowledged-acceptance dedupe, not exactly-once delivery.** A key is recorded
-  only after `issues.requestWakeup` returns `queued:true`. Receipts contain only
-  `acceptedAt`, `agentId` and `issueId`, under `wake:<SHA-256 of semantic key>`.
-  No raw key, check name, PR title/body, provider row or credential is stored.
-  The host serializes this job and the worker rejects concurrent calls; there is
-  no KV compare-and-swap claim.
-- A pre-dispatch exception (including blockers, status or budget) fails with
-  `G12_WAKE_FAILED`; `queued:false` fails with `G12_WAKE_REFUSED`. Both log only a
-  fixed enum code and counts, leave no receipt and retain the current scan position
-  for a retry next tick. A refused/misassigned issue therefore pauses scan progress
-  at that PR until it is corrected; it does not permanently consume the wake key.
-  Queued/coalesced means host acceptance, not model completion.
-- **Ambiguity limit:** an accepted wake followed by a lost response or a failed
-  receipt write can repeat next tick. The shipped host does not provide a general
-  atomic `g12:*` replay fence (see `packages/db/src/schema/agent_wakeup_requests.ts:46-115`
-  and `server/src/services/heartbeat/queue.ts:4904-4985`). Reserving before dispatch
-  is deliberately not used: it permanently lost refused wakes. Exactly-once repair
-  belongs at the host acceptance boundary, outside this plugin-only patch.
-- To reconcile, disable the plugin, wait for active runs to settle, compare the
-  specific receipt with issue activity/run history. Never reset all accepted
-  receipts: that can repeat accepted wakes. No public reset API is added here.
-  The numeric-ID key format is incompatible with the previous name-based format;
+- **Crash-safe suppression, not guaranteed delivery.** Before dispatch, persist
+  `{ pendingAt, reconcileAt, agentId, issueId }` under
+  `wake:<SHA-256 of semantic key>`. Only an acknowledged write permits dispatch.
+  `queued:true` replaces it with `{ acceptedAt, agentId, issueId }`; existing
+  accepted receipts remain compatible. A lost response or failed acceptance write
+  leaves pending in place and cannot produce a second wake after restart. Even a
+  crash after reservation but before dispatch stays suppressed until reconciled.
+  `deduped` counts suppression by either accepted or pending receipts, not proof
+  of delivery; `wakes` counts acknowledged acceptance. No raw key, check name,
+  PR title/body, provider row or credential is stored. The host serializes this
+  job and the worker rejects concurrent calls; there is
+  no KV compare-and-swap or exactly-once-delivery claim.
+- **Per-key refusal backoff and cursor progress.** `queued:false` is definitive
+  non-acceptance: save backoff, then clear pending. Local issue-read failures or
+  assignee mismatches occur before dispatch and also save backoff without pending.
+  Retry delays are 5, 10, 20, 40, then 60 minutes, capped at 60 minutes, surviving
+  worker restart. During key backoff there is no issue-read/wakeup call for that
+  key (the normal bounded GitHub scan still runs). `refused` includes keys skipped
+  for backoff. Refused keys never pin the scan cursor; siblings and later PRs are
+  visited. Fixed refusal errors are reported after advancing/checkpointing the
+  scan, rather than terminating at the first refused PR. Queued/coalesced means
+  host acceptance, not model completion.
+- **Thrown wake calls are ambiguous.** `G12_WAKE_FAILED` can mean a pre-dispatch
+  blocker/status/budget refusal OR acceptance followed by a lost response/activity
+  write. RPC error text/type cannot distinguish those cases. Keep pending and
+  continue scanning; never automatically resend based on that error. The SDK's
+  `idempotencyKey` option is present and still receives the deterministic key
+  (`packages/plugins/sdk/src/types.ts:1550-1558`), but the shipped host only carries
+  general `g12:*` keys into wake rows; it does not enforce a replay fence for them
+  (`server/src/services/plugin-host-services.ts:2426-2490`,
+  `server/src/services/heartbeat/queue.ts:4904-4985`). The plugin therefore uses
+  durable pending suppression rather than claiming host dedupe.
+- **Bounded reconciliation, never timeout-based resend.** Pending has a 15-minute
+  reconciliation deadline. On the next eligible observation at/after that deadline,
+  one state update adds `unresolvedAt`, one fixed `G12_WAKE_UNRESOLVED` warning is
+  logged, and numeric `unresolved` counts expose the condition. Later observations
+  perform no further reconciliation writes/warnings for that key and still do
+  not dispatch. There is no new timer, history poller or unbounded retry loop.
+  Positive operator reconciliation is described below. A missing history entry,
+  closed PR or elapsed deadline is not proof that dispatch never occurred.
+- The numeric-ID key format is incompatible with the earlier name-based format;
   before upgrading an already-enabled installation, reconcile active conditions
-  and expect legacy receipts not to dedupe the new keys. Old receipts are not read
-  or copied into new state.
+  and expect name-based receipts not to dedupe the new keys. Old name-based
+  receipts are not read or copied into new state.
 - Receipt/history retention is intentional: deleting it weakens dedupe, including
   a return to an older head. Storage grows with observed PR heads and wake keys.
   No new maintenance scan or automatic pruning is introduced.
@@ -234,11 +256,52 @@ acceptance was performed by the implementation task.
   minting. Before expiry, ticks access neither secrets nor HTTP. HTTP 429 without
   a usable deadline also gets a five-minute backoff. Other HTTP errors fail closed
   and never imply missing review. The host's per-request timeout is 30 seconds.
-- Job errors and warning-log codes use the closed `G12ErrorCode` enum; arbitrary
-  code-shaped host strings, response bodies and provider text are never forwarded.
+- Job errors and warning-log codes use the closed `G12ErrorCode` enum. Only the
+  locally constructed `G12Error` type carries a trusted `.code`; boundaries never
+  select a code from `.message`, even if upstream text exactly equals a valid
+  enum member. Untyped failures use the fixed code for that call site.
 - This is the explicitly requested five-minute safety-net scan for missed
   external GitHub webhooks; GitHub is the source of truth. Enabled but otherwise
   idle scans still contact GitHub. Unconfigured/`enabled:false` ticks do not
   access HTTP, secrets or KV. Disable the plugin to stop scheduled execution.
   There is no plugin-owned timer. Keep host sleep blockers: an internal cron
   cannot wake a stopped host (`doc/idle-plugin-jobs.md:63-82`).
+
+## Single-key operator reconciliation (lead/admin only)
+
+This is deliberately not automatic delivery recovery: the shipped SDK has no
+capability here that proves whether an ambiguous `g12:*` wake was accepted.
+Reconciliation is bounded to one key and at most two state reads/two writes.
+
+1. Disable the plugin and wait for the in-flight job and its host requests to
+   settle. Do not reconcile concurrently: company KV has no compare-and-swap.
+2. Identify the exact semantic key, company, plugin record and pending receipt.
+   Preserve its `pendingAt`, `agentId` and `issueId`; never dump provider payloads
+   or credentials. Review that one host admission's activity/run/transport
+   evidence. Limit initial investigation to 15 minutes; if inconclusive, leave
+   pending/unresolved suppressed and escalate to the lead. Do not guess from an
+   empty history query, error message, elapsed time or a newly cleared blocker.
+3. With positive evidence of acceptance, use `outcome: "accepted"`. With positive
+   evidence that the call never dispatched, use `outcome: "not-dispatched"`.
+   The latter writes per-key backoff **before** clearing pending, so a failed
+   maintenance write also fails safe. It re-arms only after that retry deadline.
+4. In an already-authorized, company/plugin-bound host maintenance context,
+   import `reconcileWake` from the built `dist/reconcile.js`. Supply only a
+   scoped state adapter exposing `get(ScopeKey)` and `set(ScopeKey, value)`;
+   do not add a public endpoint, obtain new credentials or bypass authorization.
+   The host's `pluginStateStore` can supply that adapter for an authorized admin;
+   keep the adapter bound to the reviewed plugin ID and company.
+
+```js
+await reconcileWake(scopedState, companyId, semanticKey, {
+  pendingAt, agentId, issueId, // Exact values from the reviewed pending receipt.
+  outcome: "accepted",       // Or positively proven "not-dispatched" only.
+});
+```
+
+The helper rejects stale timestamps, mismatched agent/issue IDs, unknown outcomes
+and non-pending receipts. It validates current state, performs bounded writes and
+makes no HTTP, secret or wake call. It does not discover or independently verify
+proof; that is the authorized operator's obligation. Preserve the evidence link
+and decision in the handoff, inspect the one receipt/backoff afterwards, and only
+then re-enable. Never clear all accepted/pending receipts: that can repeat work.

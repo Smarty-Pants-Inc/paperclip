@@ -1,7 +1,7 @@
 import { createSign } from "node:crypto";
 import type { PluginHttpClient } from "@paperclipai/plugin-sdk";
 import type { G12Config } from "./config.js";
-import { G12ErrorCode as Code } from "./errors.js";
+import { G12Error, G12ErrorCode as Code } from "./errors.js";
 
 export interface PullRequest {
   number: number;
@@ -29,7 +29,7 @@ export function signAppJwt(appId: number, privateKey: string, now: number): stri
     signer.update(input);
     return `${input}.${signer.sign(privateKey, "base64url")}`;
   } catch {
-    throw new Error(Code.AppSignFailed);
+    throw new G12Error(Code.AppSignFailed);
   }
 }
 
@@ -37,7 +37,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function id(value: unknown): value is number { return Number.isSafeInteger(value) && Number(value) > 0; }
-function malformed(): never { throw new Error(Code.GitHubResponseInvalid); }
+function malformed(): never { throw new G12Error(Code.GitHubResponseInvalid); }
 export class ScanPaused extends Error {
   constructor() { super(Code.ScanPaused); }
 }
@@ -77,7 +77,7 @@ export class GitHub {
   async request(path: string, token: string, method = "GET", body?: unknown): Promise<unknown> {
     const url = new URL(path, "https://api.github.com");
     if (url.origin !== "https://api.github.com" || url.username || url.password || url.hash) {
-      throw new Error(Code.HttpOriginDenied);
+      throw new G12Error(Code.HttpOriginDenied);
     }
     if (Date.now() >= this.deadline || this.retryAt > this.now || (method === "GET" && this.gets >= this.maxGets)) {
       throw new ScanPaused();
@@ -96,12 +96,12 @@ export class GitHub {
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
-    } catch { throw new Error(Code.GitHubTransportFailed); }
+    } catch { throw new G12Error(Code.GitHubTransportFailed); }
     this.rateBackoff(response);
     // Consume successful data even at remaining=0, but pause before any next GET.
     if (!response.ok) {
       if (this.retryAt > this.now) throw new ScanPaused();
-      throw new Error(httpErrors[response.status] ?? Code.GitHubHttpFailed);
+      throw new G12Error(httpErrors[response.status] ?? Code.GitHubHttpFailed);
     }
     try { return await response.json(); } catch { return malformed(); }
   }
@@ -109,7 +109,7 @@ export class GitHub {
   async installationToken(config: G12Config, jwt: string): Promise<string> {
     // Also fail closed for callers that did not use parseConfig. Never mint an
     // unrestricted token, even for disabled/legacy/malformed configuration.
-    if (!Array.isArray(config.repos) || config.repos.length === 0) throw new Error(Code.ConfigRepos);
+    if (!Array.isArray(config.repos) || config.repos.length === 0) throw new G12Error(Code.ConfigRepos);
     const body = {
       permissions: { checks: "read", pull_requests: "read" },
       repositories: [...new Set(config.repos.map((repo) => repo.split("/")[1]))],

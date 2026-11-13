@@ -1,4 +1,4 @@
-import { G12ErrorCode as Code } from "./errors.js";
+import { G12Error, G12ErrorCode as Code } from "./errors.js";
 
 export interface G12Config {
   enabled: boolean;
@@ -51,7 +51,7 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function keys(value: Record<string, unknown>, allowed: string[]) {
-  if (Object.keys(value).some((key) => !allowed.includes(key))) throw new Error(Code.ConfigUnknownField);
+  if (Object.keys(value).some((key) => !allowed.includes(key))) throw new G12Error(Code.ConfigUnknownField);
 }
 function matches(value: unknown, pattern: string): value is string {
   return typeof value === "string" && new RegExp(pattern).test(value);
@@ -62,36 +62,36 @@ function positive(value: unknown): value is number {
 
 /** Validate again in the worker: config may arrive by startup replay, not the form. */
 export function parseConfig(value: unknown): G12Config {
-  if (!record(value)) throw new Error(Code.ConfigInvalid);
+  if (!record(value)) throw new G12Error(Code.ConfigInvalid);
   keys(value, Object.keys(configSchema.properties));
   if (typeof value.enabled !== "boolean" || !matches(value.companyId, uuid) ||
-      !positive(value.appId) || !positive(value.installationId)) throw new Error(Code.ConfigIdentity);
+      !positive(value.appId) || !positive(value.installationId)) throw new G12Error(Code.ConfigIdentity);
   const ref = value.privateKeyRef;
-  if (!record(ref)) throw new Error(Code.ConfigSecretRef);
+  if (!record(ref)) throw new G12Error(Code.ConfigSecretRef);
   keys(ref, ["type", "secretId", "version"]);
   if (ref.type !== "secret_ref" || !matches(ref.secretId, uuid) ||
       (ref.version !== undefined && ref.version !== "latest" && !positive(ref.version))) {
-    throw new Error(Code.ConfigSecretRef);
+    throw new G12Error(Code.ConfigSecretRef);
   }
   if (!Array.isArray(value.repos) || value.repos.length < 1 || value.repos.length > 500 ||
-      !value.repos.every((name) => matches(name, repo))) throw new Error(Code.ConfigRepos);
+      !value.repos.every((name) => matches(name, repo))) throw new G12Error(Code.ConfigRepos);
   const repos = value.repos.map((name: string) => name.toLowerCase());
-  if (new Set(repos).size !== repos.length) throw new Error(Code.ConfigDuplicateRepo);
+  if (new Set(repos).size !== repos.length) throw new G12Error(Code.ConfigDuplicateRepo);
   const maxGetsPerTick = value.maxGetsPerTick ?? 200;
-  if (!positive(maxGetsPerTick) || maxGetsPerTick < 2 || maxGetsPerTick > 1000) throw new Error(Code.ConfigGetLimit);
+  if (!positive(maxGetsPerTick) || maxGetsPerTick < 2 || maxGetsPerTick > 1000) throw new G12Error(Code.ConfigGetLimit);
   const minutes = value.missingReviewMinutes ?? 15;
-  if (!positive(minutes) || minutes > 1440) throw new Error(Code.ConfigMinutes);
-  if (!record(value.owners) || Object.keys(value.owners).length === 0) throw new Error(Code.ConfigOwners);
+  if (!positive(minutes) || minutes > 1440) throw new G12Error(Code.ConfigMinutes);
+  if (!record(value.owners) || Object.keys(value.owners).length === 0) throw new G12Error(Code.ConfigOwners);
   const owners: G12Config["owners"] = Object.create(null);
   const issueAgents = new Map<string, string>();
   for (const [author, owner] of Object.entries(value.owners)) {
-    if (!matches(author, login) || !record(owner)) throw new Error(Code.ConfigOwner);
+    if (!matches(author, login) || !record(owner)) throw new G12Error(Code.ConfigOwner);
     keys(owner, ["agentId", "issueId"]);
-    if (!matches(owner.agentId, uuid) || !matches(owner.issueId, uuid)) throw new Error(Code.ConfigOwner);
+    if (!matches(owner.agentId, uuid) || !matches(owner.issueId, uuid)) throw new G12Error(Code.ConfigOwner);
     const normalized = author.toLowerCase();
-    if (Object.hasOwn(owners, normalized)) throw new Error(Code.ConfigDuplicateOwner);
+    if (Object.hasOwn(owners, normalized)) throw new G12Error(Code.ConfigDuplicateOwner);
     if (issueAgents.has(owner.issueId) && issueAgents.get(owner.issueId) !== owner.agentId) {
-      throw new Error(Code.ConfigConflictingIssueOwner);
+      throw new G12Error(Code.ConfigConflictingIssueOwner);
     }
     issueAgents.set(owner.issueId, owner.agentId);
     owners[normalized] = { agentId: owner.agentId, issueId: owner.issueId };
