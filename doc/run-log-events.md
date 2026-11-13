@@ -5,6 +5,26 @@ Run-log events write to the `heartbeat_run_events` table
 Paperclip Telemetry events, and they are not OpenTelemetry exports. A run-log
 event needs no operator endpoint.
 
+## Assigned MCP delivery
+
+`tool_gateway.runtime_mcp_delivery` is a system-stream warning when an installed,
+permitted connection is unavailable during runtime preparation, permitted access
+has no install, or the immutable assignment changed before handoff. The local
+run event and existing tool-access audit record carry the reason
+(`assigned_connections_unavailable`, `permitted_connections_not_installed`, or
+`native_mcp_assignment_changed`) and delivered gateway count. Unavailable
+connections carry only IDs, names, enabled flags, lifecycle statuses and health
+statuses, not endpoint configuration, credentials or raw provider errors. The
+warning is persisted before publishing the ordinary live run event. A
+remaining healthy assignment may still deliver one gateway. A changed assignment
+stays fail-closed; this warning does not grant access or trigger replay.
+
+A failed remote `tools/call`, including HTTP 401/403 or insufficient scope, fails
+that invocation without turning it into a shared connection-health verdict.
+Explicit health checks, session-setup authentication failures and operator
+lifecycle changes retain their existing exclusion gates. These diagnostics stay
+in the instance database and do not add Telemetry or OpenTelemetry exports.
+
 ## ACPX sidecar shutdown
 
 The ACPX sidecar emits `runtime.diagnostic` with code
