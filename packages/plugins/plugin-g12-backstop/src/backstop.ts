@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { PluginContext, ScopeKey } from "@paperclipai/plugin-sdk";
 import type { G12Config } from "./config.js";
-import { GitHub, signAppJwt } from "./github.js";
+import { GitHub, ScanPaused, signAppJwt } from "./github.js";
+import { errorCode, G12ErrorCode as Code } from "./errors.js";
 
 type Host = Pick<PluginContext, "http" | "secrets" | "state" | "issues" | "logger">;
 export interface Counts {
@@ -14,6 +15,90 @@ function stateKey(companyId: string, key: string): ScopeKey {
   return { scopeKind: "company", scopeId: companyId, namespace: "g12-v1", stateKey: key };
 }
 
+// Persist only numeric positions/IDs, a config digest, the active head SHA, a
+// review-presence bit and a retry timestamp. Never persist whole provider rows.
+interface Cursor {
+  fingerprint: string;
+  repoIndex: number;
+  pullPage: number;
+  pullOffset: number;
+  prNumber: number;
+  headSha: string;
+  checkPage: number;
+  reviewFound: boolean;
+  retryAt: number;
+}
+function freshCursor(fingerprint: string, retryAt = 0): Cursor {
+  return { fingerprint, repoIndex: 0, pullPage: 1, pullOffset: 0, prNumber: 0,
+    headSha: "", checkPage: 1, reviewFound: false, retryAt };
+}
+function resetChecks(cursor: Cursor) {
+  cursor.prNumber = 0; cursor.headSha = ""; cursor.checkPage = 1; cursor.reviewFound = false;
+}
+function readCursor(value: unknown, fingerprint: string, repoCount: number): Cursor {
+  if (value == null) return freshCursor(fingerprint);
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error(Code.ScanStateInvalid);
+  const c = value as Cursor;
+  const expected = Object.keys(freshCursor(fingerprint));
+  if (Object.keys(c).length !== expected.length || Object.keys(c).some((key) => !expected.includes(key)) ||
+      typeof c.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(c.fingerprint) ||
+      ![c.repoIndex, c.pullPage, c.pullOffset, c.prNumber, c.checkPage, c.retryAt].every((n) => Number.isSafeInteger(n) && n >= 0) ||
+      c.pullPage < 1 || c.checkPage < 1 || c.pullOffset > 100 ||
+      typeof c.headSha !== "string" || (c.headSha !== "" && !/^[a-fA-F0-9]{40,64}$/.test(c.headSha)) ||
+      typeof c.reviewFound !== "boolean") throw new Error(Code.ScanStateInvalid);
+  // Rebinding/reordering configuration cannot reuse another scan's positions,
+  // but must not evade an already observed GitHub backoff.
+  if (c.fingerprint !== fingerprint) return freshCursor(fingerprint, c.retryAt);
+  if (c.repoIndex >= repoCount) throw new Error(Code.ScanStateInvalid);
+  return { ...c };
+}
+
+async function wake(host: Host, config: G12Config, owner: G12Config["owners"][string], key: string, now: number, counts: Counts, deadline: number) {
+  if (Date.now() >= deadline) throw new ScanPaused();
+  const receiptKey = stateKey(config.companyId, `wake:${hash(key)}`);
+  const prior = await host.state.get(receiptKey);
+  if (prior != null) {
+    if (typeof prior !== "object" || !("acceptedAt" in prior) || typeof prior.acceptedAt !== "number" || !Number.isFinite(prior.acceptedAt) || prior.acceptedAt < 0) {
+      throw new Error(Code.WakeReceiptInvalid);
+    }
+    counts.deduped++;
+    return;
+  }
+  let issue;
+  try { issue = await host.issues.get(owner.issueId, config.companyId); }
+  catch { throw new Error(Code.IssueReadFailed); }
+  // The issue path remains host-owned (budget, blockers, activity, admission).
+  // Verify intended ownership immediately before requesting its wake. The SDK
+  // has no atomic expected-assignee option; see INSTALL.md for that race limit.
+  if (!issue || issue.id !== owner.issueId || issue.companyId !== config.companyId || issue.assigneeAgentId !== owner.agentId) {
+    counts.refused++;
+    host.logger.warn("G12 wake refused", { code: Code.IssueAssigneeMismatch });
+    throw new Error(Code.IssueAssigneeMismatch);
+  }
+  if (Date.now() >= deadline) throw new ScanPaused();
+  let result;
+  try {
+    result = await host.issues.requestWakeup(owner.issueId, config.companyId, {
+      reason: key, contextSource: "smarty.g12-backstop", idempotencyKey: key,
+    });
+  } catch {
+    // Host pre-dispatch refusals throw, not just queued:false. Neither outcome
+    // consumes the key. Do not infer acceptance from arbitrary host error text.
+    counts.refused++;
+    host.logger.warn("G12 wake refused", { code: Code.WakeFailed });
+    throw new Error(Code.WakeFailed);
+  }
+  if (result.queued !== true) {
+    counts.refused++;
+    host.logger.warn("G12 wake refused", { code: Code.WakeRefused });
+    throw new Error(Code.WakeRefused);
+  }
+  counts.wakes++;
+  // Only acknowledged acceptance consumes a key. The host serializes this job;
+  // no KV CAS or exactly-once guarantee across an ambiguous response is claimed.
+  await host.state.set(receiptKey, { acceptedAt: now, agentId: owner.agentId, issueId: owner.issueId });
+}
+
 /** One serialized host job. No agents.invoke, sessions, routine or model work. */
 export async function runTick(host: Host, config: G12Config, now = Date.now()): Promise<Counts> {
   const counts: Counts = { repos: 0, prs: 0, eligible: 0, drafts: 0, unmapped: 0, checks: 0,
@@ -23,92 +108,90 @@ export async function runTick(host: Host, config: G12Config, now = Date.now()): 
     return counts;
   }
   const deadline = Date.now() + 240_000;
+  const cursorKey = stateKey(config.companyId, "scan");
+  const fingerprint = hash(JSON.stringify({ appId: config.appId, installationId: config.installationId,
+    repos: config.repos, owners: config.owners, missingReviewMinutes: config.missingReviewMinutes }));
+  let cursor: Cursor | undefined;
+  let github: GitHub | undefined;
+  let complete = false;
   try {
-    const github = new GitHub(host.http, deadline);
-    // Resolve just this configured, company-bound reference. Neither key nor
-    // JWT nor installation token is cached between ticks or stored in state.
+    if (!Array.isArray(config.repos) || config.repos.length === 0) throw new Error(Code.ConfigRepos);
+    cursor = readCursor(await host.state.get(cursorKey), fingerprint, config.repos.length);
+    if (cursor.retryAt > now) return counts; // No token, secret resolution or HTTP during backoff.
+    cursor.retryAt = 0;
+    github = new GitHub(host.http, deadline, config.maxGetsPerTick, now);
     const jwt = signAppJwt(config.appId, await host.secrets.resolve(config.privateKeyRef, {
       companyId: config.companyId, configPath: "privateKeyRef",
     }), now);
     const token = await github.installationToken(config, jwt);
-    const repos = config.repos === "all" ? await github.repositories(token) : config.repos;
-    for (const repo of repos) {
+    for (; cursor.repoIndex < config.repos.length; cursor.repoIndex++) {
+      const repo = config.repos[cursor.repoIndex];
       counts.repos++;
-      for await (const pr of github.pulls(repo, token)) {
-        counts.prs++;
-        if (pr.draft) { counts.drafts++; continue; }
-        const owner = pr.user ? config.owners[pr.user.login.toLowerCase()] : undefined;
-        if (!owner) { counts.unmapped++; continue; }
-        counts.eligible++;
-        const head = pr.head.sha;
-        const identity = `${repo}:${pr.number}:${head}`;
-        const seenKey = stateKey(config.companyId, `seen:${hash(`${config.appId}:${config.installationId}:${identity}`)}`);
-        let firstSeen = await host.state.get(seenKey);
-        if (firstSeen === null || firstSeen === undefined) {
-          firstSeen = now;
-          await host.state.set(seenKey, firstSeen);
-        }
-        if (typeof firstSeen !== "number" || !Number.isFinite(firstSeen) || firstSeen < 0) {
-          throw new Error("G12_FIRST_SEEN_INVALID");
-        }
-        const checks = (await github.checks(repo, head, token)).filter((check) => check.head_sha === head);
-        counts.checks += checks.length;
-        const keys: string[] = [];
-        const hasReview = checks.some((check) => check.name === "Paperclip Review" && check.app?.id === config.appId);
-        if (!hasReview && now - firstSeen >= config.missingReviewMinutes * 60_000) {
-          counts.missing++;
-          keys.push(`g12:missing:${identity}`);
-        }
-        for (const check of checks) {
-          if (check.status !== "completed" || !["failure", "timed_out"].includes(check.conclusion ?? "")) continue;
-          counts.failing++;
-          keys.push(`g12:fail:${identity}:${check.name}:${check.conclusion}`);
-        }
-        for (const key of new Set(keys)) {
-          const receiptKey = stateKey(config.companyId, `wake:${hash(key)}`);
-          const prior = await host.state.get(receiptKey);
-          if (prior != null) {
-            counts.deduped++;
-            if (typeof prior !== "object" || !("outcome" in prior) || prior.outcome !== "queued") counts.unresolved++;
-            continue;
+      for (;;) {
+        // Refresh the resumed PR page; don't persist PR payloads or wake using a
+        // head captured in a previous tick without re-observing it on GitHub.
+        const prs = await github.pullsPage(repo, token, cursor.pullPage);
+        for (; cursor.pullOffset < prs.length; cursor.pullOffset++) {
+          const pr = prs[cursor.pullOffset];
+          counts.prs++;
+          if (pr.draft) { counts.drafts++; resetChecks(cursor); continue; }
+          const owner = pr.user ? config.owners[pr.user.login.toLowerCase()] : undefined;
+          if (!owner) { counts.unmapped++; resetChecks(cursor); continue; }
+          counts.eligible++;
+          const head = pr.head.sha;
+          if (cursor.prNumber !== pr.number || cursor.headSha !== head) {
+            resetChecks(cursor); cursor.prNumber = pr.number; cursor.headSha = head;
           }
-          if (Date.now() >= deadline) throw new Error("G12_SCAN_BUDGET_EXCEEDED");
-          // The shipped issue-wake API passes idempotencyKey to heartbeat but
-          // does NOT enforce general g12:* replay dedupe. Reserve BEFORE send:
-          // at most one attempt, including across restart after an ambiguous
-          // response. This trades a crash-window missed wake for no duplicate.
-          // No CAS is claimed: host scheduler admission serializes this job;
-          // plugin.ts also rejects concurrent worker-local runJob calls.
-          const receipt = { key, agentId: owner.agentId, issueId: owner.issueId, attemptedAt: now };
-          await host.state.set(receiptKey, { ...receipt, outcome: "reserved" });
-          let result;
-          try {
-            result = await host.issues.requestWakeup(owner.issueId, config.companyId, {
-              reason: key,
-              contextSource: "smarty.g12-backstop",
-              idempotencyKey: key,
-            });
-          } catch {
-            counts.errors++;
-            await host.state.set(receiptKey, { ...receipt, outcome: "uncertain" });
-            throw new Error("G12_WAKE_UNCERTAIN_RECONCILE_RECEIPT");
+          const identity = `${pr.base.repo.id}:${pr.number}:${head}`;
+          const seenKey = stateKey(config.companyId, `seen:${hash(`${config.appId}:${config.installationId}:${identity}`)}`);
+          let firstSeen = await host.state.get(seenKey);
+          if (firstSeen == null) { firstSeen = now; await host.state.set(seenKey, firstSeen); }
+          if (typeof firstSeen !== "number" || !Number.isFinite(firstSeen) || firstSeen < 0) throw new Error(Code.FirstSeenInvalid);
+          for (;;) {
+            const page = await github.checksPage(repo, head, token, cursor.checkPage);
+            const checks = page.filter((check) => check.head_sha === head);
+            counts.checks += checks.length;
+            cursor.reviewFound ||= checks.some((check) => check.name === "Paperclip Review" && check.app.id === config.appId);
+            const keys = new Set<string>();
+            for (const check of checks) {
+              if (check.status !== "completed" || !["failure", "timed_out"].includes(check.conclusion ?? "")) continue;
+              counts.failing++;
+              keys.add(`g12:fail:${identity}:${check.app.id}:${check.id}:${check.conclusion}`);
+            }
+            for (const key of keys) await wake(host, config, owner, key, now, counts, deadline);
+            if (page.length < 100) break;
+            cursor.checkPage++;
           }
-          if (result.queued) counts.wakes++;
-          else counts.refused++;
-          await host.state.set(receiptKey, { ...receipt, outcome: result.queued ? "queued" : "refused", runId: result.runId });
+          if (!cursor.reviewFound && now - firstSeen >= config.missingReviewMinutes * 60_000) {
+            counts.missing++;
+            await wake(host, config, owner, `g12:missing:${identity}`, now, counts, deadline);
+          }
+          resetChecks(cursor);
         }
+        cursor.pullOffset = 0;
+        if (prs.length < 100) break;
+        cursor.pullPage++;
       }
+      cursor.pullPage = 1;
     }
-    if (counts.refused > 0) throw new Error("G12_WAKE_REFUSED_RECONCILE_RECEIPT");
-    if (counts.unresolved > 0) throw new Error("G12_WAKE_UNRESOLVED_RECONCILE_RECEIPT");
+    complete = true;
     return counts;
   } catch (error) {
-    if (counts.errors === 0) counts.errors++;
-    // Host service failures may contain secrets. Only fixed plugin-owned error
-    // codes (or numeric HTTP status) cross the worker's job error boundary.
-    const message = error instanceof Error && /^G12_[A-Z0-9_]+$/.test(error.message) ? error.message : "G12_TICK_FAILED";
-    throw new Error(message);
+    if (error instanceof ScanPaused) return counts; // Cursor resumes on the next host tick; never sleep here.
+    counts.errors++;
+    throw new Error(errorCode(error, Code.TickFailed));
   } finally {
-    host.logger.info("G12 tick counts", { ...counts });
+    try {
+      if (cursor) {
+        cursor.retryAt = Math.max(cursor.retryAt, github?.retryAt ?? 0);
+        // After a full sweep, start a new one next tick. Preserve a rate-limit
+        // deadline even if it arrived with the very last successful response.
+        const saved = complete ? (cursor.retryAt > now ? freshCursor(fingerprint, cursor.retryAt) : null) : cursor;
+        await host.state.set(cursorKey, saved);
+      }
+    } catch {
+      counts.errors++;
+      throw new Error(Code.TickFailed);
+    } finally { host.logger.info("G12 tick counts", { ...counts }); }
   }
 }

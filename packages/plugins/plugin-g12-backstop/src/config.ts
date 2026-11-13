@@ -1,10 +1,13 @@
+import { G12ErrorCode as Code } from "./errors.js";
+
 export interface G12Config {
   enabled: boolean;
   companyId: string;
   appId: number;
   installationId: number;
   privateKeyRef: { type: "secret_ref"; secretId: string; version?: "latest" | number };
-  repos: string[] | "all";
+  repos: string[];
+  maxGetsPerTick: number;
   missingReviewMinutes: number;
   owners: Record<string, { agentId: string; issueId: string }>;
 }
@@ -31,10 +34,8 @@ export const configSchema = {
         version: { anyOf: [{ type: "string", const: "latest" }, { type: "integer", minimum: 1 }] },
       },
     },
-    repos: { anyOf: [
-      { type: "string", const: "all" },
-      { type: "array", minItems: 1, maxItems: 500, uniqueItems: true, items: { type: "string", pattern: repo } },
-    ] },
+    repos: { type: "array", minItems: 1, maxItems: 500, uniqueItems: true, items: { type: "string", pattern: repo } },
+    maxGetsPerTick: { type: "integer", minimum: 2, maximum: 1000, default: 200 },
     missingReviewMinutes: { type: "integer", minimum: 1, maximum: 1440, default: 15 },
     owners: {
       type: "object", minProperties: 1, propertyNames: { pattern: login },
@@ -50,7 +51,7 @@ function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function keys(value: Record<string, unknown>, allowed: string[]) {
-  if (Object.keys(value).some((key) => !allowed.includes(key))) throw new Error("G12_CONFIG_UNKNOWN_FIELD");
+  if (Object.keys(value).some((key) => !allowed.includes(key))) throw new Error(Code.ConfigUnknownField);
 }
 function matches(value: unknown, pattern: string): value is string {
   return typeof value === "string" && new RegExp(pattern).test(value);
@@ -61,37 +62,36 @@ function positive(value: unknown): value is number {
 
 /** Validate again in the worker: config may arrive by startup replay, not the form. */
 export function parseConfig(value: unknown): G12Config {
-  if (!record(value)) throw new Error("G12_CONFIG_INVALID");
+  if (!record(value)) throw new Error(Code.ConfigInvalid);
   keys(value, Object.keys(configSchema.properties));
   if (typeof value.enabled !== "boolean" || !matches(value.companyId, uuid) ||
-      !positive(value.appId) || !positive(value.installationId)) throw new Error("G12_CONFIG_IDENTITY");
+      !positive(value.appId) || !positive(value.installationId)) throw new Error(Code.ConfigIdentity);
   const ref = value.privateKeyRef;
-  if (!record(ref)) throw new Error("G12_CONFIG_SECRET_REF");
+  if (!record(ref)) throw new Error(Code.ConfigSecretRef);
   keys(ref, ["type", "secretId", "version"]);
   if (ref.type !== "secret_ref" || !matches(ref.secretId, uuid) ||
       (ref.version !== undefined && ref.version !== "latest" && !positive(ref.version))) {
-    throw new Error("G12_CONFIG_SECRET_REF");
+    throw new Error(Code.ConfigSecretRef);
   }
-  let repos: string[] | "all" = "all";
-  if (value.repos !== "all") {
-    if (!Array.isArray(value.repos) || value.repos.length < 1 || value.repos.length > 500 ||
-        !value.repos.every((name) => matches(name, repo))) throw new Error("G12_CONFIG_REPOS");
-    repos = value.repos.map((name: string) => name.toLowerCase());
-    if (new Set(repos).size !== repos.length) throw new Error("G12_CONFIG_DUPLICATE_REPO");
-  }
+  if (!Array.isArray(value.repos) || value.repos.length < 1 || value.repos.length > 500 ||
+      !value.repos.every((name) => matches(name, repo))) throw new Error(Code.ConfigRepos);
+  const repos = value.repos.map((name: string) => name.toLowerCase());
+  if (new Set(repos).size !== repos.length) throw new Error(Code.ConfigDuplicateRepo);
+  const maxGetsPerTick = value.maxGetsPerTick ?? 200;
+  if (!positive(maxGetsPerTick) || maxGetsPerTick < 2 || maxGetsPerTick > 1000) throw new Error(Code.ConfigGetLimit);
   const minutes = value.missingReviewMinutes ?? 15;
-  if (!positive(minutes) || minutes > 1440) throw new Error("G12_CONFIG_MINUTES");
-  if (!record(value.owners) || Object.keys(value.owners).length === 0) throw new Error("G12_CONFIG_OWNERS");
+  if (!positive(minutes) || minutes > 1440) throw new Error(Code.ConfigMinutes);
+  if (!record(value.owners) || Object.keys(value.owners).length === 0) throw new Error(Code.ConfigOwners);
   const owners: G12Config["owners"] = Object.create(null);
   const issueAgents = new Map<string, string>();
   for (const [author, owner] of Object.entries(value.owners)) {
-    if (!matches(author, login) || !record(owner)) throw new Error("G12_CONFIG_OWNER");
+    if (!matches(author, login) || !record(owner)) throw new Error(Code.ConfigOwner);
     keys(owner, ["agentId", "issueId"]);
-    if (!matches(owner.agentId, uuid) || !matches(owner.issueId, uuid)) throw new Error("G12_CONFIG_OWNER");
+    if (!matches(owner.agentId, uuid) || !matches(owner.issueId, uuid)) throw new Error(Code.ConfigOwner);
     const normalized = author.toLowerCase();
-    if (Object.hasOwn(owners, normalized)) throw new Error("G12_CONFIG_DUPLICATE_OWNER");
+    if (Object.hasOwn(owners, normalized)) throw new Error(Code.ConfigDuplicateOwner);
     if (issueAgents.has(owner.issueId) && issueAgents.get(owner.issueId) !== owner.agentId) {
-      throw new Error("G12_CONFIG_CONFLICTING_ISSUE_OWNER");
+      throw new Error(Code.ConfigConflictingIssueOwner);
     }
     issueAgents.set(owner.issueId, owner.agentId);
     owners[normalized] = { agentId: owner.agentId, issueId: owner.issueId };
@@ -99,6 +99,6 @@ export function parseConfig(value: unknown): G12Config {
   return {
     enabled: value.enabled, companyId: value.companyId, appId: value.appId, installationId: value.installationId,
     privateKeyRef: { type: "secret_ref", secretId: ref.secretId, ...(ref.version === undefined ? {} : { version: ref.version as "latest" | number }) },
-    repos, missingReviewMinutes: minutes, owners,
+    repos, maxGetsPerTick, missingReviewMinutes: minutes, owners,
   };
 }
