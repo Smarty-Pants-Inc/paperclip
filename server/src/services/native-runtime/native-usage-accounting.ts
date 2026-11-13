@@ -59,12 +59,12 @@ export function nativeUsageBiller(provider: NativeExecutionInput["provider"]): s
 /** Provenance note for a receipt whose run includes a provider turn lost on
  * restore. That turn's usage can never be reported, so the receipt is final
  * but its usage and price are a lower bound. */
-export const NATIVE_LOST_TURN_USAGE_EVIDENCE = "a provider turn was lost on restore and never reported its usage; observed usage is a lower bound";
+export const NATIVE_LOST_TURN_USAGE_EVIDENCE = "some provider usage was not reported; observed usage is a lower bound";
 export const NATIVE_TURN_LOST_ON_RESTORE = "provider_turn_lost_on_restore";
 const LOST_ON_RESTORE = NATIVE_TURN_LOST_ON_RESTORE;
 
 export function createNativeTurnAccounting(provider: NativeExecutionInput["provider"]) {
-  const turns = new Map<string, { usage: Record<string, unknown> | null; terminal: boolean; lost?: boolean;
+  const turns = new Map<string, { usage: Record<string, unknown> | null; terminal: boolean; lost?: boolean; summaryUnknown?: boolean;
     /** Open when the provider session was restored after process loss. */
     restored?: boolean }>();
   const sequences = new Map<string, number>();
@@ -79,7 +79,8 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
       // A turn the restored Runner reports as lost on restore can never report
       // its usage. It does not hold the receipt open; it makes it a lower bound.
       const lost = turn.lost === true && normalized === undefined;
-      usageLost ||= lost;
+      usageLost ||= lost || turn.summaryUnknown === true;
+      costIncomplete ||= turn.summaryUnknown === true;
       complete &&= turnId !== "unattributed" && turn.terminal && (normalized !== undefined || lost);
       inputTokens += (normalized?.inputTokens ?? 0) - (normalized?.cacheWriteTokens ?? 0);
       outputTokens += normalized?.outputTokens ?? 0;
@@ -133,12 +134,17 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
         turn.usage = null;
         turn.terminal = false;
         turn.lost = false;
+        turn.summaryUnknown = false;
         turn.restored = false;
       } else if (payload.kind === "usage" && (!currentTurn || !turns.has(key))) currentTurn = event.turnId;
       if (payload.kind === "usage") {
         const usage = record(payload.usage);
-        turn.usage = Object.hasOwn(usage, "runDelta")
-          ? { runDelta: record(usage.runDelta), runDeltaComplete: usage.runDeltaComplete } : null;
+        if (usage.summaryUsage === "unknown" && usage.source === "pi_summarization_unaccounted") {
+          turn.summaryUnknown = true;
+        } else {
+          turn.usage = Object.hasOwn(usage, "runDelta")
+            ? { runDelta: record(usage.runDelta), runDeltaComplete: usage.runDeltaComplete } : null;
+        }
       }
       if (terminal) turn.terminal = true;
       if (event.eventType === "turn.failed" && record(payload.error).code === LOST_ON_RESTORE) turn.lost = true;
