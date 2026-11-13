@@ -8,6 +8,7 @@ import { createWorkScheduler } from "./work-scheduler.js";
 type AccessEvent = typeof secretAccessEvents.$inferInsert;
 const DEBOUNCE_MS = 60 * 60 * 1000;
 const BATCH_SIZE = 100;
+const MAX_PENDING_RECORDS = 10_000;
 const scheduler = createWorkScheduler();
 const states = new WeakMap<Db, State>();
 const pending = new Set<State>();
@@ -20,6 +21,7 @@ type State = {
   running: Promise<void> | null;
   finish?: () => void;
   drainWaiters?: Set<() => void>;
+  capacityWaiters?: Set<() => void>;
 };
 function stateFor(db: Db): State {
   let state = states.get(db);
@@ -39,18 +41,40 @@ function schedule(state: State, delay = 1000) {
   }
 }
 
-/** No plaintext enters this queue. One UUID per resolution makes uncertain INSERT retries idempotent. */
-export function enqueueSecretAccessEvent(db: Db, event: AccessEvent) {
+function pendingCount(state: State) {
+  // In-flight batches remain in these collections until their writes succeed.
+  return state.events.length + state.touches.size;
+}
+function releaseCapacity(state: State) {
+  for (const resolve of state.capacityWaiters ?? []) resolve();
+  state.capacityWaiters?.clear();
+}
+function waitForCapacity(state: State): Promise<void> {
+  schedule(state);
+  return new Promise(resolve => { (state.capacityWaiters ??= new Set()).add(resolve); });
+}
+
+/** No plaintext enters this queue. One UUID per resolution makes uncertain INSERT retries idempotent.
+ * Only overload awaits capacity; failed/stalled writes never drop an obligation.
+ */
+export async function enqueueSecretAccessEvent(db: Db, event: AccessEvent) {
   const state = stateFor(db);
-  state.events.push({ ...event, id: randomUUID(), createdAt: new Date() });
+  const createdAt = new Date();
+  while (pendingCount(state) >= MAX_PENDING_RECORDS) await waitForCapacity(state);
+  state.events.push({ ...event, id: randomUUID(), createdAt });
   schedule(state, state.events.length >= BATCH_SIZE ? 0 : 1000);
 }
 
 /** Advisory usage metadata, not a secret mutation: never advance updatedAt. */
-export function enqueueSecretLastResolvedAt(db: Db, secret: { id: string; lastResolvedAt: Date | null }) {
+export async function enqueueSecretLastResolvedAt(db: Db, secret: { id: string; lastResolvedAt: Date | null }) {
   const state = stateFor(db);
   const now = Date.now();
-  if ((state.touchedUntil.get(secret.id) ?? 0) > now || (secret.lastResolvedAt?.getTime() ?? 0) > now - DEBOUNCE_MS) return;
+  const alreadyTouched = () => (state.touchedUntil.get(secret.id) ?? 0) > now || (secret.lastResolvedAt?.getTime() ?? 0) > now - DEBOUNCE_MS;
+  if (alreadyTouched()) return;
+  while (pendingCount(state) >= MAX_PENDING_RECORDS) {
+    await waitForCapacity(state);
+    if (alreadyTouched()) return;
+  }
   // Bound the advisory debounce cache. SQL still guards every eventual write.
   if (state.touchedUntil.size >= 10_000) {
     for (const [id, until] of state.touchedUntil) if (until <= now) state.touchedUntil.delete(id);
@@ -83,6 +107,7 @@ function flush(state: State): Promise<void> {
         const batch = state.events.slice(0, BATCH_SIZE);
         await retryOnce(async () => state.db.insert(secretAccessEvents).values(batch).onConflictDoNothing({ target: secretAccessEvents.id }), "audit");
         state.events.splice(0, batch.length);
+        releaseCapacity(state);
       }
       for (const [id, at] of state.touches) {
         await retryOnce(async () => state.db.update(companySecrets).set({ lastResolvedAt: at }).where(and(
@@ -90,6 +115,7 @@ function flush(state: State): Promise<void> {
           or(isNull(companySecrets.lastResolvedAt), lt(companySecrets.lastResolvedAt, new Date(at.getTime() - DEBOUNCE_MS))),
         )), "usage");
         if (state.touches.get(id) === at) state.touches.delete(id);
+        releaseCapacity(state);
       }
     }
   })().finally(() => {
