@@ -45,6 +45,24 @@ The response also includes:
 - `documentSummaries`: metadata for all linked issue documents
 - `legacyPlanDocument`: a read-only fallback when the description still contains an old `<plan>` block
 
+## Live Runs and Feedback Votes
+
+```
+GET /api/issues/{issueId}/live-runs
+GET /api/issues/{issueId}/feedback-votes
+```
+
+Both endpoints accept a task UUID or identifier and require permission to read
+that task, not just membership in its company. A missing task, another company's
+task, or a private task the caller cannot read returns the same `404` response
+with `{ "error": "Issue not found" }`, even when the list would be empty.
+Task access is checked again on every request, including conditional requests.
+
+Live runs returns the task's queued and running runs. Feedback votes returns the
+signed-in board user's votes; a readable task still requires a board user for
+this endpoint. Task owners and explicitly shared readers retain their normal
+access. A company owner or admin does not automatically gain private-task access.
+
 ## Create Issue
 
 ```

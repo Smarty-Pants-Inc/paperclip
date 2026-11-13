@@ -5038,8 +5038,9 @@ registry.registerPath({
   path: "/api/issues/{id}/feedback-votes",
   tags: ["issues"],
   summary: "List issue feedback votes",
+  description: "Requires task read access and a board user. Missing or unreadable tasks return 404.",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -8091,8 +8092,9 @@ registry.registerPath({
   path: "/api/issues/{issueId}/live-runs",
   tags: ["runs"],
   summary: "List live runs for an issue",
+  description: "Requires task read access. Missing or unreadable tasks return 404.",
   request: { params: z.object({ issueId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
 registry.registerPath({
