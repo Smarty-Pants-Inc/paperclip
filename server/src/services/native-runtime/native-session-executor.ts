@@ -11171,7 +11171,11 @@ async function executePaperclipNativeSessionAttempt(
     // The identity command is durable maintenance: the completed source writer
     // needs this successor's claimed lease before it may persist that command.
     // Keep the check before warm reattach/provider work, not before the claim.
-    if (idleOwner && !idleOwner.busy && !idleOwner.preparingRunId && !idleOwner.instructionPreparationRunId
+    // Managed instruction handoff reserves this owner for the successor itself;
+    // only another run's preparation (or an unrelated busy turn) excludes it.
+    if (idleOwner && (!idleOwner.busy || idleOwner.instructionPreparationRunId === input.execution.binding.runId)
+      && (!idleOwner.preparingRunId || idleOwner.preparingRunId === input.execution.binding.runId)
+      && (!idleOwner.instructionPreparationRunId || idleOwner.instructionPreparationRunId === input.execution.binding.runId)
       && idleOwner.runId !== input.execution.binding.runId && await resumedSandboxRunnerNeedsProbe(input)) {
       const root = scopedRunnerdStateRoot(input.execution);
       await restoreWarmRunnerdController(input);

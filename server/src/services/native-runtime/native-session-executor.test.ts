@@ -16087,7 +16087,14 @@ describe("runnerd provider runtime wiring", () => {
     { name: "parked ingress reconnect without authentication", connected: false, answersIdentity: true, sameGeneration: true, lost: false, probe: true },
     { name: "parked ingress different generation", connected: false, answersIdentity: true, sameGeneration: false, lost: false, probe: true },
     { name: "parked ingress silent identity", connected: false, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
-  ])("requires a current authenticated runner identity answer: $name", async ({ name, connected, answersIdentity, sameGeneration, lost, probe, resumedFromState }) => {
+    { name: "managed current copy preparation healthy", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false, preparation: "own-copy" },
+    { name: "managed current copy preparation lost", connected: true, answersIdentity: false, sameGeneration: true, lost: true, probe: true, preparation: "own-copy" },
+    { name: "managed foreign copy preparation", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false, preparation: "foreign-copy" },
+    { name: "managed current directory preparation healthy", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false, preparation: "own-directory" },
+    { name: "managed foreign directory preparation", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false, preparation: "foreign-directory" },
+  ] as Array<{ name: string; connected: boolean; answersIdentity: boolean; sameGeneration: boolean; lost: boolean; probe: boolean;
+    resumedFromState?: "stopped" | "archived"; preparation?: "own-copy" | "foreign-copy" | "own-directory" | "foreign-directory" }>)
+  ("requires a current authenticated runner identity answer: $name", async ({ name, connected, answersIdentity, sameGeneration, lost, probe, resumedFromState, preparation }) => {
     const first = scopedNativeExecution(`fresh-probe-${name.replaceAll(" ", "-")}`);
     first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
     const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
@@ -16118,6 +16125,11 @@ describe("runnerd provider runtime wiring", () => {
       normalizedSessionId: first.session.normalizedSessionId!, providerSessionId: "retained-history",
       driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     const existingSessions: unknown[] = [];
+    const instructionCopy = preparation ? { runId: first.binding.runId, preparationKey: "managed-probe",
+      root: "/workspace/agent-home", hasChanges: vi.fn(async () => false), collectStopped: vi.fn(async () => undefined),
+      ...(preparation.endsWith("directory") ? { checkpointWarm: vi.fn(async () => true) } : {}) } : undefined;
+    const nextCopy = instructionCopy ? { ...instructionCopy, runId: next.binding.runId } : undefined;
+    const managedEvents: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
     const authenticatedRunnerInstanceId = sameGeneration ? identity.runnerInstanceId : `${identity.runnerInstanceId}-other`;
     let connectionCount = connected ? 1 : 0;
     const reconnectCase = name.startsWith("parked ingress");
@@ -16197,7 +16209,31 @@ describe("runnerd provider runtime wiring", () => {
     }) as Db["select"];
     try {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first,
-        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target });
+        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target, instructionWorkingCopy: instructionCopy });
+      let releasePreparation: (() => Promise<void>) | undefined;
+      if (preparation) {
+        const runId = preparation.startsWith("foreign") ? `${next.binding.runId}-foreign` : next.binding.runId;
+        if (preparation.endsWith("copy")) {
+          const release = await claimWarmNativeInstructionCopy({ priorExecution: first, ...first.binding,
+            workspace: first.workspace, environmentId, runId, preparationKey: "managed-probe",
+            adopt: async () => ({ ...nextCopy!, runId }) });
+          expect(release).toBeTypeOf("function");
+          releasePreparation = release!;
+        } else {
+          const reservation = await reserveWarmNativeInstructionDirectory({ companyId: first.binding.companyId,
+            agentId: first.binding.agentId, previousRunId: first.binding.runId, runId, target, canReuse: async () => true });
+          expect(reservation).not.toBeNull();
+          reservation!.adopt(nextCopy!.root!, nextCopy!.collectStopped);
+          releasePreparation = reservation!.release;
+        }
+      }
+      if (preparation === "foreign-copy") {
+        await writeRunnerAuthority(root, identity, "suspended");
+        await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify({
+          ...durableControlPlaneState(identity), commands: [],
+          committedEvents: [{ eventType: "run.terminal", envelope: identity }],
+        }));
+      }
       if (lost) {
         await rm(join(root, "runner/runner-state.json"));
         await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify({
@@ -16207,9 +16243,24 @@ describe("runnerd provider runtime wiring", () => {
       }
       execute.mockClear(); restore.mockClear();
       target.sandboxLeaseAcquisition.outcome = "resumed";
-      await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
-        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target,
-        onExecutionLeaseAcquired: async () => { successorClaimed = true; } })).resolves.toMatchObject({ exitCode: 0 });
+      const attempt = executePaperclipNativeSession({ db: nextDb, execution: next,
+        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target, instructionWorkingCopy: nextCopy,
+        onExecutionLeaseAcquired: async () => { successorClaimed = true; },
+        onEvent: async event => { managedEvents.push(event); } });
+      if (preparation?.startsWith("foreign")) {
+        await expect(attempt).rejects.toThrow("native_session_supervisor_busy");
+        expect(identityCheck).not.toHaveBeenCalled();
+        expect(execute).not.toHaveBeenCalled();
+        expect(state.execute).toHaveBeenCalledOnce();
+        await releasePreparation?.();
+        return;
+      }
+      await expect(attempt).resolves.toMatchObject({ exitCode: 0 });
+      await releasePreparation?.();
+      if (preparation) expect(managedEvents.filter(event => event.eventType === "run.performance.span"
+        && event.payload?.span === "native.controller.warm_owner_identity_check")).toEqual([
+        expect.objectContaining({ payload: expect.objectContaining({ outcome: probe ? "failed" : "ok" }) }),
+      ]);
       const probes = execute.mock.calls.filter(([request]) => request.args?.[2] === "paperclip-runner-generation-marker");
       console.info(`[identity-probe] ${name}: markers=${probes.length}, totalRemoteExecs=${execute.mock.calls.length}, identityChecks=${identityCheck.mock.calls.length}, reused=${existingSessions[0] === session}`);
       if (probe) expect(probes.length).toBeGreaterThan(0);
