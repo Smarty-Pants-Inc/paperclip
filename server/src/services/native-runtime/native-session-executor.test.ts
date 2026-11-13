@@ -118,6 +118,7 @@ import * as nativeSessionResume from "./native-session-resume.js";
 import * as nativeLeaseRenewal from "./native-execution-lease.js";
 import * as retainedPackSource from "./retained-provider-pack-source.js";
 import { buildNativeHeartbeatPreparationSpans, createNativeRunTrace } from "./native-run-trace.js";
+import { measureRunnerOperation } from "./runner-operation-timing.js";
 import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 import type { AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
@@ -12976,6 +12977,52 @@ describe("native warm session supervision", () => {
       }
       await rm(stateBase, { recursive: true, force: true });
     }
+  });
+
+  it("emits bounded step spans from controller callbacks on a retained warm run", async () => {
+    const first = { ...execution, binding: { ...execution.binding, runId: "warm-step-first", executionWorkspaceId: "warm-step-workspace" },
+      session: { ...execution.session, normalizedSessionId: "warm-step-session", lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: "warm-step-second" } };
+    const sharedSession = { close: vi.fn(async () => undefined) };
+    const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+      normalizedSessionId: first.session.normalizedSessionId, providerSessionId: "provider", driverKind: "test", driverVersion: "1",
+      nativeEventCount: 3, highestContiguousSourceSeq: 3, usage: null };
+    const events: AdapterRuntimeEvent[] = [];
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.(sharedSession);
+      return result;
+    }).mockImplementationOnce(async options => {
+      expect(options.existingSession).toBe(sharedSession);
+      // The existing transport timing hook and production controller callbacks
+      // run unchanged; provider I/O and DB rows are this suite's unit ports.
+      await measureRunnerOperation("runner.transport.attach", async () => { await options.onSession?.(sharedSession); });
+      let seq = 0;
+      for (const eventType of ["session.resumed", "turn.submitted", "turn.started"] as const) {
+        await accountingEvents.committed!({ schema: "paperclip.prp.event.v1", sourceEventId: `warm-step-${++seq}`,
+          sourceSeq: seq, sourceInstanceId: "runner", sourceKind: "runner", runId: second.binding.runId,
+          normalizedSessionId: second.session.normalizedSessionId!, turnId: "turn", eventType, schemaVersion: 1, priority: 0,
+          emittedAt: new Date().toISOString(), payload: {} });
+      }
+      return result;
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: "runner" });
+      await executePaperclipNativeSession({ db: leaseDb(second), execution: second, runnerInstanceId: "runner",
+        onEvent: async event => { events.push(event); } });
+      const spans = events.filter(event => event.eventType === "run.performance.span").map(event => event.payload!);
+      expect(spans.map(span => span.span)).toEqual(expect.arrayContaining([
+        "native.controller.resume.transport_attach", "native.controller.resume.run_authority_read",
+        "native.controller.resume.provider_pack_admission", "native.controller.resume.reuse_receipt",
+        "native.controller.submit.recovery_notice", "native.controller.submit.span_persistence",
+      ]));
+      for (const [phase, wrapperName] of [["resume", "runner.session.resume"], ["submit", "runner.turn.submitted_to_started"]] as const) {
+        const wrapper = spans.find(span => span.span === wrapperName)!;
+        const children = spans.filter(span => String(span.span).startsWith(`native.controller.${phase}.`));
+        expect(wrapper).toBeDefined();
+        for (const child of children) { expect(child.durationMs).toBeGreaterThanOrEqual(0); expect(child.parentSpan).toBe(wrapperName); }
+        expect(children.reduce((sum, span) => sum + Number(span.durationMs), 0)).toBeLessThanOrEqual(Number(wrapper.durationMs));
+      }
+    } finally { await closeIdleWarmNativeSessionsForRestart(); }
   });
 
   it("reuses one session across distinct governed runs and closes it after idle expiry", async () => {

@@ -33,6 +33,7 @@ import { createNativeTurnAccounting, NATIVE_LOST_TURN_USAGE_EVIDENCE, nativeUsag
 import { crashPoint } from "@paperclipai/shared/crash-points";
 export { nativeUsageCostUsd, nativeUsageBiller, normalizeNativeUsage } from "./native-usage-accounting.js";
 import { measureRunnerOperation, recordRunnerTimingReceipt } from "./runner-operation-timing.js";
+import { createNativeControllerStepTiming, measureNativeControllerStep, runWithNativeControllerSteps } from "./native-controller-step-timing.js";
 import { formatNativeRunLogEvent } from "./native-run-log-export.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
@@ -1101,8 +1102,8 @@ async function measureNativeRunnerSpan<T>(
 function createNativeControllerTiming(runId: string, currentTrace: () => NativeRunTrace | undefined) {
   const time = createRunPreparationTiming(runId, "native.controller");
   return <T>(phase: Parameters<typeof time>[0], work: () => T | Promise<T>): Promise<T> =>
-    phase === "span_persistence" ? time(phase, work)
-      : measureNativeRunnerSpan(currentTrace(), `native.controller.${phase}`, () => time(phase, work), "task.provider_session");
+    measureNativeControllerStep(phase, () => phase === "span_persistence" ? time(phase, work)
+      : measureNativeRunnerSpan(currentTrace(), `native.controller.${phase}`, () => time(phase, work), "task.provider_session"));
 }
 
 /**
@@ -10450,6 +10451,7 @@ async function executePaperclipNativeSessionAttempt(
     Date.now(),
   );
   const traceRunId = input.execution.binding.runId;
+  let finishControllerSteps = () => {};
   const flushRecovery = () => {
     if (nativeRunRecoveryFlushers.get(traceRunId) === flushRecovery) nativeRunRecoveryFlushers.delete(traceRunId);
     trace.flushRestartRecovery();
@@ -10457,8 +10459,9 @@ async function executePaperclipNativeSessionAttempt(
   const trace = createNativeRunTrace({
     runId: traceRunId,
     startedAtMs: preparationStarts.runStartedAtMs,
-    onEvent: input.onEvent,
+    onEvent: input.onEvent ? event => measureNativeControllerStep("span_persistence", () => input.onEvent!(event)) : undefined,
     onFinish: () => {
+      finishControllerSteps();
       if (nativeRunRecoveryFlushers.get(traceRunId) === flushRecovery) nativeRunRecoveryFlushers.delete(traceRunId);
     },
     budget: {
@@ -11010,6 +11013,8 @@ async function executePaperclipNativeSessionAttempt(
         `${JSON.stringify({ type: "paperclip.plan.synchronization", synchronization })}\n`,
       );
   };
+  const controllerSteps = createNativeControllerStepTiming(trace);
+  finishControllerSteps = controllerSteps.finish;
   let nativeSessionExecuteStartedAtMs = Date.now();
   let sessionStartedAtMs: number | null = null;
   let sessionStartupMode: "bootstrap" | "resume" | null = null;
@@ -11210,7 +11215,7 @@ async function executePaperclipNativeSessionAttempt(
         }
       },
       onCommittedEvent: async (event, cursor) => {
-        await materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event });
+        await controllerSteps.measure("recovery_notice", () => materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event }));
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});
@@ -11244,15 +11249,15 @@ async function executePaperclipNativeSessionAttempt(
             });
           });
         }
-        await observeAccountingEvent(event);
-        await toolTrace.observe(event);
+        await controllerSteps.measure("accounting_event", () => observeAccountingEvent(event));
+        await controllerSteps.measure("tool_trace", () => toolTrace.observe(event));
         if (event.eventType === "item.completed" &&
             record(event.payload).kind === "agentMessage" &&
             record(event.payload).channel === "final") {
           completedConversationReply = event;
         }
-        await liveQuestions.observe(event);
-        await projectSessionGoalEvent(event);
+        await controllerSteps.measure("question_observation", () => liveQuestions.observe(event));
+        await controllerSteps.measure("goal_projection", () => projectSessionGoalEvent(event));
         providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
         providerFailureObservation.observe(event);
         const eventAtMs = Date.parse(event.emittedAt);
@@ -11283,9 +11288,9 @@ async function executePaperclipNativeSessionAttempt(
         }
         if (event.eventType === "session.resumed") {
           const restarted = piSessionRecovery(event) !== null;
-          await emitStartupReuse(input.onEvent, "provider_session", restarted
+          await controllerSteps.measure("reuse_receipt", () => emitStartupReuse(input.onEvent, "provider_session", restarted
             ? { state: "fresh", reason: "resume_failed" }
-            : { state: "reused", reason: "verified_reuse" });
+            : { state: "reused", reason: "verified_reuse" }));
           trace.setBudgetStart(restarted ? "cold" : "warm");
         }
         if (
@@ -11309,6 +11314,7 @@ async function executePaperclipNativeSessionAttempt(
                 strategy: "exact_provider_session",
               },
             });
+            controllerSteps.flush("resume", nativeSessionExecuteStartedAtMs, milestoneAtMs);
             sessionStartedAtMs = milestoneAtMs;
             sessionStartupMode = "resume";
           }
@@ -11341,6 +11347,7 @@ async function executePaperclipNativeSessionAttempt(
             startedAtMs: turnSubmittedAtMs ?? milestoneAtMs,
             endedAtMs: milestoneAtMs,
           });
+          controllerSteps.flush("submit", turnSubmittedAtMs ?? milestoneAtMs, milestoneAtMs);
         }
         if (!firstAgentEventRecorded && turnStartedAtMs !== null) {
           const kind = firstMeaningfulAgentEventKind(event);
@@ -11408,12 +11415,12 @@ async function executePaperclipNativeSessionAttempt(
           });
           trace.activate(taskSettleScope);
         }
-        if (input.onPersistedNativeLog) await input.onPersistedNativeLog(cursor, formatNativeRunLogEvent(event));
+        if (input.onPersistedNativeLog) await controllerSteps.measure("log_delivery", () => input.onPersistedNativeLog!(cursor, formatNativeRunLogEvent(event)));
         else if (input.onLog)
-          await input.onLog(
+          await controllerSteps.measure("log_delivery", () => input.onLog!(
             "stdout",
             `${JSON.stringify({ type: "paperclip.prp.event", event })}\n`,
-          );
+          ));
         if (
           input.onEvent &&
           [
@@ -11428,7 +11435,7 @@ async function executePaperclipNativeSessionAttempt(
             "turn.cancelled",
           ].includes(event.eventType)
         ) {
-          await input.onEvent({
+          await controllerSteps.measure("event_delivery", () => input.onEvent!({
             eventType: event.eventType,
             stream: "system",
             level: event.eventType.includes("failed") ? "error" : "info",
@@ -11437,7 +11444,7 @@ async function executePaperclipNativeSessionAttempt(
               prpSourceSeq: event.sourceSeq,
               prpSourceInstanceId: event.sourceInstanceId,
             },
-          });
+          }));
         }
         const inputMetric = runtimeInputLifecycleMetric(event);
         if (inputMetric && input.onLog) {
@@ -11449,11 +11456,11 @@ async function executePaperclipNativeSessionAttempt(
             })}\n`,
           );
         }
-        const questionFallback = await materializeRuntimeQuestionFallback({
+        const questionFallback = await controllerSteps.measure("question_fallback", () => materializeRuntimeQuestionFallback({
           db: input.db,
           binding: input.execution.binding,
           event,
-        });
+        }));
         if (questionFallback) {
           if (input.onLog) {
             const origin = record(record(record(event.payload).request).origin);
@@ -11475,39 +11482,39 @@ async function executePaperclipNativeSessionAttempt(
             );
           }
         }
-        await governedWaitObservation.observe(
+        await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
           event.eventType === "item.completed" || questionFallback !== null,
-        );
-        await recordRateLimits(event);
-        await recordPlanSynchronization(
+        ));
+        await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
+        await controllerSteps.measure("plan_synchronization", () => recordPlanSynchronization(
           event as {
             sourceEventId: string;
             turnId?: string;
             eventType: string;
             payload: Record<string, unknown>;
           },
-        );
+        ));
       },
       onDuplicateEvent: async (event, cursor) => {
-        await materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event });
-        await input.onPersistedNativeLog?.(cursor, formatNativeRunLogEvent(event));
+        await controllerSteps.measure("recovery_notice", () => materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event }));
+        await controllerSteps.measure("log_delivery", () => input.onPersistedNativeLog?.(cursor, formatNativeRunLogEvent(event)));
         if (!firstTokenRecorded) observeDeliverableText(event);
-        await observeAccountingEvent(event);
-        await liveQuestions.observe(event);
-        await projectSessionGoalEvent(event);
+        await controllerSteps.measure("accounting_event", () => observeAccountingEvent(event));
+        await controllerSteps.measure("question_observation", () => liveQuestions.observe(event));
+        await controllerSteps.measure("goal_projection", () => projectSessionGoalEvent(event));
         providerUsageLimitObserved ||= nativeProviderUsageLimitFromEvent(event);
         providerFailureObservation.observe(event);
-        const questionFallback = await materializeRuntimeQuestionFallback({
+        const questionFallback = await controllerSteps.measure("question_fallback", () => materializeRuntimeQuestionFallback({
           db: input.db,
           binding: input.execution.binding,
           event,
-        });
-        await governedWaitObservation.observe(
+        }));
+        await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
           event.eventType === "item.completed" || questionFallback !== null,
-        );
-        await recordRateLimits(event);
+        ));
+        await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
         const planSynchronization = await synchronizeCompletedProviderPlan({
           db: input.db,
           execution: input.execution,
@@ -11963,23 +11970,25 @@ async function executePaperclipNativeSessionAttempt(
         const runExecution = () =>
           executeNativeSession({
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner" || scheduledResumeContinuation,
-            getFreshSessionHandoff: input.getFreshSessionHandoff,
+            getFreshSessionHandoff: input.getFreshSessionHandoff
+              ? () => controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!) : undefined,
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
-            prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt,
-            getFirstTurnQueuedInput: () => claimFirstTurnQueuedInput(input.db, input.execution.binding).catch((error) => {
+            prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt
+              ? () => controllerSteps.measure("attachment_prompt", input.prepareAttachmentPrompt!) : undefined,
+            getFirstTurnQueuedInput: () => controllerSteps.measure("queued_input", () => claimFirstTurnQueuedInput(input.db, input.execution.binding)).catch((error) => {
               logger.warn({ err: error, runId: input.execution.binding.runId }, "first-turn queued input was not sealed");
               return null;
             }),
-            getUnreadSteeredMessages: () => readUnreadSteeredMessages(input.db, {
+            getUnreadSteeredMessages: () => controllerSteps.measure("steered_messages", () => readUnreadSteeredMessages(input.db, {
               companyId: input.execution.binding.companyId,
               runId: input.execution.binding.runId,
               issueId: input.execution.binding.issueId,
-            }),
+            })),
             onSessionAdmission: async () => {
               if (existingWarmSession) runnerdBackend?.bindDiagnosticSession?.(existingWarmSession);
               // Invalidate prior stop evidence before a backend can spawn.
-              await appendHeartbeatRunEvent(input.db, {
+              await controllerSteps.measure("process_start_intent", () => appendHeartbeatRunEvent(input.db, {
                 companyId: input.execution.binding.companyId,
                 runId: input.execution.binding.runId,
                 agentId: input.execution.binding.agentId,
@@ -11991,7 +12000,7 @@ async function executePaperclipNativeSessionAttempt(
                 // The provider attempt opens that attempt's outcome window for
                 // the work-based budget (provider-attempt-outcome.ts).
                 payload: { hostname: hostname(), providerAttempt: attempt, requestedAt: new Date().toISOString() },
-              });
+              }));
               crashPoint("native.process_start.after_requested_before_spawn");
             },
             input: runnerExecution,
@@ -12317,11 +12326,11 @@ async function executePaperclipNativeSessionAttempt(
                 // session is still opening. Publishing the handle before this
                 // read closes both sides of the race: earlier Stop is durable;
                 // later Stop can cancel this exact active session.
-                const [currentRun] = await input.db.select().from(heartbeatRuns).where(and(
+                const [currentRun] = await controllerSteps.measure("run_authority_read", () => input.db.select().from(heartbeatRuns).where(and(
                   eq(heartbeatRuns.id, input.execution.binding.runId),
                   eq(heartbeatRuns.companyId, input.execution.binding.companyId),
                   eq(heartbeatRuns.agentId, input.execution.binding.agentId),
-                )).limit(1);
+                )).limit(1));
                 const cancellation = record(currentRun?.resultJson?.nativeCancellation);
                 if (active.cancelRequested) {
                   // A Stop can acquire the published handle while the authority
@@ -12355,7 +12364,7 @@ async function executePaperclipNativeSessionAttempt(
                   throw new NativeControllerDetachedForRestartError();
                 }
                 try {
-                  await recordNativeProviderPackAdmission(input.db, {
+                  await controllerSteps.measure("provider_pack_admission", () => recordNativeProviderPackAdmission(input.db, {
                     session,
                     admissionEpoch: providerPackAdmissionEpoch,
                     identity: { runId: input.execution.binding.runId, companyId: input.execution.binding.companyId,
@@ -12363,7 +12372,7 @@ async function executePaperclipNativeSessionAttempt(
                       sessionId: nativeSessionKey(input.execution) },
                     claim: { leaseOwner, attempt, controllerGeneration, controllerBootId: controller.bootId },
                     waitForClaim: runnerdBackend?.providerAdmissionRequired?.() === true,
-                  });
+                  }));
                 } catch (error) {
                   // Name the database cause (a SQLSTATE only), so a lost
                   // admission is diagnosable from the run log.
@@ -12371,8 +12380,8 @@ async function executePaperclipNativeSessionAttempt(
                     ?? (error instanceof Error && /^native_[a-z_]+$/.test(error.message) ? error.message : "unknown");
                   try { await input.onLog?.("stderr", `[paperclip-runner] native provider-pack admission receipt could not be saved (cause=${cause})\n`); } catch {}
                 }
-                await runnerdBackend?.providerAdmissionPersisted?.();
-                if (session.resolveRuntimeRequest) await liveQuestions.attach();
+                await controllerSteps.measure("provider_admission_persisted", () => runnerdBackend?.providerAdmissionPersisted?.());
+                if (session.resolveRuntimeRequest) await controllerSteps.measure("question_attach", () => liveQuestions.attach());
                 if (active.cancelRequested) {
                   await active.cancellationSettled;
                   throw new NativeCancellationPendingRecoveryError();
@@ -12390,11 +12399,12 @@ async function executePaperclipNativeSessionAttempt(
             },
           });
         let result: Awaited<ReturnType<typeof runExecution>>;
+        const timedExecution = () => runWithNativeControllerSteps(controllerSteps, runExecution);
         try {
-          result = await trace.run(runnerSessionStartupScope, runExecution);
+          result = await trace.run(runnerSessionStartupScope, timedExecution);
         } catch (error) {
           if (!await continueAfterUnavailableReuse(error)) throw error;
-          result = await trace.run(runnerSessionStartupScope, runExecution);
+          result = await trace.run(runnerSessionStartupScope, timedExecution);
         }
         await trace.end(runnerSessionStartupScope, {
           outcome:

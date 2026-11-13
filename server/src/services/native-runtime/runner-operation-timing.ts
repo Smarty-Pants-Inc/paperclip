@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { trace, SpanStatusCode, type Context, type Span } from "@opentelemetry/api";
+import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { getActiveStepContext, runWithRuntimeParent } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 
 const phases = new Set(["runner.transport.cold_start", "runner.transport.resume", "runner.transport.attach", "runner.transport.prepare",
@@ -16,6 +17,10 @@ export function runWithRunnerOperationRecorder<T>(record: (span: RunnerOperation
 
 // Resolve the parent on every call: a retained transport belongs to several successive runs.
 export function measureRunnerOperation<T>(phase: string, work: () => Promise<T>, attributes?: Record<string, number | boolean>): Promise<T> {
+  return measureNativeControllerStep(phase.replace(/^runner\.transport\./, "transport_"), () => measureTracedRunnerOperation(phase, work, attributes));
+}
+
+function measureTracedRunnerOperation<T>(phase: string, work: () => Promise<T>, attributes?: Record<string, number | boolean>): Promise<T> {
   const record = operationRecorders.getStore();
   if (phase === "runner.transport.attach" && record) {
     const startedAtMs = Date.now();
