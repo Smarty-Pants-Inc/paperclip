@@ -51,7 +51,7 @@ export async function assertAgentConnectionInstallAccess(db: Db, actor: Authoriz
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId))).limit(1);
     if (!agent) throw forbidden("The target agent is not available in this company");
     if (actor.type === "agent" && actor.agentId !== agentId) {
-      await assertCanManageSubordinateAgent(db, actor, { id: agentId, companyId }, { allowCompanyWideRoot: true });
+      await assertCanManageSubordinateAgent(db, actor, { id: agentId, companyId });
     }
     const decision = await authorization.decide({
       actor, action: "agent_config:update", resource: { type: "agent", companyId, agentId }, scope: { targetAgentId: agentId, ...(actor.type === "agent" && actor.agentId !== agentId ? { requiresChangeGrant: true } : {}) },
@@ -303,7 +303,7 @@ export function connectionManagementService(db: Db) {
       for (const principal of principals) {
         const assignmentOnly = isToolAssignmentOperation(resource.operation);
         if (assignmentOnly && principal.type === "agent" && principal.agentId !== targetAgentId) {
-          await assertCanManageSubordinateAgent(db, principal, { id: targetAgentId, companyId: resource.companyId }, { allowCompanyWideRoot: true });
+          await assertCanManageSubordinateAgent(db, principal, { id: targetAgentId, companyId: resource.companyId });
         }
         const targetDecision = await authorization.decide({ actor: principal, action: "agent_config:update", resource: { type: "agent", companyId: resource.companyId, agentId: targetAgentId }, scope: { targetAgentId, ...(assignmentOnly && principal.type === "agent" && principal.agentId !== targetAgentId ? { requiresChangeGrant: true } : {}) } }, { interactionPolicy: "defer_to_mutation" });
         if (!targetDecision.allowed) throw forbidden(targetDecision.explanation, authorizationDeniedDetails(targetDecision));

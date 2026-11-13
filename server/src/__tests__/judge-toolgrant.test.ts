@@ -163,14 +163,14 @@ describe("independent judge adversarial tool assignments", () => {
     expect((await f.bind(f.ids.other)).status).toBe(403);
   }, 60_000);
 
-  it("a top-level principal with company-wide configure can install into another root's subtree", async () => {
+  it("a root with unscoped configure cannot install into another root's subtree", async () => {
     const f = await fixture("unscoped");
     await db.update(agents).set({ reportsTo: null }).where(eq(agents.id, f.ids.lead));
     const [outsideReport] = await db.insert(agents).values({ companyId: f.companyId, name: "Other root report",
       reportsTo: f.ids.other, adapterType: "process", status: "idle", lifecycleState: "ready" }).returning();
     const response = await f.put([...f.retained, { targetType: "agent", targetId: outsideReport.id }]);
-    expect(response.status, response.text).toBe(200);
-    expect(await f.installed()).toContain(outsideReport.id);
+    expect(response.status, response.text).toBe(403);
+    expect(await f.installed()).toEqual(f.retained.map(row => row.targetId).sort());
   }, 60_000);
 
   it.each(["structured", "exact-outside"] as const)("a root's %s configure grant cannot become company-wide", async style => {
@@ -179,19 +179,76 @@ describe("independent judge adversarial tool assignments", () => {
     expect((await f.bind(f.ids.other)).status).toBe(403);
   }, 60_000);
 
-  it("JUDGE: root CEO with unscoped configure must retain cross-root profile assignment (brief rule 4)", async () => {
+  it("a root CEO with unscoped configure retains descendant but not cross-root profile assignment", async () => {
     const f = await fixture("unscoped");
     await db.update(agents).set({ reportsTo: null, role: "ceo" }).where(eq(agents.id, f.ids.lead));
     const own = await f.bind(f.report);
     expect(own.status, own.text).toBe(201);
     const outside = await f.bind(f.ids.other);
-    expect(outside.status, outside.text).toBe(201);
+    expect(outside.status, outside.text).toBe(403);
+    expect(await db.select().from(toolProfileBindings).where(and(
+      eq(toolProfileBindings.profileId, f.profile.id), eq(toolProfileBindings.targetId, f.ids.other),
+    ))).toEqual([]);
   }, 60_000);
 
-  it("JUDGE: root CEO with unscoped configure must retain cross-root install removal (brief rule 4)", async () => {
+  it("a root CEO with unscoped configure cannot remove a cross-root install", async () => {
     const f = await fixture("unscoped");
     await db.update(agents).set({ reportsTo: null, role: "ceo" }).where(eq(agents.id, f.ids.lead));
     const response = await f.put(f.retained.filter(row => row.targetId !== f.ids.other));
-    expect(response.status, response.text).toBe(200);
+    expect(response.status, response.text).toBe(403);
+    expect(await f.installed()).toEqual(f.retained.map(row => row.targetId).sort());
+  }, 60_000);
+
+  // Recorded security catch: RFL R1 / #20389. Role and reporting position
+  // are editable configuration, not a board-only principal identity.
+  it.each(["self", "descendant"] as const)("an agent can set %s to root CEO but cannot manufacture tool authority", async target => {
+    const f = await fixture("unscoped");
+    const id = target === "self" ? f.ids.lead : f.descendant;
+    let token = f.token;
+    if (target === "descendant") {
+      await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: id, membershipRole: "member", status: "active" });
+      await db.insert(principalPermissionGrants).values(NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map(permissionKey => ({
+        companyId: f.companyId, principalType: "agent" as const, principalId: id, permissionKey,
+        scope: permissionKey === "agents:configure" ? null : newStandardAgentGrantScope(permissionKey, id),
+      })));
+      token = randomUUID();
+      await db.insert(agentApiKeys).values({ companyId: f.companyId, agentId: id, name: "Legacy descendant", responsibleUserId: f.userId,
+        keyHash: createHash("sha256").update(token).digest("hex") });
+    }
+    const promoted = await request(f.api).patch(`/api/agents/${id}`).set("Authorization", `Bearer ${f.token}`)
+      .send({ role: "ceo", reportsTo: null });
+    expect(promoted.status, promoted.text).toBe(200);
+    const [saved] = await db.select({ role: agents.role, reportsTo: agents.reportsTo }).from(agents).where(eq(agents.id, id));
+    expect(saved).toEqual({ role: "ceo", reportsTo: null });
+    const bind = await request(f.api).post(f.bindingUrl).set("Authorization", `Bearer ${token}`).send({ targetType: "agent", targetId: f.ids.other });
+    const unbind = await request(f.api).post(f.bindingUrl.replace(/\/bind$/, "/unbind")).set("Authorization", `Bearer ${token}`)
+      .send({ targetType: "agent", targetId: f.ids.peer });
+    const remove = await request(f.api).put(f.installUrl).set("Authorization", `Bearer ${token}`)
+      .send({ installs: f.retained.filter(row => row.targetId !== f.ids.other) });
+    console.log("CEO_ROLE_PROMOTION", JSON.stringify({ target, patch: promoted.status, saved, bind: bind.status, unbind: unbind.status, remove: remove.status }));
+    for (const response of [bind, unbind, remove]) expect(response.status, response.text).toBe(403);
+    expect(await f.installed()).toEqual(f.retained.map(row => row.targetId).sort());
+    expect((await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id))).map(row => row.targetId)).toEqual([f.ids.peer]);
+  }, 60_000);
+
+  it("the existing board path can bind, unbind, install and remove across reporting roots", async () => {
+    const f = await fixture();
+    const [outsideReport] = await db.insert(agents).values({ companyId: f.companyId, name: "Other root report",
+      reportsTo: f.ids.other, adapterType: "process", status: "idle", lifecycleState: "ready" }).returning();
+    const bind = await request(f.board).post(f.bindingUrl).send({ targetType: "agent", targetId: f.ids.other });
+    expect(bind.status, bind.text).toBe(201);
+    expect((await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id))).map(row => row.targetId)).toContain(f.ids.other);
+    const unbind = await request(f.board).post(f.bindingUrl.replace(/\/bind$/, "/unbind")).send({ targetType: "agent", targetId: f.ids.other });
+    expect(unbind.status, unbind.text).toBe(200);
+    expect(await db.select().from(toolProfileBindings).where(and(
+      eq(toolProfileBindings.profileId, f.profile.id), eq(toolProfileBindings.targetId, f.ids.other),
+    ))).toEqual([]);
+    const install = await request(f.board).put(f.installUrl).send({ installs: [...f.retained, { targetType: "agent", targetId: outsideReport.id }] });
+    expect(install.status, install.text).toBe(200);
+    expect(await f.installed()).toEqual([...f.retained.map(row => row.targetId), outsideReport.id].sort());
+    const remove = await request(f.board).put(f.installUrl).send({ installs: f.retained.filter(row => row.targetId !== f.ids.other) });
+    expect(remove.status, remove.text).toBe(200);
+    expect(await f.installed()).toEqual(f.retained.filter(row => row.targetId !== f.ids.other).map(row => row.targetId).sort());
+    console.log("BOARD_CROSS_ROOT", JSON.stringify({ bind: bind.status, unbind: unbind.status, install: install.status, remove: remove.status }));
   }, 60_000);
 });
