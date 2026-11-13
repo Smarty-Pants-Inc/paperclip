@@ -17,7 +17,14 @@ Configuration checks name the target agent. A subtree includes its root and
 transitive reports through `reportsTo`, not siblings, managers or unrelated
 principal agents. Existing `{ allow: ["subtree:<UUID>"] }` grants are also
 supported by the same authorization evaluator. Instruction writes already pass
-the target through the shared instruction authorization service.
+the target through the shared instruction authorization service. CEO writes to
+`/agents/:id/permissions` also require target-scoped configuration authority,
+even when the hiring permission is unchanged.
+
+Default-grant reconciliation (startup and direct-create follow-up) inserts only
+missing grants; it never replaces an existing scope. A missing root CEO's
+configure grant is inserted with that CEO's subtree scope, not an unscoped grant.
+Existing explicitly unscoped grants are preserved as well.
 
 ## Board-only grant updates
 
