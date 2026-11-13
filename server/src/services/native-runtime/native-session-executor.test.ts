@@ -16082,6 +16082,16 @@ describe("runnerd provider runtime wiring", () => {
     { name: "identity command error", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
     { name: "missing control plane", connected: true, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
     { name: "old inbound but current identity answer", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false },
+    // PG5: real cold registration omits its optional identity; parked ingress
+    // must reconnect/authenticate before a fresh runner-owned answer, not probe.
+    { name: "cold registration identity omitted", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false },
+    { name: "successor claim precedes identity", connected: true, answersIdentity: true, sameGeneration: true, lost: false, probe: false },
+    { name: "parked ingress reconnects", connected: false, answersIdentity: true, sameGeneration: true, lost: false, probe: false },
+    { name: "parked ingress reconnect fails", connected: false, answersIdentity: true, sameGeneration: true, lost: false, probe: true },
+    { name: "parked ingress reconnect times out", connected: false, answersIdentity: true, sameGeneration: true, lost: false, probe: true },
+    { name: "parked ingress reconnect without authentication", connected: false, answersIdentity: true, sameGeneration: true, lost: false, probe: true },
+    { name: "parked ingress different generation", connected: false, answersIdentity: true, sameGeneration: false, lost: false, probe: true },
+    { name: "parked ingress silent identity", connected: false, answersIdentity: false, sameGeneration: true, lost: false, probe: true },
   ])("requires a current authenticated runner identity answer: $name", async ({ name, connected, answersIdentity, sameGeneration, lost, probe, resumedFromState }) => {
     const first = scopedNativeExecution(`fresh-probe-${name.replaceAll(" ", "-")}`);
     first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
@@ -16114,15 +16124,57 @@ describe("runnerd provider runtime wiring", () => {
       driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     const existingSessions: unknown[] = [];
     const authenticatedRunnerInstanceId = sameGeneration ? identity.runnerInstanceId : `${identity.runnerInstanceId}-other`;
-    const identityCheck = vi.fn(async (expectedRunnerInstanceId: string) => {
+    let connectionCount = connected ? 1 : 0;
+    const reconnectCase = name.startsWith("parked ingress");
+    let successorClaimed = false;
+    let reconnectSignal: AbortSignal | undefined;
+    let reconnectDeadline: number | undefined;
+    const ensureConnected = vi.fn(async ({ deadline, signal }: { deadline: number; signal: AbortSignal }) => {
+      reconnectSignal = signal; reconnectDeadline = deadline;
+      expect(deadline - Date.now()).toBeGreaterThan(0);
+      expect(deadline - Date.now()).toBeLessThanOrEqual(1_500);
+      if (name === "parked ingress reconnect fails") throw new Error("ingress unavailable");
+      if (name === "parked ingress reconnect times out") {
+        await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+        return;
+      }
+      if (name !== "parked ingress reconnect without authentication") connectionCount = 1;
+    });
+    const identityCheck = vi.fn(async (expectedRunnerInstanceId: string, timeoutMs?: number) => {
       if (name === "identity command error") throw new Error("identity unavailable");
-      return connected && answersIdentity && authenticatedRunnerInstanceId === expectedRunnerInstanceId;
+      // A pre-claim maintenance write revokes the source checkpoint writer in
+      // the real E2E; don't let a mock identity response conceal that ordering.
+      if (name === "successor claim precedes identity" || reconnectCase) expect(successorClaimed).toBe(true);
+      if (reconnectCase) {
+        expect(ensureConnected).toHaveBeenCalledOnce();
+        expect(timeoutMs).toBeGreaterThan(0);
+        expect(timeoutMs).toBeLessThanOrEqual(1_500);
+        expect(Date.now() + timeoutMs!).toBeLessThanOrEqual(reconnectDeadline! + 5);
+        expect(reconnectSignal?.aborted).toBe(false);
+      }
+      return connectionCount === 1 && answersIdentity && authenticatedRunnerInstanceId === expectedRunnerInstanceId;
     });
     state.execute.mockReset().mockImplementationOnce(async options => {
-      await driver.mock.calls.at(-1)![0].beforeConnect?.(identity as never, {
-        activeRunnerConnectionCount: () => connected ? 1 : 0,
+      const core = {
+        store: { state: { identity } },
+        activeRunnerConnectionCount: () => connectionCount,
         ...(name !== "missing control plane" ? { checkRunnerIdentity: identityCheck } : {}),
-      } as never);
+      };
+      if (reconnectCase || name === "cold registration identity omitted") {
+        // Exercise the actual backend-to-driver registration wrapper, not a
+        // handwritten backend identity callback. No process/provider work.
+        type Registration = NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]>;
+        const registration = driver.mock.results.at(-1)!.value as { controlPlaneRegistration: Registration };
+        registration.controlPlaneRegistration = async (authority, attachment) => {
+          await driver.mock.calls.at(-1)![0].beforeConnect?.(attachment, authority);
+          return { ensureConnected, release: () => undefined };
+        };
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const transport = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { controlPlaneRegistration: Registration };
+        await transport.controlPlaneRegistration(core as never);
+      } else {
+        await driver.mock.calls.at(-1)![0].beforeConnect?.(identity as never, core as never);
+      }
       await options.onSession?.(session);
       return result;
     }).mockImplementationOnce(async options => {
@@ -16161,15 +16213,24 @@ describe("runnerd provider runtime wiring", () => {
       execute.mockClear(); restore.mockClear();
       target.sandboxLeaseAcquisition.outcome = "resumed";
       await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
-        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target })).resolves.toMatchObject({ exitCode: 0 });
+        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target,
+        onExecutionLeaseAcquired: async () => { successorClaimed = true; } })).resolves.toMatchObject({ exitCode: 0 });
       const probes = execute.mock.calls.filter(([request]) => request.args?.[2] === "paperclip-runner-generation-marker");
       console.info(`[identity-probe] ${name}: markers=${probes.length}, totalRemoteExecs=${execute.mock.calls.length}, identityChecks=${identityCheck.mock.calls.length}, reused=${existingSessions[0] === session}`);
       if (probe) expect(probes.length).toBeGreaterThan(0);
       else {
         expect(probes).toHaveLength(0);
         expect(execute).not.toHaveBeenCalled();
-        expect(identityCheck).toHaveBeenCalledExactlyOnceWith(identity.runnerInstanceId);
+        if (reconnectCase) expect(identityCheck).toHaveBeenCalledExactlyOnceWith(identity.runnerInstanceId, expect.any(Number));
+        else expect(identityCheck).toHaveBeenCalledExactlyOnceWith(identity.runnerInstanceId);
       }
+      if (reconnectCase) {
+        expect(ensureConnected).toHaveBeenCalledOnce();
+        expect(reconnectSignal?.aborted).toBe(true);
+        if (["parked ingress reconnect fails", "parked ingress reconnect times out", "parked ingress reconnect without authentication"].includes(name)) {
+          expect(identityCheck).not.toHaveBeenCalled();
+        } else expect(identityCheck).toHaveBeenCalledOnce();
+      } else expect(ensureConnected).not.toHaveBeenCalled();
       expect(existingSessions).toEqual([lost ? undefined : session]);
       if (!lost) expect(restore).not.toHaveBeenCalled();
       expect(session.close).not.toHaveBeenCalled();

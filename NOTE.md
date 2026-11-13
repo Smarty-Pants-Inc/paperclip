@@ -1,3 +1,92 @@
+# Probe gate v5 investigation (2026-11-13, epyc1)
+
+**Cause, recorded 15:59Z:** the cold transport registers its control plane
+without its launch identity at
+`packages/paperclip-runner/src/live/runnerd-codex-transport.ts:6486`.
+`native-session-executor.ts:18174` therefore leaves `warmRunnerInstanceId`
+undefined, and `:18562` short-circuits before asking `runner.identity` at turn-2
+admission. This is not a missing/expired/revoked connection: temporary diagnostics
+on the real connected E2E show **1 authenticated connection**, a wired
+`checkRunnerIdentity` function, and an unrevoked lease with **3,596,397 ms** left,
+but no captured generation and a false result. The red assertion is preserved.
+
+Reproduction: shared-harness evidence
+`/srv/scratch/paul/shared-harness/evidence/20261113T155730-13d4c5b8-174633/`
+(`vitest.log`, `result.json`); task artifacts `diagnosis.log`/`diagnosis.json`.
+The test still sees two generation-marker execs on turn 2.
+
+**Second cause, recorded 16:13Z:** once the cold generation is captured, the
+command is issued but never answered: the pre-claim gate at the original
+`native-session-executor.ts:10232` queues durable maintenance while the issue
+already points at its native successor but that successor has no claimed lease.
+`native-runner-checkpoint.ts:150-151` refuses the completed source writer
+(`native_runner_checkpoint_owner_lost`), and the failure handler detaches its
+connection. The command remains pending; the identity check fails in **21 ms**
+with **0 connections**, not by a 1.5-second timeout. Evidence:
+`/srv/scratch/paul/shared-harness/evidence/20261113T161037-13d4c5b8-418908/`
+and task artifacts `diagnosis4.log`/`diagnosis4.json`.
+
+The bounded fix captures the initialized controller's expected generation once
+when the optional cold attachment identity is omitted; this is not liveness
+proof. It also moves idle-owner admission after the successor's ordinary native
+lease claim (before warm reattach/provider work), so the existing source writer
+can persist maintenance without weakening its ownership fence. A disconnected
+warm owner uses its existing authenticated `ensureConnected` route within the
+same 1.5-second total identity-check budget, then still needs a fresh nonce'd
+`runner.identity` answer for that generation. Any failure takes the existing
+probe. No new seam, polling, provider command, process launch, allocation
+acquisition, or liveness heuristic. Temporary diagnostics are removed.
+
+## Fresh v5 qualification (2026-11-13, epyc1)
+
+- **PASS**, all four unchanged lease-change E2Es (idle/archived/stopped/connected),
+  shared harness `evidence/20261113T162950-13d4c5b8-771697/`, exit 0,
+  16:29:50Z–16:34:57Z. Connected proof
+  `proof/native-pi-new-sandbox-lease-VKe8ee/commands.json` has **0**
+  generation-marker execs across its three turns, retained runner/Pi process
+  pair and native session, and no authority-epoch rotation.
+- **PASS**, all three unchanged `native-pi-rpc-stop-warm.e2e.test.ts` cases,
+  `evidence/20261113T162257-13d4c5b8-666079/`, exit 0.
+- **PASS**, complete executor (**1,460**) and recovered-owner follow-up (**133**)
+  unit suites, **1,593/1,593**, exit 0. Task artifacts
+  `all-units-final.log`/`.json`. The root Vitest workspace does not select the
+  runner package; its control-plane suite was run separately in that package:
+  **235/235 PASS**, `control-plane-final.log`/`.json`.
+- **PASS**, `pnpm --filter @paperclipai/server typecheck`,
+  `server-typecheck3.log`/`.json`, exit 0. A task-local `pnpm` shim delegates to
+  installed Corepack because the host has no standalone pnpm executable.
+- **Red/green**, all eight new regression rows fail against the original v4
+  production source (unchanged candidate tests), then pass on v5 with every
+  original v4 test/assertion retained. `baseline-new-tests.log`/`.json` is the
+  intentionally red run; `all-units-final.log` is the complete green run.
+  New coverage includes omitted cold identity, post-claim ordering, reconnect
+  success/failure/timeout, unauthenticated reconnect, wrong generation and a
+  silent identity responder. Reconnect and command share a <=1,500 ms budget.
+
+All named task artifacts are under
+`/srv/scratch/paul/tasks/direct/pi-probegate5/artifacts/`; complete copied harness
+receipts/proofs are under its `harness/` subdirectory. The shared harness paths
+above are relative to `/srv/scratch/paul/shared-harness/`.
+
+**Prior reds remain visible, not waived:** the first full lease run
+`evidence/20261113T161546-13d4c5b8-559636/` was **1 FAIL / 3 PASS**. Idle failed
+on its *first cold turn*, before identity admission: runnerd's bootstrap
+connection failed closed and asked for a fresh one-use ticket. That failure is
+not fixed by this patch; the unchanged full suite passed on rerun. Intermediate
+unit reds from a missing optional mock store and the moved timing span were
+fixed in production code, not by weakening assertions. Three transient Cursor
+Cloud timeouts/settlement failures passed unchanged in both later full runs.
+Initial typecheck launch/typing errors were corrected and rerun; all raw logs
+remain in the task artifacts.
+
+**Scope limits:** this is real runnerd/proxy/Pi + HTTP/Postgres with a simulated
+allocation and a scripted loopback model. It is not daily-org, live-provider,
+remote-sandbox, production-latency or cold-bootstrap-flake qualification. No
+runner TypeScript/Rust source changed; the wrapper verified and reused the
+matching immutable runner artifacts. No push or GitHub write was made.
+
+---
+
 # Pi warm reattach: step one, not a PRP shortcut
 
 > Historical implementation/proof notes from source commit `48c7bf23` (base
