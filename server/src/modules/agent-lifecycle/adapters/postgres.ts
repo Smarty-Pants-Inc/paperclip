@@ -76,7 +76,7 @@ export async function requestAgentLifecycleRecheckInTransaction(
     lifecycleOperation: owned
       ? sql`${agents.lifecycleOperation} || '{"recheckRequested":true}'::jsonb`
       : input.configurationRepaired
-        ? sql`${agents.lifecycleOperation} - 'waitingForSignal' - 'recheckRequested' - 'retryAt' - 'retryRequired' - 'verificationFailures'`
+        ? sql`${agents.lifecycleOperation} - 'waitingForSignal' - 'recheckRequested' - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'failureCode' - 'failureDetail'`
         : sql`${agents.lifecycleOperation} - 'waitingForSignal' - 'recheckRequested' - 'retryAt'`,
     updatedAt: new Date(),
   }).where(and(eq(agents.id, agent.id), eq(agents.companyId, input.companyId), eq(agents.lifecycleVersion, agent.lifecycleVersion)));
@@ -103,7 +103,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     }
     await effects.notifyWork(tx);
     const [updated] = await tx.update(agents).set({ lifecycleError: null,
-      lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'waitingForSignal' - 'recheckRequested'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
+      lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt' - 'retryRequired' - 'verificationFailures' - 'failureCode' - 'failureDetail' - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'waitingForSignal' - 'recheckRequested'`, updatedAt: new Date() }).where(eq(agents.id, agent.id)).returning();
     return updated;
   }
   if (command === "resume" && !["ready", "paused", "pausing", "resuming"].includes(agent.lifecycleState)) transition(agent.lifecycleState, command);
@@ -243,7 +243,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     },
     async completeHost(agent, owner) {
       const rows = await db.update(agents).set({
-        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation}, '{hostComplete}', 'true'::jsonb)`,
+        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation} - 'failureCode' - 'failureDetail', '{hostComplete}', 'true'::jsonb)`,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
       return rows.length > 0;
@@ -260,7 +260,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     async defer(agent, owner, error, now, options) {
       if (options?.waitForSignal && agent.lifecycleState === "verifying") {
         const rows = await db.update(agents).set({ lifecycleError: null,
-          lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'waitingForSignal' - 'recheckRequested')
+          lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'waitingForSignal' - 'recheckRequested' - 'failureCode' - 'failureDetail')
             || case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
               then '{}'::jsonb else '{"waitingForSignal":true}'::jsonb end`,
           updatedAt: now,
@@ -274,11 +274,13 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
       if (options?.verificationFailures !== undefined && agent.lifecycleState === "verifying") {
         retry.verificationFailures = options.verificationFailures;
       }
+      if (options?.failureCode !== undefined) retry.failureCode = options.failureCode;
+      if (options?.failureDetail !== undefined) retry.failureDetail = options.failureDetail;
       const rows = await db.update(agents).set({
         lifecycleError: sql`case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true' then null else ${error}::text end`,
         lifecycleOperation: sql`((case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
             then ${agents.lifecycleOperation} - 'verificationFailures' else ${agents.lifecycleOperation} end)
-          - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested')
+          - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt' - 'retryRequired' - 'waitingForSignal' - 'recheckRequested' - 'failureCode' - 'failureDetail')
           || case when coalesce(${agents.lifecycleOperation}->>'recheckRequested', 'false') = 'true'
             then '{}'::jsonb else ${JSON.stringify(retry)}::jsonb end`,
         updatedAt: now,

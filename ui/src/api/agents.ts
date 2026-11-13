@@ -291,7 +291,19 @@ export const agentsApi = {
       `/companies/${companyId}/adapters/${type}/test-environment`,
       data,
       options,
-    ),
+    ).catch((error: unknown) => {
+      // A failed probe is still a result to display. Other 422s (selection,
+      // permissions, secret bindings) remain ordinary errors.
+      const result = error instanceof ApiError && error.status === 422
+        ? error.body as Partial<AdapterEnvironmentTestResult> | null : null;
+      if (result?.status === "fail" && typeof result.adapterType === "string"
+        && typeof result.testedAt === "string" && Array.isArray(result.checks)
+        && result.checks.every(check => check && typeof check.code === "string"
+          && ["info", "warn", "error"].includes(check.level) && typeof check.message === "string")) {
+        return result as AdapterEnvironmentTestResult;
+      }
+      throw error;
+    }),
   getAdapterAuthSignal: (companyId: string, type: string, environmentId?: string | null) => {
     const query = environmentId ? `?environmentId=${encodeURIComponent(environmentId)}` : "";
     return api.get<AdapterAuthSignalResponse>(

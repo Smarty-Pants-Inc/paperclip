@@ -12,6 +12,7 @@ import * as environmentTests from "../services/agent-environment-test.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { secretService } from "../services/secrets.js";
 import { readAiConnectionConfigurationFailure } from "../services/ai-connection-configuration-failure.js";
+import { readAdapterTestFailure } from "../lib/adapter-test-failure.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -116,15 +117,22 @@ describePostgres("saved harness account preflight", () => {
       await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, account.grantId));
       return { executionTarget: null, environmentName: "Fixture execution target", fallbackChecks: [], release };
     });
-    await expect(verify()).rejects.toThrow("Reconnect or validate the selected AI account");
+    const failure = await verify().catch(error => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure.message).toContain("Reconnect or validate the selected AI account");
+    expect(readAdapterTestFailure(failure)).toBeUndefined();
     expect(allocate).toHaveBeenCalledOnce();
     expect(probe).not.toHaveBeenCalled();
     expect(release).toHaveBeenCalledExactlyOnceWith("failed");
   });
 
   it("releases the target when the managed probe fails", async () => {
-    probe.mockRejectedValueOnce(new Error("Fixture probe failure"));
+    const error = Object.assign(new Error("Fixture probe failure: fixture-preflight-key"), { code: "pi_probe_cleanup_unconfirmed" });
+    probe.mockRejectedValueOnce(error);
     await expect(verify()).rejects.toThrow("Fixture probe failure");
+    expect(readAdapterTestFailure(error)).toMatchObject({ failureCode: "pi_probe_cleanup_unconfirmed",
+      failureDetail: expect.stringContaining("Fixture probe failure") });
+    expect(readAdapterTestFailure(error)?.failureDetail).not.toContain("fixture-preflight-key");
     expect(release).toHaveBeenCalledExactlyOnceWith("failed");
   });
 

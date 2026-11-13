@@ -419,8 +419,8 @@ describe("agent test-environment route", () => {
       mockInstanceSettingsService.getExperimental.mockResolvedValue({ enableManagedSandboxOnly: true });
       const response = await request(await createApp()).post("/api/companies/company-1/adapters/paperclip_runner/test-environment")
         .send({ agentId: f.id, runner: "legacy", environmentId: f.environmentId, adapterConfig: f.adapterConfig });
-      expect(response.status, JSON.stringify(response.body)).toBe(200);
-      expect(response.body).toMatchObject({ status: "fail", checks: expect.arrayContaining([
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body).toMatchObject({ status: "fail", code: "managed_sandbox_unavailable", checks: expect.arrayContaining([
         expect.objectContaining({ code: "managed_sandbox_unavailable", level: "error" }),
       ]) });
       expect(probe).not.toHaveBeenCalled();
@@ -520,7 +520,7 @@ describe("agent test-environment route", () => {
     try {
       const res = await request(app).post("/api/companies/company-1/adapters/paperclip_runner/test-environment")
         .send({ adapterConfig: { provider: "openai_dot", allowUnmeteredProvider: true } });
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(res.body.status).toBe("fail");
       expect(res.body.checks).toContainEqual(expect.objectContaining({ code: "dot_controller", level: "error" }));
       expect(mockEnvironmentRuntime.acquireRunLease).not.toHaveBeenCalled();
@@ -921,8 +921,8 @@ describe("agent test-environment route", () => {
         adapterConfig: { cwd: "/" },
         aiConnection: { provider: "anthropic", method: "api_key", mode: "responsible_user" },
       });
-    expect(res.status).toBe(200);
-    expect(res.body.status).toBe("fail");
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ status: "fail", code: "ai_connection_api_key_rejected" });
     expect(res.body.checks.map((check: { code: string }) => check.code)).toContain("ai_connection_api_key_rejected");
     expect(mockMarkAuthenticationFailed).toHaveBeenCalledWith(expect.objectContaining({
       companyId: "company-1",
@@ -950,8 +950,8 @@ describe("agent test-environment route", () => {
           adapterConfig: { cwd: "/" },
           aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" },
         });
-      expect(res.status).toBe(200);
-      expect(res.body.status).toBe("fail");
+      expect(res.status).toBe(422);
+      expect(res.body).toMatchObject({ status: "fail", code: "adapter_command_missing" });
       expect(res.body.checks.map((check: { code: string }) => check.code)).toContain("ai_connection_validation_incomplete");
       expect(cliProbeSpy).toHaveBeenCalledTimes(1);
       expect(cliProbeSpy.mock.calls[0]?.[0]?.config.engine).toBe("cli");
@@ -1175,11 +1175,12 @@ describe("agent test-environment route", () => {
         environmentId: "11111111-1111-4111-8111-111111111111",
       });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(testEnvironmentSpy).not.toHaveBeenCalled();
     expect(res.body).toMatchObject({
       adapterType: "external_test",
       status: "fail",
+      code: "environment_workspace_realize_failed",
       checks: [
         expect.objectContaining({
           code: "environment_workspace_realize_failed",
@@ -1287,7 +1288,8 @@ describe("agent test-environment route", () => {
         .post("/api/companies/company-1/adapters/external_test/test-environment")
         .send({ adapterConfig: {}, environmentId });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("environment_env_binding_missing");
       // The unresolved key is excluded from resolution; the rest still flows.
       expect(mockSecretService.resolveEnvBindings).toHaveBeenCalledWith(
         "company-1",
@@ -1337,9 +1339,9 @@ describe("agent test-environment route", () => {
         .post("/api/companies/company-1/adapters/external_test/test-environment")
         .send({ adapterConfig: {}, environmentId });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(testEnvironmentSpy).not.toHaveBeenCalled();
-      expect(res.body.status).toBe("fail");
+      expect(res.body).toMatchObject({ status: "fail", code: "environment_env_binding_missing" });
       expect(res.body.checks).toEqual([
         expect.objectContaining({ code: "environment_target_unsupported", level: "warn" }),
         expect.objectContaining({ code: "environment_env_binding_missing", level: "error" }),
@@ -1386,7 +1388,7 @@ describe("agent test-environment route", () => {
         expect.objectContaining({ adapterType: "claude_local", defaultEnvironmentId: pluginEnvironment.id }));
       // The driver check passes, and the resolved Runner leases the plugin
       // environment. The probe stops at the controlled task-capability check.
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
       expect(mockEnvironmentRuntime.acquireRunLease).toHaveBeenCalledWith(expect.objectContaining({
         adapterType: "paperclip_runner",
         environment: expect.objectContaining({ id: pluginEnvironment.id, driver: "plugin" }),
@@ -1410,8 +1412,8 @@ describe("agent test-environment route", () => {
       const res = await request(app)
         .post("/api/companies/company-1/adapters/codex_local/test-environment")
         .send({ adapterConfig: {}, environmentId: pluginEnvironment.id });
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(res.body).toMatchObject({ adapterType: "paperclip_runner", status: "fail",
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body).toMatchObject({ adapterType: "paperclip_runner", status: "fail", code: "ai_connection_required",
         checks: [{ code: "ai_connection_required", level: "error", message: expect.stringContaining(message) }] });
       expect(mockPluginRunnerTaskDriver).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ id: pluginEnvironment.id }));
       expect(mockSecretService.resolveAdapterConfigForRuntime).not.toHaveBeenCalled();
@@ -1590,7 +1592,8 @@ describe("agent test-environment route", () => {
         .post("/api/companies/company-1/adapters/external_test/test-environment")
         .send({ adapterConfig: {}, environmentId: localEnvironmentId });
 
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body.code).toBe("managed_sandbox_unavailable");
       // No fall back to a host probe: the Test reports fail-closed.
       expect(testEnvironmentSpy).not.toHaveBeenCalled();
       expect(mockEnvironmentRuntime.acquireRunLease).not.toHaveBeenCalled();

@@ -23,6 +23,10 @@ export interface AgentLifecycleOperation {
   retryRequired?: boolean;
   /** Failed generic host verification tests for this saved configuration. */
   verificationFailures?: number;
+  /** The failed execution check's own code, separate from lifecycle retry classification. */
+  failureCode?: string;
+  /** Secret-redacted probe guidance, bounded to 2,000 characters. */
+  failureDetail?: string;
   attempts: number;
   responsibleUserId?: string | null;
   /** Why a pause started: its holds and the company's pause reason at that moment. Runs the

@@ -2,6 +2,28 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentsApi } from "./agents";
 import { api } from "./client";
 
+// Keep: failed probes use HTTP 422 but must still render their diagnostic checks.
+describe("agentsApi.testEnvironment", () => {
+  it("returns structured failed checks from the real HTTP client instead of discarding them", async () => {
+    const result = { adapterType: "paperclip_runner", status: "fail", code: "pi_rpc_hello_probe_failed",
+      error: "Native Pi hello failed", testedAt: "2026-11-13T00:00:00.000Z",
+      checks: [{ code: "pi_rpc_hello_probe_failed", level: "error", message: "Native Pi hello failed" }] };
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(result), {
+      status: 422, headers: { "Content-Type": "application/json" },
+    }));
+    await expect(agentsApi.testEnvironment("company-1", "paperclip_runner", { adapterConfig: { provider: "pi_rpc" } }))
+      .resolves.toEqual(result);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it.each([403, 422, 500])("does not convert an ordinary HTTP %s error into a probe result", async status => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ error: "Selection unavailable", details: { code: "configuration_error" } }), {
+      status, headers: { "Content-Type": "application/json" },
+    }));
+    await expect(agentsApi.testEnvironment("company-1", "paperclip_runner", { adapterConfig: {} })).rejects.toMatchObject({ status });
+  });
+});
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("agentsApi.retryFailedRun", () => {
