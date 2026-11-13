@@ -92,6 +92,7 @@ export type GitHubRecoveryReceipt = GitHubRecoveryWindow & {
 
 const GITHUB_RECOVERY_DELIVERED_MEANWHILE = "github_webhook_recovery_delivered_meanwhile";
 const GITHUB_RECOVERY_ATTEMPT_NOT_ELIGIBLE = "github_webhook_recovery_attempt_not_eligible";
+const GITHUB_RECOVERY_MAX_DETAIL_READS = 10;
 
 // These are recorded observations, not provenance denials or authorizations
 // for a recovered callback. They must never fence genuine ingress.
@@ -1297,6 +1298,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
     let outcome = "scanned";
     let requested = 0;
     let inspected = 0;
+    let detailReads = 0;
     let recovered = 0;
     let deliveredMeanwhile = 0;
     let rejected = 0;
@@ -1376,6 +1378,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
       for (const [guid, group] of groups) {
         if (
           inspected >= 5 ||
+          detailReads >= GITHUB_RECOVERY_MAX_DETAIL_READS ||
           isShuttingDown() ||
           Date.now() >= Date.parse(window.nextScanAt)
         )
@@ -1450,6 +1453,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         )
           continue;
         inspected += 1;
+        detailReads += 1;
         const detail = await getGitHubAppWebhookDelivery({
           fetch: recoveryFetch,
           appToken,
@@ -1495,7 +1499,8 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         // The list is only candidate discovery. Decide from the fresh detail,
         // replacing its stale list snapshot when selecting the latest attempt.
         // Permanent decisions are recorded; temporary states wait for the list
-        // to catch up, whose pre-detail checks avoid spending detail budget.
+        // to catch up. Stale lists can keep producing deferred detail reads, so
+        // bound those separately from the five-decision budget.
         latest = [detail, ...group.filter(attempt => attempt.id !== detail.id)].sort(
           (left, right) => Date.parse(right.deliveredAt) - Date.parse(left.deliveredAt),
         )[0]!;
@@ -1526,6 +1531,9 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         if (deferredReason) {
           // Do not tombstone a delivery that can become eligible later, or
           // cancel the receipt that still owns its remaining retry attempts.
+          // A deferral is not a decision: keep capacity for older candidates.
+          // The detail-read cap still bounds work if the list never catches up.
+          inspected -= 1;
           deferred += 1;
           logger.info({ endpointId: endpoint.id, guid, reason: deferredReason },
             "GitHub webhook recovery attempt deferred");
@@ -1724,6 +1732,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           outcome,
           requested,
           inspected,
+          detailReads,
           recovered,
           deliveredMeanwhile,
           rejected,
