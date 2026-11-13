@@ -5878,9 +5878,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#diagnostic(`runner shutdown failed: ${String(error)}`);
       }
     }
+    const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
+    if (tracePath) await this.#traceFrameIndex.refresh(tracePath, true);
     this.#flushPendingTraceRehydrations(true);
     this.#traceRehydrationClosed = true;
-    const tracePath = this.options.environment?.PAPERCLIP_PROVIDER_TRACE_PATH;
     if (tracePath) {
       const incomplete =
         this.#traceRehydrationSpoolOverflow ||
