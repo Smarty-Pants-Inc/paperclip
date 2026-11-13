@@ -96,6 +96,7 @@ import {
   type QualifiedAcpxAgent,
 } from "../drivers/acpx/qualified-profiles.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createSanitizedAcpxSpawnInput } from "../drivers/acpx/environment.js";
+import { piProxyEnvironment } from "../drivers/pi/pi-process-environment.js";
 import { PI_SIDECAR_PROVIDER_ROUTE_NAMES } from "../drivers/acpx/pi-provider-config.js";
 import {
   createSanitizedAwsAgentCoreEnvironment,
@@ -3923,10 +3924,11 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
 }
 
 export function createCapabilityRunnerdProviderEnvironment(input: Parameters<typeof createCapabilityRunnerdProviderEnvironmentBase>[0]): NodeJS.ProcessEnv {
-  return {
+  const environment = {
     ...applyProviderObservabilityEnvironment(createCapabilityRunnerdProviderEnvironmentBase(input), input.options.observability, input.provider === "acpx"),
     ...nodeCompileCacheEnvironment(input.options.stateDirectory ?? input.codexHome),
   };
+  return input.provider === "pi_rpc" ? piProxyEnvironment(environment) : environment;
 }
 
 const OPEN_CODE_RUNNER_ENVIRONMENT_KEYS = new Set([
