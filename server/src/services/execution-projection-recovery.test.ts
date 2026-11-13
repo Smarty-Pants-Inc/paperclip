@@ -4,6 +4,8 @@ import { eq } from "drizzle-orm";
 import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, completionContracts } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
+import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
+import { writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("persisted stopped-workspace projection", () => {
@@ -67,6 +69,37 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     const projections = await executionProjectionsForRuns(db, companyId, [runId]);
     expect(projections.get(runId)).toMatchObject({ phase: "recovery_needed", label: "Stopped",
       nextAction: "Saved work recovered. Send a message to continue.", permittedActions: ["inspect_run"] });
+    // The same recovered files on a run whose conversation was refused: the
+    // run ledger reads the run error, and a new message is not offered.
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_continuation_requires_reconciliation",
+      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" }).where(eq(heartbeatRuns.id, runId));
+    const refused = (await executionProjectionsForRuns(db, companyId, [runId])).get(runId);
+    expect(refused).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"] });
+    expect(refused?.nextAction).not.toMatch(/send a message to continue/i);
+    expect(refused?.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+    // A run from after the fix carries no refusal code; the held
+    // conversation's durable notice says it, read in the same batch.
+    const sessionId = randomUUID();
+    await db.update(heartbeatRuns).set({ error: "Fixture failure", nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, runId));
+    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
+      .toBe("Saved work recovered. Send a message to continue.");
+    await db.transaction(tx => writePiSessionHistoryLossNotice(db, tx, { companyId, issueId, runId, agentId,
+      authorizationReason: `native_prior_owner_held:${sessionId}`, body: HELD_PREDECESSOR_NOTICE }));
+    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)).toMatchObject({
+      phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"], nextAction: HELD_PREDECESSOR_NOTICE });
+    // A committed success on another conversation (a new task) does not clear it;
+    // one on the same conversation does.
+    const succeed = async (nativeSessionId: string) => {
+      const later = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: later, companyId, agentId, nativeIssueId: issueId, nativeSessionId,
+        runtimeMode: "native", status: "succeeded", finishedAt: new Date(), contextSnapshot: { issueId } });
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: later, phase: "committed" });
+    };
+    await succeed(randomUUID());
+    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+    await succeed(sessionId);
+    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
+      .toBe("Saved work recovered. Send a message to continue.");
   });
   it("advertises Stop for a failed native retry from the real batched coordinator read", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();

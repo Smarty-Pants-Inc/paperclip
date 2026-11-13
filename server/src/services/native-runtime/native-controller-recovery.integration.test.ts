@@ -4,13 +4,14 @@ import { nativeProviderRecoveryEvidence, nativeSessionFailureSourceCode, restore
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-session-resume.js";
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agentTaskSessions, agents, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
-import { DurablePrpControlPlane, parseNativeExecutionInput, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { DurablePrpControlPlane, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
@@ -20,6 +21,7 @@ import { claimNativeSessionResumptions } from "./native-finalization-reconciler.
 import { claimNativeRestartRecoveries } from "./native-restart-recovery.js";
 import { readNativeControllerRecoveryInventory } from "./native-controller-recovery-inventory.js";
 import { inspectRemoteWarmSessionRecovery } from "./remote-warm-session-recovery.js";
+import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
 
 describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable discovery and import", () => {
   let database: Awaited<ReturnType<typeof startRecoveryPostgres>>;
@@ -46,7 +48,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     else process.env.PAPERCLIP_HOME = previousHome;
   });
 
-  async function seed() {
+  async function seed(journal: { completed?: string[]; pending?: string[]; records?: Array<Record<string, unknown>> } = {}) {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue retained execution", assigneeAgentId: agentId, status: "in_progress" });
     const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId }).returning();
@@ -58,6 +60,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
       identity: { runId, normalizedSessionId: native.normalizedSessionId, runnerInstanceId: native.runnerInstanceId,
         environmentLeaseId: native.environmentLeaseId, turnId: native.turnId, itemId: native.itemId },
       expectedRunnerVersion: "discovery-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+    for (const type of journal.completed ?? []) Object.assign(core.queueCommand(type), { status: "completed", result: { status: "completed" } });
+    for (const type of journal.pending ?? []) core.queueCommand(type);
+    // Exact command records from a real run's stopped journal (keyed command:<controllerSeq>).
+    if (journal.records) core.store.state.commands.push(...structuredClone(journal.records) as never[]);
     core.setCheckpointPersistence(nativeRunnerCheckpointWriter(db, owner));
     await core.flushCheckpoint();
     await core.stop();
@@ -390,6 +396,131 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     const claims = await claimNativeSessionResumptions({ db, runnerInstanceId: "successor", runIds: [runId], now: deadline });
     expect(claims).toHaveLength(1);
     expect(await claimNativeSessionResumptions({ db, runnerInstanceId: "duplicate", runIds: [runId], now: deadline })).toEqual([]);
+  });
+
+  // REG-03: Stop retained a clean idle Pi conversation; later archival killed
+  // its Runner without a termination receipt or a committed business result.
+  // The read binding grants no LOSS/retirement authority (that probe runs later).
+  it.each(["clean", "missing Stop", "pending Stop", "foreign Stop", "real failure", "lease held", "recovery state",
+    "missing idle receipt", "foreign idle receipt", "changed epoch", "pending request", "active turn", "missing JSONL", "invalid JSONL",
+    "escalated abort", "pending tool", "uncertain side effect", "failed turn", "open recovery", "broken handoff", "changed source",
+    // RFL (REG-03 at 45 s): the Stop stopped the box before Core's idle close
+    // completed its drain/suspend, so the stopped journal keeps them pending.
+    "pending maintenance, owner proven dead", "pending maintenance, owner alive", "pending maintenance, no probe",
+    "pending turn.start, owner proven dead", "pending tool result, owner proven dead",
+    // The same, on the REAL 45 s journal (fork-lead's REG-03 run): its pending
+    // runner.drain/suspend as written, and with its one turn.start flipped to pending.
+    "real 45 s journal, owner proven dead", "real 45 s journal, turn.start flipped to pending"] as const)(
+    "REG-03 retained clean Stop read binding: %s", async scenario => {
+    const real = JSON.parse(readFileSync(new URL("./__fixtures__/reg03-45s-stopped-journal-commands.json", import.meta.url), "utf8"))
+      .commands as Array<Record<string, unknown>>;
+    const journal = scenario === "real 45 s journal, owner proven dead" ? { records: real }
+      : scenario === "real 45 s journal, turn.start flipped to pending" ? { records: real.map(command => command.type === "turn.start"
+        ? { ...command, status: "pending", result: null } : command) }
+      : scenario.startsWith("pending maintenance") ? { completed: ["turn.start", "turn.interrupt"], pending: ["runner.drain", "runner.suspend"] }
+      : scenario === "pending turn.start, owner proven dead" ? { completed: ["turn.interrupt"], pending: ["turn.start", "runner.drain", "runner.suspend"] }
+      : scenario === "pending tool result, owner proven dead" ? { completed: ["turn.start", "turn.interrupt"], pending: ["semantic_tool.result", "runner.suspend"] }
+      : {};
+    const fixture = await seed(journal), successorRunId = randomUUID(), originalRunId = randomUUID(), environmentId = randomUUID();
+    const providerLeaseId = randomUUID(), sourceLeaseId = randomUUID(), successorLeaseId = randomUUID();
+    const remoteCwd = "/retained-workspace";
+    const snapshot: PersistedNativeSession = { ...fixture.snapshot, backendKind: "runner", driverKind: "pi_rpc",
+      providerSessionId: "retained-pi-session", activeTurnId: scenario === "active turn" ? "still-active" : null,
+      pendingRuntimeRequests: scenario === "pending request" ? [{ id: "pending" } as never] : [] };
+    const execution = parseNativeExecutionInput({
+      schema: "paperclip.native-execution-input.v1", provider: { kind: "pi_rpc", model: "paperclip/faux", profile: QUALIFIED_PI_RPC_PROFILE },
+      binding: { companyId, agentId, issueId: fixture.scope.issueId, runId: fixture.scope.runId, executionWorkspaceId: randomUUID() },
+      task: { identifier: "NCD-1", title: "Continue retained work", description: null, prompt: "Recall the private fact", workMode: "standard" },
+      workspace: { cwd: remoteCwd, repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: fixture.scope.normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } },
+      completionContract: { id: randomUUID(), sha256: "fixture", schemaVersion: "paperclip.completion-contract.v1",
+        contract: { revision: "1", objective: "Recall the fact", criteria: [{ id: "objective", requirement: "Recall the private fact" }] } },
+      credentialBindings: [], interactionResponses: [],
+    });
+    const metadata = createNativeControllerRecovery(snapshot, compatibility, { runId: fixture.scope.runId,
+      runnerInstanceId: fixture.native.runnerInstanceId, normalizedSessionId: fixture.scope.normalizedSessionId });
+    const idleReceipt = { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId: fixture.scope.issueId,
+      runId: scenario === "foreign idle receipt" ? randomUUID() : fixture.scope.runId, sessionId: fixture.scope.normalizedSessionId,
+      bootId: fixture.owner.bootId, generation: scenario === "changed epoch" ? 2 : 1 };
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: scenario === "missing Stop" ? {} : {
+      cancelledByActorType: "user", cancelledByUserId: "board-user", nativeCancellation: {
+        schema: "paperclip.native-cancellation.v1", companyId, issueId: fixture.scope.issueId,
+        runId: scenario === "foreign Stop" ? randomUUID() : fixture.scope.runId, scope: "run", reasonCode: "cancellation_run_only",
+        dispatchState: scenario === "pending Stop" ? "pending" : "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(),
+      } }, runnerProfileJson: { ...fixture.profile, nativeExecutionInput: execution, sessionCheckpoint: snapshot,
+        nativeControllerRecovery: metadata, ...(scenario === "missing idle receipt" ? {} : { nativeRetainedIdleCheckpoint: idleReceipt }) },
+    }).where(eq(heartbeatRuns.id, fixture.scope.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null,
+      failureCode: scenario === "real failure" ? "adapter_failed" : "native_retry_cancelled",
+      leaseOwner: scenario === "lease held" ? "other-controller" : null,
+      recoveryState: scenario === "recovery state" ? "awaiting_evidence" : null,
+    }).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+    for (const [id, status] of [[originalRunId, "succeeded"], [successorRunId, "running"]] as const) {
+      await db.insert(heartbeatRuns).values({ id, companyId, agentId, nativeIssueId: fixture.scope.issueId,
+        nativeSessionId: fixture.scope.normalizedSessionId, runtimeMode: "native", status });
+    }
+    await db.update(issues).set({ executionRunId: successorRunId }).where(eq(issues.id, fixture.scope.issueId));
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+    const lease = (id: string, runId: string, time: number, released: number | null) => ({ id, companyId, environmentId,
+      executionWorkspaceId: null, issueId: fixture.scope.issueId, heartbeatRunId: runId, provider: "boat", providerLeaseId,
+      leasePolicy: "reuse_by_environment", acquiredAt: new Date(time), releasedAt: released ? new Date(released) : null,
+      status: released ? "expired" : "active", cleanupStatus: released ? "success" : null, metadata: { remoteCwd, agentId } });
+    const original = lease(fixture.native.environmentLeaseId, originalRunId, 1000, 2000);
+    const source = lease(sourceLeaseId, fixture.scope.runId, 2000, 3000);
+    const successor = lease(successorLeaseId, successorRunId, 3000, null);
+    const firstHandoff = createReusableLeaseHandoff(original, source), nextHandoff = createReusableLeaseHandoff(source, successor);
+    await db.insert(environmentLeases).values([
+      { ...original, metadata: { ...original.metadata, reusableLeaseSuccessor: firstHandoff } },
+      { ...source, metadata: { ...source.metadata, reusableLeasePredecessor: firstHandoff, reusableLeaseSuccessor: nextHandoff } },
+      { ...successor, metadata: { ...successor.metadata, ...(scenario === "broken handoff" ? {} : { reusableLeasePredecessor: nextHandoff }) } },
+    ]);
+    if (["escalated abort", "pending tool", "uncertain side effect", "failed turn"].includes(scenario)) {
+      const payload = scenario === "escalated abort" ? { code: "pi_abort_escalated" }
+        : scenario === "pending tool" ? { code: "provider_interrupt_requested", pendingCallIds: ["tool-call"] }
+        : { code: "provider_side_effect_uncertain" };
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: fixture.scope.runId, seq: 1,
+        stream: "system", eventType: scenario === "failed turn" ? "turn.failed" : "harness.diagnostic", payload: { prpEvent: { payload } } });
+    }
+    if (scenario === "open recovery") {
+      const { issueRecoveryActions } = await import("@paperclipai/db");
+      const id = randomUUID();
+      await db.insert(issueRecoveryActions).values({ id, companyId, sourceIssueId: fixture.scope.issueId, kind: "active_run_watchdog",
+        cause: "native_execution_requires_reconciliation", fingerprint: id, nextAction: "Preserve the stopped run", status: "active",
+        evidence: { runId: fixture.scope.runId } });
+    }
+    const execute = vi.fn(async () => {
+      if (scenario === "changed source") await db.update(nativeRunFinalizations).set({ recoveryState: "awaiting_evidence" })
+        .where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
+      return { stdout: scenario === "missing JSONL" ? "missing" : scenario === "invalid JSONL" ? "invalid" : "valid",
+        stderr: "", exitCode: 0, timedOut: false };
+    });
+    const target = { kind: "remote", transport: "sandbox", environmentId, leaseId: successorLeaseId, providerKey: "boat",
+      remoteCwd, sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId }, runner: { execute } } as const;
+    const sourceRunnerGenerationLost = vi.fn(async () => scenario !== "pending maintenance, owner alive");
+    const binding = assertNativeRetainedSandboxBinding(db, { ...fixture.scope, successorRunId, target: target as never,
+      ...(scenario === "pending maintenance, no probe" ? {} : { sourceRunnerGenerationLost }) });
+    if (scenario === "pending maintenance, owner proven dead" || scenario === "real 45 s journal, owner proven dead") {
+      // Only maintenance is pending and the Runner is proven dead on this box:
+      // the same conversation continues from the retained source.
+      await expect(binding).resolves.toEqual({ remoteCwd });
+      expect(sourceRunnerGenerationLost).toHaveBeenCalledTimes(1);
+      expect(sourceRunnerGenerationLost).toHaveBeenCalledWith({ remoteCwd,
+        identity: { runnerInstanceId: fixture.native.runnerInstanceId, normalizedSessionId: fixture.scope.normalizedSessionId } });
+      expect(JSON.stringify(execute.mock.calls)).toContain("verifyPiSessionFile");
+    } else if (scenario.startsWith("pending") || scenario === "real 45 s journal, turn.start flipped to pending") {
+      await expect(binding).rejects.toThrow("retained_sandbox_binding");
+      // Pending conversation state refuses before any probe: proof of death
+      // never excuses an unsettled turn or tool.
+      if (!scenario.startsWith("pending maintenance")) expect(sourceRunnerGenerationLost).not.toHaveBeenCalled();
+    } else if (scenario === "clean") {
+      await expect(binding).resolves.toEqual({ remoteCwd });
+      expect(execute).toHaveBeenCalledTimes(1);
+      // The production Pi validator checks the existing JSONL; no process probe,
+      // signal, suspend, retirement or manufactured loss evidence is involved.
+      expect(JSON.stringify(execute.mock.calls)).toContain("verifyPiSessionFile");
+    } else await expect(binding).rejects.toThrow("retained_sandbox_binding");
   });
 
   // The Nov 10 staging shape: a preparation-only run's epoch was abandoned, so

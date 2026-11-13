@@ -18,6 +18,9 @@ import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, worksp
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
+import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
+import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
+import { readUnsupersededHeldConversationNotice } from "./native-runtime/pi-session-recovery-notice.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -451,13 +454,23 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     nextAction = "Verify the Grok connection, then send a new message to continue. The stopped work will not be replayed.";
   }
 
+  // The recovered files say nothing about the conversation. A held
+  // conversation's durable notice that no later committed success on its
+  // session superseded means a new message is refused the same way, so do
+  // not offer one. Runs from before that notice: the run's own refusal code,
+  // when nothing here can continue it.
+  const refusedRecoveredConversation = workspaceRecovery?.status === "recovered" && (
+    (!eligibleContinuation && !canRetry && isNativeContinuationRefusal(run))
+    || await readUnsupersededHeldConversationNotice(db, { companyId, issueId }) !== null);
+
   return {
     recoveryActionId: action.id,
     runId,
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    nextAction: (workspaceRecovery?.status === "recovered" && canRetry && !chatBinding
+    nextAction: (refusedRecoveredConversation ? HELD_PREDECESSOR_NOTICE
+      : workspaceRecovery?.status === "recovered" && canRetry && !chatBinding
       ? "Saved work recovered. Retry or send a message to continue." : workspaceRecovery?.message) ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
     ...(workspaceRecovery ? { workspaceRecovery } : {}),
     runStatus: run?.status ?? null,

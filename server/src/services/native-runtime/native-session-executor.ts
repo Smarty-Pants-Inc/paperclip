@@ -123,6 +123,7 @@ import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
 import { hasAcknowledgedNativeLifecycleStopIntent, hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, hasAcknowledgedNativeRunStopReceipt } from "../acknowledged-native-stop.js";
 import { stoppedCodexTurnIsTextOnly } from "./stopped-codex-turn.js";
+import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
 import { prepareVerifiedRemoteProviderPack, useVerifiedPreinstalledRemoteProviderPack, shouldUseBundledAcpxImageAssets } from "./remote-provider-pack.js";
 import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
@@ -241,6 +242,8 @@ import {
   isNull,
   isNotNull,
   like,
+  lt,
+  ne,
   notInArray,
   or,
   sql,
@@ -253,6 +256,7 @@ import {
   heartbeatRuns,
   issueDocuments,
   issueThreadInteractions,
+  issueRecoveryActions,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -327,7 +331,9 @@ import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js
 import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
-import { materializePiSessionRecoveryNotice, piSessionRecovery } from "./pi-session-recovery-notice.js";
+import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
+  readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
@@ -5841,7 +5847,7 @@ function retirementReasonName(kind: keyof typeof RETIREMENT_REASON_NAMES, value:
  * settled journal prove it finished, so the same retirement applies. A local
  * warm Runner, or a resumed sandbox that still holds it, keeps the live path.
  */
-async function inspectFinishedPerTurnRunnerdOwner(input: {
+export async function inspectFinishedPerTurnRunnerdOwner(input: {
   db: Db;
   root: string;
   identity: RunnerdDurableIdentity;
@@ -5850,11 +5856,12 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }): Promise<{ finished: true; run: typeof heartbeatRuns.$inferSelect; recheck: () => Promise<string | null> }
-  | { finished: false; refused: string }> {
+  | { finished: false; refused: string; generationLost: boolean }> {
   const target = input.runnerExecutionTarget;
   // A resumed sandbox still holds the prior Runner's own lifecycle, which its
   // existing recovery path reads. Plugin tasks own a separate saved checkpoint.
-  const refuse = (refused: string) => ({ finished: false as const, refused });
+  let generationLost = false;
+  const refuse = (refused: string) => ({ finished: false as const, refused, generationLost });
   const lifecycle = input.execution.session.lifecyclePolicy.mode;
   const localRunner = !target || target.kind === "local";
   // Lost warm owners use the same settled-result and exact process/provider
@@ -5871,6 +5878,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
       if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
         return refuse("restarted_sandbox_runner_generation_not_lost");
       }
+      generationLost = true;
     } else if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
@@ -5911,10 +5919,21 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   }
   if (!prior || prior.run.runtimeMode !== "native") return refuse("owner_missing");
   if (!TERMINAL_HEARTBEAT_RUN_STATUSES.has(prior.run.status)) return refuse("owner_run_not_terminal");
-  if (prior.owner.phase !== "committed") return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
-  if (!prior.owner.resultId) return refuse("owner_result_missing");
+  // A board Stop settles its run without a result: the Stop path writes
+  // native_retry_cancelled only after the acknowledged user Stop receipt that
+  // also lets a warm Pi owner be retained (retainCancelledSession).
+  const stoppedByUser = prior.run.status === "cancelled" && prior.owner.phase === "terminal_failure"
+    && prior.owner.failureCode === "native_retry_cancelled" && hasAcknowledgedNativeStopIntent(prior.run);
+  // The receipt says a user asked, not that the interrupt settled cleanly.
+  if (stoppedByUser && (await userStopLeftUncertainty(input.db, prior.run) || stopJournalLeftUndeliveredTool(controlBytes))) {
+    return refuse("owner_stop_unsettled");
+  }
+  if (prior.owner.phase !== "committed" && !stoppedByUser) return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
+  if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
   if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
+  const cancellationRecoveryHeld = () => nativeUserStopRecoveryHeld(input.db, { ...binding, runId: identity.runId });
+  if (stoppedByUser && await cancellationRecoveryHeld()) return refuse("owner_recovery_action_pending");
   // A durable controller is fenced by its released database lease; a legacy
   // controller still needs process evidence, exactly as for warm recovery.
   const finishedHere = () => isCurrentNativeControllerProcess(prior!.owner) &&
@@ -5966,6 +5985,17 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     // Database reads can await. Retire only the exact evidence proven above.
     if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8") !== originalBytes
       || readSettledRunnerdProjection(input.root, identity, projectionOptions).bytes !== controlBytes) return "journal_changed";
+    if (stoppedByUser) {
+      const [current] = await input.db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+        .innerJoin(nativeRunFinalizations, and(eq(nativeRunFinalizations.runId, heartbeatRuns.id),
+          eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId)))
+        .where(and(eq(heartbeatRuns.id, identity.runId), eq(heartbeatRuns.companyId, binding.companyId))).limit(1);
+      if (!current || current.run.status !== "cancelled" || current.owner.phase !== "terminal_failure"
+        || current.owner.failureCode !== "native_retry_cancelled" || !hasAcknowledgedNativeStopIntent(current.run)
+        || current.owner.leaseOwner || current.owner.recoveryState) return "owner_changed";
+      if (await userStopLeftUncertainty(input.db, current.run) || stopJournalLeftUndeliveredTool(controlBytes)) return "owner_stop_unsettled";
+      if (await cancellationRecoveryHeld()) return "owner_recovery_action_pending";
+    }
     if (provenFinishedHere && !finishedHere()) return "controller_restarted_here";
     if (localRunner && !(await proveLocalRunnerStopped()).stopped) return "runner_process_restarted";
     return null;
@@ -6039,7 +6069,8 @@ async function resumedSandboxRunnerNeedsProbe(input: {
  * released lease, stopped controller, settled journal). The existing authority
  * rotation keeps Pi's history and archives the old Runner; no third retirement
  * rule is introduced. */
-async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
+async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">,
+  holdLostOwner = false)
   : Promise<DurableRecoveryIdentity | null> {
   if (!await resumedSandboxRunnerNeedsProbe(input) || !isSafeNativeStateDirectory(input.root)) return null;
   const identity = readRunnerdDurableIdentity(input.root);
@@ -6047,9 +6078,16 @@ async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof insp
   const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
   if (!proof.finished) {
     await input.onLog?.("stderr", `[paperclip-runner] restarted sandbox owner ${String(identity.runId)} not retired: ${proof.refused}\n`);
+    if (holdLostOwner && proof.generationLost) {
+      throw new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=${proof.refused}`);
+    }
     return null;
   }
-  return await proof.recheck() ? null : identity as unknown as DurableRecoveryIdentity;
+  const changed = await proof.recheck();
+  if (changed && holdLostOwner) {
+    throw new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=${changed}`);
+  }
+  return changed ? null : identity as unknown as DurableRecoveryIdentity;
 }
 
 async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
@@ -7342,6 +7380,92 @@ async function refreshFinishedPerTurnRunnerdProjection(
   });
 }
 
+/** A predecessor with no committed result is gone only by the shared
+ * predicate on THIS box: its own durable lease must name this sandbox and its
+ * recorded directory, and the box's marker probe must report its process
+ * absent (45) or of another generation (47). */
+async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExecutionInput },
+  target: AdapterExecutionTarget, prior: RunnerdDurableIdentity): Promise<boolean> {
+  if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner) return false;
+  const { companyId } = input.execution.binding;
+  try {
+    const [owner] = await input.db.select({ resultId: nativeRunFinalizations.resultId, leaseOwner: nativeRunFinalizations.leaseOwner })
+      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId),
+        eq(nativeRunFinalizations.runId, prior.runId)));
+    if (!owner || owner.resultId !== null || owner.leaseOwner !== null) return false;
+    const predecessor = await resolvePredecessorRunnerLease(input.db, { companyId, runId: prior.runId });
+    const box = target.sandboxLeaseAcquisition?.providerLeaseId;
+    if (!predecessor || !box || predecessor.providerLeaseId !== box) return false;
+    const [lease] = await input.db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+      .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.id, predecessor.leaseId)));
+    const recordedCwd = lease?.metadata?.remoteCwd;
+    if (typeof recordedCwd !== "string" || recordedCwd !== target.remoteCwd) return false;
+    return await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd,
+      identity: prior as unknown as Record<string, unknown> });
+  } catch {
+    return false;
+  }
+}
+
+/** The banner text for a conversation held behind an unfinished predecessor. */
+export const HELD_PREDECESSOR_NOTICE = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+// The refusals that hold a conversation behind its unfinished predecessor:
+// the prior-owner fences (including the legacy migration fence), the
+// retained-sandbox binding, a prior session whose
+// cleanup is still quarantined (it guards process ownership of that session),
+// a predecessor Runner whose termination could not be confirmed, and a warm
+// attachment to a predecessor Runner that had already exited.
+const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch: (?:legacy_)?prior_owner_|native_controller_recovery_missing_evidence:retained_sandbox_binding|native_session_cleanup_quarantined:|runner_process_termination_unconfirmed:|native_runner_warm_attachment_runner_exited:)/;
+
+/**
+ * A conversation held because its previous run ended without a result (a
+ * failed run, or a Stop) and its owner could not be retired is never a silent
+ * stuck loop: exactly one durable notice per held predecessor, deduplicated,
+ * through the typed history-loss notice helper (one per conversation, so each
+ * later refused message adds none). Nothing else changes: the
+ * refusal stands.
+ */
+/** Exported for the notice-writer regression only. */
+export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!HELD_PREDECESSOR_REFUSAL.test(message)) return;
+  const { companyId, issueId, agentId, runId } = input.execution.binding;
+  const normalizedSessionId = nativeSessionKey(input.execution);
+  if (!issueId) return;
+  try {
+    const [current] = await input.db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
+    if (!current) return;
+    const [prior] = await input.db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.nativeIssueId, issueId),
+        eq(heartbeatRuns.nativeSessionId, normalizedSessionId), ne(heartbeatRuns.id, runId),
+        lt(heartbeatRuns.createdAt, current.createdAt)))
+      .orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+    if (!prior || !["failed", "cancelled", "interrupted", "timed_out"].includes(prior.status)) return;
+    const [owner] = await input.db.select({ resultId: nativeRunFinalizations.resultId }).from(nativeRunFinalizations)
+      .where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, prior.id)));
+    if (owner?.resultId) return;
+    await input.db.transaction(async tx => {
+      const [issue] = await tx.select({ id: issues.id }).from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
+      if (!issue) return;
+      // One notice per HOLD: while this conversation's notice stands (no later
+      // run of the same session succeeded with a committed result), every
+      // later refused message adds none. A conversation held again after it
+      // continued gets a fresh notice. The standing rule is the banner's own
+      // reader, under this issue lock.
+      const standing = await readUnsupersededHeldConversationNotice(tx as unknown as Db, { companyId, issueId });
+      if (standing?.normalizedSessionId === normalizedSessionId) return;
+      await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
+        kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
+      }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
+        sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
+    });
+  } catch (failure) {
+    logger.warn({ err: failure, runId }, "held predecessor notice unavailable");
+  }
+}
+
 /** The controller checkpoint and Runner lifecycle have separate authorities.
  * Rehydrate a missing suspension receipt before choosing live warm adoption.
  * Exported for the provider-boundary regression only. */
@@ -7379,8 +7503,22 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
     if (!target.runner) throw new Error("native_controller_recovery_dependency_unavailable:runner_state_reader");
     // The retained Runner wrote under its own lease's directory, which differs
     // from this target when the workspace moved within the same sandbox.
-    const retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId,
-      successorRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution), target });
+    let retained: { remoteCwd: string };
+    try {
+      const runner = target.runner;
+      retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId,
+        successorRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution), target,
+        sourceRunnerGenerationLost: probe => remoteRunnerGenerationLost({ runner, ...probe }) });
+    } catch (error) {
+      // Clone L: a failed predecessor with no result whose Runner died with
+      // its archived box has no retained state to adopt. Only a proven-gone
+      // owner (its process absent or of another generation on this same box)
+      // skips the retained read; the lost-owner retirement and rotation then
+      // decide. Anything else keeps the refusal, made visible once.
+      if (!(error instanceof Error) || error.message !== "native_controller_recovery_missing_evidence:retained_sandbox_binding") throw error;
+      if (await failedPredecessorRunnerGone(input, target, prior)) return;
+      throw error;
+    }
     movedAllocation = retained.remoteCwd !== target.remoteCwd;
     state = await readRemoteRunnerState({ runner: target.runner,
       stateDirectory: remoteRunnerStateDirectory(retained.remoteCwd, nativeSessionKey(input.execution)) });
@@ -10042,7 +10180,16 @@ export function resolveNativeCancellationStatus(input: {
   };
 }
 
-export async function executePaperclipNativeSession(input: {
+export async function executePaperclipNativeSession(input: Parameters<typeof executePaperclipNativeSessionUnnoticed>[0]) {
+  try {
+    return await executePaperclipNativeSessionUnnoticed(input);
+  } catch (error) {
+    await noticeHeldUnfinishedPredecessor(input, error);
+    throw error;
+  }
+}
+
+async function executePaperclipNativeSessionUnnoticed(input: {
   casesEnabled?: boolean;
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
@@ -11043,7 +11190,7 @@ async function executePaperclipNativeSessionAttempt(
       const root = scopedRunnerdStateRoot(input.execution);
       await restoreWarmRunnerdController(input);
       if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
-        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })) {
+        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog }, true)) {
         // Idle close may have suspended the box's Runner but failed its final
         // controller/checkpoint cleanup. Only detach this proven-dead owner;
         // ordinary backend authority rotation still fences/preserves history.

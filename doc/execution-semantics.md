@@ -3933,6 +3933,17 @@ Limit-triggered stops record `warm_retention_failure_limit` as
 `warmRetentionReasonCode` in both lease metadata and the run's result metadata.
 Reuse follows the existing handoff and idle timeout, including provider
 revalidation on acquisition.
+A resumed sandbox's released warm Runner is never reused after its exact process
+generation is proven lost. Its settled journal can rotate to a new Runner while
+preserving the same provider history when the predecessor has either a committed
+result or an acknowledged user Stop with a cancelled run, a `native_retry_cancelled`
+terminal owner, a clean interrupt with all journaled tool answers delivered, and
+no coordinator lease or pending recovery state. An open preservation action keeps
+that owner held; a resolved no-replay preservation
+hold requires the existing completed workspace-recovery receipts before retirement.
+If retirement is refused after proven loss, the next turn stays held rather than
+attaching to the dead cached transport. A restart label or failed close is not
+proof of loss, and other terminal failures keep their existing fences.
 Integrity/replay conflicts, ambiguous restart recovery, reconciliation-required
 or quarantined cleanup, unknown failure codes, unexported workspace work, and
 explicit stop/destroy decisions retain their existing stop/defer fences. Existing
@@ -5835,6 +5846,20 @@ remain with no unretired lineage journals. Missing or changed evidence keeps
 state is not rewritten or migrated. This admits only the retained-state read. It
 does not commit the failed business result, replay its turn, or bypass the next
 run's provider attachment and authority checks.
+
+A clean user Stop is a separate retained-read case: the acknowledged board Stop,
+`native_retry_cancelled` terminal owner and its exact controller-epoch
+`nativeRetainedIdleCheckpoint` receipt certify the idle conversation, not a
+committed result or physical process death. The same snapshot/checkpoint/session
+and reusable-lease handoff checks apply; the warm Runner's original lease may
+precede the stopped business turn within that verified chain. Admission reuses
+the finished-owner Stop uncertainty, undelivered-tool and recovery-action fences,
+and validates the existing native Pi JSONL with the pack's own file validator.
+Missing/foreign history, an unsettled Stop, an outstanding tool answer, or open
+recovery stays refused. The read rechecks source/checkpoint/ownership after the
+remote validation. Live warm adoption and exact-generation loss/retirement keep
+their own existing proofs: this read does not assert LOSS, stop a process, or
+create a new conversation.
 
 After verified cold Pi recovery, the proxy selects `deferInitialBinding`.
 The managed driver releases the unused INITIAL authority through the existing
