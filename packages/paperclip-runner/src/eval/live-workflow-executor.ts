@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
+import { createLiveWorkflowRuntime, retainLiveWorkflowRuntime } from "./live-workflow-evidence.js";
 import { join } from "node:path";
 
 import type { CapabilityJsonValue } from "../mock-core/capability-control-plane-types.js";
@@ -772,9 +772,7 @@ export async function executeLiveRunnerWorkflow(input: {
   promptOverride?: string;
   runnerBinary?: string;
 }): Promise<RunnerWorkflowObservation> {
-  const runtimeRoot = await mkdtemp(
-    join(tmpdir(), "paperclip-runner-live-eval-"),
-  );
+  const runtimeRoot = await createLiveWorkflowRuntime(input.entry.executionId);
   const tracePath = join(runtimeRoot, "provider-trace.ndjson");
   const store = new InMemoryCapabilityLiveSessionStore();
   const transportOptions = {
@@ -938,7 +936,7 @@ export async function executeLiveRunnerWorkflow(input: {
     }
   }
   if (infrastructureError !== undefined) {
-    await rm(runtimeRoot, { recursive: true, force: true });
+    await retainLiveWorkflowRuntime(runtimeRoot);
     throw new RunnerWorkflowInfrastructureError(
       "live_provider_execution_failed",
       true,
@@ -1240,6 +1238,6 @@ export async function executeLiveRunnerWorkflow(input: {
           },
         }),
   };
-  await rm(runtimeRoot, { recursive: true, force: true });
+  await retainLiveWorkflowRuntime(runtimeRoot);
   return observation;
 }

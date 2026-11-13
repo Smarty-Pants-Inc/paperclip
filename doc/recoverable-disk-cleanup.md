@@ -141,6 +141,28 @@ missing. New captures proven Pi-free keep the existing retention behavior. Neith
 Langfuse telemetry nor the presence of another local copy authorizes pruning the
 last conversation evidence.
 
+Setup probes follow the same permanent-retention rule. Their scope is the SHA-256
+of the JSON array `[companyId, "setup-probe"]`, since setup has no agent or
+conversation yet. Probes allocate under that scope on the durable state volume,
+not the OS temporary directory. On Pi retirement, the whole runtime (including
+metadata-only and failed-admission diagnostics) moves into `conversation-evidence`.
+A remote Pi probe first pulls the complete retired remote root through the existing
+runner backup sync-out path, without exclusions, and commits that local tree into
+permanent evidence **before** removing the remote root. A pull or evidence move
+failure blocks remote deletion; pending physical cleanup keeps its original owner.
+These archives can include private launch material: keep the state volume private,
+do not expose it as a public download, and budget for unbounded growth.
+
+Runner live-workflow evaluations keep their complete runtime, including the raw
+`provider-trace.ndjson`, on both success and infrastructure failure. The default
+root is `~/.paperclip/runner/eval-evidence`; set
+`PAPERCLIP_RUNNER_EVAL_EVIDENCE_DIR` to another persistent private volume if needed.
+Directories are owner-only and partitioned by the execution ID's SHA-256. A
+`pending-*` tree is already retained evidence; normal settlement renames it to a
+UUID in the same scope. Neither form expires. The observation's `traceRef` remains
+the content digest, not a claim that telemetry stores the original bytes. No raw
+provider data or new cross-company retrieval API is added to the observation.
+
 | Environment variable | Default | Effect |
 | --- | --- | --- |
 | `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED` | `true` | Set `false` to stop expiring copies |
