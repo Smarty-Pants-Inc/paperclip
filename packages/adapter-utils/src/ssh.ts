@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { remoteCommandArgv, remoteCommandEnvironment } from "./remote-command-environment.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
@@ -61,7 +62,7 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
+      const envEntries = Object.entries(remoteCommandEnvironment(commandInput.env))
         .filter((entry): entry is [string, string] => typeof entry[1] === "string");
       for (const [key] of envEntries) {
         if (!isValidShellEnvKey(key)) {
@@ -1296,7 +1297,7 @@ export async function runSshCommand(
     const auth = await createSshAuthArgs(config);
     cleanup = auth.cleanup;
     const sshArgs = [...auth.args];
-    const envEntries = Object.entries(options.env ?? {})
+    const envEntries = Object.entries(remoteCommandEnvironment(options.env))
       .filter((entry): entry is [string, string] => typeof entry[1] === "string");
     for (const [key] of envEntries) {
       if (!isValidShellEnvKey(key)) {
@@ -1330,7 +1331,8 @@ export async function runSshCommand(
       "-p",
       String(config.port),
       `${config.username}@${config.host}`,
-      `sh -c ${shellQuote(remoteScript)}`,
+      // Apply the bootstrap policy before profiles too; a profile can run Node.
+      remoteCommandArgv(["sh", "-c", remoteScript]).map(shellQuote).join(" "),
     );
 
     return options.stdin != null
