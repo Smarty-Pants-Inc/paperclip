@@ -26,13 +26,11 @@ provider credentials.
   Existing reference rows are key-share locked through insertion, so concurrent
   deletion cannot reopen the check/write gap. Every event keeps its original UUID,
   timestamp and non-reference metadata, including unrelated healthy handoffs.
-  Required company scope is never nulled or reassigned; a missing company remains
-  an explicit persistence failure. Agent and environment identities are not
+  Required company scope is key-share locked first in sorted order, never nulled or reassigned; events for deleted companies are dropped with a count-only warning (company deletion removes their stored events too). Agent and environment identities are not
   foreign keys in this audit table. Recovery adds no queries to successful batches.
 - Each failed write is logged without its raw SQL/provider error and retried
   once immediately. A second failure retains the whole batch, propagates from
-  explicit flush, and establishes a new one-second recovery deadline. Records
-  are removed from memory only after confirmed insertion. Events plus advisory
+  explicit flush, and establishes a new one-second recovery deadline. Audit batches stay fixed across retries; after five consecutive failed flushes (two write attempts each), a structured dead-letter error logs their value-free audit records, count and event IDs before removing them so later batches can proceed. Events plus advisory
   touches (including in-flight writes) share a 10,000-record per-DB capacity.
   At capacity, enqueuers await space released by successful writes and recheck
   capacity before admitting a record; failures retain the backlog and existing
@@ -47,8 +45,7 @@ provider credentials.
 - Pending writes hold the existing idle-work admission blocker. No pending
   writes means no deadline, SQL or network activity. Server shutdown stops its
   producers first, then awaits the queue before closing DB clients. The drain
-  keeps only the pending retry deadline alive. If the database stays unavailable,
-  orderly shutdown waits for recovery instead of silently discarding audits.
+  keeps only the pending retry deadline alive. Audit drain waits for persistence or the explicit bounded dead-letter disposition; advisory usage touches still await database recovery.
 - An explicit `listAccessEvents` flushes pending writes for read-your-writes.
   Caller-owned Drizzle transactions retain their existing synchronous audit
   INSERT, because a queued callback cannot safely use a transaction after it
