@@ -1,12 +1,14 @@
 import { mkdtemp, mkdir, lstat, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
+import { logger } from "../../middleware/logger.js";
+vi.mock("../../middleware/logger.js", () => ({ logger: { info: vi.fn() } }));
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
-import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
+import { retainNativePiConversationEvidence, retainNativeRuntimeEvidence } from "./native-pi-conversation-evidence.js";
 
 const roots: string[] = [];
-afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.clearAllMocks(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const scope = "a".repeat(64);
 async function fixture(directory = "pi") {
   const base = await mkdtemp(join(tmpdir(), "pi-retention-boundary-")); roots.push(base);
@@ -24,6 +26,8 @@ it.each(["pi", "pi-agent", "acpx/conversation/pi-home", "legacy/.pi"])(
     await expect(lstat(f.source)).rejects.toMatchObject({ code: "ENOENT" });
     const scoped = join(f.evidence, scope);
     const [leaf] = await readdir(scoped);
+    expect(logger.info).toHaveBeenCalledExactlyOnceWith({ event: "native_evidence_retained", source: f.source,
+      destination: join(scoped, leaf!), scope, totalBytes: 31, fileCount: 1 });
     expect((await lstat(scoped)).mode & 0o777).toBe(0o700);
     expect(await readFile(join(scoped, leaf, directory, "sessions/only.jsonl"), "utf8")).toBe("only native conversation bytes\n");
     for (const target of [f.evidence, scoped, join(scoped, leaf)]) {
@@ -32,6 +36,14 @@ it.each(["pi", "pi-agent", "acpx/conversation/pi-home", "legacy/.pi"])(
     expect(await readFile(join(scoped, leaf, directory, "sessions/only.jsonl"), "utf8")).toBe("only native conversation bytes\n");
   },
 );
+it("leaves the sole source intact and emits no success log if inventory exceeds its depth bound", async () => {
+  const f = await fixture();
+  await mkdir(join(f.source, ...Array.from({ length: 129 }, () => "deep")), { recursive: true });
+  await expect(retainNativeRuntimeEvidence(f.source)).rejects.toThrow("native_evidence_inventory_limit");
+  expect(await readFile(join(f.source, "pi/sessions/only.jsonl"), "utf8")).toBe("only native conversation bytes\n");
+  expect(logger.info).not.toHaveBeenCalled();
+});
+
 it("fails closed without deleting source when the private evidence directory is replaced by a symlink", async () => {
   const f = await fixture(), outside = join(f.base, "other-owner");
   await mkdir(outside); await symlink(outside, f.evidence);
@@ -45,6 +57,8 @@ it("keeps an invalid symlink aside without following it into another owner's byt
   await symlink(outside, join(f.source, "pi/only.jsonl.invalid-foreign"));
   expect(await retainNativePiConversationEvidence(f.source)).toBe(true);
   const scoped = join(f.evidence, scope), [leaf] = await readdir(scoped);
+  expect(logger.info).toHaveBeenCalledExactlyOnceWith({ event: "native_evidence_retained", source: f.source,
+    destination: join(scoped, leaf!), scope, totalBytes: 31 + Buffer.byteLength(outside), fileCount: 2 });
   expect(await readlink(join(scoped, leaf, "pi/only.jsonl.invalid-foreign"))).toBe(outside);
   expect(await readFile(outside, "utf8")).toBe("foreign-owner conversation\n");
 });
