@@ -534,13 +534,14 @@ export function IssueSearchInput({
   onDebouncedChange?: (search: string) => void;
 }) {
   const [draftValue, setDraftValue] = useState(value);
+  const [isFocused, setIsFocused] = useState(false);
   const lastCommittedValueRef = useRef(value);
 
   useEffect(() => {
-    if (value === lastCommittedValueRef.current) return;
+    if (isFocused || value === lastCommittedValueRef.current) return;
     setDraftValue(value);
     lastCommittedValueRef.current = value;
-  }, [value]);
+  }, [isFocused, value]);
 
   useEffect(() => {
     if (!onDebouncedChange || draftValue === lastCommittedValueRef.current) return;
@@ -563,6 +564,8 @@ export function IssueSearchInput({
         onChange={(e) => {
           setDraftValue(e.target.value);
         }}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => setIsFocused(false)}
         onKeyDown={(e) => {
           if (shouldBlurPageSearchOnEnter({
             key: e.key,
