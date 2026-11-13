@@ -935,9 +935,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(run).toMatchObject({ status: "failed", errorCode: phase === "setup" ? "setup_failed" : "adapter_failed",
       error: "Usage write failed: Database query failed (40001)", resultJson: { failureCause: "40001" } });
     expect(JSON.stringify(run.resultJson)).not.toMatch(/heartbeat_runs|sk-live-secret|params/);
-    expect(logged).toHaveBeenCalledWith(expect.objectContaining(phase === "setup"
-      ? { runId: f.run.id, failureCause: "40001" }
-      : { runId: f.run.id }), expect.any(String));
+    expect(logged).toHaveBeenCalledWith(expect.objectContaining({ runId: f.run.id, failureCause: "40001" }), expect.any(String));
   });
 
   it("bounds the failure cause to a closed-shape token and falls back to the error class", async () => {
@@ -1560,7 +1558,12 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
         const f = await fixture({}, `LOG${randomUUID().slice(0, 6)}`);
         await f.completion.failRun(f.failure(new Error("wrapped failure", { cause })));
       }
-      expect(serialized).not.toMatch(/Authorization|Bearer|SECRET|pa55w0rd|lowercase-secret-token|sk-secret-code|secret-syscall/);
+      // failureCause is the existing classified code (error.code / class name, bounded),
+      // already persisted as resultJson.failureCause; this test covers the new causeSummary
+      // and every other field, so it is the one field excluded here (RFL 11:33Z).
+      const withoutFailureCause = serialized.trim().split("\n").filter(Boolean)
+        .map(line => { const { failureCause: _ignored, ...rest } = JSON.parse(line) as Record<string, unknown>; return JSON.stringify(rest); }).join("\n");
+      expect(withoutFailureCause).not.toMatch(/Authorization|Bearer|SECRET|pa55w0rd|lowercase-secret-token|sk-secret-code|secret-syscall/);
       const lines = serialized.trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { causeSummary?: Record<string, unknown> });
       expect(lines).toHaveLength(5);
       expect(lines).toEqual(expect.arrayContaining([expect.objectContaining({ causeSummary: expect.objectContaining({ code: "other", syscall: "other" }) })]));
@@ -1583,7 +1586,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       resultJson: { failureCause: "40001" } });
     expect(JSON.stringify(failed)).not.toMatch(/heartbeat_runs|secret-run-id|Failed query/);
     const failureLog = logged.mock.calls.find(call => call[1] === "heartbeat execution failed");
-    expect(failureLog?.[0]).toMatchObject({ runId: f.run.id, errorCode: "adapter_failed" });
+    expect(failureLog?.[0]).toMatchObject({ runId: f.run.id, errorCode: "adapter_failed", failureCause: "40001" });
   });
 
   describe("a native run that fails before provider work", () => {

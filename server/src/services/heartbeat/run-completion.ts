@@ -1284,7 +1284,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       reason: allowlistedIngressReason(cause instanceof Error ? cause.message : String(cause)),
     };
     logger.error({ err: identityRedactor.redact({ message: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined }), runId,
-      errorCode: failureErrorCode, ...(causeSummary ? { causeSummary } : {}) }, "heartbeat execution failed");
+      errorCode: failureErrorCode, failureCause: thrownFailureCause, ...(causeSummary ? { causeSummary } : {}) }, "heartbeat execution failed");
 
     let logSummary: {
       bytes: number | null;
