@@ -46,9 +46,10 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
+it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
   const missingFile = savedFile === true;
   const invalidFile = savedFile === "invalid";
+  const partialFile = savedFile === "partial";
   let preservedBytes: Buffer | undefined;
   let originalSessionFile: string | undefined;
   expect(["warm", "per_turn"]).toContain(lifecycleMode);
@@ -258,10 +259,10 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
       stage("transport kind=pi_rpc", { provider: options?.provider, thinking: options?.piRpcThinkingLevel });
       expect(options?.provider).toBe("pi_rpc"); expect(options?.piRpcThinkingLevel).toBe(thinking);
       // Local idle runner loss normally retires this transport. For the
-      // invalid-file cell, use the existing reconnect policy to reach real
+      // invalid/partial-file cells, use the existing reconnect policy to reach real
       // runnerd restore + thread/resume under the full server (no RPC fakes).
       // This is local execution, not remote-target qualification.
-      const bundle = realFactory(invalidFile ? { ...options, runnerReconnectGraceMs: 10_000 } : options);
+      const bundle = realFactory(invalidFile || partialFile ? { ...options, runnerReconnectGraceMs: 10_000 } : options);
       bundles.push(bundle); return bundle;
     });
     app = await createApp(db, {
@@ -350,13 +351,26 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
         for (const file of files) await unlink(file); // turn-1 snapshots retain the deleted history
         stage("saved Pi file deleted after resident shutdown", { files, previousPids: turnProofs[0]!.pids });
       }
-      if (invalidFile && activeTurn === 2) {
+      if ((invalidFile || partialFile) && activeTurn === 2) {
         originalSessionFile = (turnProofs[0]!.sessionFiles as string[])[0]!;
-        preservedBytes = Buffer.concat([readFileSync(originalSessionFile), Buffer.from("{corrupt Pi history between turns}\n")]);
+        const complete = readFileSync(originalSessionFile);
+        if (partialFile) {
+          expect(complete.at(-1)).toBe(10);
+          const lastRecord = complete.lastIndexOf(10, complete.length - 2) + 1;
+          // Interrupt the actual last Pi record, not an invented corrupt suffix.
+          // The private fact lives in an earlier assistant message, only in Pi.
+          expect(complete.subarray(0, lastRecord).toString("utf8")).toContain(privateFact);
+          const partial = complete.subarray(0, lastRecord + Math.floor((complete.length - lastRecord) / 2));
+          preservedBytes = partial;
+          expect(partial.at(-1)).not.toBe(10);
+          expect(() => JSON.parse(partial.subarray(lastRecord).toString("utf8"))).toThrow();
+        } else {
+          preservedBytes = Buffer.concat([complete, Buffer.from("{corrupt Pi history between turns}\n")]);
+        }
         await writeFile(originalSessionFile, preservedBytes);
         process.kill((turnProofs[0]!.pids as Array<{ runnerPid: number }>)[0]!.runnerPid, "SIGKILL");
         await vi.waitFor(() => expect(bundles[0]!.evidence().diagnostics).toContain("runner process restored its durable PRP session"), { timeout: 20_000, interval: 50 });
-        stage("saved Pi file corrupted; original runner killed and restored", { originalSessionFile,
+        stage(partialFile ? "saved Pi last record interrupted; original runner killed and restored" : "saved Pi file corrupted; original runner killed and restored", { originalSessionFile,
           sha256: createHash("sha256").update(preservedBytes).digest("hex"), oldPids: turnProofs[0]!.pids });
       }
       const requestOffset = requests.length;
@@ -436,7 +450,27 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
         if (activeTurn === 2) expect.soft(row.latestInputContainsFact, "first reopen does not replay the Pi-only fact").toBe(false);
         expect.soft(reply.body).toBe(missingFile || invalidFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
         expect.soft(settled!.nativeSessionId, "all three reopened turns use the SAME normalized conversation").toBe(turnProofs[0]!.nativeSessionId);
-        if (invalidFile) {
+        if (partialFile) {
+          const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+          expect(comments.filter(comment => comment.body.includes("pi_session_file_invalid") || comment.body.includes("Starting fresh")), "no fresh-thread notice for an interrupted write").toHaveLength(0);
+          const aside = readdirSync(join(originalSessionFile!, "..")).filter(name => name.startsWith(originalSessionFile!.split("/").at(-1)! + ".invalid-"));
+          expect(aside, "interrupted original is preserved once, across further turns").toHaveLength(1);
+          const asideFile = join(originalSessionFile!, "..", aside[0]!);
+          expect(readFileSync(asideFile)).toEqual(preservedBytes);
+          const prefixBytes = preservedBytes!.lastIndexOf(10) + 1;
+          expect(readFileSync(originalSessionFile!).subarray(0, prefixBytes)).toEqual(preservedBytes!.subarray(0, prefixBytes));
+          expect(row.piNativeSessionId, "same actual Pi thread, not merely the same normalized conversation").toBe(turnProofs[0]!.piNativeSessionId);
+          expect(events.filter(event => event.eventType === "provider.notice.recorded" && JSON.stringify(event.payload).includes("pi_session_file_invalid"))).toHaveLength(0);
+          expect(ownerAlarm.mock.calls.filter(([detail]) => typeof detail === "object" && detail !== null && "code" in detail && detail.code === "pi_session_file_invalid")).toHaveLength(0);
+          if (activeTurn === 2) {
+            expect(pids[0]!.runnerPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.runnerPid);
+            expect(pids[0]!.piPid).not.toBe((turnProofs[0]!.pids as typeof pids)[0]!.piPid);
+          } else {
+            expect(pids).toEqual(turnProofs[1]!.pids);
+          }
+          stage("interrupted history resumed on the same Pi thread", { asideFile, prefixBytes, piNativeSessionId: row.piNativeSessionId,
+            sha256: createHash("sha256").update(readFileSync(asideFile)).digest("hex") });
+        } else if (invalidFile) {
           const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
           const notices = comments.filter(comment => comment.body.includes("pi_session_file_invalid"));
           expect(notices, "one visible reason across the fresh turn and its follow-up").toHaveLength(1);

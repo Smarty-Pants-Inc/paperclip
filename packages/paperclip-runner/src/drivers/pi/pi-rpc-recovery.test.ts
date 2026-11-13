@@ -1,4 +1,4 @@
-import { chmod, chown, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -89,6 +89,57 @@ describe("Pi driver verified cold recovery", () => {
     } finally { await f.cleanup(); }
   });
 
+  it.each(["ascii", "utf8-crlf", "large-record"]) ("resumes the complete prefix of an interrupted %s write and preserves the original inode aside", async kind => {
+    const f = await fixture();
+    try {
+      const prefix = kind === "utf8-crlf" ? f.content.replaceAll("Pi-only private fact", "Pi-only private fact 🐘").replaceAll("\n", "\r\n")
+        : kind === "large-record" ? f.content.replaceAll("Pi-only private fact", "Pi-only private fact " + "🐘".repeat(40_000)) : f.content;
+      const partial = Buffer.from('{"type":"message","id":"entry-2","message":{"content":"🐘');
+      // Also exercise an interrupted multi-byte character, not a decoded/re-encoded copy.
+      const bytes = Buffer.concat([Buffer.from(prefix), kind === "utf8-crlf" ? partial.subarray(0, partial.length - 2) : partial]);
+      await writeFile(f.file, bytes);
+      const before = await lstat(f.file);
+      const result = await f.recover();
+      try {
+        expect(result.recovered).toBe(true);
+        expect(result.session!.ids()).toMatchObject({ driverSessionId: f.header.id, providerSessionId: f.header.id });
+        expect(f.factory.mock.calls[0]![0].args!.slice(0, 4)).toEqual(["--mode", "rpc", "--session", f.file]);
+        expect(await readFile(f.file)).toEqual(Buffer.from(prefix));
+        const aside = (await readdir(f.runtime)).filter(name => name.startsWith("conversation.jsonl.invalid-"));
+        expect(aside).toHaveLength(1);
+        expect(await readFile(join(f.runtime, aside[0]!))).toEqual(bytes);
+        expect(await lstat(join(f.runtime, aside[0]!))).toMatchObject({ dev: before.dev, ino: before.ino, uid: before.uid, mode: before.mode });
+        expect((await lstat(f.file)).ino).not.toBe(before.ino);
+      } finally { await result.session!.close({ reason: "test" }); }
+    } finally { await f.cleanup(); }
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fails closed if the verified prefix cannot be staged, without authorizing fresh history", async () => {
+    const f = await fixture();
+    try {
+      const bytes = f.content + '{"partial":';
+      await writeFile(f.file, bytes);
+      await chmod(f.runtime, 0o500);
+      await expect(f.recover()).rejects.toMatchObject({ code: "pi_session_file_repair_failed" });
+      expect(f.factory).not.toHaveBeenCalled();
+      expect(await readFile(f.file, "utf8")).toBe(bytes);
+      expect(await readdir(f.runtime)).toEqual(["conversation.jsonl"]);
+    } finally { await chmod(f.runtime, 0o700); await f.cleanup(); }
+  });
+
+  it("keeps a valid final record without a newline unchanged", async () => {
+    const f = await fixture();
+    try {
+      const content = f.content.trimEnd();
+      await writeFile(f.file, content);
+      const result = await f.recover();
+      try {
+        expect(await readFile(f.file, "utf8")).toBe(content);
+        expect((await readdir(f.runtime)).filter(name => name.includes(".invalid-"))).toHaveLength(0);
+      } finally { await result.session!.close({ reason: "test" }); }
+    } finally { await f.cleanup(); }
+  });
+
   it("recovers the prior proxy snapshot shape (no explicit file) by normalized id", async () => {
     const f = await fixture();
     try {
@@ -108,13 +159,16 @@ describe("Pi driver verified cold recovery", () => {
     } finally { await f.cleanup(); }
   });
 
-  it.each(["wrong-id", "corrupt-header", "corrupt-tail", "malformed-entry", "duplicate-entry", "malformed-message", "empty", "foreign-workspace", "symlink", "foreign-file"]) (
+  it.each(["wrong-id", "corrupt-header", "partial-header", "corrupt-tail", "corrupt-prefix-with-partial-tail", "malformed-final-entry", "malformed-entry", "duplicate-entry", "malformed-message", "empty", "foreign-workspace", "symlink", "foreign-file"]) (
     "refuses %s by name and leaves evidence untouched", async kind => {
       const f = await fixture();
       try {
         if (kind === "wrong-id") await writeFile(f.file, JSON.stringify({ ...f.header, id: "someone-else" }) + "\n");
         if (kind === "corrupt-header") await writeFile(f.file, "{invalid json}\n");
+        if (kind === "partial-header") await writeFile(f.file, '{"type":"session","id":');
         if (kind === "corrupt-tail") await writeFile(f.file, f.content + "{corrupt tail}\n");
+        if (kind === "corrupt-prefix-with-partial-tail") await writeFile(f.file, f.content + '{broken complete line}\n{"partial":');
+        if (kind === "malformed-final-entry") await writeFile(f.file, f.content + JSON.stringify({ type: "message", id: "entry-2" }));
         if (kind === "malformed-entry") await writeFile(f.file, f.content + JSON.stringify({ type: "message", id: "entry-2" }) + "\n");
         if (kind === "duplicate-entry") await writeFile(f.file, f.content + f.content.split("\n")[1] + "\n");
         if (kind === "malformed-message") await writeFile(f.file, f.content + JSON.stringify({ type: "message", id: "entry-2", parentId: "entry-1", timestamp: f.header.timestamp, message: null }) + "\n");

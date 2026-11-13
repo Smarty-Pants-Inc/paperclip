@@ -746,6 +746,17 @@ ordinary explicit agent comments and excludes receipt-bound generated progress.
 
 ### Pi saved-history recovery
 
+An interrupted final JSONL write is not invalid history: when the header and
+all newline-terminated records validate, only a parse-failing final fragment
+without a newline is dropped. Runner stages the exact complete prefix, preserves
+the original entry using the timestamped aside format below, and resumes the
+same native Pi thread with its history. It emits no fresh-thread notice or
+invalid-history owner alarm. A valid final record without a newline is retained;
+a bad header, broken complete record, or structurally invalid JSON entry still
+uses the invalid-history path. If prefix preservation/publication fails,
+`pi_session_file_repair_failed` refuses a fresh thread and keeps the original
+history intact or safely aside.
+
 A typed `pi_session_file_missing` refusal starts a new native Pi thread under
 that task's existing normalized conversation identity. A typed
 `pi_session_file_invalid` refusal first renames the exact saved entry aside as

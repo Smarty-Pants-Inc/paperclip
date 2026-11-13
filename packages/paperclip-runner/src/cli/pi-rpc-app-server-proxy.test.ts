@@ -166,11 +166,11 @@ it("thread/resume preserves invalid Pi bytes aside, starts fresh under the same 
   } finally { await proxy.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-it("never starts fresh when invalid Pi history could not be quarantined", async () => {
+it.each(["pi_session_file_invalid", "pi_session_file_repair_failed"])("never starts fresh when Pi history could not be preserved (%s)", async code => {
   const root = await mkdtemp(join(tmpdir(), "pi-invalid-preserve-failed-"));
   const sink = new FakeSink(); const driver = makeDriver(new FakeSession());
   driver.openSession = vi.fn(driver.openSession);
-  driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("invalid"), { code: "pi_session_file_invalid" }); });
+  driver.recoverSession = vi.fn(async () => { throw Object.assign(new Error("preservation failed"), { code }); });
   const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_NORMALIZED_SESSION_ID: "conversation" }, createDriver: () => driver });
   try {
     await request(proxy, sink, 1, "thread/resume", { threadId: "native-id", cwd: root, model: "neutral/model" });
