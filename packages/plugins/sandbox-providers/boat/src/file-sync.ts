@@ -98,35 +98,58 @@ function transferFailure(error: unknown, timeout: number): string {
   const code = failure.cause && typeof failure.cause === "object" ? (failure.cause as { code?: unknown }).code : undefined;
   return name + (typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? ` (${code})` : "");
 }
+function retryableTransferFailure(error: unknown, status?: number): boolean {
+  const failure = error && typeof error === "object"
+    ? error as { name?: unknown; httpStatus?: unknown; category?: unknown; code?: unknown; cause?: { code?: unknown } } : {};
+  const httpStatus = status ?? failure.httpStatus;
+  if (typeof httpStatus === "number") return httpStatus === 429 || (httpStatus >= 500 && httpStatus <= 599);
+  if (failure.name === "TimeoutError" || failure.name === "AbortError" || failure.name === "TypeError" || failure.category === "network_error") return true;
+  const code = failure.code ?? failure.cause?.code;
+  return typeof code === "string" && /^(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET))$/.test(code);
+}
 async function signedTransfer(io: SyncTransport, base: string, remote: string, local: string, upload: boolean, timeout: number): Promise<number> {
-  const direction = upload ? "upload" : "download", signal = AbortSignal.timeout(timeout);
-  let signed;
-  try {
-    signed = await io.request(`${base}/files/${direction}-url`, {
-      method: "POST", body: JSON.stringify({ path: remote }), signal,
-    });
-  } catch (error) {
-    throw new Error(`Boat ${direction}-url request failed: ${transferFailure(signal.aborted ? signal.reason : error, timeout)}`);
-  }
-  let url: URL;
-  try { url = new URL(signed.url); } catch { throw new Error("Boat file URL response omitted a valid URL"); }
-  if (url.protocol !== "https:" || url.username || url.password) throw new Error("Boat file URL must use HTTPS without userinfo");
-  // Never attach the Boat bearer to a signed URL, or include the secret URL in errors.
-  assertBoatActivityAdmission();
-  const body = upload ? createReadStream(local) : undefined;
-  let rejectedStatus: number | undefined;
-  try {
-    const response = await fetch(url.href, { method: upload ? "PUT" : "GET", body: body as unknown as BodyInit,
-      ...(upload ? { duplex: "half" } : {}), redirect: "error", signal: AbortSignal.timeout(timeout) } as RequestInit);
-    if (!response.ok) { rejectedStatus = response.status; await response.body?.cancel(); throw new Error("signed transfer rejected"); }
-    if (upload) await response.body?.cancel();
-    else {
-      if (!response.body) throw new Error("empty download response");
-      await pipeline(Readable.fromWeb(response.body as any), createWriteStream(local, { flags: "wx", mode: 0o600 }));
+  const direction = upload ? "upload" : "download";
+  // Boat publishes an upload only once complete. Retry once, always with a fresh
+  // URL (served by the sandbox, which may have paused during snapshot capture).
+  for (let attempt = 0; ; attempt++) {
+    const suffix = attempt ? " (after 1 retry)" : "", signal = AbortSignal.timeout(timeout);
+    let signed;
+    try {
+      signed = await io.request(`${base}/files/${direction}-url`, {
+        method: "POST", body: JSON.stringify({ path: remote }), signal,
+      });
+    } catch (error) {
+      const failure = signal.aborted ? signal.reason : error;
+      if (attempt === 0 && retryableTransferFailure(failure)) continue;
+      throw new Error(`Boat ${direction}-url request failed: ${transferFailure(failure, timeout)}${suffix}`);
     }
-    return (await fs.stat(local)).size;
-  } catch (error) { throw new Error(`Boat signed ${direction} failed: ${rejectedStatus === undefined ? transferFailure(error, timeout) : `HTTP ${rejectedStatus}`}`); }
-  finally { body?.destroy(); }
+    let url: URL;
+    try { url = new URL(signed.url); } catch { throw new Error(`Boat file URL response omitted a valid URL${suffix}`); }
+    if (url.protocol !== "https:" || url.username || url.password) throw new Error(`Boat file URL must use HTTPS without userinfo${suffix}`);
+    // Never attach the Boat bearer to a signed URL, or include the secret URL in errors.
+    assertBoatActivityAdmission();
+    const body = upload ? createReadStream(local) : undefined, transferSignal = AbortSignal.timeout(timeout);
+    let rejectedStatus: number | undefined;
+    try {
+      const response = await fetch(url.href, { method: upload ? "PUT" : "GET", body: body as unknown as BodyInit,
+        ...(upload ? { duplex: "half" } : {}), redirect: "error", signal: transferSignal } as RequestInit);
+      if (!response.ok) { rejectedStatus = response.status; await response.body?.cancel(); throw new Error("signed transfer rejected"); }
+      if (upload) await response.body?.cancel();
+      else {
+        if (!response.body) throw new Error("empty download response");
+        await pipeline(Readable.fromWeb(response.body as any), createWriteStream(local, { flags: "wx", mode: 0o600 }), { signal: transferSignal });
+      }
+      return (await fs.stat(local)).size;
+    } catch (error) {
+      const failure = transferSignal.aborted ? transferSignal.reason : error;
+      if (attempt === 0 && retryableTransferFailure(failure, rejectedStatus)) {
+        // pipeline has closed the wx stream; don't let its partial archive block retry.
+        if (!upload) await fs.rm(local, { force: true });
+        continue;
+      }
+      throw new Error(`Boat signed ${direction} failed: ${rejectedStatus === undefined ? transferFailure(failure, timeout) : `HTTP ${rejectedStatus}`}${suffix}`);
+    } finally { body?.destroy(); }
+  }
 }
 async function validateExtracted(root: string, mapping: PluginSyncFileMapping): Promise<void> {
   // Never follow sandbox-planted links while inspecting/applying modes. GNU tar
@@ -185,6 +208,7 @@ export async function syncFiles(params: PluginEnvironmentSyncInParams, outbound:
   const id = params.lease.providerLeaseId;
   if (!id) throw new Error("Boat sync requires a lease ID");
   const timeout = Math.max(60_000, params.minimumTimeoutMs ?? 0), base = `/sandboxes/${encodeURIComponent(id)}`;
+  const transferTimeout = Math.max(180_000, params.minimumTimeoutMs ?? 0);
   // Validate before any side effect, including optional adapter-authored commands.
   for (const op of params.operations) {
     for (const mapping of op.files) {
@@ -215,12 +239,12 @@ export async function syncFiles(params: PluginEnvironmentSyncInParams, outbound:
           const modeText = archived.stdout.trim();
           if (mapping.kind === "directory" && !/^[0-7]{1,4}$/.test(modeText)) throw new Error("Boat archive omitted directory mode");
           const rootMode = mapping.kind === "directory" ? parseInt(modeText, 8) : undefined;
-          bytesTransferred += await signedTransfer(io, base, remote, local, false, timeout);
+          bytesTransferred += await signedTransfer(io, base, remote, local, false, transferTimeout);
           await installHost(mapping, local, timeout, rootMode);
         } else {
           const rootMode = await archiveHost(mapping, local, temp, timeout);
           remoteAttempted = true;
-          bytesTransferred += await signedTransfer(io, base, remote, local, true, timeout);
+          bytesTransferred += await signedTransfer(io, base, remote, local, true, transferTimeout);
           await success(io, installSandbox(mapping, remote, rootMode), timeout);
         }
         filesTransferred++;

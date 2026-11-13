@@ -99,6 +99,13 @@ restores owner write on an existing target before removing it. The EXIT trap als
 restores owner write on extracted staging data before cleanup, including failure
 paths with read-only nested directories.
 
+Native file sync gives each signed upload/download and its URL request at least
+180 seconds, or `minimumTimeoutMs` when larger, to tolerate sandbox snapshot
+pauses. Timeout, network, HTTP 429 and HTTP 5xx failures get one retry with a fresh
+URL; other HTTP 4xx and invalid URLs do not. Partial local downloads are removed
+before retry. A second failure reports the last safe cause with `(after 1 retry)`.
+Command, archive and cleanup timeouts are unchanged.
+
 Resume verifies the recorded workspace sentinel at the allocation's original
 cwd, even when Core rewrites `remoteCwd` to a prepared shared workspace below it.
 The allocation receipt must name the same sandbox and original cwd; foreign or

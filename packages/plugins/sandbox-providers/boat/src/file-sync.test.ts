@@ -115,6 +115,129 @@ async function clean() {
   for (const directory of [host, remote]) expect((await fs.readdir(directory)).filter(name => name.startsWith(".paperclip-upload") || name.startsWith("paperclip-boat-sync"))).toEqual([]);
 }
 describe("Boat native hybrid file sync", () => {
+  describe.each([false, true])("freeze-tolerant signed transfers (outbound=%s)", outbound => {
+    const direction = outbound ? "download" : "upload";
+    async function transfer(minimumTimeoutMs?: number) {
+      const source = path.join(outbound ? remote : host, "source"), target = path.join(outbound ? host : remote, "target");
+      await fs.writeFile(source, "NEW"); await fs.writeFile(target, "OLD");
+      const result = await (outbound ? plugin.definition.onEnvironmentSyncOut! : plugin.definition.onEnvironmentSyncIn!)({
+        ...params([operation({ sourcePath: source, targetPath: target, kind: "file" })]), minimumTimeoutMs,
+      });
+      expect(await fs.readFile(target, "utf8")).toBe("NEW");
+      expect(result.operations[0].filesTransferred).toBe(1);
+      await clean();
+    }
+    function urlCalls() {
+      return vi.mocked(fetch).mock.calls.filter(([input]) => new URL(String(input)).pathname.endsWith(`/${direction}-url`));
+    }
+    it.each([undefined, 240_000])("survives a 70 s sending-host stall on the first attempt (minimum=%s)", async minimum => {
+      // Keep: the recorded ~78 s snapshot freeze cannot be reached cheaply in a live flow.
+      // Inject only the timeout clock: real tar, streams, install and bytes still run.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new DOMException("synthetic", "TimeoutError")), ms);
+        return controller.signal;
+      });
+      let attempts = 0;
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        if (new URL(String(input)).hostname === "signed.invalid") {
+          attempts++;
+          await vi.advanceTimersByTimeAsync(70_000);
+          if (init.signal.aborted) throw init.signal.reason;
+        }
+        return mockFetch(input, init);
+      }));
+      try {
+        await transfer(minimum);
+        expect(attempts).toBe(1); expect(urlCalls()).toHaveLength(1);
+        const bounds = vi.mocked(AbortSignal.timeout).mock.calls.map(([ms]) => ms);
+        expect(bounds.filter(ms => ms === (minimum ?? 180_000))).toHaveLength(minimum ? 3 : 2);
+        if (!minimum) expect(bounds.at(-1)).toBe(60_000); // Cleanup keeps its old bound.
+      } finally { vi.useRealTimers(); }
+    });
+    it.each([503, 429, "network"] as const)("retries a first signed %s with a fresh URL", async failure => {
+      let attempts = 0;
+      const urls: string[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith(`/${direction}-url`)) {
+          const response = await mockFetch(input, init), signed = await response.json();
+          signed.url += `&attempt=${urls.length}`; urls.push(signed.url);
+          return json(signed);
+        }
+        if (url.hostname === "signed.invalid" && attempts++ === 0) {
+          if (failure === "network") throw new TypeError("synthetic", { cause: { code: "ECONNRESET" } });
+          return new Response(null, { status: failure });
+        }
+        return mockFetch(input, init);
+      }));
+      await transfer();
+      expect(attempts).toBe(2); expect(urlCalls()).toHaveLength(2);
+      expect(new Set(urls).size).toBe(2);
+    });
+    it.each([503, 429, "network"] as const)("retries a first URL-request %s", async failure => {
+      let attempts = 0;
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        if (new URL(String(input)).pathname.endsWith(`/${direction}-url`) && attempts++ === 0) {
+          if (failure === "network") throw new TypeError("synthetic");
+          return new Response(null, { status: failure });
+        }
+        return mockFetch(input, init);
+      }));
+      await transfer(); expect(urlCalls()).toHaveLength(2);
+    });
+    it("reports the last cause when the one retry also fails", async () => {
+      let attempts = 0;
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        if (new URL(String(input)).hostname === "signed.invalid") {
+          if (attempts++ === 0) return new Response(null, { status: 503 });
+          throw new TypeError("synthetic", { cause: { code: "ECONNRESET" } });
+        }
+        return mockFetch(input, init);
+      }));
+      await expect(transfer()).rejects.toThrow(`Boat signed ${direction} failed: TypeError (ECONNRESET) (after 1 retry)`);
+      expect(attempts).toBe(2); expect(urlCalls()).toHaveLength(2); await clean();
+    });
+    it.each(["invalid", "http", "userinfo"])("does not retry %s signed URLs", async invalid => {
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => new URL(String(input)).pathname.endsWith(`/${direction}-url`)
+        ? json({ url: invalid === "invalid" ? "not a URL" : invalid === "http" ? "http://signed.invalid/file" : "https://user:secret@signed.invalid/file" })
+        : mockFetch(input, init)));
+      await expect(transfer()).rejects.toThrow(/Boat file URL/);
+      expect(urlCalls()).toHaveLength(1); expect(transfers).toEqual([]); await clean();
+    });
+    if (outbound) it("removes a partial download before retrying the wx stream", async () => {
+      let attempts = 0;
+      let partial: string | undefined;
+      const before = new Set(await fs.readdir(os.tmpdir()));
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/download-url") && attempts === 1) {
+          expect(partial).toBeDefined();
+          await expect(fs.lstat(partial!)).rejects.toMatchObject({ code: "ENOENT" });
+        }
+        if (url.hostname === "signed.invalid" && attempts++ === 0) {
+          let sent = false;
+          return new Response(new ReadableStream({ async pull(controller) {
+            if (!sent) { sent = true; controller.enqueue(new Uint8Array(1024)); return; }
+            // Yield through real fs I/O until the first chunk reaches the private archive.
+            for (let check = 0; check < 100; check++) {
+              const directory = (await fs.readdir(os.tmpdir())).find(name => name.startsWith("paperclip-boat-sync-") && !before.has(name));
+              if (directory) {
+                partial = path.join(os.tmpdir(), directory, "transfer.tar");
+                if ((await fs.stat(partial).catch(() => undefined))?.size === 1024) break;
+              }
+            }
+            expect(partial).toBeDefined();
+            expect((await fs.stat(partial!)).size).toBe(1024);
+            controller.error(new TypeError("synthetic", { cause: { code: "ECONNRESET" } }));
+          } }));
+        }
+        return mockFetch(input, init);
+      }));
+      await transfer(); expect(urlCalls()).toHaveLength(2); await clean();
+    });
+  });
   describe.each([false, true])("safe transfer failures (outbound=%s)", outbound => {
     const direction = outbound ? "download" : "upload";
     async function failedSync() {
@@ -142,14 +265,19 @@ describe("Boat native hybrid file sync", () => {
         if (new URL(String(input)).hostname === "signed.invalid") throw error;
         return mockFetch(input, init);
       }));
-      const detail = name === "TypeError" ? "TypeError (ECONNRESET)" : name === "unsafe fields" ? "Error" : "timeout after 60000 ms";
-      expect(await failedSync()).toBe(`Boat signed ${direction} failed: ${detail}`);
+      const detail = name === "TypeError" ? "TypeError (ECONNRESET)" : name === "unsafe fields" ? "Error" : "timeout after 180000 ms";
+      const retry = name !== "unsafe fields";
+      expect(await failedSync()).toBe(`Boat signed ${direction} failed: ${detail}${retry ? " (after 1 retry)" : ""}`);
+      expect(vi.mocked(fetch).mock.calls.filter(([input]) => new URL(String(input)).hostname === "signed.invalid")).toHaveLength(retry ? 2 : 1);
+      expect(vi.mocked(fetch).mock.calls.filter(([input]) => new URL(String(input)).pathname.endsWith(`/${direction}-url`))).toHaveLength(retry ? 2 : 1);
     });
     it("retains signed HTTP status without the URL, response body or statusText", async () => {
       vi.stubGlobal("fetch", vi.fn(async (input, init) => new URL(String(input)).hostname === "signed.invalid"
         ? new Response("https://signed.invalid/?X-Amz-Signature=synthetic", { status: 403, statusText: "X-Amz-secret" })
         : mockFetch(input, init)));
       expect(await failedSync()).toBe(`Boat signed ${direction} failed: HTTP 403`);
+      expect(vi.mocked(fetch).mock.calls.filter(([input]) => new URL(String(input)).hostname === "signed.invalid")).toHaveLength(1);
+      expect(vi.mocked(fetch).mock.calls.filter(([input]) => new URL(String(input)).pathname.endsWith(`/${direction}-url`))).toHaveLength(1);
     });
     it.each(["timeout", "HTTP 403"])("retains %s from the URL request step", async failure => {
       const timeout = AbortSignal.timeout.bind(AbortSignal);
@@ -167,7 +295,8 @@ describe("Boat native hybrid file sync", () => {
         }
         return mockFetch(input, init);
       }));
-      expect(await failedSync()).toBe(`Boat ${direction}-url request failed: ${failure === "timeout" ? "timeout after 60000 ms" : failure}`);
+      expect(await failedSync()).toBe(`Boat ${direction}-url request failed: ${failure === "timeout" ? "timeout after 180000 ms (after 1 retry)" : failure}`);
+      expect(vi.mocked(fetch).mock.calls.filter(([input]) => new URL(String(input)).pathname.endsWith(`/${direction}-url`))).toHaveLength(failure === "timeout" ? 2 : 1);
     });
   });
   it("round-trips links, entry modes, empty directory and >5 MiB via one command per mapping", async () => {
