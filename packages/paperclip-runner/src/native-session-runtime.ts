@@ -343,6 +343,9 @@ export interface ExecuteNativeSessionOptions {
   onSession?: (session: NativeSession | null) => void;
   /** Observes why a retained session was removed from warm reuse. */
   onSessionQuarantined?: (reason: string) => Promise<void> | void;
+  /** existingSession.attachRun rejected with this error. The session is already
+   * quarantined (evicted, close started) and the same error is rethrown. */
+  onRetainedSessionAttachFailed?: (error: unknown) => void;
   existingSession?: NativeSession;
   persistedSession?: PersistedNativeSession | null;
   keepSessionOpen?: boolean;
@@ -2512,6 +2515,7 @@ export async function executeNativeSession(
         "native session attachment failed",
         cleanupDomain,
       );
+      try { options.onRetainedSessionAttachFailed?.(error); } catch {}
       throw error;
     }
     session = options.existingSession;
