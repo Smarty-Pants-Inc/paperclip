@@ -183,6 +183,28 @@ local controller cache and authenticates the recorded running artifact, even
 when its own installed runner binary differs. It does not stage a new binary
 over the running process.
 
+Native Pi reattachment also resolves the session-bound provider-pack authority
+before constructing its transport. It uses the same qualified Node, Pi executable,
+proxy paths and digests as fresh launch. A surviving daemon is not permission to
+omit these launch inputs. Recovery verifies the exact saved pack in the protected
+snapshot installation or the staged session pack; it does not upload a new pack
+over the live runner. Environment metadata and a warm in-memory session are not
+executable authority. Existing provider-pack authority files and encrypted
+checkpoint records carry forward unchanged; no persisted format migration is
+required.
+
+`native-pi-restart-executable.integration.test.ts` opens a real runnerd Pi session,
+persists its encrypted controller checkpoint in PostgreSQL, disconnects the old
+controller and restores a new controller from the database without a warm entry.
+It recovers the same runner and provider session with the saved executable even
+when the old controller launch files are absent and environment metadata is empty.
+The provider facade and connection routing are local test fixtures, not live Pi
+model or deployed sandbox qualification. Run it after building the Runner binary:
+
+```sh
+pnpm exec vitest run server/src/services/native-runtime/native-pi-restart-executable.integration.test.ts --maxWorkers=2
+```
+
 The runner package owns checkpoint encoding, validation, restoration, and command
 classification. Its persistence callback exposes opaque records and explicit
 ownership metadata. The server owns encryption and transactional lease checks;
