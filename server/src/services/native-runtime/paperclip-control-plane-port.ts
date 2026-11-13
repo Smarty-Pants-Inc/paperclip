@@ -301,6 +301,9 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
         leaseOwner: sql<string | null>`(select ${ownerLock.leaseOwner} from ${ownerLock})`,
         leaseExpiresAt: sql<Date | null>`(select ${ownerLock.leaseExpiresAt} from ${ownerLock})`.mapWith(nativeRunFinalizations.leaseExpiresAt),
         resultId: sql<string | null>`(select ${ownerLock.resultId} from ${ownerLock})`,
+        phase: sql<string>`(select ${ownerLock.phase} from ${ownerLock})`,
+        failureCode: sql<string | null>`(select ${ownerLock.failureCode} from ${ownerLock})`,
+        recoveryState: sql<string | null>`(select ${ownerLock.recoveryState} from ${ownerLock})`,
       } : {}), ...(recovery ? {
         checkpointHeader: sql<Record<string, unknown> | null>`(select material from ${nativeRunnerCheckpoints}
           where ${nativeRunnerCheckpoints.runId} = ${this.#binding.runId}
@@ -322,7 +325,8 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       // change while we hold the coordinator, but wall-clock expiry still can.
       if (owner && selected) await measureNativeControllerStep("checkpoint_owner_validate", () => validateNativeRunnerCheckpointOwner(tx, owner,
         { leaseOwner: selected.leaseOwner ?? null, leaseExpiresAt: selected.leaseExpiresAt ?? null,
-          resultId: selected.resultId ?? null, now: selected.now }, !snapshot.semanticResult));
+          resultId: selected.resultId ?? null, phase: selected.phase!, failureCode: selected.failureCode ?? null,
+          recoveryState: selected.recoveryState ?? null, now: selected.now }, !snapshot.semanticResult));
       const header = recovery && selected?.checkpointHeader
         ? inspectNativeRunnerUpgradeHeader(this.#binding, selected.checkpointHeader) : null;
       if (header && (header.normalizedSessionId !== identity.sessionId || header.runnerInstanceId !== this.#binding.sourceInstanceId)) {

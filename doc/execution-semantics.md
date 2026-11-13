@@ -2835,6 +2835,15 @@ same run does not attach again. A later run may start a new provider thread, and
 run's log and events link here when this happens. Whether a later run should keep
 that thread is tracked in [#19047](https://github.com/paperclipai/paperclip/issues/19047).
 
+A clean retained Pi Stop does not produce an accepted semantic result. After
+acknowledged cancellation, child cleanup and an idle snapshot have been proved,
+the executor records a retained-idle checkpoint receipt in the same transaction
+that releases its finalization lease. That exact controller boot and generation
+may continue maintenance checkpoint writes, but cannot admit new work. The
+receipt does not replace a result or bypass task, source-consumption, successor,
+recovery or controller-generation fences. An absent or foreign receipt keeps the
+ordinary `native_runner_checkpoint_owner_lost` refusal.
+
 ### Provider continuity and bounded finalization
 
 A permanently unusable native runner session may be replaced only with evidence that its predecessor is stopped and fenced, completed results and workspace state are preserved, required task history is available, and pending effects have been reconciled. A provider-native shell command or external write without a reliable outcome receipt is unknown. Unknown effects, integrity failures, and unverified process ownership never authorize speculative replay. Once automatic recovery is ruled out, Paperclip selects a conservative default: preserve recorded work, stop the affected task, and retain a durable no-replay hold. Unknown action outcomes remain unknown. No reconciliation form or user diagnosis is required.

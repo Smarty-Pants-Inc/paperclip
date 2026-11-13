@@ -9,6 +9,7 @@ import { createLocalEncryptedCipher } from "../../secrets/local-encrypted-provid
 import { legacyControllerBootId } from "../legacy-controller-lease.js";
 import { assertNativeSourceCheckpointConsumer, lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { runnerdStateHasNoProviderTurn, runnerdStateIsIncompleteBootstrap } from "./native-bootstrap-proof.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 
 type Binding = { companyId: string; issueId: string; runId: string };
 export const NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES = 1024 * 1024;
@@ -61,6 +62,8 @@ export function nativeRunnerCheckpointOwnerLock(tx: CheckpointTransaction, owner
     leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt,
     resultId: nativeRunFinalizations.resultId,
     phase: nativeRunFinalizations.phase,
+    failureCode: nativeRunFinalizations.failureCode,
+    recoveryState: nativeRunFinalizations.recoveryState,
   }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, owner.companyId), eq(nativeRunFinalizations.issueId, owner.issueId),
     eq(nativeRunFinalizations.runId, owner.authorityRunId), eq(nativeRunFinalizations.controllerBootId, owner.bootId),
@@ -77,14 +80,15 @@ export async function lockNativeRunnerCheckpointOwner(
   // Keep both steps in one statement without another database round trip.
   const locked = nativeRunnerCheckpointOwnerLock(tx, owner);
   const [owned] = await measureNativeControllerStep("coordinator_lock", () => tx.with(locked).select({ leaseOwner: locked.leaseOwner,
-    leaseExpiresAt: locked.leaseExpiresAt, resultId: locked.resultId, phase: locked.phase, now: sql<Date>`clock_timestamp()` }).from(locked));
+    leaseExpiresAt: locked.leaseExpiresAt, resultId: locked.resultId, phase: locked.phase,
+    failureCode: locked.failureCode, recoveryState: locked.recoveryState, now: sql<Date>`clock_timestamp()` }).from(locked));
   if (!owned) throw new Error("native_runner_checkpoint_owner_lost");
   return owned;
 }
 
 export async function validateNativeRunnerCheckpointOwner(
   tx: CheckpointTransaction, owner: NativeRunnerCheckpointFenceOwner,
-  owned: Omit<Awaited<ReturnType<typeof lockNativeRunnerCheckpointOwner>>, "phase">, newWork: boolean,
+  owned: Awaited<ReturnType<typeof lockNativeRunnerCheckpointOwner>>, newWork: boolean,
 ): Promise<void> {
   const current = owned;
   const activeOwner = owner.leaseOwner !== null && current.leaseOwner === owner.leaseOwner
@@ -107,7 +111,25 @@ export async function validateNativeRunnerCheckpointOwner(
           gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`),
           notExists(tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
             .where(eq(nativeRunFinalizations.runId, heartbeatRuns.id))))) : [];
-    if (!current.resultId || newWork || !task || (task.executionRunId && task.executionRunId !== owner.runId && !successor && !preparingSuccessor)) {
+    // A clean retained Stop has no semantic result by design. Its exact
+    // controller epoch can still persist maintenance (auth, ACK, snapshots),
+    // never new work. The executor publishes this receipt only after Pi's
+    // cancellation/child cleanup and idle snapshot have all been proved.
+    let retainedIdle = false;
+    if (!current.resultId && !newWork && owner.runId === owner.authorityRunId
+      && current.leaseOwner === null && current.phase === "terminal_failure"
+      && current.failureCode === "native_retry_cancelled" && current.recoveryState === null) {
+      const [run] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, owner.runId), eq(heartbeatRuns.companyId, owner.companyId),
+        eq(heartbeatRuns.nativeIssueId, owner.issueId))).for("share");
+      const value = run?.runnerProfileJson?.nativeRetainedIdleCheckpoint;
+      const receipt = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+      retainedIdle = !!run && run.status === "cancelled" && hasAcknowledgedNativeStopIntent(run)
+        && receipt.schema === "paperclip.native-retained-idle-checkpoint.v1"
+        && receipt.runId === owner.runId && receipt.companyId === owner.companyId && receipt.issueId === owner.issueId
+        && receipt.sessionId === run.nativeSessionId && receipt.bootId === owner.bootId && receipt.generation === owner.generation;
+    }
+    if ((!current.resultId && !retainedIdle) || newWork || !task || (task.executionRunId && task.executionRunId !== owner.runId && !successor && !preparingSuccessor)) {
       throw new Error("native_runner_checkpoint_owner_lost");
     }
   }
