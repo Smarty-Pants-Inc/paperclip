@@ -293,16 +293,12 @@
           "cacheWriteTokens": 0,
           "totalTokens": 3903
         },
-        "runDelta": {
-          "inputTokens": 3898,
-          "outputTokens": 3,
-          "cachedInputTokens": 2,
-          "cacheWriteTokens": 0,
-          "totalTokens": 3903
-        },
+        "runDelta": {},
         "runDeltaComplete": false,
         "costComplete": false,
-        "childUsage": "unknown"
+        "childUsage": "unknown",
+        "summaryUsage": "unknown",
+        "accountingUsageLost": true
       }
     }
   },
@@ -333,16 +329,12 @@
           "cacheWriteTokens": 0,
           "totalTokens": 3903
         },
-        "runDelta": {
-          "inputTokens": 3898,
-          "outputTokens": 3,
-          "cachedInputTokens": 2,
-          "cacheWriteTokens": 0,
-          "totalTokens": 3903
-        },
+        "runDelta": {},
         "runDeltaComplete": false,
         "costComplete": false,
-        "childUsage": "unknown"
+        "childUsage": "unknown",
+        "summaryUsage": "unknown",
+        "accountingUsageLost": true
       }
     }
   },

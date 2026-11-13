@@ -982,6 +982,45 @@ No command arguments, stderr, filenames, repository URLs, or ref names are saved
 The same closed fields persist in `workspaceRestoreDiagnostic` and are
 revalidated before projection into an enabled Sentry failure report.
 
+## Pi summary usage
+
+Pi compaction and summarization retry events retain an `unaccounted-summary`
+usage item with `source: "pi_summarization_unaccounted"` and
+`summaryUsage: "unknown"`. Its `runDelta` is empty, `runDeltaComplete` is false,
+and `costComplete` is false: neither the summary's token spend nor its cost is
+qualified by that item. Its `total` preserves the measured message subtotal.
+
+The missing-summary fact is sticky for the run: subsequent measured receipts
+retain `summaryUsage: "unknown"` and the native accounting convention
+`accountingUsageLost: true`. A complete measured `runDelta` is still usable, but
+`costComplete` stays false. The Pi facade and Rust usage normalizer preserve the
+same fact without adding summary tokens or manufacturing a zero-cost call.
+Producer receipt replay retains it across later turns. The run receipt's existing
+`pricingProvenance.evidence` explicitly states that Pi summary usage is unknown
+and observed usage/cost are a lower bound. `GET /api/heartbeat-runs/:runId`
+returns that provenance in `usageJson`; this does not change cost aggregation or
+run-level UI presentation.
+
+This unknown summary spend does not invalidate later assistant-message usage
+receipts. Their deltas, completeness, and cost provenance describe the measured
+message receipts, not an all-inclusive bill for the native session. Summary spend
+remains unknown; the projector does not add it to the message subtotal.
+
+Server turn accounting retains the measured message subtotal separately from
+this unknown summary increment, including when completion, cancellation,
+failure, or interruption is the next event. A later measured message or turn
+does not clear the missing-usage fact. Once the measured turn is terminal, its
+receipt can close using the existing `accountingUsageLost` lower-bound marker
+and `accountingCostIncomplete` flag. Receipt completion means accounting has
+settled, not that summary usage became known. A summary-only turn with no
+measured message receipt still cannot certify measured usage.
+
+The usage-only real-session regression fixture retains nine message token
+receipts and one compaction in their original order. It excludes message text,
+identifiers, tools, models, and prices. Its source SHA-256 records provenance.
+The tests reconstruct compaction start/end and turn boundaries explicitly;
+this is a session replay, not the original wire stream or a live provider run.
+
 ## Codex resume usage snapshot
 
 The native runner retains a bounded local `harness.diagnostic` event with code

@@ -59,27 +59,35 @@ export function nativeUsageBiller(provider: NativeExecutionInput["provider"]): s
 /** Provenance note for a receipt whose run includes a provider turn lost on
  * restore. That turn's usage can never be reported, so the receipt is final
  * but its usage and price are a lower bound. */
-export const NATIVE_LOST_TURN_USAGE_EVIDENCE = "a provider turn was lost on restore and never reported its usage; observed usage is a lower bound";
+export const NATIVE_LOST_TURN_USAGE_EVIDENCE = "some provider usage was not reported; observed usage is a lower bound";
 export const NATIVE_TURN_LOST_ON_RESTORE = "provider_turn_lost_on_restore";
 const LOST_ON_RESTORE = NATIVE_TURN_LOST_ON_RESTORE;
+export const NATIVE_SUMMARY_USAGE_EVIDENCE = "Pi summary usage is unknown; observed usage and cost are a lower bound";
+export const NATIVE_INCOMPLETE_USAGE_EVIDENCE = "final provider usage was incomplete; observed usage and cost are a lower bound";
+export function nativeUsageLowerBoundEvidence(usage: Record<string, unknown>) {
+  return usage.summaryUsage === "unknown" ? NATIVE_SUMMARY_USAGE_EVIDENCE
+    : usage.accountingUsageIncomplete === true ? NATIVE_INCOMPLETE_USAGE_EVIDENCE : NATIVE_LOST_TURN_USAGE_EVIDENCE;
+}
 
 export function createNativeTurnAccounting(provider: NativeExecutionInput["provider"]) {
-  const turns = new Map<string, { usage: Record<string, unknown> | null; terminal: boolean; lost?: boolean;
+  const turns = new Map<string, { usage: Record<string, unknown> | null; terminal: boolean; lost?: boolean; summaryUnknown?: boolean; incomplete?: boolean;
     /** Open when the provider session was restored after process loss. */
     restored?: boolean }>();
   const sequences = new Map<string, number>();
   let currentTurn: string | undefined;
+  let summaryUsageUnknown = false;
   const terminalTypes = ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"];
   const snapshot = () => {
     if (turns.size === 0) return { usage: null, turnId: undefined, complete: false };
     let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, cacheWriteTokens = 0;
-    let cost = 0n, costKnown = false, costIncomplete = false, complete = true, usageLost = false;
+    let cost = 0n, costKnown = false, costIncomplete = summaryUsageUnknown, complete = true, usageLost = summaryUsageUnknown;
     for (const [turnId, turn] of turns) {
       const normalized = normalizeNativeUsage(turn.usage);
       // A turn the restored Runner reports as lost on restore can never report
       // its usage. It does not hold the receipt open; it makes it a lower bound.
       const lost = turn.lost === true && normalized === undefined;
-      usageLost ||= lost;
+      usageLost ||= lost || turn.summaryUnknown === true || turn.incomplete === true;
+      costIncomplete ||= turn.summaryUnknown === true || turn.incomplete === true;
       complete &&= turnId !== "unattributed" && turn.terminal && (normalized !== undefined || lost);
       inputTokens += (normalized?.inputTokens ?? 0) - (normalized?.cacheWriteTokens ?? 0);
       outputTokens += normalized?.outputTokens ?? 0;
@@ -97,6 +105,8 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
       ...(retainCost ? { providerCostUsd: Number(cost) / 1_000_000_000 } : {}) };
     const current = currentTurn ? turns.get(currentTurn) : undefined;
     return { usage: { runDelta, accountingCostIncomplete: costIncomplete, ...(usageLost ? { accountingUsageLost: true } : {}),
+      ...(summaryUsageUnknown ? { summaryUsage: "unknown" } : {}),
+      ...([...turns.values()].some(turn => turn.incomplete) ? { accountingUsageIncomplete: true } : {}),
       ...(retainCost ? { accountingCostUsdExact: `${cost / 1_000_000_000n}.${String(cost % 1_000_000_000n).padStart(9, "0")}` } : {}) },
       // A turn closed as lost still names the terminal turn the executor must match.
       turnId: current && (normalizeNativeUsage(current.usage) || (current.lost && current.terminal)) ? currentTurn : undefined, complete };
@@ -133,12 +143,29 @@ export function createNativeTurnAccounting(provider: NativeExecutionInput["provi
         turn.usage = null;
         turn.terminal = false;
         turn.lost = false;
+        turn.summaryUnknown = false;
+        turn.incomplete = false;
         turn.restored = false;
       } else if (payload.kind === "usage" && (!currentTurn || !turns.has(key))) currentTurn = event.turnId;
       if (payload.kind === "usage") {
         const usage = record(payload.usage);
-        turn.usage = Object.hasOwn(usage, "runDelta")
+        summaryUsageUnknown ||= usage.summaryUsage === "unknown";
+        if (usage.summaryUsage === "unknown") turn.summaryUnknown = true;
+        const measured = Object.hasOwn(usage, "runDelta")
           ? { runDelta: record(usage.runDelta), runDeltaComplete: usage.runDeltaComplete } : null;
+        if (normalizeNativeUsage(measured)) {
+          turn.usage = measured;
+          turn.incomplete = false;
+        } else {
+          // Reports are cumulative TURN snapshots, not additive deltas. A
+          // missing final snapshot (summary, interrupt, cancellation, failure,
+          // or child accounting) cannot revoke an earlier measured subtotal.
+          // Keep it as a lower bound; never fall back to the session total.
+          // With no measured snapshot the turn remains pending as before,
+          // but retain any independently reported partial cost.
+          if (!normalizeNativeUsage(turn.usage)) turn.usage = measured;
+          turn.incomplete = true;
+        }
       }
       if (terminal) turn.terminal = true;
       if (event.eventType === "turn.failed" && record(payload.error).code === LOST_ON_RESTORE) turn.lost = true;
