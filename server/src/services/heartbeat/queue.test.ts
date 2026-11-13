@@ -981,7 +981,8 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
       await db.insert(agentWakeupRequests).values({ companyId: seeded.company.id, agentId: seeded.agent.id,
         source: "assignment", status: "completed", runId: seeded.run.id, idempotencyKey: opts.idempotencyKey,
         requestedByActorType: "system", requestedByActorId: pluginId,
-        payload: { issueId: seeded.issue.id, mutation: "plugin_wakeup", pluginId, pluginKey } } as never);
+        payload: { issueId: seeded.issue.id, mutation: "plugin_wakeup", pluginId, pluginKey,
+          _paperclipWakeContext: { issueId: seeded.issue.id, pluginId, pluginKey } } } as never);
     }
     await db.update(agentWakeupRequests).set({ agentId: seeded.agent.id, idempotencyKey: opts.idempotencyKey ?? null,
       requestedByActorType: "system", requestedByActorId: opts.requester === "other" ? randomUUID() : pluginId, payload: {
@@ -1007,14 +1008,14 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
   }
 
   it.each([
-    ["uninstalled (missing)", { pluginStatus: null }],
-    ["disabled", { pluginStatus: "disabled" }],
-    ["errored", { pluginStatus: "error" }],
-    ["disabled for the company", { companyEnabled: false }],
-  ] as const)("F1: a %s plugin's deferred wake is cancelled, not promoted", async (_label, opts) => {
+    ["uninstalled (missing)", { pluginStatus: null }, "cancelled"],
+    ["disabled", { pluginStatus: "disabled" }, "cancelled"],
+    ["errored", { pluginStatus: "error" }, "cancelled"],
+    ["disabled for the company", { companyEnabled: false }, "cancelled"],
+  ] as const)("F1: a %s plugin's deferred wake is not promoted", async (_label, opts, expectedStatus) => {
     const { queued, wake } = await runStrandedPluginWake(opts as never);
     expect(queued).toHaveLength(0);
-    expect(wake.status).toBe("cancelled");
+    expect(wake.status).toBe(expectedStatus);
   });
 
   it("F2: a wake that only carries plugin metadata (not the plugin's own requestWakeup) does not newly qualify", async () => {

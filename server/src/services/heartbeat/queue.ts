@@ -116,8 +116,6 @@ import {
   caseHandoffs,
   cases,
   agentWakeupRequests,
-  plugins,
-  pluginCompanySettings,
   activityLog,
   budgetIncidents,
   chatConversations,
@@ -2203,33 +2201,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         wake.requestedByActorType === "system" && wake.requestedByActorId === pluginId;
       if (!pluginWake && !ownerWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
-      if (pluginWake) {
-        const [plugin] = await db.select({ id: plugins.id, pluginKey: plugins.pluginKey, status: plugins.status })
-          .from(plugins).where(sql`${plugins.id}::text = ${pluginId}`);
-        const [companySetting] = plugin ? await db.select({ enabled: pluginCompanySettings.enabled })
-          .from(pluginCompanySettings).where(and(eq(pluginCompanySettings.pluginId, plugin.id),
-            eq(pluginCompanySettings.companyId, wake.companyId))) : [];
-        if (!plugin || plugin.pluginKey !== pluginKey || plugin.status !== "ready" || companySetting?.enabled === false) {
-          await db.update(agentWakeupRequests).set({ status: "cancelled", error: "plugin_wakeup_origin_unavailable",
-            finishedAt: new Date(), updatedAt: new Date() }).where(and(eq(agentWakeupRequests.id, wake.id),
-            eq(agentWakeupRequests.status, "deferred_issue_execution")));
-          continue;
-        }
-        if (wake.idempotencyKey) {
-          const [priorRun] = await db.select({ id: heartbeatRuns.id }).from(agentWakeupRequests)
-            .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
-            .where(and(eq(agentWakeupRequests.companyId, wake.companyId),
-              eq(agentWakeupRequests.agentId, wake.agentId), eq(agentWakeupRequests.idempotencyKey, wake.idempotencyKey),
-              sql`${agentWakeupRequests.payload}->>'issueId' = ${String(payload.issueId)}`,
-              sql`${agentWakeupRequests.id} <> ${wake.id}`)).limit(1);
-          if (priorRun) {
-            await db.update(agentWakeupRequests).set({ status: "coalesced", error: "plugin_wakeup_already_delivered",
-              finishedAt: new Date(), updatedAt: new Date() }).where(and(eq(agentWakeupRequests.id, wake.id),
-              eq(agentWakeupRequests.status, "deferred_issue_execution")));
-            continue;
-          }
-        }
-      }
       const [latest] = await db.select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
