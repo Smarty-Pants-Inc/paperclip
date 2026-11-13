@@ -39,6 +39,7 @@ export class RunnerIngressConnectionError extends Error {
 
 export class WsJsonWireConnection implements PrpWireConnection {
   #onJson: ((value: unknown) => void) | null = null;
+  #onPong: (() => void) | null = null;
   #onClose = new Set<(reason: TransportCloseReason) => void>();
   #pendingJson: unknown[] = [];
   #closeReason: TransportCloseReason | null = null;
@@ -47,6 +48,7 @@ export class WsJsonWireConnection implements PrpWireConnection {
   constructor(readonly socket: WebSocket) {
     socket.on("pong", () => {
       this.#lastInboundAt = Date.now();
+      if (this.#closeReason === null) this.#onPong?.();
     });
     socket.on("message", (data, isBinary) => {
       this.#lastInboundAt = Date.now();
@@ -132,6 +134,10 @@ export class WsJsonWireConnection implements PrpWireConnection {
   onJson(listener: (value: unknown) => void): void {
     this.#onJson = listener;
     for (const value of this.#pendingJson.splice(0)) listener(value);
+  }
+
+  onPong(listener: () => void): void {
+    this.#onPong = listener;
   }
 
   onClose(listener: (reason: TransportCloseReason) => void): void {

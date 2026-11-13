@@ -711,6 +711,7 @@ type WarmNativeSession = {
   onReleased: () => void;
   sessionCheckpointPersisted?: (snapshot: PersistedNativeSession) => void;
   runnerConnectionLive?: () => boolean;
+  runnerFreshlyAlive?: (nowMs: number) => boolean;
   pluginTaskId?: string;
   sandboxProviderLeaseId?: string;
   observabilityCompatibilityKey?: string;
@@ -5997,8 +5998,9 @@ function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined)
 }
 
 // Lease reuse is also reported as "resumed" on an ordinary running box. Only
-// a disconnected cached transport or an explicit stopped/archived resume makes
-// that warm owner suspect. A cache miss keeps the existing cold-recovery probe.
+// fresh authenticated inbound liveness from the cached runner generation can
+// avoid the loss probe. A counted socket can be stale; stopped/archived resumes
+// and cache misses always keep the existing recovery probe.
 function resumedSandboxRunnerNeedsProbe(input: {
   execution: NativeExecutionInput; runnerExecutionTarget?: AdapterExecutionTarget | null;
 }): boolean {
@@ -6007,7 +6009,7 @@ function resumedSandboxRunnerNeedsProbe(input: {
   const resumedFromState = target?.kind === "remote" && target.transport === "sandbox"
     ? target.sandboxLeaseAcquisition?.resumedFromState : undefined;
   return resumedFromState === "stopped" || resumedFromState === "archived"
-    || warmNativeSessions.get(nativeSessionScopeKey(input.execution))?.runnerConnectionLive?.() !== true;
+    || warmNativeSessions.get(nativeSessionScopeKey(input.execution))?.runnerFreshlyAlive?.(Date.now()) !== true;
 }
 
 /** An idle Runner can exit while its sandbox remains running. A resume from a
@@ -12321,6 +12323,7 @@ async function executePaperclipNativeSessionAttempt(
                   if (existing.session !== session) {
                     existing.sessionCheckpointPersisted = runnerdBackend?.sessionCheckpointPersisted;
                     existing.runnerConnectionLive = runnerdBackend?.runnerConnectionLive;
+                    existing.runnerFreshlyAlive = runnerdBackend?.runnerFreshlyAlive;
                   }
                   const ingress = input.useRunnerd ? nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget) : undefined;
                   existing.ingressOwner = ingress ? { ...input.execution.binding, ingress,
@@ -12336,6 +12339,7 @@ async function executePaperclipNativeSessionAttempt(
                     })(),
                     sessionCheckpointPersisted: runnerdBackend?.sessionCheckpointPersisted,
                     runnerConnectionLive: runnerdBackend?.runnerConnectionLive,
+                    runnerFreshlyAlive: runnerdBackend?.runnerFreshlyAlive,
                     onReleased: () => releaseRetainedNativeSessionCleanup(input.db, {
                       companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
                     }, { companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,
@@ -15935,6 +15939,8 @@ async function prepareRemoteExternalRunner({ input, target, runner, root, identi
 type ManagedRunnerdBackend = NativeSessionBackend & {
   /** Synchronous local transport state; never contacts the allocation. */
   runnerConnectionLive?: () => boolean;
+  /** Fresh inbound evidence bound to this backend's recorded runner generation. */
+  runnerFreshlyAlive?: (nowMs: number) => boolean;
   sandboxRetention?: SandboxRunnerRetention;
   bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
   bindDiagnosticSession?(session: NativeSession): void;
@@ -15966,6 +15972,9 @@ async function createRunnerdBackendWithinSessionClaim(
       ...(input.executionContext?.active && startupOperation ? { executionContext: input.executionContext } : {}) });
   } : rawPluginTask;
   let runnerControlPlane: DurablePrpControlPlane | undefined;
+  // Captured once for this backend/warm entry, not read back from a potentially
+  // replaced control-plane identity on the next turn.
+  let warmRunnerInstanceId: string | undefined;
   if (pluginTask && input.runnerIngressAuthorized !== true) throw new Error("runner_ingress_unavailable");
   if (pluginTask && (input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8")) {
     throw new Error("Plugin Runner tasks require a workspace session");
@@ -18139,8 +18148,10 @@ async function createRunnerdBackendWithinSessionClaim(
       remoteCaBundleMapping = { sourcePath, targetPath };
       return targetPath;
     },
-    beforeConnect: async (_identity, authority) => {
+    beforeConnect: async (identity, authority) => {
       runnerControlPlane = authority;
+      // Missing identity cannot establish freshness (including legacy callers).
+      warmRunnerInstanceId ??= identity?.runnerInstanceId;
       await input.remoteWarmRecovery?.revalidate();
       if (stagedRecovery && authority.store.state.stagedRunAttachment) {
         const current = await verifyStagedAttachmentRestart(input, stagedRecovery);
@@ -18526,6 +18537,10 @@ async function createRunnerdBackendWithinSessionClaim(
     runnerConnectionLive: () => replacementBackend
       ? replacementBackend.runnerConnectionLive?.() ?? false
       : (runnerControlPlane?.activeRunnerConnectionCount() ?? 0) > 0,
+    runnerFreshlyAlive: nowMs => replacementBackend
+      ? replacementBackend.runnerFreshlyAlive?.(nowMs) ?? false
+      : warmRunnerInstanceId !== undefined
+        && runnerControlPlane?.runnerFreshlyAlive?.(warmRunnerInstanceId, nowMs) === true,
     sandboxRetention,
     bindManagedSession: (session, options) => replacementBackend
       ? replacementBackend.bindManagedSession(session, options) : wrapManagedSession(session),
