@@ -77,6 +77,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  appWithDeploymentOAuthClient,
   classifyRisk,
   normalizeConnectionMethodConfig,
   projectedConnectionHeaders,
@@ -93,6 +94,13 @@ import { createConnectionSetupPolicy } from "../services/tool-access/connections
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { secretService } from "../services/secrets.js";
+import {
+  GIT_CREDENTIAL_TOKEN_ENV_KEY,
+  buildGitAuthInvocation,
+  filterResolvedGitHubConnectionsForRun,
+  resolveManagedGitHubCredential,
+} from "../services/git-credentials.js";
+import { resolveNativeRuntimeMcpSnapshot } from "../services/native-runtime/runtime-context.js";
 import {
   canonicalToolArguments,
   signToolArguments,
@@ -14105,6 +14113,310 @@ describeEmbeddedPostgres("tool access service", () => {
     });
   });
 
+  it("signs in through an organization's own GitHub App and renews its expiring token directly with GitHub", async () => {
+    const company = await createCompany(db);
+    const userId = `github-own-app-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use", "tools:manage_connections"]);
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+    const service = createTestToolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "github", connectionMethodKey: "own-oauth", name: "GitHub own app", grantKind: "user",
+      oauthClient: { clientId: "github-app-client", clientSecret: "github-app-secret" },
+    }, actor);
+    const started = await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri, actor, subjectUserId: userId,
+    });
+    const authorization = new URL(started.authorizationUrl);
+    expect(authorization.origin + authorization.pathname).toBe("https://github.com/login/oauth/authorize");
+    expect(authorization.searchParams.get("client_id")).toBe("github-app-client");
+
+    const tokenRequests: URLSearchParams[] = [];
+    let issuedTokens = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (href === "https://api.githubcopilot.com/mcp/") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string; method?: string };
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: payload.method === "tools/list"
+            ? { tools: [{ name: "get_me", description: "Read the signed-in user.", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] }
+            : { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "GitHub test", version: "1.0.0" } },
+        });
+      }
+      if (href.startsWith("https://api.github.com/user/repos?")) {
+        const current = new Headers(init?.headers).get("authorization") === `Bearer ghu-${issuedTokens}`;
+        if (!current) return new Response("Bad credentials", { status: 401 });
+        return Response.json(href.endsWith("page=1") ? [{ id: 1, full_name: "frontegg/identity-service", private: true }] : []);
+      }
+      if (href === "https://api.github.com/user") return Response.json({ id: 140060214, login: "octo-own-app" });
+      if (href.startsWith("https://api.github.com/user/installations?")) {
+        return Response.json({ total_count: 1, installations: [{
+          id: 77, app_slug: "paperclip-identity", repository_selection: "selected",
+          account: { login: "frontegg" }, html_url: "https://github.com/organizations/frontegg/settings/installations/77",
+        }] });
+      }
+      if (href.startsWith("https://api.github.com/user/installations/77/repositories?")) {
+        return Response.json({ total_count: 1, repositories: [{ id: 1, full_name: "frontegg/identity-service", private: true }] });
+      }
+      if (href !== "https://github.com/login/oauth/access_token") throw new Error(`unexpected fetch ${href}`);
+      const body = new URLSearchParams(String(init?.body));
+      tokenRequests.push(body);
+      if (new Headers(init?.headers).get("accept") !== "application/json") {
+        return new Response("access_token=form-encoded&token_type=bearer", { status: 200 });
+      }
+      if (body.get("refresh_token") === "ghr-revoked") {
+        return Response.json({ error: "bad_refresh_token", error_description: "The refresh token passed is incorrect or expired." });
+      }
+      issuedTokens += 1;
+      return Response.json({
+        access_token: `ghu-${issuedTokens}`,
+        refresh_token: issuedTokens < 3 ? `ghr-${issuedTokens}` : "ghr-revoked",
+        expires_in: 28800,
+        refresh_token_expires_in: 15897600,
+        token_type: "bearer",
+        scope: "",
+      });
+    });
+
+    await service.completeOAuthCallback({
+      state: authorization.searchParams.get("state")!, code: "github-code", redirectUri, actor,
+    });
+    const userGrant = async () => (await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connected.connectionId),
+      eq(connectionGrants.kind, "user"),
+      eq(connectionGrants.subjectUserId, userId),
+    )))[0]!;
+    expect(await userGrant()).toMatchObject({ status: "active" });
+    expect(tokenRequests[0]!.get("code")).toBe("github-code");
+    expect(tokenRequests[0]!.get("client_secret")).toBe("github-app-secret");
+    await expect(service.githubReadHeaders(company.id, connected.connectionId, userId))
+      .resolves.toEqual({ Authorization: "Bearer ghu-1" });
+    expect((await userGrant()).providerTenant?.github).toMatchObject({
+      login: "octo-own-app", installationCount: 1, repositoryCount: 1,
+    });
+    const agent = await createAgent(db, company.id);
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id, connectionId: connected.connectionId, targetType: "agent", targetId: agent.id,
+    });
+    await expect(resolveManagedGitHubCredential(db, secretService(db), company.id, {
+      responsibleUserId: userId, agentId: agent.id,
+    })).resolves.toMatchObject({
+      credential: { token: "ghu-1", githubIdentity: { login: "octo-own-app" }, identitySource: "personal" },
+    });
+
+    const expireAccessToken = async () => {
+      const grant = await userGrant();
+      await db.update(connectionGrants).set({ providerTenant: {
+        ...grant.providerTenant,
+        oauth: { ...grant.providerTenant?.oauth, accessTokenExpiresAt: new Date(Date.now() - 1_000).toISOString() },
+      } }).where(eq(connectionGrants.id, grant.id));
+    };
+    await expireAccessToken();
+    const listed = await service.listGitHubRepositories(company.id, userId);
+    expect(listed.repositories.map((repository) => repository.fullName)).toEqual(["frontegg/identity-service"]);
+    expect(listed.failedConnectionCount).toBe(0);
+    expect(tokenRequests[1]!.get("grant_type")).toBe("refresh_token");
+    expect(tokenRequests[1]!.get("refresh_token")).toBe("ghr-1");
+
+    await expireAccessToken();
+    await expect(service.githubReadHeaders(company.id, connected.connectionId, userId))
+      .resolves.toEqual({ Authorization: "Bearer ghu-3" });
+    expect(tokenRequests[2]!.get("refresh_token")).toBe("ghr-2");
+
+    await expireAccessToken();
+    await expect(service.githubReadHeaders(company.id, connected.connectionId, userId)).rejects.toThrow();
+    expect(await userGrant()).toMatchObject({ status: "needs_reauthorization" });
+  });
+
+  it("projects an own-oauth personal grant into a run's GH_TOKEN and Git helper, and a token rotation keeps the session inputs", async () => {
+    const company = await createCompany(db);
+    const userId = `github-own-app-run-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use", "tools:manage_connections"]);
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+    const service = createTestToolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "github", connectionMethodKey: "own-oauth", name: "GitHub own app", grantKind: "user",
+      oauthClient: { clientId: "github-app-client", clientSecret: "github-app-secret" },
+    }, actor);
+    const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor, subjectUserId: userId });
+    let issuedTokens = 0;
+    const cloudRequests: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (/paperclip\.(ing|app)/.test(href)) cloudRequests.push(href);
+      if (href === "https://api.githubcopilot.com/mcp/") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string; method?: string };
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: payload.method === "tools/list"
+            ? { tools: [{ name: "get_me", description: "Read the signed-in user.", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] }
+            : { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "GitHub test", version: "1.0.0" } },
+        });
+      }
+      if (href === "https://api.github.com/user") return Response.json({ id: 140060214, login: "octo-own-app" });
+      if (href.startsWith("https://api.github.com/user/installations?")) {
+        return Response.json({ total_count: 1, installations: [{ id: 77, repository_selection: "selected", account: { login: "smarty" } }] });
+      }
+      if (href.startsWith("https://api.github.com/user/installations/77/repositories?")) {
+        return Response.json({ total_count: 1, repositories: [{ id: 1, full_name: "smarty/app", private: true }] });
+      }
+      if (href !== "https://github.com/login/oauth/access_token") throw new Error(`unexpected fetch ${href}`);
+      issuedTokens += 1;
+      return Response.json({
+        access_token: `ghu-${issuedTokens}`, refresh_token: `ghr-${issuedTokens}`,
+        expires_in: 28800, refresh_token_expires_in: 15897600, token_type: "bearer", scope: "",
+      });
+    });
+    await service.completeOAuthCallback({
+      state: new URL(started.authorizationUrl).searchParams.get("state")!, code: "github-code", redirectUri, actor,
+    });
+    const agent = await createAgent(db, company.id);
+    await db.insert(toolConnectionInstalls).values({
+      companyId: company.id, connectionId: connected.connectionId, targetType: "agent", targetId: agent.id,
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company.id, agentId: agent.id, invocationSource: "on_demand", status: "running",
+      contextSnapshot: {}, responsibleUserId: userId,
+    }).returning();
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    const runProjection = async () => {
+      const resolved = await resolveManagedGitHubCredential(db, secretService(db), company.id, {
+        responsibleUserId: userId, agentId: agent.id, heartbeatRunId: run.id,
+      });
+      expect(resolved.error).toBeUndefined();
+      expect(resolved.credential).toBeDefined();
+      return {
+        credential: resolved.credential!,
+        invocation: buildGitAuthInvocation(resolved.credential!),
+        selected: (await filterResolvedGitHubConnectionsForRun({
+          db, companyId: company.id, agentId: agent.id, responsibleUserId: userId, connections: [connection],
+        })).map((candidate) => candidate.id),
+        mcp: await resolveNativeRuntimeMcpSnapshot({ db, agent, runId: run.id }),
+      };
+    };
+
+    const first = await runProjection();
+    expect(first.credential).toMatchObject({
+      token: "ghu-1", source: "managed_connection", identitySource: "personal",
+      githubIdentity: { userId: "140060214", login: "octo-own-app" }, connectionId: connected.connectionId,
+    });
+    expect(first.invocation.env).toMatchObject({
+      GH_TOKEN: "ghu-1", GITHUB_TOKEN: "ghu-1", [GIT_CREDENTIAL_TOKEN_ENV_KEY]: "ghu-1", GIT_TERMINAL_PROMPT: "0",
+    });
+    expect(first.invocation.configArgs).toEqual(expect.arrayContaining([
+      "-c", "credential.helper=", expect.stringMatching(/^credential\.https:\/\/github\.com\.helper=/),
+    ]));
+    expect(first.selected).toEqual([connected.connectionId]);
+    expect(first.mcp.bindingId).toBe(`native-mcp:${run.id}`);
+
+    // The 8-hour GitHub App token expires and rotates between two turns of the same agent.
+    const [grant] = await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connected.connectionId), eq(connectionGrants.subjectUserId, userId),
+    ));
+    await db.update(connectionGrants).set({ providerTenant: {
+      ...grant.providerTenant,
+      oauth: { ...grant.providerTenant?.oauth, accessTokenExpiresAt: new Date(Date.now() - 1_000).toISOString() },
+    } }).where(eq(connectionGrants.id, grant.id));
+    await expect(service.githubReadHeaders(company.id, connected.connectionId, userId))
+      .resolves.toEqual({ Authorization: "Bearer ghu-2" });
+    const second = await runProjection();
+    expect(second.credential).toMatchObject({ token: "ghu-2", grantId: first.credential.grantId });
+    expect(second.invocation.env).toMatchObject({ GH_TOKEN: "ghu-2", GITHUB_TOKEN: "ghu-2" });
+    // REG-27: the Pi conversation is keyed by the run's MCP assignment digest, not by the token it carries.
+    expect(second.selected).toEqual(first.selected);
+    expect(second.mcp).toEqual(first.mcp);
+    expect(JSON.stringify([first.mcp, second.mcp])).not.toMatch(/ghu-|ghr-/);
+    expect(cloudRequests).toEqual([]);
+  });
+
+  it("signs in through the deployment's own GitHub App client without storing it per connection", async () => {
+    const github = getConnectableAppDefinition("github")!;
+    expect(appWithDeploymentOAuthClient(github)).not.toHaveProperty("deploymentOAuthClient");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GITHUB_CLIENT_ID", "deployment-github-client");
+    expect(appWithDeploymentOAuthClient(github)).not.toHaveProperty("deploymentOAuthClient");
+    vi.stubEnv("PAPERCLIP_TOOL_OAUTH_GITHUB_CLIENT_SECRET", "deployment-github-secret");
+    expect(appWithDeploymentOAuthClient(github)).toMatchObject({ deploymentOAuthClient: true });
+
+    const company = await createCompany(db);
+    const userId = `github-deployment-app-${randomUUID()}`;
+    await grantBoardUser(db, company.id, userId, ["tools:use", "tools:manage_connections"]);
+    const actor = { actorType: "user" as const, actorId: userId };
+    const redirectUri = "https://paperclip.example/api/tools/oauth/callback";
+    const service = createTestToolAccessService(db);
+    const connected = await service.connectGalleryApp(company.id, {
+      galleryKey: "github", connectionMethodKey: "own-oauth", name: "GitHub deployment app", grantKind: "user",
+    }, actor);
+    const started = await service.startOAuth(company.id, connected.connectionId, { redirectUri, actor, subjectUserId: userId });
+    const authorization = new URL(started.authorizationUrl);
+    expect(authorization.searchParams.get("client_id")).toBe("deployment-github-client");
+
+    let tokenRequest: URLSearchParams | null = null;
+    let githubAccount = { id: 1001, login: "first-account", installed: true };
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      const href = String(url);
+      if (href === "https://api.githubcopilot.com/mcp/") {
+        const payload = JSON.parse(String(init?.body ?? "{}")) as { id?: string; method?: string };
+        return mcpHttpResponse({
+          jsonrpc: "2.0",
+          id: payload.id,
+          result: payload.method === "tools/list"
+            ? { tools: [] }
+            : { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "GitHub test", version: "1.0.0" } },
+        });
+      }
+      if (href === "https://api.github.com/user") return Response.json({ id: githubAccount.id, login: githubAccount.login });
+      if (href.startsWith("https://api.github.com/user/installations?")) {
+        return Response.json({ total_count: githubAccount.installed ? 1 : 0, installations: githubAccount.installed
+          ? [{ id: 88, repository_selection: "selected", account: { login: "frontegg" } }]
+          : [] });
+      }
+      if (href.startsWith("https://api.github.com/user/installations/88/repositories?")) {
+        return Response.json({ total_count: 1, repositories: [{ id: 2, full_name: "frontegg/auth-hub-service" }] });
+      }
+      if (href !== "https://github.com/login/oauth/access_token") throw new Error(`unexpected fetch ${href}`);
+      tokenRequest = new URLSearchParams(String(init?.body));
+      return Response.json({ access_token: `ghu-${githubAccount.login}`, refresh_token: "ghr-deployment", expires_in: 28800, token_type: "bearer" });
+    });
+    await service.completeOAuthCallback({
+      state: authorization.searchParams.get("state")!, code: "github-code", redirectUri, actor,
+    });
+
+    expect(tokenRequest!.get("client_id")).toBe("deployment-github-client");
+    expect(tokenRequest!.get("client_secret")).toBe("deployment-github-secret");
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, connected.connectionId));
+    expect(connection.credentialSecretRefs.map((ref) => ref.configPath)).not.toContain("oauth.client_secret");
+    await expect(service.githubReadHeaders(company.id, connected.connectionId, userId))
+      .resolves.toEqual({ Authorization: "Bearer ghu-first-account" });
+    const userGrant = async () => (await db.select().from(connectionGrants).where(and(
+      eq(connectionGrants.connectionId, connected.connectionId),
+      eq(connectionGrants.kind, "user"),
+      eq(connectionGrants.subjectUserId, userId),
+    )))[0]!;
+    expect((await userGrant()).providerTenant?.github).toMatchObject({ login: "first-account" });
+
+    githubAccount = { id: 1002, login: "second-account", installed: false };
+    const reconnect = new URL((await service.startOAuth(company.id, connected.connectionId, {
+      redirectUri, actor, subjectUserId: userId,
+    })).authorizationUrl);
+    await service.completeOAuthCallback({
+      state: reconnect.searchParams.get("state")!, code: "github-code-2", redirectUri, actor,
+    });
+    expect((await userGrant()).providerTenant?.github).toBeUndefined();
+    const unverified = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, connected.connectionId),
+      eq(activityLog.action, "tool_connection.github_access_unverified"),
+    ));
+    expect(unverified).toHaveLength(1);
+    expect(unverified[0]!.details).toMatchObject({ subjectUserId: userId });
+    expect(JSON.stringify(unverified[0]!.details)).not.toContain("ghu-");
+    await expect(service.githubReadHeaders(company.id, connected.connectionId, userId))
+      .resolves.toEqual({ Authorization: "Bearer ghu-second-account" });
+  });
+
   it("uses Asana v2 metadata instead of stale v1 endpoints for a saved custom app", async () => {
     const company = await createCompany(db);
     const service = createTestToolAccessService(db);
@@ -21067,7 +21379,7 @@ describe("classifyRisk", () => {
 describe("projectedConnectionHeaders", () => {
   type ProjectedConnection = Parameters<typeof projectedConnectionHeaders>[0];
 
-  it.each([undefined, "managed", "mcp-key"])(
+  it.each([undefined, "managed", "own-oauth", "mcp-key"])(
     "adds Actions to the default GitHub toolsets for method %s without saved configuration",
     (connectionMethodKey) => {
       const connection: ProjectedConnection = {
