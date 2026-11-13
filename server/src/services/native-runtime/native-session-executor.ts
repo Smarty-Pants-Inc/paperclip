@@ -14993,6 +14993,46 @@ export async function verifyRemoteRunnerReattachment(input: {
   };
 }
 
+/**
+ * The shared "prior owner proven gone" predicate for a remote Runner (RFL F1).
+ * A prior owner is gone ONLY on one of: a different boot generation of its box,
+ * its process verified absent, or a successful close of that exact owner
+ * (runnerd's own `suspended` runner state; checked by the transport's
+ * rotation). Never on a provider label such as resumedFromState
+ * stopped/archived, and never on a failed close.
+ *
+ * This function proves the first two: the box's launch marker for this
+ * session names that runner instance with a recorded start generation
+ * ("linux:<boot_id>:<start ticks>"), and the process it names is not running
+ * (45) or now has a different generation (47): another boot, or a reused pid.
+ * A live matching process, a missing or foreign marker, or a failed probe
+ * proves nothing. Callers keep every other fence.
+ */
+export async function remoteRunnerGenerationLost(input: {
+  runner: CommandManagedRuntimeRunner;
+  remoteCwd: string;
+  identity: Record<string, unknown>;
+}): Promise<boolean> {
+  const { runnerInstanceId, normalizedSessionId } = input.identity;
+  if (typeof runnerInstanceId !== "string" || !runnerInstanceId || typeof normalizedSessionId !== "string" || !normalizedSessionId) return false;
+  const identityPath = posix.join(remoteRunnerStateDirectory(input.remoteCwd, normalizedSessionId), "runner-process.identity");
+  try {
+    const marker = await input.runner.execute({ command: "sh", bypassSession: true, timeoutMs: 10_000,
+      args: ["-c", REMOTE_RECOVERY_MARKER_READ_SCRIPT, "paperclip-runner-generation-marker", identityPath] });
+    if (marker.exitCode !== 0 || marker.timedOut) return false;
+    const nonce = marker.stdout.split("\n")[0] ?? "";
+    if (!/^[a-zA-Z0-9_-]+$/.test(nonce)) return false;
+    const owner = parseRemoteRunnerProcessIdentity(marker.stdout, { nonce, runnerInstanceId });
+    if (!owner?.processStartFingerprint) return false;
+    const check = await input.runner.execute({ command: "sh", bypassSession: true, timeoutMs: 10_000,
+      args: ["-c", REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT, "paperclip-runner-generation-check", identityPath, nonce,
+        runnerInstanceId, String(owner.pid), owner.processStartFingerprint] });
+    return !check.timedOut && (check.exitCode === 45 || check.exitCode === 47);
+  } catch {
+    return false;
+  }
+}
+
 export async function verifyRemoteRunnerOrSettledExit(
   input: Parameters<typeof verifyRemoteRunnerReattachment>[0] & { providerAttempt: number },
 ) {
