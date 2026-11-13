@@ -6,11 +6,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
+import { createPiRpcAppServerProxy } from "../../cli/pi-rpc-app-server-proxy.js";
 
 // Keep reason: native admission and delayed-event attribution are trust/data-safety
 // boundaries. Exercise the live session pump, not just admission/projector helpers.
 class FakeTransport {
   readonly commands: Array<{ type: string; params: PiRpcRecord }> = [];
+  readonly requestOptions: Array<{ timeoutMs?: number } | undefined> = [];
   state: PiRpcRecord = { sessionId: "native-session", model: { provider: "neutral", id: "nested/model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
   modelReceipt: PiRpcRecord = { provider: "neutral", id: "nested/model" };
   levels = ["off", "high", "max"];
@@ -21,8 +23,9 @@ class FakeTransport {
   #records: PiRpcRecord[] = [];
   #wake?: (value: IteratorResult<PiRpcRecord>) => void;
 
-  async request(type: string, params: PiRpcRecord = {}): Promise<PiRpcRecord> {
+  async request(type: string, params: PiRpcRecord = {}, options?: { timeoutMs?: number }): Promise<PiRpcRecord> {
     this.commands.push({ type, params });
+    this.requestOptions.push(options);
     await this.hold?.(type);
     const data = type === "get_state" ? { ...this.state }
       : type === "set_model" ? this.modelReceipt
@@ -87,6 +90,39 @@ async function settle(transport: FakeTransport, id: string) {
 }
 
 describe("Pi RPC live-session L4 wiring", () => {
+  // Keep reason: closing during cold-process admission is a failure path that
+  // cannot be reached cheaply/repeatably with a real Pi process.
+  it("passes the startup bound to the first get_state and promptly rejects a pending proxy open on close", async () => {
+    const startupTimeoutMs = 45_000;
+    const f = await fixture({ processStartupTimeoutMs: startupTimeoutMs });
+    const frames: Array<Record<string, unknown>> = [];
+    let entered!: () => void;
+    const entering = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    f.transport.hold = () => new Promise<void>(resolve => { release = resolve; entered(); });
+    const openSession = vi.spyOn(f.driver, "openSession");
+    const proxy = createPiRpcAppServerProxy({
+      stdout: { write: frame => { frames.push(JSON.parse(frame)); return true; }, once: () => undefined },
+      environment: { PAPERCLIP_RUN_ID: f.input.runId, PAPERCLIP_NORMALIZED_SESSION_ID: f.input.normalizedSessionId },
+      createDriver: () => f.driver,
+    });
+    try {
+      proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/start", params: { cwd: f.input.workingDirectory, model: "neutral/nested/model" } }));
+      await entering;
+      expect(f.transport.commands.map(command => command.type)).toEqual(["get_state"]);
+      expect(f.transport.requestOptions[0]?.timeoutMs).toBe(startupTimeoutMs);
+      const opened = openSession.mock.results[0]!.value as ReturnType<PiRpcDriver["openSession"]>;
+      const rejected = expect(opened).rejects.toThrow(/abort/i);
+      await proxy.close();
+      await rejected;
+      await proxy.endInput();
+      await flush();
+      expect(f.transport.closed).toBe(true);
+      expect(frames.find(frame => frame.id === 1)).toMatchObject({ error: { code: -32000, message: expect.stringMatching(/abort/i) } });
+      expect(f.transport.commands.map(command => command.type)).toEqual(["get_state"]);
+    } finally { release?.(); await proxy.close(); openSession.mockRestore(); }
+  }, 2_000);
+
   // Keep reason: cold-start and hung-admission failure paths cannot be reached
   // cheaply/repeatably with a real Pi process. Exercise openSession's deadlines.
   it("admits a new Pi whose first get_state takes 15 seconds, beyond the admission bound", async () => {
