@@ -552,11 +552,12 @@ it.skipIf(!enabled)(`runs native Pi through the full server twice on the same Pi
       await drainLatest();
       pendingProbe = { callId: "call-native-finish-proof", name: "paperclip_finish", input: {} };
       await api("POST", `/issues/${issueId}/comments`, { body: "Finish this turn by calling paperclip_finish with the current completion contract, then end the turn." }, 201);
-      const finishEnd = await waitFor("native paperclip_finish execution completed", async () => {
+      const finishProofState = await waitFor("native paperclip_finish execution completed", async () => {
         const receipt = readNativePiHomeProof(nativeHomeProof!.receiptPath);
-        return receipt?.toolExecutions?.find((event: any) => event.type === "tool_execution_end" && event.toolCallId === "call-native-finish-proof") ?? null;
+        const finishEnd = receipt?.toolExecutions?.find((event: any) => event.type === "tool_execution_end" && event.toolCallId === "call-native-finish-proof");
+        return receipt && finishEnd ? { receipt, finishEnd } : null;
       });
-      const receipt = readNativePiHomeProof(nativeHomeProof!.receiptPath)!;
+      const { receipt, finishEnd } = finishProofState;
       const finishStart = receipt.toolExecutions.find((event: any) => event.type === "tool_execution_start" && event.toolCallId === "call-native-finish-proof");
       expect(finishStart).toBeDefined();
       const durationMs = finishEnd.monotonicMs - finishStart.monotonicMs;
