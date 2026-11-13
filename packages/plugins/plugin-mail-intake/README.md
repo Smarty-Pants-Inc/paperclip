@@ -15,15 +15,23 @@ fires the existing business routine. See also the
 The package layout follows [fork PR #23](https://github.com/Smarty-Pants-Inc/paperclip/pull/23)
 (`factory-lead/g12-backstop-plugin`).
 
+Parked-message diagnostics use the documented
+[`onHealth()` lifecycle hook (SDK README:127)](https://github.com/Smarty-Pants-Inc/paperclip/blob/96c12d3a01cc5cbb90e4bd09a3e919d88d25cd23/packages/plugins/sdk/README.md#L127)
+which returns `{ status, message?, details? }` for the existing health dashboard.
+The [SDK contract:250–258](https://github.com/Smarty-Pants-Inc/paperclip/blob/96c12d3a01cc5cbb90e4bd09a3e919d88d25cd23/packages/plugins/sdk/src/define-plugin.ts#L250-L258)
+confirms the host surfaces these diagnostics. No custom status UI or core change.
+
 ## Contract
 
 1. Re-read config using the explicitly bound company on each tick. Disabled or
    never configured means no mail, secret, or state activity. Only one company
    can be bound to a worker; a different/global company save fails closed.
 2. Read explicitly initialized, company/mailbox-scoped version-2 state: seen
-   `{id, internalDate}` records and failures `{id, internalDate, attempts,
-   nextRetryAt}`. Only IDs, millisecond timestamps and counts persist. Missing,
-   legacy-array or corrupt state fails, never silently baselines history.
+   `{id, internalDate}` records, failures `{id, internalDate, attempts,
+   nextRetryAt, lastFailureAt}`, and a monotonic `notBefore` floor (epoch ms).
+   Only IDs, millisecond timestamps and counts persist. Older version-2 rows
+   without a floor get the current window cutoff after their first complete
+   tick. Missing, legacy-array or corrupt state fails, never silently baselines history.
 3. Resolve the company-bound `gmailGrantRef`: a secret **JSON string** containing
    exactly `{client_id, client_secret, refresh_token}`. Exchange the original
    matching user OAuth grant at `https://oauth2.googleapis.com/token`. Required
@@ -49,12 +57,24 @@ The package layout follows [fork PR #23](https://github.com/Smarty-Pants-Inc/pap
 7. A delivery failure checkpoints only its ID/date, attempt count and next retry,
    then continues to the next message. Backoff starts at two minutes, doubles,
    and caps at six hours. After ten failures it stays parked until it ages out;
-   each complete tick surfaces the fixed warning `mail intake has parked deliveries`
-   through the SDK logger/health dashboard. Backoff/parked IDs do not block later
-   messages. A successful retry removes its failure record and adds seen.
-8. After a complete read, prune seen and failure records whose Gmail internalDate
-   is outside the configured window, even on an empty tick. Never prune on an
-   incomplete read or retain message/thread content in state.
+   each complete tick names the parked Gmail IDs in the fixed-text warning
+   `mail intake has parked deliveries: <id>, <id>` through the SDK logger/health
+   dashboard. Nothing but validated IDs varies in this warning. `onHealth()`
+   also reads durable company/mailbox state and returns `status: "degraded"`, the
+   same warning, and `details.parked: [{id, attempts, lastFailureAt}]`. No mail or
+   secret calls are made for health. `lastFailureAt` is epoch ms; legacy failures
+   without that recorded time report `null`, not an invented time. No subject,
+   sender, body or provider error is exposed. Backoff/parked IDs do not block
+   later messages. A successful retry removes its failure record and adds seen.
+8. Initialize-seen records the start of its scanned window as `notBefore`.
+   After a complete read, each tick advances this floor to
+   `max(previous notBefore, current window cutoff)` and prunes seen/failure
+   records below it, even on an empty tick. Listed messages with
+   `internalDate < notBefore` are never fired or added to seen. The floor never
+   moves backward: **widening the window never back-fills**, even after old IDs
+   have been pruned. A message exactly at the floor remains eligible and its
+   seen record is retained. Never advance the floor or prune on an incomplete
+   read, or retain message/thread content in state.
 
 ## Egress and failures
 
@@ -82,7 +102,8 @@ before and after every awaited fetch (a host call already running must settle).
 Delivery failure retains earlier successful per-ID checkpoints and does not
 abort other deliveries. State-write failure remains fatal. The explicit window
 is the agreed catch-up cut: mail older than that window is intentionally not
-replayed, and old IDs/failures are pruned.
+replayed, and old IDs/failures are pruned. Widening that window does not back-fill
+mail below the persisted monotonic floor.
 
 ## Scheduling and evidence limits
 

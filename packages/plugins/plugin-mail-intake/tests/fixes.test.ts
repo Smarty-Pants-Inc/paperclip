@@ -61,8 +61,8 @@ describe("review fixes", () => {
     const f = fixture();
     await runTick(f.ctx, "company", config);
     expect(f.attempts).toEqual(["aa", "bb"]);
-    expect(f.saved()).toEqual({ version: 2, seen: [{ id: "bb", internalDate: now - day }],
-      failures: [{ id: "aa", internalDate: now - day, attempts: 1, nextRetryAt: now + 120_000 }] });
+    expect(f.saved()).toEqual({ version: 2, notBefore: now - 7 * day, seen: [{ id: "bb", internalDate: now - day }],
+      failures: [{ id: "aa", internalDate: now - day, attempts: 1, nextRetryAt: now + 120_000, lastFailureAt: now }] });
     vi.mocked(Date.now).mockReturnValue(now + 119_999);
     f.ids.push("cc"); f.dates.set("cc", now);
     await runTick(f.ctx, "company", config);
@@ -70,7 +70,7 @@ describe("review fixes", () => {
     vi.mocked(Date.now).mockReturnValue(now + 120_000);
     await runTick(f.ctx, "company", config);
     expect(f.attempts).toEqual(["aa", "bb", "cc", "aa"]);
-    expect(f.saved()).toMatchObject({ failures: [{ attempts: 2, nextRetryAt: now + 360_000 }] });
+    expect(f.saved()).toMatchObject({ failures: [{ attempts: 2, nextRetryAt: now + 360_000, lastFailureAt: now + 120_000 }] });
     expect(JSON.stringify(f.saved())).not.toContain("MUST_NOT_PERSIST");
     const restarted = fixture(f.saved());
     await runTick(restarted.ctx, "company", config);
@@ -80,12 +80,82 @@ describe("review fixes", () => {
     const f = fixture({ ...empty(), failures: [{ id: "aa", internalDate: now - day, attempts: 9, nextRetryAt: now }] });
     await runTick(f.ctx, "company", config);
     expect(f.attempts).toEqual(["aa", "bb"]);
-    expect(f.saved()).toMatchObject({ failures: [{ attempts: 10, nextRetryAt: now + 6 * 3_600_000 }] });
-    expect(f.ctx.logger.warn.mock.calls).toEqual([["mail intake has parked deliveries"]]);
+    expect(f.saved()).toMatchObject({ failures: [{ attempts: 10, nextRetryAt: now + 6 * 3_600_000, lastFailureAt: now }] });
+    expect(f.ctx.logger.warn.mock.calls).toEqual([["mail intake has parked deliveries: aa"]]);
     vi.mocked(Date.now).mockReturnValue(now + 6 * 3_600_000);
     await runTick(f.ctx, "company", config);
     expect(f.attempts).toEqual(["aa", "bb"]);
     expect(f.ctx.logger.warn).toHaveBeenCalledTimes(2);
+  });
+  it("names every parked ID in the fixed-text warning without mail or provider content", async () => {
+    const f = fixture({ ...empty(), failures: ["aa", "bb"].map(id => ({
+      id, internalDate: now - day, attempts: 10, nextRetryAt: now,
+    })) });
+    await runTick(f.ctx, "company", config);
+    expect(f.attempts).toEqual([]);
+    expect(f.ctx.logger.warn.mock.calls).toEqual([["mail intake has parked deliveries: aa, bb"]]);
+  });
+  it("widening seven to thirty days after pruning never re-fires old IDs but new mail fires", async () => {
+    const oldDate = now - 8 * day;
+    const f = fixture({ ...empty(),
+      seen: [{ id: "bb", internalDate: oldDate }],
+      failures: [{ id: "aa", internalDate: oldDate, attempts: 10, nextRetryAt: now }],
+    });
+    f.dates.set("aa", oldDate); f.dates.set("bb", oldDate);
+    await runTick(f.ctx, "company", config);
+    expect(f.saved()).toEqual({ ...empty(), notBefore: now - 7 * day });
+    await runTick(f.ctx, "company", { ...config, scanWindowDays: 30 });
+    expect(f.attempts).toEqual([]);
+    expect(f.saved()).toEqual({ ...empty(), notBefore: now - 7 * day });
+    f.ids.push("cc"); f.dates.set("cc", now);
+    await runTick(f.ctx, "company", { ...config, scanWindowDays: 30 });
+    expect(f.attempts).toEqual(["cc"]);
+    expect(f.saved()).toMatchObject({ notBefore: now - 7 * day, seen: [{ id: "cc", internalDate: now }], failures: [] });
+  });
+  it("advances the floor on quiet ticks and never moves it backward on widening or clock rollback", async () => {
+    const f = fixture({ ...empty(), notBefore: now - 7 * day }); f.ids.splice(0);
+    vi.mocked(Date.now).mockReturnValue(now + day);
+    await runTick(f.ctx, "company", config);
+    expect(f.saved()).toMatchObject({ notBefore: now - 6 * day });
+    vi.mocked(Date.now).mockReturnValue(now + 2 * day);
+    await runTick(f.ctx, "company", { ...config, scanWindowDays: 30 });
+    expect(f.saved()).toMatchObject({ notBefore: now - 6 * day });
+    vi.mocked(Date.now).mockReturnValue(now - 2 * day);
+    await runTick(f.ctx, "company", config);
+    expect(f.saved()).toMatchObject({ notBefore: now - 6 * day });
+  });
+  it("persists a missing old-state floor on the first complete quiet tick", async () => {
+    const f = fixture(); f.ids.splice(0);
+    await runTick(f.ctx, "company", config);
+    expect(f.saved()).toEqual({ ...empty(), notBefore: now - 7 * day });
+    expect(f.ctx.state.set).toHaveBeenCalledTimes(1);
+  });
+  it("skips dates strictly below the floor without adding seen but admits the floor boundary", async () => {
+    const floor = now - 3 * day;
+    const f = fixture({ ...empty(), notBefore: floor });
+    f.dates.set("aa", floor - 1); f.dates.set("bb", floor);
+    await runTick(f.ctx, "company", config);
+    expect(f.attempts).toEqual(["bb"]);
+    expect(f.saved()).toEqual({ ...empty(), notBefore: floor, seen: [{ id: "bb", internalDate: floor }] });
+    await runTick(f.ctx, "company", config);
+    expect(f.attempts).toEqual(["bb"]); // Boundary seen ID must not be pruned and replayed.
+  });
+  it.each([-1, "1700000000000", null, Infinity, 1.5])("rejects an invalid persisted floor %s", async notBefore => {
+    const f = fixture({ ...empty(), notBefore });
+    await expect(runTick(f.ctx, "company", config)).rejects.toThrow(SAFE_ERROR);
+    expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.state.set).not.toHaveBeenCalled();
+  });
+  it("does not fire if the new floor cannot be durably checkpointed", async () => {
+    const f = fixture();
+    f.ctx.state.set.mockRejectedValue(new Error("provider secret"));
+    await expect(runTick(f.ctx, "company", config)).rejects.toThrow(SAFE_ERROR);
+    expect(f.attempts).toEqual([]); expect(f.saved()).toEqual(empty());
+  });
+  it.each([-1, "1700000000000", null])("rejects invalid last-failure time %s without leaking state", async lastFailureAt => {
+    const f = fixture({ ...empty(), failures: [{ id: "aa", internalDate: now,
+      attempts: 10, nextRetryAt: now, lastFailureAt }] });
+    await expect(runTick(f.ctx, "company", config)).rejects.toThrow(SAFE_ERROR);
+    expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.logger.warn).not.toHaveBeenCalled();
   });
   it("uses a default seven-day window on every list page; rejects config beyond 30 days", async () => {
     const f = fixture();
@@ -103,7 +173,8 @@ describe("review fixes", () => {
       failures: [{ id: "ee", internalDate: now - 8 * day, attempts: 10, nextRetryAt: now }] });
     f.ids.splice(0);
     await runTick(f.ctx, "company", config);
-    expect(f.saved()).toEqual({ version: 2, seen: [{ id: "dd", internalDate: now - day }], failures: [] });
+    expect(f.saved()).toEqual({ version: 2, notBefore: now - 7 * day,
+      seen: [{ id: "dd", internalDate: now - day }], failures: [] });
     expect(f.ctx.logger.warn).not.toHaveBeenCalled();
   });
   it.each([
