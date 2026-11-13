@@ -87,6 +87,40 @@ describe("Pi compaction lifecycle and warning projection (L17)", () => {
     for (const event of events.map(envelope)) expect(validatePrpEvent(event), event.eventType).toMatchObject({ ok: true });
   });
 
+  it.each([1, 2])("keeps measured message usage complete across %i compactions and flags only summary spend unknown", count => {
+    const origin = { runId: "run", turnId: "turn" };
+    const projector = createPiEventProjector(origin);
+    const uninterrupted = createPiEventProjector(origin);
+    const summaries: PiProjectedEvent[] = [];
+    const first = final({ usage });
+    projector.project(first);
+    uninterrupted.project(first);
+    for (let index = 1; index <= count; index++) {
+      summaries.push(...projector.project({ type: "compaction_start", reason: "threshold" }));
+      summaries.push(...projector.project({ type: "compaction_end", reason: "threshold", result: { tokensBefore: 90, estimatedTokensAfter: 30 } }));
+      const message = final({ responseId: `reply-${index + 1}`, usage: { ...usage, input: 7, output: 5, cost: { total: 0.03, totalFromProvider: true } } });
+      const events = projector.project(message);
+      const expected = uninterrupted.project(message);
+      expect(events.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({
+        runDelta: { inputTokens: 11 + index * 7, outputTokens: 3 + index * 5, cachedInputTokens: 2 + index * 2, cacheWriteTokens: 0 },
+        runDeltaComplete: true, costComplete: true,
+      });
+      expect(events.filter(event => event.eventType === "usage.reported" || event.payload.kind === "usage"))
+        .toEqual(expected.filter(event => event.eventType === "usage.reported" || event.payload.kind === "usage"));
+      expect(events.find(event => event.eventType === "usage.reported")?.payload).toMatchObject({
+        runDeltaAvailable: true, accountingComplete: true,
+        runDelta: { inputTokens: 7, outputTokens: 5, cacheReadTokens: 2, cacheWriteTokens: 0, providerCostUsd: 0.03 },
+      });
+    }
+    const unknown = summaries.filter(event => event.payload.kind === "usage");
+    expect(unknown).toHaveLength(count * 2);
+    for (const event of unknown) {
+      expect(event.itemId).toContain(":pi-usage:unaccounted-summary");
+      expect(event.payload.usage).toMatchObject({ source: "pi_summarization_unaccounted", summaryUsage: "unknown", runDelta: {}, runDeltaComplete: false, costComplete: false });
+    }
+    for (const event of summaries.map(envelope)) expect(validatePrpEvent(event), event.eventType).toMatchObject({ ok: true });
+  });
+
   it("surfaces a redacted, bounded compaction error as a warning and leaves final turn authority alone", () => {
     const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
     const started = projector.project({ type: "compaction_start", reason: "threshold" });
@@ -99,7 +133,7 @@ describe("Pi compaction lifecycle and warning projection (L17)", () => {
     for (const event of events.map(envelope)) expect(validatePrpEvent(event), event.eventType).toMatchObject({ ok: true });
     const finalEvents = projector.project(final({ usage }));
     expect(finalEvents.find(event => event.payload.kind === "agentMessage")).toMatchObject({ eventType: "item.completed", payload: { text: "final" } });
-    expect(finalEvents.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({ runDeltaComplete: false });
+    expect(finalEvents.find(event => event.payload.kind === "usage")?.payload.usage).toMatchObject({ runDeltaComplete: true, costComplete: true });
     const replay = [...started, ...events, ...finalEvents].map(envelope);
     const seed = createSessionSnapshotFromMetadata({
       fixtureName: "pi-compaction-warning", identity: { schema: "paperclip.prp.identity.v1", companyId: "synthetic-peer", issueId: "native-pi", runId: "run", environmentLeaseId: "loopback-only", runnerInstanceId: "capture", normalizedSessionId: "pi-session", driverSessionId: "native-session" },
@@ -434,11 +468,11 @@ describe("synthetic boundary cases (not claimed as native capture)", () => {
     expect(JSON.stringify(events)).not.toContain("estimatedCostUsd");
     expect(JSON.stringify(events)).not.toContain("outputTokens");
   });
-  it.each(["compaction_start", "compaction_end", "summarization_retry_attempt_start"])("marks accounting incomplete rather than hiding %s work", type => {
+  it.each(["compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"])("marks only summary accounting incomplete rather than hiding %s work", type => {
     const projector = createPiEventProjector({ runId: "pi-capture", turnId: "t" }); projector.project(final({ usage }));
     const events = projector.project({ type, result: { usage } });
-    expect(events[0].payload.usage).toMatchObject({ source: "pi_summarization_unaccounted", total: { inputTokens: 11, totalTokens: 16 }, runDeltaComplete: false, costComplete: false });
-    expect(projector.project(final({ responseId: "reply-2", usage })).at(-1)?.payload.usage).toMatchObject({ runDeltaComplete: false, costComplete: false });
+    expect(events[0].payload.usage).toMatchObject({ source: "pi_summarization_unaccounted", total: { inputTokens: 11, totalTokens: 16 }, runDelta: {}, runDeltaComplete: false, costComplete: false, summaryUsage: "unknown" });
+    expect(projector.project(final({ responseId: "reply-2", usage })).at(-1)?.payload.usage).toMatchObject({ runDeltaComplete: true, costComplete: true });
   });
   it("does not treat default zero usage on a failed native call as complete billing", () => {
     const events = createPiEventProjector({ runId: "pi-capture", turnId: "t" }).project(final({ stopReason: "error", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } }));
