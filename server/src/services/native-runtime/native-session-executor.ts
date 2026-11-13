@@ -186,6 +186,7 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   NativeProviderSideEffectPendingError,
+  PI_RECOVERY_COLD_START_INSTRUCTIONS,
   NativeProviderStateIncompatibleError,
   NativeProviderTerminalFailure,
   NativeGovernedWaitSettlementPendingError,
@@ -11315,6 +11316,17 @@ async function executePaperclipNativeSessionAttempt(
       },
       onCommittedEvent: async (event, cursor) => {
         await controllerSteps.measure("recovery_notice", () => materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution, event }));
+        if (piHistoryLost && event.eventType === "session.started" && event.runId === input.execution.binding.runId) {
+          // The fallback's fresh thread carries the receipt runner-core would
+          // have added after a typed missing-file refusal.
+          const payload = record(event.payload), context = record(payload.context), admission = record(context.piNativeAdmission);
+          if (admission.provider === "pi_rpc" && typeof payload.driverSessionId === "string") {
+            const lost = piHistoryLost;
+            await controllerSteps.measure("recovery_notice", () => materializePiSessionRecoveryNotice({ db: input.db, execution: input.execution,
+              event: { ...event, payload: { ...payload, context: { ...context, piNativeAdmission: { ...admission, sessionRecovery: {
+                code: "pi_session_file_missing", previousDriverSessionId: lost.previousDriverSessionId, driverSessionId: payload.driverSessionId } } } } } }));
+          }
+        }
         if (event.eventType === "run.result.proposed") {
           const at = Date.now();
           await trace.record({name:"completion.tool_accepted",parentName:"native.session.execute",startedAtMs:at,endedAtMs:at});
@@ -11657,6 +11669,7 @@ async function executePaperclipNativeSessionAttempt(
   );
   let existingWarmSession: NativeSession | undefined;
   let warmAttachFailure: { error: unknown } | undefined;
+  let piHistoryLost: { previousDriverSessionId: string } | undefined;
   let warmAttachFallbackTaken = false;
   let reusingReleasedRunner = false;
   let managedCredentialSession: NativeSession | undefined;
@@ -12173,14 +12186,25 @@ async function executePaperclipNativeSessionAttempt(
             await reportWarmAttachFailure(code, text, "prior_owner_unproven");
             throw error;
           });
-          // RFL F2: without the conversation's Pi file the cold start could
-          // only open a different Pi session, losing history without notice.
-          // Without a runner authority to resume, the typed missing-file
-          // ladder is unreachable here, so refuse under the typed code.
+          // RFL F2: the conversation's Pi file is gone. Retirement left no
+          // runner authority, so runner-core's thread/resume ladder
+          // (codex_provider.rs restarted_missing_history) cannot run. Take
+          // its outcome from here: a fresh Pi thread under the SAME normalized
+          // conversation, the same typed pi_session_file_missing receipt (one
+          // persistent notice), the cold-start re-read, and the owner alarm.
           if (input.execution.provider.kind === "pi_rpc" && input.runnerExecutionTarget?.kind !== "remote"
             && !localPiHistoryPresent(input.execution)) {
-            await reportWarmAttachFailure(code, text, "pi_history_missing");
-            throw new NativeProviderStateIncompatibleError("pi_session_file_missing: the conversation's saved Pi history is absent");
+            const previous = checkpoint.providerSessionId;
+            if (!previous) {
+              await reportWarmAttachFailure(code, text, "pi_history_missing");
+              throw new NativeProviderStateIncompatibleError("pi_session_file_missing: the conversation's saved Pi history is absent");
+            }
+            piHistoryLost = { previousDriverSessionId: previous };
+            persistedWarmSession = null;
+            logger.error({ companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
+              issueId: input.execution.binding.issueId, runId: input.execution.binding.runId,
+              normalizedSessionId: nativeSessionKey(input.execution), code: "pi_session_file_missing" },
+            "Pi saved-history recovery owner alarm: the retired conversation's Pi file is missing; native session restarted fresh");
           }
           await reportWarmAttachFailure(code, text);
           runnerdBackend = await createExecutionBackend();
@@ -12203,8 +12227,11 @@ async function executePaperclipNativeSessionAttempt(
         const runExecution = () =>
           executeNativeSession({
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner" || scheduledResumeContinuation,
-            getFreshSessionHandoff: input.getFreshSessionHandoff
-              ? () => controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!) : undefined,
+            getFreshSessionHandoff: async () => {
+              const handoff = input.getFreshSessionHandoff
+                ? await controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff) : null;
+              return piHistoryLost ? [PI_RECOVERY_COLD_START_INSTRUCTIONS, handoff].filter(Boolean).join("\n\n") : handoff;
+            },
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt

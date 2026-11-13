@@ -242,6 +242,7 @@ export const parseNativeCursorCloudConfig = runner.parseNativeCursorCloudConfig;
 export const archiveCursorCloudSessionCheckpoint = runner.archiveCursorCloudSessionCheckpoint;
 
 export const PI_RPC_BUILTIN_THINKING_CATALOG = runner.PI_RPC_BUILTIN_THINKING_CATALOG;
+export const PI_RECOVERY_COLD_START_INSTRUCTIONS = runner.PI_RECOVERY_COLD_START_INSTRUCTIONS;
 export const PI_THINKING_LEVELS = runner.PI_THINKING_LEVELS;
 export const QUALIFIED_PI_RPC_PROFILE = runner.QUALIFIED_PI_RPC_PROFILE;
 export const parsePiRpcProfile = runner.parsePiRpcProfile;

@@ -385,24 +385,6 @@ async function stopWarmProof(stopTurn: number, killRetainedRunner = false, delet
       stage("retained Pi history file deleted", { removed });
     }
     await api("POST", `/issues/${issueId}/comments`, { body: "New turn after Stop: reply with the next local faux token. No tool needed." }, 201);
-    if (deleteRetainedPiFile) {
-      // Without the Pi file the fallback cannot reach Pi's typed missing-file
-      // ladder; it must refuse under a named code, never answer from a
-      // different Pi session with the history silently gone.
-      const refused = await waitFor("follow-up refused without Pi history", async () => (await db!.select().from(heartbeatRuns)
-        .where(eq(heartbeatRuns.agentId, agentId))).find(run => !warmupRunIds.has(run.id) && run.id !== admitted.id && run.status === "failed") ?? null);
-      expect(refused.errorCode).toBe("native_provider_state_incompatible");
-      expect(refused.error).toContain("pi_session_file_missing");
-      const warmAttach = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, refused.id)))
-        .filter(event => event.eventType === "native.warm_attach.failed");
-      expect(warmAttach.map(event => event.payload)).toEqual([expect.objectContaining({ state: "warm_attach_failed_refused", refusal: "pi_history_missing" })]);
-      expect(requests, "no model turn ran on a substitute Pi session").toHaveLength(1);
-      const replies = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
-        .filter(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_"));
-      expect(replies).toHaveLength(0);
-      stage("GREEN", { refusedRunId: refused.id, errorCode: refused.errorCode, error: refused.error, event: warmAttach[0]!.payload });
-      return;
-    }
     const reply = await waitFor("NEW turn after Stop completes", async () => {
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       return rows.find(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_1")) ?? null;
@@ -434,9 +416,25 @@ async function stopWarmProof(stopTurn: number, killRetainedRunner = false, delet
       expect(replacement.runnerPid).toBe(pid.runnerPid);
       expect(warmAttachFailures).toHaveLength(0);
     }
-    expect(readNativePiHomeProof(nativeHomeProof!.receiptPath)!.sessionId).toBe(nativeSessionIdBeforeStop);
-    expect(requests[1]!.recalledAssistantFact, "private assistant history, not echoed in user input").toBe(true);
-    expect(reply.body).toContain(assistantFact);
+    if (deleteRetainedPiFile) {
+      // G-2 outcome: a fresh Pi thread in the SAME conversation, exactly one
+      // persistent history-loss notice, and the cold-start re-read.
+      const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(row => String((row.metadata as Record<string, unknown> | null)?.authorizationReason ?? "").startsWith("pi_session_file_missing:"));
+      expect(notices, "exactly one persistent history-loss notice").toHaveLength(1);
+      expect(notices[0]!.body).toContain("could not be restored");
+      expect(JSON.stringify(requests[1]!.lastMessage), "the first turn re-reads the issue thread").toContain("Pi recovery cold start");
+      expect(requests[1]!.recalledAssistantFact, "lost Pi-only history is not claimed").toBe(false);
+      expect(readNativePiHomeProof(nativeHomeProof!.receiptPath)!.sessionId, "a fresh Pi thread").not.toBe(nativeSessionIdBeforeStop);
+      const archived = readdirSync(join(root, "runner-state")).flatMap(scope => existsSync(join(root, "runner-state", scope, "continuity-breaks"))
+        ? readdirSync(join(root, "runner-state", scope, "continuity-breaks")) : []);
+      expect(archived.length, "the retired owner's state is archived, not deleted").toBeGreaterThan(0);
+      stage("history loss surfaced once with the re-read", { notice: notices[0]!.body, reply: reply.body, archived });
+    } else {
+      expect(readNativePiHomeProof(nativeHomeProof!.receiptPath)!.sessionId).toBe(nativeSessionIdBeforeStop);
+      expect(requests[1]!.recalledAssistantFact, "private assistant history, not echoed in user input").toBe(true);
+      expect(reply.body).toContain(assistantFact);
+    }
     expect(final.nativeSessionId, "Stop keeps the same Pi session").toBe(stopped.nativeSessionId);
     // A further ordinary run must also retain the same resident.
     await api("POST", `/issues/${issueId}/comments`, { body: "Another normal turn: reply with the next local faux token, no tool." }, 201);
@@ -458,7 +456,7 @@ async function stopWarmProof(stopTurn: number, killRetainedRunner = false, delet
     expect(requests.every(request => request.model === "faux")).toBe(true);
     stage("replacement stays warm", { ...replacement, runId: settledWarm.id, nativeSessionId: settledWarm.nativeSessionId, reply: warmReply.body });
     stage("native Pi fixture load proof on replacement", await assertNativePiHomeProof(nativeHomeProof!, replacement.piPid!));
-    stage("GREEN", { companyId, agentId, issueId, requests: requests.length, cancelMs, original: pid, resident: replacement, nativeSessionId: nativeSessionIdBeforeStop, assistantHistoryRecalled: true, bashPid, sleepPid });
+    stage("GREEN", { companyId, agentId, issueId, requests: requests.length, cancelMs, original: pid, resident: replacement, nativeSessionId: nativeSessionIdBeforeStop, assistantHistoryRecalled: !deleteRetainedPiFile, bashPid, sleepPid });
   } catch (error) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;
@@ -500,5 +498,5 @@ it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same res
 it.skipIf(!enabled)(`REG-03: a Stop, a killed retained runnerd, then a plain message resumes the same session on a new runner (thinking=${thinking})`,
   () => stopWarmProof(1, true), 600_000);
 
-it.skipIf(!enabled)(`REG-03 RFL-F2: a killed retained runnerd whose Pi history file is gone is refused under a named code, never answered from a different Pi session (thinking=${thinking})`,
+it.skipIf(!enabled)(`REG-03 RFL-F2: a killed retained runnerd whose Pi history file is gone continues the same conversation with one notice and the re-read (thinking=${thinking})`,
   () => stopWarmProof(1, true, true), 600_000);
