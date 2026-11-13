@@ -34,6 +34,7 @@ import {
   eq,
   isNull,
   lte,
+  notInArray,
   or,
   sql,
 } from "drizzle-orm";
@@ -1114,6 +1115,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           },
           setWhere: and(
             eq(chatActions.kind, "github_webhook_recovery"),
+            notInArray(chatActions.status, ["processing", "processed"]),
             sql`(${chatActions.payload}->>'generation')::int = ${context.generation}`,
             sql`${chatActions.payload}->>'credentialFingerprint' = ${context.credentialFingerprint}`,
           ),
@@ -1298,6 +1300,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
     let recovered = 0;
     let deliveredMeanwhile = 0;
     let rejected = 0;
+    let deferred = 0;
     try {
       if (!epochMatches) {
         outcome = "epoch_initialized";
@@ -1491,7 +1494,8 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         }
         // The list is only candidate discovery. Decide from the fresh detail,
         // replacing its stale list snapshot when selecting the latest attempt.
-        // Never spend this GUID's detail budget again just to seek agreement.
+        // Permanent decisions are recorded; temporary states wait for the list
+        // to catch up, whose pre-detail checks avoid spending detail budget.
         latest = [detail, ...group.filter(attempt => attempt.id !== detail.id)].sort(
           (left, right) => Date.parse(right.deliveredAt) - Date.parse(left.deliveredAt),
         )[0]!;
@@ -1502,19 +1506,29 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             detailStatus: detail.statusCode }, "GitHub webhook recovery delivered meanwhile");
           continue;
         }
-        if (
-          (detail.statusCode !== null && detail.statusCode !== 0 && detail.statusCode < 500) ||
-          Date.parse(detail.deliveredAt) < floor ||
-          Date.parse(detail.deliveredAt) > now.getTime() - 10_000 ||
-          detail.throttledAt !== null ||
-          (latest.statusCode !== null && latest.statusCode !== 0 && latest.statusCode < 500) ||
-          latest.throttledAt !== null ||
-          Date.parse(latest.deliveredAt) > now.getTime() - 10_000 ||
-          (receipt && (receipt.result?.latestAttemptId === latest.id || !latest.redelivery ||
-            Date.parse(latest.deliveredAt) < Date.parse(String(receipt.result?.requestedAt))))
-        ) {
+        if (Date.parse(detail.deliveredAt) < floor) {
           await rememberGitHubRecoverySkip(endpoint, context, window, original, GITHUB_RECOVERY_ATTEMPT_NOT_ELIGIBLE);
           rejected += 1;
+          continue;
+        }
+        const deferredReason = detail.throttledAt !== null || latest.throttledAt !== null
+          ? "throttled"
+          : Date.parse(detail.deliveredAt) > now.getTime() - 10_000 ||
+              Date.parse(latest.deliveredAt) > now.getTime() - 10_000
+            ? "too_recent"
+            : (detail.statusCode !== null && detail.statusCode !== 0 && detail.statusCode < 500) ||
+                (latest.statusCode !== null && latest.statusCode !== 0 && latest.statusCode < 500)
+              ? "latest_attempt_not_retryable"
+              : receipt && (receipt.result?.latestAttemptId === latest.id || !latest.redelivery ||
+                  Date.parse(latest.deliveredAt) < Date.parse(String(receipt.result?.requestedAt)))
+                ? "retry_not_eligible"
+                : null;
+        if (deferredReason) {
+          // Do not tombstone a delivery that can become eligible later, or
+          // cancel the receipt that still owns its remaining retry attempts.
+          deferred += 1;
+          logger.info({ endpointId: endpoint.id, guid, reason: deferredReason },
+            "GitHub webhook recovery attempt deferred");
           continue;
         }
         if (!(await githubRecoveryCurrentSource(detail, credentials, recoveryFetch))) {
@@ -1713,6 +1727,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           recovered,
           deliveredMeanwhile,
           rejected,
+          deferred,
         },
         expiresAt: null,
       });
