@@ -710,6 +710,7 @@ type WarmNativeSession = {
   ingressOwner?: NativeWarmIngressOwner;
   onReleased: () => void;
   sessionCheckpointPersisted?: (snapshot: PersistedNativeSession) => void;
+  runnerConnectionLive?: () => boolean;
   pluginTaskId?: string;
   sandboxProviderLeaseId?: string;
   observabilityCompatibilityKey?: string;
@@ -5995,6 +5996,20 @@ function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined)
     && target.sandboxLeaseAcquisition?.outcome === "resumed";
 }
 
+// Lease reuse is also reported as "resumed" on an ordinary running box. Only
+// a disconnected cached transport or an explicit stopped/archived resume makes
+// that warm owner suspect. A cache miss keeps the existing cold-recovery probe.
+function resumedSandboxRunnerNeedsProbe(input: {
+  execution: NativeExecutionInput; runnerExecutionTarget?: AdapterExecutionTarget | null;
+}): boolean {
+  const target = input.runnerExecutionTarget;
+  if (!resumedSandboxRunner(target)) return false;
+  const resumedFromState = target?.kind === "remote" && target.transport === "sandbox"
+    ? target.sandboxLeaseAcquisition?.resumedFromState : undefined;
+  return resumedFromState === "stopped" || resumedFromState === "archived"
+    || warmNativeSessions.get(nativeSessionScopeKey(input.execution))?.runnerConnectionLive?.() !== true;
+}
+
 /** An idle Runner can exit while its sandbox remains running. A resume from a
  * stopped state is likewise only a trigger, never proof of generation loss.
  * Return its exact identity only after the shared process-generation loss probe
@@ -6004,7 +6019,7 @@ function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined)
  * rule is introduced. */
 async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
   : Promise<DurableRecoveryIdentity | null> {
-  if (!resumedSandboxRunner(input.runnerExecutionTarget) || !isSafeNativeStateDirectory(input.root)) return null;
+  if (!resumedSandboxRunnerNeedsProbe(input) || !isSafeNativeStateDirectory(input.root)) return null;
   const identity = readRunnerdDurableIdentity(input.root);
   if (!identity || !durableIdentityMatchesSession(identity, input.execution) || identity.runId === input.execution.binding.runId) return null;
   const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
@@ -10193,7 +10208,7 @@ export async function executePaperclipNativeSession(input: {
     await closingWarmNativeSessions.get(sessionScopeId);
     const idleOwner = warmNativeSessions.get(sessionScopeId);
     if (idleOwner && !idleOwner.busy && !idleOwner.preparingRunId && !idleOwner.instructionPreparationRunId
-      && idleOwner.runId !== input.execution.binding.runId && resumedSandboxRunner(input.runnerExecutionTarget)) {
+      && idleOwner.runId !== input.execution.binding.runId && resumedSandboxRunnerNeedsProbe(input)) {
       const root = scopedRunnerdStateRoot(input.execution);
       await restoreWarmRunnerdController(input);
       if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
@@ -12305,6 +12320,7 @@ async function executePaperclipNativeSessionAttempt(
                   }
                   if (existing.session !== session) {
                     existing.sessionCheckpointPersisted = runnerdBackend?.sessionCheckpointPersisted;
+                    existing.runnerConnectionLive = runnerdBackend?.runnerConnectionLive;
                   }
                   const ingress = input.useRunnerd ? nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget) : undefined;
                   existing.ingressOwner = ingress ? { ...input.execution.binding, ingress,
@@ -12319,6 +12335,7 @@ async function executePaperclipNativeSessionAttempt(
                       return ingress ? { ...input.execution.binding, ingress, controllerBootId: controller.bootId, controllerGeneration } : undefined;
                     })(),
                     sessionCheckpointPersisted: runnerdBackend?.sessionCheckpointPersisted,
+                    runnerConnectionLive: runnerdBackend?.runnerConnectionLive,
                     onReleased: () => releaseRetainedNativeSessionCleanup(input.db, {
                       companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
                     }, { companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,
@@ -15916,6 +15933,8 @@ async function prepareRemoteExternalRunner({ input, target, runner, root, identi
 }
 
 type ManagedRunnerdBackend = NativeSessionBackend & {
+  /** Synchronous local transport state; never contacts the allocation. */
+  runnerConnectionLive?: () => boolean;
   sandboxRetention?: SandboxRunnerRetention;
   bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
   bindDiagnosticSession?(session: NativeSession): void;
@@ -18504,6 +18523,9 @@ async function createRunnerdBackendWithinSessionClaim(
   };
   let replacementBackend: ManagedRunnerdBackend | null = null;
   return {
+    runnerConnectionLive: () => replacementBackend
+      ? replacementBackend.runnerConnectionLive?.() ?? false
+      : (runnerControlPlane?.activeRunnerConnectionCount() ?? 0) > 0,
     sandboxRetention,
     bindManagedSession: (session, options) => replacementBackend
       ? replacementBackend.bindManagedSession(session, options) : wrapManagedSession(session),

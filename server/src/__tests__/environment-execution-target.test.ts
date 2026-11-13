@@ -153,6 +153,18 @@ describe("resolveEnvironmentExecutionTarget", () => {
     });
   });
 
+  it.each(["stopped", "archived", "archiving", "running", undefined])("preserves the provider's resumedFromState for a free native probe trigger: %s", async resumedFromState => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox", config: { provider: "test-provider" } });
+    const target = await resolveEnvironmentExecutionTarget({ db: {} as never, companyId: "company",
+      adapterType: "paperclip_runner", environment: { id: "env", driver: "sandbox", config: { provider: "test-provider" } },
+      leaseId: "lease", leaseMetadata: {}, environmentRuntime: null,
+      lease: { providerLeaseId: "allocation", metadata: { resumedFromState,
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "allocation" } } } as never });
+    expect(target).toMatchObject({ kind: "remote", transport: "sandbox",
+      sandboxLeaseAcquisition: { outcome: "resumed", ...(resumedFromState ? { resumedFromState } : {}) } });
+    if (!resumedFromState) expect(target).not.toHaveProperty("sandboxLeaseAcquisition.resumedFromState");
+  });
+
   it("preserves a compatible environment rollover acquisition for native backup recovery", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox", config: { provider: "test-provider" } });
     const acquisition = { outcome: "replacement", providerLeaseId: "new-allocation",
