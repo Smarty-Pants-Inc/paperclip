@@ -15071,7 +15071,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toMatchObject({ phase: "completed", label: "Completed" });
   });
 
-  it("delays a no-progress native continuation until the rewake cooldown instead of dropping it", async () => {
+  it("dispatches a no-progress same_agent continuation at the normal cadence without a rewake cooldown", async () => {
     const fixture = await seedNativePassiveBoardResponse("same_agent", { assignmentWake: true });
     const finishedAt = new Date(Date.now() - 30_000);
     const priorRunId = randomUUID();
@@ -15091,21 +15091,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       eq(agentWakeupRequests.companyId, fixture.companyId), eq(agentWakeupRequests.reason, "issue_rewake_throttled")));
     const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, fixture.companyId))).length;
 
+    // Org/RFL 13:11Z: ship the response_wake park only, not generic continuation throttling.
     await dispatch();
-    await dispatch();
-    const [receipt] = await throttled();
-    const nextAllowedAt = Date.parse(String((receipt?.payload as { heartbeatSkip?: { nextAllowedAt?: string } } | null)?.heartbeatSkip?.nextAllowedAt));
-    expect(deadlines).toEqual([nextAllowedAt, nextAllowedAt]);
-    expect(await throttled()).toHaveLength(1);
-    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id)))
-      .toEqual([expect.objectContaining({ status: "queued", runId: null })]);
-    expect(await runCount()).toBe(2);
-
-    const past = new Date(Date.now() - 30 * 60_000);
-    await db.update(heartbeatRuns).set({ finishedAt: past }).where(eq(heartbeatRuns.companyId, fixture.companyId));
-    await db.update(agentWakeupRequests).set({
-      payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{heartbeatSkip,nextAllowedAt}', to_jsonb(${past.toISOString()}::text))`,
-    }).where(eq(agentWakeupRequests.id, receipt!.id));
+    expect(deadlines).toEqual([]);
+    expect(await throttled()).toHaveLength(0);
+    expect(await runCount()).toBe(3);
     await dispatch();
     expect(await runCount()).toBe(3);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id)))

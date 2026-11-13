@@ -382,7 +382,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
   }
 
   it.each(["same_agent", "response_wake", "retry"])(
-    "throttles a %s continuation the agent declared after consecutive no-progress runs",
+    "does not throttle a %s continuation the agent declared after consecutive no-progress runs",
     async (continuationKind) => {
       const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
       for (const finishedSecondsAgo of [40, 10]) {
@@ -395,14 +395,11 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
         continuationSummary: "Nothing changed; wait.",
         continuationIdempotencyKey: `loop-${randomUUID()}`,
       });
-      expect(wake).toBeNull();
+      // Org/RFL 13:11Z: ship the response_wake park only, not generic continuation throttling.
+      expect(wake).not.toBeNull();
       expect(await latestWakeRequest(agentId)).toMatchObject({
-        status: "skipped",
-        reason: "issue_rewake_throttled",
-        payload: expect.objectContaining({
-          continuationKind,
-          heartbeatSkip: expect.objectContaining({ requestedReason: "issue_status_changed", noProgressStreak: 2 }),
-        }),
+        reason: "issue_status_changed",
+        payload: expect.objectContaining({ continuationKind }),
       });
     },
   );
