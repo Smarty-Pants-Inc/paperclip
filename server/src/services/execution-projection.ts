@@ -17,6 +17,7 @@ import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { isNativeContinuationRefusal, NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { readTaskDrain } from "./task-admission.js";
 import { getStartupRecoveryState } from "../startup-recovery-state.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
@@ -28,6 +29,7 @@ const executionRunColumns = {
   id: heartbeatRuns.id,
   agentId: heartbeatRuns.agentId,
   driverKind: heartbeatRuns.driverKind,
+  error: heartbeatRuns.error,
   errorCode: heartbeatRuns.errorCode,
   executionControlDeadlineAt: heartbeatRuns.executionControlDeadlineAt,
   finishedAt: heartbeatRuns.finishedAt,
@@ -339,7 +341,11 @@ export function projectExecution(
     Object.assign(projection, { phase, label });
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
-    projection.nextAction = workspaceRecoveryDisplay(recoveryAction.evidence, run.id)?.message
+    const workspaceRecovery = workspaceRecoveryDisplay(recoveryAction.evidence, run.id);
+    // Recovered files do not mean the conversation can continue: a refused
+    // controller recovery refuses the next message the same way.
+    projection.nextAction = (workspaceRecovery?.status === "recovered" && isNativeContinuationRefusal(run)
+      ? NATIVE_CONTINUATION_REFUSED_ACTION : workspaceRecovery?.message)
       ?? recoveryAction.nextAction;
     const continuation = recoveryAction.evidence.explicitUserContinuation as
       { previousRunId?: unknown; runId?: unknown } | undefined;

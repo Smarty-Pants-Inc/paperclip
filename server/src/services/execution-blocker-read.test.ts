@@ -152,6 +152,43 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     },
   );
 
+  // A chat's saved files were recovered, but its native controller recovery
+  // refused the conversation. Another message is refused the same way, so the
+  // blocker must not offer one.
+  async function recoveredRefusal(patch: Partial<typeof heartbeatRuns.$inferInsert>) {
+    const f = await fixture({ runtimeMode: "native", ...patch });
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(issueRecoveryActions).set({ cause: "native_continuation_requires_reconciliation",
+      nextAction: "The original sandbox is retained for workspace repair.",
+      evidence: { runId: f.run.id, workspaceRestoreFailure: "restore_failed",
+        workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [] },
+        workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId: f.run.id, status: "recovered",
+          stage: "saving_receipts", attempt: 1, requestIds: [] } } })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    return f;
+  }
+  const refused = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+
+  it.each([
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
+    { errorCode: "adapter_failed", error: "native_controller_recovery_unsupported:metadata_format" },
+  ])("does not offer a message when the conversation was refused ($error)", async patch => {
+    const f = await recoveredRefusal(patch);
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ runId: f.run.id, canRetry: false, canContinue: false,
+      workspaceRecovery: { status: "recovered" } });
+    expect(blocker!.nextAction).not.toMatch(/send a message to continue/i);
+    expect(blocker!.nextAction).toBe(refused);
+  });
+
+  it("keeps the ordinary recovered wording when the conversation was not refused", async () => {
+    const f = await recoveredRefusal({ errorCode: "native_continuation_requires_reconciliation", error: "Fixture failure" });
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ canRetry: false, canContinue: false, workspaceRecovery: { status: "recovered" } });
+    expect(blocker!.nextAction).toBe("Saved work recovered. Send a message to continue.");
+  });
+
   it.each([null, [], "scalar", 42, { issueId: 42, taskId: false }].map(context => ({ context })))("preserves decisions for malformed context $context", async ({ context }) => {
     const f = await fixture({ contextSnapshot: context as Record<string, unknown> | null });
     expect(await compare(f)).toMatchObject({ canRetry: true });

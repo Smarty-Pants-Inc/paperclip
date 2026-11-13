@@ -144,6 +144,27 @@ describe("execution truth projection", () => {
     }, now).nextAction).toBe(action.nextAction);
   });
 
+  it.each([
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
+  ])("does not offer a message on a recovered run whose conversation was refused ($error)", values => {
+    const sourceRunId = "ec036e06-90a3-4b69-81db-a8eab7dbfbac";
+    const source = run({ id: sourceRunId, status: "failed", ...values } as Partial<Run>);
+    const workspaceRecovery = { schema: "paperclip.workspace-recovery.v1", runId: sourceRunId,
+      stage: "saving_receipts", attempt: 1, requestIds: [] };
+    const action = (status: string) => ({ status: "resolved" as const, cause: "native_continuation_requires_reconciliation",
+      nextAction: "The original sandbox is retained for workspace repair.",
+      evidence: { runId: sourceRunId, continuationDelivery: "invalidated",
+        automaticRecovery: { policy: "preserve_without_replay_v1", actionOutcome: "unknown", replay: "blocked" },
+        workspaceRecovery: { ...workspaceRecovery, status } } });
+    const projected = projectExecution(source, coordinator({ phase: "terminal_failure" }), [], action("recovered"), now);
+    expect(projected).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"] });
+    expect(projected.nextAction).not.toMatch(/send a message to continue/i);
+    expect(projected.nextAction).toBe("Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.");
+    // Files not yet recovered are not called kept.
+    expect(projectExecution(source, undefined, [], action("recovering"), now).nextAction).toBe("Recovering saved work…");
+  });
+
   it("keeps cleanup quarantine visible without a coordinator or recovery row", () => {
     const stopped = run({ id: "stopped", status: "failed", errorCode: "native_session_cleanup_quarantined" });
     expect(projectExecution(stopped, undefined, [], undefined, now)).toMatchObject({

@@ -67,6 +67,15 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     const projections = await executionProjectionsForRuns(db, companyId, [runId]);
     expect(projections.get(runId)).toMatchObject({ phase: "recovery_needed", label: "Stopped",
       nextAction: "Saved work recovered. Send a message to continue.", permittedActions: ["inspect_run"] });
+    // The same recovered files on a run whose conversation was refused: the
+    // run ledger reads the run error, and a new message is not offered.
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_continuation_requires_reconciliation",
+      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" }).where(eq(heartbeatRuns.id, runId));
+    const refused = (await executionProjectionsForRuns(db, companyId, [runId])).get(runId);
+    expect(refused).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"] });
+    expect(refused?.nextAction).not.toMatch(/send a message to continue/i);
+    expect(refused?.nextAction)
+      .toBe("Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.");
   });
   it("advertises Stop for a failed native retry from the real batched coordinator read", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
