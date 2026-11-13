@@ -154,6 +154,24 @@ const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "SSL_CERT_DIR",
     "TERM",
     "COLORTERM",
+    // Paperclip's managed GitHub run projection (doc/connections/GITHUB.md,
+    // "Run projection"): launchers and per-operation broker capabilities, not
+    // raw tokens or configured GIT_CONFIG_COUNT/KEY_n/VALUE_n entries.
+    "ZDOTDIR",
+    "BASH_ENV",
+    "GH_CONFIG_DIR",
+    "PAPERCLIP_GITHUB_LAUNCHER_DIR",
+    "PAPERCLIP_GITHUB_BROKER_URL",
+    "PAPERCLIP_GITHUB_BROKER_TOKEN",
+    "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_TERMINAL_PROMPT",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_SSH_COMMAND",
+    "SSH_AUTH_SOCK",
 ];
 const CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "CURSOR_API_KEY",
@@ -1276,6 +1294,8 @@ impl CodexProvider {
             "cursor_cloud" => CURSOR_CLOUD_PROVIDER_ENVIRONMENT_KEYS,
             _ => CODEX_PROVIDER_ENVIRONMENT_KEYS,
         };
+        // Pi's managed-only GitHub subset is in its provider key set above;
+        // never inherit the raw credential/config entries in the general list.
         let github_environment_keys =
             if matches!(config.provider.as_str(), "cursor_cloud" | "pi_rpc") {
                 &[][..]
@@ -1283,8 +1303,9 @@ impl CodexProvider {
                 GITHUB_CREDENTIAL_ENVIRONMENT_KEYS
             };
         // Pi uses an exact-name environment ceiling. Outbound proxy routing
-        // and configured Langfuse exports are included there; arbitrary OTEL
-        // headers and GitHub login state are not shell settings.
+        // and configured Langfuse exports are included there, together with
+        // Paperclip's managed GitHub broker projection. Raw GitHub tokens and
+        // arbitrary OTEL headers are not passed to Pi or its shell tools.
         let common_environment_keys = if config.provider == "pi_rpc" {
             &[][..]
         } else {
@@ -7887,6 +7908,52 @@ done
             "NODE_PATH",
             "PAPERCLIP_PI_COMMAND",
             "PAPERCLIP_NATIVE_MCP_SECRET",
+        ] {
+            assert!(!PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
+        }
+    }
+
+    // Keep reason: the runnerd -> Pi proxy credential trust boundary must
+    // preserve Paperclip's managed launchers without raw GitHub credentials.
+    #[test]
+    fn pi_managed_github_projection_is_bounded_without_raw_credentials() {
+        for key in [
+            "ZDOTDIR",
+            "BASH_ENV",
+            "GH_CONFIG_DIR",
+            "PAPERCLIP_GITHUB_LAUNCHER_DIR",
+            "PAPERCLIP_GITHUB_BROKER_URL",
+            "PAPERCLIP_GITHUB_BROKER_TOKEN",
+            "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_SSH_COMMAND",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert_eq!(
+                PI_RPC_PROVIDER_ENVIRONMENT_KEYS
+                    .iter()
+                    .filter(|candidate| **candidate == key)
+                    .count(),
+                1,
+                "{key}"
+            );
+        }
+        for key in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "PAPERCLIP_GIT_TOKEN",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "PAPERCLIP_AGENT_API_KEY",
+            "ASCII_TOKEN",
         ] {
             assert!(!PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
         }
