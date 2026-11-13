@@ -18,6 +18,7 @@ import {
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { issueService } from "./issues.js";
 import { hasLiveLegacyController } from "./legacy-controller-lease.js";
 import { reportRunFailure } from "./run-failure-report.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
@@ -302,7 +303,8 @@ export async function reconcileAbandonedExecutionControl(
             (task.assigneeAgentId !== run.agentId && !isCurrentReviewer) ||
             ["done", "cancelled"].includes(task.status) ||
             (task.executionRunId && task.executionRunId !== run.id) ||
-            (task.checkoutRunId && task.checkoutRunId !== run.id)
+            (task.checkoutRunId && task.checkoutRunId !== run.id) ||
+            (task.conversationAgentId !== null && run.contextSnapshot?.conversationSessionGeneration !== task.conversationSessionGeneration)
           ) {
             if (updatedRun) await preserveNativeFailedWorkspace(tx as unknown as Db, updatedRun);
             return true;
@@ -334,6 +336,22 @@ export async function reconcileAbandonedExecutionControl(
             maxAttempts: 3,
             supersedeOnIdentityChange: true,
           });
+          // This terminal transition can precede provider admission, so there
+          // is no model reply for the normal finalizer to publish. Commit its
+          // visible failure with the run, under the same current-task lock.
+          // A repeated sweep takes the terminal-status guard above instead.
+          await issueService(db).addComment(task.id,
+            "Paperclip could not resume or finish this reply before its execution deadline. "
+              + "Open the failed run for details. Before retrying, verify that the previous execution has stopped "
+              + "and reconcile any uncertain action.",
+            {}, { authorType: "system", presentation: { kind: "system_notice", tone: "danger",
+              title: "Reply could not finish", density: "compact", detailsDefaultOpen: false },
+              metadata: { version: 1, sourceRunId: run.id, recoveryResponsibility: "system",
+                authorizationReason: `${cause}:${run.id}`,
+                sections: [{ title: "Failure details", rows: [
+                  { type: "run_link", runId: run.id, agentId: run.agentId, title: "Failed reply" },
+                  { type: "key_value", label: "Failure code", value: cause },
+                ] }] } }, tx);
           if (updatedRun) await preserveNativeFailedWorkspace(tx as unknown as Db, updatedRun);
           return true;
         });
