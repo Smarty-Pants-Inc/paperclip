@@ -10593,6 +10593,58 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
+      const requestNativeHoldTaskRetry = async (
+        retryDb: Db,
+        issue: { id: string; companyId: string; status: string; conversationAgentId: string | null;
+          conversationUserId: string | null; assigneeAgentId: string | null },
+        recoveryAction: { id: string; kind: string; ownerType: string; status: string;
+          outcome: string | null; evidence: unknown },
+      ) => {
+        const evidence = parseObject(recoveryAction.evidence);
+        if (
+          req.actor.type !== "board" || !req.actor.userId || actor.actorType !== "user" ||
+          actor.actorId !== req.actor.userId || outcome !== "restored" || sourceIssueStatus !== "todo" ||
+          executionReconciliation || issue.status !== "todo" || !issue.conversationAgentId ||
+          issue.conversationUserId !== actor.actorId || !issue.assigneeAgentId ||
+          recoveryAction.kind !== "stranded_assigned_issue" || recoveryAction.ownerType !== "board" ||
+          recoveryAction.status !== "resolved" || recoveryAction.outcome !== "handed_back"
+        ) return null;
+        const blocker = await getExecutionBlocker(retryDb, issue.companyId, issue.id);
+        if (!blocker || blocker.cause !== "native_continuation_requires_reconciliation" ||
+            !blocker.recoveryActionId || blocker.recoveryActionId === recoveryAction.id || !blocker.runId ||
+            blocker.agentId !== issue.assigneeAgentId || evidence.latestRunId !== blocker.runId) return null;
+        const [hold] = await retryDb.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.id, blocker.recoveryActionId),
+          eq(issueRecoveryActions.companyId, issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+        ));
+        const holdEvidence = parseObject(hold?.evidence);
+        const automaticRecovery = parseObject(holdEvidence.automaticRecovery);
+        if (hold?.ownerType !== "system" || hold.status !== "resolved" ||
+            hold.cause !== "native_continuation_requires_reconciliation" || automaticRecovery.replay !== "blocked" ||
+            (holdEvidence.runId ?? holdEvidence.sourceRunId) !== blocker.runId) return null;
+
+        // “Try again” is the person's Retry. Keep the canonical source-bound
+        // intent in this same issue/card transaction, not a generic restore wake.
+        const { requestTaskRetry } = await import("../services/task-retry.js");
+        const receipt = await requestTaskRetry({ db: retryDb, companyId: issue.companyId, issueId: issue.id,
+          actorId: actor.actorId, actorSource: req.actor.source,
+          idempotencyKey: recoveryAction.id, observedRunId: blocker.runId,
+          prepareChatRetry: opts.chatRunRetries?.prepareFailedChatRunRetry });
+        if (!receipt.accepted || !receipt.requestId) {
+          logger.warn({ issueId: issue.id, recoveryActionId: recoveryAction.id, observedRunId: blocker.runId },
+            "recovery Retry source changed before durable admission");
+          // This route's conflict contract is surfaced by IssueDetail's existing
+          // recovery-resolution error toast; throwing here rolls back both card
+          // resolution and task status, leaving the action available to retry.
+          throw conflict(receipt.stale
+            ? "The failed run changed before Try again was accepted. The recovery card remains unresolved; refresh the task and try again."
+            : "Try again could not be accepted. The recovery card remains unresolved; refresh the task and try again.",
+          { code: receipt.stale ? "task_retry_source_changed" : "task_retry_refused" });
+        }
+        return receipt;
+      };
+      const nativeHoldTaskRetry = { receipt: null as Awaited<ReturnType<typeof requestNativeHoldTaskRetry>> };
       const result = await db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
@@ -10690,6 +10742,7 @@ export function issueRoutes(
                 .returning();
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
+              nativeHoldTaskRetry.receipt = await requestNativeHoldTaskRetry(tx as unknown as Db, lockedIssue, settled);
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -11114,9 +11167,23 @@ export function issueRoutes(
           tx,
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
+        nativeHoldTaskRetry.receipt = await requestNativeHoldTaskRetry(tx as unknown as Db, issue, recoveryAction);
 
         return { issue, recoveryAction, chatRetry };
       });
+      const nativeHoldTaskRetryReceipt = nativeHoldTaskRetry.receipt;
+      if (nativeHoldTaskRetryReceipt?.accepted && nativeHoldTaskRetryReceipt.requestId) {
+        const finalizeRunId = "finalizeRunId" in nativeHoldTaskRetryReceipt ? nativeHoldTaskRetryReceipt.finalizeRunId : undefined;
+        const chatActionId = "chatActionId" in nativeHoldTaskRetryReceipt ? nativeHoldTaskRetryReceipt.chatActionId : undefined;
+        if (finalizeRunId) {
+          const { refinalizeSavedNativeResult } = await import("../services/native-runtime/exhausted-finalization-retry.js");
+          void refinalizeSavedNativeResult(db, { companyId: result.issue.companyId, runId: finalizeRunId }).catch(err =>
+            logger.warn({ err, issueId: result.issue.id, runId: finalizeRunId }, "Saved result finalization remains queued"));
+        } else if (chatActionId) void opts.chatRunRetries?.processFailedChatRunRetry(chatActionId).catch(err =>
+          logger.warn({ err, issueId: result.issue.id }, "Task Retry remains queued"));
+        else void heartbeat.resumeTaskRetry(result.issue.companyId, nativeHoldTaskRetryReceipt.requestId).catch(err =>
+          logger.warn({ err, issueId: result.issue.id, requestId: nativeHoldTaskRetryReceipt.requestId }, "Task Retry remains queued"));
+      }
       if (result.replayed) {
         res.json({
           issue: "workspaceRepairOnly" in result
@@ -11190,6 +11257,7 @@ export function issueRoutes(
           );
         }
       } else if (
+        !nativeHoldTaskRetry.receipt &&
         !executionReconciliation &&
         sourceIssueStatus === "todo" &&
         result.issue.assigneeAgentId &&
