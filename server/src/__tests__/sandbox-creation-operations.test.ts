@@ -150,9 +150,37 @@ describe("durable sandbox creation through the runtime entry point", () => {
     await due(); await runtime().flushDeferredOrphanCleanups();
     expect((await db.select().from(sandboxCreationOperations))[0].state).toBe("pending");
     await db.update(sandboxCreationOperations).set({ nextAttemptAt: new Date(0), metadata: sql`metadata || '{"creationSettleAt":"2000-01-01T00:00:00Z"}'::jsonb` });
-    await runtime().flushDeferredOrphanCleanups();
-    expect((await db.select().from(sandboxCreationOperations))[0].state).toBe("resolved");
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await runtime().flushDeferredOrphanCleanups();
+      const [operation] = await db.select().from(sandboxCreationOperations);
+      expect(operation.metadata.creationRecoveryAttempts).toBe(attempt);
+      expect(operation.state).toBe(attempt === 3 ? "resolved" : "pending");
+      if (attempt < 3) await due();
+    }
+    expect((await db.select().from(sandboxCreationOperations))[0].metadata.creationReconciliationReason).toBe("provider_absent_after_bounded_recovery");
     expect(destroys).toBe(0);
+  });
+
+  it("keeps an unavailable login inspector pending beyond the absence budget and settles after provider recovery", async () => {
+    loseReply = true; await expect(acquirePluginLogin(runId)).rejects.toThrow("Lost provider reply"); resources.clear();
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, runId));
+    await db.update(sandboxCreationOperations).set({ nextAttemptAt: new Date(0),
+      metadata: sql`metadata || '{"creationSettleAt":"2000-01-01T00:00:00Z"}'::jsonb` });
+    const running = vi.spyOn(workers, "isRunning").mockReturnValue(false);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await runtime().flushDeferredOrphanCleanups();
+      const [operation] = await db.select().from(sandboxCreationOperations);
+      expect(operation.state).toBe("pending");
+      expect(operation.metadata.creationRecoveryAttempts ?? 0).toBe(0);
+      expect(operation.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
+      await due();
+    }
+    running.mockRestore();
+    await runtime().flushDeferredOrphanCleanups();
+    expect((await db.select().from(sandboxCreationOperations))[0]).toMatchObject({ state: "resolved", metadata: {
+      creationRecoveryAttempts: 1, creationReconciliationReason: "provider_absent_after_bounded_recovery",
+    } });
+    expect(creates).toBe(1); expect(destroys).toBe(0);
   });
 
   it("can reapply the creation migration without losing a committed intent", async () => {
