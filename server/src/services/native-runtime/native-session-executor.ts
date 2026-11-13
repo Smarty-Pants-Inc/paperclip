@@ -16367,16 +16367,28 @@ async function waitForRemoteRunnerProcessIdentity(input: {
   runnerInstanceId: string;
   requireProcessStartFingerprint?: boolean;
 }): Promise<{ pid: number; startedAt: string; processStartFingerprint?: string }> {
-  const result = await input.runner.execute({
-    command: "node",
-    args: ["-e", REMOTE_RUNNER_IDENTITY_READY_SCRIPT, "paperclip-runner-process-identity", input.identityPath, input.nonce,
-      input.runnerInstanceId, String(REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS), String(input.requireProcessStartFingerprint === true)],
-    bypassSession: true,
-    timeoutMs: REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS + 1_000,
-  }).catch(() => null);
-  const identity = result && result.exitCode === 0 && !result.timedOut
-    ? parseRemoteRunnerProcessIdentity(result.stdout, input) : null;
-  if (identity && (!input.requireProcessStartFingerprint || identity.processStartFingerprint)) return identity;
+  // One event-subscribed read waits in the sandbox for this launch's marker. A
+  // plugin RPC TIMEOUT on that read is a stalled transport, not proof the marker
+  // is missing: re-read (never relaunch) within the plugin-stall budget while the
+  // one launched Runner stays supervised (upstream #20945). Any other failure is final.
+  const stallDeadline = Date.now() + REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS;
+  for (;;) {
+    let stalled = false;
+    const result = await input.runner.execute({
+      command: "node",
+      args: ["-e", REMOTE_RUNNER_IDENTITY_READY_SCRIPT, "paperclip-runner-process-identity", input.identityPath, input.nonce,
+        input.runnerInstanceId, String(REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS), String(input.requireProcessStartFingerprint === true)],
+      bypassSession: true,
+      timeoutMs: REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS + 1_000,
+    }).catch((error: unknown) => {
+      stalled = isPluginRpcTimeout(error);
+      return null;
+    });
+    const identity = result && result.exitCode === 0 && !result.timedOut
+      ? parseRemoteRunnerProcessIdentity(result.stdout, input) : null;
+    if (identity && (!input.requireProcessStartFingerprint || identity.processStartFingerprint)) return identity;
+    if (!stalled || Date.now() >= stallDeadline) break;
+  }
 
   throw new Error("runner_remote_process_identity_unavailable");
 }

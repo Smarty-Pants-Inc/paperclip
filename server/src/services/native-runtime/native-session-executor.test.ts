@@ -2391,6 +2391,42 @@ fs.readFileSync = function(path, ...args) {
     } finally { vi.useRealTimers(); }
   });
 
+  // Union of C8's event-subscribed identity wait and upstream's #20945 retry:
+  // only a plugin RPC TIMEOUT re-reads, within the stall budget, and nothing relaunches.
+  it.each(["stall", "failure"] as const)("bounds identity re-reads after a %s without relaunching the runner", async kind => {
+    vi.useFakeTimers();
+    const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+    let reads = 0;
+    const execute = vi.fn(async (input: { args?: string[] }) => {
+      const label = input.args?.[2];
+      if (label === "paperclip-runner-launch") return ok;
+      if (label === "paperclip-runner-process-identity") {
+        reads++;
+        if (kind === "failure") throw new Error("sandbox exec refused");
+        await new Promise(resolve => setTimeout(resolve, 40_000));
+        throw new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT, message: 'RPC call "environmentExecute" timed out after 40000ms' });
+      }
+      if (label === "paperclip-runner-identity-failure-cleanup") return ok;
+      return { ...ok, exitCode: 1 };
+    });
+    const handle = createRemoteRunnerProcessLauncher({
+      target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
+      runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
+      stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-remote",
+    })({ command: "/controller/runnerd", args: [], cwd: "/controller", environment: {} });
+    const outcome = handle.completion.catch(error => error as Error);
+    try {
+      await vi.advanceTimersByTimeAsync(300_000);
+      const failure = await outcome;
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain("runner_remote_process_identity_unavailable");
+      // 40 s stalls: reads start at 0, 40, 80, 120 and 160 s; none after the 180 s budget.
+      expect(reads).toBe(kind === "stall" ? 5 : 1);
+      expect(execute.mock.calls.filter(([x]) => x.args?.[2] === "paperclip-runner-launch")).toHaveLength(1);
+      expect(execute.mock.calls.filter(([x]) => x.args?.[2] === "paperclip-runner-identity-failure-cleanup")).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("bounds supervision without exit proof when a connected runner's probes never answer", async () => {
     vi.useFakeTimers();
     let nonce = "";
