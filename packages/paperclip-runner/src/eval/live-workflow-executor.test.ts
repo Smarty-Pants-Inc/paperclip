@@ -189,6 +189,26 @@ describe("live workflow executor infrastructure failures", () => {
     expect(retained.some(file => file.sha256 === receipt.beforeSha256)).toBe(true);
   }, 30_000);
 
+  it("logs the exact retained path and metadata without reading or logging file contents", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    try {
+      const root = await createLiveWorkflowRuntime("logged-evidence");
+      await writeFile(join(root, "provider-trace.ndjson"), "opaque trace\n");
+      await retainLiveWorkflowRuntime(root);
+      const [leaf] = await readdir(dirname(root));
+      expect(stderr).toHaveBeenCalledExactlyOnceWith(`${JSON.stringify({ level: "info", event: "native_evidence_retained",
+        source: root, destination: join(dirname(root), leaf!), scope: dirname(root).split(/[\\/]/).at(-1), totalBytes: 13, fileCount: 1 })}\n`);
+    } finally { stderr.mockRestore(); }
+  });
+
+  it("leaves pending eval trace bytes intact when the metadata walk exceeds its depth bound", async () => {
+    const root = await createLiveWorkflowRuntime("bounded-inventory");
+    await writeFile(join(root, "provider-trace.ndjson"), "opaque original\n");
+    await mkdir(join(root, ...Array.from({ length: 129 }, () => "deep")), { recursive: true });
+    await expect(retainLiveWorkflowRuntime(root)).rejects.toThrow("live_eval_evidence_inventory_limit");
+    expect(await readFile(join(root, "provider-trace.ndjson"), "utf8")).toBe("opaque original\n");
+  });
+
   it("leaves pending eval trace bytes intact when evidence permissions are unsafe", async () => {
     const root = await createLiveWorkflowRuntime("unsafe-evidence");
     const trace = join(root, "provider-trace.ndjson");

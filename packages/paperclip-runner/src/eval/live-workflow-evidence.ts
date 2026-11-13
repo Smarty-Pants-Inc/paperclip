@@ -1,7 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, mkdtemp, rename } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, opendir, rename } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
+
+/** Metadata-only inventory, bounded independently of trace file sizes. An
+ * incomplete walk fails closed before rename; symlink targets are never read. */
+async function runtimeInventory(root: string): Promise<{ totalBytes: number; fileCount: number }> {
+  let totalBytes = 0, fileCount = 0, entries = 0;
+  async function visit(filename: string, depth: number): Promise<void> {
+    if (++entries > 100_000 || depth > 128) throw new Error("live_eval_evidence_inventory_limit");
+    const metadata = await lstat(filename);
+    if (metadata.isDirectory()) {
+      for await (const entry of await opendir(filename)) await visit(join(filename, entry.name), depth + 1);
+    } else {
+      totalBytes += metadata.size;
+      fileCount++;
+    }
+  }
+  await visit(root, 0);
+  return { totalBytes, fileCount };
+}
 
 async function privateDirectory(directory: string): Promise<void> {
   await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
@@ -27,5 +45,11 @@ export async function createLiveWorkflowRuntime(executionId: string): Promise<st
  * namespace has no expiry consumer. Rename failures leave the source intact. */
 export async function retainLiveWorkflowRuntime(root: string): Promise<void> {
   await privateDirectory(dirname(root));
-  await rename(root, join(dirname(root), randomUUID()));
+  const destination = join(dirname(root), randomUUID());
+  const inventory = await runtimeInventory(root);
+  await rename(root, destination);
+  // The executor has no diagnostic sink. Use the package's structured stderr
+  // convention (also used by the scenario-chat loopback proxy), never console.
+  process.stderr.write(`${JSON.stringify({ level: "info", event: "native_evidence_retained",
+    source: root, destination, scope: basename(dirname(root)), ...inventory })}\n`);
 }
