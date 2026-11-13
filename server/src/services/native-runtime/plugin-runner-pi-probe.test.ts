@@ -72,6 +72,23 @@ describe("native Pi plugin task verification", () => {
     expect(mocks.probe).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ environment: {}, provider: "pi_rpc", model }));
   });
   it.each([
+    { PAPERCLIP_AI_PROVIDER_KEY: "selected-key-canary" },
+    { ...environment, PAPERCLIP_AI_PROVIDER_URL: "https://selected-key-canary@gateway.example/v1" },
+    { ...environment, OPENAI_API_KEY: "other-key-canary" },
+  ])("reports malformed or unrouted provider config without requesting authentication: %j", async invalid => {
+    const { context, task } = fixture();
+    context.config.env = invalid;
+    const result = await probePluginRunnerEnvironment(context, managed);
+    expect(result).toMatchObject({ status: "fail", checks: [{ code: "pi_rpc_hello_probe_config_invalid", level: "error",
+      message: "The selected Pi provider configuration is malformed or missing a complete provider route. Check its credential and routing settings." }] });
+    expect(() => assertHarnessTestPassed(result)).toThrow(expect.objectContaining({ code: "harness_test_failed" }));
+    expect(task).toHaveBeenCalledExactlyOnceWith({ kind: "describe" });
+    expect(mocks.probe).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("selected-key-canary");
+    expect(JSON.stringify(result)).not.toContain("other-key-canary");
+    expect(JSON.stringify(result)).not.toContain("needs authentication");
+  });
+  it.each([
     ["Unauthorized 401 selected-key-canary", "pi_rpc_hello_probe_auth_required", "harness_auth_failed"],
     ["Model unavailable 404 selected-key-canary", "pi_rpc_hello_probe_model_unavailable", "harness_model_unavailable"],
     ["Pi hello probe timed out", "pi_rpc_hello_probe_timed_out", "harness_probe_timed_out"],
