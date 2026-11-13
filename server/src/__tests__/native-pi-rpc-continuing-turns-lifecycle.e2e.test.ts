@@ -354,9 +354,16 @@ it.skipIf(!enabled).each([false, true, "invalid"] as const)(`three done/comment-
         originalSessionFile = (turnProofs[0]!.sessionFiles as string[])[0]!;
         preservedBytes = Buffer.concat([readFileSync(originalSessionFile), Buffer.from("{corrupt Pi history between turns}\n")]);
         await writeFile(originalSessionFile, preservedBytes);
-        process.kill((turnProofs[0]!.pids as Array<{ runnerPid: number }>)[0]!.runnerPid, "SIGKILL");
-        await vi.waitFor(() => expect(bundles[0]!.evidence().diagnostics).toContain("runner process restored its durable PRP session"), { timeout: 20_000, interval: 50 });
-        stage("saved Pi file corrupted; original runner killed and restored", { originalSessionFile,
+        // Under per_turn the settled runner already exited after turn 1, so the
+        // next turn cold-opens the corrupted file with no kill or restore. A warm
+        // lifecycle keeps the resident, which must die so the restore reads the file.
+        const residentRunner = (turnProofs[0]!.pids as Array<{ runnerPid?: number }> | undefined)?.[0]?.runnerPid;
+        if (lifecycleMode !== "per_turn") {
+          expect(residentRunner).toBeTypeOf("number");
+          process.kill(residentRunner!, "SIGKILL");
+          await vi.waitFor(() => expect(bundles[0]!.evidence().diagnostics).toContain("runner process restored its durable PRP session"), { timeout: 20_000, interval: 50 });
+        }
+        stage(lifecycleMode === "per_turn" ? "saved Pi file corrupted; next turn cold-opens it" : "saved Pi file corrupted; original runner killed and restored", { originalSessionFile,
           sha256: createHash("sha256").update(preservedBytes).digest("hex"), oldPids: turnProofs[0]!.pids });
       }
       const requestOffset = requests.length;
