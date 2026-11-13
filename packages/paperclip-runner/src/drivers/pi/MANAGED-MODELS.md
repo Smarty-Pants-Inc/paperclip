@@ -39,8 +39,8 @@ Resolution order:
 `model.api ?? provider.api` must equal the API selected by the actual managed
 connection protocol (`messages` -> `anthropic-messages`, `chat` ->
 `openai-completions`, `responses` -> `openai-responses`). A mismatch skips
-`compat`, `samplingParams` and `samplingParamsByThinkingLevel`, with a bounded
-diagnostic, and preserves API-neutral metadata.
+`compat` and every `samplingParams*` field, with a bounded diagnostic, and
+preserves API-neutral metadata.
 Provider/model compat uses Pi 1.5.2's shallow per-field override and its one-level
 merges for `openRouterRouting`, `vercelGatewayRouting`, `chatTemplateKwargs` and
 `chatTemplateArgs`. No other nested value is recursively blended. Across config
@@ -66,6 +66,21 @@ The model id remains the upstream id, selected under the `paperclip/<id>`
 provider namespace. Registration defaults fill absent fields only. A shared
 plain-JSON validator rejects non-JSON/nonplain values and cycles at configuration
 and private bind boundaries.
+
+Sampling metadata is not a second model/thinking selector. Pi 1.5.2 applies it
+last to Completions, Responses and Azure request bodies, so every
+`samplingParams*` object is recursively sanitized before it crosses a managed
+boundary. `model`, the routing/auth keys above, and reasoning/thinking controls
+(including `reasoning_effort`, `reasoning`, `thinking`, `effort`, budget fields,
+`enable_thinking` and nested `output_config.effort`) are removed. The
+`chat_template_kwargs` and `chat_template_args` containers are removed because
+compat can give their thinking controls arbitrary names. Ordinary sampling
+parameters such as `temperature`, `top_p` and `top_k`, and unrelated nested
+metadata, survive. Each stripped key gets one bounded diagnostic naming only
+its key/path, never its value; duplicate paths across config/catalog resolution
+are diagnosed once per build. The private bind validator rejects unsanitized
+sampling overrides rather than trusting callers to have projected them.
+
 Strict agent config errors refuse startup; optional original-HOME errors skip
 that source without altering it. Non-managed snapshot providers and top-level
 settings remain intact. The defensive snapshot reread uses the incoming managed
@@ -74,8 +89,9 @@ API, so mismatched compat cannot be reintroduced during models.json merging.
 The driver retains the resolved descriptor for the resident session. Warm binds
 rotate the revocable broker capability, not the model capabilities. The bind
 extension passes those same fields into Pi's in-memory registration. Startup
-resolution and the defensive reread emit at most one bounded nonleaking line;
-warm broker rotation does not reread sources or repeat startup diagnostics.
+resolution and the defensive reread emit at most one bounded nonleaking
+capability-summary line, plus one line per stripped sampling key. Warm broker
+rotation does not reread sources or repeat startup diagnostics.
 
 The ACPX child bootstrap uses this same capability builder with the original
 pre-projection environment, even when the caller supplies only model/environment.
@@ -98,6 +114,7 @@ From `packages/paperclip-runner`:
 
 ```sh
 pnpm exec vitest run src/drivers/pi/pi-managed-definition.test.ts --maxWorkers=2
+pnpm exec vitest run src/drivers/pi/pi-managed-model-sampling.test.ts --maxWorkers=2
 pnpm exec vitest run src/drivers/pi/pi-managed-compat.test.ts --maxWorkers=2
 node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
 ```
@@ -113,7 +130,10 @@ pnpm exec vitest run src/drivers/pi/pi-managed-model.native.test.ts
 
 It checks real `get_state` before any model reset and after a private warm bind,
 snapshot caps, catalog limits, explicit overrides, unknown defaults, and two
-settled turns through the real native driver. It also reproduces the original
+settled turns through the real native driver. A same-id sampling injection case
+captures both outbound requests: the model remains `claude-opus-5-5`, effort
+remains admitted `xhigh` (not injected `max`), and `temperature`/`top_p` survive.
+It also reproduces the original
 HOME-only layout with no runner `PI_CODING_AGENT_DIR`: the cap exists only under
 `HOME/.pi/agent/models.json`, with a separate managed agent home. A launch hook
 adds `--thinking max` to observe Pi's first state before admission; the driver
