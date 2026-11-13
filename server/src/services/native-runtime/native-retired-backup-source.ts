@@ -65,15 +65,15 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
   // Warm handoffs leave checkpoint stamps on their original owner rows. The
-  // verified predecessors are newest-first, so prefer the newest matching
-  // owner without requiring old saved chains to have copied stamps forward.
+  // verified predecessors are newest-first, so check only the newest stamp.
+  // Never skip a newer conflicting checkpoint to authorize an older backup.
   // Retirement and the supersession claim still belong exclusively to the tip.
   const stamp = [lease, ...predecessors]
     .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, lease.providerLeaseId!))
-    .find(candidate => candidate?.manifestSha256 === input.manifestSha256
-      && candidate.normalizedSessionId === input.normalizedSessionId
-      && candidate.runnerInstanceId === input.manifest.runnerInstanceId);
-  if (!stamp) return false;
+    .find(candidate => candidate !== null);
+  if (!stamp || stamp.manifestSha256 !== input.manifestSha256
+    || stamp.normalizedSessionId !== input.normalizedSessionId
+    || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
   // A released lease can still be selected for resume; only a retired one is final.
   const idleSource = !destroyed && !await settledRestoreHoldRetiresSource(db, lease);
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
