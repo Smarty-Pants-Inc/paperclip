@@ -99,6 +99,7 @@ const nativeRunnerSuites = [
   "server/src/__tests__/dot-runner.test.ts",
   // These process cases otherwise skip in server shards without Runner binaries.
   "server/src/services/native-runtime/native-runner-restart-recovery.integration.test.ts",
+  "server/src/services/native-runtime/native-pi-restart-executable.integration.test.ts",
   "server/src/services/native-runtime/native-runner-restart-lease-renewal.integration.test.ts",
   "server/src/services/native-runtime/native-runner-restart-preparation.integration.test.ts",
   "server/src/services/native-runtime/native-runner-restart-checkpoint-cost.integration.test.ts",
