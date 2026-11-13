@@ -6323,22 +6323,31 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
   }
 
-  /** A fresh Pi open over a proven-lost external Runner's root (its sandbox
-   * restarted under it) retires exactly that epoch through the ordinary
-   * rotation, as the recovery path does. Pi's own files stay in place; any
-   * other stored authority still fails the control plane's identity check. */
-  async #rotateLostExternalPiOpenAuthority(desired: DurableRecoveryIdentity): Promise<void> {
-    const lost = this.options.lostRunnerSource!;
+  /** A fresh Pi open over an external Runner's root retires the prior epoch
+   * through the ordinary rotation, as the recovery path and local Pi do, when
+   * that owner is proven gone: its own durable runner state says it suspended
+   * (Core closed it, for example a warm Runner displaced by the agent's other
+   * conversation), or it is the exact proven-lost Runner of a restarted
+   * sandbox. rotateAuthorityEpoch checks the exact identity and that state; a
+   * live owner fails `native_runner_authority_rotation_requires_settled_state`.
+   * Pi's own files stay in place. */
+  async #rotateExternalPiOpenAuthority(desired: DurableRecoveryIdentity): Promise<void> {
+    const lost = this.options.lostRunnerSource;
     const directory = resolve(this.#root, "control-plane");
     const active = existsSync(resolve(directory, "control-plane-state.json")) ? readControlPlaneState(directory) : null;
     if (active && controlPlaneIdentity(active).runId === desired.runId) return;
+    // Without active authority only the exact lost owner's interrupted
+    // rotation resumes from its archive; a completed one belongs to a newer
+    // Runner whose own state now sits on the box.
     const source = active
       ? takeCommittedRotation(this.#root, active) ?? active
-      : latestArchivedControlPlaneState(this.#root, desired);
-    if (!source || !recoveryIdentityMatches(controlPlaneIdentity(source), lost)) return;
+      : lost ? latestArchivedControlPlaneState(this.#root, desired) : null;
+    if (!source) return;
     if (source.warmTransition !== undefined || source.stagedRunAttachment !== undefined)
       throw new Error("native_runner_authority_archive_conflict");
-    await rotateAuthorityEpoch(this.#root, source, desired, this.#externalRunnerStateArchive(), lost);
+    const exactLost = lost && recoveryIdentityMatches(controlPlaneIdentity(source), lost) ? lost : undefined;
+    if (!active && !exactLost) return;
+    await rotateAuthorityEpoch(this.#root, source, desired, this.#externalRunnerStateArchive(), exactLost);
   }
 
   /** Runner state held by an external Runner host (a plugin task or a sandbox). */
@@ -6393,8 +6402,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (this.options.provider === "pi_rpc" && !this.options.prepareLaunch && !this.options.readRunnerState
         && this.options.runnerStateDirectory === undefined && this.options.runnerFilesystemRoot === undefined) {
       await rotateLocalPiOpenAuthority(this.#root, identity);
-    } else if (this.options.provider === "pi_rpc" && this.options.lostRunnerSource) {
-      await this.#rotateLostExternalPiOpenAuthority(identity);
+    } else if (this.options.provider === "pi_rpc" && this.options.readRunnerState && this.options.archiveExternalRunnerState) {
+      await this.#rotateExternalPiOpenAuthority(identity);
     }
     const core = new DurablePrpControlPlane({
       stateDirectory: resolve(this.#root, "control-plane"),
