@@ -78,7 +78,8 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
       expect(disk.providers.paperclip.models[0]).toMatchObject({ id: item.id, contextWindow: item.contextWindow, maxTokens: item.maxTokens });
       expect(disk.providers.paperclip.baseUrl).toBe(first.provider.baseUrl);
       expect(disk.providers.paperclip.apiKey).toBe(first.provider.apiKey);
-      const sessionId = `proof-${item.name}`, socketPath = join(directory, "bind.sock");
+      // Keep the Unix socket within its 103-byte limit even under TASK_OUT.
+      const sessionId = `proof-${item.name}`, socketPath = join(root, `${report.cases.length}.sock`);
       const initial = { schema: 1, sessionId, epoch: 1, runId: "first", model: `paperclip/${item.id}`, thinkingLevel: item.effective, instructions: "", tools: [] };
       const native = new PiRpcTransport({ command: binary!, cwd: workspace, shutdownTimeoutMs: 1000, killTimeoutMs: 1000,
         args: ["--mode", "rpc", "--no-approve", "--no-themes", "--no-extensions", "--extension", extension, "--session", join(directory, "session.jsonl"), "--model", initial.model, "--thinking", item.thinking],
@@ -101,7 +102,7 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
         proof.bind = await sendPiBindRequest(socketPath, { schema: 1, type: "bind", nonce: "warm-proof", sessionId, expectedPriorEpoch: 1, epoch: 2, runId: "warm", model: initial.model, thinkingLevel: item.effective, instructions: "", tools: [], provider: second.provider });
         const warm = (await bounded(native.request("get_state"))).data as any;
         proof.warm = warm;
-        expect(warm.model).toEqual({ ...state.model, baseUrl: second.provider.baseUrl });
+        expect(warm.model).toEqual({ ...state.model, ...(metadata.type === undefined ? {} : { type: metadata.type }), baseUrl: second.provider.baseUrl });
         expect(warm.thinkingLevel).toBe(item.effective);
         expect(warm.sessionId).toBe(state.sessionId);
         expect(native.pid).toBe(proof.pid);
@@ -250,7 +251,7 @@ it.skipIf(!binary || !output).each(["user-cap", "no-user-file"] as const)("real 
       const state = (await bounded(native!.request("get_state"))).data as any;
       expect(state.model).toMatchObject({ provider: "paperclip", id: "claude-opus-5-5", contextWindow: 1000000, maxTokens: 128000, reasoning: true });
       expect(state.thinkingLevel).toBe(effective); expect(native!.pid).toBe(proof.pid);
-      if (runId === "warm") { proof.warm = state; expect(state.model).toEqual({ ...proof.first.model, baseUrl: state.model.baseUrl }); expect(state.model.baseUrl).not.toBe(proof.first.model.baseUrl); }
+      if (runId === "warm") { proof.warm = state; expect(state.model).toEqual({ ...proof.first.model, type: "chat", baseUrl: state.model.baseUrl }); expect(state.model.baseUrl).not.toBe(proof.first.model.baseUrl); }
       await session.startTurn({ message: { role: "user", text: "Return the local fixture reply." } });
       for (;;) {
         const next = await bounded(events.next()); if (next.done) throw new Error("original HOME stream ended");
