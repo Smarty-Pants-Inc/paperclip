@@ -28,6 +28,16 @@ const safe = { PATH: "/usr/bin:/bin", HOME: "/tmp/pi-home", TMPDIR: "/tmp", LANG
   LANGFUSE_TRACING_ENABLED: "true", LANGFUSE_FLUSH_AT: "1" };
 
 describe("native Pi environment ceilings", () => {
+  it("never inherits ambient GitHub launchers, SSH authority, or a spoofed auth-mode marker", () => {
+    const ambient = { BASH_ENV: "/guest/startup", SSH_AUTH_SOCK: "/guest/agent.sock", GIT_SSH_COMMAND: "ssh -i /guest/key",
+      PAPERCLIP_GITHUB_AUTH_MODE: "managed", PAPERCLIP_PI_GITHUB_PROJECTION_SECRET: '{"BASH_ENV":"/guest/startup"}' };
+    expect(piProcessEnvironment({}, ambient)).toEqual({});
+  });
+  it("carries the controller payload only as far as runnerd, never into Pi", () => {
+    const source = { PAPERCLIP_PI_GITHUB_PROJECTION_SECRET: '{"BASH_ENV":"/managed/startup"}' };
+    expect(piProxyEnvironment(source)).toEqual(source);
+    expect(piProcessEnvironment(source, source)).toEqual({});
+  });
   it("passes Paperclip's managed GitHub projection through the proxy and final Pi spawn", async () => {
     const location = { runId: `pi-env-${randomUUID()}`, target: null };
     try {
