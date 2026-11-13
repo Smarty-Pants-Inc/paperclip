@@ -5,7 +5,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentApiKeys, authUsers, companies, companyMemberships, connectionGrants,
   createDb, principalPermissionGrants, toolApplications, toolConnections, toolConnectionInstalls,
-  toolProfiles, toolProfileEntries, toolProfileBindings, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  toolProfiles, toolProfileEntries, toolProfileBindings, toolCatalogEntries, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS, newStandardAgentGrantScope } from "../lib/agent-permissions.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -84,6 +84,115 @@ describe("tool grants to a manager's current reporting subtree", () => {
     const installed = async () => (await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).map(row => row.targetId).sort();
     return { companyId, userId, ids, report, descendant, connection, profile, retained, api, board, token, put, bind, installed, installUrl, bindingUrl };
   }
+
+  async function finishFixture(style: "structured" | "allow" | "unscoped" | "exact-outside" = "structured") {
+    const f = await fixture(style);
+    await db.update(toolProfiles).set({ profileKey: `app:${f.connection.id}` }).where(eq(toolProfiles.id, f.profile.id));
+    await db.insert(toolProfileBindings).values([
+      { companyId: f.companyId, profileId: f.profile.id, targetType: "agent", targetId: f.ids.manager },
+      { companyId: f.companyId, profileId: f.profile.id, targetType: "company", targetId: f.companyId },
+    ]);
+    await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: f.connection.id, targetType: "company", targetId: f.companyId });
+    const [entry] = await db.insert(toolCatalogEntries).values({ companyId: f.companyId, applicationId: f.connection.applicationId,
+      connectionId: f.connection.id, name: "Read mailbox", toolName: "read_mailbox", versionHash: "finish-scope" }).returning();
+    const finish = (agentIds: string[], preserveExistingAccess = true) => request(f.api)
+      .post(`/api/companies/${f.companyId}/tools/apps/${f.connection.id}/finish`)
+      .set("Authorization", `Bearer ${f.token}`)
+      .send({ access: { agentIds }, preserveExistingAccess, enabledCatalogEntryIds: [entry.id] });
+    const bindings = async () => (await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id)))
+      .map(row => `${row.targetType}:${row.targetId}`).sort();
+    return { ...f, entry, finish, bindings };
+  }
+
+  it.each([false, true])("finish preserves root/company access while enabling its own hire (already installed: %s)", async alreadyInstalled => {
+    const f = await finishFixture();
+    if (alreadyInstalled) {
+      // The production sequence saves installs successfully before finishing app actions.
+      const put = await request(f.api).put(f.installUrl).set("Authorization", `Bearer ${f.token}`).send({
+        installs: [...f.retained, { targetType: "company", targetId: f.companyId }, { targetType: "agent", targetId: f.report }],
+      });
+      expect(put.status, put.text).toBe(200);
+    }
+    const before = await f.bindings();
+    const response = await f.finish([f.report]);
+    expect(response.status, response.text).toBe(200);
+    // Install PUT may already have created the hire's binding; finish retains
+    // that one row rather than creating a duplicate.
+    expect(await f.bindings()).toEqual([...new Set([...before, `agent:${f.report}`])].sort());
+    expect(await f.installed()).toEqual([...f.retained.map(row => row.targetId), f.companyId, f.report].sort());
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    expect(entries.some(row => row.catalogEntryId === f.entry.id)).toBe(true);
+    expect(entries.some(row => row.selectorType === "connection" && row.connectionId === f.connection.id)).toBe(true);
+  }, 60_000);
+
+  it("finish does not reauthorize explicitly requested recipients retained in both bindings and installs", async () => {
+    const f = await finishFixture();
+    const before = await f.bindings();
+    const response = await f.finish([f.ids.manager, f.ids.peer, f.report]);
+    expect(response.status, response.text).toBe(200);
+    expect(await f.bindings()).toEqual([...before, `agent:${f.report}`].sort());
+  }, 60_000);
+
+  it("finish retains company-wide access without expanding an unchanged company recipient", async () => {
+    const f = await finishFixture();
+    const before = { installs: await f.installed(), bindings: await f.bindings() };
+    const response = await request(f.api).post(`/api/companies/${f.companyId}/tools/apps/${f.connection.id}/finish`)
+      .set("Authorization", `Bearer ${f.token}`)
+      .send({ access: "all_agents", preserveExistingAccess: true, enabledCatalogEntryIds: [f.entry.id] });
+    expect(response.status, response.text).toBe(200);
+    expect(await f.installed()).toEqual(before.installs);
+    expect(await f.bindings()).toEqual(before.bindings);
+  }, 60_000);
+
+  it.each(["unscoped", "exact-outside"] as const)("finish keeps %s grants inside the current subtree even for an already installed outside agent", async style => {
+    const f = await finishFixture(style);
+    const before = { installs: await f.installed(), bindings: await f.bindings() };
+    // The install already exists, but this would add an outside profile binding.
+    const response = await f.finish([f.ids.other]);
+    expect(response.status, response.text).toBe(403);
+    expect(await f.installed()).toEqual(before.installs);
+    expect(await f.bindings()).toEqual(before.bindings);
+  }, 60_000);
+
+  it("finish authorizes a new app profile even when the hire is already installed", async () => {
+    const f = await finishFixture();
+    await db.update(toolProfiles).set({ profileKey: randomUUID() }).where(eq(toolProfiles.id, f.profile.id));
+    await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: f.connection.id, targetType: "agent", targetId: f.report });
+    const response = await f.finish([f.report]);
+    expect(response.status, response.text).toBe(200);
+    expect(response.body.profileBindings).toEqual([expect.objectContaining({ targetType: "agent", targetId: f.report })]);
+  }, 60_000);
+
+  it.each(["structured", "unscoped", "exact-outside"] as const)("finish checks %s authority for a new app profile's already installed outside target", async style => {
+    const f = await finishFixture(style);
+    await db.update(toolProfiles).set({ profileKey: randomUUID() }).where(eq(toolProfiles.id, f.profile.id));
+    const before = await f.installed();
+    const response = await f.finish([f.ids.other]);
+    expect(response.status, response.text).toBe(403);
+    expect(await f.installed()).toEqual(before);
+    expect(await db.select().from(toolProfiles).where(eq(toolProfiles.profileKey, `app:${f.connection.id}`))).toEqual([]);
+  }, 60_000);
+
+  it("finish still refuses adding an outside agent with preserved access", async () => {
+    const f = await finishFixture();
+    const [outside] = await db.insert(agents).values({ companyId: f.companyId, name: "Outside finish target", adapterType: "process", status: "idle", lifecycleState: "ready" }).returning();
+    const before = { installs: await f.installed(), bindings: await f.bindings() };
+    const response = await f.finish([outside.id]);
+    expect(response.status, response.text).toBe(403);
+    expect(response.body).toMatchObject({ error: "Permission agents:configure does not cover the requested scope.", details: { reason: "deny_scope" } });
+    expect(await f.installed()).toEqual(before.installs);
+    expect(await f.bindings()).toEqual(before.bindings);
+  }, 60_000);
+
+  it("finish still refuses removing outside recipients when preserveExistingAccess is false", async () => {
+    const f = await finishFixture();
+    const before = { installs: await f.installed(), bindings: await f.bindings() };
+    const response = await f.finish([f.report], false);
+    expect(response.status, response.text).toBe(403);
+    expect(response.body).toMatchObject({ error: "Permission agents:configure does not cover the requested scope.", details: { reason: "deny_scope" } });
+    expect(await f.installed()).toEqual(before.installs);
+    expect(await f.bindings()).toEqual(before.bindings);
+  }, 60_000);
 
   for (const style of ["structured", "allow"] as const) {
     it(`${style}: installs a tool on its just-hired report without authority over retained targets`, async () => {

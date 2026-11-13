@@ -50,6 +50,15 @@ set. Agent requests authorize only additions and removals. Retained targets need
 not be in the agent's scope. Binding a profile changes only the named recipient, not its
 existing recipients or the consumers of its referenced connections. Editing a
 shared connection or profile still authorizes its affected consumers as before.
+`POST /api/companies/:companyId/tools/apps/:connectionId/finish` uses the same
+recipient-delta rule for its app profile bindings and tool connection installs,
+checked independently. Requested recipients already present in both sets do not
+need fresh agent-configuration authority. With `preserveExistingAccess: true`,
+only additions are authorized; otherwise removals are authorized too. A retained
+company binding or install does not expand the check to every company agent.
+Connection and profile management grants and the responsible-user ceiling still
+apply, and added/removed agents remain inside the caller's current subtree.
+
 Agent install PUTs never clean up a shared app profile's legacy connection-wide
 include, even for an unchanged install list. Board and trusted internal writes
 retain that cleanup; board PUTs retain full install-consumer authorization.

@@ -117,6 +117,7 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         readOnly: req.method === "GET" && action !== "connections:gateway" && (action !== "connections:audit" || purpose === "chat") };
       const targets = new Set<string>();
       const assignmentOnly = isToolAssignmentOperation(operation);
+      const finishesApp = operation === "POST /companies/:companyId/tools/apps/:connectionId/finish";
       const replacesInstalls = operation === "PUT /tool-connections/:connectionId/installs";
       const extraResources: ConnectionManagementResource[] = [];
       const bindingTargets: { targetType: string; targetId: string }[] = [];
@@ -133,7 +134,21 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         seenSelectors.add(key); selectors.push(selected);
       };
       const addSelectors = (selected: Record<string, unknown>[]) => selected.forEach(addSelector);
-      addSelectors([body, body.access && typeof body.access === "object" ? body.access : {}, body.selectors ?? {}, ...(Array.isArray(body.entries) ? body.entries : [])]);
+      const accessSelectors = body.access && typeof body.access === "object" ? body.access : {};
+      addSelectors([body, finishesApp ? { ...accessSelectors, agentIds: [] } : accessSelectors, body.selectors ?? {}, ...(Array.isArray(body.entries) ? body.entries : [])]);
+      const addAppAccessChanges = (saved: Array<{ targetType: string; targetId: string }>) => {
+        const requested: Array<{ targetType: string; targetId: string }> = body.access === "all_agents"
+          ? [{ targetType: "company", targetId: companyId! }]
+          : (Array.isArray(body.access?.agentIds) ? body.access.agentIds : []).map((targetId: string) => ({ targetType: "agent", targetId }));
+        const key = (row: { targetType: string; targetId: string }) => `${row.targetType}:${row.targetId}`;
+        const existing = new Set(saved.map(key)), desired = new Set(requested.map(key));
+        // As with install PUT, retained recipients are not mutations. Recompute
+        // bindings and installs independently on every authorization.
+        addSelectors([
+          ...requested.filter(row => !existing.has(key(row))),
+          ...(body.preserveExistingAccess === true ? [] : saved.filter(row => !desired.has(key(row)))),
+        ]);
+      };
       const lookupCache = new Map<string, Promise<unknown>>();
       const lookup = <T,>(key: string, read: () => PromiseLike<T>): Promise<T> => {
         let pending = lookupCache.get(key);
@@ -250,7 +265,11 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         resource.selfServiceUserId = connection.createdByUserId;
         if (req.method !== "GET") {
           const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id));
-          if (!replacesInstalls || req.actor.type !== "agent") addSelectors(installs);
+          if (finishesApp) {
+            // Keep saved resource selectors, but resolve recipient changes below.
+            addSelectors(installs.map(row => ({ ...row, targetType: undefined, targetId: undefined })));
+            if (resource.purpose === "tool") addAppAccessChanges(installs);
+          } else if (!replacesInstalls || req.actor.type !== "agent") addSelectors(installs);
           if (replacesInstalls && Array.isArray(body.installs)) {
             // PUT replaces the set, but retained recipients are not mutations.
             // Recompute on every authorization, including writer revalidation.
@@ -271,11 +290,12 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
           if (!grants.some(grant => grant.subjectUserId === userId) && connection.createdByUserId !== userId) throw forbidden("Another user's personal account is not available for delegated management");
         }
       }
-      if (connectionId && operation === "POST /companies/:companyId/tools/apps/:connectionId/finish") {
+      if (connectionId && finishesApp) {
         const [profile] = await db.select({ id: toolProfiles.id }).from(toolProfiles).where(and(
           eq(toolProfiles.companyId, companyId!), eq(toolProfiles.profileKey, `app:${resource.connectionId}`),
         ));
         profileId = profile?.id ?? profileId;
+        if (!profile) addAppAccessChanges([]);
       }
       if (profileId) {
         const [profile] = await db.select().from(toolProfiles).where(eq(toolProfiles.id, uuid(profileId)));
@@ -284,7 +304,8 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
           const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
           addSelectors(entries);
           const bindings = assignmentOnly ? [] : await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
-          for (const binding of bindings) {
+          if (finishesApp) addAppAccessChanges(bindings);
+          for (const binding of finishesApp ? [] : bindings) {
             if (binding.targetType === "agent") targets.add(binding.targetId);
             if (binding.targetType === "company") {
               const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, binding.companyId));
@@ -312,7 +333,7 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
       for (const install of !replacesInstalls && Array.isArray(body.installs) ? body.installs : []) {
         if (install.targetType === "agent" && text(install.targetId)) targets.add(install.targetId);
       }
-      if ((operation.includes("ai-connection-pools") && req.method === "POST") || body.allAgents || body.access === "all_agents" || body.targetType === "company" || (!replacesInstalls && body.installs?.some?.((install: { targetType: string }) => install.targetType === "company"))) {
+      if ((operation.includes("ai-connection-pools") && req.method === "POST") || body.allAgents || (!finishesApp && body.access === "all_agents") || body.targetType === "company" || (!replacesInstalls && body.installs?.some?.((install: { targetType: string }) => install.targetType === "company"))) {
         const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, companyId));
         companyAgents.forEach(agent => targets.add(agent.id));
       }
