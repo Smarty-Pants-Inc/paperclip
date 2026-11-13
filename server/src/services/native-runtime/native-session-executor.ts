@@ -8814,6 +8814,11 @@ function markWarmAttachColdFallbackFailure(error: unknown): unknown {
   return error;
 }
 
+function protocolIntegrityCause(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== "object" || depth > 5) return false;
+  return error instanceof NativeSessionProtocolIntegrityError || protocolIntegrityCause((error as { cause?: unknown }).cause, depth + 1);
+}
+
 /** The attach rejection's own code, else its leading snake_case token. */
 function warmAttachFailureCode(error: unknown): string {
   const code = record(error).code;
@@ -12001,6 +12006,14 @@ async function executePaperclipNativeSessionAttempt(
       if (error instanceof NativeRunnerSourceReconciliationRequiredError) {
         await reportWarmAttachFailure(code, text, "side_effect_pending");
         throw new NativeProviderSideEffectPendingError(code);
+      }
+      // REG-30: events the controller could not commit (for example a
+      // checkpoint_flush_failed stall) may record the stopped turn's effects. A
+      // cold resume from the last committed checkpoint would drop them, so keep
+      // the integrity refusal and its native_event_replay_conflict code.
+      if (protocolIntegrityCause(error)) {
+        await reportWarmAttachFailure(code, text, "protocol_integrity");
+        return false;
       }
       // These keep their existing owners: the proven released-runner path, a
       // pending warm transition, or another claimant of the same source.
