@@ -3,8 +3,10 @@
 This is a **new plugin consumer, not a core patch**. It runs one code-only job,
 `g12-backstop`, every five minutes (UTC cron `*/5 * * * *`). GitHub webhooks and
 core review recovery remain the normal/unattended path. This job only detects
-missing reviews or failed checks and requests one owner-issue wake. It never
-posts a review request, a GitHub comment, or a human mention itself.
+missing reviews or failed checks and requests an **at-least-once owner-issue
+wake**. Duplicate admissions are possible; the owner must make the effect
+idempotent under the contract below. The plugin never posts a review request,
+a GitHub comment, or a human mention itself.
 
 ## Existing extension points (shipped source evidence)
 
@@ -161,9 +163,12 @@ Read `/jobs/<job-record-id>/runs` for the actual result, not just HTTP acceptanc
 The lead must preserve evidence on authorized **real daily-work PRs** in TEST:
 
 1. Missing App review: record the first eligible tick/current head, then the tick
-   at or after M minutes and its one owner-agent issue wake. Repeat a tick and
-   restart/replay without another wake for that semantic key.
-2. Completed failing/timed-out current-head check: one wake per distinct key.
+   at or after M minutes and its owner-agent issue wake. Repeat a tick and
+   restart/replay: a saved sent receipt suppresses the same semantic key. Prove
+   that a pending-only crash re-arms after the bounded wait.
+2. Completed failing/timed-out current-head check: acknowledged wakes are
+   suppressed per distinct key; uncertain/deferred delivery may repeat. Confirm
+   the owner checks GitHub before acting and does not repeat an existing effect.
    Cancelled/pending/success/stale-head checks do not wake. A new head re-arms.
 3. Healthy/empty ticks: numeric counts, no new agent/model run attributable to
    this job. No human is notified directly.
@@ -176,6 +181,23 @@ does not admit a new review or replace the core recovery patch.
 
 No live install, App permission check, real PR action, model run or TEST-company
 acceptance was performed by the implementation task.
+
+## Owner contract: at-least-once wake, idempotent effect
+
+Every wake `reason` contains one JSON line with `dedupeKey`, `repo` (the configured
+`owner/name`), `prNumber`, and `headSha`. Failing-check wakes also contain
+`checkRunId` and `conclusion`. The second line is always exactly:
+
+> Before acting, check GitHub for an existing review/comment or action at this PR head sha (or for this check run); if one exists, stop.
+
+The host carries this reason into the owner's wake context as `wakeReason`.
+The owner must read it, inspect GitHub at the specified PR head/check run before
+acting, and stop if an existing review/comment or action already covers it.
+Duplicate wakes (including a deferred admission followed by a retry) are not
+permission to repeat an action. The owner performs the effect check using its
+own authorized GitHub access; the plugin does not perform that check, obtain
+write permissions, or promise exactly-once effects on the owner's behalf.
+Preserve this contract in the assigned owner's instructions before enabling.
 
 ## Policy, idempotency and operational limits
 
@@ -190,49 +212,46 @@ acceptance was performed by the implementation task.
 - Semantic wake keys are exactly `g12:missing:<repo-id>:<pr-number>:<head-sha>` and
   `g12:fail:<repo-id>:<pr-number>:<head-sha>:<check-app-id>:<check-run-id>:<conclusion>`.
   Repository IDs come from the PR's base repository; check IDs come from GitHub.
-  Editable names never participate in dedupe: renamed checks do not double-wake,
-  while same-name checks from distinct apps/runs remain distinct. The same key is
-  passed as both wake `reason` and SDK `idempotencyKey`.
-- **Crash-safe suppression, not guaranteed delivery.** Before dispatch, persist
+  Editable names never participate in dedupe: renamed checks keep the same key,
+  while same-name checks from distinct apps/runs remain distinct. The key is
+  passed as SDK `idempotencyKey` and as `dedupeKey` in the wake reason JSON.
+- **At-least-once delivery, not exactly-once admission.** Before dispatch, persist
   `{ pendingAt, reconcileAt, agentId, issueId }` under
   `wake:<SHA-256 of semantic key>`. Only an acknowledged write permits dispatch.
-  `queued:true` replaces it with `{ acceptedAt, agentId, issueId }`; existing
-  accepted receipts remain compatible. A lost response or failed acceptance write
-  leaves pending in place and cannot produce a second wake after restart. Even a
-  crash after reservation but before dispatch stays suppressed until reconciled.
-  `deduped` counts suppression by either accepted or pending receipts, not proof
-  of delivery; `wakes` counts acknowledged acceptance. No raw key, check name,
-  PR title/body, provider row or credential is stored. The host serializes this
-  job and the worker rejects concurrent calls; there is
+  `queued:true` records **sent**, using the compatible
+  `{ acceptedAt, agentId, issueId }` receipt shape. A saved sent receipt suppresses
+  future dispatches for that key. If its write fails, pending remains recoverable.
+  `deduped` counts suppression by either sent or unexpired pending receipts, not
+  proof of model execution; `wakes` counts acknowledged acceptance. No raw key,
+  check name, PR title/body, provider row or credential is stored in plugin KV.
+  The host serializes this job and the worker rejects concurrent calls; there is
   no KV compare-and-swap or exactly-once-delivery claim.
-- **Per-key refusal backoff and cursor progress.** `queued:false` is definitive
-  non-acceptance: save backoff, then clear pending. Local issue-read failures or
-  assignee mismatches occur before dispatch and also save backoff without pending.
-  Retry delays are 5, 10, 20, 40, then 60 minutes, capped at 60 minutes, surviving
-  worker restart. During key backoff there is no issue-read/wakeup call for that
-  key (the normal bounded GitHub scan still runs). `refused` includes keys skipped
-  for backoff. Refused keys never pin the scan cursor; siblings and later PRs are
-  visited. Fixed refusal errors are reported after advancing/checkpointing the
-  scan, rather than terminating at the first refused PR. Queued/coalesced means
-  host acceptance, not model completion.
-- **Thrown wake calls are ambiguous.** `G12_WAKE_FAILED` can mean a pre-dispatch
-  blocker/status/budget refusal OR acceptance followed by a lost response/activity
-  write. RPC error text/type cannot distinguish those cases. Keep pending and
-  continue scanning; never automatically resend based on that error. The SDK's
-  `idempotencyKey` option is present and still receives the deterministic key
-  (`packages/plugins/sdk/src/types.ts:1550-1558`), but the shipped host only carries
-  general `g12:*` keys into wake rows; it does not enforce a replay fence for them
+- **Per-key retry backoff and cursor progress.** Throws from `requestWakeup`,
+  `queued:false`, and malformed acknowledgements save backoff, then clear pending.
+  Neither throws nor `queued:false` prove non-admission: the host can accept
+  deferred work and return false, or throw after acceptance. Retrying is deliberate
+  under the owner effect contract. Local issue-read failures/assignee mismatches
+  also save backoff before dispatch. Retry delays are 5, 10, 20, 40, then 60 minutes,
+  capped at 60 minutes and persisted across worker restart. During key backoff
+  there is no issue-read/wakeup call for that key (the normal bounded GitHub scan
+  still runs). `refused` includes keys skipped for backoff. Refused keys never pin
+  the scan cursor; siblings and later PRs are visited. Fixed refusal errors are
+  reported after advancing/checkpointing the scan, not at the first refused PR.
+  Upstream error text/type is never used to decide whether an admission happened.
+- **Bounded pending recovery.** New pending reservations expire after 30 minutes.
+  A crash after pending but before dispatch, a lost pending-write acknowledgement,
+  or a failed sent-receipt write re-arms on the next eligible observation at/after
+  `reconcileAt`, subject to persisted backoff, current eligibility, host availability,
+  and scan/GET/rate limits. Existing pending receipts (including `unresolvedAt`)
+  retain their saved deadline but no longer suppress forever. Each observation
+  attempts at most one dispatch per key; no in-tick retry loop, new timer or history
+  poller is added. Retry deadlines are eligibility bounds, not wall-clock delivery
+  guarantees. A lost response can yield duplicate admissions, and the owner must
+  check GitHub before acting. The SDK transports the deterministic `idempotencyKey`
+  (`packages/plugins/sdk/src/types.ts:1550-1558`), but the shipped host has no
+  general `g12:*` replay fence or reliable admission receipt
   (`server/src/services/plugin-host-services.ts:2426-2490`,
-  `server/src/services/heartbeat/queue.ts:4904-4985`). The plugin therefore uses
-  durable pending suppression rather than claiming host dedupe.
-- **Bounded reconciliation, never timeout-based resend.** Pending has a 15-minute
-  reconciliation deadline. On the next eligible observation at/after that deadline,
-  one state update adds `unresolvedAt`, one fixed `G12_WAKE_UNRESOLVED` warning is
-  logged, and numeric `unresolved` counts expose the condition. Later observations
-  perform no further reconciliation writes/warnings for that key and still do
-  not dispatch. There is no new timer, history poller or unbounded retry loop.
-  Positive operator reconciliation is described below. A missing history entry,
-  closed PR or elapsed deadline is not proof that dispatch never occurred.
+  `server/src/services/heartbeat/queue.ts:4904-4985`).
 - The numeric-ID key format is incompatible with the earlier name-based format;
   before upgrading an already-enabled installation, reconcile active conditions
   and expect name-based receipts not to dedupe the new keys. Old name-based
@@ -269,18 +288,22 @@ acceptance was performed by the implementation task.
 
 ## Single-key operator reconciliation (lead/admin only)
 
-This is deliberately not automatic delivery recovery: the shipped SDK has no
-capability here that proves whether an ambiguous `g12:*` wake was accepted.
-Reconciliation is bounded to one key and at most two state reads/two writes.
+Automatic pending recovery and refusal retries require no operator reconciliation.
+This optional helper remains for positively evidenced corrections; the shipped
+SDK has no capability here that proves whether an ambiguous `g12:*` wake was
+accepted. Reconciliation is bounded to one key and at most two state reads/two
+writes. The owner effect contract applies even after a manual correction.
 
 1. Disable the plugin and wait for the in-flight job and its host requests to
    settle. Do not reconcile concurrently: company KV has no compare-and-swap.
 2. Identify the exact semantic key, company, plugin record and pending receipt.
    Preserve its `pendingAt`, `agentId` and `issueId`; never dump provider payloads
    or credentials. Review that one host admission's activity/run/transport
-   evidence. Limit initial investigation to 15 minutes; if inconclusive, leave
-   pending/unresolved suppressed and escalate to the lead. Do not guess from an
-   empty history query, error message, elapsed time or a newly cleared blocker.
+   evidence. Limit initial investigation to 15 minutes; if inconclusive, do not
+   fabricate proof or mutate state. Re-enable to allow normal bounded retries,
+   or keep disabled and escalate to the lead if the owner contract is not ready.
+   Do not infer non-admission from an empty history query, error message, elapsed
+   time or a newly cleared blocker.
 3. With positive evidence of acceptance, use `outcome: "accepted"`. With positive
    evidence that the call never dispatched, use `outcome: "not-dispatched"`.
    The latter writes per-key backoff **before** clearing pending, so a failed

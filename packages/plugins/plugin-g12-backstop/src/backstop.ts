@@ -53,7 +53,15 @@ function readCursor(value: unknown, fingerprint: string, repoCount: number): Cur
   return { ...c };
 }
 
-const RECONCILE_AFTER_MS = 900_000;
+const RECONCILE_AFTER_MS = 1_800_000;
+const OWNER_INSTRUCTION = "Before acting, check GitHub for an existing review/comment or action at this PR head sha (or for this check run); if one exists, stop.";
+interface WakeContext {
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  checkRunId?: number;
+  conclusion?: string;
+}
 const RETRY_BASE_MS = 300_000;
 const RETRY_CAP_MS = 3_600_000;
 interface AcceptedWake { acceptedAt: number; agentId: string; issueId: string }
@@ -93,30 +101,24 @@ function nextRetry(prior: Retry | null, now: number): Retry {
 // the first refused PR. Other failures still stop the scan at its checkpoint.
 class WakeRefusal extends G12Error {}
 
-async function wake(host: Host, config: G12Config, owner: G12Config["owners"][string], key: string, now: number, counts: Counts, deadline: number) {
+async function wake(host: Host, config: G12Config, owner: G12Config["owners"][string], key: string, context: WakeContext, now: number, counts: Counts, deadline: number) {
   if (Date.now() >= deadline) throw new ScanPaused();
   const receiptKey = stateKey(config.companyId, `wake:${hash(key)}`);
   const prior = readReceipt(await host.state.get(receiptKey));
-  if (prior) {
+  if (prior && ("acceptedAt" in prior || now < prior.reconcileAt)) {
     counts.deduped++;
-    if ("pendingAt" in prior && now >= prior.reconcileAt) {
-      counts.unresolved++;
-      // One bounded transition at the reconciliation deadline. Never infer
-      // non-acceptance from elapsed time; keep suppressing until proven otherwise.
-      if (prior.unresolvedAt === undefined) {
-        await host.state.set(receiptKey, { ...prior, unresolvedAt: now });
-        host.logger.warn("G12 wake unresolved", { code: Code.WakeUnresolved });
-      }
-    }
     return;
   }
+  // A stale pending receipt may have dispatched or crashed before dispatch.
+  // Re-arm once on this observation: delivery is at-least-once; the owner must
+  // check GitHub before acting. Legacy unresolved receipts recover here too.
   const retryKey = stateKey(config.companyId, `retry:${hash(key)}`);
   const retry = readRetry(await host.state.get(retryKey));
   if (retry && retry.retryAt > now) { counts.refused++; return; }
   async function refuse(code: Code, clearPending = false): Promise<never> {
     await host.state.set(retryKey, nextRetry(retry, now));
-    // Only an explicit queued:false is proof this invocation was not accepted.
-    // Write backoff before clearing pending: a failed write must fail safe.
+    // Throws and queued:false can both hide an admission. Retrying is safe only
+    // under the owner effect contract. Persist backoff before clearing pending.
     if (clearPending) await host.state.set(receiptKey, null);
     counts.refused++;
     host.logger.warn("G12 wake refused", { code });
@@ -132,30 +134,26 @@ async function wake(host: Host, config: G12Config, owner: G12Config["owners"][st
     return refuse(Code.IssueAssigneeMismatch);
   }
   if (Date.now() >= deadline) throw new ScanPaused();
-  // The SDK transports idempotencyKey, but the shipped host does not enforce a
-  // general g12:* replay fence. Persist uncertainty BEFORE any possible effect.
+  // The host has no general g12:* replay fence or reliable admission receipt.
+  // Persist a bounded reservation before dispatch, not an exactly-once claim.
   await host.state.set(receiptKey, { pendingAt: now, reconcileAt: now + RECONCILE_AFTER_MS, agentId: owner.agentId, issueId: owner.issueId });
   if (Date.now() >= deadline) throw new ScanPaused();
   let result;
   try {
     result = await host.issues.requestWakeup(owner.issueId, config.companyId, {
-      reason: key, contextSource: "smarty.g12-backstop", idempotencyKey: key,
+      reason: `${JSON.stringify({ dedupeKey: key, ...context })}\n${OWNER_INSTRUCTION}`,
+      contextSource: "smarty.g12-backstop", idempotencyKey: key,
     });
   } catch {
-    // Throws include both pre-dispatch refusals and lost accepted responses.
-    // Neither text nor the caught RPC Error type proves which one occurred.
-    counts.unresolved++;
-    host.logger.warn("G12 wake unresolved", { code: Code.WakeFailed });
-    throw new WakeRefusal(Code.WakeFailed);
+    // Both pre-dispatch refusals and lost accepted responses are retryable.
+    // Never inspect upstream error text/type or expose it in state/logs.
+    return refuse(Code.WakeFailed, true);
   }
   if (result?.queued === false) return refuse(Code.WakeRefused, true);
-  if (result?.queued !== true) {
-    counts.unresolved++;
-    host.logger.warn("G12 wake unresolved", { code: Code.WakeFailed });
-    throw new WakeRefusal(Code.WakeFailed);
-  }
+  if (result?.queued !== true) return refuse(Code.WakeFailed, true);
   counts.wakes++;
-  // If this acknowledgement write fails, pending remains and suppresses replay.
+  // Sent receipt (legacy acceptedAt shape). A failed write leaves pending,
+  // which suppresses replay only until its bounded recovery deadline.
   await host.state.set(receiptKey, { acceptedAt: now, agentId: owner.agentId, issueId: owner.issueId });
 }
 
@@ -169,7 +167,8 @@ export interface WakeReconciliation {
  * Bounded, single-key ADMIN maintenance helper, not a worker tool or retry loop.
  * Caller MUST disable/drain the job and obtain positive host evidence first.
  * An empty history query or a timeout is NOT proof of not-dispatched. Unknown
- * outcomes must remain pending/unresolved. No new host capability is required.
+ * outcomes need no operator action: pending automatically re-arms after its
+ * bounded wait. No new host capability is required.
  */
 export async function reconcileWake(state: Pick<Host["state"], "get" | "set">, companyId: string, key: string, proof: WakeReconciliation, now = Date.now()): Promise<void> {
   try {
@@ -204,8 +203,8 @@ export async function runTick(host: Host, config: G12Config, now = Date.now()): 
   let github: GitHub | undefined;
   let complete = false;
   let refusal: WakeRefusal | undefined;
-  async function tryWake(owner: G12Config["owners"][string], key: string) {
-    try { await wake(host, config, owner, key, now, counts, deadline); }
+  async function tryWake(owner: G12Config["owners"][string], key: string, context: WakeContext) {
+    try { await wake(host, config, owner, key, context, now, counts, deadline); }
     catch (error) {
       if (!(error instanceof WakeRefusal)) throw error;
       refusal ??= error;
@@ -249,19 +248,21 @@ export async function runTick(host: Host, config: G12Config, now = Date.now()): 
             const checks = page.filter((check) => check.head_sha === head);
             counts.checks += checks.length;
             cursor.reviewFound ||= checks.some((check) => check.name === "Paperclip Review" && check.app.id === config.appId);
-            const keys = new Set<string>();
+            const keys = new Map<string, WakeContext>();
             for (const check of checks) {
               if (check.status !== "completed" || !["failure", "timed_out"].includes(check.conclusion ?? "")) continue;
               counts.failing++;
-              keys.add(`g12:fail:${identity}:${check.app.id}:${check.id}:${check.conclusion}`);
+              keys.set(`g12:fail:${identity}:${check.app.id}:${check.id}:${check.conclusion}`, {
+                repo, prNumber: pr.number, headSha: head, checkRunId: check.id, conclusion: check.conclusion!,
+              });
             }
-            for (const key of keys) await tryWake(owner, key);
+            for (const [key, context] of keys) await tryWake(owner, key, context);
             if (page.length < 100) break;
             cursor.checkPage++;
           }
           if (!cursor.reviewFound && now - firstSeen >= config.missingReviewMinutes * 60_000) {
             counts.missing++;
-            await tryWake(owner, `g12:missing:${identity}`);
+            await tryWake(owner, `g12:missing:${identity}`, { repo, prNumber: pr.number, headSha: head });
           }
           resetChecks(cursor);
         }

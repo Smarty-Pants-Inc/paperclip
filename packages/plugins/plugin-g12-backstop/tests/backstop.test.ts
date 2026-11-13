@@ -124,11 +124,117 @@ function fake(store = new Map<string, unknown>()) {
 const job: PluginJobContext = { jobKey: "g12-backstop", runId: "test-run", trigger: "schedule", scheduledAt: new Date(T).toISOString() };
 function getCount(f: ReturnType<typeof fake>) { return f.requests.filter(({ init }) => init.method === "GET").length; }
 
+const OWNER_INSTRUCTION = "Before acting, check GitHub for an existing review/comment or action at this PR head sha (or for this check run); if one exists, stop.";
+const PENDING_WAIT = 1_800_000;
+
+function expectOwnerContext(reason: string, context: Record<string, unknown>) {
+  const [payload, instruction, ...extra] = reason.split("\n");
+  expect(JSON.parse(payload)).toEqual(context);
+  expect(instruction).toBe(OWNER_INSTRUCTION);
+  expect(extra).toEqual([]);
+}
+
+async function crashAfterPending(f: ReturnType<typeof fake>) {
+  const set = f.ctx.state.set;
+  f.ctx.state.set = async (key, value) => {
+    await set(key, value);
+    if (key.stateKey.startsWith("wake:")) throw new Error("crash after durable pending");
+  };
+  try { await expect(f.tick()).rejects.toThrow(Code.TickFailed); }
+  finally { f.ctx.state.set = set; }
+  expect(f.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+}
+
+describe("G12 fix-round-3 at-least-once recovery", () => {
+  // Keep reason: PR #23/RFL admission uncertainty and crash boundaries cannot
+  // be safely reproduced with live daily-work actions in this bounded task.
+  it("A recovers a crash after pending and before dispatch at the 30-minute bound", async () => {
+    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    const set = f.ctx.state.set;
+    f.ctx.state.set = async (key, value) => {
+      await set(key, value);
+      if (key.stateKey.startsWith("wake:")) throw new Error("crash after durable pending");
+    };
+    await expect(f.tick()).rejects.toThrow(Code.TickFailed);
+    expect(f.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    const restarted = fake(f.store); restarted.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    await restarted.tick(T + PENDING_WAIT - 1);
+    expect(restarted.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect((await restarted.tick(T + PENDING_WAIT)).wakes).toBe(1);
+    await restarted.tick(T + PENDING_WAIT);
+    expect(restarted.wakes).toHaveLength(1);
+  });
+
+  it.each(["blocker", "status", "budget"])("B automatically retries a thrown %s refusal after backoff and restart", async (blocker) => {
+    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    f.ctx.issues.requestWakeup = vi.fn(async () => { throw new Error(`host refused: ${blocker}`); });
+    await expect(f.tick()).rejects.toThrow(Code.WakeFailed);
+    expect(f.wakes).toHaveLength(0);
+    expect([...f.store.values()]).toContainEqual({ attempts: 1, retryAt: T + 300_000 });
+    const restarted = fake(f.store); restarted.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    await restarted.tick(T + 299_999);
+    expect(restarted.ctx.issues.get).not.toHaveBeenCalled();
+    expect(restarted.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect((await restarted.tick(T + 300_000)).wakes).toBe(1);
+    expect((await restarted.tick(T + 300_000)).deduped).toBe(1);
+  });
+
+  it.each(["failure", "missing"])("C permits a deferred duplicate admission with the full %s owner contract", async (kind) => {
+    const f = fake();
+    if (kind === "failure") f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    else await f.tick();
+    const request = f.ctx.issues.requestWakeup;
+    let attempts = 0;
+    f.ctx.issues.requestWakeup = async (id, companyId, options) => {
+      const result = await request(id, companyId, options); // Host admits deferred work.
+      return ++attempts === 1 ? { queued: false, runId: null } : result;
+    };
+    const now = kind === "failure" ? T : T + 900_000;
+    await expect(f.tick(now)).rejects.toThrow(Code.WakeRefused);
+    expect((await f.tick(now + 300_000)).wakes).toBe(1);
+    expect(f.wakes).toHaveLength(2); // Duplicate delivery is intentional, not duplicate permission to act.
+    const key = kind === "failure" ? `g12:fail:123:1:${A}:42:456:failure` : `g12:missing:123:1:${A}`;
+    for (const wake of f.wakes) {
+      expect(wake.opts.idempotencyKey).toBe(key);
+      expectOwnerContext(wake.opts.reason, { dedupeKey: key, repo: "org/repo", prNumber: 1, headSha: A,
+        ...(kind === "failure" ? { checkRunId: 456, conclusion: "failure" } : {}) });
+    }
+  });
+
+  it("recovers legacy unresolved pending receipts instead of leaving old installations suppressed forever", async () => {
+    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    await crashAfterPending(f);
+    const receiptKey = [...f.store.keys()].find((key) => JSON.parse(key).stateKey.startsWith("wake:"))!;
+    f.store.set(receiptKey, { pendingAt: T, reconcileAt: T + 900_000, unresolvedAt: T + 900_000, agentId: agent, issueId: issue });
+    const restarted = fake(f.store); restarted.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    expect((await restarted.tick(T + PENDING_WAIT)).wakes).toBe(1);
+    await restarted.tick(T + 86_400_000);
+    expect(restarted.wakes).toHaveLength(1);
+  });
+
+  it("bounds retries to one dispatch per key per tick, persists backoff, and never loops within a tick", async () => {
+    const f = fake(); f.setConfig({ ...rawConfig(), maxGetsPerTick: 2 });
+    f.checks.set(`org/repo:${A}`, Array.from({ length: 99 }, () => check({ conclusion: "failure" })));
+    f.setWakeMode("throw-after-effect");
+    await expect(f.tick()).rejects.toThrow(Code.WakeFailed);
+    expect(f.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(getCount(f)).toBe(2);
+    const restarted = fake(f.store); restarted.setConfig({ ...rawConfig(), maxGetsPerTick: 2 });
+    restarted.checks.set(`org/repo:${A}`, f.checks.get(`org/repo:${A}`)!);
+    // Revisit twice before the per-key deadline, without redispatching.
+    await restarted.tick(T + 1); await restarted.tick(T + 299_999);
+    expect(restarted.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    await restarted.tick(T + 300_000);
+    expect(restarted.wakes).toHaveLength(1);
+    expect(getCount(restarted)).toBeLessThanOrEqual(6);
+  });
+});
+
 describe("G12 fix-round-2 regressions", () => {
   // Keep reason: PR #23 RFL data-safety failures across admission/receipt/restart boundaries.
   // The fake host intentionally does NOT dedupe arbitrary idempotencyKey values:
   // the shipped queue persists g12:* keys but has no corresponding replay fence.
-  it.each(["lost-response", "receipt-write-failed"])("F1a never repeats an accepted wake after %s and restart", async (mode) => {
+  it.each(["lost-response", "receipt-write-failed"])("F1a retries uncertain delivery after %s and restart, then suppresses a sent key", async (mode) => {
     const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
     if (mode === "lost-response") f.setWakeMode("throw-after-effect");
     else {
@@ -141,15 +247,17 @@ describe("G12 fix-round-2 regressions", () => {
     await expect(f.tick()).rejects.toThrow(mode === "lost-response" ? Code.WakeFailed : Code.TickFailed);
     expect(f.wakes).toHaveLength(1);
     expect(f.wakes[0].opts.idempotencyKey).toBe(`g12:fail:123:1:${A}:42:456:failure`);
-    expect([...f.store.values()]).toContainEqual(expect.objectContaining({ pendingAt: T, reconcileAt: T + 900_000 }));
+    const delay = mode === "lost-response" ? 300_000 : PENDING_WAIT;
+    if (mode === "receipt-write-failed") {
+      expect([...f.store.values()]).toContainEqual(expect.objectContaining({ pendingAt: T, reconcileAt: T + PENDING_WAIT }));
+    }
     const restarted = fake(f.store); restarted.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
-    await restarted.tick(T + 300_000);
-    // Expiry calls for reconciliation, never proof of non-acceptance or permission to resend.
-    expect((await restarted.tick(T + 900_000)).unresolved).toBe(1);
-    await restarted.tick(T + 86_400_000);
-    expect(restarted.wakes).toHaveLength(0);
+    await restarted.tick(T + delay - 1);
     expect(restarted.ctx.issues.requestWakeup).not.toHaveBeenCalled();
-    expect(f.wakes.length + restarted.wakes.length).toBe(1);
+    expect((await restarted.tick(T + delay)).wakes).toBe(1);
+    await restarted.tick(T + 86_400_000);
+    expect(restarted.wakes).toHaveLength(1);
+    expect(f.wakes.length + restarted.wakes.length).toBe(2);
   });
 
   it("F1a never dispatches without an acknowledged pending write, including a lost write acknowledgement", async () => {
@@ -188,7 +296,7 @@ describe("G12 fix-round-2 regressions", () => {
     } finally { clock.mockRestore(); }
   });
 
-  it("F1b backs off refused keys across 12 restarted ticks and advances the two-GET cursor to PR 2", async () => {
+  it.each(["queued:false", "throw"])("F1b backs off %s keys across 12 restarted ticks and advances the two-GET cursor to PR 2", async (mode) => {
     const store = new Map<string, unknown>();
     const attempts: string[] = [], accepted: string[] = [];
     for (let tick = 0; tick < 12; tick++) {
@@ -198,7 +306,10 @@ describe("G12 fix-round-2 regressions", () => {
       const request = f.ctx.issues.requestWakeup;
       f.ctx.issues.requestWakeup = async (id, companyId, options) => {
         const key = options!.idempotencyKey!; attempts.push(key);
-        if (key.startsWith("g12:fail:123:1:")) return { queued: false, runId: null };
+        if (key.startsWith("g12:fail:123:1:")) {
+          if (mode === "throw") throw new Error("Issue is blocked by unresolved blockers");
+          return { queued: false, runId: null };
+        }
         const result = await request(id, companyId, options); accepted.push(key); return result;
       };
       await f.tick(T + tick * 300_000).catch(() => {});
@@ -209,11 +320,12 @@ describe("G12 fix-round-2 regressions", () => {
     expect(attempts.filter((key) => key.startsWith("g12:fail:123:1:")).length).toBeLessThanOrEqual(4);
   });
 
-  it("F1b retries a definitive queued:false only at its persisted deadline and caps exponential backoff", async () => {
-    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]); f.setWakeMode("refused");
+  it.each(["queued:false", "throw"])("F1b retries %s only at its persisted deadline and caps exponential backoff", async (mode) => {
+    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    f.setWakeMode(mode === "throw" ? "throw-after-effect" : "refused");
     let now = T;
     for (const delay of [300_000, 600_000, 1_200_000, 2_400_000, 3_600_000, 3_600_000]) {
-      await expect(f.tick(now)).rejects.toThrow(Code.WakeRefused);
+      await expect(f.tick(now)).rejects.toThrow(mode === "throw" ? Code.WakeFailed : Code.WakeRefused);
       const before = vi.mocked(f.ctx.issues.requestWakeup).mock.calls.length;
       await f.tick(now + delay - 1);
       expect(f.ctx.issues.requestWakeup).toHaveBeenCalledTimes(before);
@@ -243,24 +355,23 @@ describe("G12 fix-round-2 regressions", () => {
     expect(errorCode({ code: Code.ConfigSecretRef, message: Code.ConfigSecretRef }, Code.JobFailed)).toBe(Code.JobFailed);
   });
 
-  it("F1a protects the missing-review key across a lost accepted response and restart too", async () => {
+  it("F1a retries the missing-review key after a lost accepted response and restart too", async () => {
     const f = fake(); await f.tick(); f.setWakeMode("throw-after-effect");
     await expect(f.tick(T + 900_000)).rejects.toThrow(Code.WakeFailed);
     expect(f.wakes.map((wake) => wake.opts.idempotencyKey)).toEqual([`g12:missing:123:1:${A}`]);
-    const restarted = fake(f.store); await restarted.tick(T + 1_200_000);
+    const restarted = fake(f.store); await restarted.tick(T + 1_199_999);
     expect(restarted.wakes).toHaveLength(0);
     expect(restarted.ctx.issues.requestWakeup).not.toHaveBeenCalled();
+    expect((await restarted.tick(T + 1_200_000)).wakes).toBe(1);
   });
 
-  it("F1a bounds unresolved reconciliation to one state transition/warning and permits positive acceptance reconciliation", async () => {
-    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]); f.setWakeMode("throw-after-effect");
-    await expect(f.tick()).rejects.toThrow(Code.WakeFailed);
+  it("F1a suppresses pending only within its bounded wait and permits positive acceptance reconciliation", async () => {
+    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    await crashAfterPending(f);
     await f.tick(T + 900_000);
     const writes = vi.mocked(f.ctx.state.set).mock.calls.filter(([key]) => key.stateKey.startsWith("wake:")).length;
-    await f.tick(T + 86_400_000); await f.tick(T + 86_700_000);
+    await f.tick(T + PENDING_WAIT - 1);
     expect(vi.mocked(f.ctx.state.set).mock.calls.filter(([key]) => key.stateKey.startsWith("wake:"))).toHaveLength(writes);
-    expect(f.warnings.filter((warning) => JSON.stringify(warning).includes(Code.WakeUnresolved))).toHaveLength(1);
-    expect([...f.store.values()]).toContainEqual(expect.objectContaining({ unresolvedAt: T + 900_000 }));
     const reads = vi.mocked(f.ctx.state.get).mock.calls.length, before = vi.mocked(f.ctx.state.set).mock.calls.length;
     await reconcileWake(f.ctx.state, company, `g12:fail:123:1:${A}:42:456:failure`, {
       pendingAt: T, agentId: agent, issueId: issue, outcome: "accepted",
@@ -268,12 +379,12 @@ describe("G12 fix-round-2 regressions", () => {
     expect(f.ctx.state.get).toHaveBeenCalledTimes(reads + 1);
     expect(f.ctx.state.set).toHaveBeenCalledTimes(before + 1);
     expect((await f.tick(T + 87_000_000)).unresolved).toBe(0);
-    expect(f.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(f.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
 
   it.each(["timestamp", "agent", "issue", "outcome"])("F1a rejects stale or mismatched %s reconciliation without changing state", async (field) => {
-    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]); f.setWakeMode("throw-after-effect");
-    await expect(f.tick()).rejects.toThrow(Code.WakeFailed);
+    const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
+    await crashAfterPending(f);
     const before = structuredClone([...f.store.entries()]);
     const proof = { pendingAt: T, agentId: agent, issueId: issue, outcome: "not-dispatched" as const };
     if (field === "timestamp") proof.pendingAt++;
@@ -282,7 +393,7 @@ describe("G12 fix-round-2 regressions", () => {
     if (field === "outcome") Object.assign(proof, { outcome: "unknown" });
     await expect(reconcileWake(f.ctx.state, company, `g12:fail:123:1:${A}:42:456:failure`, proof, T)).rejects.toThrow(Code.WakeReconcileInvalid);
     expect([...f.store.entries()]).toEqual(before);
-    expect(f.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(f.ctx.issues.requestWakeup).not.toHaveBeenCalled();
   });
 
   it("F6(e) also sanitizes upstream state errors at the admin reconciliation boundary", async () => {
@@ -306,6 +417,8 @@ describe("G12 fix-round-2 regressions", () => {
     f.ctx.state.set = set; await f.tick(T + 300_000);
     expect(f.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
     expect([...f.store.values()]).toContainEqual(expect.objectContaining({ pendingAt: T }));
+    f.setWakeMode("ok");
+    expect((await f.tick(T + PENDING_WAIT)).wakes).toBe(1);
   });
 
   it.each(["receipt", "retry"])("F1 fails closed on corrupt %s metadata before dispatch", async (kind) => {
@@ -320,22 +433,14 @@ describe("G12 fix-round-2 regressions", () => {
 
 describe("G12 fix-round regressions", () => {
   // Keep reason: PR #23/RFL findings at the host admission, credential and state trust boundaries.
-  it.each(["blockers", "status", "budget", "queued:false"])("F1 retries a proven pre-dispatch %s refusal after backoff/reconciliation, including worker restart", async (mode) => {
+  it.each(["blockers", "status", "budget", "queued:false"])("F1 automatically retries a pre-dispatch %s refusal after backoff, including worker restart", async (mode) => {
     const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
     if (mode === "queued:false") f.setWakeMode("refused");
     else f.ctx.issues.requestWakeup = async () => { throw new Error(`host refused: ${mode}`); };
     await f.tick().catch(() => {});
     expect(f.wakes).toHaveLength(0);
     const receipt = [...f.store.entries()].find(([key]) => JSON.parse(key).stateKey.startsWith("wake:"))![1];
-    if (mode === "queued:false") expect(receipt).toBeNull();
-    else {
-      expect(receipt).toMatchObject({ pendingAt: T });
-      // Only this fake host knows it threw before any effect. A real RPC Error
-      // does not prove that: an admin must positively reconcile the one key.
-      await reconcileWake(f.ctx.state, company, `g12:fail:123:1:${A}:42:456:failure`, {
-        pendingAt: T, agentId: agent, issueId: issue, outcome: "not-dispatched",
-      }, T);
-    }
+    expect(receipt).toBeNull(); // Every refusal retries automatically; no admin proof required.
     const restarted = fake(f.store); restarted.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
     expect((await restarted.tick(T + 299_999)).wakes).toBe(0);
     expect((await restarted.tick(T + 300_000)).wakes).toBe(1);
@@ -428,7 +533,7 @@ describe("G12 fix-round regressions", () => {
 });
 
 describe("G12 cursor, identity and boundary coverage", () => {
-  it("F1 keeps accepted siblings deduped while retrying a positively reconciled refusal after backoff", async () => {
+  it("F1 keeps sent siblings deduped while automatically retrying a thrown refusal after backoff", async () => {
     const f = fake();
     f.checks.set(`org/repo:${A}`, [check({ id: 1, conclusion: "failure" }), check({ id: 2, conclusion: "failure" })]);
     const request = f.ctx.issues.requestWakeup;
@@ -438,9 +543,6 @@ describe("G12 cursor, identity and boundary coverage", () => {
     };
     await expect(f.tick()).rejects.toThrow("G12_WAKE_FAILED"); expect(f.wakes).toHaveLength(1);
     f.ctx.issues.requestWakeup = request;
-    await reconcileWake(f.ctx.state, company, `g12:fail:123:1:${A}:42:2:failure`, {
-      pendingAt: T, agentId: agent, issueId: issue, outcome: "not-dispatched",
-    }, T);
     expect(await f.tick(T + 300_000)).toMatchObject({ wakes: 1, deduped: 1 }); expect(f.wakes).toHaveLength(2);
   });
 
@@ -552,7 +654,7 @@ describe("G12 cursor, identity and boundary coverage", () => {
     const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
     f.ctx.issues.requestWakeup = async () => { throw new Error("G12_PRIVATE_KEY_SENTINEL"); };
     await expect(f.tick()).rejects.toThrow(/^G12_WAKE_FAILED$/);
-    expect(f.warnings).toEqual([{ message: "G12 wake unresolved", meta: { code: "G12_WAKE_FAILED" } }]);
+    expect(f.warnings).toEqual([{ message: "G12 wake refused", meta: { code: "G12_WAKE_FAILED" } }]);
     expect(JSON.stringify([f.logs, f.warnings, [...f.store.entries()]])).not.toContain("G12_PRIVATE_KEY_SENTINEL");
   });
 
@@ -589,7 +691,8 @@ describe("G12 code-only backstop", () => {
     expect(f.wakes).toHaveLength(0);
     expect((await f.tick(T + 15 * 60_000)).wakes).toBe(1);
     expect(f.wakes[0]).toEqual({ issueId: issue, companyId: company, opts: {
-      reason: `g12:missing:123:1:${A}`, contextSource: "smarty.g12-backstop", idempotencyKey: `g12:missing:123:1:${A}`,
+      reason: `${JSON.stringify({ dedupeKey: `g12:missing:123:1:${A}`, repo: "org/repo", prNumber: 1, headSha: A })}\n${OWNER_INSTRUCTION}`,
+      contextSource: "smarty.g12-backstop", idempotencyKey: `g12:missing:123:1:${A}`,
     } });
     expect((await f.tick(T + 20 * 60_000)).deduped).toBe(1);
     const restarted = fake(f.store);
@@ -670,13 +773,14 @@ describe("G12 code-only backstop", () => {
     f.ctx.http.fetch = original; await f.tick(T + 1_000_000); expect(f.wakes).toHaveLength(1);
   });
 
-  it("keeps an ambiguous response pending rather than either claiming acceptance or repeating its possible effect", async () => {
+  it("backs off an ambiguous response without claiming acceptance, then retries its possible effect", async () => {
     const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]); f.setWakeMode("throw-after-effect");
     await expect(f.tick()).rejects.toThrow("G12_WAKE_FAILED"); expect(f.wakes).toHaveLength(1);
-    expect([...f.store.values()]).toContainEqual(expect.objectContaining({ pendingAt: T }));
+    expect([...f.store.values()]).toContainEqual({ attempts: 1, retryAt: T + 300_000 });
     expect([...f.store.values()].some((value) => value !== null && typeof value === "object" && "acceptedAt" in value)).toBe(false);
     f.setWakeMode("ok"); expect((await f.tick()).wakes).toBe(0);
-    expect((await f.tick()).deduped).toBe(1); expect(f.wakes).toHaveLength(1);
+    expect((await f.tick()).refused).toBe(1); expect(f.wakes).toHaveLength(1);
+    expect((await f.tick(T + 300_000)).wakes).toBe(1); expect(f.wakes).toHaveLength(2);
     expect(JSON.stringify([f.logs, f.warnings])).not.toContain("synthetic-installation-token");
   });
 
@@ -692,7 +796,7 @@ describe("G12 code-only backstop", () => {
     expect((await f.tick()).deduped).toBe(1); expect(f.wakes).toHaveLength(1);
   });
 
-  it("surfaces failure to save an acceptance while preserving its pre-dispatch reservation against replay", async () => {
+  it("surfaces failure to save a sent receipt while suppressing replay only within the pending wait", async () => {
     const f = fake(); f.checks.set(`org/repo:${A}`, [check({ conclusion: "failure" })]);
     const set = f.ctx.state.set;
     f.ctx.state.set = async (key, value) => {
@@ -703,8 +807,10 @@ describe("G12 code-only backstop", () => {
     expect([...f.store.values()]).toContainEqual(expect.objectContaining({ pendingAt: T }));
     f.ctx.state.set = set; f.setWakeMode("refused");
     expect((await f.tick()).deduped).toBe(1);
-    expect((await f.tick(T + 900_000)).unresolved).toBe(1);
+    expect((await f.tick(T + PENDING_WAIT - 1)).deduped).toBe(1);
     expect(f.ctx.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    await expect(f.tick(T + PENDING_WAIT)).rejects.toThrow(Code.WakeRefused);
+    expect(f.ctx.issues.requestWakeup).toHaveBeenCalledTimes(2);
   });
 
   it("keeps an unconfigured/disabled worker completely quiet, including no secret or HTTP access", async () => {
@@ -809,6 +915,13 @@ describe("G12 code-only backstop", () => {
       expect(f.wakes.map((wake) => wake.opts.idempotencyKey)).toEqual([
         `g12:missing:123:1:${A}`, `g12:fail:123:1:${A}:42:456:timed_out`,
       ]);
+      expectOwnerContext(f.wakes[0].opts.reason, {
+        dedupeKey: `g12:missing:123:1:${A}`, repo: "org/repo", prNumber: 1, headSha: A,
+      });
+      expectOwnerContext(f.wakes[1].opts.reason, {
+        dedupeKey: `g12:fail:123:1:${A}:42:456:timed_out`, repo: "org/repo", prNumber: 1, headSha: A,
+        checkRunId: 456, conclusion: "timed_out",
+      });
       expect(new Set(methods)).toEqual(new Set(["log", "config.get", "secrets.resolve", "state.get", "state.set", "http.fetch", "issues.get", "issues.requestWakeup"]));
       expect(failures).toEqual([]); expect(pending.size).toBe(0);
     } finally {

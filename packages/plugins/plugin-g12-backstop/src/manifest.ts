@@ -6,7 +6,7 @@ const manifest: PaperclipPluginManifestV1 = {
   apiVersion: 1,
   version: "0.1.0",
   displayName: "G12 backstop",
-  description: "Code-only safety net: detect missing App reviews and failing checks, then wake the configured PR owner once.",
+  description: "Code-only safety net: detect missing App reviews and failing checks, then wake the configured PR owner with at-least-once delivery.",
   author: "Smarty Pants",
   categories: ["automation"],
   capabilities: [
