@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
+import { open, stat } from "node:fs/promises";
 
 const READ_BUDGET_BYTES = 1024 * 1024;
 const MAX_RECORD_BYTES = 64 * 1024;
@@ -10,6 +10,7 @@ export class RunnerdTraceFrameIndex {
   #identity = "";
   #offset = 0;
   #mtimeMs = 0;
+  #complete = false;
   #record = 0;
   #settledAt = 0;
   #partial: Buffer[] = [];
@@ -17,7 +18,8 @@ export class RunnerdTraceFrameIndex {
   #discardUntilNewline = false;
   #frames = new Map<string, Frame>();
   #snapshotActive = false;
-  #snapshot: { tracePath: string; ready: boolean } | { tracePath: string; error: unknown } | null = null;
+  #snapshot: { tracePath: string; ready: boolean } | null = null;
+  #refreshes = new Map<string, Promise<void>>();
 
   withSnapshot<T>(work: () => T): T {
     if (this.#snapshotActive) return work();
@@ -33,14 +35,10 @@ export class RunnerdTraceFrameIndex {
   locate(tracePath: string, sourceEventId: string) {
     let snapshot = this.#snapshotActive ? this.#snapshot : null;
     if (snapshot?.tracePath !== tracePath) {
-      try {
-        snapshot = { tracePath, ready: this.#refresh(tracePath) };
-      } catch (error) {
-        snapshot = { tracePath, error };
-      }
+      snapshot = { tracePath, ready: this.#complete && this.#identity !== "" };
+      this.#requestRefresh(tracePath);
       if (this.#snapshotActive) this.#snapshot = snapshot;
     }
-    if ("error" in snapshot) throw snapshot.error;
     if (!snapshot.ready) return { frameId: null, nativeChannelSettled: false };
     const frame = this.#frames.get(sourceEventId);
     return {
@@ -49,44 +47,57 @@ export class RunnerdTraceFrameIndex {
     };
   }
 
-  #refresh(tracePath: string): boolean {
-    const stat = statSync(tracePath);
-    const identity = `${stat.dev}:${stat.ino}`;
+  async refresh(tracePath: string, drain = false): Promise<void> {
+    const inFlight = this.#refreshes.get(tracePath);
+    if (inFlight) await inFlight;
+    this.#requestRefresh(tracePath);
+    await this.#refreshes.get(tracePath);
+    while (drain) {
+      const current = await stat(tracePath).catch(() => null);
+      if (!current || current.size <= this.#offset) return;
+      this.#requestRefresh(tracePath);
+      await this.#refreshes.get(tracePath);
+    }
+  }
+
+  #requestRefresh(tracePath: string): void {
+    if (this.#refreshes.has(tracePath)) return;
+    const refresh = this.#refresh(tracePath)
+      .catch(() => undefined)
+      .finally(() => this.#refreshes.delete(tracePath));
+    this.#refreshes.set(tracePath, refresh);
+  }
+
+  async #refresh(tracePath: string): Promise<void> {
+    const current = await stat(tracePath);
+    const identity = `${current.dev}:${current.ino}`;
     if (
-      identity !== this.#identity || stat.size < this.#offset ||
-      (stat.size === this.#offset && stat.mtimeMs !== this.#mtimeMs)
+      identity !== this.#identity || current.size < this.#offset ||
+      (current.size === this.#offset && current.mtimeMs !== this.#mtimeMs)
     ) {
       this.clear();
       this.#identity = identity;
     }
-    this.#mtimeMs = stat.mtimeMs;
-    if (stat.size > this.#offset) {
-      const fd = openSync(tracePath, "r");
+    this.#mtimeMs = current.mtimeMs;
+    if (current.size > this.#offset) {
+      const file = await open(tracePath, "r");
       try {
-        const opened = fstatSync(fd);
-        // Do not mix a replacement file with the prefix we already indexed.
-        if (`${opened.dev}:${opened.ino}` !== identity) {
-          return false;
-        }
-        const buffer = Buffer.allocUnsafe(Math.min(READ_BUDGET_BYTES, stat.size - this.#offset));
-        const bytes = readSync(fd, buffer, 0, buffer.length, this.#offset);
-        this.#offset += bytes;
+        const opened = await file.stat();
+        if (`${opened.dev}:${opened.ino}` !== identity) return;
+        const buffer = Buffer.allocUnsafe(Math.min(READ_BUDGET_BYTES, current.size - this.#offset));
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, this.#offset);
+        this.#offset += bytesRead;
         let start = 0;
-        for (let end = buffer.indexOf(10); end !== -1 && end < bytes; end = buffer.indexOf(10, start)) {
+        for (let end = buffer.indexOf(10); end !== -1 && end < bytesRead; end = buffer.indexOf(10, start)) {
           this.#consume(buffer.subarray(start, end), true);
           start = end + 1;
         }
-        if (start < bytes) this.#consume(buffer.subarray(start, bytes), false);
+        if (start < bytesRead) this.#consume(buffer.subarray(start, bytesRead), false);
       } finally {
-        closeSync(fd);
+        await file.close();
       }
     }
-    // Until the observed suffix is indexed, a later interpretation or terminal
-    // status may supersede the prefix. Let the existing pending queue retry.
-    if (this.#offset < stat.size || this.#partialBytes > 0 || this.#discardUntilNewline) {
-      return false;
-    }
-    return true;
+    this.#complete = this.#offset >= current.size && this.#partialBytes === 0 && !this.#discardUntilNewline;
   }
 
   clear() {
@@ -94,6 +105,7 @@ export class RunnerdTraceFrameIndex {
     this.#identity = "";
     this.#offset = 0;
     this.#mtimeMs = 0;
+    this.#complete = false;
     this.#record = 0;
     this.#settledAt = 0;
     this.#partial = [];
@@ -104,8 +116,6 @@ export class RunnerdTraceFrameIndex {
 
   #consume(part: Buffer, terminated: boolean) {
     if (this.#discardUntilNewline || this.#partialBytes + part.length > MAX_RECORD_BYTES) {
-      // Raw provider frames can be tens of MiB. Correlation needs only small
-      // interpretation/status records; leave oversized records in the raw file.
       this.#partial = [];
       this.#partialBytes = 0;
       this.#discardUntilNewline = !terminated;
@@ -130,14 +140,11 @@ export class RunnerdTraceFrameIndex {
     try {
       entry = JSON.parse(line);
     } catch {
-      // A damaged debug record must not block later valid correlations.
       return;
     }
     if (!entry || typeof entry !== "object") return;
     this.#record += 1;
-    if (entry.kind === "trace_status" && entry.debugChannel === "rust_native") {
-      this.#settledAt = this.#record;
-    }
+    if (entry.kind === "trace_status" && entry.debugChannel === "rust_native") this.#settledAt = this.#record;
     if (entry.kind !== "interpretation" || !Array.isArray(entry.emittedEventIds)) return;
     const frameId = typeof entry.frameId === "number" ? entry.frameId : null;
     for (const eventId of entry.emittedEventIds) {

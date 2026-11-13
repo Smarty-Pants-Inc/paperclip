@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +11,14 @@ import { defaultCapabilityRunnerdBinary, fakeCodex, fakeCodexArgs } from "../../
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>();
-  return { ...fs, statSync: vi.fn(fs.statSync), existsSync: vi.fn(fs.existsSync) };
+  return {
+    ...fs,
+    statSync: vi.fn(fs.statSync),
+    existsSync: vi.fn(fs.existsSync),
+    openSync: vi.fn(fs.openSync),
+    fstatSync: vi.fn(fs.fstatSync),
+    readSync: vi.fn(fs.readSync),
+  };
 });
 
 afterEach(() => vi.restoreAllMocks());
@@ -90,6 +97,18 @@ it.each([false, true])("bounds filesystem calls across M pending entries and K r
   } finally {
     await f.cleanup();
   }
+}, 90_000);
+
+it("does not run synchronous trace-file I/O while pumping pending rehydrations", async () => {
+  const f = await fixture(true);
+  try {
+    f.transport.recordTraceInterpretation!(interpretation("sync-io-regression"));
+    for (const mock of [statSync, openSync, fstatSync, readSync]) vi.mocked(mock).mockClear();
+    await f.pump();
+    expect([statSync, openSync, fstatSync, readSync].some((mock) => vi.mocked(mock).mock.calls.length > 0)).toBe(false);
+  } finally {
+    await f.cleanup();
+  }
 }, 30_000);
 
 it("appends a late frame once, retaining distinct driver interpretations and contiguous sequences", async () => {
@@ -99,7 +118,9 @@ it("appends a late frame once, retaining distinct driver interpretations and con
     f.transport.recordTraceInterpretation!(interpretation("late", "item/completed"));
     for (let i = 0; i < 5; i++) await f.pump();
     appendFileSync(f.path, `${JSON.stringify({ kind: "interpretation", frameId: 42, emittedEventIds: ["late"] })}\n`);
-    for (let i = 0; i < 5; i++) await f.pump();
+    for (let i = 0; i < 100 && !existsSync(`${f.path}.rehydration`); i++) await f.pump();
+    await f.transport.close();
+    expect(existsSync(`${f.path}.rehydration`)).toBe(true);
     const records = readFileSync(`${f.path}.rehydration`, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     const late = records.filter((entry) => entry.sourceEventId === "late");
     expect(late).toHaveLength(2);
