@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.js";
 import { isLifecycleWorkPending } from "../domain/policy.js";
 import { lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "./failure.js";
+import { LIFECYCLE_STOP_FAILURE_LIMIT } from "./retry.js";
 
 /** Database leases protect each attempt across server processes. */
 export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
@@ -31,6 +32,19 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         void attempt({ ...context, stage: "renew" }, () => store.renew(agent, owner, new Date())).catch(() => {});
       }, 30_000);
       renewal.unref?.();
+      const deferIncomplete = (error: string | null, detail?: { invocationId?: string; pluginId?: string }) => {
+        if (!["pausing", "terminating", "cleaning_up"].includes(agent.lifecycleState)) {
+          return store.defer(agent, owner, error, new Date());
+        }
+        const stopFailures = (agent.lifecycleOperation?.stopFailures ?? 0) + 1;
+        const retryRequired = stopFailures >= LIFECYCLE_STOP_FAILURE_LIMIT;
+        const blocker = detail?.invocationId ? `invocation ${detail.invocationId}`
+          : detail?.pluginId ? `required plugin ${detail.pluginId}` : "invocation stop or resource cleanup proof";
+        const message = retryRequired
+          ? `Automatic stop work is paused after ${stopFailures} incomplete attempts in ${agent.lifecycleState}: ${blocker} remains unresolved (lifecycle operation ${agent.lifecycleOperation?.id}). Recheck the stop evidence, then use Retry.`
+          : error;
+        return store.defer(agent, owner, message, new Date(), { retryRequired, stopFailures });
+      };
       try {
         const operation = agent.lifecycleOperation!;
         const saved = agent.lifecycleRequiredPluginIds;
@@ -51,8 +65,8 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
             if (!await runStep("defer", () => store.defer(agent, owner, null, new Date(), { waitForSignal: true }))) continue;
             return;
           }
-          if (host === "pending") {
-            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date()))) continue;
+          if (host === "pending" || typeof host === "object") {
+            if (!await runStep("defer", () => deferIncomplete(null, typeof host === "object" ? host : undefined))) continue;
             return;
           }
           if (!await runStep("complete_host", () => store.completeHost(agent, owner))) continue;
@@ -65,7 +79,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
           }
           if (!await runStep("renew", () => store.renew(agent, owner, new Date()))) continue phase;
           if (await runStep("plugin", () => driver.runPlugin(agent, pluginId), pluginId) === "pending") {
-            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date()))) continue phase;
+            if (!await runStep("defer", () => deferIncomplete(null, { pluginId }))) continue phase;
             return;
           }
           if (!await runStep("complete_plugin", () => store.completePlugin(agent, owner, pluginId), pluginId)) continue phase;
@@ -90,7 +104,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         const retryRequired = lifecycleVerificationNeedsRetry(failureContext, error);
         if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined
           ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
-          : store.defer(agent, owner, message, new Date()))) continue;
+          : deferIncomplete(message, { pluginId: failureContext.pluginId }))) continue;
         return;
       } finally {
         clearInterval(renewal);

@@ -343,12 +343,31 @@ A database lease permits one active attempt for each agent.
 The worker renews that lease during external calls.
 Every host failure during verification or resume spends the operation's consecutive
 `verificationFailures` budget, including provider allocation failures before a test
-starts. Failed attempts wait at least one minute at the saved `retryAt`; scans and
-direct claims both honor that deadline. Three consecutive failures park the
+starts. Failed attempts use the shared bounded exponential backoff at the saved
+`retryAt` (one minute, two minutes, four minutes, capped at five minutes); scans
+and direct claims both honor that deadline. Three consecutive failures park the
 operation with `retryRequired: true` and a fixed, secret-safe `lifecycleError`
 identifying the last failure category. Known configuration or account failures
 park immediately. Host completion resets the counter. Retry or a configuration
 repair clears the parked operation's budget; a restart alone does not.
+
+Stop work (`pausing`, `terminating`, `cleaning_up`) counts incomplete host or
+required-plugin attempts in the saved operation's `stopFailures`. Both `pending`
+and failed attempts use the same growing backoff helper as verification. After
+five incomplete attempts the operation parks with `retryRequired: true`, no
+`retryAt`, and a visible `lifecycleError` naming the blocking invocation when the
+stop evidence identifies one, or the required plugin for pending plugin work.
+When no invocation can be identified, the error names the lifecycle operation
+and the unresolved stop/cleanup proof rather than inventing an invocation ID.
+The phase and all unfinished resources are retained; parking is not stop proof.
+Scans, direct claims, and coordinator deadlines exclude every parked lifecycle
+phase, including an operator's already-set `retryRequired` on stop work. Restart
+and later sweeps do not retry it. After checking the outstanding invocation or
+cleanup, the operator uses the existing Retry action to clear the park and its
+Stop budget. A successful stop then completes through the ordinary state path.
+A Retry racing an active attempt is retained; that old result cannot park over it.
+Claims deferred before external work do not consume a Stop attempt.
+
 Each result must match the current revision and lease owner.
 Shutdown waits for active work.
 
