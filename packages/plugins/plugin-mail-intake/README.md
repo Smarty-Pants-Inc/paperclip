@@ -21,6 +21,22 @@ which returns `{ status, message?, details? }` for the existing health dashboard
 The [SDK contract:250–258](https://github.com/Smarty-Pants-Inc/paperclip/blob/96c12d3a01cc5cbb90e4bd09a3e919d88d25cd23/packages/plugins/sdk/src/define-plugin.ts#L250-L258)
 confirms the host surfaces these diagnostics. No custom status UI or core change.
 
+## Secret-ref schema / runtime boundary
+
+The manifest declares each ref as `{type:"string", format:"secret-ref"}`.
+The settings picker still saves the **binding object**, never a raw UUID or value:
+[PLUGIN_SPEC.md:1293](../../../doc/plugins/PLUGIN_SPEC.md#L1293) and
+[PLUGIN_SPEC.md:1501](../../../doc/plugins/PLUGIN_SPEC.md#L1501).
+The host [plugin-config-validator.ts:32–34](../../../server/src/services/plugin-config-validator.ts#L32-L34)
+projects valid bindings to IDs for Ajv validation only. `parseConfig` validates
+stored binding objects, and the worker passes them unchanged to
+`ctx.secrets.resolve(ref, {companyId, configPath})` (SDK `src/types.ts`,
+`PluginSecretsClient.resolve`). Do not change runtime config to UUID strings.
+The authoring guide and SDK README at this package's base revision do not
+specify this schema projection; the cited specification and host validator do.
+`tests/host-config.test.ts` exercises that actual host validator plus runtime
+secret resolution and preserves the old object-schema failure as a control.
+
 ## Contract
 
 1. Re-read config using the explicitly bound company on each tick. Disabled or
