@@ -128,7 +128,10 @@ it.skipIf(!enabled)("latest secret rotation refreshes the Pi process without los
             for (const part of typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content ?? []) {
               if (part.type !== "text") continue;
               try {
-                const value = JSON.parse(part.text);
+                // The provider may prepend its owned cold-start directive after history
+                // loss; the native envelope after it must stay intact and parseable.
+                const envelopeStart = part.text.indexOf('{"schema":"paperclip.native-');
+                const value = JSON.parse(envelopeStart < 0 ? part.text : part.text.slice(envelopeStart));
                 if (value.completionContract) contract = value.completionContract;
                 if (value.schema === "paperclip.native-continuation.v1" && value.completion)
                   contract = { revision: value.completion.revision, criteria: value.completion.criterionIds.map((id: string) => ({ id })) };
