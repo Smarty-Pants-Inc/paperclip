@@ -5,9 +5,8 @@ import { createCapabilityRunnerdProviderEnvironment } from "./runnerd-codex-tran
 import { piProcessEnvironment } from "../drivers/pi/pi-process-environment.js";
 
 // Keep reason: controller -> runnerd credential/command-launcher trust boundary.
-// The seven-launcher regression now uses the single controller payload route;
-// launcher-looking direct input does not prove this run's projection provenance.
-const payloadKey = "PAPERCLIP_PI_GITHUB_PROJECTION_SECRET";
+// These explicit values have already crossed nativePiGitHubEnvironment; agent
+// configuration is stripped there, before the native transport is constructed.
 const projection = {
   BASH_ENV: "/managed/.bashrc", ZDOTDIR: "/managed", GH_CONFIG_DIR: "/managed/gh",
   PAPERCLIP_GITHUB_LAUNCHER_DIR: "/managed",
@@ -37,38 +36,37 @@ function runner(environment?: NodeJS.ProcessEnv) {
 afterEach(() => vi.unstubAllEnvs());
 
 it.each(Object.keys(projection) as Array<keyof typeof projection>)("carries this run's exact managed value for %s through both runnerd boundaries", name => {
-  const payload = JSON.stringify(projection);
-  const source = { PATH: "/managed:/usr/bin", ...projection, ...credentials, [payloadKey]: payload };
+  const source = { PATH: "/managed:/usr/bin", ...projection, ...credentials };
   const environment = runner(launch(source));
-  expect(environment[payloadKey]).toBe(payload);
-  expect(JSON.parse(environment[payloadKey]!)[name]).toBe(projection[name]);
+  expect(environment[name]).toBe(projection[name]);
   expect(environment.PATH).toBe(source.PATH);
-  expect(piProcessEnvironment(environment, {})).not.toHaveProperty(payloadKey);
+  expect(piProcessEnvironment(environment, {})[name]).toBe(projection[name]);
 });
 
-it.each([undefined, "", "  ", "/spoofed/launcher"])("does not authorize direct managed selectors with a spoofed launcher (%s)", launcher => {
+it.each([undefined, "", "  "])("does not authorize managed selectors without a launcher (%s)", launcher => {
   const environment = launch({ ...projection, PAPERCLIP_GITHUB_LAUNCHER_DIR: launcher, PAPERCLIP_GITHUB_AUTH_MODE: "managed" });
   for (const name of Object.keys(projection)) expect(environment).not.toHaveProperty(name);
-  expect(environment).not.toHaveProperty(payloadKey);
 });
 
-it("does not inherit an ambient managed projection or payload at either runnerd boundary", () => {
+it("does not inherit an ambient managed projection at either runnerd boundary", () => {
   for (const [name, value] of Object.entries(projection)) vi.stubEnv(name, value);
-  vi.stubEnv(payloadKey, JSON.stringify(projection));
   for (const environment of [launch(), runner(launch()), runner()]) {
     for (const name of Object.keys(projection)) expect(environment).not.toHaveProperty(name);
-    expect(environment).not.toHaveProperty(payloadKey);
   }
 });
 
+it.each(Object.keys(projection))("validates the managed %s through the shared sanitizer", name => {
+  expect(() => launch({ ...projection, [name]: "invalid\0value" })).toThrow(/null byte/);
+  expect(() => launch({ ...projection, [name]: "x".repeat(65_537) })).toThrow(/bounded launch size/);
+});
+
 it("keeps ACPX Pi unchanged and excludes raw credentials from native Pi", () => {
-  const source = { ...projection, ...credentials, [payloadKey]: JSON.stringify(projection) };
+  const source = { ...projection, ...credentials };
   const acpxPi = createSanitizedAcpxSpawnInput(source, "pi").env;
   for (const name of Object.keys(projection)) expect(acpxPi).not.toHaveProperty(name);
-  expect(acpxPi).not.toHaveProperty(payloadKey);
   for (const name of Object.keys(credentials)) {
     expect(launch(source)).not.toHaveProperty(name);
     expect(piProcessEnvironment(runner(launch(source)), {})).not.toHaveProperty(name);
   }
-  expect(source).toEqual({ ...projection, ...credentials, [payloadKey]: JSON.stringify(projection) });
+  expect(source).toEqual({ ...projection, ...credentials });
 });

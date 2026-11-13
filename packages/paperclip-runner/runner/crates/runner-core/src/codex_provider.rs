@@ -1046,27 +1046,6 @@ struct ProviderExitDrain {
     warning_emitted: bool,
 }
 
-// Only the controller's current GitHub projection may supply these Pi values.
-// Keep in sync with native-pi-github-environment.ts and Pi's TS ceiling.
-pub(crate) const PI_GITHUB_PROJECTION_KEYS: &[&str] = &[
-    "ZDOTDIR",
-    "BASH_ENV",
-    "GH_CONFIG_DIR",
-    "PAPERCLIP_GITHUB_LAUNCHER_DIR",
-    "PAPERCLIP_GITHUB_BROKER_URL",
-    "PAPERCLIP_GITHUB_BROKER_TOKEN",
-    "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
-    "GIT_TERMINAL_PROMPT",
-    "GIT_ASKPASS",
-    "SSH_ASKPASS",
-    "GIT_SSH_COMMAND",
-    "SSH_AUTH_SOCK",
-];
-pub(crate) const PI_GITHUB_PROJECTION_ENV: &str = "PAPERCLIP_PI_GITHUB_PROJECTION_SECRET";
-
 // The controller accepts at most 32 process-scoped Git config entries and
 // projects only these exact GitHub credential names into runnerd. Keep the
 // provider child boundary equally explicit: runnerd may inherit a configured

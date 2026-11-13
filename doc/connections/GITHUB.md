@@ -458,6 +458,15 @@ environment names come only from the controller's current managed projection;
 company/agent configuration and the Runner host's ambient environment cannot
 supply them. Setting `PAPERCLIP_GITHUB_AUTH_MODE` does not authorize a projection.
 Safe process-scoped Git configuration still passes through Pi's existing filter.
+The existing direct native launch environment carries these fifteen names through
+Runner's sanitizer, spawn boundary, and Pi proxy (not a serialized payload):
+`ZDOTDIR`, `BASH_ENV`, `GH_CONFIG_DIR`, `PAPERCLIP_GITHUB_LAUNCHER_DIR`,
+`PAPERCLIP_GITHUB_BROKER_URL`, `PAPERCLIP_GITHUB_BROKER_TOKEN`,
+`PAPERCLIP_GITHUB_BRIDGE_TOKEN`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`,
+`GIT_CONFIG_NOSYSTEM`, `GIT_TERMINAL_PROMPT`, `GIT_ASKPASS`, `SSH_ASKPASS`,
+`GIT_SSH_COMMAND`, and `SSH_AUTH_SOCK`. Without this run's managed launcher,
+none of these names is admitted; configured values are stripped before merging
+only the current managed projection.
 
 Tokens never appear in arguments, URLs, files, logs, events, or model context,
 and the projection never replaces `HOME`.

@@ -3826,13 +3826,9 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
   }
   if (input.provider === "pi_rpc") {
     const selected = {
-      ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env,
+      ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi", { nativePi: true }).env,
       ...piGitConfigEnvironment(input.options.environment ?? {}),
     };
-    // The controller-owned capability payload is not a configured setting or
-    // ACPX provider variable. Carry it explicitly to runnerd, never from ambient.
-    const githubProjection = input.options.environment?.PAPERCLIP_PI_GITHUB_PROJECTION_SECRET;
-    if (githubProjection !== undefined) selected.PAPERCLIP_PI_GITHUB_PROJECTION_SECRET = githubProjection;
     // Native Pi bypasses ACPX's home sandbox. Preserve only the explicit
     // server-provided home; PiRpcDriver validates it at the final spawn boundary.
     if (input.options.environment?.AGENT_HOME !== undefined) selected.AGENT_HOME = input.options.environment.AGENT_HOME;

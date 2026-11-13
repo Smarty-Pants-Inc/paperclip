@@ -33,9 +33,9 @@ describe("native Pi environment ceilings", () => {
       PAPERCLIP_GITHUB_AUTH_MODE: "managed", PAPERCLIP_PI_GITHUB_PROJECTION_SECRET: '{"BASH_ENV":"/guest/startup"}' };
     expect(piProcessEnvironment({}, ambient)).toEqual({});
   });
-  it("carries the controller payload only as far as runnerd, never into Pi", () => {
+  it("does not admit a legacy serialized projection at either Pi boundary", () => {
     const source = { PAPERCLIP_PI_GITHUB_PROJECTION_SECRET: '{"BASH_ENV":"/managed/startup"}' };
-    expect(piProxyEnvironment(source)).toEqual(source);
+    expect(piProxyEnvironment(source)).toEqual({});
     expect(piProcessEnvironment(source, source)).toEqual({});
   });
   it("passes Paperclip's managed GitHub projection through the proxy and final Pi spawn", async () => {

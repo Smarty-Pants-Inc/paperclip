@@ -4,6 +4,7 @@ import { providerObservabilityEnvironment } from "../agent-observability.js";
 import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, configuredEnvironmentKeys } from "../../configured-environment.js";
 import { PI_CREDENTIAL_NAMES, PI_GENERAL_IAM_CREDENTIAL_NAMES, piCredentialNames } from "./pi-provider-config.js";
 import { PRECONFIGURED_HOME_KEYS, usesPreconfiguredHome } from "../preconfigured-home.js";
+import { PI_GITHUB_PROJECTION_KEYS } from "../pi/pi-process-environment.js";
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 
 export const ACPX_CREDENTIAL_BINDING_ENV = "PAPERCLIP_ACPX_CREDENTIAL_BINDING";
@@ -128,6 +129,7 @@ export interface SanitizedAcpxSpawnInput {
 export function createSanitizedAcpxSpawnInput(
   environment: NodeJS.ProcessEnv | undefined,
   agent: QualifiedAcpxAgent,
+  options: { nativePi?: boolean } = {},
 ): SanitizedAcpxSpawnInput {
   const source = agent === "claude" && environment?.PAPERCLIP_RUNNER_PREPARED_HARNESS_HOME !== undefined
     ? { ...environment, CLAUDE_CONFIG_DIR: environment.PAPERCLIP_RUNNER_PREPARED_HARNESS_HOME }
@@ -167,6 +169,11 @@ export function createSanitizedAcpxSpawnInput(
     ...(agent === "claude" && environment?.PAPERCLIP_GITHUB_LAUNCHER_DIR?.trim()
       ? ["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR",
         "PAPERCLIP_GITHUB_BROKER_URL", "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN"] : []),
+    // Native Pi uses the controller-scrubbed current-run projection. Keep its
+    // existing direct route inside this sanitizer's NUL and size validation;
+    // ACPX Pi must not gain these names.
+    ...(agent === "pi" && options.nativePi && environment?.PAPERCLIP_GITHUB_LAUNCHER_DIR?.trim()
+      ? PI_GITHUB_PROJECTION_KEYS : []),
     ...(usesPreconfiguredHome(source) ? [...PRECONFIGURED_HOME_KEYS, "PAPERCLIP_RUNNER_HOME_MODE", "ACPX_CLAUDE_INCLUDE_USER_SETTINGS"] : []),
     ...(agent === "claude" && environment?.PAPERCLIP_RUNNER_PREPARED_HARNESS_HOME
       ? [...PRECONFIGURED_HOME_KEYS, "PAPERCLIP_RUNNER_PREPARED_HARNESS_HOME"] : []),

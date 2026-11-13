@@ -16182,7 +16182,7 @@ describe("runnerd provider runtime wiring", () => {
   // Keep reason: I-4 controller -> runnerd projection trust boundary. Exercise
   // the real executor merge, not just the projection helper in isolation.
   it.each(["no-connection", "spoofed-auth", "connected"] as const)("native Pi strips configured GitHub authority: %s", async scenario => {
-    const { PI_GITHUB_PROJECTION_KEYS, PI_GITHUB_PROJECTION_ENV } = await import("./native-pi-github-environment.js");
+    const { PI_GITHUB_PROJECTION_KEYS } = await import("./native-pi-github-environment.js");
     const current = { ...scopedNativeExecution(`pi-github-${scenario}`),
       provider: { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE },
       session: { ...execution.session, normalizedSessionId: `pi-github-${scenario}`, driverKind: "pi_rpc" },
@@ -16198,7 +16198,6 @@ describe("runnerd provider runtime wiring", () => {
     await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: `pi-github-${scenario}`,
       useRunnerd: true, managedGitHub: scenario === "connected", runnerRemoteProviderPackPath: packRoot,
       runnerEnvironment: { ...configuredEnvironmentProjection(Object.fromEntries(PI_GITHUB_PROJECTION_KEYS.map(key => [key, `configured-${key}`]))),
-        [PI_GITHUB_PROJECTION_ENV]: JSON.stringify({ BASH_ENV: "/configured/spoof" }),
         ...(scenario === "spoofed-auth" ? { PAPERCLIP_GITHUB_AUTH_MODE: "managed" } : {}) },
     });
     state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
@@ -16208,8 +16207,6 @@ describe("runnerd provider runtime wiring", () => {
       if (scenario === "connected") expect(environment[key], key).toBe(projection[key]);
       else expect(environment, key).not.toHaveProperty(key);
     }
-    if (scenario === "connected") expect(JSON.parse(environment[PI_GITHUB_PROJECTION_ENV]!)).toEqual(projection);
-    else expect(environment[PI_GITHUB_PROJECTION_ENV]).toBe("{}");
     expect(githubAccess.create).toHaveBeenCalledTimes(scenario === "connected" ? 1 : 0);
   });
 
