@@ -1329,11 +1329,13 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         const originals = group.filter((item) => !item.redelivery);
         if (originals.length !== 1) continue;
         const original = originals[0]!;
+        // null/0 means GitHub could not complete delivery (for example, an edge
+        // timeout). Recovery is safe even if we received it: the GUID fence and
+        // no-existing-ingress/filtered-receipt checks prevent double admission.
         if (
           Date.parse(original.deliveredAt) < floor ||
           Date.parse(original.deliveredAt) > now.getTime() - 10_000 ||
-          original.statusCode === null ||
-          original.statusCode < 500 ||
+          (original.statusCode !== null && original.statusCode !== 0 && original.statusCode < 500) ||
           !githubRecoveryEventIsEligible(original.event, original.action) ||
           original.installationId !== credentials.installationId ||
           !original.repositoryId ||
@@ -1362,8 +1364,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             Date.parse(right.deliveredAt) - Date.parse(left.deliveredAt),
         )[0]!;
         if (
-          latest.statusCode === null ||
-          latest.statusCode < 500 ||
+          (latest.statusCode !== null && latest.statusCode !== 0 && latest.statusCode < 500) ||
           latest.throttledAt !== null ||
           Date.parse(latest.deliveredAt) > now.getTime() - 10_000
         )
@@ -1379,8 +1380,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             count >= 3 ||
             receipt.result?.latestAttemptId === latest.id ||
             !latest.redelivery ||
-            latest.statusCode === null ||
-            latest.statusCode < 500 ||
+            (latest.statusCode !== null && latest.statusCode !== 0 && latest.statusCode < 500) ||
             Date.parse(latest.deliveredAt) <
               Date.parse(String(receipt.result?.requestedAt)) ||
             Date.parse(String(receipt.result?.retryAt)) > now.getTime())

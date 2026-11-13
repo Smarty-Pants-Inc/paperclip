@@ -16919,8 +16919,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     } finally { await context.service.shutdown(); }
   });
 
-  it("automatically recovers a pre-ingress GitHub failure only through a genuine callback and normal durable workers", async () => {
-    const context = await githubPreIngressRecoveryFixture();
+  it.each([502, null, 0].flatMap(statusCode =>
+    (["issue_comment", "pull_request_review_comment"] as const).map(event => ({ statusCode, event }))))(
+    "automatically recovers a pre-ingress GitHub $event failure ($statusCode) only through a genuine callback and normal durable workers", async ({ statusCode, event }) => {
+    const context = await githubPreIngressRecoveryFixture(event);
+    context.original.status_code = statusCode;
     const { service, endpoint } = context;
     try {
       await context.makeScanDue();
@@ -17031,9 +17034,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   });
 
   it.each(["opened", "synchronize", "reopened", "ready_for_review"].flatMap(action =>
-    [false, true].map(moved => ({ action, moved, bot: false }))).concat({ action: "opened", moved: true, bot: true }))(
-    "recovers a lost pull_request.$action once through the current PR and original GUID (moved: $moved, bot: $bot)", async ({ action, moved, bot }) => {
+    [false, true].map(moved => ({ action, moved, bot: false, statusCode: 502 as number | null })))
+    .concat({ action: "opened", moved: true, bot: true, statusCode: 502 },
+      ...[null, 0].map(statusCode => ({ action: "opened", moved: false, bot: false, statusCode }))))(
+    "recovers a lost pull_request.$action ($statusCode) once through the current PR and original GUID (moved: $moved, bot: $bot)", async ({ action, moved, bot, statusCode }) => {
       const context = await githubPreIngressRecoveryFixture("pull_request");
+      context.original.status_code = statusCode;
       const { service, endpoint } = context;
       try {
         context.original.action = context.payload.action = action;
@@ -17232,10 +17238,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
-  it.each(["received", "processing", "processed", "failed", "cancelled"])(
-    "suppresses automatic pre-ingress GitHub redelivery for any existing local receipt (%s)",
-    async (status) => {
-      const context = await githubPreIngressRecoveryFixture();
+  it.each(["received", "processing", "processed", "failed", "cancelled"].map(status =>
+    ({ status, event: "issue_comment" as "issue_comment" | "pull_request_review_comment" | "pull_request", statusCode: 502 as number | null }))
+    .concat([null, 0].flatMap(statusCode =>
+      (["issue_comment", "pull_request_review_comment", "pull_request"] as const).map(event => ({ status: "received", event, statusCode })))))(
+    "suppresses automatic pre-ingress GitHub $event redelivery ($statusCode) for any existing local receipt ($status)",
+    async ({ status, event, statusCode }) => {
+      const context = await githubPreIngressRecoveryFixture(event);
+      context.original.status_code = statusCode;
       try {
         await context.callback();
         const ingress = await context.ingress();
@@ -17256,6 +17266,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       } finally {
         await retirePublicationFixture(context.service, context.endpoint.id);
       }
+    },
+  );
+
+  it.each([202, 302, 404].flatMap(statusCode =>
+    (["issue_comment", "pull_request_review_comment", "pull_request"] as const).map(event => ({ statusCode, event }))))(
+    "does not recover a pre-ingress GitHub $event delivery with status $statusCode", async ({ statusCode, event }) => {
+      const context = await githubPreIngressRecoveryFixture(event);
+      try {
+        context.original.status_code = statusCode;
+        await context.makeScanDue();
+        await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+        expect(context.posts).toEqual([]);
+        expect(await context.receipt()).toBeUndefined();
+        expect(await context.ingress()).toBeUndefined();
+        expect(context.wakeup).not.toHaveBeenCalled();
+      } finally { await retirePublicationFixture(context.service, context.endpoint.id); }
     },
   );
 
@@ -17334,7 +17360,35 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
   });
 
-  it.each(["pending", "4xx", "throttled", "too recent"])(
+  it.each([null, 0])("retries pre-ingress GitHub recovery once for a distinct lost provider attempt (%s)", async statusCode => {
+    const context = await githubPreIngressRecoveryFixture();
+    try {
+      await context.makeScanDue();
+      await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+      const receipt = (await context.receipt())!;
+      await db.update(chatActions).set({ result: { ...receipt.result,
+        requestedAt: new Date(Date.now() - 20_000).toISOString(), retryAt: new Date(0).toISOString() } })
+        .where(eq(chatActions.id, receipt.id));
+      context.setDeliveries([{
+        ...context.original,
+        id: "9007199254740994",
+        redelivery: true,
+        status_code: statusCode,
+        delivered_at: new Date(Date.now() - 15_000).toISOString(),
+      }, context.original]);
+      await context.makeScanDue();
+      await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+      expect(context.posts).toHaveLength(2);
+      expect(await context.receipt()).toMatchObject({ status: "processed",
+        result: { attempts: 2, latestAttemptId: "9007199254740994" } });
+      await context.makeScanDue();
+      await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+      expect(context.posts).toHaveLength(2);
+      expect(context.wakeup).not.toHaveBeenCalled();
+    } finally { await retirePublicationFixture(context.service, context.endpoint.id); }
+  });
+
+  it.each(["2xx", "3xx", "4xx", "throttled", "too recent"])(
     "does not request automatic pre-ingress GitHub recovery while the latest provider attempt is %s",
     async (state) => {
       const context = await githubPreIngressRecoveryFixture();
@@ -17345,7 +17399,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             id: "9007199254740994",
             redelivery: true,
             status_code:
-              state === "pending" ? null : state === "4xx" ? 400 : 502,
+              state === "2xx" ? 202 : state === "3xx" ? 302 : state === "4xx" ? 400 : 502,
             throttled_at:
               state === "throttled" ? new Date().toISOString() : null,
             delivered_at: new Date(
