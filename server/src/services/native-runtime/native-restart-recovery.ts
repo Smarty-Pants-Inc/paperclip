@@ -1,3 +1,4 @@
+import { humanMessageStartWait, readTransientStartWait } from "../transient-start-wait.js";
 import { carriesInheritedRunnerIdentity } from "./native-inherited-runner-retry.js";
 import { readPendingNativeRunStop } from "./native-cancellation-request.js";
 import { CONTROLLER_LEASE_RENEW_MS } from "../controller-instance-lease.js";
@@ -755,6 +756,8 @@ export function classifyNativeRunnerRecoveryEvidence(input: {
   providerAttempt?: number;
   /** False when resuming keeps the current attempt (a clean drain). */
   resumeChargesAttempt?: boolean;
+  /** Validated durable human-message START wait; never waives evidence/owner fences. */
+  transientStartWait?: boolean;
 }): {
   claimKind: NativeRestartRecoveryClaim["kind"] | null;
   reason: string;
@@ -764,6 +767,7 @@ export function classifyNativeRunnerRecoveryEvidence(input: {
       claimKind: null,
       reason: "provider_checkpoint_permanently_failed",
     };
+  const availabilityWait = input.transientStartWait === true && !input.hasCheckpoint && !input.hasProviderEvidence;
   // Sandbox PIDs belong to another host. This claim only authorizes remote
   // inspection; the executor must prove the original lease and authenticate
   // the surviving runner before it can resume delivery.
@@ -777,7 +781,7 @@ export function classifyNativeRunnerRecoveryEvidence(input: {
     // Callers prove provider evidence is absent or only session-open events.
     if (input.remoteBootstrapProvenIncomplete === true && !input.hasCheckpoint) {
       // Each same-run bootstrap is another provider attempt; keep restarts bounded.
-      if (input.resumeChargesAttempt !== false && (input.providerAttempt ?? 0) >= 3)
+      if (!availabilityWait && input.resumeChargesAttempt !== false && (input.providerAttempt ?? 0) >= 3)
         return { claimKind: null, reason: "execution_recovery_budget_exhausted" };
       return { claimKind: "bootstrap_incomplete",
         reason: input.remoteBootstrapIncompleteReason ?? "remote_bootstrap_proven_incomplete" };
@@ -818,7 +822,7 @@ export function classifyNativeRunnerRecoveryEvidence(input: {
     };
   }
   // Continuing an attempt already counted needs no budget; a new one does.
-  if (input.resumeChargesAttempt !== false && (input.providerAttempt ?? 0) >= NATIVE_PROVIDER_RECOVERY_ATTEMPT_LIMIT)
+  if (!availabilityWait && input.resumeChargesAttempt !== false && (input.providerAttempt ?? 0) >= NATIVE_PROVIDER_RECOVERY_ATTEMPT_LIMIT)
     return { claimKind: null, reason: "execution_recovery_budget_exhausted" };
   const checkpointIdentityMatches =
     input.checkpointIdentityMatches ?? input.hasCheckpoint;
@@ -1643,6 +1647,8 @@ export async function claimNativeRestartRecoveries(input: {
         ? { keepsAttempt: true, noProgressRestarts: previousNoProgressRestarts(row.coordinator.recoveryHistory) }
         : await restartResumeKeepsAttempt(tx, { runId: row.run.id, coordinator: row.coordinator });
       const resumeKeepsAttempt = restartCredit.keepsAttempt;
+      const transientStartWait = readTransientStartWait(row.run)
+        && await humanMessageStartWait(tx as unknown as Db, row.run, now);
       const classification = classifyNativeRunnerRecoveryEvidence({
         remoteSandbox: remoteSandbox || Boolean(pluginTask && durableAuthority),
         unclaimedBootstrap,
@@ -1672,6 +1678,7 @@ export async function claimNativeRestartRecoveries(input: {
           !nativeRestartContinuationInFlight(checkpointRecord as unknown as PersistedNativeSession),
         providerAttempt: row.coordinator.attempt,
         resumeChargesAttempt: !resumeKeepsAttempt,
+        transientStartWait: !!transientStartWait,
       });
       if (stopCleanup && classification.claimKind !== "reattach_remote_runner") {
         return { kind: "blocked", runId: row.run.id, reason: "native_stop_requires_existing_remote_session" } as const;

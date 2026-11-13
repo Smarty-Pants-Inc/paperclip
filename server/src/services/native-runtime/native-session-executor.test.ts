@@ -14585,8 +14585,16 @@ describe("native session bounded recovery", () => {
       ]) {
         const failure = sessionOpenFailure(startupFailure(fields));
         const code = nativeSessionFailureSourceCode(failure);
-        expect(code).toBe("provider_session_open_rejected");
-        expect(nativeRemoteStartupRejectionCode(code, failure, false)).toBe("provider_session_open_rejected");
+        const expected = fields.category === "overloaded" || fields.category === "timeout"
+          ? "provider_startup_unavailable" : "provider_session_open_rejected";
+        expect(code).toBe(expected);
+        expect(nativeRemoteStartupRejectionCode(code, failure, false)).toBe(expected);
+        // Naming the transient class does not grant a non-message run another
+        // attempt, or relax the remote ownership-proof boundary.
+        expect(nativeSessionFailureDisposition(3, new Date(), code).phase).toBe("terminal_failure");
+        if (expected === "provider_startup_unavailable") {
+          expect(nativeRemoteStartupRejectionCode(code, failure, true)).toBe(NATIVE_PROVIDER_STARTUP_REJECTED);
+        }
       }
       expect(nativeSessionFailureDisposition(2, new Date(), "provider_session_open_rejected")).toMatchObject({ phase: "retryable_failure" });
       expect(nativeSessionFailureDisposition(3, new Date(), "provider_session_open_rejected")).toEqual({

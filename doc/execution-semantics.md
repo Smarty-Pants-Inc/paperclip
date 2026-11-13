@@ -1454,6 +1454,26 @@ provider failure as the reason, retries automatically, and on exhaustion becomes
 `blocked` with a specific recovery notice and a Retry. Because no provider work
 started, no execution-reconciliation hold is created.
 
+For a run answering a persisted human message in the same task, these proven
+pre-dispatch availability failures instead use `transient_start_wait`, an
+uncharged wait within the existing scheduled-retry owner. They have no attempt
+cap. Refused starts can cost money, so retries are never faster than once every
+five minutes, and a typed provider `retryAt` can only delay that deadline. The
+original message identity, authorization, and independent wait count follow the
+chain; the predecessor's transactional successor claim deduplicates competing
+scheduler/recovery requests. No message or tool is replayed after work begins.
+Native startup uses its existing same-run bootstrap coordinator for the exact
+`runnerd transport closed during provider startup` failure or a typed transient
+session.open refusal (startup rate-limit/overload/timeout with an allowlisted
+HTTP status). Only existing no-provider-event/no-checkpoint proof admits another
+start; lease, identity, retained-owner and task admission fences still apply.
+Unknown failures, authentication, model/permission and owner-state refusals gain
+no new retry authority. After 60 seconds waiting, the existing retry deadline
+owner projects one compact persistent system notice per human message: “The
+provider is temporarily unavailable. Retrying automatically.” The provenance key
+survives restarts and is deduplicated under the task lock, not per attempt.
+Non-message work keeps its existing bounded budgets.
+
 A saved workspace that cannot be restored into a new allocation before provider
 dispatch fails with `remote_workspace_restore_failed`. The run error names the
 server step (`snapshot_lookup`, `snapshot_download`, or `sandbox_restore`) and,

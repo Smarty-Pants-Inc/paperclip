@@ -15,7 +15,7 @@ export const INTERRUPTED_PREPARATION_RETRY_MAX_ATTEMPTS = PROVIDER_ATTEMPT_CREDI
 /** Retry lanes that keep their own counter and never spend failures. */
 const UNCHARGED_RETRY_LANES: ReadonlySet<string> = new Set([
   "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", RUNNER_REVISION_WAIT_RETRY_REASON,
-  INTERRUPTED_PREPARATION_RETRY_REASON, STORAGE_UNAVAILABLE_WAIT_RETRY_REASON,
+  INTERRUPTED_PREPARATION_RETRY_REASON, STORAGE_UNAVAILABLE_WAIT_RETRY_REASON, "transient_start_wait",
 ]);
 
 type RetryRun = {
@@ -37,6 +37,8 @@ export interface ExecutionRetryAccounting {
   interruptedPreparations?: number;
   /** Storage-outage waits in this chain, kept across intervening resource waits. Omitted while zero. */
   storageWaits?: number;
+  /** Proven pre-provider availability waits; never charge a failed turn. */
+  transientStarts?: number;
 }
 
 function count(value: unknown): number | null {
@@ -52,9 +54,11 @@ function savedAccounting(run: RetryRun): ExecutionRetryAccounting | null {
   if (saved.version !== 1 || failureRetries === null || maxTurnContinuations === null) return null;
   const interruptedPreparations = count(saved.interruptedPreparations) ?? 0;
   const storageWaits = count(saved.storageWaits) ?? 0;
+  const transientStarts = count(saved.transientStarts) ?? 0;
   return { version: 1, failureRetries, maxTurnContinuations,
     ...(interruptedPreparations > 0 ? { interruptedPreparations } : {}),
-    ...(storageWaits > 0 ? { storageWaits } : {}) };
+    ...(storageWaits > 0 ? { storageWaits } : {}),
+    ...(transientStarts > 0 ? { transientStarts } : {}) };
 }
 
 function historicalFailureCount(run: RetryRun): number {
@@ -79,6 +83,8 @@ export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccountin
     reason === INTERRUPTED_PREPARATION_RETRY_REASON ? count(run.scheduledRetryAttempt) ?? 0 : 0);
   const storageWaits = Math.max(saved?.storageWaits ?? 0,
     reason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON ? count(run.scheduledRetryAttempt) ?? 0 : 0);
+  const transientStarts = Math.max(saved?.transientStarts ?? 0,
+    reason === "transient_start_wait" ? count(run.scheduledRetryAttempt) ?? 0 : 0);
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
@@ -86,6 +92,7 @@ export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccountin
       run.scheduledRetryReason === "max_turns_continuation" ? count(run.scheduledRetryAttempt) ?? 0 : 0),
     ...(interruptedPreparations > 0 ? { interruptedPreparations } : {}),
     ...(storageWaits > 0 ? { storageWaits } : {}),
+    ...(transientStarts > 0 ? { transientStarts } : {}),
   };
 }
 
@@ -95,6 +102,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
 }
 
 export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
+  if (reason === "transient_start_wait") return executionRetryAccounting(run).transientStarts ?? 0;
   if (reason === INTERRUPTED_PREPARATION_RETRY_REASON) return executionRetryAccounting(run).interruptedPreparations ?? 0;
   if (reason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON) return executionRetryAccounting(run).storageWaits ?? 0;
   if (UNCHARGED_RETRY_LANES.has(reason)) {
@@ -109,6 +117,7 @@ export function accountingForScheduledRetry(run: RetryRun, reason: string, attem
   if (reason === "max_turns_continuation") accounting.maxTurnContinuations = attempt;
   else if (reason === INTERRUPTED_PREPARATION_RETRY_REASON) accounting.interruptedPreparations = attempt;
   else if (reason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON) accounting.storageWaits = attempt;
+  else if (reason === "transient_start_wait") accounting.transientStarts = attempt;
   else if (!UNCHARGED_RETRY_LANES.has(reason)) accounting.failureRetries = attempt;
   return accounting;
 }

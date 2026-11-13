@@ -4,6 +4,7 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import { readProviderFailure, type ProviderFailure } from "@paperclipai/shared";
 import { logger } from "../../middleware/logger.js";
 import { infrastructureRetryDelayMs, PROVIDER_LIMIT_DEFAULT_COOLDOWN_MS } from "../system-recovery-state.js";
+import { transientStartRetryAt } from "../transient-start-wait.js";
 import { parseProviderQuotaClockReset } from "../provider-quota-reset.js";
 
 /** Categories that report an exhausted account or request allowance. */
@@ -107,7 +108,12 @@ export async function planNativeStartupRetry(input: {
   retryable: boolean;
   failure: ProviderFailure | null;
   now: Date;
+  transientStartWait?: boolean;
 }): Promise<{ nextAttemptAt: Date | null; providerCooldownAt: Date | null }> {
+  if (input.transientStartWait) return {
+    nextAttemptAt: input.retryable ? transientStartRetryAt(input.now, input.failure) : null,
+    providerCooldownAt: input.failure?.retryAt ? new Date(input.failure.retryAt) : null,
+  };
   // Limit evidence only refines the schedule. A failed read must not stop the
   // failure from settling, so the retry falls back to plain backoff.
   const providerCooldownAt = await agentProviderLimitCooldown(input.db, {

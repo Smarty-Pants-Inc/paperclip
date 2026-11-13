@@ -29,7 +29,7 @@ describe("failure attempts across resource waits", () => {
 });
 
 describe("persisted independent accounting", () => {
-  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", "runner_revision_wait", "storage_unavailable_wait"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
+  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", "runner_revision_wait", "storage_unavailable_wait", "transient_start_wait"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
     expect(executionFailureRetryCount({ scheduledRetryReason, scheduledRetryAttempt: 20,
       contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 1 } },
     })).toBe(2);
@@ -105,6 +105,22 @@ describe("interrupted preparation retries", () => {
       contextSnapshot: { executionRetryAccounting: accounting(1) } };
     expect(executionRetryAttemptCount(retry, "transient_failure")).toBe(1);
     expect(accountingForScheduledRetry(retry, "transient_failure", 2).failureRetries).toBe(2);
+  });
+});
+
+describe("transient human-message START waits", () => {
+  it("preserves its independent count across another wait and still charges later real failures", () => {
+    const source = { scheduledRetryReason: "transient_start_wait", scheduledRetryAttempt: 64,
+      contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 1, maxTurnContinuations: 0 } } };
+    const ledger = accountingForScheduledRetry(source, "workspace_busy", 1);
+    expect(ledger).toMatchObject({ transientStarts: 64, failureRetries: 1 });
+    const waited = { scheduledRetryReason: "workspace_busy", scheduledRetryAttempt: 1,
+      contextSnapshot: { executionRetryAccounting: ledger } };
+    expect(executionRetryAttemptCount(waited, "transient_start_wait")).toBe(64);
+    expect(accountingForScheduledRetry(waited, "transient_start_wait", 65))
+      .toMatchObject({ transientStarts: 65, failureRetries: 1 });
+    expect(accountingForScheduledRetry(waited, "transient_failure", 2))
+      .toMatchObject({ transientStarts: 64, failureRetries: 2 });
   });
 });
 

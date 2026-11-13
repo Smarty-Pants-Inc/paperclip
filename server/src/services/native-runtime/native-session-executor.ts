@@ -105,6 +105,8 @@ import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
 import { createNativeProviderFailureObservation } from "./native-provider-failure.js";
+import { humanMessageStartWait, readTransientStartWait, transientProviderStartFailure, TRANSIENT_START_TRANSPORT_CLOSED, TRANSIENT_START_UNAVAILABLE } from "../transient-start-wait.js";
+import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { nativeStartupRetryExhaustedAction, nativeStartupRetryWait, planNativeStartupRetry } from "./native-startup-retry.js";
 import { admitUnclaimedNativeBootstrapRetry } from "./native-bootstrap-retry.js";
 import { RUNNERD_CONTROL_PLANE_STATE_SCHEMAS, runnerdStateIsIncompleteBootstrap,
@@ -8766,6 +8768,7 @@ export function nativeSessionFailureDisposition(
   attempt: number,
   now = new Date(),
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
+  transientStartWait = false,
 ) {
   const permanentFailure =
     sourceFailureCode === "runner_task_admission_rejected" ||
@@ -8789,7 +8792,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED ||
     sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER;
   const permissionDeclined = sourceFailureCode === "native_permission_declined";
-  const exhausted = permanentFailure || permissionDeclined || attempt >= 3;
+  const exhausted = permanentFailure || permissionDeclined || (!transientStartWait && attempt >= 3);
   return {
     phase: exhausted
       ? ("terminal_failure" as const)
@@ -8858,7 +8861,7 @@ export function nativeRemoteStartupRejectionCode<Code extends string>(
   error: unknown,
   remoteTarget: boolean,
 ): Code | typeof NATIVE_PROVIDER_STARTUP_REJECTED {
-  return remoteTarget && sourceFailureCode === "provider_session_open_rejected"
+  return remoteTarget && (sourceFailureCode === "provider_session_open_rejected" || sourceFailureCode === TRANSIENT_START_UNAVAILABLE)
     && providerFailureFromError(error)?.phase === "startup"
     ? NATIVE_PROVIDER_STARTUP_REJECTED : sourceFailureCode;
 }
@@ -8915,6 +8918,8 @@ export function nativeSessionFailureSourceCode(
   | typeof NATIVE_CURRENT_WAKE_COMMENTS_CHANGED_AFTER_READ
   | "provider_session_open_rejected"
   | "provider_session_open_timeout"
+  | typeof TRANSIENT_START_TRANSPORT_CLOSED
+  | typeof TRANSIENT_START_UNAVAILABLE
   | "runner_task_admission_rejected"
   | "runner_ingress_access_rejected"
   | "runner_ingress_acquisition_failed"
@@ -8957,6 +8962,7 @@ export function nativeSessionFailureSourceCode(
   }
   if (runnerClosedTurnStartSession(error)) return NATIVE_PROVIDER_SESSION_CLOSED;
   const message = error instanceof Error ? error.message : String(error);
+  if (message === "runnerd transport closed during provider startup") return TRANSIENT_START_TRANSPORT_CLOSED;
   if (/"code":"controller_sequence_mismatch"/.test(message)) return NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER;
   if (/^(?:runner_ingress_unavailable: runnerd exited unexpectedly with code 1: )?runner_task_admission_rejected: (session_state_unavailable|account_binding_mismatch)$/.test(message)) {
     return "runner_task_admission_rejected";
@@ -9036,6 +9042,7 @@ export function nativeSessionFailureSourceCode(
       return "native_provider_model_rejected";
     }
     if (deterministicProviderStartupFailure(error)) return NATIVE_PROVIDER_STARTUP_REJECTED;
+    if (transientProviderStartFailure(providerFailureFromError(error))) return TRANSIENT_START_UNAVAILABLE;
     return "provider_session_open_rejected";
   }
   // The controller stopped waiting for session.open while runner startup was
@@ -9184,6 +9191,8 @@ export async function nativeProviderRecoveryEvidence(input: {
     "provider_request_protocol_error",
     "native_runner_process_exited",
     "provider_session_open_rejected",
+    TRANSIENT_START_TRANSPORT_CLOSED,
+    TRANSIENT_START_UNAVAILABLE,
     NATIVE_PROVIDER_STARTUP_REJECTED,
     "provider_session_open_timeout",
     "local_runtime_api_listener_unavailable",
@@ -10931,6 +10940,9 @@ async function executePaperclipNativeSessionAttempt(
             throw new NativeResultPendingFinalizationError();
           const boundRun = await tx
             .select({
+              issueId: heartbeatRuns.issueId,
+              scopeKind: heartbeatRuns.scopeKind,
+              contextSnapshot: heartbeatRuns.contextSnapshot,
               retryOfRunId: heartbeatRuns.retryOfRunId,
               scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
               agentId: heartbeatRuns.agentId,
@@ -11045,8 +11057,19 @@ async function executePaperclipNativeSessionAttempt(
             recovering?.kind,
             !recovering || !("chargesProviderAttempt" in recovering) || recovering.chargesProviderAttempt !== false,
           );
-          if (nextAttempt > 3)
-            throw new Error("native_session_retry_exhausted");
+          if (nextAttempt > 3) {
+            // Only a durable human-message availability wait can waive the
+            // failure budget, and only while the native evidence still proves
+            // no provider work. Existing owner/lease/identity gates above stay.
+            const wait = readTransientStartWait(boundRun)
+              && await humanMessageStartWait(tx as unknown as Db, boundRun, new Date());
+            const evidence = wait ? await nativeProviderRecoveryEvidence({
+              db: tx as unknown as Db, runId: input.execution.binding.runId,
+              executionTargetKind: input.runnerExecutionTarget?.kind ?? "local",
+              sourceFailureCode: TRANSIENT_START_TRANSPORT_CLOSED,
+            }) : null;
+            if (evidence?.recoveryMode !== "bootstrap_retry") throw new Error("native_session_retry_exhausted");
+          }
           scheduledResumeContinuation = (await scheduledResumeContinuationAllowed(tx as unknown as Db, {
             companyId: input.execution.binding.companyId,
             runId: input.execution.binding.runId,
@@ -12966,10 +12989,16 @@ async function executePaperclipNativeSessionAttempt(
         sourceFailureCode,
         bootstrap,
       });
+      const startRun = (sourceFailureCode === TRANSIENT_START_TRANSPORT_CLOSED || sourceFailureCode === TRANSIENT_START_UNAVAILABLE)
+        && recoveryEvidence.recoveryMode === "bootstrap_retry"
+        ? await input.db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.execution.binding.runId))
+          .then(rows => rows[0] ?? null) : null;
+      const startWait = startRun ? await humanMessageStartWait(input.db, startRun, now) : null;
       const disposition = nativeSessionFailureDisposition(
         attempt,
         now,
         sourceFailureCode,
+        !!startWait,
       );
       const phase =
         recoveryEvidence.recoveryMode === "ambiguous_state"
@@ -12998,6 +13027,7 @@ async function executePaperclipNativeSessionAttempt(
               retryable: phase === "retryable_failure",
               failure: providerFailure,
               now,
+              transientStartWait: !!startWait,
             })
           : null;
       const providerCooldownAt = startupRetry?.providerCooldownAt ?? null;
@@ -13272,6 +13302,7 @@ async function executePaperclipNativeSessionAttempt(
         }
         const unusedTerminal = !!recoveryEvidence.unclaimedBootstrap && phase === "terminal_failure"
           && !runBeforeWrite?.costAccountedAt;
+        if (startWait) await notifyScheduledRetryDispatch(tx, { companyId: input.execution.binding.companyId });
         if (unusedTerminal) await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.execution.binding.companyId);
         if (!ownershipUnverified) await notifyExternalAgentSettlement(tx, input.execution.binding);
         if (!ownershipUnverified) await notifyInstructionCollection(tx, { companyId: input.execution.binding.companyId, runId: input.execution.binding.runId });
@@ -13298,6 +13329,7 @@ async function executePaperclipNativeSessionAttempt(
             error: message,
             resultJson: sql`(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'remoteRunnerRecovery')
               || ${JSON.stringify(remoteRunnerRecovery ? { remoteRunnerRecovery } : {})}::jsonb
+              || ${JSON.stringify(startWait ? { transientStartWait: startWait } : {})}::jsonb
               || ${providerFailure ? sql`jsonb_build_object('providerFailure', coalesce(${heartbeatRuns.resultJson}->'providerFailure', ${JSON.stringify(providerFailure)}::jsonb))` : sql`'{}'::jsonb`}`,
             errorCode: ownershipUnverified
               ? NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE
