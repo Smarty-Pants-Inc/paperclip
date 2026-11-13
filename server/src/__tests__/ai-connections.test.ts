@@ -579,13 +579,18 @@ describe("managed AI connections", () => {
     const stopped = deferredSignal();
     const provider = vi.fn(async runtime => readFile(path.join(String(runtime.config.env.CODEX_HOME), "auth.json"), "utf8"));
     const merge = vi.spyOn(codexAdapter, "decideCodexAuthMerge").mockRejectedValue(new Error("fixture cleanup storage unavailable"));
+    const { logger } = await import("../middleware/logger.js");
+    const probeWarn = vi.spyOn(logger, "warn");
     let retained: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
     try {
       await expect(withManagedAiProbe(db, input, async runtime => {
         retained = runtime;
         await writeFile(path.join(String(runtime.config.env.CODEX_HOME), "auth.json"), auth(owner, "11"));
         throw new runnerProbe.NativeEnvironmentProbeCleanupError(stopped.promise, new Error("fixture probe interruption"), []);
-      })).rejects.toMatchObject({ details: { code: "native_probe_cleanup_pending" } });
+      })).rejects.toMatchObject({ message: expect.stringContaining("native account test failed"), details: { code: "native_probe_cleanup_pending" } });
+      // The test's own failure is not masked by its pending cleanup.
+      expect(probeWarn).toHaveBeenCalledWith(expect.objectContaining({ companyId, cause: expect.stringContaining("fixture probe interruption") }),
+        "Native account test failed; its runtime cleanup is still pending");
       await expect(withManagedAiProbe(db, input, provider)).resolves.toBe(auth(owner, "10"));
       expect(provider).toHaveBeenCalledOnce(); expect(merge).not.toHaveBeenCalled();
       stopped.resolve();

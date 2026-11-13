@@ -1,3 +1,5 @@
+import { logger } from "../middleware/logger.js";
+import { probeFailureSummary } from "./native-runtime/probe-failure-summary.js";
 import { environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
 import type { ManagedAiCredentialWritebackBinding } from "./managed-ai-credential-writeback.js";
 import { OPENROUTER_ATTRIBUTION_HEADERS, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
@@ -651,7 +653,15 @@ export async function withManagedAiProbe<T>(
       const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
       retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, retired: error.retired,
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
-      throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
+      // The cleanup error wraps the test's own failure; keep it visible to the
+      // operator instead of reporting only the pending cleanup.
+      if (error.operationError !== undefined) {
+        logger.warn({ companyId: input.companyId, agentId: input.agentId, adapterType: input.adapterType, cause: probeFailureSummary(error.operationError) },
+          "Native account test failed; its runtime cleanup is still pending");
+      }
+      throw unprocessable(error.operationError !== undefined
+        ? "The native account test failed, and its runtime is still cleaning up. Retry after runtime cleanup completes."
+        : "The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
     }
     throw error;
   } finally {

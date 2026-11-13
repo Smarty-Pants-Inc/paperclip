@@ -9,6 +9,8 @@ import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
 import { nativePiRemoteLaunchOptions } from "./native-pi-launch.js";
+import { logger } from "../../middleware/logger.js";
+import { probeFailureSummary } from "./probe-failure-summary.js";
 
 const SAFE_FAILURES: Record<string, string> = {
   pi_prompt_rejected: "Pi handled or rejected hello without starting a model turn.",
@@ -121,6 +123,9 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
   } catch (error) {
     if (error instanceof NativeEnvironmentProbeCleanupError) throw error;
     const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    // The check stays free of raw provider text; operators still get the cause.
+    logger.warn({ companyId: context.companyId, stage, code: code || null, cause: probeFailureSummary(error) },
+      "Native Pi setup probe failed");
     // No raw provider error, argv, environment, request body or credential is reflected.
     const message = error instanceof PaperclipRunnerProviderProfileError ? error.message : SAFE_FAILURES[code]
       ?? (stage === "hello" ? "Native Pi did not prove a nonempty tool-free hello and successful retirement. The connection was not adopted." : "The selected factory could not complete native Pi metadata admission. No hello prompt was sent.");
