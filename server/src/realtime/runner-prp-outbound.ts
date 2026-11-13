@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 import { logger } from "../middleware/logger.js";
+import { allowlistedErrnoCode, allowlistedIngressReason, allowlistedSyscall, finiteSafeInteger } from "./ingress-error-summary.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "../services/native-runtime/native-runner-recovery-contract.js";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import type {
@@ -288,32 +289,30 @@ async function openEndpoint(input: {
 }
 
 function ingressErrorSummary(error: unknown): {
-  code: string | null;
-  errno: string | number | null;
-  syscall: string | null;
+  code: string;
+  errno: number | null;
+  syscall: string;
   statusCode: number | null;
   reason: string | null;
 } {
   const value = typeof error === "object" && error !== null
     ? error as Record<string, unknown>
     : {};
-  const stringOrNumber = (entry: unknown): string | number | null =>
-    typeof entry === "string" || typeof entry === "number" ? entry : null;
   const message = error instanceof Error ? error.message : String(error);
   return {
-    code: typeof value.code === "string" ? value.code : null,
-    errno: stringOrNumber(value.errno),
-    syscall: typeof value.syscall === "string" ? value.syscall : null,
-    statusCode: typeof value.statusCode === "number" ? value.statusCode : null,
+    code: allowlistedErrnoCode(value.code),
+    errno: finiteSafeInteger(value.errno),
+    syscall: allowlistedSyscall(value.syscall),
+    statusCode: finiteSafeInteger(value.statusCode),
     // Raw transport prose can carry credentials (an Authorization header, a
     // URL inside a sentence). Log only a machine reason code, never prose.
-    reason: machineReasonCode(message),
+    reason: allowlistedIngressReason(message),
   };
 }
 
-/** A bare error code such as `runner_ingress_upgrade_rejected`; anything else is dropped. */
+/** Only codes this ingress path can emit are safe to include in logs. */
 export function machineReasonCode(message: string): string | null {
-  return /^[a-z][a-z0-9_.:-]{0,79}$/.test(message) ? message : null;
+  return allowlistedIngressReason(message);
 }
 
 function socketClosed(wire: WsJsonWireConnection): Promise<void> {
