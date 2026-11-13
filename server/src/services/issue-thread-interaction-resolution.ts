@@ -407,20 +407,19 @@ export function assertIssueThreadInteractionResolverAudience(
 
 /**
  * Resolves agent-owned attention with the same audience rules used by mutation
- * routes. Use the current run when supplied; otherwise represent attribution
- * with the interaction's source run for its creator and an opaque non-source
- * run for other agents. The real run is still authenticated at mutation time.
+ * routes. Run attribution is deliberately represented by the interaction's
+ * source run for the creator and by an opaque non-source run for other agents;
+ * the real run is still authenticated at mutation time.
  */
 export function issueThreadInteractionAttentionAgentAllowed(input: {
   agentId: string;
-  runId?: string;
   interaction: IssueThreadInteractionResolverAudienceInput["interaction"];
   additionalRestriction?: IssueThreadInteractionResolverAudienceInput["additionalRestriction"];
   governedAction?: boolean;
 }) {
-  const attentionRunId = input.runId ?? (input.interaction.createdByAgentId === input.agentId
+  const attentionRunId = input.interaction.createdByAgentId === input.agentId
     ? input.interaction.sourceRunId ?? "attention-owner-creator-run"
-    : "attention-owner-non-source-run");
+    : "attention-owner-non-source-run";
   return evaluateIssueThreadInteractionResolverAudience({
     actor: { type: "agent", agentId: input.agentId, runId: attentionRunId },
     interaction: input.interaction,
