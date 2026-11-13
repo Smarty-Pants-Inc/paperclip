@@ -8,6 +8,7 @@ import { describeInteractionAudience, type InteractionAudienceDescription } from
 import { interactionResolutionErrorMessage } from "../lib/interaction-resolution-error";
 import { buildDocumentAnnotationHash } from "../lib/document-annotation-hash";
 import { itemVerdictHref } from "@/lib/item-verdict-links";
+import { decisionReceiptHref } from "@/lib/decision-receipt-navigation";
 import {
   isInteractionPreparingApproval,
   buildSuggestedTaskTree,
@@ -1550,7 +1551,11 @@ function requestConfirmationTargetHref({
     return `/issues/${target.issueId ?? interaction.issueId}${buildDocumentAnnotationHash({ documentKey: target.key, revisionId: target.revisionId, interactionId: interaction.id, threadId: null, commentId: null })}`;
   }
   if (target.type === "issue_attachment") {
-    return `/api/attachments/${encodeURIComponent(target.attachmentId)}/content`;
+    return decisionReceiptHref({
+      issueHref: `/issues/${target.issueId ?? interaction.issueId}`,
+      interactionId: interaction.id,
+      target,
+    });
   }
   if (target.href) return target.href;
   if (target.type === "issue_document") {
@@ -1587,7 +1592,7 @@ function RequestConfirmationTargetChip({
   );
 
   if (!href) return <span className={className}>{content}</span>;
-  if (target.type === "issue_attachment" || /^https?:\/\//i.test(href)) {
+  if (/^https?:\/\//i.test(href)) {
     return (
       <a href={href} target="_blank" rel="noreferrer" className={className}>
         {content}

@@ -305,7 +305,7 @@ function CompactTarget({
   const label = targetLabel(interaction);
   if (!target || !label) return null;
   const href = target.type === "issue_attachment"
-    ? `/api/attachments/${encodeURIComponent(target.attachmentId)}/content`
+    ? decisionReceiptHref({ issueHref: `/issues/${target.issueId ?? interaction.issueId}`, interactionId: interaction.id, target })
     : target.href ? normalizeRequestConfirmationTargetHref(target.href)
       // A document on this chat opens in its document panel, like a reply's
       // `#document-<key>` link, so the person can read what they are asked to review.
@@ -315,14 +315,21 @@ function CompactTarget({
         : null;
   if (href) {
     return (
-      <a
-        href={href}
-        target={target.type === "issue_attachment" ? "_blank" : undefined}
-        rel={target.type === "issue_attachment" ? "noreferrer" : undefined}
-        className="inline-flex rounded-sm border border-border px-2 py-0.5 font-mono text-xs text-foreground hover:bg-muted/60"
-      >
-        {label}
-      </a>
+      target.type === "issue_attachment" ? (
+        <Link
+          to={href}
+          className="inline-flex rounded-sm border border-border px-2 py-0.5 font-mono text-xs text-foreground hover:bg-muted/60"
+        >
+          {label}
+        </Link>
+      ) : (
+        <a
+          href={href}
+          className="inline-flex rounded-sm border border-border px-2 py-0.5 font-mono text-xs text-foreground hover:bg-muted/60"
+        >
+          {label}
+        </a>
+      )
     );
   }
   return (
