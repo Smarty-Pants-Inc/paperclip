@@ -65,8 +65,9 @@ pickers) or `POST /api/plugins/<installed-plugin-id>/config`:
     "mailbox": "smarty@smartypants.ai",
     "gmailGrantRef": {"type":"secret_ref","secretId":"<gmail-secret-uuid>","version":"latest"},
     "routineFireSecretRef": {"type":"secret_ref","secretId":"<routine-secret-uuid>","version":"latest"},
-    "routineOrigin": "https://CANONICAL-PUBLIC-TEST-ORIGIN",
-    "routinePublicId": "<existing-TEST-public-id>"
+    "routineOrigin": "https://hq.smartypants.ai",
+    "routinePublicId": "<existing-TEST-public-id>",
+    "scanWindowDays": 7
   }
 }
 ```
@@ -74,6 +75,12 @@ pickers) or `POST /api/plugins/<installed-plugin-id>/config`:
 Config save binds the refs at their exact config paths. Never use `op://`, raw
 values or global config. Keep only TEST configured for this proof. Explicit
 company IDs scope config, secret resolution and all KV operations.
+The compiled origin is HQ only; use a TEST company there, or obtain the exact
+canonical distinct TEST-instance origin for a reviewed frozen-list rebuild.
+An arbitrary origin, port (including explicit 443), IP or userinfo is rejected.
+Config cannot widen the host list. No distinct TEST hostname was supplied to
+this build. `scanWindowDays` is an integer from 1 to 30 (default 7); agree that
+catch-up boundary before enabling. Older mail is deliberately outside intake.
 
 ## Explicit one-time seen initialization
 
@@ -90,9 +97,15 @@ Using the authenticated company-scoped actions bridge documented in
 The host injects the authorized company into params and immutable actor context.
 This action requires disabled config, matching company/mailbox, IDs-only input
 and an absent state row. It cannot reset existing state or run during a tick.
-An explicit empty array authorizes firing **all** currently eligible incoming
-history at first enable; to avoid replay, supply the explicitly approved existing
-IDs instead. No automatic baseline, eviction or guessed received-time cutoff.
+It performs the same complete, bounded Gmail scan as a tick and gets internalDate
+metadata before writing version-2 state. Every supplied ID must be present within
+that window; out-of-window/unknown IDs and incomplete reads fail without writing.
+An explicit empty array authorizes firing **all** incoming mail within the
+configured window at first enable; to avoid replay, supply the explicitly approved
+IDs from that same window. No automatic baseline or guessed received-time cutoff.
+This package has not been installed yet; legacy ID-array state is rejected, not
+silently migrated with fabricated dates. An operator with pre-release legacy
+state must arrange an explicit approved reinitialization before enabling.
 
 ## Receiver and real proof, then enable
 
@@ -108,3 +121,9 @@ multi-page and interrupted read (safe failure/no seen advance); two arrivals
 while receiver active (two admissions); restart/lost-KV retry (same receipt);
 KV/log/payload privacy. Check job history and actual routing separately. Then
 leave enabled only under the authorized deployment's liveness/sleep policy.
+Delivery failures retry after 2 minutes, doubling to at most 6 hours; the tenth
+failure parks the ID and emits the fixed job-health warning
+`mail intake has parked deliveries`. Later messages continue. Parked entries
+remain until their internalDate ages outside the window; inspect the receiving
+routine through its normal authorized history, not through message content in
+plugin logs. Seen and failure entries are pruned after complete scans only.
