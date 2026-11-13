@@ -1,4 +1,6 @@
 import WebSocket from "ws";
+import { logger } from "../middleware/logger.js";
+import { stripSecretBearingUrlParts } from "../middleware/redact-sensitive.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "../services/native-runtime/native-runner-recovery-contract.js";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import type {
@@ -286,6 +288,28 @@ async function openEndpoint(input: {
   });
 }
 
+function ingressErrorSummary(error: unknown): {
+  code: string | null;
+  errno: string | number | null;
+  syscall: string | null;
+  statusCode: number | null;
+  message: string;
+} {
+  const value = typeof error === "object" && error !== null
+    ? error as Record<string, unknown>
+    : {};
+  const stringOrNumber = (entry: unknown): string | number | null =>
+    typeof entry === "string" || typeof entry === "number" ? entry : null;
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    code: typeof value.code === "string" ? value.code : null,
+    errno: stringOrNumber(value.errno),
+    syscall: typeof value.syscall === "string" ? value.syscall : null,
+    statusCode: typeof value.statusCode === "number" ? value.statusCode : null,
+    message: stripSecretBearingUrlParts(message),
+  };
+}
+
 function socketClosed(wire: WsJsonWireConnection): Promise<void> {
   return new Promise((resolve) => wire.onClose(() => resolve()));
 }
@@ -338,8 +362,9 @@ export function connectRunnerPrpIngress(input: {
   const abort = new AbortController();
   const ownedWires = new Set<WsJsonWireConnection>();
   let endpoint = input.endpoint;
+  const startupBudgetStartedAt = Date.now();
   const startupDeadline =
-    Date.now() + (input.startupDeadlineMs ?? DEFAULT_STARTUP_DEADLINE_MS);
+    startupBudgetStartedAt + (input.startupDeadlineMs ?? DEFAULT_STARTUP_DEADLINE_MS);
   const recoveryGraceMs = input.recoveryGraceMs ?? DEFAULT_RECOVERY_GRACE_MS;
   const random = input.random ?? Math.random;
   let readyResolve!: () => void;
@@ -363,6 +388,7 @@ export function connectRunnerPrpIngress(input: {
 
   const loop = (async () => {
     let attempt = 0;
+    let failedAttemptNumber = 0;
     let recoveryDeadline = startupDeadline;
     // A runner whose connection lease lapsed exits without another
     // authenticated frame. Keep the authority's reason so the run log and the
@@ -428,6 +454,16 @@ export function connectRunnerPrpIngress(input: {
         // an active-run transport failure and must not reject the long-lived
         // failure promise (an unobserved rejection here can terminate Node).
         if (abort.signal.aborted) return;
+        // Intentional close() is not a failed attempt; log only real failures.
+        failedAttemptNumber += 1;
+        const summary = ingressErrorSummary(error);
+        logger.warn({
+          event: "runner_ingress_connect_attempt_failed",
+          attempt: failedAttemptNumber,
+          elapsedMs: Math.max(0, Date.now() - startupBudgetStartedAt),
+          remainingBudgetMs: Math.max(0, recoveryDeadline - Date.now()),
+          ...summary,
+        }, "runner ingress connect attempt failed");
         let failure: unknown = error;
         const statusCode =
           typeof error === "object" && error !== null && "statusCode" in error
@@ -486,6 +522,9 @@ export function connectRunnerPrpIngress(input: {
                 "Runner ingress connection failed.",
                 { cause: failure },
               );
+        if (failure instanceof Error) {
+          Object.assign(terminal, { causeSummary: ingressErrorSummary(failure) });
+        }
         if (!readySettled) {
           readySettled = true;
           readyReject(terminal);
