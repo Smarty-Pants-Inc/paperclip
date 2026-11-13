@@ -185,7 +185,11 @@ async function withBudgetStopDelivery<T>(db: Db, work: () => Promise<T>): Promis
 
 /** `preservePauseDeferred`: the stop comes from a pause, which keeps the
  * messages it deferred for delivery once the pause lifts. */
-export type StopInvocationOptions = { preservePauseDeferred?: boolean };
+export type StopInvocationOptions = {
+  preservePauseDeferred?: boolean;
+  /** Report only the recorded invocation identity, never provider diagnostics. */
+  onPending?: (invocationId: string) => void;
+};
 
 /** Cancellation shares executor ownership and delegates lifecycle and admission effects. */
 

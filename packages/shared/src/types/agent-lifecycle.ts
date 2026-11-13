@@ -19,10 +19,12 @@ export interface AgentLifecycleOperation {
   waitingForSignal?: boolean;
   /** A committed recheck raced an active host attempt; its defer must not park it. */
   recheckRequested?: boolean;
-  /** A failed configuration check waits for configuration repair or an explicit retry. */
+  /** A failed or stalled lifecycle step waits for repair or an explicit retry. */
   retryRequired?: boolean;
   /** Failed generic host verification tests for this saved configuration. */
   verificationFailures?: number;
+  /** Incomplete host/plugin Stop attempts for this saved operation. */
+  stopFailures?: number;
   attempts: number;
   responsibleUserId?: string | null;
   /** Why a pause started: its holds and the company's pause reason at that moment. Runs the
