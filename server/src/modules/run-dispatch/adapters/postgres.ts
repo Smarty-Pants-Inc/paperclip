@@ -27,6 +27,7 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
   nativeRunFinalizations,
@@ -42,6 +43,7 @@ import { budgetService, budgetServiceInTransaction, recheckAdmittedRunBudgetRead
 import { lockRunBudgetRecoveryOwnerInTransaction, recheckRunBudgetReservationInTransaction } from "../../../services/budget-reservations.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { isUnstartedTaskQuestionAnswer } from "../../../services/unstarted-task-question-answer.js";
+import { issueThreadInteractionAttentionAgentAllowed } from "../../../services/issue-thread-interaction-resolution.js";
 import { isVerifiedDependencyInteractionResponse } from "../../../services/queued-interaction-response.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
@@ -615,12 +617,39 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const isInteractionWake = allowsIssueInteractionWake(
+    const wakeReason = readNonEmptyString(context.wakeReason);
+    const pendingAddresseeInteractionId = readNonEmptyString(context.interactionId);
+    const pendingAddresseeQuery = issue && wakeReason === "interaction_pending" && pendingAddresseeInteractionId
+      ? dbOrTx
+          .select()
+          .from(issueThreadInteractions)
+          .where(and(
+            eq(issueThreadInteractions.id, pendingAddresseeInteractionId),
+            eq(issueThreadInteractions.companyId, input.companyId),
+            eq(issueThreadInteractions.issueId, issueId),
+            eq(issueThreadInteractions.status, "pending"),
+            eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+          ))
+      : null;
+    const pendingAddresseeWake = pendingAddresseeQuery
+      ? await (tx ? pendingAddresseeQuery.for("update") : pendingAddresseeQuery)
+          .limit(1)
+          .then((rows) => rows[0] ?? null)
+      : null;
+    const isPendingAddresseeResolver = Boolean(pendingAddresseeWake && issueThreadInteractionAttentionAgentAllowed({
+      agentId: input.agentId,
+      interaction: pendingAddresseeWake!,
+      governedAction: pendingAddresseeWake!.kind === "request_confirmation"
+        && typeof pendingAddresseeWake!.payload === "object"
+        && pendingAddresseeWake!.payload !== null
+        && "toolAction" in pendingAddresseeWake!.payload
+        && pendingAddresseeWake!.payload.toolAction !== undefined,
+    }));
+    const isInteractionWake = isPendingAddresseeResolver || allowsIssueInteractionWake(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     );
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
-    const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason =
       readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);

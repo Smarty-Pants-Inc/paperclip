@@ -24,6 +24,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
   nativeRunFinalizations,
@@ -154,6 +155,27 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       assigneeAgentId: input.assigneeAgentId ?? null,
       executionState: input.executionState ?? null,
     });
+  }
+
+  async function seedPendingInteraction(input: {
+    companyId: string;
+    issueId: string;
+    addresseeAgentId: string | null;
+    status?: string;
+    effectiveResolverPolicy?: "anyone" | "not_creator" | "human_only";
+  }) {
+    const id = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id,
+      companyId: input.companyId,
+      issueId: input.issueId,
+      kind: "ask_user_questions",
+      status: input.status ?? "pending",
+      addresseeAgentId: input.addresseeAgentId,
+      effectiveResolverPolicy: input.effectiveResolverPolicy ?? "anyone",
+      payload: { version: 1, questions: [] },
+    });
+    return id;
   }
 
   async function seedRun(input: {
@@ -1329,6 +1351,62 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         outcome: "cancelled",
         errorCode: "issue_assignee_changed",
       });
+    });
+
+    it.each([null, "other-agent"])(
+      "keeps a pending addressed-card wake current with issue assignee %s",
+      async (assigneeAgentId) => {
+        const { companyId, agentId } = await seedCompanyAndAgent();
+        const otherAgentId = randomUUID();
+        await seedAgent({ id: otherAgentId, companyId, name: "OtherAgent" });
+        const issueId = randomUUID();
+        await seedIssue({ companyId, issueId, status: "backlog", assigneeAgentId: assigneeAgentId === "other-agent" ? otherAgentId : null });
+        const interactionId = await seedPendingInteraction({ companyId, issueId, addresseeAgentId: agentId });
+        const runId = await seedRun({ companyId, agentId, contextSnapshot: {
+          issueId, wakeReason: "interaction_pending", interactionId,
+        } });
+
+        const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+          runId, companyId, expectedStatus: "queued", now: new Date(),
+        });
+        expect(result).toMatchObject({ outcome: "not_stale" });
+      },
+    );
+
+    it.each([
+      { label: "resolved", status: "answered", addresseeMatches: true, interactionExists: true },
+      { label: "withdrawn", status: "withdrawn", addresseeMatches: true, interactionExists: true },
+      { label: "expired", status: "expired", addresseeMatches: true, interactionExists: true },
+      { label: "wrong addressee", status: "pending", addresseeMatches: false, interactionExists: true },
+      { label: "ineligible human-only resolver policy", status: "pending", addresseeMatches: true, interactionExists: true, effectiveResolverPolicy: "human_only" as const },
+      { label: "different issue", status: "pending", addresseeMatches: true, interactionExists: true, scopeMismatch: "issue" as const },
+      { label: "different company", status: "pending", addresseeMatches: true, interactionExists: true, scopeMismatch: "company" as const },
+      { label: "unknown interaction", status: "pending", addresseeMatches: true, interactionExists: false },
+    ])("does not exempt a stale or unverified card wake: $label", async ({ status, addresseeMatches, interactionExists, effectiveResolverPolicy, scopeMismatch }) => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const replacementAgentId = randomUUID();
+      await seedAgent({ id: replacementAgentId, companyId, name: "ReplacementCoder" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "backlog", assigneeAgentId: replacementAgentId });
+      const interactionCompanyId = scopeMismatch === "company"
+        ? (await seedCompanyAndAgent()).companyId
+        : companyId;
+      const interactionIssueId = scopeMismatch === "issue"
+        ? randomUUID()
+        : issueId;
+      if (scopeMismatch === "issue") {
+        await seedIssue({ companyId, issueId: interactionIssueId, status: "backlog" });
+      }
+      const interactionId = interactionExists
+        ? await seedPendingInteraction({ companyId: interactionCompanyId, issueId: interactionIssueId, addresseeAgentId: addresseeMatches ? agentId : replacementAgentId, status, effectiveResolverPolicy })
+        : randomUUID();
+      const runId = await seedRun({ companyId, agentId, contextSnapshot: {
+        issueId, wakeReason: "interaction_pending", interactionId,
+      } });
+      const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId, companyId, expectedStatus: "queued", now: new Date(),
+      });
+      expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
     });
 
     it(
