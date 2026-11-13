@@ -5841,6 +5841,24 @@ function retirementReasonName(kind: keyof typeof RETIREMENT_REASON_NAMES, value:
  * cleanup, or an interrupt with pending tool calls (the markers the settled
  * Pi interrupt proof rejects, native-retained-pi-source.ts). An unreadable
  * event log is uncertain too. */
+/** The settled-journal projection lets a gone remote Runner's undelivered
+ * semantic_tool.result count as answered: a committed result vouches for it.
+ * A Stop-settled owner has no result, so every journaled tool input needs a
+ * delivered (completed) answer, and no answer may be outstanding. */
+function stopJournalLeftUndeliveredTool(controlBytes: string): boolean {
+  try {
+    const control = record(JSON.parse(controlBytes));
+    const results = (Array.isArray(control.commands) ? control.commands : []).map(record)
+      .filter(command => command.type === "semantic_tool.result");
+    if (results.some(command => command.status !== "completed")) return true;
+    const delivered = new Set(results.map(command => record(command.payload).sourceEventId));
+    return (Array.isArray(control.committedEvents) ? control.committedEvents : []).map(record).some(event =>
+      (event.eventType === "semantic_tool.input" || event.eventType === "mcp_app.tool_input") && !delivered.has(event.sourceEventId));
+  } catch {
+    return true;
+  }
+}
+
 async function userStopLeftUncertainty(db: Db, run: { id: string; companyId: string }): Promise<boolean> {
   try {
     const rows = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
@@ -5927,7 +5945,9 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   const stoppedByUser = prior.run.status === "cancelled" && prior.owner.phase === "terminal_failure"
     && prior.owner.failureCode === "native_retry_cancelled" && hasAcknowledgedNativeStopIntent(prior.run);
   // The receipt says a user asked, not that the interrupt settled cleanly.
-  if (stoppedByUser && await userStopLeftUncertainty(input.db, prior.run)) return refuse("owner_stop_unsettled");
+  if (stoppedByUser && (await userStopLeftUncertainty(input.db, prior.run) || stopJournalLeftUndeliveredTool(controlBytes))) {
+    return refuse("owner_stop_unsettled");
+  }
   if (prior.owner.phase !== "committed" && !stoppedByUser) return refuse(`owner_${retirementReasonName("ownerPhase", prior.owner.phase)}`);
   if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
