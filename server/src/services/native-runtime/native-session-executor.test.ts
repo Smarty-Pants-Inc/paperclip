@@ -11298,6 +11298,44 @@ describe("native warm session supervision", () => {
     }
   });
 
+  // REG-26: Boat archived the box between turns; turn 2's resume restarted the
+  // machine, but the retained warm runner was reused and its attachment failed
+  // with "runnerd transport closed during provider startup". A restarted
+  // allocation must take the cold path (fresh runnerd, saved checkpoint).
+  it.each([false, true])("reuses the warm runner only when its allocation did not restart on resume (restarted: %s)", async restarted => {
+    const name = `warm-allocation-restarted-${restarted}`;
+    const current = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-one`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: name,
+      remoteCwd: `/tmp/${name}`, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: name } };
+    // The restarted machine has no runner left to prove a durable suspend.
+    const close = vi.fn(async (): Promise<void> => { throw new Error("runner did not prove durable suspension before checkpoint"); });
+    const session = { close };
+    const result = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+      turnId: name, normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+      nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    let reused: unknown = "not called";
+    state.execute.mockReset()
+      .mockImplementationOnce(async options => { await options.onSession?.(session); return result; })
+      .mockImplementationOnce(async options => { reused = options.existingSession; return result; });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name, runnerExecutionTarget: target });
+      const next = { ...current, binding: { ...current.binding, runId: `${name}-two` } };
+      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: name,
+        runnerExecutionTarget: { ...target, sandboxLeaseAcquisition: { outcome: "resumed" as const, providerLeaseId: name,
+          ...(restarted ? { restarted: true as const } : {}) } } })).resolves.toMatchObject({ exitCode: 0 });
+      expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(reused).toBe(restarted ? undefined : session);
+      if (restarted) expect(close).toHaveBeenCalledWith({ reason: "warm native session allocation restarted" });
+      else expect(close).not.toHaveBeenCalled();
+    } finally {
+      close.mockImplementation(async () => undefined);
+      await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" });
+    }
+  });
+
   it.each(["failed", "cancelled"] as const)("checkpoints managed edits before retiring a %s session whose close rejects", async (runTerminalState) => {
     const name = `warm-terminal-close-fails-${runTerminalState}`;
     const current = { ...execution,
