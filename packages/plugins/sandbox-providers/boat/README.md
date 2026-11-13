@@ -18,13 +18,25 @@ and `running` report `active`; all other states report `unknown`, including
 `archived` without a stop timestamp. See Boat's [GET contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).
 
 Observations preserve `stoppedAt` and `lastReboot.at` as `lastRebootAt` verbatim,
-using null when absent. `observedAt` is the HTTP response's `Date` converted to
-ISO, or null when missing or invalid; it is never the plugin's local clock.
+using null when absent. `observedAt` is the HTTP response's strict RFC 7231
+`Date` converted to ISO, or null when missing or invalid; it is never replaced
+with the plugin's local clock. IMF-fixdate and the obsolete RFC 850/asctime
+recipient forms are accepted only with exact grammar, matching weekday, valid
+calendar/time components, and a post-epoch timestamp no more than 24 hours ahead
+of the local clock. Numeric/ISO dates, invalid calendar dates, non-GMT zones,
+and out-of-range clocks return null; `Date.parse` leniency is not used.
 Missing resources also retain the response observation time when available.
 The existing idle-drain accounting and creation-operation inspection are unchanged.
 These fields describe provider observations, not authenticated Runner readiness
 or process continuity. This release adds the three optional observation fields
 to its vendored SDK; the corresponding Core consumer is a separate change.
+
+Request failures retain only method, path, HTTP status (`httpStatus`, null when
+no response arrived), and a fixed category (`request_error`, `network_error`,
+`http_error`, `parse_error`, or `ambiguous_404`). Provider error fields,
+`statusText`, network diagnostics, JSON previews and original causes are not
+retained. The configured key is centrally redacted from the resulting message
+and stack, including accidental collisions with an otherwise-safe path.
 
 ## Route A — default off
 

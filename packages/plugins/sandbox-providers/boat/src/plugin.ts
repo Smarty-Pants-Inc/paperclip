@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { syncFiles } from "./file-sync.js";
+import { parseHttpDate } from "./http-date.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
 import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
@@ -47,30 +48,53 @@ function parse(raw: Record<string, unknown>): Config {
     ...(typeof raw.boatEnvironment === "string" ? { boatEnvironment: raw.boatEnvironment } : {}),
   };
 }
+type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "parse_error" | "ambiguous_404";
+/** Never retain provider/transport diagnostics, even as a cause. Only these safe
+ * fields may cross the worker boundary; scrub the key from our own stack too. */
+function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory): Error & { httpStatus: number | null; category: RequestErrorCategory } {
+  const redact = (text: string) => config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text;
+  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}`)), { httpStatus, category });
+  if (error.stack) error.stack = redact(error.stack);
+  return error;
+}
 async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: { onHeaders?: (headers: Headers) => void; requireJson?: boolean; strictMissing?: boolean } = {}): Promise<any> {
-  if (init.method && init.method !== "GET") assertBoatActivityAdmission();
-  const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
-  if (allocation) idleActivity.resource(activityKey(config, decodeURIComponent(allocation)));
-  const headers = new Headers(init.headers);
-  headers.set("Authorization", `Bearer ${config.apiKey}`);
-  if (init.body !== undefined) headers.set("Content-Type", "application/json");
-  const response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: init.signal ?? AbortSignal.timeout(30_000) });
-  responseOptions.onHeaders?.(response.headers);
-  if (allowMissing && response.status === 404) {
-    if (!responseOptions.strictMissing) { await response.body?.cancel(); return null; }
-    // Boat's 404 'not_found' also covers an unknown route (it then names details.path).
-    // Only a sandbox-not-found envelope counts as missing; anything else is ambiguous.
-    const missing = await response.json().catch(() => null);
-    if (missing?.code === "not_found" && missing?.error?.details?.path === undefined) return null;
-    throw Object.assign(new Error(`Boat ${init.method ?? "GET"} ${path} returned an ambiguous 404`), { httpStatus: 404 });
+  let category: RequestErrorCategory = "request_error";
+  let httpStatus: number | null = null;
+  try {
+    if (init.method && init.method !== "GET") assertBoatActivityAdmission();
+    const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
+    if (allocation) idleActivity.resource(activityKey(config, decodeURIComponent(allocation)));
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", `Bearer ${config.apiKey}`);
+    if (init.body !== undefined) headers.set("Content-Type", "application/json");
+    category = "network_error";
+    const response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: init.signal ?? AbortSignal.timeout(30_000) });
+    httpStatus = response.status;
+    responseOptions.onHeaders?.(response.headers);
+    if (allowMissing && response.status === 404) {
+      if (!responseOptions.strictMissing) { await response.body?.cancel(); return null; }
+      category = "ambiguous_404";
+      // Boat's 404 'not_found' also covers an unknown route (details.path).
+      const missing = await response.json();
+      if (missing?.code === "not_found" && missing?.error?.details?.path === undefined) return null;
+      throw new Error(category);
+    }
+    if (!response.ok) {
+      category = "http_error";
+      // Do not parse or retain provider message, nested error, or statusText.
+      await response.body?.cancel();
+      throw new Error(category);
+    }
+    category = "parse_error";
+    const body = response.status === 204 ? null : await response.json().catch(error => {
+      if (responseOptions.requireJson) throw error;
+      return null;
+    });
+    if (responseOptions.requireJson && body === null) throw new Error(category);
+    return body;
+  } catch {
+    throw requestError(config, init.method ?? "GET", path, httpStatus, category);
   }
-  const body = response.status === 204 ? null : await response.json().catch(error => {
-    if (responseOptions.requireJson && response.ok) throw error;
-    return null;
-  });
-  if (!response.ok) throw Object.assign(new Error(`Boat ${init.method ?? "GET"} ${path} failed (${response.status}): ${body?.message ?? body?.error?.message ?? response.statusText}`), { httpStatus: response.status });
-  if (responseOptions.requireJson && body === null) throw new Error("Boat inspection response omitted JSON data.");
-  return body;
 }
 export type BoatSnapshotIdentity = { provider: "boat"; requestedRef: string; id: string; name: string; createdAt: string };
 /** Resolve the mutable create name to its immutable artifact; never use the UUID as create.from. */
@@ -427,8 +451,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const proof = idleActivity.proof(activityKey(c, params.providerLeaseId));
     let observedAt: string | null = null;
     const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true, strictMissing: true, onHeaders: headers => {
-      const date = headers.get("Date");
-      if (date !== null && Number.isFinite(Date.parse(date))) observedAt = new Date(date).toISOString();
+      observedAt = parseHttpDate(headers.get("Date"));
     } });
     if (result === null) {
       // A missing sandbox is 'destroyed' only when the same key and route still answer

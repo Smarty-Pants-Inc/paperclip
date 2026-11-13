@@ -65,7 +65,7 @@ describe("acquisition recovery ownership", () => {
   it.each([undefined, false, true])("lost reply stops every paginated match with retain=%s", async retain => {
     const f = fixture({ lost: true, pages: true });
     const { retainOnDestroy: _ignored, ...legacyConfig } = config;
-    await expect(plugin.definition.onEnvironmentAcquireLease!({ ...params, config: { ...legacyConfig, ...(retain === undefined ? {} : { retainOnDestroy: retain }) } })).rejects.toThrow("lost create reply");
+    await expect(plugin.definition.onEnvironmentAcquireLease!({ ...params, config: { ...legacyConfig, ...(retain === undefined ? {} : { retainOnDestroy: retain }) } })).rejects.toThrow("network_error");
     const cleanups = f.calls.filter(c => c.method === "POST" && c.url.pathname !== "/api/v1/sandboxes");
     expect(cleanups.map(c => c.url.pathname)).toEqual([`/api/v1/sandboxes/${id}/stop`, "/api/v1/sandboxes/bx_abcdefgh/stop"]);
     expect(f.calls.some(c => c.method === "DELETE")).toBe(false);

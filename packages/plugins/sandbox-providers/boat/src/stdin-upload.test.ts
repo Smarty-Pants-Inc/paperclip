@@ -85,7 +85,7 @@ describe("Runner stdin staging", () => {
     it(`${failure} upload failure: refuses execution and cleans the same temp path`, async () => {
       const stdin = "x".repeat(threshold + 1), f = fixture(stdin, failure);
       await expect(plugin.definition.onEnvironmentExecute!({ ...params, stdin })).rejects.toThrow(
-        failure === "http" ? "Boat stdin upload failed (403)" : failure === "network" ? "fixture connection lost" : "upload URL unavailable",
+        failure === "http" ? "Boat stdin upload failed (403)" : failure === "network" ? "fixture connection lost" : "failed (503): http_error",
       );
       expect(f.events).toEqual(failure === "url" ? ["url", "cleanup"] : ["url", "signed", "cleanup"]);
       expect(f.files.size).toBe(0);

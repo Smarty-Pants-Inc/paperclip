@@ -203,7 +203,7 @@ describe("Boat Runner contract", () => {
     const refused = await plugin.definition.onEnvironmentResumeLease!({ ...owned, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata }).catch(error => error);
     finish(); const execution = await executing;
     expect(refused).toBeInstanceOf(Error); expect(refused.message).toMatch(/settling/);
-    expect(execution.message).toMatch(/no longer active/);
+    expect(execution).toMatchObject({ category: "request_error", httpStatus: null });
     expect(f.network.mock.calls.some(([, init]) => String(init?.body).includes("dangerous-command"))).toBe(false);
   });
   it.each([
@@ -281,7 +281,7 @@ describe("Boat Runner contract", () => {
         else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
     }));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ category: "network_error", httpStatus: null });
     expect(timeout).toHaveBeenCalledWith(10_000);
   });
   it("throws if the inspection deadline expires while reading the response body", async () => {
@@ -294,7 +294,7 @@ describe("Boat Runner contract", () => {
         else signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
       },
     }))));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ category: "parse_error", httpStatus: 200 });
     expect(timeout).toHaveBeenCalledWith(10_000);
   });
   it.each(["{", "null", "", "false", "0", '""'])("never mistakes an invalid success body for a missing sandbox: %j", async body => {
@@ -311,7 +311,7 @@ describe("Boat Runner contract", () => {
   });
   it("throws on inspection transport failure rather than returning unknown", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("network unavailable"); }));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("network unavailable");
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("network_error");
   });
   it("still rejects a foreign inspection allocation", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox: { id: "bx_33333333", state: "running" } })));
@@ -329,16 +329,16 @@ describe("Boat Runner contract", () => {
       error: { code: "not_found", message: "Not Found", status: 404, details: { path: `/api/v1/sandboxez/${inspectId}` } },
     }, 404)).mockResolvedValueOnce(reply({ ok: true, sandboxes: [] }));
     vi.stubGlobal("fetch", network);
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ message: expect.stringContaining("ambiguous 404"), httpStatus: 404 });
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ category: "ambiguous_404", httpStatus: 404 });
     expect(network).toHaveBeenCalledTimes(1);
   });
   it.each([null, "<html>Not Found</html>", "{"])("rejects a 404 without JSON: %j", async body => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 404 })));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ message: expect.stringContaining("ambiguous 404"), httpStatus: 404 });
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ category: "ambiguous_404", httpStatus: 404 });
   });
   it.each([{}, { code: "unauthorized" }, null])("rejects an unrecognized JSON 404 envelope: %j", async body => {
     vi.stubGlobal("fetch", vi.fn(async () => reply(body, 404)));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("ambiguous 404");
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("ambiguous_404");
   });
   it.each([401, 500])("throws if the confirming list returns HTTP %i", async status => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(reply(sandboxNotFound, 404)).mockResolvedValueOnce(reply({ ok: false, code: "unavailable" }, status)));

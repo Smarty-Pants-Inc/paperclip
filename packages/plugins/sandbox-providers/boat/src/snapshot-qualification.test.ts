@@ -116,7 +116,7 @@ describe("Boat lease snapshot qualification", () => {
 
   it("never allocates after a timed-out identity read", async () => {
     const calls = fixture({ lookupError: new DOMException("lookup timed out", "TimeoutError") });
-    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toThrow(/timed out/);
+    await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toThrow(/network_error/);
     expect(calls.map(c => c.method)).toEqual(["GET"]);
   });
 
