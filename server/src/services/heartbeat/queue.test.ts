@@ -13,7 +13,7 @@ import { closeProcessRunAdmission, resetProcessRunAdmissionForTests } from "./ru
 import { createHeartbeatQueue, DEFERRED_WAKE_CONTEXT_KEY, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake, type HeartbeatQueueDependencies } from "./queue.js";
 import { createWakeQueue } from "../../modules/wake-queue/index.js";
 import { TransactionScope } from "../../modules/wake-queue/application/ports.js";
-import { enrichWakeContextSnapshot, mergeCoalescedContextSnapshot } from "./run-preparation.js";
+import { buildPaperclipWakePayload, enrichWakeContextSnapshot, mergeCoalescedContextSnapshot } from "./run-preparation.js";
 import { withQueuedCommentIdsInWakePayload, withQueuedCommentIdsInRunContext } from "../issue-queued-comment-queue.js";
 import { settleConversationTurn } from "../agent-conversations.js";
 import { chatCompletionDeliveryService, recordChatCompletion, recordChatHandoff } from "../chat-completion-delivery.js";
@@ -534,6 +534,11 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     const forFollowup = attachedRequests.filter(request => request.runId === followupRuns[0].id);
     expect(forFollowup).toHaveLength(1);
     expect(forFollowup[0]).toMatchObject({ coalescedCount: 4, status: "queued" });
+
+    const promotedContext = followupRuns[0].contextSnapshot as Record<string, unknown>;
+    expect(promotedContext).toMatchObject({ pluginId: "p1" });
+    const promotedPayload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: promotedContext });
+    expect(promotedPayload?.fallbackFetchNeeded).toBe(true);
   });
 
   async function pendingPredecessorFixture() {
