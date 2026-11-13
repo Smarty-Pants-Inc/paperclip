@@ -26,8 +26,15 @@ provider credentials.
   Existing reference rows are key-share locked through insertion, so concurrent
   deletion cannot reopen the check/write gap. Every event keeps its original UUID,
   timestamp and non-reference metadata, including unrelated healthy handoffs.
-  Required company scope is key-share locked first in sorted order, never nulled or reassigned; events for deleted companies are dropped with a count-only warning (company deletion removes their stored events too). Agent and environment identities are not
-  foreign keys in this audit table. Recovery adds no queries to successful batches.
+  Required company scope is checked with an ordinary SELECT, never nulled or
+  reassigned. Recovery must not hold a company row lock while waiting on optional
+  children: concurrent company deletion can hold those children while upgrading
+  its company lock for the final DELETE. If a company disappears after the check,
+  the INSERT fails its FK; the original batch remains queued and the next attempt
+  checks existence again. Events for deleted companies are dropped with a
+  count-only warning (company deletion removes their stored events too). Agent
+  and environment identities are not foreign keys in this audit table. Recovery
+  adds no queries to successful batches.
 - Each failed write is logged without its raw SQL/provider error and retried
   once immediately. A second failure retains the whole batch, propagates from
   explicit flush, and establishes a new one-second recovery deadline. Audit batches stay fixed across retries; after five consecutive failed flushes (two write attempts each), a structured dead-letter error logs their value-free audit records, count and event IDs before removing them so later batches can proceed. Events plus advisory
@@ -108,7 +115,14 @@ removes an issue through `issueService.remove`, then requires both that handoff
 (with a null issue reference) and an unrelated healthy handoff to persist and drain.
 It also deletes each other nullable FK target and all targets together, preserving
 live references. A recovery-commit/connection-loss case requires retry without
-duplicates. These tests cover data safety at the real PostgreSQL persistence boundary.
+duplicates. `secret-resolution-deadlock.test.ts` forces an actual missing-definition
+FK failure, pauses the real `deleteCompany` after its secret DELETE, and observes
+recovery waiting on that child through PostgreSQL's blocking-PID query. It then
+releases deletion with each operation's deadlock detector ordered first. Neither
+schedule may surface `40P01`, roll back company deletion, lose the live tenant's
+handoff, or retain the deleted tenant's event; the drop warning must contain only
+the audit kind and count. These tests cover data safety at the real PostgreSQL
+persistence boundary.
 
 These are data-safety and recorded warm-turn row-contention regressions. They
 are not a claim of a deployed Boat wake-to-start latency improvement; that must
