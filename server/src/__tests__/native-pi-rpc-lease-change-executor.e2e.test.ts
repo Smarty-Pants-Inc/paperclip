@@ -480,13 +480,15 @@ it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected", "stop-arch
         return { next, runnerReuse: undefined };
       }
       if (stopArchived) {
-        // Record and assert the actual product receipts even on the RED path.
-        for (const layer of ["runner", "provider_session"]) {
-          expect(reuse.find(payload => record(payload).layer === layer), `${layer} startup receipt`).toMatchObject({
-            layer, state: "reused", reason: "verified_reuse",
-          });
-        }
-        stage("archived resume product reuse claims", reuse);
+        expect(reuse.filter(payload => record(payload).layer === "runner")).not.toContainEqual(
+          expect.objectContaining({ layer: "runner", state: "reused", reason: "verified_reuse" }));
+        expect(reuse.find(payload => record(payload).layer === "provider_session"), "provider continuity receipt").toMatchObject({
+          layer: "provider_session", state: "reused", reason: "verified_reuse",
+        });
+        expect(spawned, "the next turn launched a replacement Runner").toHaveLength(2);
+        expect(sameBirth(spawned.at(-1)!)).toBe(true);
+        expect(sameBirth(runner)).toBe(false);
+        stage("archived resume replaced Runner and retained provider history", reuse);
       }
       expect(record(outcome).error, `turn ${index}: ${JSON.stringify(outcome)}`).toBeUndefined();
       if (resumedFrom === "connected") {
