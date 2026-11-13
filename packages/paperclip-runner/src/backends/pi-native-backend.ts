@@ -1,4 +1,4 @@
-import { resolveDefaultPiRpcThinkingLevel } from "@paperclipai/adapter-utils/pi-rpc-default-thinking";
+import { resolveDefaultPiRpcThinkingLevel } from "../pi-rpc-default-thinking.js";
 import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { NATIVE_EXECUTION_INPUT_SCHEMA, NATIVE_EXECUTION_INPUT_SCHEMA_V7, NATIVE_EXECUTION_INPUT_SCHEMA_V9, NATIVE_EXECUTION_INPUT_SCHEMA_V10 } from "../contracts/native-execution.js";
