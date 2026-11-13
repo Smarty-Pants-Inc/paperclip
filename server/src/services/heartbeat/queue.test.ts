@@ -480,6 +480,62 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     return { company, agent, issue, wake, run };
   }
 
+  it("coalesces five plugin wakes behind one running issue run", async () => {
+    const f = await fixture();
+    const initialRunContext = f.run.contextSnapshot;
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(f.agent);
+    deps.instanceSettings.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false, enableNativeRunner: true } as Awaited<ReturnType<typeof deps.instanceSettings.getExperimental>>);
+    const admission = createWakeQueue(db, {
+      resolveResponsibleUserId: async () => "queue-test-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+      wakeAdmissionHelpers: { filterZombieCoalesceTarget: deps.filterZombieCoalesceTarget,
+        mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+    deps.wakeQueue.createAdmissionTransactionScope.mockImplementation(admission.createAdmissionTransactionScope);
+    deps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(admission.admitWakeBehindIssueExecution);
+    const queue = createHeartbeatQueue(db, deps);
+
+    for (let k = 1; k <= 5; k += 1) {
+      await queue.enqueueWakeup(f.agent.id, {
+        source: "assignment",
+        payload: { issueId: f.issue.id },
+        contextSnapshot: {
+          issueId: f.issue.id,
+          wakeReason: `plugin wake ${k}`,
+          source: "paperclip-plugin-x",
+          pluginId: "p1",
+          pluginKey: "k",
+        },
+      });
+    }
+
+    const runsWhileActive = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id));
+    const running = runsWhileActive.filter(run => run.status === "running");
+    expect(running).toHaveLength(1);
+    expect(running[0]).toMatchObject({ id: f.run.id, contextSnapshot: initialRunContext });
+    expect(runsWhileActive).toHaveLength(1);
+
+    const pendingRequests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agent.id));
+    const pendingFollowups = pendingRequests.filter(request => request.status === "deferred_issue_execution" && request.runId === null);
+    expect(pendingFollowups).toHaveLength(1);
+    expect(pendingFollowups[0]).toMatchObject({ coalescedCount: 4,
+      payload: { issueId: f.issue.id, _paperclipWakeContext: { pluginId: "p1", pluginKey: "k" } } });
+
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    await admission.releaseIssueExecution({ companyId: f.company.id, runId: f.run.id, now: new Date() });
+    const releasedRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id));
+    const followupRuns = releasedRuns.filter(run => run.id !== f.run.id && run.status === "queued");
+    expect(followupRuns).toHaveLength(1);
+    const attachedRequests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agent.id));
+    const forFollowup = attachedRequests.filter(request => request.runId === followupRuns[0].id);
+    expect(forFollowup).toHaveLength(1);
+    expect(forFollowup[0]).toMatchObject({ coalescedCount: 4, status: "queued" });
+  });
+
   async function pendingPredecessorFixture() {
     const f = await fixture("queued");
     const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
