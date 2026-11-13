@@ -188,6 +188,16 @@ async function createdSandboxStopped(db: Db, operation: SandboxCreationOperation
   return created === lease.providerLeaseId && hasRemoteTerminationReceipt(await resolveRemoteTerminationLease(db, lease));
 }
 
+async function hasUnresolvedCreationSuccessor(db: Db, operation: SandboxCreationOperation): Promise<boolean> {
+  const [successor] = await db.select({ id: sandboxCreationOperations.id }).from(sandboxCreationOperations).where(and(
+    eq(sandboxCreationOperations.companyId, operation.companyId),
+    eq(sandboxCreationOperations.originalEnvironmentId, operation.originalEnvironmentId),
+    eq(sandboxCreationOperations.runId, operation.runId), eq(sandboxCreationOperations.requestKey, operation.requestKey),
+    ne(sandboxCreationOperations.id, operation.id), ne(sandboxCreationOperations.state, "resolved"),
+  )).limit(1);
+  return Boolean(successor);
+}
+
 /** Keep an already returned resource identity even when task attachment fails.
  * Positive evidence revives an absence-only resolution in this same journal.
  * Save the pending deadline atomically so a crash before transfer cannot orphan it. */
@@ -198,8 +208,18 @@ export async function recordSandboxCreationResource(db: Db, input: {
   const resolvedAbsent = and(eq(sandboxCreationOperations.state, "resolved"), sql`${sandboxCreationOperations.leaseId} is null`,
     sql`${sandboxCreationOperations.metadata}->>'creationReconciliationReason' = ${CREATION_ABSENCE_RESOLUTION_REASON}`);
   await writeEnvironmentCleanup(db, async tx => {
+    // Match cleanup/admission lock order. Upstream releases a resolved key, so
+    // a newer attempt may now own it; late evidence must not reclaim that key.
+    await tx.select({ id: environments.id }).from(environments).where(eq(environments.id, input.environmentId)).for("update");
+    const [prior] = await tx.select().from(sandboxCreationOperations).where(and(
+      eq(sandboxCreationOperations.id, input.id), eq(sandboxCreationOperations.companyId, input.companyId),
+      eq(sandboxCreationOperations.originalEnvironmentId, input.environmentId),
+    )).for("update");
+    const hasSuccessor = prior?.state === "resolved" && !prior.leaseId &&
+      prior.metadata.creationReconciliationReason === CREATION_ABSENCE_RESOLUTION_REASON &&
+      await hasUnresolvedCreationSuccessor(tx as unknown as Db, prior);
     const [recorded] = await tx.update(sandboxCreationOperations).set({
-      state: sql`case when ${resolvedAbsent} then 'pending' else ${sandboxCreationOperations.state} end`,
+      state: sql`case when ${resolvedAbsent} and ${!hasSuccessor} then 'pending' else ${sandboxCreationOperations.state} end`,
       nextAttemptAt: sql`case when ${sandboxCreationOperations.state} = 'needs_reconciliation' or ${resolvedAbsent} then clock_timestamp() else ${sandboxCreationOperations.nextAttemptAt} end`,
       metadata: sql`coalesce(${sandboxCreationOperations.metadata}, '{}'::jsonb) || ${JSON.stringify({ creationProviderLeaseId: input.providerLeaseId, ...(input.providerMetadata ? { creationProviderMetadata: input.providerMetadata } : {}) })}::jsonb`,
       updatedAt: new Date(),
@@ -209,6 +229,10 @@ export async function recordSandboxCreationResource(db: Db, input: {
         sql`${sandboxCreationOperations.metadata}->>'creationProviderLeaseId' = ${input.providerLeaseId}`),
     )).returning({ id: sandboxCreationOperations.id });
     if (!recorded) throw new Error("Sandbox creation resource identity changed");
+    // This row cannot become pending under upstream's partial unique index.
+    // Transfer atomically instead, so a record -> queue crash still has one
+    // cleanup lease owner without disturbing the replacement's creation fence.
+    if (hasSuccessor) await queueSandboxCreationCleanup(tx as unknown as Db, input);
   }, { companyId: input.companyId });
 }
 
@@ -233,6 +257,7 @@ export async function queueSandboxCreationCleanup(db: Db, input: {
       ? operation.metadata.runnerTaskCreationContextId : null;
     if (operation.state !== "pending" && !resolvedAbsent && !(operation.state === "needs_reconciliation" && contextId &&
         operation.metadata.creationProviderLeaseId === input.providerLeaseId)) throw new Error("Sandbox creation cleanup ownership changed");
+    const hasSuccessor = resolvedAbsent && await hasUnresolvedCreationSuccessor(tx as unknown as Db, operation);
     // The non-null runId also correlates agentless creation attempts. Only the
     // original optional heartbeat reference belongs in the lease's foreign key.
     // Older task intents predate that explicit field; retain their relationship
@@ -256,7 +281,9 @@ export async function queueSandboxCreationCleanup(db: Db, input: {
         ...(contextId ? { runnerTaskStartupCleanup: { contextId, requiresPreparationStop: false } } : {}) },
       failureReason: operation.metadata.purpose === "login" ? "interrupted_login_creation" : "interrupted_task_creation",
     });
-    await tx.update(sandboxCreationOperations).set({ state: "cleanup_pending", leaseId: lease.id, updatedAt: new Date(),
+    // A late resource's cleanup lease owns the work. Keep an old tombstone
+    // resolved when a replacement already holds the unresolved creation key.
+    await tx.update(sandboxCreationOperations).set({ state: hasSuccessor ? "resolved" : "cleanup_pending", leaseId: lease.id, updatedAt: new Date(),
       metadata: { ...operation.metadata, creationProviderLeaseId: input.providerLeaseId,
         creationProviderMetadata: input.providerMetadata ?? operation.metadata.creationProviderMetadata ?? {} },
     }).where(eq(sandboxCreationOperations.id, operation.id));

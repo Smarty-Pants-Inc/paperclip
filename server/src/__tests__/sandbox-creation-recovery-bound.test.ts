@@ -160,6 +160,33 @@ describe("bounded absent sandbox creation recovery", () => {
     expect(await nextEnvironmentCleanupAt(db)).toBeNull();
     await expect(recordSandboxCreationResource(db, { ...resource, providerLeaseId: "foreign-resource" })).rejects.toThrow("identity changed");
   });
+  it.each(["record", "queue"] as const)("retains late cleanup after upstream reuses an absence-resolved creation key (%s)", async mode => {
+    const operation = await intent();
+    for (let attempt = 0; attempt < 3; attempt++) { await due(); await recoverSandboxCreations(db, absent); }
+    const create = vi.fn(async () => ({ providerLeaseId: "replacement-resource", metadata: {} }));
+    await createOwnedSandbox(db, { companyId, environmentId, heartbeatRunId: runId,
+      provider: operation.provider, driverKey: operation.driverKey, config: {}, metadata: operation.metadata,
+    }, create);
+    const [successor] = await db.select().from(sandboxCreationOperations).where(sql`${sandboxCreationOperations.id} <> ${operation.id}`);
+    expect(successor).toMatchObject({ state: "pending", runId, requestKey: operation.requestKey });
+    const resource = { id: operation.id, companyId, environmentId, providerLeaseId: "late-original-resource" };
+    if (mode === "record") {
+      // If a newer owner holds the unresolved key, recording must transfer in
+      // the same transaction: a crash before the caller's queue cannot orphan it.
+      await recordSandboxCreationResource(db, resource);
+      expect(await db.select().from(environmentLeases)).toHaveLength(1);
+    }
+    await Promise.all(Array.from({ length: 4 }, () => queueSandboxCreationCleanup(db, resource)));
+    const [late] = await db.select().from(sandboxCreationOperations).where(eq(sandboxCreationOperations.id, operation.id));
+    expect(late).toMatchObject({ state: "resolved", metadata: { creationProviderLeaseId: resource.providerLeaseId } });
+    expect(await db.select().from(environmentLeases)).toEqual([expect.objectContaining({
+      id: late.leaseId, providerLeaseId: resource.providerLeaseId, status: "pending_cleanup",
+    })]);
+    expect(await nextEnvironmentCleanupAt(db)).not.toBeNull();
+    expect((await db.select().from(sandboxCreationOperations).where(eq(sandboxCreationOperations.id, successor.id)))[0])
+      .toMatchObject({ state: "pending", leaseId: null });
+    expect(create).toHaveBeenCalledOnce();
+  });
   it("still transfers a discovered allocation to cleanup even after earlier absence", async () => {
     await intent(); await recoverSandboxCreations(db, absent); await due();
     const onRecovered = vi.fn();
