@@ -623,6 +623,7 @@ fn continues_a_settled_conversation_in_the_next_run_after_a_runner_upgrade() {
                 sha256: format!("sha256:{:x}", Sha256::digest(fs::read(&sidecar).unwrap())),
             }],
         }),
+        pi_launch_profile: None,
         opencode_launch_profile: None,
         cursor_cloud_launch_profile: None,
         max_outbox_bytes: 1024 * 1024,
