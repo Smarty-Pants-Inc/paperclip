@@ -1155,21 +1155,6 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       if (!connection.enabled || connection.status === "disabled" || connection.status === "archived") {
         return { ok: false, redaction, decision: decision("deny", "deny_disabled_connection", "Connection is disabled.", [], [], { redactionPlan: redaction.redactionPlan }) };
       }
-      // Installs are an agent audience boundary, independent of action grants,
-      // profiles and policies. Legacy connections with no installs retain their
-      // existing authorization behavior; board/user actors are unchanged.
-      if (input.actor.actorType === "agent") {
-        const installs = await cachedRead(cache, `connection-installs:${input.companyId}:${contextConnectionId}`, async () =>
-          db.select({ targetType: toolConnectionInstalls.targetType, targetId: toolConnectionInstalls.targetId })
-            .from(toolConnectionInstalls)
-            .where(and(eq(toolConnectionInstalls.companyId, input.companyId), eq(toolConnectionInstalls.connectionId, contextConnectionId))));
-        const installedForAgent = installs.some((install) =>
-          (install.targetType === "company" && install.targetId === input.companyId)
-          || (install.targetType === "agent" && install.targetId === agentId));
-        if (installs.length > 0 && !installedForAgent) {
-          return { ok: false, redaction, decision: decision("deny", "deny_not_installed_for_agent", "Connection is not installed for this agent or the company.", [], [], { redactionPlan: redaction.redactionPlan }) };
-        }
-      }
       applicationId = connection.applicationId;
       connectionTransport = connection.transport;
     }
@@ -1548,6 +1533,22 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
     const loaded = await loadContext(input, cache);
     if (!loaded.ok) return loaded.decision;
     const { ctx, redaction } = loaded;
+    // Installs are an agent audience boundary, independent of action grants,
+    // profiles and policies. Keep context valid so denied calls can be audited.
+    // Legacy zero-install connections and board/user actors are unchanged.
+    if (ctx.actorType === "agent" && ctx.connectionId) {
+      const connectionId = ctx.connectionId;
+      const installs = await cachedRead(cache, `connection-installs:${ctx.companyId}:${connectionId}`, async () =>
+        db.select({ targetType: toolConnectionInstalls.targetType, targetId: toolConnectionInstalls.targetId })
+          .from(toolConnectionInstalls)
+          .where(and(eq(toolConnectionInstalls.companyId, ctx.companyId), eq(toolConnectionInstalls.connectionId, connectionId))));
+      const installedForAgent = installs.some((install) =>
+        (install.targetType === "company" && install.targetId === ctx.companyId)
+        || (install.targetType === "agent" && install.targetId === ctx.agentId));
+      if (installs.length > 0 && !installedForAgent) {
+        return decision("deny", "deny_not_installed_for_agent", "Connection is not installed for this agent or the company.", [], [], { redactionPlan: redaction.redactionPlan });
+      }
+    }
     // A final handoff rechecks current permissions for work already admitted by
     // the gateway. Its own last consumed slot cannot reject that same work.
     // Only durable consumption of an unchanged rule retains that slot; new or
