@@ -141,6 +141,7 @@ import { selectRemotePiCompanion } from "./remote-pi-companion.js";
 import { scheduledResumeContinuationAllowed } from "./scheduled-resume-continuation.js";
 import { readNativeLocalProcessStop, recordedLocalExecutionStopped, PRIOR_OWNER_FENCE_REFUSED, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, withReleasedNativeRunProcess } from "../native-local-process-stop.js";
 import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "../reusable-sandbox-kept-marker.js";
 import { connectorToolDefinitionsForSkills } from "../connector-runtime.js";
 import { NATIVE_PREPARATION_FENCING_VERSION, setNativeExecutionActive } from "./native-active-runs.js";
 import { preserveNativeFailedWorkspace } from "./native-failed-workspace-recovery.js";
@@ -11096,6 +11097,56 @@ const NATIVE_ATTEMPT_PROVIDER_KINDS: ReadonlySet<string> = new Set([
   "cursor_cloud", "codex", "opencode", "claude_managed", "aws_agentcore", "acpx", "pi_rpc",
 ]);
 
+/**
+ * A restart claim names the sandbox from the interrupted attempt. Abandon it
+ * only when the acquired lease itself records a replacement of that exact
+ * provider lease (or its retired predecessor points at this replacement).
+ * A changed environment-lease id alone is not enough: reusable handoffs can
+ * still name the same live box.
+ */
+async function remoteReattachLeaseWasReplaced(input: {
+  db: Pick<Db, "select">;
+  execution: NativeExecutionInput;
+  claim: Extract<NativeRestartRecoveryClaim, { kind: "reattach_remote_runner" }>;
+  target: AdapterExecutionTarget | null | undefined;
+}): Promise<boolean> {
+  const { claim, target } = input;
+  if (claim.remote.kind === "plugin_task") return false;
+  const remoteClaim = claim.remote;
+  if (target?.kind !== "remote" || target.transport !== "sandbox"
+    || target.runnerTask || !target.leaseId || !target.environmentId || !target.providerKey
+    || target.sandboxLeaseAcquisition?.outcome !== "replacement") return false;
+  const acquiredProviderLeaseId = target.sandboxLeaseAcquisition.providerLeaseId;
+  if (!acquiredProviderLeaseId || acquiredProviderLeaseId === remoteClaim.providerLeaseId) return false;
+  const leases = await input.db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.execution.binding.companyId),
+    eq(environmentLeases.environmentId, target.environmentId),
+    inArray(environmentLeases.providerLeaseId, [acquiredProviderLeaseId, remoteClaim.providerLeaseId]),
+  ));
+  const acquired = leases.find(lease => lease.id === target.leaseId);
+  if (!acquired || acquired.status !== "active" || acquired.heartbeatRunId !== input.execution.binding.runId
+    || acquired.issueId !== input.execution.binding.issueId
+    || acquired.executionWorkspaceId !== input.execution.binding.executionWorkspaceId
+    || acquired.provider !== target.providerKey || acquired.providerLeaseId !== acquiredProviderLeaseId
+    || record(acquired.metadata).remoteCwd !== target.remoteCwd) return false;
+  const recordedAcquisition = record(record(acquired.metadata).sandboxLeaseAcquisition);
+  if (recordedAcquisition.outcome !== "replacement"
+    || (typeof recordedAcquisition.providerLeaseId === "string" && recordedAcquisition.providerLeaseId !== acquiredProviderLeaseId)
+    || (target.sandboxLeaseAcquisition.previousProviderLeaseId !== undefined
+      && recordedAcquisition.previousProviderLeaseId !== target.sandboxLeaseAcquisition.previousProviderLeaseId)) return false;
+  if (recordedAcquisition.previousProviderLeaseId !== undefined) {
+    return recordedAcquisition.previousProviderLeaseId === remoteClaim.providerLeaseId;
+  }
+  const predecessor = leases.find(lease => lease.id !== acquired.id && lease.provider === target.providerKey
+    && lease.providerLeaseId === remoteClaim.providerLeaseId && lease.executionWorkspaceId === acquired.executionWorkspaceId
+    && lease.issueId === acquired.issueId && record(lease.metadata).remoteCwd === remoteClaim.remoteCwd);
+  if (!predecessor) return false;
+  const keptAfterReplacement = record(record(predecessor.metadata)[REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]);
+  return keptAfterReplacement.replacementLeaseId === acquired.id
+    || (recordedAcquisition.reason === "resume_failed" && predecessor.leasePolicy === "reuse_by_environment"
+      && predecessor.status === "pending_cleanup" && predecessor.failureReason === "resume_failed");
+}
+
 /** The provider gate at the start of a native attempt (pi_rpc launches through runnerd like ACPX). */
 export function isNativeAttemptProviderSupported(execution: Pick<NativeExecutionInput, "provider" | "schema">): boolean {
   return NATIVE_ATTEMPT_PROVIDER_KINDS.has(execution.provider.kind)
@@ -11109,6 +11160,14 @@ async function executePaperclipNativeSessionAttempt(
   cleanupOnly = false,
   ownDiagnosticLease?: (lease: NativeDiagnosticLease) => void,
 ): Promise<AdapterExecutionResult> {
+  if (input.restartRecovery?.kind === "reattach_remote_runner"
+    && await remoteReattachLeaseWasReplaced({ db: input.db, execution: input.execution,
+      claim: input.restartRecovery, target: input.runnerExecutionTarget })) {
+    // Stop trying to adopt a Runner that the recorded replacement box cannot
+    // contain. Do not substitute bootstrap_incomplete: the regular cold path
+    // must retain its existing conversation-restore behavior.
+    input = { ...input, restartRecovery: undefined };
+  }
   if (input.execution.provider.kind === "acpx" && input.execution.provider.agent === "antigravity") {
     const candidate = resolveAntigravityCandidateAdmission({
       companyId: input.execution.binding.companyId, model: input.execution.provider.model,
