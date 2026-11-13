@@ -14783,7 +14783,7 @@ async function readRemoteRunnerProviderState(input: {
 }
 
 const REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS = 20_000;
-const REMOTE_RUNNER_PROCESS_POLL_MS = 1_000;
+const REMOTE_RUNNER_PROCESS_POLL_MS = 15_000;
 
 // Linux boot identity plus start ticks identifies a process generation across
 // PID reuse. exec preserves both the launch shell's PID and its start ticks.
@@ -15112,6 +15112,8 @@ export function createRemoteRunnerProcessLauncher(input: {
   trace?: NativeRunTrace;
   onRunnerProcessSpawned?: () => void;
   sandboxRetention?: SandboxRunnerRetention;
+  /** Test seam only; production uses the bounded safety-net cadence. */
+  processPollMs?: number;
 }): (spec: RunnerProcessLaunchSpec) => RunnerProcessHandle {
   const runner = input.runner;
   return (spec) => {
@@ -15307,6 +15309,10 @@ export function createRemoteRunnerProcessLauncher(input: {
         attributes: { identitySource: "remote_marker", detached: true },
       });
 
+      // PRP owns authenticated connection-close observation. This detached
+      // launch has no provider child-completion channel (its launch RPC already
+      // finished), so retain exact process verification as the bounded fallback.
+      // A socket close alone is never permission to replace a possibly live PID.
       while (true) {
         const supervision = input.sandboxRetention?.supervision;
         await supervision?.waitUntilActive();
@@ -15340,7 +15346,7 @@ export function createRemoteRunnerProcessLauncher(input: {
         if (!observed) continue;
         if (observed.exitCode === 0 && !observed.timedOut) {
           await new Promise<void>((resolve) =>
-            setTimeout(resolve, REMOTE_RUNNER_PROCESS_POLL_MS),
+            setTimeout(resolve, input.processPollMs ?? REMOTE_RUNNER_PROCESS_POLL_MS),
           );
           continue;
         }

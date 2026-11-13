@@ -26,6 +26,7 @@ export async function readRemoteRunnerRecoveryProbe(input: {
     try {
       const result = await input.runner.execute({
         ...input.request,
+        readOnlyProbe: input.readOnly,
         timeoutMs: Math.min(10_000, remaining),
       });
       if (!result.timedOut) return result;

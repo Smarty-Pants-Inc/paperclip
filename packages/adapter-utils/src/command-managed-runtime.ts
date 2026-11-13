@@ -109,6 +109,9 @@ export interface CommandManagedRuntimeRunner {
      * `useSession`. The default keeps the context-based session selection.
      */
     bypassSession?: boolean;
+    /** Host-owned read-only recovery observation. Reuses this runner's resolved
+     * provider config; never forwarded to the provider as execution authority. */
+    readOnlyProbe?: boolean;
   }): Promise<RunProcessResult>;
   /**
    * Optional native inbound file transfer. Present only when the sandbox

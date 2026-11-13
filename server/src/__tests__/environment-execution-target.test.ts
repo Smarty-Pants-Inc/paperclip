@@ -553,6 +553,7 @@ describe("resolveEnvironmentExecutionTarget", () => {
         args?: string[];
         useSession?: boolean;
         bypassSession?: boolean;
+        readOnlyProbe?: boolean;
       }): Promise<unknown>;
     } }).runner!;
 
@@ -576,6 +577,14 @@ describe("resolveEnvironmentExecutionTarget", () => {
     };
     expect(second.forceSession).toBeUndefined();
     expect(second.bypassSession).toBe(true);
+    await runner.execute({ command: "sh", args: ["-c", "true"], bypassSession: true, readOnlyProbe: true });
+    const calls = environmentRuntime.execute.mock.calls.map(([call]) => call as {
+      probeRuntimeConfigScope?: object; readOnlyProbe?: boolean;
+    });
+    expect(calls[0].probeRuntimeConfigScope).toBeTruthy();
+    expect(calls[2].probeRuntimeConfigScope).toBe(calls[0].probeRuntimeConfigScope);
+    expect(calls[2].readOnlyProbe).toBe(true);
+    expect(calls[0].readOnlyProbe).toBeUndefined();
   });
 
   // A recording tracer that captures each provider-exec span's name, attribute

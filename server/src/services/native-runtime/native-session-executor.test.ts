@@ -1301,6 +1301,46 @@ exit 23
 });
 
 describe("remote runner process supervision", () => {
+  // Keep reason: measured production command/audit amplification (cl-poll-bound).
+  it("bounds warm runner probes to one per 15 seconds and detects exit 45 on the next probe", async () => {
+    vi.useFakeTimers();
+    const handles: ReturnType<ReturnType<typeof createRemoteRunnerProcessLauncher>>[] = [];
+    const counters = Array.from({ length: 6 }, () => ({ probes: 0, dead: false }));
+    const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+    try {
+      for (const counter of counters) {
+        let nonce = "";
+        const execute = vi.fn(async (request: { args?: string[] }) => {
+          const label = request.args?.[2];
+          if (label === "paperclip-runner-launch") { nonce = request.args![4]!; return ok; }
+          if (label === "paperclip-runner-process-identity") return { ...ok, stdout: `${nonce}\n4321\n2026-09-06T00:00:00.000Z\nrunner-budget\n` };
+          if (label === "paperclip-runner-monitor") { counter.probes++; return { ...ok, exitCode: counter.dead ? 45 : 0 }; }
+          return { ...ok, exitCode: 1 };
+        });
+        handles.push(createRemoteRunnerProcessLauncher({
+          target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
+          runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
+          stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-budget",
+        })({ command: "/runtime/runnerd", args: [], cwd: "/workspace", environment: {} }));
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(counters.map(c => c.probes)).toEqual(Array(6).fill(1));
+      const initial = counters.reduce((sum, c) => sum + c.probes, 0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(counters.reduce((sum, c) => sum + c.probes, 0) - initial).toBeLessThanOrEqual(6 * 60 / 15);
+      counters.forEach(c => { c.dead = true; });
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(handles.every(h => h.isExitConfirmed?.() === false)).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.all(handles.map(h => h.completion));
+      expect(handles.every(h => h.isExitConfirmed?.() === true)).toBe(true);
+    } finally {
+      counters.forEach(c => { c.dead = true; });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await Promise.all(handles.map(h => h.completion.catch(() => undefined)));
+      vi.useRealTimers();
+    }
+  });
   it("waits for delayed identity publication with exactly one remote readiness invocation", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-event-readiness-"));
     const marker = join(root, "identity");
@@ -1574,6 +1614,7 @@ fs.readFileSync = function(path, ...args) {
       target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: root },
       runner: { execute } as never, remoteBinary: fixture, processIdentityPath: marker,
       stateDirectory: root, diagnosticsDirectory: join(root, "diagnostics"), runnerInstanceId: "runner-health",
+      processPollMs: 1_000,
     })({ command: fixture, args: [], cwd: root, environment: {} });
     void handle.completion.then(() => { settled = true; }, () => { settled = true; });
     try {
@@ -1642,6 +1683,7 @@ fs.readFileSync = function(path, ...args) {
       target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
       runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
       stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-remote",
+      processPollMs: 1_000,
     });
     const handle = launcher({ command: "/controller/runnerd", args: [], cwd: "/controller", environment: {} });
     void handle.completion.then(() => { settled = true; }, () => { settled = true; });
