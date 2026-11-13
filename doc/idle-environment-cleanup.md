@@ -110,8 +110,13 @@ resource ID unknown.
 ## Compatible changes on reusable sandboxes
 
 Reusable sandbox scopes retain the full configuration fingerprint and a separate
-allocation-identity fingerprint. Only scalar boot-source keys (`from`, `snapshot`,
-`image`, `rootfs`), sizing keys (`cpu`, `memory`, `disk`, `gpu`, `size`, `shape`),
+allocation-identity fingerprint. Boot-source keys (`from`, `snapshot`, `image`,
+`rootfs`) are identity fields: a change, including clearing a source, never reuses
+an allocation created from the old source. Obsolete retained/released allocations
+enter the existing durable stop-only cleanup path so their workspace/session
+state stays recoverable while a new allocation uses the current source. This
+also applies to pre-upgrade fingerprints that omitted boot sources from identity.
+Only scalar sizing keys (`cpu`, `memory`, `disk`, `gpu`, `size`, `shape`),
 explicit timing keys (`timeoutMs`, `bridgeRequestTimeoutMs`, `livenessTimeoutMs`,
 `ttlMinutes`, `autoStopInterval`, `autoArchiveInterval`, `autoDeleteInterval`,
 `runnerIdleTimeoutMs`), and scalar `resources.{cpu,memory,disk,gpu}` may drain to
@@ -119,7 +124,7 @@ the next allocation. Objects under these names, unknown fields, provider/plugin
 identity, account, region, endpoints, mounts, environment and credential/secret
 scope changes remain identity changes and keep the existing mismatch behavior.
 
-A compatible change does not relabel the running allocation as the new image.
+A compatible sizing/timing change does not relabel the running allocation.
 Reuse, provider resume, and the stored scope keep its admitted creation settings
 while the owning run is nonterminal or its required checkpoint is unavailable.
 An old valid backup is insufficient when later durable provider events exist.
@@ -133,11 +138,12 @@ is introduced. Pre-upgrade full fingerprints are checked against reconstructed
 admitted settings under the current security context, never accepted by a
 compatible-key-only comparison.
 
-The PostgreSQL runtime regression covers active and released warm leases, old
-scope migration, serving the next message on the original image, absent/stale
-checkpoints, replacement creation failure, eventual new-image adoption with F7
-backup propagation, and incompatible account/region/mount or object-valued
-creation-setting changes. This is local lifecycle proof with a controlled provider, not a live
+The PostgreSQL runtime regression covers retained and released boot-source
+changes, legacy scopes, stale lifecycle support, same-source reuse, and execution
+on the newly acquired source. Compatible sizing coverage includes active and
+released warm leases, old scope migration, absent/stale checkpoints, replacement
+creation failure, eventual sizing adoption with F7 backup propagation, and
+incompatible account/region/mount or object-valued creation-setting changes. This is local lifecycle proof with a controlled provider, not a live
 Boat/Pi conversation acceptance result.
 
 ## Legacy deferred orphan buffers

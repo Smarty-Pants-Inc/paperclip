@@ -10,6 +10,7 @@ import { findPluginWorkerUnavailableError } from "./plugin-worker-unavailable-er
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
+import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 
 /**
  * Total time one run spends resuming a preserved reusable sandbox, including
@@ -109,6 +110,7 @@ export async function reusableSandboxReplacementIsSafe(input: {
  * and the state needed by the next allocation is verifiable. Projectless chats
  * have no project workspace to checkpoint, but still require their F7 backup. */
 export async function reusableSandboxConfigurationChangeIsSafe(input: {
+  config: Record<string, unknown>;
   db: Db;
   lease: EnvironmentLease;
   companyId: string;
@@ -117,6 +119,7 @@ export async function reusableSandboxConfigurationChangeIsSafe(input: {
   adapterType: string | null | undefined;
 }): Promise<boolean> {
   const { db, lease } = input;
+  if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) return false;
   if (!input.heartbeatRunId || !lease.heartbeatRunId || !lease.providerLeaseId || lease.companyId !== input.companyId
     || !["released", "retained"].includes(lease.status)) return false;
   const [owner] = await db.select({ status: heartbeatRuns.status, nativeSessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns)
