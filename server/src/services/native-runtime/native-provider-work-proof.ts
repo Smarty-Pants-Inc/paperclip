@@ -40,6 +40,12 @@ export type FailedNativePredecessorProbe = Pick<EnvironmentRuntimeService, "exec
 type ProofDb = Pick<Db, "select" | "execute">;
 type Predecessor = typeof heartbeatRuns.$inferSelect;
 
+/** P1 switch. Off until the generation-loss helper is judged same-box and
+ * fail-closed (Image C); with it off, a failed predecessor that has execution
+ * start evidence stays HELD with its visible notice. P2 alone frees the
+ * claimed, never-launched rows (SMA-43 shape). */
+export const FAILED_PREDECESSOR_P1_ENABLED = false;
+
 /** ONE failed-predecessor gate, shared by resume selection and legacy identity
  * walk-back. P1 proves the old physical generation gone; P2 proves no execution
  * ever started. A claim (attempt/generation > 0) is not execution evidence.
@@ -54,7 +60,8 @@ export async function canBypassFailedNativePredecessor(db: ProofDb, input: {
     .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
   if (!row || row.run.runtimeMode !== "native" || row.run.status !== "failed" || !row.run.finishedAt
     || row.owner.phase !== "terminal_failure" || row.owner.leaseOwner !== null || row.owner.leaseExpiresAt !== null) return false;
-  return await predecessorGenerationLost(db, row.run, input.predecessorEnvironmentRuntime) || await terminalCompleteWithoutExecutionStart(db, row.run); // P1 OR P2
+  return (FAILED_PREDECESSOR_P1_ENABLED && await predecessorGenerationLost(db, row.run, input.predecessorEnvironmentRuntime))
+    || await terminalCompleteWithoutExecutionStart(db, row.run); // P1 OR P2
 }
 
 /** Never probe the successor's box. Resolve the predecessor's exact saved lease

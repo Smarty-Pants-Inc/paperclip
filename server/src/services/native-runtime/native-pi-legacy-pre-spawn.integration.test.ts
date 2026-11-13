@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentTaskSessions, authUsers, companies, completionContracts, createDb, environments, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
-import { canBypassFailedNativePredecessor, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { canBypassFailedNativePredecessor, FAILED_PREDECESSOR_P1_ENABLED, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { selectPiConversation } from "./pi-conversation-record.js";
 import { findNativeSessionResumeRun } from "./native-session-resume.js";
@@ -191,7 +191,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("legacy Pi setup failures th
   }, 60_000);
 
   it.each(["unprobeable", "live", "lost", "rebooted", "foreign-marker"] as const)(
-    "P1 probes ONLY the predecessor's box and is fail-closed: %s", async control => {
+    "P1 (when enabled) probes ONLY the predecessor's box and is fail-closed; disabled = HELD: %s", async control => {
       const h = await seed("SMAA-143", "claimed"), failed = h.rows.at(-1)!;
       await db.insert(heartbeatRunEvents).values({ companyId: failed.companyId, agentId: failed.agentId, runId: failed.id,
         seq: 1000, eventType: "native.process_start_requested", stream: "system" });
@@ -214,8 +214,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("legacy Pi setup failures th
         return { exitCode: control === "lost" ? 45 : control === "rebooted" ? 47 : 0, signal: null, timedOut: false, stdout: "", stderr: "" };
       });
       const predecessorEnvironmentRuntime = { execute };
-      const allowed = control === "lost" || control === "rebooted";
+      const allowed = FAILED_PREDECESSOR_P1_ENABLED && (control === "lost" || control === "rebooted");
       expect(await canBypassFailedNativePredecessor(db, { companyId: failed.companyId, runId: failed.id, predecessorEnvironmentRuntime })).toBe(allowed);
+      if (!FAILED_PREDECESSOR_P1_ENABLED) expect(execute).not.toHaveBeenCalled();
       const selected = await findNativeSessionResumeRun(db, { ...h.input, normalizedSessionId: failed.nativeSessionId,
         currentRunId: h.current.id, beforeCreatedAt: h.current.createdAt, predecessorEnvironmentRuntime });
       expect(selected?.id ?? null).toBe(allowed ? null : failed.id);
