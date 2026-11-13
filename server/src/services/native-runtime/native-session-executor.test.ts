@@ -1422,15 +1422,19 @@ exit 23
         expect(spawnSync(launch.command, launch.args, { cwd: root, encoding: "utf8" }).status).toBe(0);
         await vi.waitFor(async () => expect(await readFile(done, "utf8")).toBe("23"));
       }
-      const logs = await readdir(diagnostics);
-      const contents = await Promise.all(logs.map(async name => {
+      const logs = (await readdir(diagnostics)).sort();
+      const contents = new Map(await Promise.all(logs.map(async name => {
         const path = join(diagnostics, name);
         expect((await lstat(path)).mode & 0o777).toBe(0o600);
-        return readFile(path, "utf8");
-      }));
-      expect(contents).toContain("first-generation-crash\n");
-      expect(contents).toContain("second-generation-crash\n");
-      expect(logs).toHaveLength(2);
+        return [name, await readFile(path, "utf8")] as const;
+      })));
+      // Trace-keep (C8 2868978cf) alongside upstream's bounded process log: each
+      // generation keeps its own durable pre-exec file, and runnerd's stderr from
+      // both generations stays in the recovery-readable process log.
+      const launchFiles = logs.filter(name => /^runnerd\.launch-stderr\..+\.log$/.test(name));
+      expect(launchFiles).toHaveLength(2);
+      expect(contents.get(REMOTE_RUNNER_PROCESS_STDERR_FILE)).toBe("first-generation-crash\nsecond-generation-crash\n");
+      expect(logs).toEqual([...launchFiles, REMOTE_RUNNER_PROCESS_STDERR_FILE].sort());
       expect((await lstat(diagnostics)).mode & 0o777).toBe(0o700);
     } finally {
       await rm(root, { recursive: true, force: true });

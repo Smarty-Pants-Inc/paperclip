@@ -15758,7 +15758,11 @@ export const REMOTE_RUNNER_AUTHORITY_ARCHIVE_SCRIPT =
  * never leaves the sandbox on its own; recovery reads a short redacted tail.
  */
 export const REMOTE_RUNNER_PROCESS_STDERR_FILE = "runnerd.process-stderr.log";
-/** Above this size the file is rotated once at launch, so each runnerd starts with a fresh file. */
+/**
+ * Above this size the file is rotated at launch, so each runnerd starts with a
+ * fresh file. Rotation never discards an earlier generation: the previous
+ * `.1` moves to a per-generation retired name first.
+ */
 export const REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES = 1_048_576;
 /** The disk backstop for one runnerd's lifetime: above this size the trimmer keeps the last 1 MiB. */
 export const REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES = 8_388_608;
@@ -15870,19 +15874,36 @@ const REMOTE_RUNNER_STALE_STATE_FENCE_SCRIPT =
   'if test -L "$fence_log" || { test -e "$fence_log" && test ! -f "$fence_log"; }; then fence_log=/dev/null; fi; ' +
   `node -e "${REMOTE_RUNNER_STALE_LINEAGE_STOP_SCRIPT}" "$1" "$state_dir" $stale_pids 2>>"$fence_log" || exit 75; fi; fi; `;
 
+/**
+ * Trace-keep: every launch generation keeps its own durable evidence.
+ * - Pre-exec: right after the private diagnostics directory exists, the launch
+ *   shell's own stderr goes to `runnerd.launch-stderr.<nonce>.<pid>.log`. The
+ *   detached parent sends the shell's stderr to /dev/null, so without this a
+ *   launch that fails before `exec` (for example the identity-marker write)
+ *   leaves no evidence at all. The launch nonce + child PID names a private
+ *   file; noclobber refuses reuse or a planted symlink.
+ * - Process: runnerd's own stderr goes to the bounded, recovery-readable
+ *   `runnerd.process-stderr.log` below; rotation retires, never deletes, an
+ *   earlier generation's file.
+ * Nothing deletes diagnostics from an earlier generation.
+ */
 export const REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT =
   'set -eu; identity_path=$1; identity_nonce=$2; runner_instance_id=$3; diagnostics_directory=$4; shift 4; umask 077; ' +
   'test ! -L "$diagnostics_directory"; if test -e "$diagnostics_directory"; then test -d "$diagnostics_directory"; else mkdir -p -- "$diagnostics_directory"; fi; chmod 0700 "$diagnostics_directory"; ' +
+  'set -C; exec 2> "$diagnostics_directory/runnerd.launch-stderr.${identity_nonce}.$$.log"; set +C; ' +
   REMOTE_RUNNER_STALE_STATE_FENCE_SCRIPT +
   'started_at=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"); pid=$$; process_fingerprint=""; if ' +
   REMOTE_RUNNER_PROCESS_FINGERPRINT_SCRIPT +
   '; then :; else process_fingerprint=""; fi; ' +
-  // Bounded stderr evidence: rotate an oversized file once, then trim it in place while runnerd runs.
+  // Bounded stderr evidence: rotate an oversized file, then trim it in place while runnerd runs.
+  // Rotation first retires an existing `.1` under this launch's own name, so no generation is lost.
   // A symlink or non-file at the path keeps the old /dev/null behavior.
   `stderr_log="$diagnostics_directory/${REMOTE_RUNNER_PROCESS_STDERR_FILE}"; ` +
   'if test -L "$stderr_log" || { test -e "$stderr_log" && test ! -f "$stderr_log"; }; then stderr_log=/dev/null; else ' +
   'stderr_size=0; if test -f "$stderr_log"; then stderr_size=$(wc -c < "$stderr_log" | tr -d " "); fi; ' +
-  `if test "\${stderr_size:-0}" -gt ${REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES}; then mv -f -- "$stderr_log" "$stderr_log.1"; fi; ` +
+  `if test "\${stderr_size:-0}" -gt ${REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES}; then ` +
+  'if test -f "$stderr_log.1" && test ! -L "$stderr_log.1"; then mv -f -- "$stderr_log.1" "$diagnostics_directory/runnerd.process-stderr.retired.${identity_nonce}.$$.log"; fi; ' +
+  'mv -f -- "$stderr_log" "$stderr_log.1"; fi; ' +
   `( ( exec sh -c '${REMOTE_RUNNER_PROCESS_STDERR_TRIM_SCRIPT}' paperclip-runner-stderr-trim "$pid" "$stderr_log" </dev/null >/dev/null 2>&1 ) & ); fi; ` +
   'identity_tmp="${identity_path}.tmp.$$"; printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "$identity_nonce" "$$" "$started_at" "$runner_instance_id" "$process_fingerprint" > "$identity_tmp"; chmod 0600 "$identity_tmp"; mv -f -- "$identity_tmp" "$identity_path"; exec "$@" 2>>"$stderr_log"';
 
