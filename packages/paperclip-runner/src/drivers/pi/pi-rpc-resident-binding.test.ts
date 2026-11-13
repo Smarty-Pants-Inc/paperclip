@@ -198,11 +198,20 @@ describe("resident Pi model binding", () => {
     const startedAtMs = Date.now();
     await f.session.attachRun({ runId: "run-b" });
     const turn = await f.session.startTurn({ message: { role: "user", text: "two" } });
-    expect(f.events.filter(event => event.runId === "run-b").flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()))
-      .some(span => span.name === "runner.pi.prompt_to_started")).toBe(false);
+    expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toEqual([]);
     await finish(f, 2);
-    const spans = f.events.filter(event => event.runId === "run-b")
-      .flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
+    const runEvents = f.events.filter(event => event.runId === "run-b");
+    const diagnostics = runEvents.filter(event => event.eventType === "harness.diagnostic"
+      && event.payload.code === "provider_performance_spans");
+    const spans = diagnostics.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
+    if (process.env.PI_WARM_ORDER_OUT) await writeFile(process.env.PI_WARM_ORDER_OUT,
+      JSON.stringify({ runId: "run-b", turnId: turn.turnId, diagnosticCount: diagnostics.length,
+        events: runEvents.map(event => ({ eventType: event.eventType, code: event.payload.code, runId: event.runId,
+          turnId: event.turnId, sourceSeq: event.sourceSeq, spanCount: parseProviderPerformanceSpans(event.payload, Date.now()).length })) }, null, 2));
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]).toMatchObject({ runId: "run-b", turnId: turn.turnId });
+    expect(runEvents.indexOf(runEvents.find(event => event.eventType === "turn.started")!))
+      .toBeLessThan(runEvents.indexOf(diagnostics[0]!));
     expect(f.transport.commands.slice(commandStart)).toEqual([...admission, ...admission, "prompt"]);
     expect(spans.map(span => span.name)).toEqual(expect.arrayContaining([
       "runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn", "runner.pi.prompt_to_started",
@@ -223,6 +232,57 @@ describe("resident Pi model binding", () => {
       JSON.stringify({ runId: "run-b", turnId: turn.turnId, providerSessionId: f.session.ids().providerSessionId,
         commands: f.transport.commands.slice(commandStart), spans }, null, 2));
   });
+  // Keep reason: prompt rejection/handled input and failed admission can omit
+  // native agent_start; diagnostics must survive these trust-boundary paths.
+  it.each(["handled", "rejected"])("flushes %s prompt timings once before its terminal without agent_start", async disposition => {
+    const f = await fixture();
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.attachRun({ runId: "run-b" });
+    f.transport.promptDisposition = disposition;
+    f.transport.rejectPrompt = disposition === "rejected";
+    const started = f.session.startTurn({ message: { role: "user", text: "no model work" } });
+    if (disposition === "rejected") await expect(started).rejects.toThrow("rejected before acceptance");
+    else await started;
+    await tick();
+    const events = f.events.filter(event => event.runId === "run-b");
+    const diagnostics = events.filter(event => event.payload.code === "provider_performance_spans");
+    expect(diagnostics).toHaveLength(1);
+    expect(events[0]).toMatchObject({ eventType: "turn.started" });
+    expect(diagnostics[0]).toMatchObject({ turnId: events[0]!.turnId });
+    expect(events.at(-1)).toMatchObject({ eventType: disposition === "rejected" ? "turn.failed" : "turn.completed" });
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(13);
+    await f.session.close(); await tick();
+    expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(1);
+  });
+
+  it("flushes an unused warm attachment on close with its captured run and no invented turn", async () => {
+    const f = await fixture();
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.attachRun({ runId: "run-b" });
+    expect(f.events.some(event => event.runId === "run-b")).toBe(false);
+    await f.session.close(); await tick();
+    const diagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.turnId).toBeUndefined();
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(7);
+    expect(f.events.filter(event => event.runId === "run-a" && event.payload.code === "provider_performance_spans")).toHaveLength(1);
+  });
+
+  it("retains the failed outer attach timing when admission closes the session before measurement unwinds", async () => {
+    const f = await fixture();
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    f.transport.effortMismatch = true;
+    await expect(f.session.attachRun({ runId: "run-b" })).rejects.toThrow(/thinking/);
+    await tick();
+    const diagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.turnId).toBeUndefined();
+    const spans = parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now());
+    expect(spans.find(span => span.name === "runner.pi.attach")).toMatchObject({ outcome: "failed" });
+    expect(spans.filter(span => span.name === "runner.pi.attach")).toHaveLength(1);
+    expect(f.transport.closed).toBe(true);
+  });
+
   it("boots a 200 KiB binding through a private file instead of an E2BIG environment entry", async () => {
     const large = { ...tool("large"), inputSchema: { type: "object", properties: { body: { type: "string", description: "x".repeat(200 * 1024) } } } };
     const f = await fixture({ dynamicTools: [large] });

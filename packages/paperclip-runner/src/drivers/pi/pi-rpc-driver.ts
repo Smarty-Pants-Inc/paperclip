@@ -36,7 +36,7 @@ import type {
 import { HarnessCapabilityUnavailableError, HarnessOperationAlreadyTerminalError, HarnessStaleTurnError } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
-import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase } from "../../contracts/provider-performance.js";
+import { MAX_PROVIDER_PERFORMANCE_SPANS, PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 
 export interface PiRpcDriverOptions {
   /** Proxy/backend integration options currently forwarded by the native factory. */
@@ -526,6 +526,8 @@ export class PiRpcHarnessSession implements HarnessSession {
   #admitted = true;
   #failure: Error | null = null;
   #closed = false;
+  readonly #timings: { span: ProviderPerformanceSpan; origin: { runId: string; turnId?: string } }[] = [];
+  readonly #pendingTimings = new Set<(endedAtMs: number) => void>();
 
   constructor(state: PiSessionState) {
     this.#transport = state.transport;
@@ -640,17 +642,47 @@ export class PiRpcHarnessSession implements HarnessSession {
 
   #recordTiming(name: ProviderPerformancePhase, startedAtMs: number, endedAtMs: number,
     outcome: "ok" | "failed", origin: { runId: string; turnId?: string }): void {
-    try {
-      this.#emit("harness.diagnostic", { code: PROVIDER_PERFORMANCE_DIAGNOSTIC,
-        spans: [{ name, startedAtMs, endedAtMs: Math.max(startedAtMs, endedAtMs), outcome }] }, origin);
-    } catch { /* Diagnostics must not replace the operation's result. */ }
+    this.#timings.push({ span: { name, startedAtMs, endedAtMs: Math.max(startedAtMs, endedAtMs), outcome },
+      origin: { runId: origin.runId, ...(origin.turnId ? { turnId: origin.turnId } : {}) } });
+  }
+
+  #flushTimings(turn?: { runId: string; turnId?: string }, closing = false): void {
+    // Failure can close the session from inside a measured operation. Capture
+    // those intervals before closing the queue, not in an unreachable finally.
+    if (closing) for (const finish of this.#pendingTimings) finish(Date.now());
+    const batches = new Map<string, { origin: { runId: string; turnId?: string }; spans: ProviderPerformanceSpan[] }>();
+    for (const { span, origin: captured } of this.#timings.splice(0)) {
+      // Admission precedes creation of the turn. Associate it only with the
+      // matching run; never relabel an explicit old run/turn on warm reuse.
+      const origin = captured.turnId || captured.runId !== turn?.runId ? captured : { ...captured, turnId: turn.turnId };
+      const key = JSON.stringify([origin.runId, origin.turnId]);
+      let batch = batches.get(key);
+      if (!batch) { batch = { origin, spans: [] }; batches.set(key, batch); }
+      batch.spans.push(span);
+    }
+    for (const { origin, spans } of batches.values()) {
+      // Respect the existing reader's limit even after repeated admissions.
+      for (let offset = 0; offset < spans.length; offset += MAX_PROVIDER_PERFORMANCE_SPANS) {
+        try { this.#emit("harness.diagnostic", { code: PROVIDER_PERFORMANCE_DIAGNOSTIC,
+          spans: spans.slice(offset, offset + MAX_PROVIDER_PERFORMANCE_SPANS) }, origin); }
+        catch { /* Diagnostics must not replace the operation's result. */ }
+      }
+    }
   }
 
   async #measure<T>(name: ProviderPerformancePhase, work: () => Promise<T>, origin = { runId: this.#runId }): Promise<T> {
     const startedAtMs = Date.now();
     let outcome: "ok" | "failed" = "failed";
+    const finish = (endedAtMs: number) => {
+      if (!this.#pendingTimings.delete(finish)) return;
+      this.#recordTiming(name, startedAtMs, endedAtMs, outcome, origin);
+    };
+    this.#pendingTimings.add(finish);
     try { const result = await work(); outcome = "ok"; return result; }
-    finally { this.#recordTiming(name, startedAtMs, Date.now(), outcome, origin); }
+    finally {
+      finish(Date.now());
+      if (outcome === "failed" && !this.#pendingTimings.size) this.#flushTimings();
+    }
   }
 
   async #waitForInterrupt(runId = this.#runId): Promise<void> {
@@ -683,6 +715,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       this.#admitted = true;
     } catch (error) {
       if (this.#resident) await this.#fenceFailure(error);
+      else if (!this.#pendingTimings.size) this.#flushTimings();
       throw error;
     }
   }
@@ -1169,6 +1202,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         try { await cleanup(); this.#cleanupSteps!.delete(cleanup); } catch (error) { failures.push(error); }
       }
       const turn = this.#activeTurn;
+      this.#flushTimings(turn ?? undefined, true);
       if (turn && !turn.settled) {
         turn.settled = true;
         this.#emit(failures.length ? "turn.failed" : "turn.cancelled", failures.length
@@ -1263,6 +1297,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         } catch {
           // The original failure is already published; cleanup cannot mask it.
         } finally {
+          this.#flushTimings(turn ?? undefined, true);
           this.#events.close(this.#failure);
           await this.close().catch(() => undefined);
         }
@@ -1341,6 +1376,9 @@ export class PiRpcHarnessSession implements HarnessSession {
           this.#recordTiming("runner.pi.prompt_to_started", turn.promptStartedAtMs, observedAtMs, "ok", turn);
           turn.promptStartedAtMs = undefined;
         }
+        // startTurn already published turn.started before submitting prompt.
+        // Keep the whole admission burst behind that lifecycle event.
+        this.#flushTimings(turn);
         this.#agentTurn = turn;
         this.#activeTurn.agentEnded = false;
       }
@@ -1508,6 +1546,9 @@ export class PiRpcHarnessSession implements HarnessSession {
   async #finishTurn(turn: PiTurnState, status: "completed" | "failed" | "cancelled", extra: Record<string, unknown>): Promise<void> {
     if (turn.settled) return;
     turn.settled = true;
+    // Handled/rejected prompts may never emit agent_start. Drain before the
+    // terminal so a consumer stopping there still receives their timings.
+    this.#flushTimings(turn);
     if (this.#activeTurn === turn) this.#clearTurnIdleTimer();
     // Fence host authority synchronously; native extension fences on the same
     // agent_settled boundary. Do not publish a terminal until revocation finishes.
