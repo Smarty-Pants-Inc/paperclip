@@ -12,17 +12,21 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tungstenite::client::IntoClientRequest;
-use tungstenite::handshake::server::ErrorResponse;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{accept_hdr_with_config, client_tls_with_config, Connector, Message, WebSocket};
+use tungstenite::{client_tls_with_config, Connector, Message, WebSocket};
 
 use super::state::{open_private_regular_file, Command, DurableState};
 use super::{
     BootstrapTicket, DurableRunnerConfig, DurableRunnerError, Secret, PROTOCOL,
     PROTOCOL_MIN_VERSION, PROTOCOL_VERSION,
 };
+
+mod listener;
+#[cfg(test)]
+mod listener_tests;
+use listener::{ListenerIngress, ListenerSocket};
 
 const SECURE_FRAME_SCHEMA: &str = "paperclip.runner.secure-frame.v1";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -179,10 +183,21 @@ where
 
 pub(crate) enum RunnerTransportEndpoint {
     Dial(ResolvedWsTarget),
-    Listen { listener: TcpListener, path: String },
+    Listen {
+        listener: ListenerIngress,
+        path: String,
+    },
 }
 
 impl RunnerTransportEndpoint {
+    #[cfg(test)]
+    pub(crate) fn from_listener(listener: TcpListener, path: String) -> Self {
+        Self::Listen {
+            listener: ListenerIngress::new(listener, path.clone()).unwrap(),
+            path,
+        }
+    }
+
     pub(crate) fn new(input: &str, run_id: &str) -> Result<Self, DurableRunnerError> {
         if let Some(remainder) = input.strip_prefix("listen://") {
             let (authority, path) = remainder.split_once('/').ok_or_else(|| {
@@ -203,9 +218,9 @@ impl RunnerTransportEndpoint {
                     "runner_ingress_bind_conflict: failed to bind listener: {error}"
                 ))
             })?;
-            listener.set_nonblocking(true).map_err(|error| {
+            let listener = ListenerIngress::new(listener, path.clone()).map_err(|error| {
                 DurableRunnerError::invalid(format!(
-                    "runner_ingress_bind_conflict: failed to configure listener: {error}"
+                    "runner_ingress_bind_conflict: failed to start listener: {error}"
                 ))
             })?;
             return Ok(Self::Listen { listener, path });
@@ -244,6 +259,7 @@ impl RunnerTransportEndpoint {
                         "runner listener path does not match the configured run",
                     ));
                 }
+                listener.rotate(next_path.clone());
                 *path = next_path;
                 return Ok(());
             }
@@ -313,71 +329,18 @@ impl RunnerTransportEndpoint {
                 socket.configure_auth_timeouts(connect_deadline)?;
                 Ok(Some(socket))
             }
-            Self::Listen { listener, path } => {
+            Self::Listen { listener, .. } => {
                 if ca_bundle_path.is_some() {
                     return Err(DurableRunnerError::invalid(
                         "--ca-bundle-path is not accepted in listener mode",
                     ));
                 }
-                let (stream, _) = match listener.accept() {
-                    Ok(connection) => connection,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                    Err(error) => {
-                        return Err(DurableRunnerError::invalid(format!(
-                            "runner ingress listener accept failed: {error}"
-                        )))
-                    }
+                let Some(mut socket) = listener.take()? else {
+                    return Ok(None);
                 };
-                stream.set_nonblocking(true).map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "runner ingress stream configuration failed: {error}"
-                    ))
-                })?;
-                let expected_path = path.clone();
-                let mut handshake = accept_hdr_with_config(
-                    stream,
-                    move |request: &tungstenite::handshake::server::Request, response| {
-                        if request.uri().path() != expected_path
-                            || request.uri().query().is_some()
-                            || request.headers().contains_key("sec-websocket-extensions")
-                        {
-                            let mut rejection = ErrorResponse::new(Some(
-                                "runner listener requires the configured path without extensions"
-                                    .to_owned(),
-                            ));
-                            *rejection.status_mut() = tungstenite::http::StatusCode::BAD_REQUEST;
-                            return Err(rejection);
-                        }
-                        Ok(response)
-                    },
-                    Some(websocket_config()),
-                );
-                let deadline = bounded_operation_deadline(connect_deadline, AUTH_TIMEOUT)?;
-                let mut socket = loop {
-                    match handshake {
-                        Ok(socket) => break socket,
-                        Err(HandshakeError::Interrupted(mid_handshake)) => {
-                            let remaining = deadline.saturating_duration_since(Instant::now());
-                            if remaining.is_zero() {
-                                return Err(DurableRunnerError::invalid(
-                                    "runner ingress WebSocket upgrade deadline elapsed",
-                                ));
-                            }
-                            thread::sleep(Duration::from_millis(5).min(remaining));
-                            handshake = mid_handshake.handshake();
-                        }
-                        Err(error) => {
-                            return Err(DurableRunnerError::invalid(format!(
-                                "runner ingress WebSocket upgrade failed: {error}"
-                            )))
-                        }
-                    }
-                };
-                socket.get_mut().set_nonblocking(false).map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "runner ingress stream configuration failed: {error}"
-                    ))
-                })?;
+                // No frames are read during HTTP upgrade. Apply the configured
+                // frame limits before any authentication or runtime I/O.
+                socket.set_config(|config| *config = websocket_config());
                 configure_auth_timeouts(socket.get_ref(), connect_deadline)?;
                 Ok(Some(RunnerSocket::Listen(socket)))
             }
@@ -571,7 +534,7 @@ fn custom_tls_connector(path: &Path) -> Result<Connector, DurableRunnerError> {
 
 enum RunnerSocket {
     Dial(WebSocket<MaybeTlsStream<TcpStream>>),
-    Listen(WebSocket<TcpStream>),
+    Listen(ListenerSocket),
 }
 
 trait WebSocketMessages {
@@ -2277,14 +2240,28 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let path = "/api/runner/v1/connect/run_1".to_owned();
-        let endpoint = RunnerTransportEndpoint::Listen {
-            listener,
-            path: path.clone(),
-        };
+        let endpoint = RunnerTransportEndpoint::from_listener(listener, path.clone());
         let config = config(address.port());
         let state = test_state(&config);
         let ticket = BootstrapTicket::new("bootstrap-secret".to_owned()).unwrap();
 
+        // Ingress upgrades now progress independently of controller ticks.
+        let connect = || {
+            let deadline = Instant::now() + config.max_runtime;
+            loop {
+                match AuthenticatedTransport::connect(
+                    &endpoint,
+                    &config,
+                    &state,
+                    Some(&ticket),
+                    None,
+                    deadline,
+                ) {
+                    Ok(None) => thread::sleep(Duration::from_millis(5)),
+                    result => break result,
+                }
+            }
+        };
         let (invalid_ready, invalid_connected) = mpsc::channel();
         let invalid_path = path.clone();
         let invalid_config = config.clone();
@@ -2306,14 +2283,7 @@ mod tests {
             .unwrap();
         });
         invalid_connected.recv().unwrap();
-        let invalid_failure = match AuthenticatedTransport::connect(
-            &endpoint,
-            &config,
-            &state,
-            Some(&ticket),
-            None,
-            Instant::now() + config.max_runtime,
-        ) {
+        let invalid_failure = match connect() {
             Err(error) => error,
             Ok(_) => panic!("invalid listener peer unexpectedly authenticated"),
         };
@@ -2355,16 +2325,7 @@ mod tests {
             );
         });
         valid_connected.recv().unwrap();
-        let (_, accepted) = AuthenticatedTransport::connect(
-            &endpoint,
-            &config,
-            &state,
-            Some(&ticket),
-            None,
-            Instant::now() + config.max_runtime,
-        )
-        .unwrap()
-        .unwrap();
+        let (_, accepted) = connect().unwrap().unwrap();
         assert_eq!(accepted.connection.connection_id, "connection_1");
         assert_eq!(accepted.lease.unwrap().expose().unwrap(), "lease-secret");
         valid_peer.join().unwrap();
