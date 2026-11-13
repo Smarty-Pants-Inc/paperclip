@@ -736,6 +736,12 @@ export interface PluginEnvironmentLeaseObservation {
   creationCleanup?: import("./environment-creation-cleanup.js").PluginEnvironmentCreationCleanup;
   providerLeaseId: string;
   state: "active" | "stopped" | "destroyed" | "unknown";
+  /** When the sandbox last stopped, by any cause (ISO 8601); null while not stopped. From a fresh provider read. */
+  stoppedAt?: string | null;
+  /** The sandbox kernel's last restart on its machine (ISO 8601): every process running then ended. */
+  lastRebootAt?: string | null;
+  /** The provider's clock for this answer (its response Date header, ISO 8601), or null. */
+  observedAt?: string | null;
 }
 
 export interface PluginEnvironmentRealizeWorkspaceParams extends PluginEnvironmentDriverBaseParams {
