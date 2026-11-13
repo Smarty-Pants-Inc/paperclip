@@ -134,6 +134,8 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   let pendingDiagnostics: PiProjectedEvent[] = [];
   const totals: Record<string, number> = {};
   let usageComplete = true;
+  let summaryUsageUnknown = false;
+  const summaryAccounting = () => summaryUsageUnknown ? { summaryUsage: "unknown" as const, accountingUsageLost: true } : {};
   let estimatedCostUsd: number | undefined;
   let providerReportedCostUsd: number | undefined;
   let costComplete = true;
@@ -194,7 +196,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     if (!identity()) {
       usageComplete = false; costComplete = false;
       output.push(...diagnostic("receipt", "pi_receipt_projection_limit"));
-      output.push(emit("item.completed", `${prefix}:pi-usage:projection-limit`, { kind: "usage", usage: { source: "pi_receipt_projection_limit", total: { ...totals }, runDeltaComplete: false, costComplete: false, childUsage: "unknown" } }));
+      output.push(emit("item.completed", `${prefix}:pi-usage:projection-limit`, { kind: "usage", usage: { source: "pi_receipt_projection_limit", total: { ...totals }, runDeltaComplete: false, costComplete: false, childUsage: "unknown", ...summaryAccounting() } }));
       return "limited";
     }
     receipts.set(receiptKey, fingerprint);
@@ -218,7 +220,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         // message of the turn. Absence is not a zero-token receipt.
         output.push(emit("usage.reported", `${prefix}:pi-usage:${digest(key)}`, {
           provider: "pi_rpc", providerRequestId: digest(key),
-          runDeltaAvailable: false, runDelta: {}, accountingComplete: false,
+          runDeltaAvailable: false, runDelta: {}, accountingComplete: false, ...summaryAccounting(),
         }));
       }
       return;
@@ -271,12 +273,12 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       provider: "pi_rpc", model: message.model ?? null, providerRequestId: digest(key),
       runDeltaAvailable: Object.keys(counts).length >= 5,
       runDelta: { ...(counts.inputTokens === undefined ? {} : { inputTokens: counts.inputTokens }), ...(counts.outputTokens === undefined ? {} : { outputTokens: counts.outputTokens }), ...(counts.cachedInputTokens === undefined ? {} : { cacheReadTokens: counts.cachedInputTokens }), ...(counts.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: counts.cacheWriteTokens }), ...(record(usage.cost).totalFromProvider === true && typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? { providerCostUsd: cost } : {}) },
-      childUsage: "unknown", accountingComplete: usageComplete && !childUsageUnknown,
+      childUsage: "unknown", accountingComplete: usageComplete && !childUsageUnknown, ...summaryAccounting(),
       costProvenance, ...(costProvenance === "catalog_estimate" ? { estimatedCostUsd: cost } : {}),
     }));
     output.push(emit("item.completed", receiptItemId, {
       kind: "usage", usage: { receiptId: digest(receiptItemId), scope: message.role === "toolResult" ? "nested_tool_message" : "assistant_message", source: "pi_message_usage",
-        total: { ...totals }, runDelta: { ...totals }, runDeltaComplete: usageComplete && !childUsageUnknown, childUsage: "unknown",
+        total: { ...totals }, runDelta: { ...totals }, runDeltaComplete: usageComplete && !childUsageUnknown, childUsage: "unknown", ...summaryAccounting(),
         ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }), ...(providerReportedCostUsd === undefined ? {} : { providerReportedCostUsd }), costProvenance, costComplete: costComplete && !childUsageUnknown,
       },
     }));
@@ -471,7 +473,9 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       // Summarization can spend outside assistant-message receipts (native
       // json.md:128-180). Unknown summary spend does not invalidate measured
       // assistant-message receipts. The summary itself remains unaccounted.
-      output.push(emit("item.completed", `${prefix}:pi-usage:unaccounted-summary`, { kind: "usage", usage: { source: "pi_summarization_unaccounted", total: { ...totals }, runDelta: {}, runDeltaComplete: false, costComplete: false, childUsage: "unknown", summaryUsage: "unknown" } }));
+      summaryUsageUnknown = true;
+      costComplete = false;
+      output.push(emit("item.completed", `${prefix}:pi-usage:unaccounted-summary`, { kind: "usage", usage: { source: "pi_summarization_unaccounted", total: { ...totals }, runDelta: {}, runDeltaComplete: false, costComplete: false, childUsage: "unknown", ...summaryAccounting() } }));
       if (event.type === "compaction_start" || event.type === "compaction_end") {
         // Match Codex's contextCompaction item lifecycle, retaining one identity
         // through the native start/end pair (including an end-only receipt).

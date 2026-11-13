@@ -990,6 +990,17 @@ usage item with `source: "pi_summarization_unaccounted"` and
 and `costComplete` is false: neither the summary's token spend nor its cost is
 qualified by that item. Its `total` preserves the measured message subtotal.
 
+The missing-summary fact is sticky for the run: subsequent measured receipts
+retain `summaryUsage: "unknown"` and the native accounting convention
+`accountingUsageLost: true`. A complete measured `runDelta` is still usable, but
+`costComplete` stays false. The Pi facade and Rust usage normalizer preserve the
+same fact without adding summary tokens or manufacturing a zero-cost call.
+Producer receipt replay retains it across later turns. The run receipt's existing
+`pricingProvenance.evidence` explicitly states that Pi summary usage is unknown
+and observed usage/cost are a lower bound. `GET /api/heartbeat-runs/:runId`
+returns that provenance in `usageJson`; this does not change cost aggregation or
+run-level UI presentation.
+
 This unknown summary spend does not invalidate later assistant-message usage
 receipts. Their deltas, completeness, and cost provenance describe the measured
 message receipts, not an all-inclusive bill for the native session. Summary spend

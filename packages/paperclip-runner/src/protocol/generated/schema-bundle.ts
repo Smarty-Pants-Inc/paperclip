@@ -3647,6 +3647,14 @@ export const usageSchema = {
         "unknown"
       ]
     },
+    "summaryUsage": {
+      "description": "Summary spend is not reported. Measured message usage and cost are a lower bound, not a complete bill.",
+      "const": "unknown"
+    },
+    "accountingUsageLost": {
+      "description": "Known usage omits unreported provider work; uses the native accounting lower-bound convention.",
+      "const": true
+    },
     "cumulative": {
       "$ref": "#/$defs/measurement"
     },
