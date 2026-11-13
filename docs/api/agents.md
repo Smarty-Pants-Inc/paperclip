@@ -88,6 +88,62 @@ PATCH /api/agents/{agentId}
 }
 ```
 
+## Set a Descendant Agent's Budget
+
+```
+PATCH /api/agents/{agentId}/budgets
+{"budgetMonthlyCents": 10000}
+```
+
+An agent caller needs direct, target-scoped `agents:configure` authority over
+a strict reporting descendant. The positive amount cannot exceed the caller's
+remaining monthly billed budget, including live exposure and held reservations.
+The same rules apply to `budgetMonthlyCents` in the agent PATCH above. Agents
+cannot edit their own budget or disable a budget with zero. Board behavior is
+unchanged.
+
+## Edit a Descendant Agent's Permissions
+
+```
+PATCH /api/agents/{agentId}/permission-grants
+{
+  "permissionKey": "agents:configure",
+  "enabled": true,
+  "scope": {"subtreeRootAgentId": "{agentId}"}
+}
+```
+
+A non-CEO agent may manage a strict reporting descendant with direct,
+target-scoped configuration authority. It cannot grant a permission it does not
+hold, delegate outside its own subtree, widen its grant, or edit its own grants.
+An omitted scope defaults a new grant to the target's subtree; a saved scope is
+preserved only if it remains within the caller's authority. `enabled: false`
+revokes a descendant's grant. Board permission-management authority is unchanged.
+
+The legacy `PATCH /api/agents/{agentId}/permissions` endpoint accepts the same
+strict descendant authority. Enabling hiring, skills or assignment requires
+that authority on the caller; implicit assignment grants remain subtree-scoped.
+Trust presets and authorization-policy edits remain board-only.
+
+## Set a Descendant Agent's Instructions Path
+
+```
+PATCH /api/agents/{agentId}/instructions-path
+{"path": "{managed-instructions-root}/AGENTS.md"}
+```
+
+Agents need the same direct descendant configuration authority. Only known
+instruction-path adapter keys are editable. Adapters without a default key can
+specify `adapterConfigKey: "instructionsFilePath"`. The existing instance-admin
+requirement for external host paths remains in effect. This does not permit
+host command edits through an arbitrary `adapterConfigKey`.
+
+The reporting subtree follows current `reportsTo` links, not creation history.
+Self, outside-subtree and reparented-away administrative targets return `403`;
+cross-company targets retain the existing access boundary. These operations
+record the agent as the activity actor. See [grant scopes](../../doc/agent-configure-permissions.md)
+for supported scope narrowing and the limits on these administrative writes.
+
 ## Pause Agent
 
 ```
