@@ -251,6 +251,21 @@ after a failed resume, it opens a fresh provider session as before. Otherwise th
 run fails with `native_provider_state_incompatible` and is not retried. A board
 Retry then continues the task in a fresh provider session in the same workspace.
 
+Completion contracts belong to runs, not to the reusable Codex provider session
+or its native facades. The provider snapshot records the run identity that owns
+its current binding. A `run.prepare` for a different known run may adopt its own
+contract only over settled state: no active or ambiguous turn, startup attempt,
+receipt-limit interruption, pending tool call, undelivered event, continuing goal,
+deferred terminal, descendant work, or live provider request. An existing thread
+uses the ordinary `run.attach` rebinding path; preparation before a thread exists
+updates the saved binding directly. Same-run contract changes and provider-profile
+changes still refuse without replacing the saved state.
+
+Older snapshots without a recorded run owner retain the strict contract equality
+check. An unchanged successful preparation records the current owner; an explicit
+`run.attach` records its target owner. A changed contract alone is never evidence
+that an ownerless snapshot belongs to another run.
+
 A Codex `run.attach` that would change the durable provider profile or a
 protected launch argument fails with the closed classification
 `provider_attach_refused`. An attach blocked by a pending tool call fails with
