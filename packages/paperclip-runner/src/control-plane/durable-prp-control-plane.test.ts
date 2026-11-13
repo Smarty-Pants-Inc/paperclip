@@ -1767,7 +1767,9 @@ it("reports an expired connection lease instead of closing silently", async () =
 
 it("reports how long the authenticated Runner has been disconnected", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "runner-disconnect-age-"));
-  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  const disconnected = vi.fn();
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest,
+    onAuthenticatedDisconnect: disconnected });
   try {
     await core.start();
     expect(core.runnerDisconnectedForMs()).toBeNull();
@@ -1784,6 +1786,7 @@ it("reports how long the authenticated Runner has been disconnected", async () =
     expect(unauthenticated.isAuthenticated()).toBe(false);
     closeUnauthenticated();
     expect(core.runnerDisconnectedForMs()).toBeNull();
+    expect(disconnected).not.toHaveBeenCalled();
     const client = (await authenticate(core, core.issueBootstrapTicket()))!;
     expect(core.runnerDisconnectedForMs()).toBeNull();
     const before = Date.now();
@@ -1792,6 +1795,7 @@ it("reports how long the authenticated Runner has been disconnected", async () =
     const after = Date.now();
     expect(core.runnerDisconnectedForMs(after + 300_000)).toBeGreaterThanOrEqual(300_000);
     expect(core.runnerDisconnectedForMs(after + 300_000)).toBeLessThanOrEqual(300_000 + after - before);
+    expect(disconnected).toHaveBeenCalledOnce();
     const resumed = (await authenticate(core, client.leaseToken!))!;
     expect(core.runnerDisconnectedForMs()).toBeNull();
     resumed.socket.destroy();

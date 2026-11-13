@@ -1302,10 +1302,10 @@ exit 23
 
 describe("remote runner process supervision", () => {
   // Keep reason: measured production command/audit amplification (cl-poll-bound).
-  it("bounds warm runner probes to one per 5 seconds and detects exit 45 on the next probe", async () => {
+  it("bounds ten warm runner probes to one per 5 seconds and detects exit 45 on the next probe", async () => {
     vi.useFakeTimers();
     const handles: ReturnType<ReturnType<typeof createRemoteRunnerProcessLauncher>>[] = [];
-    const counters = Array.from({ length: 6 }, () => ({ probes: 0, dead: false }));
+    const counters = Array.from({ length: 10 }, () => ({ probes: 0, dead: false }));
     const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
     try {
       for (const counter of counters) {
@@ -1324,10 +1324,10 @@ describe("remote runner process supervision", () => {
         })({ command: "/runtime/runnerd", args: [], cwd: "/workspace", environment: {} }));
       }
       await vi.advanceTimersByTimeAsync(0);
-      expect(counters.map(c => c.probes)).toEqual(Array(6).fill(1));
+      expect(counters.map(c => c.probes)).toEqual(Array(10).fill(1));
       const initial = counters.reduce((sum, c) => sum + c.probes, 0);
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(counters.reduce((sum, c) => sum + c.probes, 0) - initial).toBeLessThanOrEqual(6 * 60 / 5);
+      expect(counters.reduce((sum, c) => sum + c.probes, 0) - initial).toBeLessThanOrEqual(10 * 60 / 5);
       counters.forEach(c => { c.dead = true; });
       await vi.advanceTimersByTimeAsync(4_999);
       expect(handles.every(h => h.isExitConfirmed?.() === false)).toBe(true);
@@ -1338,6 +1338,52 @@ describe("remote runner process supervision", () => {
       counters.forEach(c => { c.dead = true; });
       await vi.advanceTimersByTimeAsync(5_000);
       await Promise.all(handles.map(h => h.completion.catch(() => undefined)));
+      vi.useRealTimers();
+    }
+  });
+  it.each([false, true])("immediately verifies a disconnect hint, including one during an in-flight probe (%s)", async duringProbe => {
+    vi.useFakeTimers();
+    const ok = { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+    let nonce = "", probes = 0, dead = false;
+    let finishProbe: (() => void) | undefined;
+    const execute = vi.fn(async (request: { args?: string[] }) => {
+      const label = request.args?.[2];
+      if (label === "paperclip-runner-launch") { nonce = request.args![4]!; return ok; }
+      if (label === "paperclip-runner-process-identity") return { ...ok, stdout: `${nonce}\n4321\n2026-09-06T00:00:00.000Z\nrunner-hint\n` };
+      if (label === "paperclip-runner-monitor") {
+        probes++;
+        const result = { ...ok, exitCode: dead ? 45 : 0 };
+        if (duringProbe && probes === 1) await new Promise<void>(resolve => { finishProbe = resolve; });
+        return result;
+      }
+      return { ...ok, exitCode: 1 };
+    });
+    const handle = createRemoteRunnerProcessLauncher({
+      target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
+      runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
+      stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-hint",
+    })({ command: "/runtime/runnerd", args: [], cwd: "/workspace", environment: {} });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(probes).toBe(1);
+      expect(handle).toHaveProperty("requestExitVerification", expect.any(Function));
+      handle.requestExitVerification!();
+      finishProbe?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(probes).toBe(2);
+      expect(handle.isExitConfirmed?.()).toBe(false);
+      dead = true;
+      handle.requestExitVerification!();
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.completion;
+      expect(probes).toBe(3);
+      expect(handle.isExitConfirmed?.()).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      dead = true;
+      finishProbe?.();
+      await vi.advanceTimersByTimeAsync(15_000);
+      await handle.completion.catch(() => undefined);
       vi.useRealTimers();
     }
   });
