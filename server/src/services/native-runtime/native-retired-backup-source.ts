@@ -19,10 +19,10 @@ export function nativeHarnessBackupManifestSha256(manifestBytes: Buffer | string
  * A created sandbox normally refuses a per-turn backup that has no recorded
  * reusable lease, because the backup's source sandbox may still hold newer
  * provider state. That ambiguity is absent when Paperclip itself destroyed the
- * source sandbox: the provider confirmed the termination, the source lease's
- * stamp names exactly this backup, and no provider work for the session was
- * recorded after the backup completed. This is the same proof a confirmed
- * replacement relies on, reached through a lease that was retired first.
+ * source sandbox: the provider confirmed the termination, a stamp on the source
+ * allocation's verified lease chain names this backup, and no provider work for
+ * the session was recorded after the backup completed. This is the same proof a
+ * confirmed replacement relies on, reached through a lease that was retired first.
  *
  * A settled workspace-restore hold is the other retired source. The hold
  * changed the lease to `retain_on_failure`, which reuse never selects, and
@@ -59,14 +59,21 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   const tips = source.filter(lease => !Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor"));
   if (tips.length !== 1) return false;
   const lease = tips[0]!;
-  if (!retiredReusableLeasePredecessors(lease, source.filter(row => row.id !== lease.id))) return false;
+  const predecessors = retiredReusableLeasePredecessors(lease, source.filter(row => row.id !== lease.id));
+  if (!predecessors) return false;
   const termination = lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined;
   const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
-  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
-  if (!stamp || stamp.manifestSha256 !== input.manifestSha256
-    || stamp.normalizedSessionId !== input.normalizedSessionId
-    || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
+  // Warm handoffs leave checkpoint stamps on their original owner rows. The
+  // verified predecessors are newest-first, so prefer the newest matching
+  // owner without requiring old saved chains to have copied stamps forward.
+  // Retirement and the supersession claim still belong exclusively to the tip.
+  const stamp = [lease, ...predecessors]
+    .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, lease.providerLeaseId!))
+    .find(candidate => candidate?.manifestSha256 === input.manifestSha256
+      && candidate.normalizedSessionId === input.normalizedSessionId
+      && candidate.runnerInstanceId === input.manifest.runnerInstanceId);
+  if (!stamp) return false;
   // A released lease can still be selected for resume; only a retired one is final.
   const idleSource = !destroyed && !await settledRestoreHoldRetiresSource(db, lease);
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;

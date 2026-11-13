@@ -24,6 +24,8 @@ describeDb("retired native backup source authority", () => {
 
   async function fixture(options: { termination?: "destroyed" | "stopped" | null; status?: string; stampSha?: string;
     providerEventAt?: Date; secondLease?: boolean; handoffs?: number;
+    predecessorStamp?: boolean; stampOnOtherAllocation?: boolean; stoppedWarm?: boolean;
+    stampIdentity?: "wrong_session" | "wrong_runner"; tipStamp?: "different_checkpoint" | "older_matching";
     handoffFault?: "missing_receipt" | "changed_receipt" | "active_predecessor" | "missing_predecessor";
     restoreHold?: "settled" | "no_marker" | "foreign_marker" | "reusable_policy" | "no_stop_receipt" | "dirty_writer";
     idleWarm?: "retained" | "released" | "run_active" | "export_pending" | "same_target" | "cleanup_in_flight" } = {}) {
@@ -37,7 +39,8 @@ describeDb("retired native backup source authority", () => {
     const lease = (id: string) => ({ id, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
       status: options.status ?? "expired", cleanupStatus: "success", releasedAt: new Date(),
       metadata: {
-        nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: sessionId, runnerInstanceId,
+        nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: options.stampIdentity === "wrong_session" ? randomUUID() : sessionId,
+          runnerInstanceId: options.stampIdentity === "wrong_runner" ? randomUUID() : runnerInstanceId,
           sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: providerLeaseId, authorizedProviderLeaseId: providerLeaseId,
           manifestSha256: options.stampSha ?? manifestSha256, completedAt: completedAt.toISOString() },
         ...(options.termination === null ? {} : { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId,
@@ -72,6 +75,18 @@ describeDb("retired native backup source authority", () => {
       const { remoteExecutionTermination: _termination, ...metadata } = sourceLease.metadata;
       sourceLease.metadata = { ...metadata, sandboxState: "started", reusableSandboxLease: { version: 1, provider: "daytona" },
         ...(idle === "cleanup_in_flight" ? { pendingCleanupInFlight: true } : {}) } as typeof sourceLease.metadata;
+      if (options.stoppedWarm) {
+        // SMAA-143: failed tip run, released warm lease, confirmed stop-and-retain,
+        // but no stamp on the tip after earlier same-allocation handoffs.
+        const pluginId = randomUUID(), confirmedAt = new Date().toISOString();
+        sourceLease.metadata = { ...sourceLease.metadata, pluginId,
+          remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId,
+            runId: sourceRunId, leaseId, provider: "daytona", providerLeaseId, state: "stopped", confirmedAt },
+          sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1",
+            requestId: randomUUID(), companyId, runId: sourceRunId, leaseId, provider: "daytona", providerLeaseId, pluginId,
+            method: "environmentStopLease", confirmedAt } } as typeof sourceLease.metadata;
+        await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, sourceRunId));
+      }
       if (idle === "run_active") await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, sourceRunId));
       if (idle === "export_pending") await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceSync: {
         schema: "paperclip.native-workspace-sync/v3", state: "prepared", leaseId, providerLeaseId, workspaceId: randomUUID(),
@@ -91,12 +106,14 @@ describeDb("retired native backup source authority", () => {
         if (ownerRunId !== sourceRunId) await db.insert(heartbeatRuns).values({ id: ownerRunId, companyId, agentId,
           status: "succeeded", runtimeMode: "native", nativeSessionId: sessionId,
           invocationSource: "assignment", triggerDetail: "system" });
-        const acquiredAt = new Date(completedAt.getTime() - (options.handoffs - index + 1) * 60_000);
+        const acquiredAt = new Date(completedAt.getTime() + (options.predecessorStamp
+          ? (2 * index - 1) * 60_000 : -(options.handoffs - index + 1) * 60_000));
         const row = { ...sourceLease, id: index === options.handoffs ? leaseId : randomUUID(),
           heartbeatRunId: ownerRunId, environmentId, issueId, executionWorkspaceId: workspaceId, acquiredAt,
           leasePolicy: "reuse_by_environment", metadata: { ...sourceLease.metadata, agentId },
           // Only the tip carries a settled restore hold; its predecessors retired by handoff.
-          ...(options.restoreHold ? index === options.handoffs ? { leasePolicy: sourceLease.leasePolicy } : { status: "expired" } : {}) };
+          ...(index < options.handoffs ? { status: "expired" } : {}),
+          ...(options.restoreHold && index === options.handoffs ? { leasePolicy: sourceLease.leasePolicy } : {}) };
         if (index < options.handoffs) {
           const { nativeHarnessBackup: _backup, remoteExecutionTermination: _termination, ...metadata } = row.metadata;
           history.push({ ...row, metadata });
@@ -109,6 +126,22 @@ describeDb("retired native backup source authority", () => {
         previous.releasedAt = current.acquiredAt;
         previous.metadata = { ...previous.metadata, reusableLeaseSuccessor: handoff };
         current.metadata = { ...current.metadata, reusableLeasePredecessor: handoff };
+      }
+      if (options.predecessorStamp) {
+        const owner = history[0]!, tip = history[history.length - 1]!;
+        owner.metadata = { ...owner.metadata, nativeHarnessBackup: sourceLease.metadata.nativeHarnessBackup };
+        const { nativeHarnessBackup: _backup, ...tipMetadata } = tip.metadata!;
+        tip.metadata = tipMetadata;
+        if (options.tipStamp) tip.metadata.nativeHarnessBackup = { ...sourceLease.metadata.nativeHarnessBackup,
+          ...(options.tipStamp === "different_checkpoint" ? { manifestSha256: `sha256:${"d".repeat(64)}` }
+            : { completedAt: new Date(completedAt.getTime() - 120_000).toISOString() }) };
+        if (options.stampOnOtherAllocation) {
+          delete owner.metadata.nativeHarnessBackup;
+          const otherProviderLeaseId = randomUUID();
+          await db.insert(environmentLeases).values({ ...lease(randomUUID()), providerLeaseId: otherProviderLeaseId,
+            metadata: { nativeHarnessBackup: { ...sourceLease.metadata.nativeHarnessBackup,
+              sourceProviderLeaseId: otherProviderLeaseId, authorizedProviderLeaseId: otherProviderLeaseId } } });
+        }
       }
       if (options.handoffFault === "missing_receipt") delete history[0]!.metadata!.reusableLeaseSuccessor;
       if (options.handoffFault === "changed_receipt") history[0]!.metadata!.reusableLeaseSuccessor = {
@@ -129,6 +162,58 @@ describeDb("retired native backup source authority", () => {
       manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId: sessionId }, manifestSha256,
       targetProviderLeaseId: options.idleWarm === "same_target" ? providerLeaseId : randomUUID() });
   }
+
+  // Recorded production regression SMAA-143: one allocation, 12 owner rows,
+  // a stamped expired predecessor, and an unstamped released/stopped tip whose
+  // run failed. The backup is still current; handoff must not hide its stamp.
+  it("authorizes SMAA-143's earlier-row stamp across 12 warm lease owners and supersedes only the tip", async () => {
+    await expect(fixture({ handoffs: 11, predecessorStamp: true, idleWarm: "released", stoppedWarm: true })).resolves.toBe(true);
+    const [tip] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    expect(tip!.status).toBe("released");
+    expect(tip!.metadata).not.toHaveProperty("nativeHarnessBackup");
+    expect(tip!.metadata).not.toHaveProperty("reusableLeaseSuccessor");
+    expect(tip!.metadata).not.toHaveProperty("reusableSandboxLease");
+    expect(tip!.metadata?.remoteExecutionTermination).toMatchObject({ state: "stopped" });
+    expect(tip!.metadata?.reusableSandboxLeaseSuperseded).toMatchObject({ manifestSha256 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, tip!.heartbeatRunId!));
+    expect(run!.status).toBe("failed");
+    const chain = await db.select().from(environmentLeases).where(eq(environmentLeases.providerLeaseId, tip!.providerLeaseId!));
+    expect(chain).toHaveLength(12);
+    const stamped = chain.filter(row => row.metadata?.nativeHarnessBackup);
+    expect(stamped).toHaveLength(1);
+    expect(stamped[0]!.status).toBe("expired");
+    expect(stamped[0]!.metadata).toHaveProperty("reusableLeaseSuccessor");
+    expect(stamped[0]!.metadata).not.toHaveProperty("reusableSandboxLeaseSuperseded");
+  });
+
+  it.each([
+    ["a destroyed tip", {}],
+    ["a settled restore-hold tip", { termination: "stopped" as const, restoreHold: "settled" as const }],
+    ["a newer nonmatching stamp on the tip", { idleWarm: "released" as const, stoppedWarm: true, tipStamp: "different_checkpoint" as const }],
+  ])("finds a matching predecessor stamp with %s", async (_label, options) => {
+    await expect(fixture({ handoffs: 2, predecessorStamp: true, ...options })).resolves.toBe(true);
+  });
+
+  it.each([
+    ["another manifest sha", { stampSha: `sha256:${"c".repeat(64)}` }],
+    ["later provider work", { providerEventAt: new Date(completedAt.getTime() + 60_000) }],
+    ["a live tip run", { idleWarm: "run_active" as const }],
+    ["a stamp on a different provider allocation", { stampOnOtherAllocation: true }],
+    ["another session", { stampIdentity: "wrong_session" as const }],
+    ["another runner instance", { stampIdentity: "wrong_runner" as const }],
+    ["an invalid handoff receipt", { handoffFault: "changed_receipt" as const }],
+    ["a pending workspace export", { idleWarm: "export_pending" as const }],
+    ["a cleanup in flight", { idleWarm: "cleanup_in_flight" as const }],
+    ["the same restore target", { idleWarm: "same_target" as const }],
+    // The newest matching owner, not a later timestamp on an older row, wins.
+    ["provider work after the tip's matching checkpoint", { tipStamp: "older_matching" as const,
+      providerEventAt: new Date(completedAt.getTime() - 60_000) }],
+  ])("keeps a predecessor-stamped warm backup held with %s", async (_label, options) => {
+    await expect(fixture({ handoffs: 11, predecessorStamp: true, idleWarm: "released", stoppedWarm: true, ...options })).resolves.toBe(false);
+    const [tip] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    expect(tip!.metadata).toHaveProperty("reusableSandboxLease");
+    expect(tip!.metadata).not.toHaveProperty("reusableSandboxLeaseSuperseded");
+  });
 
   it("authorizes a destroyed source lease whose stamp names the backup", async () => {
     await expect(fixture()).resolves.toBe(true);
