@@ -47,7 +47,7 @@ function parse(raw: Record<string, unknown>): Config {
     ...(typeof raw.boatEnvironment === "string" ? { boatEnvironment: raw.boatEnvironment } : {}),
   };
 }
-async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: { onHeaders?: (headers: Headers) => void; requireJson?: boolean } = {}): Promise<any> {
+async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: { onHeaders?: (headers: Headers) => void; requireJson?: boolean; strictMissing?: boolean } = {}): Promise<any> {
   if (init.method && init.method !== "GET") assertBoatActivityAdmission();
   const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
   if (allocation) idleActivity.resource(activityKey(config, decodeURIComponent(allocation)));
@@ -56,7 +56,14 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   if (init.body !== undefined) headers.set("Content-Type", "application/json");
   const response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: init.signal ?? AbortSignal.timeout(30_000) });
   responseOptions.onHeaders?.(response.headers);
-  if (allowMissing && response.status === 404) { await response.body?.cancel(); return null; }
+  if (allowMissing && response.status === 404) {
+    if (!responseOptions.strictMissing) { await response.body?.cancel(); return null; }
+    // Boat's 404 'not_found' also covers an unknown route (it then names details.path).
+    // Only a sandbox-not-found envelope counts as missing; anything else is ambiguous.
+    const missing = await response.json().catch(() => null);
+    if (missing?.code === "not_found" && missing?.error?.details?.path === undefined) return null;
+    throw Object.assign(new Error(`Boat ${init.method ?? "GET"} ${path} returned an ambiguous 404`), { httpStatus: 404 });
+  }
   const body = response.status === 204 ? null : await response.json().catch(error => {
     if (responseOptions.requireJson && response.ok) throw error;
     return null;
@@ -419,11 +426,19 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     idleActivity.resource(activityKey(c, params.providerLeaseId));
     const proof = idleActivity.proof(activityKey(c, params.providerLeaseId));
     let observedAt: string | null = null;
-    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true, onHeaders: headers => {
+    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true, strictMissing: true, onHeaders: headers => {
       const date = headers.get("Date");
       if (date !== null && Number.isFinite(Date.parse(date))) observedAt = new Date(date).toISOString();
     } });
-    if (result === null) { idleActivity.confirm(proof, true); return { providerLeaseId: params.providerLeaseId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt }; }
+    if (result === null) {
+      // A missing sandbox is 'destroyed' only when the same key and route still answer
+      // (docs.boat.dev api/v1: 404 not_found covers a sandbox OR a key that does not exist).
+      if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(params.providerLeaseId)) throw new Error("Boat inspection id is not a sandbox id; refusing to report it destroyed");
+      const listed = await request(c, "/sandboxes?limit=1", { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, false, { requireJson: true });
+      if (listed?.ok !== true || !Array.isArray(listed?.sandboxes)) throw new Error("Boat could not confirm the sandbox list; refusing to report it destroyed");
+      idleActivity.confirm(proof, true);
+      return { providerLeaseId: params.providerLeaseId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt };
+    }
     const sandbox = result.sandbox ?? result;
     if (sandbox.id !== params.providerLeaseId) throw new Error("Boat inspection returned a different allocation.");
     if (sandbox.state === "archived") idleActivity.confirm(proof, true);
