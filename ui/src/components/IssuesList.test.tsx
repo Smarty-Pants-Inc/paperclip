@@ -1512,6 +1512,57 @@ describe("IssuesList", () => {
     await reactAct(async () => root.unmount());
   });
 
+  it("keeps the focused draft through a stale prop echo and the next keystroke", async () => {
+    vi.useFakeTimers();
+
+    let parentValue = "";
+    let emittedValue = "";
+    let root: ReturnType<typeof createRoot>;
+    const renderSearch = () => root.render(
+      <IssueSearchInput
+        value={parentValue}
+        onDebouncedChange={(search) => { emittedValue = search; }}
+      />,
+    );
+    root = createRoot(container);
+    await reactAct(async () => renderSearch());
+
+    const input = container.querySelector('input[aria-label="Search tasks"]') as HTMLInputElement;
+    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+    expect(valueSetter).toBeTypeOf("function");
+    input.focus();
+
+    const type = async (value: string) => {
+      await reactAct(async () => {
+        valueSetter!.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    };
+    const commit = async (value: string) => {
+      await reactAct(async () => vi.advanceTimersByTime(250));
+      expect(emittedValue).toBe(value);
+      parentValue = value;
+      await reactAct(async () => renderSearch());
+    };
+
+    await type("S");
+    await commit("S");
+    await type("SMAA");
+    await commit("SMAA");
+    await type("SMAA-");
+
+    // Router state is one update behind the value just typed, then catches up.
+    parentValue = "S";
+    await reactAct(async () => renderSearch());
+    expect(input.value).toBe("SMAA-");
+    parentValue = "SMAA-";
+    await reactAct(async () => renderSearch());
+    await type("SMAA-3");
+    expect(input.value).toBe("SMAA-3");
+
+    await reactAct(async () => root.unmount());
+  });
+
   it("debounces search updates so typing does not notify the page on every keystroke", async () => {
     vi.useFakeTimers();
 
