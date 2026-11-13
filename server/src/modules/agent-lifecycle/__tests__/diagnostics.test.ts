@@ -104,10 +104,16 @@ describe("lifecycle failure diagnostics", () => {
     expect(lifecycleVerificationNeedsRetry(context, { code: reason })).toBe(false);
   });
 
-  it("allows two automatic retries of a generic failed test before waiting for repair", () => {
-    for (const verificationFailures of [1, 2, 3, 8_000]) {
-      const context = { stage: "host" as const, phase: "verifying" as const, attempts: 8_000, verificationFailures };
-      expect(lifecycleVerificationNeedsRetry(context, { code: "harness_test_failed" })).toBe(verificationFailures >= 3);
+  it.each(["verifying", "resuming"] as const)("bounds every %s host failure, including unknown codes and uncoded exceptions", phase => {
+    for (const error of [{ code: "harness_test_failed" }, { code: "ECONNRESET" }, { code: "runner_revision_mismatch" }, new Error("private quota")]) {
+      for (const verificationFailures of [1, 2, 3, 8_000]) {
+        const context = { stage: "host" as const, phase, attempts: 8_000, verificationFailures };
+        expect(lifecycleVerificationNeedsRetry(context, error)).toBe(verificationFailures >= 3);
+        if (verificationFailures >= 3) {
+          expect(lifecycleFailureMessage(context, error)).toContain("Automatic verification is paused");
+          expect(lifecycleFailureMessage(context, error)).not.toMatch(/private|retry automatically|check again automatically/);
+        }
+      }
     }
   });
 
@@ -126,7 +132,7 @@ describe("lifecycle failure diagnostics", () => {
     if (stage === "transition") store.change.mockRejectedValue(error);
     await worker.process(agent.id);
     expect(store.defer).toHaveBeenCalledWith(agent, expect.any(String), expect.stringContaining(expected), expect.any(Date),
-      ...(stage === "host" ? [{ retryRequired: true }] : []));
+      ...(stage === "host" ? [{ retryRequired: true, verificationFailures: 1 }] : []));
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("secret provider output");
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("unknown private code");
     await worker.stop();
