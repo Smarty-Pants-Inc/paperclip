@@ -400,10 +400,6 @@ function buildLoginShellScript(input: {
     ? `exec env ${envArgs.join(" ")} ${commandParts}`
     : `exec ${commandParts}`;
   return [
-    // The controller's bootstrap policy must also reach Node run by profiles.
-    // Other caller env still applies only to the command, after profile setup.
-    ...(typeof env.NODE_DISABLE_COMPILE_CACHE === "string"
-      ? [`export NODE_DISABLE_COMPILE_CACHE=${shellQuote(env.NODE_DISABLE_COMPILE_CACHE)}`] : []),
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
