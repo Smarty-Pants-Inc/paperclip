@@ -3457,10 +3457,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         },
       ],
     });
+    let expectedProviderKey = "resolved-provider-key";
     const workerManager = {
       isRunning: vi.fn((id: string) => id === pluginId),
       call: vi.fn(async (_pluginId: string, method: string, params: any) => {
-        expect(params.config.apiKey).toBe("resolved-provider-key");
+        expect(params.config.apiKey).toBe(expectedProviderKey);
         expect(params.config).not.toHaveProperty("provider");
         if (method === "environmentAcquireLease") {
           return {
@@ -3533,17 +3534,22 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
     await flushSecretResolutionWrites();
     expect(await auditCount()).toBe(handoffAuditCount);
-    // The handle still has its old snapshot: a persisted revision change must
-    // invalidate it anyway. A fresh runner/lease owner must not borrow it either.
+    await secretService(db).rotate(apiSecret.id, { value: "rotated-provider-key" });
+    expectedProviderKey = "rotated-provider-key";
+    await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+      command: "true", probeRuntimeConfigScope });
+    await flushSecretResolutionWrites();
+    const uncachedHandoffAuditCount = await auditCount();
+    expect(uncachedHandoffAuditCount).toBe(handoffAuditCount + 1);
     await environmentService(db).update(environment.id, { name: "Revised secure sandbox" });
     await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
       command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
     await flushSecretResolutionWrites();
-    expect(await auditCount()).toBe(handoffAuditCount + 1);
+    expect(await auditCount()).toBe(uncachedHandoffAuditCount + 1);
     await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
       command: "true", probeRuntimeConfigScope: {}, readOnlyProbe: true });
     await flushSecretResolutionWrites();
-    expect(await auditCount()).toBe(handoffAuditCount + 2);
+    expect(await auditCount()).toBe(uncachedHandoffAuditCount + 2);
     const executed = await runtimeWithPlugin.execute({
       environment,
       lease: acquired.lease,
@@ -3566,12 +3572,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     // is undefined when the caller passes no sink.
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentExecute", expect.objectContaining({
       config: expect.objectContaining({
-        apiKey: "resolved-provider-key",
+        apiKey: "rotated-provider-key",
       }),
     }), 31234, undefined);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentReleaseLease", expect.objectContaining({
       config: expect.objectContaining({
-        apiKey: "resolved-provider-key",
+        apiKey: "rotated-provider-key",
       }),
     }), 31234);
   });

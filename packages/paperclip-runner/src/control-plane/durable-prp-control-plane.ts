@@ -329,6 +329,7 @@ export interface DurablePrpControlPlaneOptions {
   ) => void;
   /** Diagnostic only: called synchronously after each runner connection is authenticated. */
   onAuthenticatedConnection?: () => void;
+  onAuthenticatedDisconnect?: () => void;
   connectionLeaseTtlMs?: number;
 }
 
@@ -627,6 +628,7 @@ export interface RunnerProcessHandle {
   processGroupId?: number | null;
   startedAt?: string;
   isExitConfirmed?(): boolean;
+  requestExitVerification?(): void;
   /** Relaunches the same immutable process specification with a fresh ticket. */
   restart?: ((ticket: string) => RunnerProcessHandle) | null;
 }
@@ -2102,6 +2104,7 @@ export class DurablePrpControlPlane {
   #beforeAuthenticatedConnection?: DurablePrpControlPlaneOptions["beforeAuthenticatedConnection"];
   #onProtocolIntegrityError?: DurablePrpControlPlaneOptions["onProtocolIntegrityError"];
   #onAuthenticatedConnection?: DurablePrpControlPlaneOptions["onAuthenticatedConnection"];
+  #onAuthenticatedDisconnect?: DurablePrpControlPlaneOptions["onAuthenticatedDisconnect"];
   #protocolIntegrityError: NativeSessionProtocolIntegrityError | null = null;
   #eventDeliveryStall: { runId: string; ackedSourceSeq: number; since: number; failures: number } | null = null;
   #connectionLeaseTtlMs: number;
@@ -2164,6 +2167,7 @@ export class DurablePrpControlPlane {
     this.#beforeAuthenticatedConnection = options.beforeAuthenticatedConnection;
     this.#onProtocolIntegrityError = options.onProtocolIntegrityError;
     this.#onAuthenticatedConnection = options.onAuthenticatedConnection;
+    this.#onAuthenticatedDisconnect = options.onAuthenticatedDisconnect;
     this.#connectionLeaseTtlMs = options.connectionLeaseTtlMs ?? 60_000;
   }
 
@@ -3094,8 +3098,10 @@ export class DurablePrpControlPlane {
       onClose: () => {
         this.#recordLeaseFailureIfLapsed(connection);
         this.#connections.delete(connection);
-        if (connection.secureChannel !== null && this.activeRunnerConnectionCount() === 0)
+        if (connection.secureChannel !== null && this.activeRunnerConnectionCount() === 0) {
           this.#runnerDisconnectedAt ??= Date.now();
+          try { this.#onAuthenticatedDisconnect?.(); } catch {}
+        }
       },
     });
     this.#connections.add(connection);
