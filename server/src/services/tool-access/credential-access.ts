@@ -121,12 +121,9 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
     }
     let grant: typeof connectionGrants.$inferSelect | null = null;
     try {
-      if (
-        connection.authKind === "oauth" ||
-        connection.credentialPolicy !== "shared"
-      ) {
-        grant = await vaultGrantForConnection(connection, actor);
-      }
+      // Shared API-key/header credentials use the same grant mapping and
+      // ownership checks as tools/call, not the connection's raw secret IDs.
+      grant = await vaultGrantForConnection(connection, actor);
       if (connection.authKind === "oauth" && grant) {
         grant = await refreshOAuthGrantCredentials({
           companyId: connection.companyId,
@@ -136,7 +133,10 @@ export function createConnectionCredentialAccess(db: Db, { secrets, audit, verce
           actor,
         });
       } else {
-        connection = await maybeRefreshOAuthCredentials(connection, actor);
+        const refreshed = await maybeRefreshOAuthCredentials(connection, actor);
+        // A legacy shared/M2M refresh may have published new grant refs.
+        if (refreshed !== connection) grant = await vaultGrantForConnection(refreshed, actor);
+        connection = refreshed;
       }
     } catch (error) {
       const scope = credentialScope(connection);
