@@ -41,7 +41,8 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 // closing the PRP transport by itself is never called sandbox retirement.
 // Only the allocation driver is simulated: Stop, execution, finalization,
 // checkpoint publication and receipt persistence remain product code.
-// Core's own idle timer closes the warm Runner between turns.
+// Core's own idle timer closes the warm Runner between turns, except in the
+// connected case, which must reuse it without a generation-probe exec.
 const WARM_IDLE_MS = 4_000;
 const allocation = vi.hoisted(() => ({ drivers: undefined as import("../services/environment-runtime.js").EnvironmentRuntimeDriver[] | undefined }));
 vi.mock("../services/environment-runtime.js", async importOriginal => {
@@ -101,7 +102,7 @@ function sessionFile(pi: Birth): string {
 // "idle": the box resumes from idle (still running; the first hit).
 // "archived": the box resumes from archived (the sticky loop after a failed
 // run). Turns 2 and 3 must each continue with history.
-it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of the warm Runner, then a %s resume of the same box: later turns continue through the executor", async resumedFrom => {
+it.skipIf(!enabled).each(["idle", "archived", "stopped", "connected"] as const)("A %s resume of the same box continues through the executor without probing a connected warm owner", async resumedFrom => {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
@@ -278,7 +279,7 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
       const execution = buildNativeExecutionInput({ companyId, agentId, runId, provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh",
         issue: { id: issueId, identifier: "PIL-1", title: issue!.title, description: null, workMode: "standard" }, taskPrompt: prompt,
         workspace: { id: workspaceId, cwd: remoteCwd, repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: native.normalizedSessionId,
-        lifecyclePolicy: { mode: "warm", idleTimeoutMs: WARM_IDLE_MS }, runtimeContext,
+        lifecyclePolicy: { mode: "warm", idleTimeoutMs: resumedFrom === "connected" ? 600_000 : WARM_IDLE_MS }, runtimeContext,
         completionContract: { id: contract!.id, sha256: contract!.canonicalSha256, schemaVersion: contract!.schemaVersion, contract: contract!.contractJson as never } });
       // The native authority uses the actual acquired DB id, never the
       // executionWorkspaceId or the unrelated PRP connection lease token.
@@ -289,7 +290,7 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
       return { runId, run: run!, native, execution, lease, prompt };
     };
     type Fixture = Awaited<ReturnType<typeof seed>>;
-    const executionOptions = async (fixture: Fixture, outcome: "created" | "resumed", restarted = false) => {
+    const executionOptions = async (fixture: Fixture, outcome: "created" | "resumed") => {
       const path = `/api/runner/v1/connect/${fixture.runId}`;
       previewBindings.set(path, fixture.lease.id);
       const endpoint = async (): Promise<RunnerIngressEndpoint> => {
@@ -303,7 +304,9 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
         effectiveCapabilities: { runnerWebSocketIngress: true, reusableLeases: true, independentControlCommands: true,
           nativeSyncIn: false, nativeSyncOut: false, persistentProcessSessions: false, incrementalSessionOutput: false,
           concurrentSyncOperations: false, duplexCommandStream: false }, getRunnerIngressEndpoint: endpoint,
-        sandboxLeaseAcquisition: { outcome, providerLeaseId, ...(restarted ? { restarted: true as const } : {}) } };
+        sandboxLeaseAcquisition: { outcome, providerLeaseId,
+          ...(outcome === "resumed" && (resumedFrom === "archived" || resumedFrom === "stopped")
+            ? { resumedFromState: resumedFrom, restarted: true as const } : {}) } };
       return { db: db!, execution: fixture.execution, runnerInstanceId: fixture.native.runnerInstanceId,
         durableEnvironmentLeaseId: fixture.lease.id, controllerPersistence: { bootId: controller.bootId }, runnerIngressAuthorized: true,
         runnerExecutionTarget: target, runnerRemoteBinaryPath: runnerBinary, runnerRemoteProviderPackPath: providerPack,
@@ -344,6 +347,11 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
     const settle = async (fixture: Fixture) => {
       await db!.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, fixture.runId));
       await db!.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, fixture.runId));
+      if (resumedFrom === "connected") {
+        expect(sameBirth(spawned.at(-1)!)).toBe(true);
+        await environmentService(db!).releaseLease(fixture.lease.id, "released");
+        return;
+      }
       // Core's idle timer closes the warm Runner; it suspends and exits.
       const owned = spawned.at(-1)!;
       await vi.waitFor(() => { expect(sameBirth(owned)).toBe(false); }, { timeout: WARM_IDLE_MS + 30_000, interval: 200 });
@@ -371,13 +379,20 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
         || ${JSON.stringify({ sessionCheckpoint: admission.checkpoint })}::jsonb` }).where(eq(heartbeatRuns.id, next.runId));
       // The same box resumes from idle or archived. Archived sets the restarted
       // trigger; the owner's process generation must still be proven gone.
-      const nextOptions = await executionOptions(next, "resumed", resumedFrom === "archived");
+      const nextOptions = await executionOptions(next, "resumed");
+      const beforeCommands = commands.length;
       activeRunId = next.runId;
       const outcome = await executePaperclipNativeSession({ ...nextOptions, useRunnerd: true, conversationMode: true }).then(
         result => ({ result }), error => ({ error: String(error) }));
       activeRunId = undefined;
       await writeFile(join(root, `turn-${index}-outcome.json`), JSON.stringify(outcome, null, 2));
       expect(record(outcome).error, `turn ${index}: ${JSON.stringify(outcome)}`).toBeUndefined();
+      if (resumedFrom === "connected") {
+        expect(commands.slice(beforeCommands).filter(command =>
+          (record(command).args as string[] | undefined)?.[2] === "paperclip-runner-generation-marker"),
+        "ordinary warm turns must not execute a generation probe").toEqual([]);
+        expect(new Set(spawned.map(entry => entry.pid)).size, "the connected Runner is retained").toBe(1);
+      }
       expect(record(outcome).result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: `RECALLED_${fact}` });
       expect(requests).toHaveLength(index);
       expect(requests.at(-1)).toMatchObject({ historyHasFact: true, latestPromptHasFact: false, reply: `RECALLED_${fact}` });
@@ -396,10 +411,11 @@ it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of th
       const leases = await db!.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, next.runId));
       expect(leases.map(lease => lease.providerLeaseId)).toEqual([providerLeaseId]);
     }
-    const epochs = readdirSync(join(remoteSessionRoot, "authority-epochs")).filter(name => name.startsWith("epoch-"));
+    const epochs = resumedFrom === "connected" ? []
+      : readdirSync(join(remoteSessionRoot, "authority-epochs")).filter(name => name.startsWith("epoch-"));
     await writeFile(join(root, "proof.json"), JSON.stringify({ scope: "executePaperclipNativeSession warm path; real runnerd/proxy/Pi; simulated allocation and loopback model",
       firstRunId: first.runId, nativeSessionId: first.native.normalizedSessionId, requests, processPairs, epochs }, null, 2));
-    stage(`GREEN: three turns of the same conversation across Core's idle closes (${resumedFrom})`, { epochs });
+    stage(`GREEN: three turns of the same conversation (${resumedFrom})`, { epochs });
     await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "closed-owner proof complete" });
   } catch (error) { failure = error; throw error; }
   finally {

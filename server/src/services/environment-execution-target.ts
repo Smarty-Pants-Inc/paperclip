@@ -117,6 +117,7 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? { previousProviderLeaseId: candidate.previousProviderLeaseId }
       : {}),
     ...(reason ? { reason } : {}),
+    ...(candidate.outcome === "resumed" && typeof resumedFromState === "string" ? { resumedFromState } : {}),
     // A provider that did not report the prior state proves no restart.
     ...(candidate.outcome === "resumed" && typeof resumedFromState === "string"
       && STOPPED_SANDBOX_STATES.has(resumedFromState) ? { restarted: true as const } : {}),
