@@ -938,7 +938,14 @@ export async function createTarballFromDirectory(input: {
   exclude?: string[];
   followSymlinks?: boolean;
 }): Promise<void> {
-  const excludeArgs = ["._*", ...(input.exclude ?? [])].flatMap((entry) => ["--exclude", entry]);
+  const sourceRoot = await physicalPath(input.localDir);
+  // All callers place output in a dedicated staging directory. If that
+  // directory is beneath the source (e.g. cwd === os.tmpdir()), omit it rather
+  // than packing runtime state or letting tar encounter its own output.
+  const archiveDirectory = relativizeUnderGitToplevel({
+    toplevel: sourceRoot, localPath: await physicalPath(path.dirname(input.archivePath)),
+  });
+  const archiveExclude = archiveDirectory === "" ? path.basename(input.archivePath) : archiveDirectory;
   // Archive the directory's top-level entries BY NAME rather than ".". Archiving
   // "." embeds a "./" self-entry whose mode/mtime tar then tries to restore onto
   // the extraction target directory; that chmod/utime fails with "Operation not
@@ -948,6 +955,12 @@ export async function createTarballFromDirectory(input: {
   // tar (no GNU-only --no-overwrite-dir needed). --exclude still filters nested
   // matches and any named entry it matches.
   await withTempDir("paperclip-tar-list-", async (directory) => {
+    const listDirectory = relativizeUnderGitToplevel({ toplevel: sourceRoot, localPath: await physicalPath(directory) });
+    const ownStagingExcludes = [archiveExclude, listDirectory]
+      .filter((entry): entry is string => Boolean(entry))
+      .map(escapeTarExcludeLiteral);
+    const excludeArgs = ["._*", ...(input.exclude ?? []), ...ownStagingExcludes]
+      .flatMap((entry) => ["--exclude", entry]);
     const list = path.join(directory, "entries.nul");
     const file = await fs.open(list, "wx", 0o600);
     try {

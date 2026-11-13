@@ -3747,6 +3747,15 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
       previousSessionParams,
       opts,
     );
+    // Apply the existing session-root safety rule to every local source, not
+    // just restored sessions: operator cwd, project sources and supplied anchors
+    // must not hand sandbox sync its own temporary staging tree.
+    if (isUnsafeSessionWorkspaceCwd(anchor.cwd)) {
+      throw new WorkspaceValidationFailure(
+        `Workspace root "${anchor.cwd}" is a system root or contains runtime temporary staging. Configure a concrete workspace directory, or clear cwd to use the managed task directory or agent home.`,
+        { workspaceValidation: { reason: "unsafe_workspace_root", cwd: anchor.cwd, resolvedWorkspaceSource: anchor.source } },
+      );
+    }
     await retainCurrentWorkspaceSource(anchor.cwd);
     if (!isMultiProjectWorkspaceSyncEnabled()) {
       return {
