@@ -13,6 +13,8 @@ const DEFAULT_STARTUP_DEADLINE_MS = 60_000;
 const DEFAULT_RECOVERY_GRACE_MS = REMOTE_RUNNER_RECONNECT_GRACE_MS;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
+// Do not flood a serial listener with new handshakes while repairing its route.
+const MIN_ROUTE_REACQUIRE_DELAY_MS = 1_000;
 // A runner can legitimately stay silent for many minutes while its provider
 // waits on a long foreground tool call. Protocol pings distinguish that quiet
 // but live runner from a half-open connection (for example a preview proxy that
@@ -478,8 +480,11 @@ export function connectRunnerPrpIngress(input: {
         let failure: unknown = error;
         const statusCode =
           typeof error === "object" && error !== null && "statusCode" in error
+            && (error as { statusCode?: unknown }).statusCode != null
             ? Number((error as { statusCode?: unknown }).statusCode)
             : null;
+        const transportFailure = (statusCode === null || statusCode >= 500)
+          && !(failure instanceof RunnerIngressConnectionError && failure.code !== "runner_ingress_unavailable");
         if (
           (statusCode === 401 || statusCode === 403) &&
           Date.now() < recoveryDeadline
@@ -503,9 +508,9 @@ export function connectRunnerPrpIngress(input: {
           }
         }
         if (Date.now() < recoveryDeadline) {
-          const base = RECONNECT_DELAYS_MS[
+          const base = Math.max(RECONNECT_DELAYS_MS[
             Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)
-          ]!;
+          ]!, transportFailure ? MIN_ROUTE_REACQUIRE_DELAY_MS : 0);
           attempt += 1;
           await delay(
             Math.min(
@@ -515,7 +520,25 @@ export function connectRunnerPrpIngress(input: {
             abort.signal,
           );
           if (abort.signal.aborted) return;
-          if (Date.now() < recoveryDeadline) continue;
+          if (Date.now() < recoveryDeadline) {
+            // Re-post the route on this same sandbox before another handshake.
+            // Space refreshes with the existing backoff; never reset the budget
+            // or turn an authentication/lease failure into transport recovery.
+            if (transportFailure) {
+              try {
+                const refreshedEndpoint = await awaitWithinDeadline({
+                  operation: () => endpoint.refresh(),
+                  deadline: recoveryDeadline,
+                  signal: abort.signal,
+                });
+                if (Date.now() < recoveryDeadline) endpoint = refreshedEndpoint;
+              } catch (refreshError) {
+                if (abort.signal.aborted) return;
+                failure = refreshError;
+              }
+            }
+            if (Date.now() < recoveryDeadline) continue;
+          }
         }
         const terminal =
           leaseFailureCode !== null

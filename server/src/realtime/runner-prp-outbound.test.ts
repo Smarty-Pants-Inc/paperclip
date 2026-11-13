@@ -80,9 +80,9 @@ describe("runner provider-ingress WebSocket wire", () => {
       websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-log", secretHeaders: [], generation: "log",
       refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
     const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: vi.fn() } as unknown as DurablePrpControlPlane,
-      endpoint, startupDeadlineMs: 5_000, random: () => 0.5 });
+      endpoint, startupDeadlineMs: 6_000, random: () => 0.5 });
     try {
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(6_000);
       const lines = serialized.trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
       expect(lines.length).toBeGreaterThan(0);
       for (const secret of secretValues) expect(serialized).not.toContain(secret);
@@ -113,8 +113,8 @@ describe("runner provider-ingress WebSocket wire", () => {
       await vi.advanceTimersByTimeAsync(600);
       const terminal = await observed;
       const records = warn.mock.calls.filter(call => (call[0] as Record<string, unknown>)?.event === "runner_ingress_connect_attempt_failed");
-      expect(records.length).toBe(2);
-      expect(records.map(call => (call[0] as Record<string, unknown>)?.attempt)).toEqual([1, 2]);
+      expect(records.length).toBe(1);
+      expect(records.map(call => (call[0] as Record<string, unknown>)?.attempt)).toEqual([1]);
       expect(records[0]?.[0]).toMatchObject({ code: "ECONNREFUSED" });
       expect(JSON.stringify(records)).not.toContain("must-not-log");
       expect(terminal).toMatchObject({ causeSummary: { code: "ECONNREFUSED", errno: -111, syscall: "connect" } });
@@ -217,6 +217,76 @@ describe("runner provider-ingress WebSocket wire", () => {
         await expect(handle.failure).rejects.toMatchObject({ code: "runner_ingress_unavailable" });
         expect(attach).not.toHaveBeenCalled();
       }
+    } finally { await handle.close(); sockets.create = create; vi.useRealTimers(); }
+  });
+
+  it.each([
+    ["handshake timeout", false], ["connection refusal", false],
+    ["handshake timeout", true], ["connection refusal", true],
+  ] as const)("reacquires the same-box route after %s (warm=%s) before authenticating", async (mode, warm) => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warmSocket = new FakeSocket();
+    let warmOpened = false;
+    let refreshed = false;
+    const began = Date.now();
+    const refreshTimes: number[] = [];
+    const failedSockets: FakeSocket[] = [];
+    sockets.create = options => {
+      if (warm && !warmOpened) { warmOpened = true; return openingSocket(warmSocket); }
+      if (refreshed) return openingSocket();
+      const socket = new FakeSocket();
+      socket.readyState = WebSocket.CONNECTING;
+      failedSockets.push(socket);
+      setTimeout(() => {
+        socket.readyState = WebSocket.CLOSED;
+        socket.emit("error", Object.assign(new Error(mode === "handshake timeout" ? "Opening handshake has timed out" : "connect ECONNREFUSED"), { code: mode === "handshake timeout" ? "ETIMEDOUT" : "ECONNREFUSED" }));
+        socket.emit("close", 1006, Buffer.alloc(0));
+      }, mode === "handshake timeout" ? Math.min(1_000, options.handshakeTimeout) : 1);
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/same-box", secretHeaders: [], generation: "same-box",
+      refresh: vi.fn(async () => { refreshTimes.push(Date.now() - began); refreshed = true; return endpoint; }), close: vi.fn(async () => {}) };
+    const attach = vi.fn(() => ({ isAuthenticated: () => true }));
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: attach } as unknown as DurablePrpControlPlane,
+      endpoint, startupDeadlineMs: 5_000, recoveryGraceMs: 5_000, random: () => 0.5 });
+    let result: unknown;
+    void handle.ready.then(() => { result = "ready"; }, error => { result = error; });
+    try {
+      if (warm) { await vi.advanceTimersByTimeAsync(0); await handle.ready; warmSocket.close(); }
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(result).toBe("ready");
+      expect(endpoint.refresh).toHaveBeenCalledOnce();
+      expect(refreshTimes).toEqual([mode === "handshake timeout" ? 2_000 : 1_001]);
+      expect(attach).toHaveBeenCalledTimes(warm ? 2 : 1);
+      expect(failedSockets.every(socket => socket.readyState === WebSocket.CLOSED)).toBe(true);
+    } finally { await handle.close(); sockets.create = create; vi.useRealTimers(); }
+  });
+
+  it("bounds a stalled same-box route refresh by the original startup deadline", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    let attempts = 0;
+    sockets.create = () => {
+      attempts++;
+      const socket = new FakeSocket(); socket.readyState = WebSocket.CONNECTING;
+      queueMicrotask(() => { socket.readyState = WebSocket.CLOSED; socket.emit("error", new Error("connect ECONNREFUSED")); });
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/refresh-stalled", secretHeaders: [], generation: "same-box",
+      refresh: vi.fn(async () => await new Promise<never>(() => {})), close: vi.fn(async () => {}) };
+    const attach = vi.fn();
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: attach } as unknown as DurablePrpControlPlane,
+      endpoint, startupDeadlineMs: 5_000, random: () => 0.5 });
+    const observed = handle.ready.catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await observed).toMatchObject({ code: "runner_ingress_unavailable" });
+      expect(endpoint.refresh).toHaveBeenCalledOnce();
+      expect(attempts).toBe(1);
+      expect(attach).not.toHaveBeenCalled();
     } finally { await handle.close(); sockets.create = create; vi.useRealTimers(); }
   });
 
