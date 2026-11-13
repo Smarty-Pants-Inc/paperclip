@@ -55,11 +55,13 @@ import {
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { isVerifiedDependencyInteractionResponse, readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import {
+  conversationRunsForLastMessages,
   isConversation,
   isConversationReset,
   isConversationExecutionWake,
   isWaitingConversation,
 } from "../agent-conversations.js";
+import { hasPendingConversationResponseCard } from "../native-runtime/native-governance.js";
 import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import {
   admitExplicitNativeContinuation,
@@ -2764,6 +2766,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       companyId: agent.companyId, issueId, agentId, payload, context: enrichedContextSnapshot,
       actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
     })) return null;
+    const permitsUnansweredConversationContinuation = async (reader: Db, currentIssueId: string): Promise<boolean> => {
+      const actionId = readNonEmptyString(enrichedContextSnapshot.recoveryActionId);
+      const previousRunId = readNonEmptyString(enrichedContextSnapshot.previousRunId);
+      if (!executionReconciliationWake || source !== "automation" || triggerDetail !== "system"
+        || reason !== "issue_recovery_action_restored" || opts.requestedByActorType !== "system"
+        || opts.requestedByActorId !== "execution-recovery" || !actionId || !isUuidLike(actionId)
+        || opts.idempotencyKey !== `execution-reconciliation:${actionId}`
+        || enrichedContextSnapshot.source !== "execution.reconciled" || enrichedContextSnapshot.forceFreshSession !== true
+        || !previousRunId || !isUuidLike(previousRunId) || enrichedContextSnapshot.retryOfRunId !== previousRunId
+        || payload?.issueId !== currentIssueId || payload?.recoveryActionId !== actionId) return false;
+      if (await hasAutomaticInteractionDeliveryHold(reader, {
+        companyId: agent.companyId, issueId: currentIssueId, agentId, payload, context: enrichedContextSnapshot,
+        actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
+      })) return false;
+      if (await hasPendingConversationResponseCard({ db: reader, companyId: agent.companyId,
+        issueId: currentIssueId, runId: previousRunId })) return false;
+      const carriers = await conversationRunsForLastMessages(reader, {
+        companyId: agent.companyId, issues: [{ issueId: currentIssueId, agentId }], runId: previousRunId,
+      });
+      return carriers.length === 1 && carriers[0]!.hasReply === false;
+    };
     if (issueId) {
       const [pending] = await db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, agent.companyId), eq(caseHandoffs.issueId, issueId),
         inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1);
@@ -2783,7 +2806,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (isConversationExecutionWake(conversation, reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason))) return null;
         if (agent.id !== conversation!.conversationAgentId) return null;
         if (!(await instanceSettings.getExperimental()).enableAgentChat) return null;
-        if (isWaitingConversation(conversation) && !hasIndependentConversationWakeCause()) return null;
+        if (isWaitingConversation(conversation) && !hasIndependentConversationWakeCause()
+          && !(await permitsUnansweredConversationContinuation(db, issueId))) return null;
       }
     }
     if (agent.adapterType === "paperclip_runner") {
@@ -3738,8 +3762,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           // Completion can settle the conversation while admission is outside
-          // the issue lock. Recheck the current state before persisting a wake.
-          if (isWaitingConversation(issue) && !hasIndependentConversationWakeCause()) {
+          // the issue lock. Recheck the current state and its exact message
+          // provenance before persisting a saved-work continuation.
+          const allowsUnansweredConversationContinuation = isConversation(issue)
+            && await permitsUnansweredConversationContinuation(tx as unknown as Db, issue.id);
+          if (isWaitingConversation(issue) && !hasIndependentConversationWakeCause()
+            && !allowsUnansweredConversationContinuation) {
             return { kind: "skipped" as const };
           }
 
@@ -3926,7 +3954,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 or(eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.issueId, issue.id),
                   sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}::text`),
                 sql`${heartbeatRuns.createdAt} >= ${freshRecordedAt}::timestamptz`)).limit(1);
-              if (intervening || issue.status === "in_review") {
+              if (intervening || (issue.status === "in_review" && !allowsUnansweredConversationContinuation)) {
                 await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
                   intervening ? { continuationDelivery: "delivered", continuationRunId: intervening.id, continuationSupersededByRun: true }
                     : { continuationDelivery: "invalidated", continuationInvalidatedReason: "in_review" })}::jsonb` })

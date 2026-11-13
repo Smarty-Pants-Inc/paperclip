@@ -570,6 +570,36 @@ suite("fresh-continuation fallback", () => {
     expect((await pendingRecord(f.issueId))!.evidence.continuationDelivery).toBe("invalidated");
   }, 60_000);
 
+  it("freshly continues an in_review conversation when its last person message has no reply or own card", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+    await db.update(issues).set({ status: "in_review", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorUserId: userId,
+      authorType: "user", body: "Please answer this.", createdAt: new Date(Date.now() - 10 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "continued" });
+    expect(await continuedFrom(f.runId)).toHaveLength(1);
+  }, 60_000);
+
+  it("keeps an in_review conversation person-owned when the last message has its own run's reply", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+    await db.update(issues).set({ status: "in_review", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorUserId: userId,
+      authorType: "user", body: "What happened?", createdAt: new Date(Date.now() - 10 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorAgentId: agentId, authorType: "agent",
+      createdByRunId: f.runId, origin: "comment", body: "Here is the answer." });
+
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toEqual({ kind: "person_owned", reason: "in_review" });
+    expect(await continuedFrom(f.runId)).toHaveLength(0);
+  }, 60_000);
+
   it("settles coalesced holds with their primary, so a task back in todo is not shown as working and the sweep sees it", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     // A second no-replay hold of the same run, settled together with the first.

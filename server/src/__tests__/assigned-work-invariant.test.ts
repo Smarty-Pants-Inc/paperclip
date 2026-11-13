@@ -3,7 +3,7 @@ import { and, eq, sql as sqlTag } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agents, agentTaskSessions, agentWakeupRequests, approvals, companies, createDb, heartbeatRuns, issueApprovals,
-  issueRecoveryActions, issueRelations, issues, issueThreadInteractions, nativeRunFinalizations,
+  issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { recoveryService } from "../services/recovery/service.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -72,6 +72,81 @@ describePostgres("assigned-work invariant sweep", () => {
     }
     return { companyId, agentId, issue, run };
   }
+
+  it("continues a conversation whose last person message has no run reply or card, exactly once", async () => {
+    const f = await seedCompany();
+    const issueId = await f.issue({ conversationAgentId: f.agentId, conversationUserId: "person-1", conversationState: "waiting" });
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId, authorUserId: "person-1",
+      authorType: "user", body: "Please finish this.", createdAt: new Date(Date.now() - 4 * HOUR) }).returning();
+    await f.run(issueId, { status: "failed", errorCode: "process_lost", contextSnapshot: { issueId, taskId: issueId,
+      wakeCommentId: message!.id } });
+    const queue = wakeQueue();
+    const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup });
+
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "repaired", verdict: { kind: "violation" } });
+    expect(queue.calls).toHaveLength(1);
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "ok", verdict: { clause: "pending_intent", intent: "queued_wake" } });
+    expect(queue.calls).toHaveLength(1);
+  }, 60_000);
+
+  it("keeps a conversation waiting when the last person message has its own run's reply", async () => {
+    const f = await seedCompany();
+    const issueId = await f.issue({ conversationAgentId: f.agentId, conversationUserId: "person-2", conversationState: "waiting" });
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId, authorUserId: "person-2",
+      authorType: "user", body: "What happened?", createdAt: new Date(Date.now() - 4 * HOUR) }).returning();
+    const run = await f.run(issueId, { status: "succeeded", errorCode: null, livenessState: null,
+      contextSnapshot: { issueId, taskId: issueId, wakeCommentId: message!.id } });
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId, authorAgentId: f.agentId, authorType: "agent",
+      createdByRunId: run.id, origin: "comment", body: "Here is the answer.", createdAt: new Date(Date.now() - 3 * HOUR) });
+    const queue = wakeQueue();
+    const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup });
+
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "ok", verdict: { clause: "waiting", reason: "conversation" } });
+    expect(queue.calls).toHaveLength(0);
+  }, 60_000);
+
+  it("does not mistake an approval for an answer to the person's last message", async () => {
+    const f = await seedCompany();
+    const issueId = await f.issue({ conversationAgentId: f.agentId, conversationUserId: "person-3", conversationState: "active" });
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId, authorUserId: "person-3",
+      authorType: "user", body: "Do the work.", createdAt: new Date(Date.now() - 4 * HOUR) }).returning();
+    await f.run(issueId, { status: "failed", errorCode: "process_lost", contextSnapshot: { issueId, taskId: issueId,
+      wakeCommentId: message!.id } });
+    const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "plan", status: "pending", payload: {} } as never).returning();
+    await db.insert(issueApprovals).values({ companyId: f.companyId, issueId, approvalId: approval!.id } as never);
+    const queue = wakeQueue();
+    const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup });
+
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "ok", verdict: { clause: "waiting", reason: "approval" } });
+    await db.update(approvals).set({ status: "approved" }).where(eq(approvals.id, approval!.id));
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "repaired", verdict: { kind: "violation" } });
+    expect(queue.calls).toHaveLength(1);
+  }, 60_000);
+
+  it.each(["queued", "running"] as const)("does not add a wake while the person's message is carried by a %s first-turn run", async status => {
+    const f = await seedCompany();
+    const issueId = await f.issue({ conversationAgentId: f.agentId, conversationUserId: `person-${status}`, conversationState: "active" });
+    const [message] = await db.insert(issueComments).values({ companyId: f.companyId, issueId,
+      authorUserId: `person-${status}`, authorType: "user", body: "Please continue.", createdAt: new Date(Date.now() - 4 * HOUR) }).returning();
+    const run = await f.run(issueId, { status, errorCode: null, livenessState: null,
+      startedAt: status === "running" ? new Date(Date.now() - 60_000) : null, finishedAt: null,
+      contextSnapshot: { issueId, taskId: issueId, firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1",
+        runId: "pending", wakeupRequestIds: [], commentIds: [message!.id], claimedAt: new Date().toISOString() } } });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, taskId: issueId,
+      firstTurnQueuedInput: { schema: "paperclip.first-turn-queued-input.v1", runId: run.id,
+        wakeupRequestIds: [], commentIds: [message!.id], claimedAt: new Date().toISOString() } } }).where(eq(heartbeatRuns.id, run.id));
+    const queue = wakeQueue();
+    const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup });
+
+    expect(await recovery.assignedWork.checkIssue({ companyId: f.companyId, issueId }))
+      .toMatchObject({ outcome: "ok", verdict: { clause: "live_run", runId: run.id } });
+    expect(queue.calls).toHaveLength(0);
+  }, 60_000);
 
   it("a deploy-interrupted in_progress task with nothing pending gets exactly one continuation; the stranded sweep leaves it", async () => {
     const f = await seedCompany();

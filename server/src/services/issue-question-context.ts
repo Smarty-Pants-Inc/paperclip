@@ -49,7 +49,7 @@ export function historicalQuestionCondition() {
 
 /** One predicate for completion feedback, waiting, and status arbitration. */
 export function activeIssueInteractionCondition(input: {
-  runId?: string | null;
+  runId?: string | null | SQL;
   conversationMode?: boolean;
   responsibleUserId?: string | null;
   responsibleUser?: SQL;

@@ -131,7 +131,7 @@ describe("assigned-work invariant", () => {
       ["credential", { activeRecoveryAction: { cause: "configuration_incomplete", ownerType: "board", resumeAt: null } }],
       ["provider_limit", { activeRecoveryAction: { cause: "native_provider_usage_limit", ownerType: "board",
         resumeAt: new Date(now.getTime() + 30 * 60_000) } }],
-      ["conversation", { issue: { isConversation: true } }],
+      ["conversation", { issue: { isConversation: true, conversationAnswered: true } }],
       ["awaiting_first_message", { issue: { awaitingFirstMessage: true } }],
       ["approval", { interruption: { responsibility: "user", state: "waiting_for_user", userAction: "approval", nextRetryAt: null, canRetry: false } }],
       ["credential", { interruption: { responsibility: "user", state: "waiting_for_user", userAction: "reconnect", nextRetryAt: null, canRetry: false } }],
@@ -160,6 +160,11 @@ describe("assigned-work invariant", () => {
   describe("violations", () => {
     it("an in_progress task whose deploy-interrupted run left nothing pending", () => {
       expect(evaluateAssignedWork(facts(), now)).toEqual({ kind: "violation", reason: "no_pending_path", stale: false });
+    });
+
+    it("an unanswered conversation is not a wait", () => {
+      expect(evaluateAssignedWork(facts({ issue: { isConversation: true, conversationAnswered: false } }), now))
+        .toEqual({ kind: "violation", reason: "no_pending_path", stale: false });
     });
 
     it("a task offering a Retry only the system can act on", () => {

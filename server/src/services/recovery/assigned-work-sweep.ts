@@ -12,6 +12,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueComments,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -21,6 +22,8 @@ import { logActivity, publishActivity, type ActivityPublication } from "../activ
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { unadmittedChatWakeupCondition } from "../durable-chat-wakeup.js";
+import { conversationReplyRunsForLastMessages } from "../agent-conversations.js";
+import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueService } from "../issues.js";
 import { legacyControllerOwnerStamp } from "../legacy-controller-lease.js";
@@ -29,6 +32,7 @@ import { issueTreeControlService } from "../issue-tree-control.js";
 import { taskInterruptionPresentations } from "../task-interruption-presentation.js";
 import { CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
+import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { PENDING_CONTINUATION_BOUND_MS } from "../recovery-continuation-pacing.js";
 import { attributeBlock, BLOCK_ATTRIBUTION_WINDOW_MS, blockedStatusDetailsSql } from "../interruption-block-release.js";
 import { ASSIGNED_WORK_CONTINUED_ACTION, taskAutomaticAttempts } from "./task-automatic-attempts.js";
@@ -330,6 +334,17 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const latestByIssue = new Map(rowsOf<RunRow>(latestRuns).map(row => [row.issueId, row]));
     const blockActivityByIssue = new Map(rowsOf<{ issueId: string; actorType: string; actorId: string; agentId: string | null; details: unknown }>(blockActivity)
       .map(row => [row.issueId, row]));
+    const conversationReplyRuns = await conversationReplyRunsForLastMessages(database, {
+      companyId,
+      issues: issueRows.flatMap(issue => (issue.conversationAgentId || issue.originKind === "chat_channel") && issue.assigneeAgentId
+        ? [{ issueId: issue.id, agentId: issue.conversationAgentId ?? issue.assigneeAgentId }]
+        : []),
+    });
+    const answeredConversationIds = new Set<string>();
+    await Promise.all(conversationReplyRuns.map(async row => {
+      if (await conversationTurnAnswered({ db: database, companyId, issueId: row.issueId, runId: row.runId }))
+        answeredConversationIds.add(row.issueId);
+    }));
 
     const ownedRunsByIssue = new Map<string, AssignedWorkFacts["activeRuns"]>();
     for (const issue of issueRows) {
@@ -363,6 +378,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
           unblockOwner: (issue.unblockDescriptor?.owner ?? null) as AssignedWorkFacts["issue"]["unblockOwner"],
           monitorNextCheckAt: issue.monitorNextCheckAt,
           isConversation: Boolean(issue.conversationAgentId) || issue.originKind === "chat_channel",
+          conversationAnswered: answeredConversationIds.has(issue.id),
           awaitingFirstMessage: onboardingIds.has(issue.id),
         },
         activeRuns: ownedRuns,
@@ -428,8 +444,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
    * The cheap, indexed pre-filter the sweep reconstructs from: open assigned
    * tasks with no run that is plainly live, no pending wake and no pending
    * question. Everything it lets through is judged by the full predicate.
-   * Chat conversations and blocks older than the stale window are left out:
-   * the first wait on a person's message, the second is only reported.
+   * Person-facing chats are considered only when their latest human message
+   * is not answered by the run that carried it; old blocks are only reported.
    */
   async function listSuspects(scope: { companyId?: string; issueId?: string; createdAfter?: Date | null }, cursor: string | null, limit: number) {
     const at = now();
@@ -447,8 +463,48 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       sql`${issues.assigneeAgentId} is not null`,
       isNull(issues.assigneeUserId),
       isNull(issues.hiddenAt),
-      isNull(issues.conversationAgentId),
-      sql`coalesce(${issues.originKind}, '') <> 'chat_channel'`,
+      sql`(
+        (${issues.conversationAgentId} is null and coalesce(${issues.originKind}, '') <> 'chat_channel')
+        or (
+          (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel')
+          and exists (select 1 from ${issueComments} person where person.company_id = ${issues.companyId}
+            and person.issue_id = ${issues.id} and person.author_user_id is not null and person.author_agent_id is null
+            and person.created_by_run_id is null and person.deleted_at is null)
+          and not exists (
+            select 1 from ${issueComments} last_person
+            where last_person.company_id = ${issues.companyId} and last_person.issue_id = ${issues.id}
+              and last_person.author_user_id is not null and last_person.author_agent_id is null
+              and last_person.created_by_run_id is null and last_person.deleted_at is null
+              and last_person.id = (select person.id from ${issueComments} person
+                where person.company_id = ${issues.companyId} and person.issue_id = ${issues.id}
+                  and person.author_user_id is not null and person.author_agent_id is null
+                  and person.created_by_run_id is null and person.deleted_at is null
+                order by person.created_at desc, person.id desc limit 1)
+              and exists (
+                select 1 from ${heartbeatRuns} response_run
+                where response_run.company_id = ${issues.companyId}
+                  and response_run.agent_id = coalesce(${issues.conversationAgentId}, ${issues.assigneeAgentId})
+                  and response_run.context_snapshot->>'issueId' = ${issues.id}::text
+                  and (response_run.context_snapshot->>'wakeCommentId' = last_person.id::text
+                    or response_run.context_snapshot->>'commentId' = last_person.id::text
+                    or (response_run.context_snapshot->'firstTurnQueuedInput'->>'schema' = 'paperclip.first-turn-queued-input.v1'
+                      and response_run.context_snapshot->'firstTurnQueuedInput'->>'runId' = response_run.id::text
+                      and jsonb_typeof(response_run.context_snapshot->'firstTurnQueuedInput'->'claimedAt') = 'string'
+                      and nullif(trim(response_run.context_snapshot->'firstTurnQueuedInput'->>'claimedAt'), '') is not null
+                      and response_run.context_snapshot->'firstTurnQueuedInput'->'commentIds' @> jsonb_build_array(last_person.id::text)))
+                  and exists (select 1 from ${issueComments} reply where reply.company_id = ${issues.companyId}
+                    and reply.issue_id = ${issues.id} and reply.created_by_run_id = response_run.id
+                    and reply.author_agent_id = response_run.agent_id and reply.origin = 'comment'
+                    and reply.deleted_at is null and (reply.created_at, reply.id) > (last_person.created_at, last_person.id))
+                  and not exists (select 1 from ${issueThreadInteractions}
+                    where ${issueThreadInteractions.companyId} = ${issues.companyId}
+                      and ${issueThreadInteractions.issueId} = ${issues.id}
+                      and ${issueThreadInteractions.status} = 'pending'
+                      and ${activeIssueInteractionCondition({ runId: sql`response_run.id`, conversationMode: true })})
+              )
+          )
+        )
+      )`,
       sql`(${issues.status} <> 'blocked' or coalesce(${issues.blockedTransitionAt}, ${issues.updatedAt}) > ${new Date(at.getTime() - STALE_BLOCK_MS).toISOString()}::timestamptz)`,
       sql`(${issues.monitorNextCheckAt} is null or ${issues.monitorNextCheckAt} <= ${at.toISOString()}::timestamptz)`,
       // A legacy run whose controller lease lapsed may have lost its owner;

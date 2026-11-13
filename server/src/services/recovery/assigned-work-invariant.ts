@@ -127,6 +127,8 @@ export type AssignedWorkFacts = {
     unblockOwner: { agentId: string } | { userId: string } | "board" | null;
     monitorNextCheckAt: Date | null;
     isConversation: boolean;
+    /** The last person message has a reply from the run that carried it. */
+    conversationAnswered?: boolean;
     awaitingFirstMessage: boolean;
   };
   /** Non-terminal runs (queued, running, scheduled_retry) for this task. */
@@ -292,7 +294,7 @@ function waitingReason(facts: AssignedWorkFacts, now: Date): WaitingReason | nul
       return "provider_limit";
     }
   }
-  if (issue.isConversation) return "conversation";
+  if (issue.isConversation && issue.conversationAnswered) return "conversation";
   if (issue.awaitingFirstMessage) return "awaiting_first_message";
   if (issue.status === "blocked") {
     if (facts.blockedBy === "user") return "user_stop";

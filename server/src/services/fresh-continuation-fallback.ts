@@ -18,6 +18,8 @@ import { isInterruptedNativePreparationCandidate } from "./cancelled-native-star
 import { notifyDeferredWakesForIssue } from "./deferred-execution-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { issueService } from "./issues.js";
+import { conversationRunsForLastMessages, isConversation } from "./agent-conversations.js";
+import { conversationTurnAnswered } from "./native-runtime/native-governance.js";
 import { holdOwnsBlockedStatus } from "./recovery-hold-blocked-status.js";
 import { proveRunProcessGone } from "./run-process-owner.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
@@ -546,8 +548,21 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     // be a person's Stop saved by an older release; it is never undone.
     || (!cancellation && !run.errorCode))))
     return { kind: "person_owned", reason: "stopped_on_request" };
-  // A task in review waits for its reviewer.
-  if (issue.status === "in_review") return { kind: "person_owned", reason: "in_review" };
+  // In-review chat is person-owned unless this exact failed run carried the
+  // latest person message and no run has replied to it. A copied first-turn
+  // receipt is not provenance; unrelated runs and older replies cannot answer it.
+  let unansweredConversationContinuation = false;
+  if (isConversation(issue)) {
+    const carriers = await conversationRunsForLastMessages(tx, {
+      companyId, issues: [{ issueId: issue.id, agentId: issue.conversationAgentId! }],
+    });
+    const replyRuns = carriers.filter(row => row.hasReply);
+    const conversationAnswered = await Promise.all(replyRuns.map(row => conversationTurnAnswered({
+      db: tx, companyId, issueId: issue.id, runId: row.runId,
+    }))).then(results => results.some(Boolean));
+    unansweredConversationContinuation = carriers.some(row => row.runId === run.id)
+      && replyRuns.length === 0 && !conversationAnswered;
+  }
   // A recorded operator reconciliation that already delivered a continuation
   // was handled above (successor_exists); any other human gate stays.
   if (holds.some(hold => blocksExecution(hold) && isHumanGate(hold) && !hold.evidence.executionReconciliation)
@@ -555,6 +570,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     return { kind: "person_owned", reason: "operator_decision_recorded" };
   const taskWait = await personOwnedTaskWait(tx, { companyId, issue, run });
   if (taskWait) return { kind: "person_owned", reason: taskWait };
+  if (issue.status === "in_review" && (!isConversation(issue) || !unansweredConversationContinuation))
+    return { kind: "person_owned", reason: "in_review" };
   let ownsBlock = false;
   if (issue.status === "blocked") {
     const receipts = holds.filter(hold => hold.evidence.nativeFailureBlock !== undefined || hold.evidence.legacyCancellationBlock !== undefined

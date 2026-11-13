@@ -97,6 +97,15 @@ export async function pendingNativeGovernance(input: {
  * task, but none presents that answer in the conversation. Only a pending
  * question or confirmation card this run created is the turn's visible response.
  */
+export async function hasPendingConversationResponseCard(input: {
+  db: Db;
+  companyId: string;
+  issueId: string;
+  runId: string;
+}): Promise<boolean> {
+  return Boolean(await pendingNativeInteraction({ ...input, createdByRun: true }));
+}
+
 export async function conversationTurnAnswered(input: {
   db: Db;
   companyId: string;

@@ -25,6 +25,7 @@ import {
 
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
 import { sanitizeQuarantinedCommentForHigherTrust } from "./source-trust.js";
+import { readFirstTurnQueuedInputReceipt } from "./native-runtime/first-turn-queued-input.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { createHeartbeatTimerPolicy, parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
@@ -49,6 +50,64 @@ export function isWaitingConversation(
     issue?.conversationState === "waiting" &&
     issue.status === "in_review"
   );
+}
+
+/** Runs that actually carried the last person message, with whether each run
+ * materialized its own prose reply. First-turn receipts are accepted only by
+ * upstream's reader, which rejects malformed and copied predecessor receipts. */
+export async function conversationRunsForLastMessages(
+  db: Db,
+  input: { companyId: string; issues: Array<{ issueId: string; agentId: string }>; runId?: string },
+): Promise<Array<{ issueId: string; runId: string; lastPersonCommentId: string; hasReply: boolean }>> {
+  if (!input.issues.length) return [];
+  const requested = JSON.stringify(input.issues.map(({ issueId, agentId }) => ({ issue_id: issueId, agent_id: agentId })));
+  const result = await db.execute<{ issueId: string; runId: string; lastPersonCommentId: string; contextSnapshot: unknown; hasReply: boolean }>(sql`
+    select requested.issue_id::text as "issueId", response_run.id::text as "runId",
+      last_person.id::text as "lastPersonCommentId", response_run.context_snapshot as "contextSnapshot",
+      exists (
+        select 1 from issue_comments reply
+        where reply.company_id = task.company_id and reply.issue_id = task.id
+          and reply.created_by_run_id = response_run.id and reply.author_agent_id = requested.agent_id
+          and reply.origin = 'comment' and reply.deleted_at is null
+          and (reply.created_at, reply.id) > (last_person.created_at, last_person.id)
+      ) as "hasReply"
+    from jsonb_to_recordset(${requested}::jsonb) as requested(issue_id uuid, agent_id uuid)
+    join issues task on task.company_id = ${input.companyId}::uuid and task.id = requested.issue_id
+    cross join lateral (
+      select person.id, person.created_at from issue_comments person
+      where person.company_id = task.company_id and person.issue_id = task.id
+        and person.author_user_id is not null and person.author_agent_id is null
+        and person.created_by_run_id is null and person.deleted_at is null
+      order by person.created_at desc, person.id desc limit 1
+    ) last_person
+    join heartbeat_runs response_run on response_run.company_id = task.company_id
+      and response_run.agent_id = requested.agent_id
+      and response_run.context_snapshot->>'issueId' = task.id::text
+      and (response_run.context_snapshot->>'wakeCommentId' = last_person.id::text
+        or response_run.context_snapshot->>'commentId' = last_person.id::text
+        or response_run.context_snapshot->'firstTurnQueuedInput'->'commentIds' @> jsonb_build_array(last_person.id::text))
+      and (${input.runId ?? null}::uuid is null or response_run.id = ${input.runId ?? null}::uuid)`);
+  const rows = Array.isArray(result) ? result as Array<{ issueId: string; runId: string; lastPersonCommentId: string; contextSnapshot: unknown; hasReply: boolean }>
+    : ((result as { rows?: Array<{ issueId: string; runId: string; lastPersonCommentId: string; contextSnapshot: unknown; hasReply: boolean }> }).rows ?? []);
+  return rows.filter(row => {
+    const context = row.contextSnapshot && typeof row.contextSnapshot === "object" && !Array.isArray(row.contextSnapshot)
+      ? row.contextSnapshot as Record<string, unknown> : {};
+    if (context.wakeCommentId === row.lastPersonCommentId || context.commentId === row.lastPersonCommentId) return true;
+    return readFirstTurnQueuedInputReceipt({ id: row.runId, contextSnapshot: context })?.commentIds.includes(row.lastPersonCommentId) === true;
+  }).map(({ issueId, runId, lastPersonCommentId, hasReply }) => ({
+    issueId, runId, lastPersonCommentId, hasReply: hasReply === true,
+  }));
+}
+
+/** Find runs that carried the last person message and materialized their own reply.
+ * Callers use native-governance's `conversationTurnAnswered` for the answer decision. */
+export async function conversationReplyRunsForLastMessages(
+  db: Db,
+  input: { companyId: string; issues: Array<{ issueId: string; agentId: string }>; runId?: string },
+): Promise<Array<{ issueId: string; runId: string }>> {
+  return (await conversationRunsForLastMessages(db, input))
+    .filter(row => row.hasReply)
+    .map(({ issueId, runId }) => ({ issueId, runId }));
 }
 
 /** Recovery for an older turn must not replace a reset or an answered chat. */
