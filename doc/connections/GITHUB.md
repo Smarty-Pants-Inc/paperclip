@@ -267,7 +267,10 @@ outcomes but no webhook content. GitHub webhook content is never first-party
 telemetry.
 
 Direct-App endpoints recover recent pre-ingress HTTP 5xx failures by asking
-GitHub to redeliver the original GUID. Eligible events are `issue_comment` and
+GitHub to redeliver the original GUID. Deliveries with no HTTP status (`null` or
+`0`, such as connection failures or timeouts) are also eligible, subject to the
+same GUID receipt fence, recovery window, and source validation.
+Eligible events are `issue_comment` and
 `pull_request_review_comment` with action `created`, plus automatic
 `pull_request` actions `opened`, `synchronize`, `reopened`, and `ready_for_review`.
 Comment recovery still requires the unchanged human-authored source. PR recovery
