@@ -46,7 +46,11 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same resident/session and assistant history (thinking=${thinking})`, async stopTurn => {
+// REG-03 (prod I-8g run df2cf036): after a Stop the retained runner's attach
+// failed and the plain follow-up died. With killRetainedRunner the retained
+// runnerd is SIGKILLed after the Stop; Core must retire it and resume the same
+// conversation once on a NEW runner from its checkpoint, visibly.
+async function stopWarmProof(stopTurn: number, killRetainedRunner = false) {
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -359,6 +363,11 @@ it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same res
     expect(alive(pid.piPid), "Stop must keep Pi alive after server run drain, before harness teardown").toBe(true);
     expect(alive(pid.runnerPid), "Stop must keep the original runnerd warm").toBe(true);
     expect(existsSync(join(root, "after-stop.txt")), "cancelled command cannot run its trailing effect").toBe(false);
+    if (killRetainedRunner) {
+      process.kill(pid.runnerPid, "SIGKILL");
+      await waitFor("retained runnerd killed", async () => alive(pid.runnerPid) ? null : true, 10_000);
+      stage("retained runnerd SIGKILLed after Stop", { runnerPid: pid.runnerPid, residentAlive: alive(pid.piPid) });
+    }
     await api("POST", `/issues/${issueId}/comments`, { body: "New turn after Stop: reply with the next local faux token. No tool needed." }, 201);
     const reply = await waitFor("NEW turn after Stop completes", async () => {
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -372,10 +381,25 @@ it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same res
     const newPids = bundles.map(bundle => { const info = bundle.transport.processInfo?.(); return { runnerPid: info?.pid, piPid: info?.pid ? piDescendant(info.pid) : null }; });
     stage("NEW turn completed after Stop", { runId: final.id, status: final.status, old: pid, newPids, reply: reply.body });
     expect(final.status).toBe("succeeded");
-    const replacement = newPids.find(value => value.piPid !== null)!;
-    expect(replacement, "next run uses the same healthy resident").toBeDefined();
-    expect(replacement.piPid).toBe(pid.piPid);
-    expect(replacement.runnerPid).toBe(pid.runnerPid);
+    const warmAttachFailures = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, final.id)))
+      .filter(event => event.eventType === "native.warm_attach.failed");
+    const replacement = newPids.find(value => value.piPid !== null && (!killRetainedRunner || value.runnerPid !== pid.runnerPid))!;
+    if (killRetainedRunner) {
+      expect(replacement, "the follow-up runs on a NEW runner and Pi").toBeDefined();
+      expect(replacement.runnerPid).not.toBe(pid.runnerPid);
+      expect(replacement.piPid).not.toBe(pid.piPid);
+      expect(alive(pid.runnerPid)).toBe(false);
+      expect(alive(pid.piPid), "the retired runner's Pi was reaped, not left running").toBe(false);
+      expect(warmAttachFailures, "the failed warm attach is visible exactly once").toHaveLength(1);
+      expect(warmAttachFailures[0]!.payload).toMatchObject({ schema: "paperclip.warm-attach-failure.v1", layer: "runner",
+        state: "warm_attach_failed_cold_fallback" });
+      stage("warm attach failed; cold fallback on a NEW runner", { old: pid, replacement, event: warmAttachFailures[0]!.payload });
+    } else {
+      expect(replacement, "next run uses the same healthy resident").toBeDefined();
+      expect(replacement.piPid).toBe(pid.piPid);
+      expect(replacement.runnerPid).toBe(pid.runnerPid);
+      expect(warmAttachFailures).toHaveLength(0);
+    }
     expect(readNativePiHomeProof(nativeHomeProof!.receiptPath)!.sessionId).toBe(nativeSessionIdBeforeStop);
     expect(requests[1]!.recalledAssistantFact, "private assistant history, not echoed in user input").toBe(true);
     expect(reply.body).toContain(assistantFact);
@@ -405,7 +429,7 @@ it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same res
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;
   } finally {
-    await writeFile(join(root, "proof.json"), JSON.stringify({ stopTurn, warmupIdentities, stages, requests }, null, 2) + "\n");
+    await writeFile(join(root, "proof.json"), JSON.stringify({ stopTurn, killRetainedRunner, warmupIdentities, stages, requests }, null, 2) + "\n");
     await writeFile(join(root, "remote-pack-verification.json"), JSON.stringify(packVerificationCommands, null, 2) + "\n");
     if (db && agentId) {
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
@@ -434,4 +458,10 @@ it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same res
     vi.restoreAllMocks(); vi.unstubAllEnvs();
     console.log(`[pi-full-server] evidence retained at ${root}`);
   }
-}, 600_000);
+}
+
+it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same resident/session and assistant history (thinking=${thinking})`,
+  stopTurn => stopWarmProof(stopTurn), 600_000);
+
+it.skipIf(!enabled)(`REG-03: a Stop, a killed retained runnerd, then a plain message resumes the same session on a new runner (thinking=${thinking})`,
+  () => stopWarmProof(1, true), 600_000);
