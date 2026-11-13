@@ -1302,7 +1302,7 @@ exit 23
 
 describe("remote runner process supervision", () => {
   // Keep reason: measured production command/audit amplification (cl-poll-bound).
-  it("bounds warm runner probes to one per 15 seconds and detects exit 45 on the next probe", async () => {
+  it("bounds warm runner probes to one per 5 seconds and detects exit 45 on the next probe", async () => {
     vi.useFakeTimers();
     const handles: ReturnType<ReturnType<typeof createRemoteRunnerProcessLauncher>>[] = [];
     const counters = Array.from({ length: 6 }, () => ({ probes: 0, dead: false }));
@@ -1327,16 +1327,16 @@ describe("remote runner process supervision", () => {
       expect(counters.map(c => c.probes)).toEqual(Array(6).fill(1));
       const initial = counters.reduce((sum, c) => sum + c.probes, 0);
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(counters.reduce((sum, c) => sum + c.probes, 0) - initial).toBeLessThanOrEqual(6 * 60 / 15);
+      expect(counters.reduce((sum, c) => sum + c.probes, 0) - initial).toBeLessThanOrEqual(6 * 60 / 5);
       counters.forEach(c => { c.dead = true; });
-      await vi.advanceTimersByTimeAsync(14_999);
+      await vi.advanceTimersByTimeAsync(4_999);
       expect(handles.every(h => h.isExitConfirmed?.() === false)).toBe(true);
       await vi.advanceTimersByTimeAsync(1);
       await Promise.all(handles.map(h => h.completion));
       expect(handles.every(h => h.isExitConfirmed?.() === true)).toBe(true);
     } finally {
       counters.forEach(c => { c.dead = true; });
-      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(5_000);
       await Promise.all(handles.map(h => h.completion.catch(() => undefined)));
       vi.useRealTimers();
     }

@@ -14783,7 +14783,7 @@ async function readRemoteRunnerProviderState(input: {
 }
 
 const REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS = 20_000;
-const REMOTE_RUNNER_PROCESS_POLL_MS = 15_000;
+const REMOTE_RUNNER_PROCESS_POLL_MS = 5_000;
 
 // Linux boot identity plus start ticks identifies a process generation across
 // PID reuse. exec preserves both the launch shell's PID and its start ticks.
