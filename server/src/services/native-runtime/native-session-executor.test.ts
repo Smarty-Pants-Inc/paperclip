@@ -2568,7 +2568,8 @@ describe("remote provider pack manifest", () => {
         packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
         durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
         providerPacks: [{ root: "/opt/paperclip-runner/provider-pack", manifest: installed, immutable: true }],
-      }) : firstDurable && command.args?.[1]?.startsWith("const os=require") ? JSON.stringify({ home: "/home/runtime-account", uid: 1000 })
+      }) : script.includes('$candidate/provider-pack.json') ? "/opt/paperclip-runner/provider-pack\n"
+        : firstDurable && command.args?.[1]?.startsWith("const os=require") ? JSON.stringify({ home: "/home/runtime-account", uid: 1000 })
         : firstDurable && command.args?.[1]?.includes("base64 <") ? Buffer.from(JSON.stringify(command.args[1].includes("codex-provider-state.json")
           && !command.args[1].includes("runner-state.json") ? providerState : suspendedState)).toString("base64") : "",
       };
@@ -2834,7 +2835,8 @@ describe("remote provider pack manifest", () => {
           }) };
           if (request.args[0] === "-e" || request.args[0] === "--version") return { exitCode: 0, timedOut: false, stderr: "", stdout: request.args[0] === "--version" ? "1.18.34" : "" };
           const script = request.args[1];
-          const stdout = script.includes("base64") ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "running" })).toString("base64")
+          const stdout = script.includes('$candidate/provider-pack.json') ? "/opt/paperclip-runner/provider-pack\n"
+            : script.includes("base64") ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "running" })).toString("base64")
             : script.includes("cat --") ? `nonce\n123\n2026-09-19T10:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:100\n` : "";
           return { stdout, stderr: "", exitCode: 0, timedOut: false };
         });
@@ -16971,6 +16973,9 @@ describe("runnerd provider runtime wiring", () => {
     const environmentGate = new Promise<void>(resolve => { releaseEnvironment = resolve; });
     const snapshotGate = new Promise<void>(resolve => { releaseSnapshot = resolve; });
     const execute = vi.fn(async (request: { args?: string[] }) => {
+      if (request.args?.some(arg => arg.includes("for candidate in"))) {
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "/opt/paperclip-runner/provider-pack\n", stderr: "" };
+      }
       if (!request.args?.includes("paperclip-snapshot-pack")) throw new Error("unexpected remote operation");
       await snapshotGate;
       return { exitCode: 0, signal: null, timedOut: false, stdout: Buffer.from(JSON.stringify(manifest)).toString("base64"), stderr: "" };
@@ -16986,7 +16991,7 @@ describe("runnerd provider runtime wiring", () => {
     }).then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
     try {
       await vi.waitFor(() => expect(prepareRunnerEnvironment).toHaveBeenCalledOnce());
-      await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(2));
       releaseEnvironment();
       await new Promise<void>(resolve => setImmediate(resolve));
       expect(settled).toBe(false);
@@ -17180,7 +17185,8 @@ describe("runnerd provider runtime wiring", () => {
           packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
           durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
           providerPacks: installed ? [{ root: "/opt/paperclip-runner/provider-pack", manifest: installed, immutable: true }] : [],
-        }) : script.includes("base64") ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "suspended" })).toString("base64")
+        }) : script.includes('$candidate/provider-pack.json') ? (installed ? "/opt/paperclip-runner/provider-pack\n" : "")
+          : script.includes("base64") ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "suspended" })).toString("base64")
           : script.includes("cat --") ? `nonce\n123\n2026-09-19T10:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:100\n` : "" };
     });
     state.createBackend.mockClear(); state.createTransport.mockClear();

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterEach, expect, it, vi } from "vitest";
@@ -85,23 +85,28 @@ describeEmbeddedPostgres("native Pi restart executable selection", () => {
   const environment = nativeRestartFixture();
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
-  it("recovers pi_rpc from PostgreSQL without a warm entry using its saved qualified executable", async () => {
+  it.each(["staged", "home"] as const)("recovers pi_rpc from PostgreSQL without a warm entry using its qualified %s executable", async packLocation => {
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "73".repeat(32));
-    const f = await environment.seedRun("PI-EXECUTABLE");
+    const f = await environment.seedRun(`PI-EXECUTABLE-${packLocation}`);
     const { companyId, agentId, runtimeRoot } = environment.current;
-    const cwd = join(runtimeRoot, "pi-sandbox");
+    const cwd = join(runtimeRoot, `pi-sandbox-${packLocation}`);
     await mkdir(cwd, { recursive: true });
     await writeFile(join(cwd, "AGENTS.md"), "X");
     const remoteRoot = join(cwd, ".paperclip-runtime", "paperclip-runner");
-    const packRoot = join(remoteRoot, "provider-pack");
+    const home = join(runtimeRoot, "pi-home");
+    vi.stubEnv("HOME", home);
+    const stagedPackRoot = join(remoteRoot, "provider-pack");
+    const packRoot = packLocation === "home"
+      ? join(home, ".local", "share", "paperclip-runner", "provider-pack") : stagedPackRoot;
     const manifest = await executablePack(packRoot, cwd);
+    if (packLocation === "home") await expect(access(stagedPackRoot)).rejects.toMatchObject({ code: "ENOENT" });
     const context = nativeRuntimeContextFixture();
     context.instructions.bundle.rootPath = cwd;
     context.aggregateDigest = canonicalNativeRuntimeContextDigest(context);
     const execution = buildNativeExecutionInput({
       provider: "pi_rpc", model: "localFaux/faux", piRpcThinkingLevel: "low",
       companyId, agentId, runId: f.runId, normalizedSessionId: f.native.normalizedSessionId,
-      issue: { id: f.issueId, identifier: "NRR-PI-EXECUTABLE", title: "Recover native Pi", description: null, workMode: "standard" },
+      issue: { id: f.issueId, identifier: `NRR-PI-EXECUTABLE-${packLocation}`, title: "Recover native Pi", description: null, workMode: "standard" },
       taskPrompt: "Recover the admitted Pi session.", workspace: { id: f.native.environmentLeaseId, cwd, repoUrl: null, repoRef: null, branchName: null },
       lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
       completionContract: { id: randomUUID(), sha256: digest("fixture"), schemaVersion: "paperclip.run-result.v1",
@@ -170,7 +175,7 @@ describeEmbeddedPostgres("native Pi restart executable selection", () => {
           providerDigest: nativeSha256(execution.provider) }, current: () => manifest, runnerArtifact: () => artifact }).verified();
       await f.db.update(heartbeatRuns).set({ runnerProfileJson: { ...f.preparedProfile, nativeExecutionInput: execution, sessionCheckpoint: snapshot } })
         .where(eq(heartbeatRuns.id, f.runId));
-      const [env] = await f.db.insert(environments).values({ name: "Qualified Pi snapshot", driver: "daytona", status: "active",
+      const [env] = await f.db.insert(environments).values({ name: `Qualified Pi snapshot ${packLocation}`, driver: "daytona", status: "active",
         config: { platformQualificationRecorded: true }, metadata: {} }).returning();
       expect(env.metadata).toEqual({});
       await initial!.detachControllerForRestart();
@@ -215,7 +220,7 @@ describeEmbeddedPostgres("native Pi restart executable selection", () => {
           provider: "pi_rpc", runnerArtifact: artifact, adoptExistingRunner: { pid },
         });
         console.info(JSON.stringify({ proof: "pi_restart_executable_selected", checkpoint: "PostgreSQL",
-          provider: "pi_rpc", runnerPidUnchanged: pid, providerSessionIdUnchanged: snapshot.providerSessionId,
+          provider: "pi_rpc", packLocation, runnerPidUnchanged: pid, providerSessionIdUnchanged: snapshot.providerSessionId,
           selectedPackDigest: manifest.digest, piExecutable: join(packRoot, manifest.payload.artifacts.piRpcExecutable.path) }));
       } finally {
         await recoveredSession?.close({ reason: "restart regression complete" }).catch(() => undefined);
