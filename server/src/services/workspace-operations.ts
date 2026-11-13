@@ -18,6 +18,7 @@ import { persistActivity, publishActivity, type ActivityPublication } from "./ac
 import { crashPoint } from "@paperclipai/shared/crash-points";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { retryTransientLockContention } from "./transient-lock-contention.js";
+import { retryUnlessTransactionBound } from "./transaction-retry.js";
 
 type WorkspaceOperationRow = typeof workspaceOperations.$inferSelect;
 
@@ -572,18 +573,25 @@ export function workspaceOperationService(db: Db) {
         async attachExecutionWorkspaceId(nextExecutionWorkspaceId) {
           executionWorkspaceId = nextExecutionWorkspaceId ?? null;
           if (!executionWorkspaceId || createdIds.length === 0) return;
-          await db.transaction(async tx => {
+          await retryUnlessTransactionBound(db, () => db.transaction(async tx => {
             if (hasFinalization) await notifyTerminalWorkspaceWork(tx, `workspace:${executionWorkspaceId}`);
             await tx
               .update(workspaceOperations)
               .set({ executionWorkspaceId, updatedAt: new Date() })
               .where(and(eq(workspaceOperations.companyId, input.companyId), inArray(workspaceOperations.id, createdIds)));
-          });
+          }));
         },
 
         async recordOperation(recordInput) {
           async function writeState<T>(write: (database: Db) => Promise<T>): Promise<T> {
-            if (recordInput.phase !== "workspace_finalize" || (!input.heartbeatRunId && !executionWorkspaceId && !input.issueId)) return write(db);
+            // DB-only row writes. Their foreign keys take KEY SHARE on the run and
+            // then the issue, the reverse of the issue -> run lock order, so a
+            // 40P01 on the plain write is retried from a fresh statement
+            // (smarty-dev#20454). The workspace_finalize transaction below
+            // already has upstream's retry (#20971), so it is not wrapped again.
+            if (recordInput.phase !== "workspace_finalize" || (!input.heartbeatRunId && !executionWorkspaceId && !input.issueId)) {
+              return retryUnlessTransactionBound(db, () => write(db));
+            }
             return retryTransientLockContention(() => db.transaction(async tx => {
               if (executionWorkspaceId) await notifyTerminalWorkspaceWork(tx, `workspace:${executionWorkspaceId}`);
               else if (input.issueId) await notifyTerminalWorkspaceWork(tx, `issue:${input.issueId}`);
@@ -677,11 +685,11 @@ export function workspaceOperationService(db: Db) {
               if (runtimeControlAction || localCommand) {
                 // Wake the ownership worker (on any server) before the row it
                 // announces, so a quiet worker starts watching this owner.
-                await db.transaction(async tx => {
+                await retryUnlessTransactionBound(db, () => db.transaction(async tx => {
                   await notifyDeliveryWork(tx, DELIVERY_QUEUES.ownershipInvariantReport,
                     JSON.stringify({ companyId: input.companyId, operationId: id }));
                   await insertRunning(tx as unknown as Db);
-                });
+                }));
               } else {
                 await writeState(insertRunning);
               }

@@ -10,6 +10,7 @@ import { and, asc, eq, getTableColumns, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
+import { retryUnlessTransactionBound } from "./transaction-retry.js";
 
 export const RETRY_EXHAUSTION_MESSAGE_PREFIX = "Bounded retry exhausted";
 
@@ -98,7 +99,20 @@ export async function allocateHeartbeatRunEventSeq(
   return Number(updated.nextEventSeq) - 1;
 }
 
-export async function appendHeartbeatRunEvent(
+/**
+ * The sequence allocation locks the run row and the event insert then
+ * key-shares the run's agent and company rows. It is DB-only (a rolled-back
+ * attempt leaves no event, sequence or wake), so on the pool-level db a
+ * 40P01/40001 is retried from a fresh transaction (smarty-dev#20454).
+ */
+export function appendHeartbeatRunEvent(
+  db: Db,
+  input: AppendHeartbeatRunEventInput,
+): Promise<AppendHeartbeatRunEventResult> {
+  return retryUnlessTransactionBound(db, () => appendHeartbeatRunEventOnce(db, input));
+}
+
+async function appendHeartbeatRunEventOnce(
   db: Db,
   input: AppendHeartbeatRunEventInput,
 ): Promise<AppendHeartbeatRunEventResult> {

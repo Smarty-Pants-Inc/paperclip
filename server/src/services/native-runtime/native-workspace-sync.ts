@@ -14,6 +14,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
+import { retryUnlessTransactionBound } from "../transaction-retry.js";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import {
   prepareAdapterExecutionTargetRuntime,
@@ -615,7 +616,8 @@ async function persistRunReference(
   runId: string,
   reference: NativeWorkspaceSyncReference,
 ): Promise<void> {
-  await db.transaction(async (tx) => {
+  // DB-only run write; a 40P01/40001 is retried from a fresh transaction (smarty-dev#20454).
+  await retryUnlessTransactionBound(db, () => db.transaction(async (tx) => {
     const run = await tx
       .select({ companyId: heartbeatRuns.companyId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
       .from(heartbeatRuns)
@@ -635,7 +637,7 @@ async function persistRunReference(
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, runId));
-  });
+  }));
 }
 
 async function persistLeaseStamp(input: {
@@ -643,7 +645,8 @@ async function persistLeaseStamp(input: {
   leaseId: string;
   stamp: Record<string, unknown>;
 }): Promise<void> {
-  await input.db.transaction(async (tx) => {
+  // DB-only lease write; a 40P01/40001 is retried from a fresh transaction (smarty-dev#20454).
+  await retryUnlessTransactionBound(input.db, () => input.db.transaction(async (tx) => {
     const lease = await tx
       .select({ metadata: environmentLeases.metadata, companyId: environmentLeases.companyId, heartbeatRunId: environmentLeases.heartbeatRunId })
       .from(environmentLeases)
@@ -663,7 +666,7 @@ async function persistLeaseStamp(input: {
         updatedAt: new Date(),
       })
       .where(eq(environmentLeases.id, input.leaseId));
-  });
+  }));
 }
 
 function providerLeaseIdFor(input: {
