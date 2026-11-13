@@ -11520,12 +11520,16 @@ describe("native warm session supervision", () => {
       if (!runnerSuspended) expect(errorCode).toBe("native_session_interrupted");
     });
 
-    it("leaves a Stop during attach to the Stop path", async () => {
-      const { events, alarm, close } = await run("warm-attach-stopped",
+    it("leaves a Stop during attach to the Stop path, recording the rejection without an alarm", async () => {
+      const { events, alarm, close, onLog } = await run("warm-attach-stopped",
         (options, session) => rejectAttach(options, session, new Error("native_session_cancelled")));
       expect(state.execute).toHaveBeenCalledTimes(2);
       expect(close).not.toHaveBeenCalled();
-      expect(events.some(event => event.eventType === "native.warm_attach.failed")).toBe(false);
+      expect(events.filter(event => event.eventType === "native.warm_attach.failed").map(event => event.payload)).toEqual([{
+        schema: "paperclip.warm-attach-failure.v1", layer: "runner", state: "warm_attach_failed_refused",
+        reason: "native_session_cancelled", error: "native_session_cancelled", refusal: "stop_owned" }]);
+      expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(
+        "warm runner attach failed (native_session_cancelled): native_session_cancelled; cold start refused (stop_owned)"));
       expect(alarm).toHaveLength(0);
     });
   });
