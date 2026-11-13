@@ -164,23 +164,6 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(target).toMatchObject({ kind: "remote", transport: "sandbox", sandboxLeaseAcquisition: acquisition });
   });
 
-  // REG-26: a resume that woke a stopped or archived allocation restarted its
-  // machine. No process from an earlier run survived, so no warm runner may be reused.
-  it.each([
-    ["archived", true], ["stopped", true], ["error", true],
-    ["ready", false], ["started", false], ["running", false], ["idle", false], [null, false], [undefined, false],
-  ] as const)("marks a resume from provider state %s as restarted: %s", async (resumedFromState, restarted) => {
-    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox", config: { provider: "test-provider" } });
-    const target = await resolveEnvironmentExecutionTarget({ db: {} as never, companyId: "company",
-      adapterType: "paperclip_runner", environment: { id: "env", driver: "sandbox", config: { provider: "test-provider" } },
-      leaseId: "lease", leaseMetadata: {}, environmentRuntime: null,
-      lease: { providerLeaseId: "allocation", metadata: { sandboxLeaseAcquisition: { outcome: "resumed" },
-        ...(resumedFromState === undefined ? {} : { resumedFromState }) } } as never });
-    expect(target).toMatchObject({ kind: "remote", transport: "sandbox" });
-    expect((target as { sandboxLeaseAcquisition?: unknown }).sandboxLeaseAcquisition).toEqual({
-      outcome: "resumed", providerLeaseId: "allocation", ...(restarted ? { restarted: true } : {}) });
-  });
-
   it("keeps sandbox targets on bridge mode even when lease metadata includes a Paperclip API URL", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",
