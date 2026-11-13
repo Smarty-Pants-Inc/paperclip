@@ -284,8 +284,10 @@ export class PiRpcDriver implements HarnessDriver {
       // a cold box (lazy snapshot files, no compile cache yet) that alone took
       // 6.6-12.4 s, so the first request of a NEW process waits for startup
       // under its own bound; every later admission RPC keeps the short bound.
-      const ready = record(await withAbort(withTimeout(transport.request("get_state"),
-        this.#options.processStartupTimeoutMs ?? PI_PROCESS_STARTUP_TIMEOUT_MS, "Pi RPC startup timed out"), input.signal).then(response => response.data));
+      const startupTimeoutMs = this.#options.processStartupTimeoutMs ?? PI_PROCESS_STARTUP_TIMEOUT_MS;
+      // The transport's own per-request deadline (30 s) must not cut the wait short.
+      const ready = record(await withAbort(withTimeout(transport.request("get_state", {}, { timeoutMs: startupTimeoutMs }),
+        startupTimeoutMs, "Pi RPC startup timed out"), input.signal).then(response => response.data));
       if (recovery) {
         // Check native readback before model/config mutation, not just the argv.
         const live = ready;

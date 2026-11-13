@@ -199,6 +199,9 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   const environment = options.environment ?? process.env;
   const launchBinding = options.createDriver ? null : trustedPiLaunchBinding(options.argv ?? process.argv.slice(2));
   const stdoutFrames = createBackpressuredFrameWriter(options.stdout);
+  // A session open can wait up to the driver's process-startup bound; closing
+  // the proxy must be able to cut that wait short.
+  const openAbort = new AbortController();
   const output = createOpenCodeProxyOutput((frame, frameOptions) => stdoutFrames.write(frame, frameOptions));
   const send = output.send;
   const controller = createOpenCodeProxyControllerRequests(send);
@@ -587,7 +590,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       };
       let recovered: Awaited<ReturnType<NonNullable<HarnessDriver["recoverSession"]>>> | null = null;
       try {
-        recovered = await driver.recoverSession(snapshot, { signal: new AbortController().signal });
+        recovered = await driver.recoverSession(snapshot, { signal: openAbort.signal });
       } catch (error) {
         // The box was replaced and its transcript wasn't restored: continue in
         // a fresh Pi conversation under the SAME conversation id rather than
@@ -602,13 +605,14 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         }
         opened = recovered.session;
       } else {
-        opened = await driver.openSession({ runId: activeRunId, normalizedSessionId, workingDirectory: cwd });
+        opened = await driver.openSession({ runId: activeRunId, normalizedSessionId, workingDirectory: cwd, signal: openAbort.signal });
       }
     } else {
       opened = await driver.openSession({
         runId: activeRunId,
         normalizedSessionId: environment.PAPERCLIP_NORMALIZED_SESSION_ID ?? idleTimeoutSessionId ?? `runnerd-${Date.now()}`,
         workingDirectory: cwd,
+        signal: openAbort.signal,
       });
     }
     // A new native thread starts a new session accounting scope. Warm
@@ -830,6 +834,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
   }
 
   async function close(): Promise<void> {
+    openAbort.abort();
     if (!inputEnded) {
       inputEnded = true;
       controller.closeInput(new Error("Pi RPC controller input closed before its response"));
