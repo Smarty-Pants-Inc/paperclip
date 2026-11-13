@@ -2629,7 +2629,10 @@ pub(crate) fn redact_sensitive_text_values(input: &str) -> String {
         let full_name = &input[name_start..start + key.len()];
         let is_cli_key = full_name.starts_with('-')
             && (name_start == 0 || bytes[name_start - 1].is_ascii_whitespace());
+        // Compound prefixes must start with a letter or underscore, not a
+        // digit: "1Password plan" is prose rather than a credential field.
         let is_compound_field = key_is_compound
+            && (full_name.as_bytes()[0].is_ascii_alphabetic() || full_name.starts_with('_'))
             && (full_name.contains('_')
                 || full_name.chars().any(|value| value.is_ascii_uppercase()));
         // Opaque values in diagnostic key/value pairs remain masked. Plain
@@ -4140,6 +4143,69 @@ mod tests {
             completed.result["nested"]["diagnostic"],
             json!("token=[REDACTED]")
         );
+    }
+
+    #[test]
+    fn diagnostic_redaction_preserves_1password_plan_prose() {
+        assert_eq!(redact_text("1Password plan and"), "1Password plan and");
+    }
+
+    #[test]
+    fn diagnostic_redaction_preserves_1password_conjunction_prose() {
+        assert_eq!(redact_text("1Password and"), "1Password and");
+    }
+
+    #[test]
+    fn diagnostic_redaction_preserves_1password_storage_prose() {
+        assert_eq!(
+            redact_text("Use 1Password to store it"),
+            "Use 1Password to store it"
+        );
+    }
+
+    #[test]
+    fn diagnostic_redaction_preserves_other_noncredential_prose() {
+        for prose in ["2FA code", "secret storage", "credential handling"] {
+            assert_eq!(redact_text(prose), prose, "{prose}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_redaction_keeps_credential_assignment_values_masked() {
+        for (input, expected) in [
+            ("password=hunter2", "password=[REDACTED]"),
+            ("password: abc", "password: [REDACTED]"),
+            ("PASSWORD: hunter2", "PASSWORD: [REDACTED]"),
+            (
+                "OPENAI_API_KEY sk-proj-abc123def456",
+                "OPENAI_API_KEY [REDACTED]",
+            ),
+            ("DB_PASSWORD hunter2", "DB_PASSWORD [REDACTED]"),
+            ("proxyPassword x9Y-abc_12345", "proxyPassword [REDACTED]"),
+            ("proxyPassword correcthorse", "proxyPassword [REDACTED]"),
+            ("--password hunter2", "--password [REDACTED]"),
+            (r#""password":"hunter2""#, r#""password":"[REDACTED]""#),
+            (
+                "authorization: Bearer abc.def.ghi",
+                "authorization: Bearer [REDACTED]",
+            ),
+            ("A1Password correcthorse", "A1Password [REDACTED]"),
+            ("_1Password correcthorse", "_1Password [REDACTED]"),
+        ] {
+            assert_eq!(redact_text(input), expected, "{input}");
+            assert_eq!(redact_text(expected), expected, "{expected}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_redaction_documents_preexisting_bare_mixed_case_password_behavior() {
+        // Without an assignment separator or a compound/CLI key, the existing
+        // opaque-value heuristic excludes mixed-case values. Keep this separate
+        // from the compound-prefix fix rather than changing that behavior here.
+        let input = "password hunter2xY9";
+        let actual = redact_text(input);
+        println!("pre-existing on base: {input:?} -> {actual:?}");
+        assert_eq!(actual, input);
     }
 
     #[test]
