@@ -372,7 +372,7 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root", "leg
         const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
         // per_turn already retired the settled resident at the end of turn 1;
         // only a warm lifecycle still has an idle Pi to close here.
-        expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: lifecycleMode === "per_turn" ? 0 : 1, busy: 0, failed: 0 });
+        expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: lifecycleMode === "per_turn" ? 0 : 1, busy: 0, failed: 0, failures: [] });
         const files = turnProofs[0]!.sessionFiles as string[];
         if (replacedRunnerRoot) {
           // A replacement computer has none of the old runner/controller/Pi

@@ -396,7 +396,7 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
     }
     const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
     const closure = await closeIdleWarmNativeSessionsForRestart();
-    expect(closure).toEqual({ closed: 1, busy: 0, failed: 0 });
+    expect(closure).toEqual({ closed: 1, busy: 0, failed: 0, failures: [] });
     expect(alive(replacement.piPid!)).toBe(false);
     expect(alive(replacement.runnerPid!)).toBe(false);
     await api("POST", `/issues/${issueId}/comments`, { body: "Recall the private memory fact again after the idle session closed." }, 201);
