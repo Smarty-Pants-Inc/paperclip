@@ -17407,7 +17407,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
             payload: { original: { deliveredAt: context.original.delivered_at } } });
         } else {
           expect(receipt).toBeUndefined();
-          expect((await context.checkpoint()).value).toMatchObject({ inspected: 1,
+          expect((await context.checkpoint()).value).toMatchObject({ inspected: 0, detailReads: 1,
             recovered: 0, deliveredMeanwhile: 0, rejected: 0, deferred: 1 });
         }
         const detailReads = context.requests.filter(request => request.pathname === `/app/hook/deliveries/${context.deliveryId}`).length;
@@ -17538,15 +17538,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           eq(chatActions.endpointId, context.endpoint.id), eq(chatActions.kind, "github_webhook_recovery")));
         await context.makeScanDue();
         await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
-        expect(await receipts()).toEqual([]);
-        expect(context.posts).toEqual([]);
-        expect((await context.checkpoint()).value).toMatchObject({ inspected: 5, deferred: 5, rejected: 0 });
+        expect(await receipts()).toEqual([expect.objectContaining({
+          providerActionId: `github_webhook_recovery:${context.guid}`, status: "processed", result: expect.objectContaining({ attempts: 1 }),
+        })]);
+        expect(context.posts).toEqual([`/app/hook/deliveries/${context.deliveryId}/attempts`]);
+        expect((await context.checkpoint()).value).toMatchObject({ inspected: 1, detailReads: 6,
+          recovered: 1, deferred: 5, rejected: 0 });
         context.setDeliveries([...details, context.original]);
         await context.makeScanDue(false);
         await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
         expect(context.posts).toEqual([`/app/hook/deliveries/${context.deliveryId}/attempts`]);
         expect(await context.receipt()).toMatchObject({ status: "processed", result: { attempts: 1 } });
-        expect((await context.checkpoint()).value).toMatchObject({ inspected: 1, recovered: 1, deferred: 0 });
+        expect((await context.checkpoint()).value).toMatchObject({ inspected: 0, detailReads: 0, recovered: 0, deferred: 0 });
         // The temporary candidates themselves remain recoverable when eligible.
         vi.setSystemTime(baseTime + 60_000);
         for (const detail of details) detail.throttled_at = null;
@@ -17559,6 +17562,86 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(reads).toHaveLength(11);
       } finally { vi.useRealTimers(); await retirePublicationFixture(context.service, context.endpoint.id); }
     });
+
+  it.each([null, 502])(
+    "recovers an older GitHub original behind five persistently detail-throttled GUIDs with a stale list (%s)", async statusCode => {
+      const context = await githubPreIngressRecoveryFixture();
+      const baseTime = Date.now();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(baseTime);
+      try {
+        const newer = Array.from({ length: 5 }, (_, index) => ({ ...context.original,
+          id: String(93000 + index), guid: randomUUID(), status_code: statusCode,
+          delivered_at: new Date(baseTime - 15_000 - index * 1_000).toISOString(),
+        }));
+        for (const candidate of newer) context.setDetail({ ...candidate,
+          throttled_at: new Date(baseTime).toISOString() }, context.payload);
+        // The list never catches up: only detail reports persistent throttling.
+        context.setDeliveries([...newer, context.original]);
+        await context.makeScanDue();
+        const floor = ((await context.checkpoint()).value as Record<string, unknown>).floor;
+        const receipts = () => db.select().from(chatActions).where(and(
+          eq(chatActions.endpointId, context.endpoint.id), eq(chatActions.kind, "github_webhook_recovery")));
+        for (const minute of [0, 1, 59]) {
+          vi.setSystemTime(baseTime + minute * 60_000);
+          await context.makeScanDue(false);
+          const start = context.requests.length;
+          await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+          const reads = context.requests.slice(start).filter(request =>
+            request.method === "GET" && /^\/app\/hook\/deliveries\/\d+$/.test(request.pathname));
+          expect(reads.length).toBeLessThanOrEqual(10);
+          expect(reads).toHaveLength(minute === 0 ? 6 : 5);
+          expect(context.posts).toEqual([`/app/hook/deliveries/${context.deliveryId}/attempts`]);
+          const receipt = (await context.receipt())!;
+          expect(receipt).toMatchObject({ status: "processed", result: { attempts: 1 } });
+          // All five remain deferred without any receipt or locally admitted work.
+          expect(await receipts()).toEqual([receipt]);
+          expect((await context.checkpoint()).value).toMatchObject({ floor, outcome: "scanned",
+            detailReads: reads.length, inspected: minute === 0 ? 1 : 0, deferred: 5,
+            recovered: minute === 0 ? 1 : 0, rejected: 0, deliveredMeanwhile: 0 });
+        }
+        expect(await context.ingress()).toBeUndefined();
+        expect(context.wakeup).not.toHaveBeenCalled();
+      } finally { vi.useRealTimers(); await retirePublicationFixture(context.service, context.endpoint.id); }
+    });
+
+  it("caps GitHub detail reads at ten per scan behind eleven persistent deferrals; the older original waits", async () => {
+    const context = await githubPreIngressRecoveryFixture();
+    const baseTime = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(baseTime);
+    try {
+      const newer = Array.from({ length: 11 }, (_, index) => ({ ...context.original,
+        id: String(94000 + index), guid: randomUUID(), status_code: index % 2 ? null : 502,
+        delivered_at: new Date(baseTime - 15_000 - index * 1_000).toISOString(),
+      }));
+      for (const candidate of newer) context.setDetail({ ...candidate,
+        throttled_at: new Date(baseTime).toISOString() }, context.payload);
+      context.setDeliveries([...newer, context.original]);
+      await context.makeScanDue();
+      const floor = ((await context.checkpoint()).value as Record<string, unknown>).floor;
+      for (const minute of [0, 1, 59]) {
+        vi.setSystemTime(baseTime + minute * 60_000);
+        await context.makeScanDue(false);
+        const start = context.requests.length;
+        await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+        const reads = context.requests.slice(start).filter(request =>
+          request.method === "GET" && /^\/app\/hook\/deliveries\/\d+$/.test(request.pathname));
+        expect(reads.length).toBeLessThanOrEqual(10);
+        expect(reads.map(request => request.pathname)).toEqual(newer.slice(0, 10).map(candidate =>
+          `/app/hook/deliveries/${candidate.id}`));
+        // This is the bounded tradeoff, not unlimited fairness: with more than
+        // ten newer persistent deferrals, the older original waits for capacity.
+        expect(context.posts).toEqual([]);
+        expect(await db.select().from(chatActions).where(and(eq(chatActions.endpointId, context.endpoint.id),
+          eq(chatActions.kind, "github_webhook_recovery")))).toEqual([]);
+        expect((await context.checkpoint()).value).toMatchObject({ floor, outcome: "scanned",
+          detailReads: 10, inspected: 0, deferred: 10, recovered: 0, rejected: 0, deliveredMeanwhile: 0 });
+      }
+      expect(await context.ingress()).toBeUndefined();
+      expect(context.wakeup).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); await retirePublicationFixture(context.service, context.endpoint.id); }
+  });
 
   it.each(["github_webhook_recovery_delivered_meanwhile", "github_webhook_recovery_attempt_not_eligible"])(
     "never lets a non-cancelling GitHub decision revoke an ingress admitted with recovery authority (%s)", async code => {
@@ -17619,7 +17702,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
         expect(context.posts).toEqual([]);
         const permanent = reason === "outside window";
-        expect((await context.checkpoint()).value).toMatchObject({ inspected: 1,
+        expect((await context.checkpoint()).value).toMatchObject({ inspected: permanent ? 1 : 0, detailReads: 1,
           recovered: 0, deliveredMeanwhile: 0, rejected: permanent ? 1 : 0, deferred: permanent ? 0 : 1 });
         if (permanent) {
           const receipt = (await context.receipt())!;
@@ -17721,7 +17804,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
       expect(context.posts).toHaveLength(1);
       expect(await context.receipt()).toEqual(before);
-      expect((await context.checkpoint()).value).toMatchObject({ inspected: 1, recovered: 0, rejected: 0, deferred: 1 });
+      expect((await context.checkpoint()).value).toMatchObject({ inspected: 0, detailReads: 1, recovered: 0, rejected: 0, deferred: 1 });
       context.setBeforeDetail(undefined);
       context.setDeliveries([{ ...latest, delivered_at: new Date(Date.now() - 11_000).toISOString() }, context.original]);
       await context.makeScanDue();
