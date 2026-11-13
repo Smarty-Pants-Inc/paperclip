@@ -24,6 +24,9 @@ import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import {
+  findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementUnprovenError,
+} from "./predecessor-retirement.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
 vi.mock("../../runtime-api.js", async importOriginal => ({ ...await importOriginal<typeof import("../../runtime-api.js")>(), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:43219" }));
@@ -216,6 +219,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const remoteExecute = vi.fn(async (_request: unknown): Promise<{ exitCode: number; timedOut: boolean; stdout: string; stderr: string }> => {
       throw new Error("admission must not reach the sandbox");
     });
+    const failures: unknown[] = [];
     const start = (outcome: "created" | "replacement" | "resumed" = "created",
       restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], restarted = false) => createRunnerdBackend({
       db, execution, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
@@ -224,13 +228,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
         runner: { execute: remoteExecute },
         sandboxLeaseAcquisition: { outcome, providerLeaseId, ...(restarted ? { restarted: true } : {}) } } as never,
-    }).then(() => "constructed", (error: Error) => error.message);
+    }).then(() => "constructed", (error: Error) => { failures.push(error); return error.message; });
     // A local Runner keeps its controller root on this host between turns.
     const startLocal = (restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"]) => createRunnerdBackend({
       db, execution, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
       ...(restartRecovery ? { restartRecovery } : {}),
     }).then(() => "constructed", (error: Error) => error.message);
-    return { runId, logs, start, startLocal, native: next, environmentId, leaseId, providerLeaseId, remoteExecute, selectedRunId: selected?.id ?? null };
+    return { runId, logs, start, startLocal, failures, native: next, environmentId, leaseId, providerLeaseId, remoteExecute, selectedRunId: selected?.id ?? null };
   }
 
   /** The prior run's released lease on this same allocation: the evidence a
@@ -255,6 +259,32 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       if (text.includes("runner-state.json")) return { exitCode: 0, timedOut: false, stdout: deadRunnerState, stderr: "" };
       throw new Error("admission must not reach the sandbox");
     });
+  }
+
+  const RESTARTED_OWNER_REFUSAL =
+    "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=restarted_sandbox_owner_unproven";
+
+  /**
+   * Upstream 566a97b88 (#20863): an unretirable owner on a resumed sandbox is a
+   * typed fresh-sandbox fallback, not a raw failure. The fork's exact refusal
+   * stays its cause, the fallback names this sandbox (the one to replace, never
+   * reuse), and nothing beyond the read-only generation proof reached it: the
+   * unproven owner is never retired by force and no Runner is launched there.
+   */
+  function expectFreshSandboxFallback(message: string, prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>) {
+    expect(message).toBe(`The previous run's session on this sandbox could not be retired (${RESTARTED_OWNER_REFUSAL}). `
+      + "The next attempt starts on a fresh sandbox.");
+    const typed = findNativePredecessorRetirementUnproven(followUp.failures.at(-1));
+    expect(typed).toBeInstanceOf(NativePredecessorRetirementUnprovenError);
+    expect(typed!.code).toBe(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE);
+    expect(typed!.predecessorRunId).toBe(prior.runId);
+    expect(typed!.providerLeaseId).toBe(followUp.providerLeaseId);
+    expect(typed!.cause).toBeInstanceOf(Error);
+    expect((typed!.cause as Error).message).toBe(RESTARTED_OWNER_REFUSAL);
+    expect(followUp.remoteExecute.mock.calls.every(([request]) =>
+      /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
+    expect(followUp.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-launch"))).toBe(false);
   }
 
   async function quarantined() {
@@ -876,8 +906,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
     const followUp = await admitFollowUp(prior);
     await recordPriorLeaseOnSameSandbox(prior, followUp, "live");
-    expect(await followUp.start("resumed", undefined, true)).toBe(
-      "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=restarted_sandbox_owner_unproven");
+    expectFreshSandboxFallback(await followUp.start("resumed", undefined, true), prior, followUp);
     expect(followUp.logs.join("")).toMatch(/restarted sandbox owner \S+ not retired: restarted_sandbox_runner_generation_not_lost/);
     // As for every refused prior owner, the controller root is kept aside, not rotated.
     expect(await quarantined()).toHaveLength(1);
@@ -893,9 +922,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       const prior = await seedRecoveredPriorRun(control, { provider: "codex", lifecycle: "warm" });
       const followUp = await admitFollowUp(prior);
       await recordPriorLeaseOnSameSandbox(prior, followUp);
-      expect(await followUp.start("resumed", undefined, true)).toBe(
-        "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=restarted_sandbox_owner_unproven");
+      expectFreshSandboxFallback(await followUp.start("resumed", undefined, true), prior, followUp);
       expect(followUp.logs.join("")).toMatch(/restarted sandbox owner \S+ not retired: journal_/);
+      // As for every refused prior owner, the controller root is kept aside, not rotated.
+      expect(await quarantined()).toHaveLength(1);
     }, 60_000);
 
   it.each(["pending-command", "unanswered-tool"] as const)(
