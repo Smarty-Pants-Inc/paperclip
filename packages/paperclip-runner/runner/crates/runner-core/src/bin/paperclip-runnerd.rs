@@ -355,6 +355,7 @@ fn opencode_launch_profile(
             Some(executable),
             Some(executable_sha256),
         ) => Ok(Some(OpenCodeLaunchProfile {
+            process_hardening: None,
             command: QualifiedLaunchArtifact {
                 path: PathBuf::from(command),
                 sha256: command_sha256,
@@ -375,6 +376,20 @@ fn opencode_launch_profile(
 }
 
 fn pi_launch_profile(args: &[String]) -> Result<Option<PiRpcLaunchProfile>, LocalRunnerError> {
+    let hardening = optional_value(args, "--pi-process-hardening")?;
+    let hardening_sha256 = optional_value(args, "--pi-process-hardening-sha256")?;
+    let process_hardening = match (hardening, hardening_sha256) {
+        (None, None) => None,
+        (Some(path), Some(sha256)) => Some(QualifiedLaunchArtifact {
+            path: PathBuf::from(path),
+            sha256,
+        }),
+        _ => {
+            return Err(LocalRunnerError::invalid(
+                "Pi process hardening requires path and SHA-256 digest",
+            ))
+        }
+    };
     let command = optional_value(args, "--pi-proxy-command")?;
     let command_sha256 = optional_value(args, "--pi-proxy-command-sha256")?;
     let proxy_script = optional_value(args, "--pi-proxy-script")?;
@@ -398,6 +413,7 @@ fn pi_launch_profile(args: &[String]) -> Result<Option<PiRpcLaunchProfile>, Loca
             Some(executable),
             Some(executable_sha256),
         ) => Ok(Some(PiRpcLaunchProfile {
+            process_hardening,
             command: QualifiedLaunchArtifact {
                 path: PathBuf::from(command),
                 sha256: command_sha256,

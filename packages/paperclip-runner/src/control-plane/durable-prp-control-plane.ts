@@ -1,5 +1,6 @@
 import { safeErrorCauseCode } from "./safe-error-cause.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../drivers/agent-observability.js";
+import { PI_LANGFUSE_ENVIRONMENT_KEYS } from "../drivers/pi/pi-process-environment.js";
 import { configuredEnvironment } from "../configured-environment.js";
 import { nodeCompileCacheEnvironment } from "../node-compile-cache-environment.js";
 import { spawn } from "node:child_process";
@@ -4611,6 +4612,7 @@ const runnerPlatformEnvironmentKeys = [
 ] as const;
 
 const runnerExplicitProviderEnvironmentKeys = [
+  ...PI_LANGFUSE_ENVIRONMENT_KEYS,
   ...ACPX_CREDENTIAL_NAMES.claude.filter(name => !name.startsWith("AWS_")),
   ...CLAUDE_ROUTING_ENV_KEYS,
   ...PI_SIDECAR_PROVIDER_ROUTE_NAMES,
@@ -4751,6 +4753,7 @@ export function spawnRunner(options: {
   };
   piLaunchProfile?: {
     command: string; commandSha256: string; proxyScript: string; proxyScriptSha256: string; executable: string; executableSha256: string;
+    processHardening?: string; processHardeningSha256?: string;
   };
   opencodeLaunchProfile?: {
     command: string;
@@ -4854,6 +4857,10 @@ export function spawnRunner(options: {
       "--pi-proxy-script-sha256", options.piLaunchProfile.proxyScriptSha256,
       "--pi-executable", options.piLaunchProfile.executable,
       "--pi-executable-sha256", options.piLaunchProfile.executableSha256,
+      ...(options.piLaunchProfile.processHardening ? [
+        "--pi-process-hardening", options.piLaunchProfile.processHardening,
+        "--pi-process-hardening-sha256", options.piLaunchProfile.processHardeningSha256!,
+      ] : []),
     ] : []),
     ...(options.opencodeLaunchProfile
       ? [

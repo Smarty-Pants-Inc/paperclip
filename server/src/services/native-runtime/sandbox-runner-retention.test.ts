@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
 import type { CommandManagedDuplexChannel } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { createSandboxRunnerRetention, createSandboxRunnerSupervision, SANDBOX_RUNNER_GUARDIAN_CLIENT } from "./sandbox-runner-retention.js";
@@ -140,6 +141,18 @@ describe("sandbox resident Runner trust boundary", () => {
     await vi.waitFor(() => expect(claimAck).toBeDefined()); const retiring = f.owner.retire(); claimAck();
     await expect(pending).rejects.toThrow("cancelled"); await retiring;
     expect(f.frames.find(x => x.op === "retire")).toMatchObject({ parkId, claimId: `claim_${hash("ticket")}`, identity: source, lastControllerCommandSeq: 4, ackedSourceSeq: 8 });
+  });
+  it("scrubs Boat-injected machine env at the retained guardian runner launch, not general guest commands", async () => {
+    const f = fixture(); await qualify(f);
+    const original = f.setHandler(async frame => frame.op === "launch" ? { id: frame.id, status: "launched" } : original(frame));
+    await f.owner.launch({ command: process.execPath, args: ["-e", "process.stdout.write(JSON.stringify(process.env))"],
+      cwd: "/", environment: { NO_PROXY: "localhost" }, identityPath: "/state/identity", identityNonce: "scrub-proof", diagnosticsDirectory: "/state/diagnostics" });
+    const launch = f.frames.find(frame => frame.op === "launch")!;
+    const observed = JSON.parse(execFileSync(launch.command, launch.args, { encoding: "utf8", env: {
+      PATH: process.env.PATH, ...launch.environment, ASCII_TOKEN: "machine-decoy", ASCII_FUTURE_SECRET: "future-decoy", LANGFUSE_SECRET_KEY: "agent-export",
+    } }));
+    expect(Object.keys(observed).filter(name => name.startsWith("ASCII_"))).toEqual([]);
+    expect(observed).toMatchObject({ NO_PROXY: "localhost", LANGFUSE_SECRET_KEY: "agent-export" });
   });
   it("keys launch receipts by process nonce so a proven cold replacement can retain the durable Runner ID", async () => {
     const f = fixture(); await qualify(f);
