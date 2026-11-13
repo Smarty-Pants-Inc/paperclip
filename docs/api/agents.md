@@ -113,12 +113,6 @@ POST /api/agents/{agentId}/clear-error
 Moves an agent from `error` back to `idle` without deleting run history or runtime diagnostics.
 Only agents currently in `error` can be cleared.
 
-Agent callers need a direct `agents:configure` grant matching the target agent.
-The same target-scoped decision governs lifecycle retry, session reset, waking
-another agent and run cancellation; board checks and state preconditions remain.
-See [Recovery and work permissions](../../doc/agent-recovery-work-permissions.md)
-for the endpoints, subtree boundary and separate exact-run retry restriction.
-
 ## Terminate Agent
 
 ```
