@@ -5736,6 +5736,29 @@ cached locally; provider files remain on the execution host. Prepared tasks use
 their existing `read_state` contract. The normal snapshot rebinder, tool-contract
 checks and current admission authority still govern the next turn.
 
+A native Pi source without a committed result can satisfy this read binding only
+when its coordinator is `terminal_failure` with no lease owner or recovery work,
+and its terminal run, checkpoint and native conversation IDs match. The same
+sandbox must carry a verified termination receipt and reusable-lease handoff to
+the active successor. The measured Runner must be suspended with no outbox or
+pending delivery/cleanup, and Pi must have an authoritative completed turn with
+no active turn, startup, pending events or semantic requests. On Linux, the exact
+Runner birth must be absent and its existing process-lineage writer markers must
+remain with no unretired lineage journals. Missing or changed evidence keeps
+`native_controller_recovery_missing_evidence:retained_sandbox_binding`; old saved
+state is not rewritten or migrated. This admits only the retained-state read. It
+does not commit the failed business result, replay its turn, or bypass the next
+run's provider attachment and authority checks.
+
+After verified cold Pi recovery, the managed driver uses the existing idle
+INITIAL shape (no `turnId`) and revokes the discovery-only broker. It does not
+prepare or reuse the predecessor's INITIAL turn. The current `run.attach` then
+uses the ordinary fresh broker/epoch `bind` receipt followed by `begin_turn`.
+The normalized conversation and verified native JSONL header remain unchanged;
+no old prompt is sent. The prepared-context equality fence still applies to a
+live prepared binding, including one newly prepared after recovery. Unknown or
+mismatched bind receipts retain the existing fail-closed cleanup behavior.
+
 An active remote owner causes startup recovery to retain the obligation at the
 actual lease deadline. The existing recovery dispatch timer is rearmed on drain
 resume; successful reconciliation leaves no recurring recovery work.
