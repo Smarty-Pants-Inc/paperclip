@@ -147,6 +147,20 @@ it("shows a pending native same-run resume instead of a competing Retry", () => 
     .toMatchObject({ state: "failed", canRetry: true });
 });
 
+// Keep reason: the recorded Pi restart bug must use the existing interruption
+// notice once bounded same-run recovery is exhausted, even without model output.
+it("keeps an exhausted Pi reattach failure visible on its original run with Retry", () => {
+  const failed = { ...run, runtimeMode: "native" as const, nativeIssueId: issue.id,
+    companyId: issue.companyId, errorCode: "native_session_retry_exhausted", resultJson: null,
+    error: "native_session_recovery_failed: Error: runner_native_pi_executable_required: select the qualified Pi distribution executable" };
+  const action = { status: "active", ownerType: "board", cause: "native_session_retry_exhausted", evidence: {} };
+  const presentation = projectTaskInterruption(issue, { run: failed, action: action as never,
+    agent, paused: false, approval: false });
+  expect(presentation).toMatchObject({ responsibility: "system", state: "failed", canRetry: true,
+    observedRunId: failed.id, sourceRunIds: [failed.id], nextRetryAt: null });
+  expect(JSON.stringify(presentation)).not.toContain("runner_native_pi_executable_required");
+});
+
 it("explains a persisted Retry wait without exposing the saved payload", () => {
   const failed = { ...run, errorCode: "native_provider_terminal_failed", resultJson: null };
   const wait = { id: "retry", requestedAt: new Date(), sourceRunId: failed.id,
