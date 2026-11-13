@@ -52,7 +52,8 @@ export function warmWindowEndsAtSql() {
   const window = sql`least(coalesce(
     ${positiveWindowSql(sql`${environmentLeases.metadata}->${WARM_SANDBOX_IDLE_TIMEOUT_KEY}`)},
     ${PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS}), ${PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS})`;
-  return sql`(extract(epoch from ${environmentLeases.lastUsedAt}) * 1000 + ${window})`;
+  return sql`least((extract(epoch from ${environmentLeases.lastUsedAt}) * 1000 + ${window}),
+    extract(epoch from ${environmentLeases.expiresAt}) * 1000)`;
 }
 
 /**
