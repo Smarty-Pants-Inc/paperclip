@@ -8690,6 +8690,7 @@ export function nativeSessionFailureSourceCode(
   | "runner_ingress_access_rejected"
   | "runner_ingress_acquisition_failed"
   | "local_runtime_api_listener_unavailable"
+  | typeof NATIVE_WARM_ATTACH_COLD_FALLBACK_FAILED
   | "native_session_interrupted" {
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
@@ -8823,7 +8824,26 @@ export function nativeSessionFailureSourceCode(
   if (/\blocal_runtime_api_listener_unavailable\b/.test(message)) {
     return "local_runtime_api_listener_unavailable";
   }
+  if (error && typeof error === "object" && warmAttachColdFallbackFailures.has(error)) {
+    return NATIVE_WARM_ATTACH_COLD_FALLBACK_FAILED;
+  }
   return "native_session_interrupted";
+}
+
+/** The cold start after a failed warm attach also failed. Typed causes keep their own code. */
+export const NATIVE_WARM_ATTACH_COLD_FALLBACK_FAILED = "native_warm_attach_cold_fallback_failed";
+const warmAttachColdFallbackFailures = new WeakSet<object>();
+function markWarmAttachColdFallbackFailure(error: unknown): unknown {
+  if (error && typeof error === "object") warmAttachColdFallbackFailures.add(error);
+  return error;
+}
+
+/** The attach rejection's own code, else its leading snake_case token. */
+function warmAttachFailureCode(error: unknown): string {
+  const code = record(error).code;
+  if (typeof code === "string" && /^[a-z][a-z0-9_]{2,80}$/.test(code)) return code;
+  const token = /^([a-z][a-z0-9]*_[a-z0-9_]+)(?::|$)/.exec(error instanceof Error ? error.message : "")?.[1];
+  return token && token.length <= 80 ? token : "native_warm_attach_failed";
 }
 
 const NATIVE_PROVIDER_SIDE_EFFECT_PENDING_ACTION =
@@ -11550,6 +11570,8 @@ async function executePaperclipNativeSessionAttempt(
     `native-warm-session:${input.execution.binding.runId}`,
   );
   let existingWarmSession: NativeSession | undefined;
+  let warmAttachFailure: { error: unknown } | undefined;
+  let warmAttachFallbackTaken = false;
   let reusingReleasedRunner = false;
   let managedCredentialSession: NativeSession | undefined;
   let githubAccess: NativeGitHubAccess | undefined;
@@ -11951,6 +11973,86 @@ async function executePaperclipNativeSessionAttempt(
       remoteCleanupLease = await readRemoteCleanupLease();
       return true;
     };
+    const reportWarmAttachFailure = async (code: string, text: string, refusal?: string) => {
+      const state = refusal ? "warm_attach_failed_refused" : "warm_attach_failed_cold_fallback";
+      const outcome = refusal ? `cold start refused (${refusal})`
+        : "retired that runner; resuming the same conversation cold from its checkpoint";
+      // Diagnostics must not change execution or settlement.
+      try { await input.onLog?.("stderr", `[paperclip-runner] warm runner attach failed (${code}): ${text}; ${outcome}\n`); } catch {}
+      try {
+        await input.onEvent?.({ eventType: "native.warm_attach.failed", stream: "system", level: "warn",
+          message: `warm runner attach failed (${code}): ${outcome}`,
+          payload: { schema: "paperclip.warm-attach-failure.v1", layer: "runner", state, reason: code, error: text,
+            ...(refusal ? { refusal } : {}) } });
+      } catch {}
+      if (!refusal) {
+        // Fresh receipts dominate the earlier reuse receipts, so the run is never summarized as warm.
+        await emitStartupReuse(input.onEvent, "runner", { state: "fresh", reason: "resume_failed" });
+        await emitStartupReuse(input.onEvent, "provider_session", { state: "fresh", reason: "resume_failed" });
+      }
+      logger.error({ companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
+        issueId: input.execution.binding.issueId, runId: input.execution.binding.runId,
+        normalizedSessionId: nativeSessionKey(input.execution), code, state, refusal },
+      "Warm runner attach owner alarm: a retained runner failed to attach");
+    };
+    // REG-03: a retained warm runner passed the reuse checks, then attachRun
+    // failed and the runtime quarantined it. Retire it and take the existing
+    // cold path once: a fresh Runner resumes the same conversation from its
+    // saved checkpoint through recoverSession and every refusal it enforces.
+    const continueAfterFailedWarmAttach = async (error: unknown): Promise<boolean> => {
+      const failed = warmAttachFailure;
+      warmAttachFailure = undefined;
+      const retained = existingWarmSession;
+      if (!failed || failed.error !== error || !retained || warmAttachFallbackTaken || warmConfigDigest === null) return false;
+      // A Stop, an expired startup or a controller restart is the run's own outcome.
+      if (startupForAdmission?.stopRequested || executionContext?.signal.aborted
+        || nativeRunsDetachingForRestart.has(input.execution.binding.runId)
+        || (error instanceof Error && ["native_session_cancelled", "native_execution_startup_expired"].includes(error.message))) {
+        return false;
+      }
+      warmAttachFallbackTaken = true;
+      const code = warmAttachFailureCode(error);
+      const text = redactIdentityText(error instanceof Error ? error.message : String(error)).slice(0, 1_000);
+      // An unsettled tool result or runtime input could be repeated or lost by
+      // a replacement: keep the refusal under its reconciliation code.
+      if (error instanceof NativeRunnerSourceReconciliationRequiredError) {
+        await reportWarmAttachFailure(code, text, "side_effect_pending");
+        throw new NativeProviderSideEffectPendingError(code);
+      }
+      // These keep their existing owners: the proven released-runner path, a
+      // pending warm transition, or another claimant of the same source.
+      if (error instanceof Error && ["native_runner_reuse_unavailable", "native_runner_warm_transition_completion_pending",
+        "native_runner_resume_identity_conflict"].includes(error.message)) {
+        await reportWarmAttachFailure(code, text, "controller_state_unsettled");
+        return false;
+      }
+      // Stopped, not left half-quarantined: close is idempotent and joins the
+      // runtime's quarantine close. Without that proof no second Runner starts.
+      try { await retained.close({ reason: "warm runner attach failed" }); }
+      catch {
+        await reportWarmAttachFailure(code, text, "retire_unproven");
+        return false;
+      }
+      existingWarmSession = undefined;
+      reusingReleasedRunner = false;
+      pluginTaskDescription = undefined;
+      try {
+        await finishStartupContextForFallback();
+        const checkpoint = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, input.runnerExecutionTarget?.kind ?? "local");
+        // Same conversation only: no checkpoint would mean a fresh thread.
+        if (!checkpoint) {
+          await reportWarmAttachFailure(code, text, "checkpoint_missing");
+          return false;
+        }
+        await reportWarmAttachFailure(code, text);
+        persistedWarmSession = checkpoint;
+        if (runnerdBackend !== null) runnerdBackend = await createExecutionBackend();
+        remoteCleanupLease = await readRemoteCleanupLease();
+      } catch (coldError) {
+        throw markWarmAttachColdFallbackFailure(coldError);
+      }
+      return true;
+    };
     nativeSessionExecuteStartedAtMs = Date.now();
     native = await trace.measure(
       "native.session.execute",
@@ -12141,6 +12243,9 @@ async function executePaperclipNativeSessionAttempt(
                 "stderr",
                 `[paperclip-runner] post-completion ${stage} enrichment failed: ${detail}\n`,
               );
+            },
+            onRetainedSessionAttachFailed: (error) => {
+              if (existingWarmSession) warmAttachFailure = { error };
             },
             onSessionQuarantined: async (reason) => {
               await input.onLog?.(
@@ -12393,8 +12498,12 @@ async function executePaperclipNativeSessionAttempt(
         try {
           result = await trace.run(runnerSessionStartupScope, runExecution);
         } catch (error) {
-          if (!await continueAfterUnavailableReuse(error)) throw error;
-          result = await trace.run(runnerSessionStartupScope, runExecution);
+          if (await continueAfterUnavailableReuse(error)) {
+            result = await trace.run(runnerSessionStartupScope, runExecution);
+          } else if (await continueAfterFailedWarmAttach(error)) {
+            try { result = await trace.run(runnerSessionStartupScope, runExecution); }
+            catch (coldError) { throw markWarmAttachColdFallbackFailure(coldError); }
+          } else throw error;
         }
         await trace.end(runnerSessionStartupScope, {
           outcome:
