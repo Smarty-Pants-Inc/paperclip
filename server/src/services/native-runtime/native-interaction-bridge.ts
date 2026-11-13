@@ -18,6 +18,7 @@ import {
 } from "@paperclipai/db";
 import { getAgentWorkEligibility } from "@paperclipai/shared";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { issueThreadInteractionAttentionAgentAllowed } from "../issue-thread-interaction-resolution.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { nativeSha256 } from "./canonical.js";
 import { recordNativeAttentionAssessment } from "./work-assessments.js";
@@ -175,6 +176,7 @@ export async function materializeNativeInteractionResponses(input: {
   runId: string;
   agentId: string;
   interactionIds: string[];
+  wakeReason?: string;
 }): Promise<NativeInteractionResponseEnvelope[]> {
   const requestedIds = new Set(input.interactionIds.filter(Boolean));
   if (requestedIds.size === 0) return [];
@@ -195,6 +197,36 @@ export async function materializeNativeInteractionResponses(input: {
         "native_interaction_binding_mismatch",
         `Interaction ${interaction.id} is not bound to the native company and issue`,
       );
+    }
+    // An addressed pending wake carries a request to resolve, not a response
+    // to consume. Resolution still rechecks authority in the interaction service.
+    if (
+      interaction.status === "pending"
+      && input.wakeReason === "interaction_pending"
+      && interaction.addresseeAgentId === input.agentId
+      && issueThreadInteractionAttentionAgentAllowed({
+        agentId: input.agentId,
+        runId: input.runId,
+        interaction,
+        governedAction: interaction.kind === "request_confirmation"
+          && typeof interaction.payload === "object"
+          && interaction.payload !== null
+          && "toolAction" in interaction.payload
+          && interaction.payload.toolAction !== undefined,
+      })
+    ) {
+      responses.push({
+        interactionId: interaction.id,
+        kind: interaction.kind as NativeInteractionResponseEnvelope["kind"],
+        response: {
+          status: "pending",
+          title: interaction.title,
+          summary: interaction.summary,
+          payload: structuredClone(interaction.payload),
+          result: structuredClone(interaction.result),
+        },
+      });
+      continue;
     }
     if (interaction.kind === "request_confirmation" && interaction.payload.toolAction) {
       const action = interaction.payload.toolAction;

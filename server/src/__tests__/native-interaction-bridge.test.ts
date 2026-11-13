@@ -46,33 +46,78 @@ describe("P6-19 native interaction bridge", () => {
   const suggestedTasksId = "78000000-0000-4000-8000-000000000012";
   const checkboxId = "78000000-0000-4000-8000-000000000013";
   const itemVerdictsId = "78000000-0000-4000-8000-000000000014";
+  const addresseeAgentId = "78000000-0000-4000-8000-000000000032";
+  const otherAgentId = "78000000-0000-4000-8000-000000000033";
+  const addresseeRunId = "78000000-0000-4000-8000-000000000034";
+  const pendingIssueId = "78000000-0000-4000-8000-000000000036";
+  const pendingAllowedId = "78000000-0000-4000-8000-000000000037";
+  const pendingCreatorId = "78000000-0000-4000-8000-000000000038";
+  const pendingSourceRunId = "78000000-0000-4000-8000-000000000039";
+  const pendingHumanOnlyId = "78000000-0000-4000-8000-000000000040";
+  const pendingWrongAddresseeId = "78000000-0000-4000-8000-000000000041";
+  const pendingGovernedId = "78000000-0000-4000-8000-000000000042";
 
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("paperclip-native-interaction-");
     db = createDb(temporary.connectionString);
     await db.insert(companies).values({ id: companyId, name: "Native interaction", issuePrefix: "NIB" });
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "Native interaction agent",
-      adapterType: "codex_local",
-      status: "running",
-    });
-    await db.insert(issues).values({
-      id: issueId,
-      companyId,
-      title: "Consume an authorized interaction response",
-      status: "in_progress",
-      assigneeAgentId: agentId,
-      workMode: "standard",
-    });
-    await db.insert(heartbeatRuns).values({
-      id: runId,
-      companyId,
-      agentId,
-      status: "running",
-      contextSnapshot: { issueId, interactionId: confirmationId },
-    });
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "Native interaction agent",
+        adapterType: "codex_local",
+        status: "running",
+      },
+      {
+        id: addresseeAgentId,
+        companyId,
+        name: "Native interaction addressee",
+        adapterType: "codex_local",
+        status: "running",
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other native interaction agent",
+        adapterType: "codex_local",
+        status: "running",
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: issueId,
+        companyId,
+        title: "Consume an authorized interaction response",
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        workMode: "standard",
+      },
+      {
+        id: pendingIssueId,
+        companyId,
+        title: "Resolve an addressed interaction",
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        workMode: "standard",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runId,
+        companyId,
+        agentId,
+        status: "running",
+        contextSnapshot: { issueId, interactionId: confirmationId },
+      },
+      {
+        id: addresseeRunId,
+        companyId,
+        agentId: addresseeAgentId,
+        status: "running",
+        contextSnapshot: { issueId: pendingIssueId, interactionId: pendingAllowedId, wakeReason: "interaction_pending" },
+      },
+    ]);
     await db.insert(issueThreadInteractions).values([
       {
         id: confirmationId,
@@ -206,9 +251,189 @@ describe("P6-19 native interaction bridge", () => {
         },
       },
     ]);
+    await db.insert(issueThreadInteractions).values([
+      {
+        id: pendingAllowedId,
+        companyId,
+        issueId: pendingIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        requestedResolverPolicy: "not_creator",
+        effectiveResolverPolicy: "not_creator",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        createdByUserId: "board-operator",
+        addresseeAgentId,
+        title: "Review the implementation plan",
+        summary: "Check the proposed plan before continuing.",
+        payload: { version: 1, prompt: "Review the implementation plan?" },
+        result: null,
+      },
+      {
+        id: pendingCreatorId,
+        companyId,
+        issueId: pendingIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        requestedResolverPolicy: "not_creator",
+        effectiveResolverPolicy: "not_creator",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        createdByAgentId: addresseeAgentId,
+        sourceRunId: addresseeRunId,
+        addresseeAgentId,
+        payload: { version: 1, prompt: "Review your own request?" },
+        result: null,
+      },
+      {
+        id: pendingSourceRunId,
+        companyId,
+        issueId: pendingIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        requestedResolverPolicy: "not_creator",
+        effectiveResolverPolicy: "not_creator",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        sourceRunId: addresseeRunId,
+        addresseeAgentId,
+        payload: { version: 1, prompt: "Review a request from this run?" },
+        result: null,
+      },
+      {
+        id: pendingHumanOnlyId,
+        companyId,
+        issueId: pendingIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        requestedResolverPolicy: "human_only",
+        effectiveResolverPolicy: "human_only",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        createdByUserId: "board-operator",
+        addresseeAgentId,
+        payload: { version: 1, prompt: "Human-only decision?" },
+        result: null,
+      },
+      {
+        id: pendingWrongAddresseeId,
+        companyId,
+        issueId: pendingIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        createdByUserId: "board-operator",
+        addresseeAgentId: otherAgentId,
+        payload: { version: 1, prompt: "A request for another agent?" },
+        result: null,
+      },
+      {
+        id: pendingGovernedId,
+        companyId,
+        issueId: pendingIssueId,
+        kind: "request_confirmation",
+        status: "pending",
+        requestedResolverPolicy: "anyone",
+        effectiveResolverPolicy: "anyone",
+        resolverPolicyProvenance: "explicit",
+        effectiveResolverPolicySource: "requested",
+        createdByUserId: "board-operator",
+        addresseeAgentId,
+        payload: {
+          version: 1,
+          prompt: "Approve a governed write?",
+          toolAction: {
+            version: 1,
+            actionRequestId: "78000000-0000-4000-8000-000000000044",
+            invocationId: "78000000-0000-4000-8000-000000000045",
+            toolName: "write",
+            toolDisplayName: "Write",
+            connectionId: null,
+            applicationId: null,
+            appDisplayName: null,
+            risk: "write",
+            previewMarkdown: "write",
+            argumentsSummaryJson: "{}",
+            argumentsHash: "pending-governed-hash",
+            expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          },
+        },
+        result: null,
+      },
+    ]);
   }, 30_000);
 
   afterAll(async () => temporary?.cleanup());
+
+  const pendingWakeInput = (
+    interactionId: string,
+    options: { wakeReason?: string; companyId?: string } = {},
+  ) => ({
+    db,
+    companyId: options.companyId ?? companyId,
+    issueId: pendingIssueId,
+    runId: addresseeRunId,
+    agentId: addresseeAgentId,
+    interactionIds: [interactionId],
+    ...(options.wakeReason === undefined ? {} : { wakeReason: options.wakeReason }),
+  });
+
+  it("projects a pending addressed interaction to a non-assignee addressee with its request context", async () => {
+    const [issue] = await db.select({ assigneeAgentId: issues.assigneeAgentId }).from(issues)
+      .where(eq(issues.id, pendingIssueId));
+    expect(issue?.assigneeAgentId).toBe(agentId);
+    expect(addresseeAgentId).not.toBe(issue?.assigneeAgentId);
+
+    const responses = await materializeNativeInteractionResponses(pendingWakeInput(pendingAllowedId, {
+      wakeReason: "interaction_pending",
+    }));
+    expect(responses).toMatchObject([{
+      interactionId: pendingAllowedId,
+      kind: "request_confirmation",
+      response: {
+        status: "pending",
+        title: "Review the implementation plan",
+        summary: "Check the proposed plan before continuing.",
+        payload: { version: 1, prompt: "Review the implementation plan?" },
+        result: null,
+      },
+    }]);
+  });
+
+  it.each([
+    ["the not_creator agent creator and source run", pendingCreatorId],
+    ["the source run even without a creator agent id", pendingSourceRunId],
+    ["a human-only card", pendingHumanOnlyId],
+    ["a card addressed to another agent", pendingWrongAddresseeId],
+  ])("does not project a pending card when the resolver is excluded by %s", async (_reason, interactionId) => {
+    await expect(materializeNativeInteractionResponses(pendingWakeInput(interactionId, {
+      wakeReason: "interaction_pending",
+    }))).rejects.toMatchObject({ code: "native_interaction_unresolved" });
+  });
+
+  it.each([
+    ["missing", {}],
+    ["not interaction_pending", { wakeReason: "issue_commented" }],
+  ])("preserves the unresolved refusal when wakeReason is %s", async (_reason, options) => {
+    await expect(materializeNativeInteractionResponses(pendingWakeInput(pendingAllowedId, options)))
+      .rejects.toMatchObject({ code: "native_interaction_unresolved" });
+  });
+
+  it("fails closed for a pending addressee interaction with a mismatched company binding", async () => {
+    await expect(materializeNativeInteractionResponses(pendingWakeInput(pendingAllowedId, {
+      companyId: "78000000-0000-4000-8000-000000000046",
+      wakeReason: "interaction_pending",
+    }))).rejects.toMatchObject({ code: "native_interaction_binding_mismatch" });
+  });
+
+  it("does not expose a pending governed tool confirmation to its addressed agent", async () => {
+    await expect(materializeNativeInteractionResponses(pendingWakeInput(pendingGovernedId, {
+      wakeReason: "interaction_pending",
+    }))).rejects.toMatchObject({ code: "native_interaction_governed_request_unresolved" });
+  });
 
   it("projects supported typed responses through the authorized interaction service", async () => {
     await expect(materializeNativeInteractionResponses({

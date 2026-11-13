@@ -4,8 +4,9 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agentTaskSessions, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, issueComments, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agentTaskSessions, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, issueComments, issueThreadInteractions, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -181,6 +182,57 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect((await selectHeartbeatRuntime(db, f.input)).selected).toBe(true);
     expect((await read(f.run.id)).runtimeMode).toBe("native");
     expect(await coordinators(f.run.id)).toHaveLength(1);
+  });
+
+  it("starts an addressed pending confirmation for its non-assignee agent to resolve in the same run", async () => {
+    const { input, issue, run, agent } = await fixture();
+    const [assignee] = await db.insert(agents).values({ companyId: agent.companyId, name: "Assigned agent", status: "idle",
+      adapterType: "paperclip_runner", adapterConfig: {} }).returning();
+    const [updatedIssue] = await db.update(issues).set({ assigneeAgentId: assignee!.id })
+      .where(eq(issues.id, issue.id)).returning();
+    input.task.issueRef = updatedIssue!;
+    input.nativeRuntimeResolution = resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true,
+      runtimeConfig: {}, adapterConfig: agent.adapterConfig, agent, issue: updatedIssue!, target: null, workspaceId: null });
+
+    const interactionId = randomUUID();
+    const prompt = "Confirm the reviewed handoff.";
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId: agent.companyId,
+      issueId: issue.id,
+      kind: "request_confirmation",
+      status: "pending",
+      continuationPolicy: "none",
+      requestedResolverPolicy: "not_creator",
+      effectiveResolverPolicy: "not_creator",
+      resolverPolicyProvenance: "explicit",
+      effectiveResolverPolicySource: "requested",
+      addresseeAgentId: agent.id,
+      createdByUserId: "board-user",
+      payload: { version: 1, prompt },
+    });
+    input.task.context = { interactionId, wakeReason: "interaction_pending" };
+
+    const selected = await selectHeartbeatRuntime(db, input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
+    expect(selected.nativeExecution.interactionResponses).toEqual(expect.arrayContaining([
+      expect.objectContaining({ interactionId, kind: "request_confirmation", response: expect.objectContaining({
+        status: "pending", payload: expect.objectContaining({ prompt }),
+      }) }),
+    ]));
+    const [pending] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(pending).toMatchObject({ status: "pending", result: null, resolvedByAgentId: null,
+      resolvedByRunId: null, resolvedByUserId: null, resolvedAt: null });
+
+    await issueThreadInteractionService(db).acceptInteraction(
+      { id: issue.id, companyId: agent.companyId, projectId: issue.projectId, goalId: issue.goalId, status: issue.status },
+      interactionId,
+      {},
+      { agentId: agent.id, runId: run.id },
+    );
+    const [resolved] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(resolved).toMatchObject({ status: "accepted", resolvedByAgentId: agent.id,
+      resolvedByRunId: run.id, resolvedByUserId: null });
   });
 
   it("preserves immutable native recovery when current local Runner configuration is invalid", async () => {
