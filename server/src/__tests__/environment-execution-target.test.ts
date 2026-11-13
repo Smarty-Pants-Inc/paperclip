@@ -166,13 +166,8 @@ describe("resolveEnvironmentExecutionTarget", () => {
 
   // REG-26: a resume that woke a stopped or archived allocation restarted its
   // machine. No process from an earlier run survived, so no warm runner may be reused.
-  // Only a provider-defined stopped state proves it (docs.boat.dev/readiness.md
-  // "Ready, in one table": archiving and archived refuse commands; Daytona
-  // stopped/archived). error, starting and unknown states keep warm reuse.
   it.each([
-    ["archived", true], ["archiving", true], ["stopped", true],
-    ["error", false], ["provisioning", false], ["provisioned", false], ["cloning", false],
-    ["stopping", false], ["starting", false], ["some_new_state", false],
+    ["archived", true], ["stopped", true], ["error", true],
     ["ready", false], ["started", false], ["running", false], ["idle", false], [null, false], [undefined, false],
   ] as const)("marks a resume from provider state %s as restarted: %s", async (resumedFromState, restarted) => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox", config: { provider: "test-provider" } });

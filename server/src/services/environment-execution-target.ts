@@ -76,11 +76,9 @@ function toBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-// Provider-defined stopped states: a resume from one restarted the machine, so
-// no earlier process survived (Boat archiving/archived per docs.boat.dev/
-// readiness.md "Ready, in one table"; Daytona stopped/archived). Error,
-// starting and unknown states prove nothing and keep warm reuse.
-const STOPPED_SANDBOX_STATES = new Set(["stopped", "archiving", "archived"]);
+// Provider states in which a resumed allocation kept its processes running
+// (Daytona `started`; `ready`, `idle` and `running` in other providers).
+const RUNNING_SANDBOX_STATES = new Set(["started", "running", "ready", "idle"]);
 
 function sandboxLeaseAcquisitionFromMetadata(
   value: unknown,
@@ -117,7 +115,7 @@ function sandboxLeaseAcquisitionFromMetadata(
     ...(reason ? { reason } : {}),
     // A provider that did not report the prior state leaves reuse unchanged.
     ...(candidate.outcome === "resumed" && typeof resumedFromState === "string"
-      && STOPPED_SANDBOX_STATES.has(resumedFromState) ? { restarted: true as const } : {}),
+      && !RUNNING_SANDBOX_STATES.has(resumedFromState.toLowerCase()) ? { restarted: true as const } : {}),
   };
 }
 
