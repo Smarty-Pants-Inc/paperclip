@@ -12,6 +12,14 @@ describe("complete Anthropic receipt pricing", () => {
     expect(priced.pricingProvenance).toMatchObject({ version: "anthropic-standard-2026-10-12", inputCentsPerMillion: "400", cachedInputCentsPerMillion: "20", cacheWriteCentsPerMillion: "800", outputCentsPerMillion: "2000" });
     expect(priced.costStatus).toBe("estimated");
   });
+  it("prices Sonnet 5.5 and Fable 5.2 from the 2026-11-13 card", () => {
+    const sonnet = priceAnthropicReceipt({ ...receipt, model: "paperclip/claude-sonnet-5-5" });
+    expect(sonnet.costUsdExact).toBe("0.135145800");
+    expect(sonnet.pricingProvenance).toMatchObject({ version: "anthropic-standard-2026-11-13", inputCentsPerMillion: "200", cachedInputCentsPerMillion: "10", cacheWriteCentsPerMillion: "400", outputCentsPerMillion: "1000" });
+    const fable = priceAnthropicReceipt({ ...receipt, model: "claude-fable-5-2" });
+    expect(fable.costUsdExact).toBe("0.498939600");
+    expect(fable.pricingProvenance).toMatchObject({ version: "anthropic-standard-2026-11-13", inputCentsPerMillion: "800", cachedInputCentsPerMillion: "20", cacheWriteCentsPerMillion: "1600", outputCentsPerMillion: "4000" });
+  });
   it("prices a gateway-prefixed Opus receipt with the real sample cache counts", () => {
     const priced = priceAnthropicReceipt({ ...receipt, model: "paperclip/claude-opus-5-5",
       usage: { inputTokens: 7923, cachedInputTokens: 391189, cacheWriteTokens: 7915, outputTokens: 535 } });
