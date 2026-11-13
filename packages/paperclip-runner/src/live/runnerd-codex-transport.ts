@@ -6317,12 +6317,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
 
   /** A fresh Pi open over an external Runner's root retires the prior epoch
    * through the ordinary rotation, as the recovery path and local Pi do, when
-   * that owner is proven gone: its own durable runner state says it suspended
-   * (Core closed it, for example a warm Runner displaced by the agent's other
-   * conversation), or it is the exact proven-lost Runner of a restarted
-   * sandbox. rotateAuthorityEpoch checks the exact identity and that state; a
-   * live owner fails `native_runner_authority_rotation_requires_settled_state`.
-   * Pi's own files stay in place. */
+   * that owner is proven gone:
+   * - its own durable runner state, for the exact identity, reads suspended.
+   *   runnerd writes that only after a SUCCESSFUL runner.suspend (runner-core
+   *   durable/runner.rs complete_command -> CommandLifecycle::for_terminal,
+   *   persisted before the reply; a failed suspend stays Continue and never
+   *   writes it, see CommandLifecycle::after_failure) or at a host-park cut
+   *   immediately before the process exits. A rejected or failed Core close
+   *   leaves it unsuspended; or
+   * - it is the exact proven-lost Runner of a restarted sandbox, whose
+   *   process generation the controller proved gone on the box.
+   * rotateAuthorityEpoch checks the exact identity and that state; a live owner
+   * fails `native_runner_authority_rotation_requires_settled_state`. Pi's own
+   * files stay in place. */
   async #rotateExternalPiOpenAuthority(desired: DurableRecoveryIdentity): Promise<void> {
     const lost = this.options.lostRunnerSource;
     const directory = resolve(this.#root, "control-plane");
