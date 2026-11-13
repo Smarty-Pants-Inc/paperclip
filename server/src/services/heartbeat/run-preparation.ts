@@ -93,6 +93,7 @@ import {
   type MissingRuntimeBinding,
 } from "../secrets.js";
 import { createToolGatewayService } from "../tool-gateway.js";
+import { lockToolAssignmentAgents } from "../tool-access/assignment-locks.js";
 import { toolAccessService } from "../tool-access.js";
 import {
   buildDocumentReviewContext,
@@ -1164,16 +1165,20 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   // The assignment digest includes the agent id, so a reused gateway is this
   // agent's own: bind it here instead of waiting for the assignment to change.
   if (gateway && !gateway.agentId) {
-    await input.db
-      .update(toolMcpGateways)
-      .set({ agentId: input.agent.id, contextScopeType: "agent", contextScopeId: input.agent.id, updatedAt: new Date() })
-      .where(
-        and(
-          eq(toolMcpGateways.id, gateway.id),
+    const gatewayId = gateway.id;
+    await input.db.transaction(async tx => {
+      // This repair fires the same company-wide invalidation as named gateway
+      // edits. Match their agent-before-gateway order, retaining the null CAS.
+      await lockToolAssignmentAgents(tx, input.agent.companyId,
+        [{ targetType: "company", targetId: input.agent.companyId }], input.agent.id);
+      await tx.update(toolMcpGateways)
+        .set({ agentId: input.agent.id, contextScopeType: "agent", contextScopeId: input.agent.id, updatedAt: new Date() })
+        .where(and(
+          eq(toolMcpGateways.id, gatewayId),
           eq(toolMcpGateways.companyId, input.agent.companyId),
           isNull(toolMcpGateways.agentId),
-        ),
-      );
+        ));
+    });
     [gateway] = await input.db
       .select()
       .from(toolMcpGateways)

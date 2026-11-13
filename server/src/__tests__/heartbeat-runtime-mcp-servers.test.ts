@@ -3,7 +3,8 @@ import express from "express";
 import request from "supertest";
 import { mcpGatewayProtocolRoutes } from "../routes/tool-gateway.js";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { lockToolAssignmentAgents } from "../services/tool-access/assignment-locks.js";
 import {
   agents,
   activityLog,
@@ -318,6 +319,66 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     expect(gateways).toHaveLength(1);
     expect(gateways[0]!.agentId).toBe(owner!.agent.id);
   });
+
+  // Gateway updates and the legacy warm-up repair must both take company
+  // agents before the gateway row. Keep reason: the cd191df1 production
+  // connector-trigger deadlock; covering all production gateway writers avoids
+  // moving the inversion from scoped permission checks to the gateway row.
+  it("orders a legacy gateway binding repair behind company runtime ownership", async () => {
+    const [owner] = await seedAssignedAgents(1);
+    await buildPaperclipRuntimeMcpServers({ db, agent: owner!.agent, runId: owner!.run.id });
+    const [gateway] = await db.select().from(toolMcpGateways);
+    await db.update(toolMcpGateways).set({ agentId: null }).where(eq(toolMcpGateways.id, gateway!.id));
+    let locked!: () => void;
+    const held = new Promise<void>(resolve => { locked = resolve; });
+    let release!: () => void;
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    // Hold the same first lock used by updateNamedGateway so its subsequent
+    // gateway read can be released only after the real repair is waiting.
+    const update = db.transaction(async tx => {
+      await tx.execute(sql`set local deadlock_timeout = '200ms'`);
+      await tx.execute(sql`set local statement_timeout = '10s'`);
+      await lockToolAssignmentAgents(tx, owner!.agent.companyId, [{ targetType: "company", targetId: owner!.agent.companyId }]);
+      locked();
+      await resume;
+      return createToolGatewayService(tx as unknown as typeof db).updateNamedGateway({
+        companyId: owner!.agent.companyId, gatewayId: gateway!.id, body: { name: "Concurrent gateway edit" },
+      });
+    });
+    const updateResult = Promise.allSettled([update]);
+    let repairResult: Promise<PromiseSettledResult<unknown>[]> | undefined;
+    let repairPid: number | undefined;
+    let waitingQuery = "";
+    let waitError: unknown;
+    try {
+      await Promise.race([held, update.then(() => { throw new Error("Gateway updater exited before taking ownership"); })]);
+      repairResult = Promise.allSettled([db.transaction(async tx => {
+        await tx.execute(sql`set local deadlock_timeout = '5s'`);
+        await tx.execute(sql`set local statement_timeout = '10s'`);
+        const [backend] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        repairPid = backend!.pid;
+        return buildPaperclipRuntimeMcpServers({ db: tx as unknown as typeof db, agent: owner!.agent, runId: owner!.run.id });
+      })]);
+      await vi.waitFor(async () => {
+        expect(repairPid).toBeDefined();
+        const [activity] = await db.execute<{ wait: string | null; query: string }>(sql`select wait_event_type as wait, query from pg_stat_activity where pid = ${repairPid!}`);
+        expect(activity?.wait).toBe("Lock");
+        waitingQuery = activity!.query;
+      }, { timeout: 5_000, interval: 10 });
+    } catch (error) { waitError = error; }
+    finally { release(); }
+    const results = [...await updateResult, ...await (repairResult ?? Promise.resolve([]))];
+    if (waitError) throw waitError;
+    const outcomes = results.map(result => result.status === "fulfilled" ? "committed" : {
+      code: result.reason?.cause?.code ?? result.reason?.code,
+      message: String(result.reason?.cause?.message ?? result.reason?.message),
+    });
+    console.log("[gateway-binding-lock-order]", JSON.stringify({ waitingQuery, outcomes }));
+    expect(outcomes).toEqual(["committed", "committed"]);
+    expect(await db.select().from(toolMcpGateways)).toEqual([
+      expect.objectContaining({ id: gateway!.id, agentId: owner!.agent.id, name: "Concurrent gateway edit" }),
+    ]);
+  }, 20_000);
 
   it("rejects another run on a legacy native gateway before the owner runs again", async () => {
     const [owner, other] = await seedAssignedAgents(2);
