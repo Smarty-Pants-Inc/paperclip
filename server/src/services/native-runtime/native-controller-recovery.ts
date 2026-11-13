@@ -10,6 +10,9 @@ import { findNativeSessionResumeRun, isNativeSessionId, isUnusedNativeSessionBoo
 import { insertMigratedNativeRunnerCheckpoint, loadNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { offlineMigrationExecutionWhere } from "../offline-migration-execution.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
+import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
+import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
+import { isQuiescentRetainedPiSource, readStoppedRemotePiSource } from "./native-retained-pi-source.js";
 
 export const NATIVE_CONTROLLER_RECOVERY_MAX_BYTES = 4 * 1024;
 
@@ -144,13 +147,80 @@ function sameSandboxWorkspaceAllocation(recorded: string, current: string): bool
 const UUID = "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
 const WORKSPACE_ALLOCATION = new RegExp(`^(${UUID})(?:-[1-9][0-9]*-${UUID})?$`);
 
+type RetainedSandboxBindingInput = {
+  companyId: string; issueId: string; runId: string;
+  agentId?: string; successorRunId?: string; normalizedSessionId?: string;
+  target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
+};
+
+/** A cancelled business run may still leave a good conversation checkpoint.
+ * Compose existing lease termination/handoff and runnerd lineage evidence; do
+ * not manufacture a committed result or replace Goal1's authority retirement. */
+async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInput,
+  owner: typeof nativeRunFinalizations.$inferSelect, sourceLease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  const { target, agentId, successorRunId, normalizedSessionId } = input;
+  if (target.transport !== "sandbox" || !target.runner || !agentId || !successorRunId || !normalizedSessionId || successorRunId === input.runId
+    || owner.phase !== "terminal_failure" || owner.resultId !== null || owner.leaseOwner !== null || owner.recoveryState !== null
+    || !hasRemoteTerminationReceipt(sourceLease) || record(sourceLease.metadata?.remoteExecutionTermination).state !== "stopped") return false;
+  const history = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.provider, target.providerKey!), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition!.providerLeaseId)));
+  const successor = history.find(lease => lease.id === target.leaseId);
+  if (!successor || successor.companyId !== input.companyId || successor.environmentId !== target.environmentId
+    || successor.issueId !== input.issueId || successor.heartbeatRunId !== successorRunId || successor.status !== "active"
+    || successor.releasedAt !== null || successor.metadata?.agentId !== agentId
+    || !retiredReusableLeasePredecessors(successor, history.filter(lease => lease.id !== successor.id))
+      ?.some(lease => lease.id === sourceLease.id)) return false;
+  const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+    eq(heartbeatRuns.nativeSessionId, normalizedSessionId), inArray(heartbeatRuns.id, [input.runId, successorRunId])));
+  const source = runs.find(run => run.id === input.runId), current = runs.find(run => run.id === successorRunId);
+  const [task] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(and(
+    eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  if (!source || !current || source.runtimeMode !== "native" || current.runtimeMode !== "native"
+    || current.status !== "running" || task?.executionRunId !== successorRunId || !source.finishedAt) return false;
+  const profile = record(source.runnerProfileJson), snapshot = record(profile.sessionCheckpoint), binding = record(snapshot.identity);
+  const metadata = readNativeControllerRecovery(profile.nativeControllerRecovery, snapshot);
+  const admitted = parseNativeExecutionInput(profile.nativeExecutionInput);
+  if (admitted.provider.kind !== "pi_rpc" || admitted.binding.runId !== source.id || admitted.binding.companyId !== input.companyId
+    || admitted.binding.agentId !== agentId || admitted.binding.issueId !== input.issueId
+    || admitted.session.normalizedSessionId !== normalizedSessionId
+    || binding.companyId !== input.companyId || binding.agentId !== agentId || binding.issueId !== input.issueId
+    || binding.runId !== source.id || binding.sessionId !== normalizedSessionId
+    || snapshot.activeTurnId !== null || !Array.isArray(snapshot.pendingRuntimeRequests) || snapshot.pendingRuntimeRequests.length !== 0
+    || !metadata?.checkpoint || metadata.checkpoint.runId !== source.id || metadata.checkpoint.runnerInstanceId !== source.runnerInstanceId
+    || metadata.checkpoint.normalizedSessionId !== normalizedSessionId || typeof snapshot.providerSessionId !== "string") return false;
+  const checkpoint = await loadNativeRunnerCheckpoint(db, { companyId: input.companyId, issueId: input.issueId, runId: source.id });
+  if (!checkpoint || checkpoint.recoveryEvidence.runnerInstanceId !== source.runnerInstanceId
+    || checkpoint.recoveryEvidence.normalizedSessionId !== normalizedSessionId) return false;
+  const header = record(JSON.parse(checkpoint.records.get("header") ?? "null"));
+  const identity = record(record(header.state).identity);
+  if (identity.runId !== source.id || identity.environmentLeaseId !== sourceLease.id
+    || identity.runnerInstanceId !== source.runnerInstanceId || identity.normalizedSessionId !== normalizedSessionId
+    || [...checkpoint.records].some(([key, bytes]) => key.startsWith("command:") && record(JSON.parse(bytes)).status !== "completed")) return false;
+  const measured = await readStoppedRemotePiSource({ runner: target.runner, remoteCwd: sourceLease.metadata!.remoteCwd as string,
+    normalizedSessionId, runnerInstanceId: source.runnerInstanceId! });
+  if (!measured || !isQuiescentRetainedPiSource({ owner, runStatus: source.status, terminationReceipt: true, leaseHandoff: true,
+    identity: identity as Record<string, string>, providerSessionId: snapshot.providerSessionId, ...measured })) return false;
+  // Measurements await a remote read. Recheck the exact source and current
+  // ownership before accepting them; changed durable bytes keep the refusal.
+  const [freshOwner] = await db.select().from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, input.runId)));
+  const freshHistory = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.provider, target.providerKey!), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition!.providerLeaseId)));
+  const freshRuns = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    inArray(heartbeatRuns.id, [input.runId, successorRunId])));
+  const [freshTask] = await db.select({ executionRunId: issues.executionRunId }).from(issues).where(and(
+    eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  const sorted = <T extends { id: string }>(rows: T[]) => [...rows].sort((left, right) => left.id.localeCompare(right.id));
+  return nativeSha256(freshOwner) === nativeSha256(owner)
+    && nativeSha256(sorted(freshHistory)) === nativeSha256(sorted(history))
+    && nativeSha256(sorted(freshRuns)) === nativeSha256(sorted(runs)) && freshTask?.executionRunId === successorRunId;
+}
+
 /** Bind a read of retained Runner lifecycle to the surviving sandbox and
  * return the directory that Runner wrote under. The ordinary admission owner
  * still checks current permissions before execution. */
-export async function assertNativeRetainedSandboxBinding(db: Db, input: {
-  companyId: string; issueId: string; runId: string;
-  target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
-}): Promise<{ remoteCwd: string }> {
+export async function assertNativeRetainedSandboxBinding(db: Db, input: RetainedSandboxBindingInput): Promise<{ remoteCwd: string }> {
   const { target } = input;
   if (target.transport !== "sandbox" || target.sandboxLeaseAcquisition?.outcome !== "resumed"
     || !target.providerKey || !target.environmentId || !target.leaseId) {
@@ -159,14 +229,20 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: {
   const [owner] = await db.select().from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
     eq(nativeRunFinalizations.runId, input.runId)));
-  const leases = await db.select({ metadata: environmentLeases.metadata, status: environmentLeases.status }).from(environmentLeases).where(and(
+  const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.issueId, input.issueId),
     eq(environmentLeases.heartbeatRunId, input.runId), eq(environmentLeases.environmentId, target.environmentId),
     eq(environmentLeases.provider, target.providerKey), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition.providerLeaseId)));
   const recordedCwd = leases.length === 1 ? leases[0].metadata?.remoteCwd : undefined;
-  if (!owner || !owner.resultId || owner.recoveryState || typeof recordedCwd !== "string"
+  if (!owner || owner.recoveryState || typeof recordedCwd !== "string"
     || !sameSandboxWorkspaceAllocation(recordedCwd, target.remoteCwd)
     || !["active", "released", "expired"].includes(leases[0].status)) {
+    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+  }
+  if (!owner.resultId) {
+    // A failed or missing observation must retain the existing refusal, never
+    // degrade into the committed-source lane or an implicit fresh session.
+    if (await stoppedRetainedPiSource(db, input, owner, leases[0]).catch(() => false)) return { remoteCwd: recordedCwd };
     throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
   }
   if (owner.leaseOwner && owner.leaseExpiresAt && owner.leaseExpiresAt > new Date()) {

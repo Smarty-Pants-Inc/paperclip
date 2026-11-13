@@ -35,6 +35,7 @@ class FakeTransport {
   order: string[] = [];
   ready: Promise<void> = Promise.resolve();
   mismatch = false;
+  sessionFile?: string;
   effortMismatch = false;
   thinkingLevel = "off";
   promptDisposition = "started";
@@ -45,7 +46,7 @@ class FakeTransport {
     await this.ready; this.commands.push(type); this.order.push(type);
     if (type === "prompt" && this.rejectPrompt) throw new PiRpcCommandError(type, { success: false, error: "rejected before acceptance" });
     const model = { provider: "paperclip", id: this.mismatch ? "wrong" : "faux" };
-    return { success: true, data: type === "get_state" ? { sessionId: "native-session", model, thinkingLevel: this.effortMismatch ? "high" : this.thinkingLevel, isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+    return { success: true, data: type === "get_state" ? { sessionId: "native-session", sessionFile: this.sessionFile, model, thinkingLevel: this.effortMismatch ? "high" : this.thinkingLevel, isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
       : type === "get_available_models" ? { models: [{ ...model, name: "Fixture", api: "openai-completions" }] }
       : type === "set_model" ? model : type === "get_available_thinking_levels" ? { levels: [this.thinkingLevel] }
       : type === "prompt" ? { disposition: this.promptDisposition } : undefined };
@@ -79,7 +80,7 @@ async function faux() {
   const address = server.address(); if (!address || typeof address === "string") throw new Error("faux bind failed");
   return { requests, environment: { PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: "upstream-binding-canary" } };
 }
-async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale" | "lost" | "begin-lost") {
+async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale" | "lost" | "begin-lost", recovery = false) {
   const root = await mkdtemp(join(tmpdir(), "pi-resident-binding-")); const workspace = join(root, "workspace"); await mkdir(workspace);
   const upstream = await faux(); const transport = new FakeTransport(); const ipc: PiBindCommand[] = [];
   transport.thinkingLevel = options.piRpcThinkingLevel ?? "off";
@@ -107,7 +108,14 @@ async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale
       return transport as unknown as PiRpcTransport;
     },
   });
-  const session = await driver.openSession({ runId: "run-a", normalizedSessionId: "host-session", workingDirectory: workspace }) as PiRpcHarnessSession; sessions.push(session);
+  const input = { runId: "run-a", normalizedSessionId: "host-session", workingDirectory: workspace };
+  if (recovery) {
+    await mkdir(join(root, "sessions"));
+    transport.sessionFile = join(root, "sessions", "host-session.jsonl");
+    await writeFile(transport.sessionFile, JSON.stringify({ type: "session", version: 3, id: "native-session", timestamp: new Date().toISOString(), cwd: workspace }) + "\n", { mode: 0o600 });
+  }
+  const session = (recovery ? (await driver.recoverSession({ ...input, driverKind: "pi_rpc", driverSessionId: "native-session", providerSessionId: "native-session", activeTurnId: null }, { signal: new AbortController().signal })).session
+    : await driver.openSession(input)) as PiRpcHarnessSession; sessions.push(session);
   const events: PrpEvent[] = []; void (async () => { for await (const event of session.events()) events.push(event); })();
   return { root, session, transport, launch, ipc, events, ...upstream };
 }
@@ -136,6 +144,48 @@ describe("resident Pi model binding", () => {
     expect(f.ipc.map(command => command.type)).toEqual(["settle", "bind", "begin_turn"]);
   });
 
+  it("recovers without a prepared old-run turn and binds the current attachment through fresh bind/begin receipts", async () => {
+    const f = await fixture({ deferInitialBinding: true }, undefined, true);
+    const initialBytes = await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8");
+    // Recovery uses the same INITIAL shape; G-2 settles and revokes it before attach.
+    expect(JSON.parse(initialBytes).turnId).toEqual(expect.any(String));
+    expect(f.ipc.map(command => command.type)).toEqual(["settle"]);
+    const bootstrap = JSON.parse(await readFile(join(f.launch.env!.PI_CODING_AGENT_DIR!, "models.json"), "utf8")).providers.paperclip;
+    const saved = await f.session.snapshot();
+    expect(saved.binding).toMatchObject({ epoch: 1, preparedTurnId: null });
+    expect(saved.normalizedSessionId).toBe("host-session");
+    expect(f.session.ids().providerSessionId).toBe("native-session");
+    expect(await revoked(bootstrap)).toBe(true);
+    expect(f.transport.commands).not.toContain("prompt");
+    await f.session.attachRun({ runId: "run-b", baseInstructions: "CURRENT lease", dynamicTools: [tool("current_tool")], runtimeContext: { revision: 2 } });
+    expect(f.ipc.map(command => command.type)).toEqual(["settle", "bind"]);
+    const bound = f.ipc[1] as Extract<PiBindCommand, { type: "bind" }>;
+    expect(bound).toMatchObject({ expectedPriorEpoch: 1, epoch: 2, runId: "run-b", sessionId: "host-session", tools: [tool("current_tool")] });
+    expect(bound.instructions).toContain("CURRENT lease");
+    expect(bound.instructions).toContain('"revision":2');
+    expect(bound.provider.baseUrl).not.toBe(bootstrap.baseUrl);
+    expect(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8")).toBe(initialBytes);
+    // Same-context proxy admission must not rotate twice; a changed prepared
+    // LIVE attachment still refuses even though this process was recovered.
+    await f.session.attachRun({ runId: "run-b" });
+    await expect(f.session.attachRun({ runId: "run-c" })).rejects.toThrow("Pi prepared binding context cannot change before its turn");
+    expect(f.ipc.map(command => command.type)).toEqual(["settle", "bind"]);
+    const turn = await f.session.startTurn({ message: { role: "user", text: "continue, do not replay" } });
+    expect(f.ipc.map(command => command.type)).toEqual(["settle", "bind", "begin_turn"]);
+    expect(f.ipc[2]).toMatchObject({ epoch: 2, runId: "run-b", turnId: turn.turnId });
+    expect(f.transport.commands.filter(command => command === "prompt")).toHaveLength(1);
+    await finish(f);
+  });
+  it.each(["stale", "lost", "begin-lost"] as const)("fences a recovered %s receipt without replay", async fault => {
+    const f = await fixture({ deferInitialBinding: true }, fault, true);
+    if (fault === "begin-lost") await f.session.attachRun({ runId: "run-b" });
+    const operation = fault === "begin-lost" ? f.session.startTurn({ message: { role: "user", text: "continue" } }) : f.session.attachRun({ runId: "run-b" });
+    await expect(operation).rejects.toThrow(/receipt|private|channel|timed/i);
+    expect(f.transport.commands).not.toContain("prompt");
+    expect(f.ipc.filter(command => command.type === "bind")).toHaveLength(1);
+    expect(await revoked((f.ipc.find(command => command.type === "bind") as Extract<PiBindCommand, { type: "bind" }>).provider)).toBe(true);
+    expect(f.transport.closed).toBe(true);
+  });
   it("boots a 200 KiB binding through a private file instead of an E2BIG environment entry", async () => {
     const large = { ...tool("large"), inputSchema: { type: "object", properties: { body: { type: "string", description: "x".repeat(200 * 1024) } } } };
     const f = await fixture({ dynamicTools: [large] });
