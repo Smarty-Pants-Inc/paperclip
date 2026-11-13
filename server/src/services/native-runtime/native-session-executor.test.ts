@@ -15632,6 +15632,7 @@ describe("runnerd provider runtime wiring", () => {
       identity: options.prpIdentity as never,
       codexHome: "/unused", runtimeContextPath: "/private/runtime-context.json", hasRuntimeContext: true });
     expect(projected).toEqual({ CURSOR_API_KEY: "selected-company-cursor-key", PAPERCLIP_RUNNER_INSTANCE_ID: "cursor-controller",
+      NODE_COMPILE_CACHE: join(options.stateDirectory!, "node-compile-cache"), NODE_DISABLE_COMPILE_CACHE: "1",
       PAPERCLIP_RUN_ID: current.binding.runId, PAPERCLIP_NORMALIZED_SESSION_ID: current.session.normalizedSessionId,
       PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH: "/private/runtime-context.json",
       ...Object.fromEntries(Object.entries(options.environment!).filter(([key]) => key.startsWith("PAPERCLIP_CURSOR_CLOUD_"))),
