@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createPiEventProjector } from "../../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js";
 import { QUALIFIED_PI_RPC_PROFILE, type PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { createNativeTurnAccounting, nativeUsageCostUsd, normalizeNativeUsage, usesNativeUsageDelivery } from "./native-usage-accounting.js";
 
@@ -31,6 +32,35 @@ describe("native turn accounting", () => {
     expect(snapshot.complete).toBe(true);
     expect(normalizeNativeUsage(snapshot.usage)).toEqual({ inputTokens: 240, outputTokens: 20, cachedInputTokens: 0, cacheWriteTokens: 0 });
     expect(nativeUsageCostUsd(snapshot.usage, provider)).toBe(0.5);
+  });
+
+  it.each([1, 2])("accounts measured Pi message deltas after %i compactions without counting summaries or replay twice", count => {
+    const accounting = createNativeTurnAccounting({ kind: "pi_rpc", model: "paperclip/faux", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "xhigh" });
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn-1" });
+    let seq = 0;
+    const history: PrpEvent[] = [event(++seq, "turn.started")];
+    const project = (value: unknown) => history.push(...projector.project(value).map(projected =>
+      event(++seq, projected.eventType, projected.turnId, projected.payload)));
+    const message = (id: string, input: number, output: number) => ({ type: "message_end", message: {
+      role: "assistant", provider: "neutral", model: "model", responseId: id, stopReason: "stop", content: [],
+      usage: { input, output, cacheRead: 2, cacheWrite: 0, cost: { total: 0.02, totalFromProvider: false } },
+    } });
+    project(message("first", 11, 3));
+    for (let index = 1; index <= count; index++) {
+      project({ type: "compaction_start", reason: "threshold" });
+      project({ type: "compaction_end", result: { tokensBefore: 90, estimatedTokensAfter: 30 } });
+      project(message(`after-${index}`, 7, 5));
+    }
+    history.push(event(++seq, "turn.completed"));
+    history.forEach(value => accounting.observe(value));
+    const snapshot = accounting.snapshot();
+    expect(snapshot.complete).toBe(true);
+    expect(normalizeNativeUsage(snapshot.usage)).toEqual({
+      inputTokens: 11 + count * 7, outputTokens: 3 + count * 5, cachedInputTokens: 2 + count * 2, cacheWriteTokens: 0,
+    });
+    expect(snapshot.usage).toMatchObject({ accountingCostIncomplete: true });
+    history.forEach(value => accounting.observe(value));
+    expect(accounting.snapshot()).toEqual(snapshot);
   });
 
   // Keep reason: S11-parent's real facade emits a display-only usage item

@@ -956,6 +956,19 @@ No command arguments, stderr, filenames, repository URLs, or ref names are saved
 The same closed fields persist in `workspaceRestoreDiagnostic` and are
 revalidated before projection into an enabled Sentry failure report.
 
+## Pi summary usage
+
+Pi compaction and summarization retry events retain an `unaccounted-summary`
+usage item with `source: "pi_summarization_unaccounted"` and
+`summaryUsage: "unknown"`. Its `runDelta` is empty, `runDeltaComplete` is false,
+and `costComplete` is false: neither the summary's token spend nor its cost is
+qualified by that item. Its `total` preserves the measured message subtotal.
+
+This unknown summary spend does not invalidate later assistant-message usage
+receipts. Their deltas, completeness, and cost provenance describe the measured
+message receipts, not an all-inclusive bill for the native session. Summary spend
+remains unknown; the projector does not add it to the message subtotal.
+
 ## Codex resume usage snapshot
 
 The native runner retains a bounded local `harness.diagnostic` event with code
