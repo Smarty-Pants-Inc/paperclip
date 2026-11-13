@@ -54,3 +54,10 @@ describe("native hire runtime inheritance", () => {
 it("preserves Pi thinking configuration without live identity or credentials", () => {
   expect(inheritNativeRunnerAdapterConfig({ provider: "acpx", acpxAgent: "pi", piThinkingLevel: "low", runtimeSessionId: "prior", env: { OPENROUTER_API_KEY: "canary" } })).toEqual({ provider: "acpx", acpxAgent: "pi", piThinkingLevel: "low" });
 });
+
+it("preserves the native pi_rpc thinking level a hired teammate needs to pass setup", () => {
+  expect(inheritNativeRunnerAdapterConfig({
+    provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "xhigh",
+    runtimeSessionId: "prior", env: { PAPERCLIP_AGENT_TOKEN: "canary" },
+  })).toEqual({ provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "xhigh" });
+});

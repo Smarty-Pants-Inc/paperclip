@@ -15,6 +15,9 @@ export const INHERITABLE_NATIVE_RUNNER_CONFIG_KEYS = [
   "acpxPermissionMode",
   "acpxSessionMode",
   "piThinkingLevel",
+  // Native pi_rpc reads its level from this key (not piThinkingLevel); a hire
+  // without it fails the native Pi setup probe and never reaches ready.
+  "piRpcThinkingLevel",
   "lifecycleMode",
   "modelReasoningEffort",
   "maxIterations",
