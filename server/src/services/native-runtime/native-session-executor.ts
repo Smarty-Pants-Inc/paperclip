@@ -221,7 +221,9 @@ import {
   type RunnerProcessLaunchSpec,
   type NativeSessionGoalControl,
 } from "../../vendor/paperclip-runner/index.js";
-import { adapterExecutionTargetEnablesSandboxDuplexBridge, type AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import { adapterExecutionTargetEnablesSandboxDuplexBridge, type AdapterExecutionTarget, type PredecessorSandboxRecord } from "@paperclipai/adapter-utils/execution-target";
+export type { PredecessorSandboxRecord } from "@paperclipai/adapter-utils/execution-target";
+import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createRemoteAttachmentStager } from "./remote-attachment-staging.js";
 import { createRunnerAttachmentGrant, runnerAttachmentDownloadUrl } from "./runner-attachment-download.js";
@@ -5862,7 +5864,17 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     // restart label. That label is never proof: use the shared exact-generation
     // probe, including on an ordinary resume of a still-running box.
     if (resumedSandboxRunner(target)) {
-      if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
+      const predecessor = target.readPredecessorSandboxRecord && input.identity.runId
+        ? await resolvePredecessorRunnerLease(input.db, { companyId: input.execution.binding.companyId, runId: input.identity.runId })
+        : null;
+      if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity,
+        ...(predecessor && target.readPredecessorSandboxRecord ? { predecessor: {
+          start: predecessor.start,
+          providerLeaseId: predecessor.providerLeaseId,
+          probedProviderLeaseId: target.sandboxLeaseAcquisition?.providerLeaseId ?? null,
+          readSandbox: () => target.readPredecessorSandboxRecord!({ leaseId: predecessor.leaseId }),
+        } } : {}),
+      })) {
         return refuse("restarted_sandbox_runner_generation_not_lost");
       }
     } else if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
@@ -15080,24 +15092,6 @@ export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
 export const PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE = true;
 /** Bound on the caller's read of the predecessor's provider record. */
 export const PREDECESSOR_SANDBOX_READ_TIMEOUT_MS = 15_000;
-
-/** The provider's own record of the PREDECESSOR's sandbox (its own
- * providerLeaseId, never the current box), as the provider plugin reads it
- * (Boat: GET /sandboxes/{id}). Never derived from a lease label. */
-export type PredecessorSandboxRecord =
-  /** The provider no longer has the sandbox (Boat: 404; a cancelled sandbox is reported once, then 404). */
-  | { kind: "gone" }
-  | {
-      kind: "present";
-      /** Provider-neutral state: "stopped" or "running" (from the typed observation). */
-      state: string;
-      /** When the sandbox last stopped, by any cause; null while it is not stopped (Boat stoppedAt). */
-      stoppedAt: string | null;
-      /** The sandbox kernel's last restart on its machine: every process running then ended (Boat lastReboot.at). */
-      lastRebootAt: string | null;
-      /** The provider's clock for this answer (the response's Date header), when it sent one. */
-      observedAt?: string | null;
-    };
 
 /** The predecessor Runner's own recorded start, and which record it is. */
 export type PredecessorStart = { at: string; source: "process" | "run" };

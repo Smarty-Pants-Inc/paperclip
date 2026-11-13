@@ -506,6 +506,11 @@ export async function resolveEnvironmentExecutionTarget(input: {
           typeof input.lease.metadata?.agentId === "string" && input.lease.metadata.agentId.trim()
         ? { runnerLeaseLifecycle: bindSandboxRunnerLeaseLifecycle(input as Parameters<typeof bindSandboxRunnerLeaseLifecycle>[0]) } : {}),
       ...(effectiveCapabilities ? { effectiveCapabilities: Object.freeze({ ...effectiveCapabilities }) } : {}),
+      ...(input.environmentRuntime?.readPredecessorSandboxRecord
+        ? { readPredecessorSandboxRecord: ({ leaseId }) => input.environmentRuntime!.readPredecessorSandboxRecord({
+            companyId: input.companyId, leaseId,
+          }) }
+        : {}),
       ...(input.environmentRuntime?.getRunnerIngressEndpoint && input.lease
         ? {
             getRunnerIngressEndpoint: ({ port, path }) =>

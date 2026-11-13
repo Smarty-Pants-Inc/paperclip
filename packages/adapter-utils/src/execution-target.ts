@@ -185,6 +185,24 @@ export interface SandboxLeaseAcquisition {
   restarted?: true;
 }
 
+/** The provider's own record of the PREDECESSOR's sandbox (its own
+ * providerLeaseId, never the current box), as the provider plugin reads it
+ * (Boat: GET /sandboxes/{id}). Never derived from a lease label. */
+export type PredecessorSandboxRecord =
+  /** The provider no longer has the sandbox (Boat: 404; a cancelled sandbox is reported once, then 404). */
+  | { kind: "gone" }
+  | {
+      kind: "present";
+      /** Provider-neutral state: "stopped" or "running" (from the typed observation). */
+      state: string;
+      /** When the sandbox last stopped, by any cause; null while it is not stopped (Boat stoppedAt). */
+      stoppedAt: string | null;
+      /** The sandbox kernel's last restart on its machine: every process running then ended (Boat lastReboot.at). */
+      lastRebootAt: string | null;
+      /** The provider's clock for this answer (the response's Date header), when it sent one. */
+      observedAt?: string | null;
+    };
+
 export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
   kind: "remote";
   transport: "sandbox";
@@ -238,6 +256,10 @@ export interface AdapterSandboxExecutionTarget extends AdapterExecutionTargetWor
   remoteCwd: string;
   timeoutMs?: number | null;
   runner?: CommandManagedRuntimeRunner;
+  /** Host-only fresh provider read, bound to this target's company. The caller
+   * names the predecessor's own lease, not the current target's lease. Older
+   * runtimes may omit it; absence grants no provider proof. */
+  readPredecessorSandboxRecord?: (input: { leaseId: string }) => Promise<PredecessorSandboxRecord>;
   /** Host-only provider operation. It is never serialized into the sandbox. */
   getRunnerIngressEndpoint?: (input: {
     leaseId: string;
