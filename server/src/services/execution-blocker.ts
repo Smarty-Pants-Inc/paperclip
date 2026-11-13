@@ -24,6 +24,7 @@ import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/held-predecessor-notic
 import { readUnsupersededHeldConversationNotice } from "./native-runtime/pi-session-recovery-notice.js";
 import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 import { NATIVE_HUMAN_SELF_HANDOFF_KEY } from "./native-runtime/native-human-self-handoff.js";
+import { readUnsupersededExecutionDeadlineNotice } from "./execution-deadline-notice.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -424,7 +425,11 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   // its session superseded refuses a Retry the same way it refuses a message,
   // so do not offer Retry (or tell a person to use it) while it stands.
   const heldConversationNotice = await readUnsupersededHeldConversationNotice(db, { companyId, issueId });
-  const canRetry = Boolean(!heldConversationNotice && (!restoreHold || recoveredFailure) && run &&
+  // The execution-deadline notice tells the person to verify the stopped
+  // execution before retrying. Until a later committed success supersedes it,
+  // follow it: no Retry, and its own guidance as the next action.
+  const deadlineNotice = await readUnsupersededExecutionDeadlineNotice(db, { companyId, issueId });
+  const canRetry = Boolean(!heldConversationNotice && !deadlineNotice && (!restoreHold || recoveredFailure) && run &&
     conversation?.assigneeAgentId === run.agentId &&
 
     !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
@@ -497,6 +502,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     agentId: run?.agentId ?? null,
     cause: action.cause,
     nextAction: (refusedRecoveredConversation ? HELD_PREDECESSOR_NOTICE
+      : deadlineNotice && !withoutWorkspace && (!workspaceRecovery || workspaceRecovery.status === "recovered") ? deadlineNotice.body
       : workspaceRecovery?.status === "recovered" && canRetry && !chatBinding
       ? "Saved work recovered. Retry or send a message to continue." : workspaceRecovery?.message) ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
 
