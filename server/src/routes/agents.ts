@@ -167,7 +167,7 @@ import { adapterSettingsService } from "../services/adapter-settings.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
-import { assertCanManageSubordinateAgent, assertSubordinateBudgetChange, subordinatePermissionScope } from "../services/agent-subtree-management.js";
+import { assertAgentLifecycleAuthority, assertCanManageSubordinateAgent, assertSubordinateBudgetChange, subordinatePermissionScope } from "../services/agent-subtree-management.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import { AGENT_TERMINATED_STOP_REASON } from "../services/governance-pause-stop.js";
 import {
@@ -2630,6 +2630,12 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
+  function lifecycleForRequest(req: Request, target: { id: string; companyId: string }) {
+    if (req.actor.type !== "agent") return svcLifecycle;
+    return createAgentLifecycle(db, { cancelWorkForScope: scope => heartbeat.cancelBudgetScopeWork(scope) },
+      tx => assertAgentLifecycleAuthority(tx, req.actor, target));
+  }
+
   function assertNoAgentInstructionsConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
@@ -4464,7 +4470,8 @@ export function agentRoutes(
       typeof req.body.taskKey === "string" && req.body.taskKey.trim().length > 0
         ? req.body.taskKey.trim()
         : null;
-    const state = await heartbeat.resetRuntimeSession(id, { taskKey });
+    const state = await heartbeat.resetRuntimeSession(id, { taskKey,
+      ...(req.actor.type === "agent" ? { managementActor: req.actor } : {}) });
 
     const actor = getActorInfo(req);
     await logActivity(db, {
@@ -5122,49 +5129,52 @@ export function agentRoutes(
           at: new Date().toISOString(),
         } }
       : req.body;
-    const agent = await svc.updatePermissions(id, permissionsPatch, { actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null });
+    const agent = await svc.updatePermissions(id, permissionsPatch, {
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
+      afterUpdate: async (tx, agent, publications) => {
+        const txAccess = accessService(tx);
+        const effectiveCanAssignTasks =
+          agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
+        await txAccess.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
+        // The toggle is the visible hiring control: turning it off also removes an
+        // explicit agents:create grant that would otherwise still allow hiring.
+        if (req.body.canCreateAgents === false) {
+          await txAccess.setPrincipalPermission(agent.companyId, "agent", agent.id, "agents:create", false, null);
+        }
+        await txAccess.setPrincipalPermission(
+          agent.companyId,
+          "agent",
+          agent.id,
+          "tasks:assign",
+          effectiveCanAssignTasks,
+          req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+          req.actor.type === "agent" ? { subtreeRootAgentId: agent.id } : null,
+        );
+
+        const actor = getActorInfo(req);
+        await logActivity(tx, {
+          companyId: agent.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "agent.permissions_updated",
+          entityType: "agent",
+          entityId: agent.id,
+          details: {
+            canCreateAgents: agent.permissions?.canCreateAgents ?? false,
+            canCreateSkills: agent.permissions?.canCreateSkills ?? true,
+            canAssignTasks: effectiveCanAssignTasks,
+            trustPreset: agent.permissions?.trustPreset ?? "standard",
+          },
+        }, publications);
+      },
+    });
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-
-    const effectiveCanAssignTasks =
-      agent.role === "ceo" || Boolean(agent.permissions?.canCreateAgents) || req.body.canAssignTasks;
-    await access.ensureMembership(agent.companyId, "agent", agent.id, "member", "active");
-    // The toggle is the visible hiring control: turning it off also removes an
-    // explicit agents:create grant that would otherwise still allow hiring.
-    if (req.body.canCreateAgents === false) {
-      await access.setPrincipalPermission(agent.companyId, "agent", agent.id, "agents:create", false, null);
-    }
-    await access.setPrincipalPermission(
-      agent.companyId,
-      "agent",
-      agent.id,
-      "tasks:assign",
-      effectiveCanAssignTasks,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-      req.actor.type === "agent" ? { subtreeRootAgentId: agent.id } : null,
-    );
-
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "agent.permissions_updated",
-      entityType: "agent",
-      entityId: agent.id,
-      details: {
-        canCreateAgents: agent.permissions?.canCreateAgents ?? false,
-        canCreateSkills: agent.permissions?.canCreateSkills ?? true,
-        canAssignTasks: effectiveCanAssignTasks,
-        trustPreset: agent.permissions?.trustPreset ?? "standard",
-      },
-    });
-
     res.json(await buildAgentDetail(agent));
   });
 
@@ -5219,6 +5229,7 @@ export function agentRoutes(
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
           source: "instructions_path_patch",
         },
+        requireSubordinateManagement: true,
       },
     );
     if (!agent) {
@@ -5904,7 +5915,7 @@ export function agentRoutes(
     };
     const command = requestedStatus === "paused" ? "pause" : requestedStatus === "idle" ? "resume" : requestedStatus === "terminated" ? "terminate" : null;
     const agent = command
-      ? await svcLifecycle.updateAndTransition(id, command, patchData, updateOptions)
+      ? await lifecycleForRequest(req, existing).updateAndTransition(id, command, patchData, updateOptions)
       : await svc.update(id, patchData, updateOptions);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5933,7 +5944,7 @@ export function agentRoutes(
     if (!existing) return;
     await assertCanManageAgentLifecycle(req, existing);
     await assertCanConfigureAgentSetup(req, existing);
-    const agent = await svcLifecycle.retry(id);
+    const agent = await lifecycleForRequest(req, existing).retry(id);
     if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
     const actor = getActorInfo(req);
     await logActivity(db, { companyId: agent.companyId, actorType: actor.actorType, actorId: actor.actorId,
@@ -5949,7 +5960,7 @@ export function agentRoutes(
       return;
     }
     await assertCanManageAgentLifecycle(req, existing);
-    const agent = await svcLifecycle.pauseAgent(id);
+    const agent = await lifecycleForRequest(req, existing).pauseAgent(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -5986,7 +5997,7 @@ export function agentRoutes(
       });
       return;
     }
-    const agent = await svcLifecycle.resumeAgent(id);
+    const agent = await lifecycleForRequest(req, existing).resumeAgent(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -6022,7 +6033,9 @@ export function agentRoutes(
       return;
     }
 
-    const agent = await svc.clearError(id);
+    const agent = req.actor.type === "agent"
+      ? await lifecycleForRequest(req, existing).clearError(id)
+      : await svc.clearError(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -6090,7 +6103,7 @@ export function agentRoutes(
 
     const agent = existing.status === "pending_approval"
       ? (await approvalsSvc.rejectHire(id, req.actor.userId ?? "board"))?.agent
-      : await svcLifecycle.terminateAgent(id);
+      : await lifecycleForRequest(req, existing).terminateAgent(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
@@ -6441,6 +6454,7 @@ export function agentRoutes(
       );
     }
     const run = await heartbeat.wakeup(id, {
+      ...(req.actor.type === "agent" && req.actor.agentId !== id ? { managementActor: req.actor } : {}),
       failedRunId: req.body.failedRunId ?? null,
       ...(req.actor.type === "board" && !req.body.failedRunId ? { manualUserWake: true } : {}),
       source: opts.source,
@@ -6577,6 +6591,7 @@ export function agentRoutes(
       }
     }
     const wakeOpts: Parameters<typeof heartbeat.wakeup>[1] = {
+      ...(req.actor.type === "agent" && req.actor.agentId !== id ? { managementActor: req.actor } : {}),
       ...(req.actor.type === "board" ? { manualUserWake: true } : {}),
       source: "on_demand",
       triggerDetail: typeof body.triggerDetail === "string" ? body.triggerDetail as "manual" | "system" | "ping" | "callback" : "manual",
@@ -7368,7 +7383,7 @@ export function agentRoutes(
     const run = await heartbeat.cancelRun(runId, req.actor.type === "agent"
       ? "Cancelled by a managing agent" : "Cancelled by a board operator", {
       ...(requestId ? { cancellationRequestId: requestId, cancellationRequestedByUserId: req.actor.userId ?? null } : {}),
-      ...(req.actor.type === "agent" ? { errorCode: "operator_interrupted" } : {}),
+      ...(req.actor.type === "agent" ? { errorCode: "operator_interrupted", managementActor: req.actor } : {}),
       resultJson: req.actor.type === "agent" ? {
         cancelledByActorType: "agent",
         cancelledByAgentId: actor.agentId,

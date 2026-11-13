@@ -1,3 +1,5 @@
+import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
+import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -2437,6 +2439,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    const withManagedWakeWrite = async <T>(work: (writer: Db) => Promise<T>): Promise<T> => {
+      if (!opts.managementActor) return work(db);
+      return db.transaction(async tx => {
+        await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
+        return work(tx as unknown as Db);
+      });
+    };
     if (issueId && await hasAutomaticInteractionDeliveryHold(db, {
       companyId: agent.companyId, issueId, agentId, payload, context: enrichedContextSnapshot,
       actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
@@ -2467,7 +2476,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const oldConfig = parseObject(agent.adapterConfig);
       const nextConfig = normalizeLegacyRunnerProvider(oldConfig);
       if (nextConfig !== oldConfig) {
-        await agentService(db).update(
+        const update = opts.managementActor
+          ? createAgentLifecycle(db, {}, tx => assertAgentLifecycleAuthority(tx, opts.managementActor!, agent)).updateConfiguration
+          : agentService(db).update;
+        await update(
           agent.id,
           { adapterConfig: nextConfig },
           {
@@ -2654,7 +2666,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       skipReason: string,
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
       waitCondition?: Record<string, unknown>,
-    ): Promise<{ created: boolean; waitSaved?: boolean }> => {
+    ): Promise<{ created: boolean; waitSaved?: boolean }> => withManagedWakeWrite(async db => {
       // A temporary refusal must leave the handoff retryable, without burning
       // its one durable receipt ID on a skipped wake.
       if (caseRequest) return { created: false };
@@ -2704,7 +2716,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         await db.insert(agentWakeupRequests).values(request);
       }
       return { created: true };
-    };
+    });
     const writeSkippedHeartbeatRequest = async (
       skipReason: string,
       details: Record<string, unknown>,
@@ -3103,6 +3115,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       const outcome = await db
         .transaction(withDurableChatAdmission(durableRequest, async (tx) => {
+          await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
@@ -4870,6 +4883,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       : filterZombieCoalesceTarget(rawCoalescedTarget, liveRunExecutions);
 
     if (coalescedTargetRun) {
+      return withManagedWakeWrite(async db => {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
@@ -4906,9 +4920,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         finishedAt: new Date(),
       });
       return mergedRun;
+      });
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
+      await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
       await notifyRunDispatch(tx, { companyId: agent.companyId });
       await tx.execute(
         sql`select id from agents where id = ${agentId} and company_id = ${agent.companyId} for update`,

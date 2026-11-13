@@ -96,8 +96,16 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
   };
 }
 
-export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
-  return lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
+export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}, authorize?: (tx: Db) => Promise<void>) {
+  const effects = createAgentLifecycleEffects(hooks);
+  // Reporting-tree edits use this same company accounting lock. Never reuse a
+  // route's earlier authorization snapshot after waiting for that lock.
+  if (authorize) effects.transaction = (database, companyId, work) =>
+    withAccountingTransaction(database, companyId, async (tx, publications) => {
+      await authorize(tx);
+      return work(tx, publications);
+    });
+  return lifecycle.createAgentLifecycle(db, effects);
 }
 
 export function initializeImportedAgentConfigurationInTransaction(tx: Db, publications: ActivityPublication[],
