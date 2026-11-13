@@ -15997,7 +15997,10 @@ describe("runnerd provider runtime wiring", () => {
       // beforeConnect is the production callback that binds this backend to
       // its live control plane. No probe is used to obtain the connection count.
       await driver.mock.calls.at(-1)![0].beforeConnect?.(identity as never,
-        { activeRunnerConnectionCount: () => connected ? 1 : 0 } as never);
+        // Since RFL F2 a counted socket alone is not liveness: a connected row
+        // here means connected AND fresh from that same runner generation.
+        { activeRunnerConnectionCount: () => connected ? 1 : 0,
+          runnerFreshlyAlive: (runnerInstanceId: string) => connected && runnerInstanceId === identity.runnerInstanceId } as never);
       await options.onSession?.(session);
       return result;
     }).mockImplementationOnce(async options => {
