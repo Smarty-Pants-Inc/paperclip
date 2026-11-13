@@ -1525,8 +1525,9 @@ nothing needs board repair, and the task's Retry starts a new acquisition.
 For a run answering a persisted human message in the same task, these proven
 pre-dispatch availability failures instead use `transient_start_wait`, an
 uncharged wait within the existing scheduled-retry owner. They have no attempt
-cap. Refused starts can cost money, so retries are never faster than once every
-five minutes, and a typed provider `retryAt` can only delay that deadline. The
+cap **only for class (i)**: an acquisition refusal before a box exists spends no
+start, and backs off 15, 30, 60, 120, 240, then 300 seconds. A typed provider
+`retryAt` can only delay that deadline. The
 original message identity, authorization, and independent wait count follow the
 chain; the predecessor's transactional successor claim deduplicates competing
 scheduler/recovery requests. No message or tool is replayed after work begins.
@@ -1535,6 +1536,15 @@ Native startup uses its existing same-run bootstrap coordinator for the exact
 session.open refusal (startup rate-limit/overload/timeout with an allowlisted
 HTTP status). Only existing no-provider-event/no-checkpoint proof admits another
 start; lease, identity, retained-owner and task admission fences still apply.
+These failures are **class (ii)** because the box already started/resumed. They
+keep the five-minute backoff and the native ceiling of **three total starts**,
+including the original (no fourth start). The admitted-attempt and restart gates
+keep that same bound, including state saved by the previous release. Exhaustion
+hands the unchanged message/run identity to the existing terminal coordinator
+and board-owned `active_run_watchdog` action (`native_session_retry_exhausted`).
+The run records class, attempt, cap, message identity and handoff in
+`resultJson.transientStartRetry`; scheduled class (i) retries record class and
+attempt in their lifecycle event. Neither cap consumes or deletes the message.
 Unknown failures, authentication, model/permission and owner-state refusals gain
 no new retry authority. After 60 seconds waiting, the existing retry deadline
 owner projects one compact persistent system notice per human message: “The

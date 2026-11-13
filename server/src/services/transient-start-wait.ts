@@ -51,12 +51,14 @@ export async function environmentStartWait(db: Db, run: typeof heartbeatRuns.$in
   return humanMessageStartWait(db, run, now);
 }
 
-/** Five-minute ceiling on frequency for paid/refused starts. Never cap attempts.
- * A provider's later retryAt can only slow this down. */
-export function transientStartRetryAt(now: Date, failure?: unknown): Date {
+/** Class (i) refusals cost no start: 15s -> 300s, uncapped. Omit the
+ * attempt for the conservative five-minute class (ii) schedule. */
+export function transientStartRetryAt(now: Date, failure?: unknown, freeAttempt?: number): Date {
   const typed = readProviderFailure(failure);
   const retryAt = typed?.retryAt ? Date.parse(typed.retryAt) : 0;
-  return new Date(Math.max(now.getTime() + 300_000, Number.isFinite(retryAt) ? retryAt : 0));
+  const delay = freeAttempt === undefined ? 300_000
+    : Math.min(300_000, 15_000 * 2 ** Math.min(5, Math.max(0, freeAttempt - 1)));
+  return new Date(Math.max(now.getTime() + delay, Number.isFinite(retryAt) ? retryAt : 0));
 }
 
 function noticeKey(messageId: string) { return `transient_start_retry:${messageId}`; }

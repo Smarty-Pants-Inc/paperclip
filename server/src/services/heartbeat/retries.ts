@@ -610,9 +610,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const taskCapSpent = transientIssueId !== null
       && !(await transientRetryWithinTaskCap(db, run.companyId, transientIssueId, now));
     const computedBaseSchedule = startWait ? {
-      attempt: nextAttempt, baseDelayMs: 300_000,
-      delayMs: transientStartRetryAt(now, run.resultJson?.providerFailure).getTime() - now.getTime(),
-      dueAt: transientStartRetryAt(now, run.resultJson?.providerFailure), maxAttempts,
+      attempt: nextAttempt, baseDelayMs: Math.min(300_000, 15_000 * 2 ** Math.min(5, consumedAttempts)),
+      delayMs: transientStartRetryAt(now, run.resultJson?.providerFailure, nextAttempt).getTime() - now.getTime(),
+      dueAt: transientStartRetryAt(now, run.resultJson?.providerFailure, nextAttempt), maxAttempts,
     } : failureBudgetSpent || taskCapSpent ? null
       : opts?.delayMs != null
         ? nextAttempt <= maxAttempts
@@ -1488,10 +1488,14 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
+      message: startWait
+        ? `Transient start class=i retry=${schedule.attempt} scheduled for ${schedule.dueAt.toISOString()}`
+        : `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
       payload: {
         retryRunId: retryRun.id,
         retryReason,
+        ...(startWait ? { transientStartRetry: { class: "i", attempt: schedule.attempt,
+          messageId: startWait.messageId, exhausted: false } } : {}),
         ...(transientRecovery
           ? { errorFamily: transientRecovery.errorFamily }
           : {}),

@@ -115,7 +115,7 @@ import { parseCodexCliVersion } from "./codex-runtime-compatibility.js";
 import { createNativeToolTrace, type NativeToolTrace } from "./native-tool-trace.js";
 import { createNativeProviderFailureObservation } from "./native-provider-failure.js";
 import { explainNativeTurnFailure } from "./native-run-failure-explanation.js";
-import { humanMessageStartWait, readTransientStartWait, transientProviderStartFailure, TRANSIENT_START_TRANSPORT_CLOSED, TRANSIENT_START_UNAVAILABLE } from "../transient-start-wait.js";
+import { humanMessageStartWait, transientProviderStartFailure, TRANSIENT_START_TRANSPORT_CLOSED, TRANSIENT_START_UNAVAILABLE } from "../transient-start-wait.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { nativeStartupRetryExhaustedAction, nativeStartupRetryWait, planNativeStartupRetry } from "./native-startup-retry.js";
 import { admitUnclaimedNativeBootstrapRetry } from "./native-bootstrap-retry.js";
@@ -9123,7 +9123,7 @@ export function nativeSessionFailureDisposition(
   attempt: number,
   now = new Date(),
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
-  transientStartWait = false,
+  _transientStartWait = false,
 ) {
   const permanentFailure =
     // A same-run retry would meet the same unretired owner on the same sandbox;
@@ -9150,7 +9150,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED ||
     sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER;
   const permissionDeclined = sourceFailureCode === "native_permission_declined";
-  const exhausted = permanentFailure || permissionDeclined || (!transientStartWait && attempt >= 3);
+  const exhausted = permanentFailure || permissionDeclined || attempt >= 3;
   return {
     phase: exhausted
       ? ("terminal_failure" as const)
@@ -13627,6 +13627,12 @@ async function executePaperclipNativeSessionAttempt(
               transientStartWait: !!startWait,
             })
           : null;
+      const startRetry = startWait ? { class: "ii" as const, attempt, maxAttempts: 3,
+        exhausted: startupRetryExhausted, messageId: startWait.messageId,
+        ...(startupRetryExhausted ? { handoff: "active_run_watchdog" } : {}) } : null;
+      if (startRetry) {
+        try { await input.onLog?.("stderr", `[paperclip-runner] transient start class=ii attempt=${attempt}/3${startupRetryExhausted ? " exhausted; handoff=active_run_watchdog; message=pending" : " retry=scheduled"}\n`); } catch {}
+      }
       const providerCooldownAt = startupRetry?.providerCooldownAt ?? null;
       const nextAttemptAt =
         recoveryEvidence.recoveryMode === "ambiguous_state"
@@ -13935,7 +13941,7 @@ async function executePaperclipNativeSessionAttempt(
             error: message,
             resultJson: sql`(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'remoteRunnerRecovery')
               || ${JSON.stringify(remoteRunnerRecovery ? { remoteRunnerRecovery } : {})}::jsonb
-              || ${JSON.stringify(startWait ? { transientStartWait: startWait } : {})}::jsonb
+              || ${JSON.stringify(startWait ? { transientStartWait: startWait, transientStartRetry: startRetry } : {})}::jsonb
               || ${providerFailure ? sql`jsonb_build_object('providerFailure', coalesce(${heartbeatRuns.resultJson}->'providerFailure', ${JSON.stringify(providerFailure)}::jsonb))` : sql`'{}'::jsonb`}`,
             errorCode: ownershipUnverified
               ? NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE
@@ -14005,6 +14011,7 @@ async function executePaperclipNativeSessionAttempt(
               statusVersion: failureBlockStatusVersion,
             } } : {}),
             coordinatorAttempt: attempt,
+            ...(startRetry ? { transientStartRetry: startRetry } : {}),
             sourceFailureCode,
             ...(remoteRunnerRecovery ? { remoteRunnerRecovery } : {}),
             recoveryDisposition: failureCode,

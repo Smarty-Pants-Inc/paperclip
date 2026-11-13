@@ -114,10 +114,13 @@ describe("native restart recovery classification", () => {
       reason: "execution_recovery_budget_exhausted",
     });
   });
-  it("keeps a proven human-message START wait unbounded without weakening owner or work evidence", () => {
+  it("caps paid startup even when old saved state carries the human-message wait marker", () => {
     const evidence = { runnerPidAlive: false, runnerGroupAlive: false, processStartMatches: false,
       hasCheckpoint: false, hasProviderEvidence: false, providerAttempt: 64, transientStartWait: true };
-    expect(classifyNativeRunnerRecoveryEvidence(evidence).claimKind).toBe("bootstrap_incomplete");
+    expect(classifyNativeRunnerRecoveryEvidence(evidence)).toMatchObject({ claimKind: null, reason: "execution_recovery_budget_exhausted" });
+    expect(classifyNativeRunnerRecoveryEvidence({ ...evidence, providerAttempt: 2 }).claimKind).toBe("bootstrap_incomplete");
+    expect(classifyNativeRunnerRecoveryEvidence({ ...evidence, providerAttempt: 3,
+      remoteSandbox: true, remoteBootstrapProvenIncomplete: true }).claimKind).toBeNull();
     for (const changed of [{ hasCheckpoint: true }, { hasProviderEvidence: true }, { checkpointFailed: true },
       { runnerPidAlive: true }, { runnerGroupAlive: true }, { knownProviderProcessAlive: true },
       { knownProviderProcessIdentityAmbiguous: true }, { remoteSandbox: true }]) {

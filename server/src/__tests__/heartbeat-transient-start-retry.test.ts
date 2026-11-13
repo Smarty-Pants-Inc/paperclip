@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { agents, authUsers, companyMemberships, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, authUsers, companyMemberships, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import type { NativeRunIdentity, NativeSession, NativeSessionBackend, PrpEvent } from "@paperclipai/paperclip-runner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { heartbeatService, type HeartbeatServiceOptions } from "../services/heartbeat.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { projectTransientStartNotices } from "../services/transient-start-wait.js";
 import { closeIdleWarmNativeSessionsForRestart } from "../services/native-runtime/native-session-executor.js";
 import { nativeRestartFixture, waitForCondition } from "./helpers/native-restart-fixture.js";
 import { getRecoveryPostgresSupport } from "./helpers/recovery-postgres-fixture.js";
@@ -123,15 +124,16 @@ describe.skipIf(!support.supported)("human-message transient start retries", () 
       expect(await f.read()).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
       const [first] = await f.children(f.run.id);
       expect(first).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: RETRY_REASON, scheduledRetryAttempt: 1 });
-      expect(first!.scheduledRetryAt!.getTime() - Date.now()).toBeGreaterThan(295_000);
+      expect(first!.scheduledRetryAt!.getTime() - Date.now()).toBeGreaterThan(10_000);
+      expect(first!.scheduledRetryAt!.getTime() - Date.now()).toBeLessThanOrEqual(15_000);
       expect(first!.contextSnapshot?.executionRetryAccounting).toMatchObject({ failureRetries: 0 });
       expect(await f.notices()).toHaveLength(0);
       const began = Date.parse((first!.contextSnapshot!.transientStartWait as { firstFailureAt: string }).firstFailureAt);
       // Simulate the scheduler's clock, not the PostgreSQL lease clock.
-      expect(await f.heartbeat.promoteDueScheduledRetries(new Date(began + 59_999))).toMatchObject({ promoted: 0 });
+      await projectTransientStartNotices(f.db, new Date(began + 59_999));
       expect(await f.notices()).toHaveLength(0);
-      await Promise.all([f.heartbeat.promoteDueScheduledRetries(new Date(began + 60_000)),
-        f.heartbeat.promoteDueScheduledRetries(new Date(began + 60_000))]);
+      await Promise.all([projectTransientStartNotices(f.db, new Date(began + 60_000)),
+        projectTransientStartNotices(f.db, new Date(began + 60_000))]);
       const notices = await f.notices();
       expect(notices).toHaveLength(1);
       expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice" });
@@ -211,11 +213,49 @@ describe.skipIf(!support.supported)("human-message transient start retries", () 
     } finally { await f.cleanup(); }
   }, 90_000);
 
+  it.each(["transport", "overloaded"] as const)("caps class ii %s after three starts and preserves the pending message at the fence seam", async kind => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = await start({ startupFailures: 10, startupFailureKind: kind });
+    try {
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const [coordinator] = await f.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id));
+        expect(coordinator).toMatchObject({ phase: "retryable_failure", attempt });
+        if (attempt === 1) {
+          vi.setSystemTime(Date.now() + 60_000);
+          await f.heartbeat.promoteDueScheduledRetries();
+        }
+        vi.setSystemTime(coordinator!.nextAttemptAt!);
+        await f.heartbeat.reapOrphanedRuns();
+        await waitForCondition("capped attempt settlement", () => f.heartbeat.getTaskDrainStatus().quiescent);
+      }
+      const [coordinator] = await f.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id));
+      expect(coordinator).toMatchObject({ phase: "terminal_failure", attempt: 3,
+        failureCode: "native_session_retry_exhausted", nextAttemptAt: null });
+      expect((await f.read()).resultJson).toMatchObject({ transientStartRetry: {
+        class: "ii", attempt: 3, maxAttempts: 3, exhausted: true, messageId: f.message.id,
+        handoff: "active_run_watchdog" } });
+      const holds = await f.db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issue.id));
+      expect(holds).toContainEqual(expect.objectContaining({ kind: "active_run_watchdog", status: "active",
+        ownerType: "board", cause: "native_session_retry_exhausted", evidence: expect.objectContaining({ runId: f.run.id }) }));
+      const comments = await f.db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+      expect(comments.filter(comment => comment.authorType === "user")).toEqual([expect.objectContaining({ id: f.message.id, deletedAt: null })]);
+      expect((await f.read()).contextSnapshot?.wakeCommentId).toBe(f.message.id);
+      expect(f.startup.starts).toBe(3);
+      expect(f.startup.turns).toBe(0);
+      expect(await f.notices()).toHaveLength(1);
+      vi.setSystemTime(Date.now() + 3_600_000);
+      await f.heartbeat.reapOrphanedRuns();
+      await f.heartbeat.promoteDueScheduledRetries();
+      expect(f.startup.starts).toBe(3);
+      expect(await f.children(f.run.id)).toHaveLength(0);
+    } finally { await f.cleanup(); }
+  }, 90_000);
+
   it.each(["transport", "overloaded"] as const)("retries %s-at-startup on the same native run and never resubmits a tool or comment", async kind => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    const f = await start({ startupFailures: 4, startupFailureKind: kind });
+    const f = await start({ startupFailures: 2, startupFailureKind: kind });
     try {
-      for (let attempt = 1; attempt <= 4; attempt++) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
         const [coordinator] = await f.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id));
         expect(coordinator).toMatchObject({ phase: "retryable_failure", attempt, failureDetail: {
           originalFailureCode: kind === "transport" ? "provider_startup_transport_closed" : "provider_startup_unavailable",
@@ -234,7 +274,7 @@ describe.skipIf(!support.supported)("human-message transient start retries", () 
       }
       await waitForCondition("same-run answer", async () => (await f.read()).status === "succeeded");
       expect(await f.children(f.run.id)).toHaveLength(0);
-      expect(f.startup.starts).toBe(5);
+      expect(f.startup.starts).toBe(3);
       expect(await f.notices()).toHaveLength(1);
       expect(f.startup.turns).toBe(1);
       const replies = await f.db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));

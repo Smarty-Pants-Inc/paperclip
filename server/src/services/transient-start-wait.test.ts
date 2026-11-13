@@ -32,9 +32,15 @@ describe("closed transient START policy", () => {
     expect(nativeSessionFailureSourceCode(error)).toBe("provider_startup_unavailable");
     expect(nativeSessionFailureSourceCode(Object.assign(new Error("unknown failure"), { providerFailure: failure })))
       .toBe("native_session_interrupted");
-    expect(nativeSessionFailureDisposition(64, new Date(), "provider_startup_transport_closed", true).phase).toBe("retryable_failure");
+    expect(nativeSessionFailureDisposition(3, new Date(), "provider_startup_transport_closed", true).phase).toBe("terminal_failure");
     expect(nativeSessionFailureDisposition(64, new Date(), "provider_startup_transport_closed").phase).toBe("terminal_failure");
     expect(nativeSessionFailureDisposition(64, new Date(), "runner_task_admission_rejected", true).phase).toBe("terminal_failure");
+  });
+  it("backs off free acquire refusals from 15 seconds to five minutes and honors retryAt", () => {
+    const now = new Date("2026-11-13T20:00:00Z");
+    const expected = [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
+    expected.forEach((delay, index) => expect(transientStartRetryAt(now, failure, index + 1).getTime() - now.getTime()).toBe(delay));
+    expect(transientStartRetryAt(now, { ...failure, retryAt: "2026-11-13T21:00:00Z" }, 1)).toEqual(new Date("2026-11-13T21:00:00Z"));
   });
   it("never retries a paid start sooner than five minutes, including arbitrarily late attempts, and honors retryAt", () => {
     const now = new Date("2026-11-13T20:00:00Z");
