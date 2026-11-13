@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, nativeRunnerCheckpoints, type Db } from "@paperclipai/db";
@@ -14,6 +15,9 @@ import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.j
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { isQuiescentRetainedPiSource, readStoppedRemotePiSource } from "./native-retained-pi-source.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
+import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
 
 export const NATIVE_CONTROLLER_RECOVERY_MAX_BYTES = 4 * 1024;
 
@@ -161,8 +165,9 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
   owner: typeof nativeRunFinalizations.$inferSelect, sourceLease: typeof environmentLeases.$inferSelect): Promise<boolean> {
   const { target, agentId, successorRunId, normalizedSessionId } = input;
   if (target.transport !== "sandbox" || !target.runner || !agentId || !successorRunId || !normalizedSessionId || successorRunId === input.runId
-    || owner.phase !== "terminal_failure" || owner.resultId !== null || owner.leaseOwner !== null || owner.recoveryState !== null
-    || !hasRemoteTerminationReceipt(sourceLease) || record(sourceLease.metadata?.remoteExecutionTermination).state !== "stopped") return false;
+    || owner.phase !== "terminal_failure" || owner.resultId !== null || owner.leaseOwner !== null || owner.recoveryState !== null) return false;
+  const physicallyStopped = hasRemoteTerminationReceipt(sourceLease)
+    && record(sourceLease.metadata?.remoteExecutionTermination).state === "stopped";
   const history = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.provider, target.providerKey!), eq(environmentLeases.providerLeaseId, target.sandboxLeaseAcquisition!.providerLeaseId)));
   const successor = history.find(lease => lease.id === target.leaseId);
@@ -180,6 +185,14 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
   if (!source || !current || source.runtimeMode !== "native" || current.runtimeMode !== "native"
     || current.status !== "running" || task?.executionRunId !== successorRunId || !source.finishedAt) return false;
   const profile = record(source.runnerProfileJson), snapshot = record(profile.sessionCheckpoint), binding = record(snapshot.identity);
+  // This receipt is issued only after Pi's clean cancellation/child cleanup
+  // and idle snapshot. It grants checkpoint maintenance, not a result or LOSS.
+  const idle = record(profile.nativeRetainedIdleCheckpoint);
+  const retainedUserStop = source.status === "cancelled" && owner.failureCode === "native_retry_cancelled"
+    && hasAcknowledgedNativeStopIntent(source) && idle.schema === "paperclip.native-retained-idle-checkpoint.v1"
+    && idle.companyId === input.companyId && idle.issueId === input.issueId && idle.runId === source.id
+    && idle.sessionId === normalizedSessionId && idle.bootId === owner.controllerBootId && idle.generation === owner.controllerGeneration;
+  if (!physicallyStopped && !retainedUserStop) return false;
   const metadata = readNativeControllerRecovery(profile.nativeControllerRecovery, snapshot);
   const admitted = parseNativeExecutionInput(profile.nativeExecutionInput);
   if (admitted.provider.kind !== "pi_rpc" || admitted.binding.runId !== source.id || admitted.binding.companyId !== input.companyId
@@ -195,14 +208,39 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
     || checkpoint.recoveryEvidence.normalizedSessionId !== normalizedSessionId) return false;
   const header = record(JSON.parse(checkpoint.records.get("header") ?? "null"));
   const identity = record(record(header.state).identity);
-  if (identity.runId !== source.id || identity.environmentLeaseId !== sourceLease.id
+  if (identity.runId !== source.id
     || identity.runnerInstanceId !== source.runnerInstanceId || identity.normalizedSessionId !== normalizedSessionId
     || [...checkpoint.records].some(([key, bytes]) => key.startsWith("command:") && record(JSON.parse(bytes)).status !== "completed")) return false;
-  const measured = await readStoppedRemotePiSource({ runner: target.runner, remoteCwd: sourceLease.metadata!.remoteCwd as string,
-    normalizedSessionId, runnerInstanceId: source.runnerInstanceId! });
-  if (!measured || !isQuiescentRetainedPiSource({ owner, runStatus: source.status, terminationReceipt: true, leaseHandoff: true,
-    identity: identity as Record<string, string>, providerSessionId: snapshot.providerSessionId,
-    checkpointRecords: checkpoint.records, ...measured })) return false;
+  if (retainedUserStop) {
+    // A warm Runner's physical lease can predate the stopped business turn.
+    // Accept it only within the already verified same-sandbox handoff chain.
+    const origin = history.find(lease => lease.id === identity.environmentLeaseId);
+    if (admitted.session.lifecyclePolicy.mode !== "warm" || !origin || origin.acquiredAt > sourceLease.acquiredAt
+      || typeof origin.metadata?.remoteCwd !== "string"
+      || !sameSandboxWorkspaceAllocation(origin.metadata.remoteCwd, sourceLease.metadata!.remoteCwd as string)) return false;
+    const controlBytes = JSON.stringify({
+      commands: [...checkpoint.records].filter(([key]) => key.startsWith("command:")).map(([, bytes]) => JSON.parse(bytes)),
+      committedEvents: [...checkpoint.records].filter(([key]) => key.startsWith("event:")).map(([, bytes]) => JSON.parse(bytes)),
+    });
+    if (stopJournalLeftUndeliveredTool(controlBytes) || await userStopLeftUncertainty(db, source)
+      || await nativeUserStopRecoveryHeld(db, input)) return false;
+    // Use the pack's existing no-follow, owner/cwd/native-header validator.
+    // This is only a read of retained history, not process death evidence.
+    const packRoot = posix.join(sourceLease.metadata!.remoteCwd as string, ".paperclip-runtime", "paperclip-runner", "provider-pack");
+    const directory = posix.join(sourceLease.metadata!.remoteCwd as string, ".paperclip-runtime", "paperclip-runner", "sessions",
+      createHash("sha256").update(normalizedSessionId).digest("hex"), "filesystem", "pi");
+    if (await probePiSessionResumeFile({ runner: target.runner, node: posix.join(packRoot, "node_modules", "node", "bin", "node"),
+      providerPackRoot: packRoot, directory, filename: `${normalizedSessionId}.jsonl`, normalizedSessionId,
+      providerSessionId: snapshot.providerSessionId, providerBackendSessionId: null,
+      workingDirectory: sourceLease.metadata!.remoteCwd as string }) !== "valid") return false;
+  } else {
+    if (identity.environmentLeaseId !== sourceLease.id) return false;
+    const measured = await readStoppedRemotePiSource({ runner: target.runner, remoteCwd: sourceLease.metadata!.remoteCwd as string,
+      normalizedSessionId, runnerInstanceId: source.runnerInstanceId! });
+    if (!measured || !isQuiescentRetainedPiSource({ owner, runStatus: source.status, terminationReceipt: true, leaseHandoff: true,
+      identity: identity as Record<string, string>, providerSessionId: snapshot.providerSessionId,
+      checkpointRecords: checkpoint.records, ...measured })) return false;
+  }
   // Measurements await a remote read. Recheck the exact source and current
   // ownership before accepting them; changed durable bytes keep the refusal.
   const [freshOwner] = await db.select().from(nativeRunFinalizations).where(and(
@@ -216,6 +254,7 @@ async function stoppedRetainedPiSource(db: Db, input: RetainedSandboxBindingInpu
   const sorted = <T extends { id: string }>(rows: T[]) => [...rows].sort((left, right) => left.id.localeCompare(right.id));
   const freshCheckpoint = await loadNativeRunnerCheckpoint(db, { companyId: input.companyId, issueId: input.issueId, runId: source.id });
   const parts = (value: DurablePrpCheckpoint) => [...value.records].sort(([left], [right]) => left.localeCompare(right));
+  if (retainedUserStop && (await userStopLeftUncertainty(db, source) || await nativeUserStopRecoveryHeld(db, input))) return false;
   return freshCheckpoint !== null && nativeSha256(parts(freshCheckpoint)) === nativeSha256(parts(checkpoint))
     && nativeSha256(freshOwner) === nativeSha256(owner)
     && nativeSha256(sorted(freshHistory)) === nativeSha256(sorted(history))

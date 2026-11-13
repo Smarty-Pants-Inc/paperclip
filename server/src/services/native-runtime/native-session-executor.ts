@@ -123,7 +123,7 @@ import { copyBackCodexAuth } from "@paperclipai/adapter-codex-local/server";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
 import { hasAcknowledgedNativeLifecycleStopIntent, hasAcknowledgedNativeReassignmentStopIntent, hasAcknowledgedNativeStopIntent, hasAcknowledgedNativeRunStopReceipt } from "../acknowledged-native-stop.js";
 import { stoppedCodexTurnIsTextOnly } from "./stopped-codex-turn.js";
-import { completedWorkspaceRecoveryCondition } from "../workspace-recovery-receipt.js";
+import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
 import { prepareVerifiedRemoteProviderPack, useVerifiedPreinstalledRemoteProviderPack, shouldUseBundledAcpxImageAssets } from "./remote-provider-pack.js";
 import { uploadVerifiedProviderPack } from "./provider-pack-upload.js";
 import { selectRemotePiCompanion } from "./remote-pi-companion.js";
@@ -5843,47 +5843,6 @@ function retirementReasonName(kind: keyof typeof RETIREMENT_REASON_NAMES, value:
  * settled journal prove it finished, so the same retirement applies. A local
  * warm Runner, or a resumed sandbox that still holds it, keeps the live path.
  */
-/** A user Stop leaves its owner uncertain when the owner's own events show a
- * failed turn or session, Pi's escalated abort, an uncertain side effect or
- * cleanup, or an interrupt with pending tool calls (the markers the settled
- * Pi interrupt proof rejects, native-retained-pi-source.ts). An unreadable
- * event log is uncertain too. */
-/** The settled-journal projection lets a gone remote Runner's undelivered
- * semantic_tool.result count as answered: a committed result vouches for it.
- * A Stop-settled owner has no result, so every journaled tool input needs a
- * delivered (completed) answer, and no answer may be outstanding. */
-function stopJournalLeftUndeliveredTool(controlBytes: string): boolean {
-  try {
-    const control = record(JSON.parse(controlBytes));
-    const results = (Array.isArray(control.commands) ? control.commands : []).map(record)
-      .filter(command => command.type === "semantic_tool.result");
-    if (results.some(command => command.status !== "completed")) return true;
-    const delivered = new Set(results.map(command => record(command.payload).sourceEventId));
-    return (Array.isArray(control.committedEvents) ? control.committedEvents : []).map(record).some(event =>
-      (event.eventType === "semantic_tool.input" || event.eventType === "mcp_app.tool_input") && !delivered.has(event.sourceEventId));
-  } catch {
-    return true;
-  }
-}
-
-async function userStopLeftUncertainty(db: Db, run: { id: string; companyId: string }): Promise<boolean> {
-  try {
-    const rows = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
-      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id),
-        inArray(heartbeatRunEvents.eventType, ["harness.diagnostic", "turn.failed", "session.failed"])));
-    return rows.some(row => {
-      if (row.eventType !== "harness.diagnostic") return true;
-      const payload = record(record(record(row.payload).prpEvent).payload);
-      if (payload.code === "provider_interrupt_requested"
-        && !(Array.isArray(payload.pendingCallIds) && payload.pendingCallIds.length === 0)) return true;
-      return [payload.code, record(payload.details).code, record(payload.error).code].some(code =>
-        typeof code === "string" && /pi_abort_escalated|side_effect.*(?:pending|uncertain)|cleanup_uncertain/.test(code));
-    });
-  } catch {
-    return true;
-  }
-}
-
 export async function inspectFinishedPerTurnRunnerdOwner(input: {
   db: Db;
   root: string;
@@ -5969,18 +5928,7 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   if (!prior.owner.resultId && !stoppedByUser) return refuse("owner_result_missing");
   if (prior.owner.leaseOwner) return refuse("owner_lease_held");
   if (prior.owner.recoveryState) return refuse(`owner_recovery_${retirementReasonName("recoveryState", prior.owner.recoveryState)}`);
-  const cancellationRecoveryHeld = async () => {
-    const [held] = await input.db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-      eq(issueRecoveryActions.companyId, binding.companyId), eq(issueRecoveryActions.sourceIssueId, binding.issueId),
-      or(sql`${issueRecoveryActions.evidence}->>'runId' = ${identity.runId}`,
-        sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${identity.runId}`,
-        sql`${issueRecoveryActions.evidence}#>>'{systemRecovery,sourceRunId}' = ${identity.runId}`),
-      or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        sql`(${issueRecoveryActions.evidence}#>>'{automaticRecovery,replay}' = 'blocked'
-          and not coalesce((${completedWorkspaceRecoveryCondition(identity.runId)}), false))`),
-    )).limit(1);
-    return !!held;
-  };
+  const cancellationRecoveryHeld = () => nativeUserStopRecoveryHeld(input.db, { ...binding, runId: identity.runId });
   if (stoppedByUser && await cancellationRecoveryHeld()) return refuse("owner_recovery_action_pending");
   // A durable controller is fenced by its released database lease; a legacy
   // controller still needs process evidence, exactly as for warm recovery.
