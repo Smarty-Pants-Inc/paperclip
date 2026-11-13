@@ -114,8 +114,12 @@ resource still transfers to `cleanup_pending`, regardless of prior absence.
 A late successful create reply has the same obligation. Recording its exact
 resource ID atomically restores `pending` and a due deadline when the operation
 was resolved only by bounded absence and has no lease owner. Recovery can finish
-the transfer even if the caller stops before queuing cleanup. Transfer holds the
-existing operation lock, so concurrent positive replies create one cleanup lease.
+the transfer even if the caller stops before queuing cleanup. If a newer attempt
+already owns the same unresolved creation key, recording transfers the late
+resource to its cleanup lease in that same transaction instead; the old operation
+stays `resolved` with that lease ID, so it does not reclaim the replacement's key.
+Direct late cleanup uses the same rule. The environment/admission lock and existing
+operation lock serialize these paths, so concurrent positive replies create one cleanup lease.
 A resolution after completed lease cleanup retains its lease ID and does not
 reopen or create another owner.
 Failed/unavailable lookups, null or unknown observations, foreign identities, and
