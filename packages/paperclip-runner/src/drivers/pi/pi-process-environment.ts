@@ -32,6 +32,13 @@ export const PI_PROCESS_ENVIRONMENT_KEYS = [
   ...PI_LANGFUSE_ENVIRONMENT_KEYS,
   // Assigned-MCP's existing run-scoped capability, NOT an agent API bearer.
   "PAPERCLIP_NATIVE_MCP_NAME", "PAPERCLIP_NATIVE_MCP_URL", "PAPERCLIP_NATIVE_MCP_TOKEN",
+  // Paperclip's managed GitHub run projection (doc/connections/GITHUB.md,
+  // "Run projection"): launchers and per-operation broker capabilities, never
+  // raw GitHub tokens. Do not admit GIT_CONFIG_COUNT/KEY_n/VALUE_n here.
+  "ZDOTDIR", "BASH_ENV", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR",
+  "PAPERCLIP_GITHUB_BROKER_URL", "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
+  "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT",
+  "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH_COMMAND", "SSH_AUTH_SOCK",
 ] as const;
 const PI_KEYS = new Set<string>(PI_PROCESS_ENVIRONMENT_KEYS);
 const PROXY_KEYS = new Set([

@@ -584,6 +584,14 @@ means no `GIT_CONFIG_*` variables. A nonnumeric count or any missing key/value
 rejects the entire set. HTTP, credential, URL, remote, and all other config keys
 are excluded. API bearer/JWT secrets, `ASCII_*`, tracing headers, and unknown runner variables do not reach Pi
 or its shell tools.
+Paperclip's managed GitHub run projection does reach Pi and
+its shell tools: launcher layout, broker URL and capabilities, and Git/SSH
+isolation settings (see `doc/connections/GITHUB.md`, "Run projection"). The
+capabilities are not GitHub tokens; the broker checks the active run and current
+identity/grants per operation. Raw `GH_TOKEN`, `GITHUB_TOKEN`,
+`GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, and `PAPERCLIP_GIT_TOKEN` do not
+reach Pi. Credential-bearing configured Git config pairs are not inherited;
+the managed launcher acquires credentials only for the individual GitHub operation.
 Paperclip tools use the existing run-bound host callback instead of an API key
 in the child environment.
 
