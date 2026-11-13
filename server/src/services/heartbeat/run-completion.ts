@@ -42,6 +42,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { allowlistedErrnoCode, allowlistedIngressReason, allowlistedSyscall, finiteSafeInteger } from "../../realtime/ingress-error-summary.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
 import { parseObject } from "../../adapters/utils.js";
 import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCandidate, isExternalChatPresentationContext, mergeHeartbeatRunResultJson, resolveHeartbeatRunResponse, type RunPresentationDecision } from "../heartbeat-run-summary.js";
@@ -1275,14 +1276,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const cause = err instanceof Error ? err.cause : undefined;
     const causeRecord = typeof cause === "object" && cause !== null ? cause as Record<string, unknown> : {};
     const causeSummary = cause === undefined ? undefined : {
-      code: typeof causeRecord.code === "string" ? causeRecord.code : null,
-      errno: typeof causeRecord.errno === "string" || typeof causeRecord.errno === "number" ? causeRecord.errno : null,
-      statusCode: typeof causeRecord.statusCode === "number" ? causeRecord.statusCode : null,
+      code: allowlistedErrnoCode(causeRecord.code),
+      errno: finiteSafeInteger(causeRecord.errno),
+      syscall: allowlistedSyscall(causeRecord.syscall),
+      statusCode: finiteSafeInteger(causeRecord.statusCode),
       // Never log the cause's raw prose: it can carry credentials. Code only.
-      reason: (m => /^[a-z][a-z0-9_.:-]{0,79}$/.test(m) ? m : null)(cause instanceof Error ? cause.message : String(cause)),
+      reason: allowlistedIngressReason(cause instanceof Error ? cause.message : String(cause)),
     };
     logger.error({ err: identityRedactor.redact({ message: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined }), runId,
-      errorCode: failureErrorCode, failureCause: thrownFailureCause, ...(causeSummary ? { causeSummary } : {}) }, "heartbeat execution failed");
+      errorCode: failureErrorCode, ...(causeSummary ? { causeSummary } : {}) }, "heartbeat execution failed");
 
     let logSummary: {
       bytes: number | null;
