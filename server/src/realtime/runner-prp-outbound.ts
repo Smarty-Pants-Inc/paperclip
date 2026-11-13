@@ -1,6 +1,5 @@
 import WebSocket from "ws";
 import { logger } from "../middleware/logger.js";
-import { stripSecretBearingUrlParts } from "../middleware/redact-sensitive.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "../services/native-runtime/native-runner-recovery-contract.js";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import type {
@@ -293,7 +292,7 @@ function ingressErrorSummary(error: unknown): {
   errno: string | number | null;
   syscall: string | null;
   statusCode: number | null;
-  message: string;
+  reason: string | null;
 } {
   const value = typeof error === "object" && error !== null
     ? error as Record<string, unknown>
@@ -306,8 +305,15 @@ function ingressErrorSummary(error: unknown): {
     errno: stringOrNumber(value.errno),
     syscall: typeof value.syscall === "string" ? value.syscall : null,
     statusCode: typeof value.statusCode === "number" ? value.statusCode : null,
-    message: stripSecretBearingUrlParts(message),
+    // Raw transport prose can carry credentials (an Authorization header, a
+    // URL inside a sentence). Log only a machine reason code, never prose.
+    reason: machineReasonCode(message),
   };
+}
+
+/** A bare error code such as `runner_ingress_upgrade_rejected`; anything else is dropped. */
+export function machineReasonCode(message: string): string | null {
+  return /^[a-z][a-z0-9_.:-]{0,79}$/.test(message) ? message : null;
 }
 
 function socketClosed(wire: WsJsonWireConnection): Promise<void> {

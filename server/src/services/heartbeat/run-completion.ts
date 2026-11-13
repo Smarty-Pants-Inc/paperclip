@@ -1278,7 +1278,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       code: typeof causeRecord.code === "string" ? causeRecord.code : null,
       errno: typeof causeRecord.errno === "string" || typeof causeRecord.errno === "number" ? causeRecord.errno : null,
       statusCode: typeof causeRecord.statusCode === "number" ? causeRecord.statusCode : null,
-      message: identityRedactor.redact(cause instanceof Error ? cause.message : String(cause)),
+      // Never log the cause's raw prose: it can carry credentials. Code only.
+      reason: (m => /^[a-z][a-z0-9_.:-]{0,79}$/.test(m) ? m : null)(cause instanceof Error ? cause.message : String(cause)),
     };
     logger.error({ err: identityRedactor.redact({ message: err instanceof Error ? err.message : String(err), stack: err instanceof Error ? err.stack : undefined }), runId,
       errorCode: failureErrorCode, failureCause: thrownFailureCause, ...(causeSummary ? { causeSummary } : {}) }, "heartbeat execution failed");
