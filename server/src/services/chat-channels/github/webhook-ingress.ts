@@ -1,5 +1,5 @@
 import { GITHUB_RECOVERY_STATE_KEY, GITHUB_RECOVERY_INTERVAL_MS, GITHUB_RECOVERY_WINDOW_MS,
-  GITHUB_RECOVERY_SCAN_LEASE_MS, githubRecoveryWindow, type GitHubRecoveryWindow } from "./webhook-recovery-state.js";
+  GITHUB_RECOVERY_SCAN_LEASE_MS, githubRecoveryWindow, githubRecoveryEventIsEligible, type GitHubRecoveryWindow } from "./webhook-recovery-state.js";
 import { githubWebhookRecoverySchedule } from "./webhook-recovery-schedule.js";
 import { registerGitHubWebhookRecoveryWork } from "./webhook-recovery-work.js";
 import { notifyGitHubWebhookRecovery } from "./webhook-recovery-notifications.js";
@@ -72,6 +72,8 @@ import {
   readGitHubAppWebhookConfig,
   requestGitHubAppWebhookRedelivery,
   getGitHubRecoveryComment,
+  getGitHubRecoveryPullRequest,
+  type GitHubRecoveryPullRequest,
   type GitHubAppWebhookDelivery,
   type GitHubAppWebhookDeliveryDetail,
 } from "../../chat-github-webhook-config.js";
@@ -377,7 +379,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             installation?: { id?: unknown };
             repository?: { id?: unknown; full_name?: unknown };
             issue?: { id?: unknown; number?: unknown };
-            pull_request?: { id?: unknown; number?: unknown };
+            pull_request?: { id?: unknown; number?: unknown; head?: { sha?: unknown } };
             sender?: { id?: unknown };
             comment?: {
               id?: unknown;
@@ -396,9 +398,10 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
             fence.credentialFingerprint !== context.credentialFingerprint ||
             fence.webhookUrl !==
               `${getWebhookPublicBaseUrl()}/api/chat-webhooks/${currentEndpoint.publicId}/github` ||
-            !original?.payload?.comment ||
+            !original?.payload ||
             original.event !== eventType ||
-            incoming?.action !== "created" ||
+            !githubRecoveryEventIsEligible(original.event, original.action) ||
+            incoming?.action !== original.action ||
             String(incoming?.installation?.id) !==
               original.payload.installationId ||
             String(incoming?.repository?.id) !==
@@ -413,13 +416,15 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
                   original.payload.pullRequestId ||
                 String(incoming?.pull_request?.number) !==
                   original.payload.pullRequestNumber) ||
-            String(comment?.id) !== original.payload.comment.id ||
-            String(comment?.user?.id) !== original.payload.comment.userId ||
-            comment?.created_at !== original.payload.comment.createdAt ||
-            comment?.updated_at !== original.payload.comment.updatedAt ||
-            typeof comment?.body !== "string" ||
-            createHash("sha256").update(comment.body).digest("hex") !==
-              original.payload.comment.bodySha256
+            (eventType === "pull_request"
+              ? incoming?.pull_request?.head?.sha !== original.payload.pullRequestHeadSha
+              : !original.payload.comment ||
+                String(comment?.id) !== original.payload.comment.id ||
+                String(comment?.user?.id) !== original.payload.comment.userId ||
+                comment?.created_at !== original.payload.comment.createdAt ||
+                comment?.updated_at !== original.payload.comment.updatedAt ||
+                typeof comment?.body !== "string" ||
+                createHash("sha256").update(comment.body).digest("hex") !== original.payload.comment.bodySha256)
           ) {
             return "ignored" as const;
           }
@@ -835,14 +840,11 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           ),
         )
         .then((rows) => rows[0] ?? null);
-      if (
-        recovery &&
-        (recovery.status === "cancelled" ||
-          !(await githubRecoverySourceIsCurrent(
-            (recovery.payload as GitHubRecoveryReceipt).original,
-            credentials,
-          )))
-      ) {
+      const original = (recovery?.payload as GitHubRecoveryReceipt | undefined)?.original;
+      const currentSource = recovery && recovery.status !== "cancelled" && original
+        ? await githubRecoveryCurrentSource(original, credentials)
+        : false;
+      if (recovery && !currentSource) {
         await settleGitHubWebhookIngress(action.id, {
           attempts,
           payload,
@@ -850,11 +852,22 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         });
         return githubIngressAcceptedResponse();
       }
+      let replayBody = payload.body;
+      if (currentSource && typeof currentSource === "object") {
+        // Keep GitHub's authenticated envelope and original GUID, but apply
+        // policy to today's PR snapshot. A moved head is a synchronize event.
+        const moved = currentSource.head.sha !== original!.payload.pullRequestHeadSha;
+        replayBody = JSON.stringify({ ...JSON.parse(payload.body),
+          pull_request: currentSource,
+          action: moved ? "synchronize" : original!.action,
+          ...(moved ? { before: original!.payload.pullRequestHeadSha } : {}),
+        });
+      }
       const signature = `sha256=${createHmac(
         "sha256",
         credentials.webhookSecret,
       )
-        .update(payload.body)
+        .update(replayBody)
         .digest("hex")}`;
       await options.githubWebhookReplayBarrier?.();
       const replayContext = {
@@ -878,7 +891,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
               "x-github-event": payload.eventType,
               "x-hub-signature-256": signature,
             },
-            body: payload.body,
+            body: replayBody,
           },
         ),
         replayContext,
@@ -1051,11 +1064,26 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
     });
   }
 
-  async function githubRecoverySourceIsCurrent(
+  async function githubRecoveryCurrentSource(
     detail: GitHubAppWebhookDeliveryDetail,
     credentials: Record<string, string>,
     sourceFetch: typeof fetch = fetchImpl,
-  ): Promise<boolean> {
+  ): Promise<boolean | GitHubRecoveryPullRequest> {
+    if (detail?.event === "pull_request") {
+      if (!detail.payload?.repositoryFullName || !detail.payload.pullRequestNumber ||
+          !detail.payload.pullRequestId || !detail.payload.pullRequestHeadSha) return false;
+      const current = await getGitHubRecoveryPullRequest({
+        fetch: sourceFetch,
+        appToken: githubAppJwt(credentials.appId, credentials.privateKey),
+        installationId: credentials.installationId,
+        repositoryFullName: detail.payload.repositoryFullName,
+        pullRequestNumber: detail.payload.pullRequestNumber,
+      }).catch(error => {
+        if (error?.statusCode === 404 || error?.statusCode === 410) return null;
+        throw error;
+      });
+      return current?.id === detail.payload.pullRequestId && current.state === "open" ? current : false;
+    }
     const comment = detail?.payload?.comment;
     if (
       !comment ||
@@ -1090,7 +1118,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
 
   /**
    * GitHub does not retry callbacks that fail before our durable inbox. Ask
-   * GitHub to redeliver a bounded recent created-comment envelope, never turn
+   * GitHub to redeliver a bounded recent comment or automatic PR envelope, never turn
    * delivery-history JSON into a locally signed or directly admitted request.
    * A missing/changed epoch starts at now; historical messages are not adopted
    * into a new credential/generation merely because the App can still see them.
@@ -1306,10 +1334,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           Date.parse(original.deliveredAt) > now.getTime() - 10_000 ||
           original.statusCode === null ||
           original.statusCode < 500 ||
-          original.action !== "created" ||
-          !["issue_comment", "pull_request_review_comment"].includes(
-            original.event,
-          ) ||
+          !githubRecoveryEventIsEligible(original.event, original.action) ||
           original.installationId !== credentials.installationId ||
           !original.repositoryId ||
           !(await githubRecoveryResource(db, endpoint, original.repositoryId))
@@ -1378,15 +1403,17 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           detail.statusCode !== original.statusCode ||
           detail.installationId !== original.installationId ||
           detail.repositoryId !== original.repositoryId ||
-          detail.action !== "created" ||
-          detail.payload.action !== "created" ||
+          detail.action !== original.action ||
+          detail.payload.action !== original.action ||
           detail.payload.installationId !== credentials.installationId ||
           detail.payload.repositoryId !== original.repositoryId ||
-          !comment ||
-          comment.userType !== "User" ||
-          detail.payload.senderId !== comment.userId ||
-          Date.parse(comment.createdAt) < floor ||
-          comment.createdAt !== comment.updatedAt ||
+          (detail.event === "pull_request"
+            ? !detail.payload.pullRequestId || !detail.payload.pullRequestNumber || !detail.payload.pullRequestHeadSha
+            : !comment ||
+              comment.userType !== "User" ||
+              detail.payload.senderId !== comment.userId ||
+              Date.parse(comment.createdAt) < floor ||
+              comment.createdAt !== comment.updatedAt) ||
           !(await githubRecoveryResource(
             db,
             endpoint,
@@ -1403,7 +1430,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           );
           continue;
         }
-        if (!(await githubRecoverySourceIsCurrent(detail, credentials, recoveryFetch))) {
+        if (!(await githubRecoveryCurrentSource(detail, credentials, recoveryFetch))) {
           await rememberGitHubRecoverySkip(
             endpoint,
             context,

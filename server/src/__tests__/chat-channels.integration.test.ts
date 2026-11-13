@@ -9382,7 +9382,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
   }
 
   async function githubPreIngressRecoveryFixture(
-    event: "issue_comment" | "pull_request_review_comment" = "issue_comment",
+    event: "issue_comment" | "pull_request_review_comment" | "pull_request" = "issue_comment",
     replayBarrier?: ChatChannelServiceOptions["githubWebhookReplayBarrier"],
   ) {
     const fixture = await seedCompany();
@@ -9443,7 +9443,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
       ...(event === "issue_comment"
         ? { issue: { id: 9190, number: 91 } }
-        : { pull_request: { id: 9190, number: 91 } }),
+        : { pull_request: { id: 9190, number: 91, state: "open", title: "Recover review",
+            body: "Untrusted PR body", draft: false, head: { sha: "a".repeat(40) },
+            base: { sha: "b".repeat(40), ref: "master" }, user: comment.user, labels: [] } }),
       comment,
       sender: { id: 42, login: "octocat", type: "User" },
     };
@@ -9454,7 +9456,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       redelivery: false,
       status_code: 502 as number | null,
       event,
-      action: "created",
+      action: event === "pull_request" ? "opened" : "created",
       installation_id: 2468,
       repository_id: 97531,
       throttled_at: null as string | null,
@@ -9466,7 +9468,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     >();
     let historyHasMore = false;
     let historyPage = 0;
+    if (event === "pull_request") {
+      payload.action = "opened";
+      Reflect.deleteProperty(payload, "comment");
+    }
     let canonicalComment = { ...comment };
+    let canonicalPullRequest = { ...payload.pull_request! };
     let beforeList: (() => Promise<void>) | undefined;
     let beforePost: (() => Promise<void>) | undefined;
     const requests: Array<{ method: string; pathname: string }> = [];
@@ -9487,6 +9494,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const isRecovery =
         url.pathname.startsWith("/app/hook/") ||
         url.pathname === commentPath ||
+        url.pathname === "/repos/paperclipai/paperclip/pulls/91" ||
         url.pathname === "/installation/token";
       if (!isRecovery) return undefined;
       requests.push({ method, pathname: url.pathname });
@@ -9535,6 +9543,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await beforePost?.();
         return new Response(null, { status: 202 });
       }
+      if (url.pathname === "/repos/paperclipai/paperclip/pulls/91") return json(canonicalPullRequest);
       if (url.pathname === commentPath) return json(canonicalComment);
       if (url.pathname === "/installation/token" && method === "DELETE")
         return new Response(null, { status: 204 });
@@ -9646,6 +9655,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
       setCanonicalComment(value: Partial<typeof comment>) {
         canonicalComment = { ...canonicalComment, ...value };
+      },
+      setCanonicalPullRequest(value: Partial<typeof canonicalPullRequest>) {
+        canonicalPullRequest = { ...canonicalPullRequest, ...value };
       },
       setBeforeList(value: typeof beforeList) {
         beforeList = value;
@@ -17016,6 +17028,108 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     } finally {
       await retirePublicationFixture(service, endpoint.id);
     }
+  });
+
+  it.each(["opened", "synchronize", "reopened", "ready_for_review"].flatMap(action =>
+    [false, true].map(moved => ({ action, moved, bot: false }))).concat({ action: "opened", moved: true, bot: true }))(
+    "recovers a lost pull_request.$action once through the current PR and original GUID (moved: $moved, bot: $bot)", async ({ action, moved, bot }) => {
+      const context = await githubPreIngressRecoveryFixture("pull_request");
+      const { service, endpoint } = context;
+      try {
+        context.original.action = context.payload.action = action;
+        if (bot) {
+          context.payload.pull_request!.user.type = "Bot";
+          context.setCanonicalPullRequest({ user: { ...context.payload.pull_request!.user } });
+        }
+        const management = githubChatManagementService(db, context.providerFetch);
+        const saved = await management.configuration(endpoint.id, "owner-user");
+        await management.saveConfiguration(endpoint.id, { expectedRevision: saved.revision,
+          configuration: { ...saved.configuration, toolsEnabled: true,
+            defaults: { ...saved.configuration.defaults, invocation: "allowed_authors", includeAuthors: ["octocat"], reviewBotAuthors: bot } },
+        }, "owner-user");
+        const current = await service.get(endpoint.id);
+        const [principal] = await db.insert(chatExternalPrincipals).values({
+          companyId: context.fixture.companyId, provider: "github", providerAccountId: current.providerAccountId!,
+          externalId: "42", kind: "user", displayName: "Octocat", handle: "octocat", isBot: false,
+        }).returning();
+        await db.insert(chatIdentityLinks).values({ companyId: context.fixture.companyId, endpointId: endpoint.id,
+          principalId: principal.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date(),
+        });
+        await context.makeScanDue();
+        await service.processFailedGitHubWebhookDeliveries(5, endpoint.id);
+        expect(context.posts).toEqual([`/app/hook/deliveries/${context.deliveryId}/attempts`]);
+        expect(await context.ingress()).toBeUndefined();
+        expect(context.wakeup).not.toHaveBeenCalled();
+        expect(await context.receipt()).toMatchObject({ status: "processed", result: { attempts: 1 } });
+        expect((await context.callback()).status).toBe(202);
+        const ingress = await context.ingress();
+        expect(ingress).toMatchObject({ status: "received" });
+        // A push after the redelivery request (even after ingress staging) must
+        // run the current head, not the opening envelope's obsolete snapshot.
+        const headSha = (moved ? "c" : "a").repeat(40);
+        context.setCanonicalPullRequest({ head: { sha: headSha }, title: "Current PR title" });
+        await service.processPendingGitHubWebhookIngress(1, ingress!.id);
+        const deliveries = await readChatDeliveriesByEndpointId(endpoint.id);
+        expect(deliveries).toHaveLength(1);
+        expect(deliveries[0].normalizedEvent).toMatchObject({ githubAutomatic: { context: {
+          deliveryId: context.guid, event: moved ? "synchronize" : action, headSha, title: "Current PR title",
+        } } });
+        await db.update(chatDeliveries).set({ nextAttemptAt: new Date(0) }).where(eq(chatDeliveries.id, deliveries[0].id));
+        await service.processPendingDeliveries(1, deliveries[0].id);
+        expect(context.wakeup).toHaveBeenCalledTimes(1);
+        const tasks = await readIssuesByCompanyId(context.fixture.companyId);
+        expect(tasks).toHaveLength(1);
+        const comments = await readIssueCommentsByIssueId(tasks[0].id);
+        expect(comments).toHaveLength(1);
+        expect(comments[0].body).toContain(`"headSha":"${headSha}"`);
+        if (moved) expect(comments[0].body).not.toContain(`"headSha":"${"a".repeat(40)}"`);
+        await context.callback();
+        await service.processPendingGitHubWebhookIngress(1, ingress!.id);
+        await context.makeScanDue();
+        await service.processFailedGitHubWebhookDeliveries(5, endpoint.id);
+        expect(context.posts).toHaveLength(1);
+        expect(await readChatDeliveriesByEndpointId(endpoint.id)).toHaveLength(1);
+        expect(await readIssueCommentsByIssueId(tasks[0].id)).toHaveLength(1);
+        expect(context.wakeup).toHaveBeenCalledTimes(1);
+      } finally { await retirePublicationFixture(service, endpoint.id); }
+    },
+  );
+
+  it.each(["closed", "edited", "labeled", "review_requested"])(
+    "does not recover a non-automatic pull_request.%s", async action => {
+      const context = await githubPreIngressRecoveryFixture("pull_request");
+      try {
+        context.original.action = context.payload.action = action;
+        await context.makeScanDue();
+        await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+        expect(context.posts).toEqual([]);
+        expect(await context.receipt()).toBeUndefined();
+        expect(await context.ingress()).toBeUndefined();
+      } finally { await retirePublicationFixture(context.service, context.endpoint.id); }
+    },
+  );
+
+  it.each(["scan", "processing"])("rejects recovered PRs closed before %s", async phase => {
+    const context = await githubPreIngressRecoveryFixture("pull_request");
+    try {
+      if (phase === "scan") context.setCanonicalPullRequest({ state: "closed" });
+      await context.makeScanDue();
+      await context.service.processFailedGitHubWebhookDeliveries(5, context.endpoint.id);
+      if (phase === "scan") {
+        expect(context.posts).toEqual([]);
+        expect(await context.receipt()).toMatchObject({ status: "cancelled" });
+      } else {
+        expect(context.posts).toHaveLength(1);
+        await context.callback();
+        context.setCanonicalPullRequest({ state: "closed" });
+        const ingress = await context.ingress();
+        await context.service.processPendingGitHubWebhookIngress(1, ingress!.id);
+        expect(await context.ingress()).toMatchObject({ status: "cancelled",
+          result: { code: "github_webhook_recovery_source_changed" } });
+      }
+      expect(await readChatDeliveriesByEndpointId(context.endpoint.id)).toHaveLength(0);
+      expect(context.wakeup).not.toHaveBeenCalled();
+    } finally { await retirePublicationFixture(context.service, context.endpoint.id); }
   });
 
   it("does not adopt historical pre-ingress GitHub failures when initializing a recovery epoch", async () => {
