@@ -6,7 +6,6 @@ import {
   issueRecoveryActions,
   issues,
   nativeRunFinalizations,
-  nativeRunResults,
   type Db,
 } from "@paperclipai/db";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
@@ -141,6 +140,30 @@ export function unansweredMessageCode(run: { status: string; error: string | nul
 const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorizationReason'`;
 
 /**
+ * SQL: an agent answer ATTRIBUTED to message m, the Paperclip way: a reply
+ * written by a run whose input carried m or a later person message (the native
+ * conversation finalizer's reply boundary, agent-conversations.ts:406-437:
+ * messages after a run's boundary stay actionable), via any carrying key. An
+ * agent comment with no run counts by time. A later reply to ANOTHER message
+ * never answers m.
+ */
+function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
+  return sql`exists (select 1 from ${issueComments} a
+    left join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
+    where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
+      and a.created_at > ${m.createdAt}
+      and (a.created_by_run_id is null or exists (select 1 from ${issueComments} b
+        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
+          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
+          and (r.context_snapshot->>'wakeCommentId' = b.id::text or r.context_snapshot->>'commentId' = b.id::text
+            or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
+            or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
+            or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text))))`;
+}
+const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
+  issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
+
+/**
  * SQL: this issue row has a person's message within the lookback that no agent
  * answered and that has no notice yet, or an unanswered-message notice that a
  * later agent comment answered. The stranded sweep visits such tasks in every
@@ -151,8 +174,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
   return sql`(exists (select 1 from ${issueComments} m
       where m.company_id = ${companyId} and m.issue_id = ${issueId} and m.author_type = 'user'
         and m.deleted_at is null and m.created_at > ${since}::timestamptz
-        and not exists (select 1 from ${issueComments} a where a.company_id = m.company_id and a.issue_id = m.issue_id
-          and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at)
+        and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text))
     or exists (select 1 from ${issueComments} n
@@ -161,8 +183,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and exists (select 1 from ${issueComments} a where a.company_id = n.company_id and a.issue_id = n.issue_id
-        and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at)))`;
+      and ${answeredSql(rawMessage("m"))}))`;
 }
 
 /**
@@ -175,18 +196,17 @@ export function unansweredPersonMessageCommentCondition(): SQL {
   const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
   return sql`((${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
       and ${issueComments.createdAt} > ${since}::timestamptz
-      and not exists (select 1 from ${issueComments} a where a.company_id = ${issueComments.companyId}
-        and a.issue_id = ${issueComments.issueId} and a.author_type = 'agent' and a.deleted_at is null
-        and a.created_at > ${issueComments.createdAt})
+      and not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and exists (select 1 from ${issueComments} m join ${issueComments} a on a.company_id = m.company_id
-          and a.issue_id = m.issue_id and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at
+      and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
-          and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1}))))`;
+          and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
+          and ${answeredSql(rawMessage("m"))})))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -222,9 +242,14 @@ function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
 }
 
 /** One task: answer, supersede or notice its person's last message. Idempotent. */
+/** The recovery service's own native blocked-request repair check (it publishes
+ * the run's unblock request itself when it applies). */
+export type NativeBlockedRepairApplies = (input: { companyId: string; issueId: string; runId: string }, database: Db) => Promise<boolean>;
+
 export async function settleUnansweredPersonMessage(
   db: Db,
-  input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null },
+  input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null;
+    nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
 ): Promise<UnansweredMessageOutcome> {
   const now = input.now ?? new Date();
   const [issue] = await db.select({
@@ -252,11 +277,10 @@ export async function settleUnansweredPersonMessage(
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
       and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and exists (select 1 from ${issueComments} a where a.company_id = n.company_id and a.issue_id = n.issue_id
-          and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at))`);
+        and ${answeredSql(rawMessage("m"))})`);
   });
 
-  const decision = await decideUnansweredMessage(db, issue, now);
+  const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
   if (decision.kind !== "notice") return decision;
   const commentId = await db.transaction(async tx => {
     // The issue fence that comment writers, the executor's held-notice writer
@@ -266,7 +290,7 @@ export async function settleUnansweredPersonMessage(
     // means no notice.
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now);
+    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason) return null;
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
       authorType: "system",
@@ -285,7 +309,8 @@ type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" }>
 
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
-async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date): Promise<Decision> {
+async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
@@ -296,8 +321,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date): 
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   if (!message || message.createdAt.getTime() < now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS) return { kind: "none" };
   const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt))).limit(1);
+    eq(issueComments.id, message.id), answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+      issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -375,18 +400,16 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date): 
         return { kind: "pending", recheckAt: Math.max(now.getTime() + 30_000, (coordinator.nextAttemptAt?.getTime() ?? 0) + OVERDUE_NATIVE_RETRY_MS) };
       }
     }
-    if (run.status === "succeeded") {
-      // An accepted native result that declared a blocker or asked for
-      // attention is the agent's answer: it named whose move it is
-      // (upstream's waiting reason "assignee_declared_block").
-      // (the stored envelope is { result, terminal }, recovery/service.ts:1572).
-      const [accepted] = await q.select({ resultJson: nativeRunResults.resultJson }).from(nativeRunResults).where(and(
-        eq(nativeRunResults.companyId, issue.companyId), eq(nativeRunResults.runId, run.id),
-        eq(nativeRunResults.schemaStatus, "accepted"))).limit(1);
-      const envelope = (accepted?.resultJson ?? {}) as Record<string, unknown>;
-      const result = (envelope.result && typeof envelope.result === "object" ? envelope.result : envelope) as Record<string, unknown>;
-      if (result.blocker || result.reportedWorkDisposition === "blocked"
-        || (Array.isArray(result.attentionRequests) && result.attentionRequests.length > 0)) return { kind: "answered" };
+    // A declared blocker or attention request answers the person only when its
+    // words were PUBLISHED for this message (a reply attributed above, or the
+    // run's own card). An accepted result whose text never reached the thread
+    // (25-SILENT-BLOCK) is unanswered, unless the recovery's native
+    // blocked-request repair applies: that path publishes the unblock request
+    // as its own visible notice on this sweep's next pass, so it owns the
+    // disposition (and its notice then explains the message).
+    if (run.status === "succeeded" && nativeBlockedRepairApplies
+      && await nativeBlockedRepairApplies({ companyId: issue.companyId, issueId: issue.id, runId: run.id }, q)) {
+      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     }
     code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
@@ -427,7 +450,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date): 
  * a person's message to settle): no candidate lookup of its own. */
 export async function settleUnansweredPersonMessagesForTask(
   db: Db,
-  input: { companyId: string; issueId: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date },
+  input: { companyId: string; issueId: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date;
+    nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
 ): Promise<{ noticed: number; pending: number }> {
   const outcome = await settleUnansweredPersonMessage(db, input);
   if (outcome.kind === "pending") input.onDeferredDeadline?.(outcome.recheckAt);
@@ -438,7 +462,8 @@ export async function settleUnansweredPersonMessagesForTask(
  * scope with a person's message to settle, found with one candidate query. */
 export async function settleUnansweredPersonMessages(
   db: Db,
-  input: { companyId?: string; issueId?: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date },
+  input: { companyId?: string; issueId?: string; issueCreatedAtGte?: Date | null; onDeferredDeadline?: (at: number) => void; now?: Date;
+    nativeBlockedRepairApplies?: NativeBlockedRepairApplies },
 ): Promise<{ noticed: number; pending: number }> {
   const candidates = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues).where(and(
     input.companyId ? eq(issues.companyId, input.companyId) : undefined,
@@ -448,7 +473,8 @@ export async function settleUnansweredPersonMessages(
   )).limit(200);
   const result = { noticed: 0, pending: 0 };
   for (const candidate of candidates) {
-    const outcome = await settleUnansweredPersonMessage(db, { companyId: candidate.companyId, issueId: candidate.id, now: input.now });
+    const outcome = await settleUnansweredPersonMessage(db, { companyId: candidate.companyId, issueId: candidate.id, now: input.now,
+      nativeBlockedRepairApplies: input.nativeBlockedRepairApplies });
     if (outcome.kind === "noticed") result.noticed += 1;
     if (outcome.kind === "pending") {
       result.pending += 1;
