@@ -11451,16 +11451,20 @@ describe("native warm session supervision", () => {
     // runner_event_commit_stalled (checkpoint_flush_failed). Events the
     // controller could not commit may record the stopped tool's effects; a
     // cold resume from the last committed checkpoint would drop them. Refuse.
-    it("refuses the cold start when attach failed on an event-commit integrity stall", async () => {
+    it.each([false, true])("refuses the cold start when attach failed on an event-commit integrity stall (wrapped: %s)", async wrapped => {
       const stall = new NativeSessionProtocolIntegrityError("runner_event_commit_stalled", "checkpoint_flush_failed:EIO at source seq 7");
-      const { errorCode, close, events, alarm } = await run("warm-attach-commit-stall",
-        (options, session) => rejectAttach(options, session, stall));
+      const rejection = wrapped ? new Error("attach wrapper", { cause: stall }) : stall;
+      const { errorCode, close, events, alarm, onLog } = await run(`warm-attach-commit-stall-${wrapped}`,
+        (options, session) => rejectAttach(options, session, rejection));
       expect(state.execute).toHaveBeenCalledTimes(2);
       expect(close).not.toHaveBeenCalled();
+      // A wrapped integrity cause still fails terminally under its own code.
       expect(errorCode).toBe("native_event_replay_conflict");
       expect(events.find(event => event.eventType === "native.warm_attach.failed")?.payload).toMatchObject({
         state: "warm_attach_failed_refused", reason: "native_event_replay_conflict", refusal: "protocol_integrity",
-        error: expect.stringContaining("checkpoint_flush_failed:EIO") });
+        error: wrapped ? "attach wrapper" : expect.stringContaining("checkpoint_flush_failed:EIO") });
+      if (wrapped) expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(
+        "warm runner attach failed (native_event_replay_conflict): attach wrapper; cold start refused (protocol_integrity)"));
       expect(alarm).toHaveLength(1);
     });
 
