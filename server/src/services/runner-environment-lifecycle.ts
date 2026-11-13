@@ -25,7 +25,7 @@ export function providerResourceDispositionForTerminalRun(
   // In particular, native_restart_recovery_blocked, replay conflicts and
   // quarantined cleanup retain their existing stop policy.
   if (errorCode && !["adapter_failed", "adapter_error", "native_session_interrupted",
-    "native_retry_cancelled", "cancelled"].includes(errorCode)) {
+    "native_warm_attach_cold_fallback_failed", "native_retry_cancelled", "cancelled"].includes(errorCode)) {
     return "stop_and_retain";
   }
   return desired;
