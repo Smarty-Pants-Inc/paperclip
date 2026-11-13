@@ -352,6 +352,10 @@ export function shouldQueueFollowupForRunningIssueWake(input: {
   ) {
     return true;
   }
+  // A plugin's ctx.issues.requestWakeup carries input the running turn never
+  // reads (its snapshot is fixed at start), so it runs after that turn, like a
+  // comment, instead of being merged into it and lost.
+  if (readNonEmptyString(input.contextSnapshot?.pluginId)) return true;
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
   if (wakeReason === "issue_children_completed" && (
     input.contextSnapshot?.onboardingCompletion === true ||
