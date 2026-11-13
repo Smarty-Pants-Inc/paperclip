@@ -105,6 +105,15 @@ function redactSecretLikeConfigValue(value: unknown): unknown {
   return value;
 }
 
+/** Board/API view of an environment lease: provider metadata can carry the
+ * sandbox provider's credentials (e.g. a Boat lease apiKey). Never echo
+ * credential-shaped keys at any depth; structural lease fields stay visible. */
+function redactEnvironmentLeaseForResponse<T extends { metadata?: Record<string, unknown> | null }>(lease: T): T {
+  return isPlainRecord(lease.metadata)
+    ? { ...lease, metadata: redactSecretLikeConfigKeys(lease.metadata) }
+    : lease;
+}
+
 /**
  * Floor view of a platform-provisioned environment on a cloud-managed
  * instance: credential-shaped config keys are never echoed — to ANY actor,
@@ -1162,7 +1171,7 @@ export function environmentRoutes(
     const leases = await svc.listLeases(environment.id, {
       status: req.query.status as string | undefined,
     });
-    res.json(leases);
+    res.json(leases.map(redactEnvironmentLeaseForResponse));
   });
 
   router.get("/environment-leases/:leaseId", async (req, res) => {
@@ -1172,7 +1181,7 @@ export function environmentRoutes(
       res.status(404).json({ error: "Environment lease not found" });
       return;
     }
-    res.json(lease);
+    res.json(redactEnvironmentLeaseForResponse(lease));
   });
 
   router.patch("/environments/:id", validate(updateEnvironmentSchema), async (req, res) => {

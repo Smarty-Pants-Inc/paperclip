@@ -2613,6 +2613,34 @@ describe("environment routes", () => {
     });
   });
 
+  it("never echoes provider credentials from lease metadata to a board reader", async () => {
+    const environment = createEnvironment();
+    mockEnvironmentService.getById.mockResolvedValue(environment);
+    const lease = {
+      id: "lease-boat", companyId: "company-1", environmentId: environment.id, executionWorkspaceId: null,
+      issueId: null, heartbeatRunId: "run-1", status: "active", leasePolicy: "reuse_by_environment",
+      provider: "boat", providerLeaseId: "bx_test", acquiredAt: new Date("2026-11-13T02:00:00.000Z"),
+      lastUsedAt: null, expiresAt: null, releasedAt: null, failureReason: null, cleanupStatus: null,
+      metadata: { remoteCwd: "/work", sandboxProviderPlugin: true,
+        providerConfig: { apiKey: "boat-secret-canary", region: "us" }, apiKey: "boat-secret-canary-top",
+        nested: [{ authToken: "boat-secret-canary-nested", label: "kept" }] },
+      createdAt: new Date("2026-11-13T02:00:00.000Z"), updatedAt: new Date("2026-11-13T02:00:00.000Z"),
+    };
+    mockEnvironmentService.listLeases.mockResolvedValue([lease]);
+    mockEnvironmentService.getLeaseById.mockResolvedValue(lease);
+    const app = createApp(localBoardActor());
+
+    const list = await request(app).get(`/api/environments/${environment.id}/leases`);
+    const one = await request(app).get("/api/environment-leases/lease-boat");
+
+    for (const res of [list, one]) {
+      expect(res.status).toBe(200);
+      expect(JSON.stringify(res.body)).not.toContain("boat-secret-canary");
+    }
+    expect(list.body[0].metadata).toMatchObject({ remoteCwd: "/work", providerConfig: { region: "us" }, nested: [{ label: "kept" }] });
+    expect(one.body.providerLeaseId).toBe("bx_test");
+  });
+
   it("returns a single lease after company access is confirmed", async () => {
     mockEnvironmentService.getLeaseById.mockResolvedValue({
       id: "lease-1",
