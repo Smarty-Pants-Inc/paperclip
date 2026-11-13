@@ -1,5 +1,4 @@
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { findSandboxStoppedError } from "../sandbox-stopped-error.js";
 import {
   attachRemoteRunnerRecoveryDiagnostic,
   RemoteRunnerRecoveryError,
@@ -32,10 +31,6 @@ export async function readRemoteRunnerRecoveryProbe(input: {
       if (!result.timedOut) return result;
       lastError = new RemoteRunnerRecoveryError({ stage: input.stage, reason: "probe_timeout" });
     } catch (error) {
-      // The command boundary already tried the exact lease's resume once. A
-      // definite stopped rejection cannot improve by polling it for 30s (or
-      // by restarting another provider-startup retry episode).
-      if (findSandboxStoppedError(error)) throw error;
       lastError = attachRemoteRunnerRecoveryDiagnostic(error, {
         stage: input.stage, reason: "probe_transport_failed",
       });

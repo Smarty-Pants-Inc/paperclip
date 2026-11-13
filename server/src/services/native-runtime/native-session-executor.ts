@@ -289,7 +289,6 @@ import {
   remoteRecoveryProbeReason,
 } from "./remote-runner-recovery-diagnostics.js";
 import { readRemoteRunnerRecoveryProbe, REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS } from "./remote-runner-recovery-probe.js";
-import { findSandboxStoppedError } from "../sandbox-stopped-error.js";
 import { describeOwnFailedAttachment, inspectRemoteWarmSessionRecovery, isSettledRemoteWarmControlState, summarizePostTerminalEvents, type RemoteWarmSessionRecovery, unsettledControllerCommands } from "./remote-warm-session-recovery.js";
 import { assertNativeWarmIngressRetirement, nativeWarmIngressAllocation, nativeWarmIngressIdentity, type NativeWarmIngressClaim, type NativeWarmIngressOwner } from "./native-warm-ingress-ownership.js";
 import { resolveNativeStagedAttachmentRecovery, type NativeStagedAttachmentRecovery } from "./native-staged-attachment-recovery.js";
@@ -8498,7 +8497,6 @@ export function nativeSessionFailureDisposition(
 ) {
   const permanentFailure =
     sourceFailureCode === "runner_task_admission_rejected" ||
-    sourceFailureCode === "sandbox_stopped" ||
     sourceFailureCode === "runner_ingress_access_rejected" ||
     sourceFailureCode === "native_provider_runtime_missing" ||
     sourceFailureCode === "native_provider_model_rejected" ||
@@ -8647,11 +8645,9 @@ export function nativeSessionFailureSourceCode(
   | "provider_session_open_timeout"
   | "runner_task_admission_rejected"
   | "runner_ingress_access_rejected"
-  | "sandbox_stopped"
   | "runner_ingress_acquisition_failed"
   | "local_runtime_api_listener_unavailable"
   | "native_session_interrupted" {
-  if (findSandboxStoppedError(error)) return "sandbox_stopped";
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
@@ -16434,7 +16430,7 @@ async function createRunnerdBackendWithinSessionClaim(
         providerPackVerified = true;
         return true;
       } catch (error) {
-        if (findSandboxStoppedError(error) || error instanceof Error && error.name === "AbortError") throw error;
+        if (error instanceof Error && error.name === "AbortError") throw error;
       }
     }
     return false;
