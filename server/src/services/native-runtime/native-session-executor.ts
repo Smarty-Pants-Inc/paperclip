@@ -12757,6 +12757,19 @@ async function executePaperclipNativeSessionAttempt(
                 context: input.taskSessionPublication, snapshot: retainedCancelledCheckpoint, run, issue: issue ?? null,
               }, { retainedCancelledOwner: true }) === "published";
             }
+            if (settled.length && cancelledSessionRetained && retainedCancelledCheckpoint) {
+              // Hand the cancelled run's writer a no-new-work idle authority
+              // atomically with lease release. Do not invent a committed result.
+              // The snapshot/Stop/child-cleanup proof above is the only issuer;
+              // generation, source consumption and task ownership still fence it.
+              const receipt = { schema: "paperclip.native-retained-idle-checkpoint.v1",
+                companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId,
+                runId: input.execution.binding.runId, sessionId: nativeSessionKey(input.execution),
+                bootId: controller.bootId, generation: controllerGeneration };
+              await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+                || ${JSON.stringify({ nativeRetainedIdleCheckpoint: receipt })}::jsonb` }).where(and(
+                eq(heartbeatRuns.id, input.execution.binding.runId), eq(heartbeatRuns.companyId, input.execution.binding.companyId)));
+            }
             return settled;
           }, { companyId: input.execution.binding.companyId });
           if (settled) {
