@@ -45,6 +45,8 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
         WHERE r.id IN (${sql.join([...liveRunIds].map(id => sql`${id}::uuid`), sql`, `)})
           AND r.company_id = ${agents.companyId} AND r.agent_id = ${agents.id})`
     : sql``;
+  // A retained allocation is warm capacity, not agent execution. Finished-run,
+  // ownership, finalization and cleanup obligations must still settle separately.
   return sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs r
       WHERE r.company_id = ${agents.companyId} AND r.agent_id = ${agents.id}
         AND r.status IN ('running', 'queued'))
@@ -61,7 +63,7 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
     AND NOT EXISTS (SELECT 1 FROM environment_leases l
       JOIN heartbeat_runs r ON r.id = l.heartbeat_run_id AND r.company_id = l.company_id
       WHERE l.company_id = ${agents.companyId} AND r.agent_id = ${agents.id}
-        AND ((l.status NOT IN ('released', 'expired')
+        AND ((l.status NOT IN ('released', 'expired', 'retained')
             AND (${sql.raw(finishedFailedIdleLease("l"))}) IS NOT TRUE)
           OR COALESCE(l.metadata->>'pendingCleanupInFlight', 'false') <> 'false'
           OR COALESCE(l.metadata, '{}'::jsonb) ?| ARRAY['nativeWorkspaceExportResume', 'sandboxStopAndRetain']))

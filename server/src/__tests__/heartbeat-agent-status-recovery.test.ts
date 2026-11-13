@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases,
+  heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -47,6 +48,32 @@ describePostgres("heartbeat recovery of a stranded agent", () => {
     const replacement = heartbeatService(db);
     expect(await replacement.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
     expect(await inspect()).toEqual({ version: 1, backgroundWork: "none" });
+  });
+
+  it("repairs a finished native run's status through the reaper without cooling its retained allocation", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
+    const old = new Date(Date.now() - 60 * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Warm native recovery", issuePrefix: "WARM" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Native worker", role: "engineer",
+      status: "running", adapterType: "process", runtimeConfig: { heartbeat: { enabled: false } },
+      updatedAt: old, lastHeartbeatAt: null });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Completed native work", status: "done" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId,
+      status: "succeeded", runtimeMode: "native", invocationSource: "automation",
+      startedAt: old, finishedAt: old, updatedAt: old });
+    await db.insert(nativeRunFinalizations).values({ companyId, runId, issueId, phase: "committed", updatedAt: old });
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId, issueId,
+      status: "retained", leasePolicy: "reuse_by_environment", provider: "daytona",
+      providerLeaseId: "warm-native-allocation", cleanupStatus: "success" }).returning();
+
+    const service = heartbeatService(db);
+    expect(await service.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+    expect(await db.select().from(agents).where(eq(agents.id, agentId)))
+      .toEqual([expect.objectContaining({ status: "idle", lastHeartbeatAt: null })]);
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id)))
+      .toEqual([expect.objectContaining({ status: "retained", providerLeaseId: "warm-native-allocation", releasedAt: null })]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))
+      .toEqual([expect.objectContaining({ status: "succeeded" })]);
   });
 
   it("keeps unrelated recovery available when the correction audit fails", async () => {

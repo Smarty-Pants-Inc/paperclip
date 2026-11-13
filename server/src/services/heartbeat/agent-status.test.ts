@@ -61,6 +61,19 @@ describePostgres("heartbeat agent status", () => {
     return { companyId, agentId, runId, issueId };
   }
 
+  async function seedNativeLease(status = "succeeded", leaseStatus = "retained") {
+    const seeded = await seed(status);
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: seeded.issueId })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: seeded.companyId,
+      runId: seeded.runId, issueId: seeded.issueId, phase: "committed", updatedAt: old() });
+    const [lease] = await db.insert(environmentLeases).values({ companyId: seeded.companyId,
+      heartbeatRunId: seeded.runId, issueId: seeded.issueId, status: leaseStatus,
+      leasePolicy: "reuse_by_environment", provider: "daytona", providerLeaseId: "warm-allocation",
+      cleanupStatus: "success" }).returning();
+    return { ...seeded, leaseId: lease!.id };
+  }
+
   const reconcile = () => service.reconcileStrandedAgentStatuses(() => live);
   const agent = (id: string) => db.select().from(agents).where(eq(agents.id, id)).then(rows => rows[0]!);
 
@@ -144,6 +157,64 @@ describePostgres("heartbeat agent status", () => {
     await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId,
       status: "released", releasedAt: old(), metadata: { [key]: true } });
     expect(await reconcile()).toEqual([]);
+  });
+
+  it("settles a finished native run without releasing its warm retained lease", async () => {
+    const { agentId, leaseId } = await seedNativeLease();
+    expect(await reconcile()).toEqual([agentId]);
+    expect(await agent(agentId)).toMatchObject({ status: "idle", lastHeartbeatAt: null });
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))
+      .toEqual([expect.objectContaining({ status: "retained", releasedAt: null })]);
+    expect(await reconcile()).toEqual([]);
+  });
+
+  it("normally finalizes a successful native run while its lease remains warm", async () => {
+    const { agentId } = await seedNativeLease();
+    await service.finalizeAgentStatus(agentId, "succeeded");
+    expect(await agent(agentId)).toMatchObject({ status: "idle", lastHeartbeatAt: expect.any(Date) });
+  });
+
+  it.each(["running", "queued"])("keeps an active lease of a %s native run running", async status => {
+    const { agentId } = await seedNativeLease(status, "active");
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
+  });
+
+  it.each(["active", "pending_cleanup", "unknown"])("keeps a finished native run's %s lease unsettled", async status => {
+    const { agentId } = await seedNativeLease("succeeded", status);
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
+  });
+
+  it.each(["pendingCleanupInFlight", "nativeWorkspaceExportResume", "sandboxStopAndRetain"])("keeps a retained lease's %s obligation until it clears", async key => {
+    const { agentId, leaseId } = await seedNativeLease();
+    await db.update(environmentLeases).set({ metadata: { [key]: true } })
+      .where(eq(environmentLeases.id, leaseId));
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
+    await db.update(environmentLeases).set({ metadata: {} }).where(eq(environmentLeases.id, leaseId));
+    expect(await reconcile()).toEqual([agentId]);
+  });
+
+  it.each(["missing_finish", "accounting", "retry", "controller", "local_execution", "wake", "finalization", "finalizer_lease", "finalizer_retry"])("keeps retained native resources with unfinished %s work", async hold => {
+    const { companyId, agentId, runId } = await seedNativeLease();
+    const future = new Date(Date.now() + 60_000);
+    const patch = hold === "missing_finish" ? { finishedAt: null }
+      : hold === "accounting" ? { costAccountingPending: true }
+      : hold === "retry" ? { scheduledRetryAt: future }
+      : hold === "controller" ? { controllerLeaseExpiresAt: future } : {};
+    if (Object.keys(patch).length > 0) {
+      await db.update(heartbeatRuns).set(patch).where(eq(heartbeatRuns.id, runId));
+    }
+    if (hold === "local_execution") live.add(runId);
+    if (hold === "wake") await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", status: "queued" });
+    if (hold.startsWith("finaliz")) {
+      const finalizerPatch = hold === "finalization" ? { phase: "workspace_finalizing" }
+        : hold === "finalizer_lease" ? { leaseExpiresAt: future } : { nextAttemptAt: future };
+      await db.update(nativeRunFinalizations).set(finalizerPatch).where(eq(nativeRunFinalizations.runId, runId));
+    }
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
   });
 
   it("accepts proved-settled failed local lease history before a later shutdown", async () => {

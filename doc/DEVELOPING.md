@@ -1126,6 +1126,9 @@ statuses after a five-minute grace period, at most 25 agents per pass.
 
 The repair requires finished runs and wake requests, expired controller ownership,
 settled accounting and retries, and no pending resource or instruction cleanup.
+A warm `retained` environment lease alone does not keep the agent running; pending
+cleanup, workspace export/resume, and stop-and-retain obligations still do. The
+repair does not release or destroy the retained allocation.
 It also checks the shared local execution sets. It rechecks under an agent row
 lock, preserves pause and retirement, and records the correction in the same
 transaction. It preserves run history and does not invent a heartbeat timestamp.
