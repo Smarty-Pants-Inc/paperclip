@@ -1,4 +1,6 @@
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
+import { lockAgentForRunWrite } from "../../agent-run-cancellation.js";
+import { withTransactionRetry } from "../transaction-retry.js";
 import { authorizationDeniedDetails } from "../authorization.js";
 import { budgetServiceInTransaction } from "../budgets.js";
 import { resolveTaskWatchdogMutationScope, taskWatchdogScopeAllowsIssueMutation } from "../task-watchdog-scope.js";
@@ -179,6 +181,12 @@ const RECOVERABLE_READ_OPERATIONS = new Set([
 // state it read. Recovery may run them again: the receipt proves whether the
 // first attempt applied (see #recoverTransactionalWrite).
 const TRANSACTIONAL_RECEIPT_OPERATIONS = new Set(["write_document"]);
+// Receipt operations whose effect writes object storage or the filesystem
+// before commit. #withMutationReceipt never retries them on 40P01/40001.
+const NON_REPLAYABLE_RECEIPT_OPERATIONS = new Set<string>([
+  "register_deliverable", REUSE_CHAT_ATTACHMENT_TOOL_NAME,
+  "update_agent_instructions", "restore_agent_instructions",
+]);
 const TRANSACTIONAL_RECOVERY_REFUSALS = new Set([
   "paperclip_runner_tool_idempotency_conflict", "paperclip_runner_tool_input_invalid",
   "paperclip_runner_tool_mode_denied",
@@ -649,9 +657,12 @@ export class PaperclipRunnerToolAuthority {
         ...(create.workflowId !== undefined ? { workflowId: create.workflowId } : {}),
         ...(create.initialDocuments !== undefined ? { initialDocuments: create.initialDocuments } : {}),
       } : call.arguments;
-      return caseHandoffService(this.db).handoff(this.binding.companyId, this.#privacyActor(run), handoffCaseSchema.parse(request), {
+      // handoff() owns one DB-only transaction and publishes only after it
+      // commits, so a 40P01/40001 is retried by calling it again.
+      const parsedHandoff = handoffCaseSchema.parse(request);
+      return withTransactionRetry(() => caseHandoffService(this.db).handoff(this.binding.companyId, this.#privacyActor(run), parsedHandoff, {
         beforeAccept: async tx => { await this.#lockAuthorizedMutationContext(tx); },
-      });
+      }));
     }
     await this.#assertToolScope(call.tool);
     if (this.binding.nativeReview && call.tool === "resolve_review") return this.#resolveReview(call.arguments);
@@ -1095,7 +1106,9 @@ export class PaperclipRunnerToolAuthority {
     if (!call.callId || call.callId.length > 500) throw badRequest("Use a stable bounded call ID");
     const key = toolCallKey(call.callId);
     const digest = toolInputDigest({ tool: call.tool, arguments: call.arguments });
-    const prior = await this.db.transaction(async tx => {
+    // Reservation and completion are DB-only and retried on 40P01/40001; the
+    // workspace effect between them runs once and is never replayed.
+    const prior = await withTransactionRetry(() => this.db.transaction(async tx => {
       const context = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
       const resultJson = record(context.run.resultJson), receipts = record(resultJson.bridgeToolReceipts);
       const old = record(receipts[key]);
@@ -1107,16 +1120,16 @@ export class PaperclipRunnerToolAuthority {
       receipts[key] = { digest, tool: call.tool, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, bridgeToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;
-    });
+    }));
     if (prior) return prior.result;
     let result: unknown;
     try { result = await execute(); } catch (error) { result = { outcome: "failed", message: error instanceof Error ? error.message : "Workspace operation failed" }; }
-    await this.db.transaction(async tx => {
+    await withTransactionRetry(() => this.db.transaction(async tx => {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, this.binding.runId), eq(heartbeatRuns.companyId, this.binding.companyId))).for("update");
       const resultJson = record(run?.resultJson), receipts = record(resultJson.bridgeToolReceipts);
       receipts[key] = { digest, tool: call.tool, state: "completed", result };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, bridgeToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
-    });
+    }));
     await logActivity(this.db, { companyId: this.binding.companyId, actorType: "agent", actorId: this.binding.agentId, runId: this.binding.runId,
       action: "runner.workspace_operation", entityType: "issue", entityId: this.binding.issueId, details: { tool: call.tool, requestFingerprint: digest, outcome: record(result).outcome ?? "completed" } });
     return result;
@@ -1207,7 +1220,9 @@ export class PaperclipRunnerToolAuthority {
     // outcome rather than replaying a possibly committed external mutation.
     const key = toolCallKey(callId);
     const digest = toolInputDigest(input);
-    const prior = await this.db.transaction(async (tx) => {
+    // Reservation and completion are DB-only and retried on 40P01/40001; the
+    // HTTP dispatch between them runs once and is never replayed.
+    const prior = await withTransactionRetry(() => this.db.transaction(async (tx) => {
       const locked = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
       const resultJson = record(locked.run.resultJson);
       const receipts = record(resultJson.apiToolReceipts);
@@ -1227,7 +1242,7 @@ export class PaperclipRunnerToolAuthority {
       receipts[key] = { digest, operationId: operation.operationId, state: "pending" };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
       return null;
-    });
+    }));
     if (prior) return prior.result;
     const result = await execute();
     const storedResult = provider
@@ -1242,13 +1257,13 @@ export class PaperclipRunnerToolAuthority {
       details: { operationId: operation.operationId, requestFingerprint: digest, pathParams: input.pathParams ?? {}, status: result.status, outcome: record(result).outcome ?? (result.ok ? "succeeded" : "failed") },
     });
     publishActivity(apiActivity.publication);
-    await this.db.transaction(async (tx) => {
+    await withTransactionRetry(() => this.db.transaction(async (tx) => {
       const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, this.binding.runId)).for("update");
       const resultJson = record(run?.resultJson);
       const receipts = record(resultJson.apiToolReceipts);
       receipts[key] = { digest, operationId: operation.operationId, state: "completed", ...storedResult };
       await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiToolReceipts: receipts } }).where(eq(heartbeatRuns.id, this.binding.runId));
-    });
+    }));
     return result;
   }
 
@@ -1540,7 +1555,8 @@ export class PaperclipRunnerToolAuthority {
     const release = acquireRunnerApiResponseSlot(this.binding.companyId);
     let id: string;
     try {
-      id = await this.db.transaction(async tx => {
+      // DB-only reservation (no temp file exists yet): retried on 40P01/40001.
+      id = await withTransactionRetry(() => this.db.transaction(async tx => {
         await this.#lockApiCaptureCompany(tx as unknown as Db);
         const locked = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
         const resultJson = record(locked.run.resultJson);
@@ -1571,7 +1587,7 @@ export class PaperclipRunnerToolAuthority {
         await tx.update(heartbeatRuns).set({ resultJson: { ...resultJson, apiResponseCaptureBytes: used + RUNNER_API_RESPONSE_MAX_BYTES } }).where(eq(heartbeatRuns.id, this.binding.runId));
         const [reservation] = await tx.insert(runnerApiResponseReservations).values({ companyId: this.binding.companyId, runId: this.binding.runId, reservedBytes: RUNNER_API_RESPONSE_MAX_BYTES }).returning({ id: runnerApiResponseReservations.id });
         return reservation.id;
-      });
+      }));
     } catch (error) { release(); throw error; }
     let settled = false;
     return { id, settle: async (completedBytes?: number, cleaned?: boolean, storageAttempted?: boolean) => {
@@ -2317,7 +2333,7 @@ export class PaperclipRunnerToolAuthority {
     };
     // Stop outside row locks: the runtime needs those locks to acknowledge cancellation.
     // A second locked check below prevents any intervening ownership/version change.
-    const prepared = receiptOnly ? null : await this.db.transaction(async (tx) => {
+    const prepared = receiptOnly ? null : await withTransactionRetry(() => this.db.transaction(async (tx) => {
       const context = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
       if (context.issue.workMode !== "standard") throw new Error("paperclip_runner_tool_mode_denied");
       const target = await authorize(tx as unknown as Db, context.run);
@@ -2325,7 +2341,7 @@ export class PaperclipRunnerToolAuthority {
       validate(target);
       await assertReassignmentComment(tx as unknown as Db, target);
       return target;
-    });
+    }));
     // Cancellation and ownership commit cannot share locks. If the second
     // phase loses its preconditions, restore runnable work to the still-current
     // prior owner. The durable wake key deduplicates retries; the state guard
@@ -2446,7 +2462,8 @@ export class PaperclipRunnerToolAuthority {
     requiredString(titleInput.idempotencyKey);
     // Use the shared title receipt so native and HTTP retries have the same
     // identity and cannot overwrite a later user edit when switching surfaces.
-    const receipt = await this.db.transaction(async (tx) => {
+    // DB-only; the publication is returned from the committed attempt only.
+    const receipt = await withTransactionRetry(() => this.db.transaction(async (tx) => {
       await this.#lockAuthorizedMutationContext(tx as unknown as Db);
       const actor = {
         actorType: "agent", actorId: this.binding.agentId, agentId: this.binding.agentId, runId: this.binding.runId,
@@ -2454,7 +2471,7 @@ export class PaperclipRunnerToolAuthority {
       return receiptOnly
         ? setIssueTitle(tx as unknown as Db, this.binding.companyId, this.binding.issueId, titleInput, actor, { receiptOnly: true })
         : setIssueTitle(tx as unknown as Db, this.binding.companyId, this.binding.issueId, titleInput, actor);
-    });
+    }));
     if (!receipt) return undefined;
     const { result, publication } = receipt;
     if (publication) publishActivity(publication);
@@ -2931,7 +2948,9 @@ export class PaperclipRunnerToolAuthority {
       // the attempt *before* permitting that effect. If the effect transaction
       // or its acknowledgement is lost, a missing result is unknown, not a
       // license to run the instruction write a second time.
-      const reserved = recoveryOnly ? false : await this.db.transaction(async (tx) => {
+      // The reservation is DB-only and precedes the filesystem effect, so it is
+      // retried on 40P01/40001; the effect transaction below is not.
+      const reserved = recoveryOnly ? false : await withTransactionRetry(() => this.db.transaction(async (tx) => {
         const context = await this.#lockAuthorizedMutationContext(tx as unknown as Db);
         const bound = await authorize(tx as unknown as Db);
         const resultJson = record(context.run.resultJson);
@@ -2961,7 +2980,7 @@ export class PaperclipRunnerToolAuthority {
           details: { callId, operationId: tool, inputDigest: digest },
         });
         return true;
-      });
+      }));
       try {
         return await this.#withMutationReceipt(tool, key, input, async (tx) => {
           // Recovery reuses current authorization and receipt validation. If
@@ -3135,13 +3154,18 @@ export class PaperclipRunnerToolAuthority {
         throw error;
       }
     };
-    return this.db.transaction(async tx => {
+    const attempt = () => this.db.transaction(async tx => {
       if (operationId === "create_task") {
         await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, this.binding.companyId)).for("no key update");
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${this.binding.companyId}`}, 0))`);
       }
       return mutate(tx);
     });
+    // A 40P01/40001 rolls the whole transaction back, so DB-only effects are
+    // re-run from scratch; callers publish activity and wake only after this
+    // returns. Effects that write object storage or the filesystem before
+    // commit are never replayed: the shared lock order is their protection.
+    return NON_REPLAYABLE_RECEIPT_OPERATIONS.has(operationId) ? attempt() : withTransactionRetry(attempt);
   }
 
   async #lockAuthorizedMutationContext(tx: Db): Promise<{
@@ -3149,6 +3173,13 @@ export class PaperclipRunnerToolAuthority {
     issue: typeof issues.$inferSelect;
     actor: typeof agents.$inferSelect;
   }> {
+    // One lock order for every run write (agent-run-cancellation.ts
+    // lockAgentForRunWrite): agents FOR SHARE -> issue FOR UPDATE ->
+    // heartbeat_runs FOR UPDATE. The agent row is never locked FOR UPDATE here:
+    // after the run that inverted assertInteractionRunWriteAllowed and FK
+    // key-share writers and deadlocked (40P01). FOR SHARE still blocks
+    // pause/terminate until commit, so the actor status check below holds.
+    await lockAgentForRunWrite(tx, this.binding.companyId, this.binding.agentId);
     if (this.binding.museRuntime) {
       await withExternalExecutionAdmission(tx as unknown as ExternalAdmissionTransaction,
         this.binding.companyId, this.binding.agentId, this.binding.runId, async () => {});
@@ -3158,8 +3189,8 @@ export class PaperclipRunnerToolAuthority {
       eq(issues.id, this.binding.issueId), eq(issues.companyId, this.binding.companyId),
     )).for("update");
     // Authorization for writes is intentionally re-read only after the
-    // transaction starts. Locking the run and issue in the same statement
-    // closes the gap between the discovery-time check and the mutation: a
+    // transaction starts. Locking the run here, with the issue and agent rows
+    // already locked above, closes the gap between the discovery-time check and the mutation: a
     // reassignment, replacement run, or terminal transition must commit either
     // before this check (and be rejected) or after this transaction completes.
     const [context] = await tx
@@ -3177,7 +3208,7 @@ export class PaperclipRunnerToolAuthority {
         eq(issues.executionRunId, this.binding.runId),
         eq(agents.companyId, this.binding.companyId),
       ))
-      .for("update")
+      .for("update", { of: heartbeatRuns })
       .limit(1);
     if (
       !context
