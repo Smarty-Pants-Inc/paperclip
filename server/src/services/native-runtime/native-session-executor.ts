@@ -5739,7 +5739,7 @@ const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_to
   "session.goal.get"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
-  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean } = {}): SettledRunnerdProjection {
+  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
     if (!isSafeNativeStateDirectory(root)) return refuse("root_unsafe");
@@ -5763,7 +5763,10 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
     // a delivery that it never acknowledged.
     const goneCommandTypes = options.remoteRunnerGone ? new Set([...LOCAL_RUNNER_LIFECYCLE_COMMANDS, ...GONE_REMOTE_RUNNER_DELIVERY_COMMANDS])
       : LOCAL_RUNNER_LIFECYCLE_COMMANDS;
-    const settledCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone) && Array.isArray(control.commands)
+    // A remote Runner whose own environment restarted can no longer act on its
+    // lifecycle commands either. Its deliveries and tool answers still count.
+    const settledCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone
+      || options.remoteRunnerStopped) && Array.isArray(control.commands)
       ? commands.filter(command => !goneCommandTypes.has(String(command.type)) || command.status === "completed")
       : commands;
     const settledControl = settledCommands === commands ? control : { ...control, commands: settledCommands };
@@ -5923,7 +5926,9 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
       return refuse("target_not_sandbox_runner");
     }
-    if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
+    // A resume that woke a provider-stopped allocation restarted its machine,
+    // so the prior Runner is no more alive there than on a new sandbox.
+    if (!restartedSandboxResume(target) && !["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
   }
@@ -5939,12 +5944,13 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   try { originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8"); }
   catch { return refuse("journal_unreadable"); }
   const { binding } = input.execution;
-  const remoteRunnerGone = !localRunner && await priorRemoteSandboxLeasesEnded(input.db, {
+  const remoteRunnerStopped = !localRunner && restartedSandboxResume(target);
+  const remoteRunnerGone = !localRunner && !remoteRunnerStopped && await priorRemoteSandboxLeasesEnded(input.db, {
     companyId: binding.companyId, runId: identity.runId,
     currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
       ? target.sandboxLeaseAcquisition?.providerLeaseId : undefined,
   });
-  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone };
+  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped };
   const projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
   if (projection.refused !== undefined) return refuse(projection.refused);
   const controlBytes = projection.bytes;
@@ -6018,7 +6024,7 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     for (const name of readdirSync(quarantine)) {
       if (!name.startsWith(`${basename(input.root)}.`)) continue;
       if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
-      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone });
+      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped });
       if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
     }
   }
@@ -6054,6 +6060,29 @@ async function priorRemoteSandboxLeasesEnded(db: Db, input: {
   } catch {
     return false;
   }
+}
+
+function restartedSandboxResume(target: AdapterExecutionTarget | null | undefined): boolean {
+  return target?.kind === "remote" && target.transport === "sandbox" && !target.runnerTask
+    && target.sandboxLeaseAcquisition?.outcome === "resumed" && target.sandboxLeaseAcquisition.restarted === true;
+}
+
+/** The prior Runner of a provider-restarted sandbox is lost, not live: its
+ * process died with the machine and it never suspended. Return its exact
+ * identity only when the ordinary finished-owner proofs pass (committed or
+ * cleanly stopped result, released lease, stopped controller, settled
+ * journal); authority rotation then archives its last state. */
+async function provenLostRestartedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">)
+  : Promise<DurableRecoveryIdentity | null> {
+  if (!restartedSandboxResume(input.runnerExecutionTarget) || !isSafeNativeStateDirectory(input.root)) return null;
+  const identity = readRunnerdDurableIdentity(input.root);
+  if (!identity || !durableIdentityMatchesSession(identity, input.execution) || identity.runId === input.execution.binding.runId) return null;
+  const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
+  if (!proof.finished) {
+    await input.onLog?.("stderr", `[paperclip-runner] restarted sandbox owner ${String(identity.runId)} not retired: ${proof.refused}\n`);
+    return null;
+  }
+  return await proof.recheck() ? null : identity as unknown as DurableRecoveryIdentity;
 }
 
 async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
@@ -6365,9 +6394,16 @@ async function migrateRunnerdStateRootForExecution(input: {
       let retirementRefusal = "";
       if (verification === "terminal_state_indeterminate" && !input.retainedWarmOwnerRunId
         && (!input.restartRecovery || input.restartRecovery.kind === "bootstrap_incomplete")) {
-        const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
-        if (retirement.retired) return;
-        if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
+        if (restartedSandboxResume(input.runnerExecutionTarget)) {
+          // The backend's authority rotation archives a proven-lost owner of a
+          // restarted sandbox, keeping its journal and provider files in place.
+          if (await provenLostRestartedSandboxRunner({ ...input, root: scoped })) return;
+          retirementRefusal = "; retirement_refused=restarted_sandbox_owner_unproven";
+        } else {
+          const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+          if (retirement.retired) return;
+          if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
+        }
       }
       if (
         verification !== "verified" &&
@@ -16598,6 +16634,13 @@ async function createRunnerdBackendWithinSessionClaim(
     remoteTarget?.transport === "sandbox"
       ? (remoteTarget.sandboxLeaseAcquisition ?? null)
       : null;
+  // A provider-restarted sandbox still holds its dead Runner's last,
+  // unsuspended state. Authority rotation may archive it only after the
+  // ordinary finished-owner proofs; anything unproven keeps the refusal.
+  const lostRunnerSource = !pluginTask && !input.restartRecovery && !input.remoteWarmRecovery
+    ? await provenLostRestartedSandboxRunner({ db: input.db, root, execution: input.execution,
+      runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })
+    : null;
   let verifyRetainedRemoteProcess: (() => Promise<void>) | undefined;
   // Capability support alone is not guardian qualification. A provider must
   // explicitly opt this exact allocation into the resident fd4 guardian, and
@@ -17368,7 +17411,15 @@ async function createRunnerdBackendWithinSessionClaim(
                       const restoresRetiredSource = !provenRestart && state.incompleteReason === "unavailable"
                         && backupAvailable && remoteTarget.reusableLeaseConfigured === true
                         && await retiredSourceBackupAuthorized();
-                      if (restoresRetiredSource) {
+                      // A provider-restarted sandbox keeps its proven-lost Runner's
+                      // last state for authority rotation to archive. The provider
+                      // files beside it stay in place for the same conversation.
+                      const lostOwnerState = !provenRestart && !restoresRetiredSource && lostRunnerSource !== null
+                        && state.incompleteReason === "not_suspended" && state.notSuspendedRunId === lostRunnerSource.runId;
+                      if (lostOwnerState) {
+                        await input.onLog?.("stdout", `[paperclip-runner] Run ${lostRunnerSource.runId} stopped with its restarted sandbox; `
+                          + "retiring its runner and resuming the same conversation.\n");
+                      } else if (restoresRetiredSource) {
                         await measureNativeRunnerSpan(input.trace, "sandbox.lease.replacement", restoreVerifiedHarnessBackup, {
                           attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
                             lifecycleMode: input.execution.session.lifecyclePolicy.mode, outcome: "resumed", reason: "state_absent" },
@@ -18111,7 +18162,8 @@ async function createRunnerdBackendWithinSessionClaim(
     process: { runnerStateDirectory: remoteStateDirectory,
       readRunnerState: remoteStateDirectory && remoteCommandRunner
         ? () => readRemoteRunnerState({ runner: remoteCommandRunner, stateDirectory: remoteStateDirectory }) : undefined,
-      prepareExternalRunnerState, archiveExternalRunnerState, runnerProcessLauncher: remoteProcessLauncher, adoptExistingRunner: adoptedProcess },
+      prepareExternalRunnerState, archiveExternalRunnerState, runnerProcessLauncher: remoteProcessLauncher, adoptExistingRunner: adoptedProcess,
+      ...(lostRunnerSource ? { lostRunnerSource } : {}) },
     target, sandboxRetention,
     controllerPersistence: input.controllerPersistence ? nativeRunnerCheckpointPersistence(
       input.db, input.controllerPersistence.bootId, () => {

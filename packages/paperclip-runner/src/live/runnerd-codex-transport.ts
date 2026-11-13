@@ -241,6 +241,18 @@ function assertSuspendedRunnerState(
   }
 }
 
+/** A suspended prior state, or the exact proven-lost Runner's last state:
+ * its process died with its environment, so it can never suspend. */
+function assertRotatableRunnerState(
+  state: Record<string, unknown>,
+  expected: DurableRecoveryIdentity,
+  lostSource?: DurableRecoveryIdentity,
+): void {
+  if (lostSource && recoveryIdentityMatches(lostSource, expected)
+    && state.schema === "paperclip.runner.durable.state.v1" && recoveryIdentityMatches(state, expected)) return;
+  assertSuspendedRunnerState(state, expected);
+}
+
 function assertRealDirectory(path: string): void {
   const metadata = lstatSync(path);
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
@@ -469,6 +481,7 @@ async function rotateAuthorityEpoch(
   controlPlaneState: Record<string, unknown>,
   desired: DurableRecoveryIdentity,
   runnerState: RunnerStateArchive,
+  lostSource?: DurableRecoveryIdentity,
 ): Promise<Record<string, unknown>> {
   const priorIdentity = controlPlaneIdentity(controlPlaneState);
   if (
@@ -507,7 +520,7 @@ async function rotateAuthorityEpoch(
       priorIdentity,
     );
   } else {
-    assertSuspendedRunnerState(await runnerState.read(), priorIdentity);
+    assertRotatableRunnerState(await runnerState.read(), priorIdentity, lostSource);
     if (!existsSync(activeControlPlane)) {
       throw new Error("native_runner_authority_archive_incomplete");
     }
@@ -518,7 +531,7 @@ async function rotateAuthorityEpoch(
     archiveKey: basename(archive).replace(/^epoch-/, ""),
     priorIdentity,
   });
-  assertSuspendedRunnerState(archivedRunnerState, priorIdentity);
+  assertRotatableRunnerState(archivedRunnerState, priorIdentity, lostSource);
   return resumedState ?? controlPlaneState;
 }
 
@@ -6828,6 +6841,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           rotationSource,
           desiredIdentity,
           localStateOwner ? localRunnerStateArchive(this.#root) : this.#externalRunnerStateArchive(),
+          localStateOwner ? undefined : this.options.lostRunnerSource,
         );
       } catch (error) {
         // Locally owned state is preserved aside for operator recovery.
