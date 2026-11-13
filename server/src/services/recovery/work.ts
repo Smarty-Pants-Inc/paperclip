@@ -6,6 +6,7 @@ import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notificati
 import type { IssueRecoveryScope } from "../issue-recovery-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { recoveryActionSweepCondition } from "./blocker-stall-wakeups.js";
+import { unansweredPersonMessageCondition } from "./unanswered-person-message.js";
 
 type Entry = { id: string; companyId: string; dueAt: number };
 type Scope = { companyId: string; issueId: string; onDeferredDeadline: (at: number) => void };
@@ -31,7 +32,8 @@ export function registerIssueRecoveryWork(
   },
   canRun: () => boolean,
 ) {
-  function register(queue: DeliveryQueue, statuses: string[] | null, check: (scope: Scope) => Promise<unknown>) {
+  function register(queue: DeliveryQueue, statuses: string[] | null, check: (scope: Scope) => Promise<unknown>,
+    alsoBlockedWhen?: () => ReturnType<typeof unansweredPersonMessageCondition>) {
     const cursors = new Map<string, string>();
     let enabled = false;
     return registerScopedDeadlineWork<Entry, IssueRecoveryScope>(coordinator, {
@@ -48,7 +50,11 @@ export function registerIssueRecoveryWork(
           scope ? eq(issues.companyId, scope.companyId) : undefined,
           scope?.issueId ? eq(issues.id, scope.issueId) : undefined,
           cursor ? gt(issues.id, cursor) : undefined,
-          statuses ? inArray(issues.status, statuses) : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId)),
+          statuses
+            ? alsoBlockedWhen
+              ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()))
+              : inArray(issues.status, statuses)
+            : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId)),
           statuses ? isNull(issues.hiddenAt) : undefined,
           statuses ? isNull(issues.assigneeUserId) : undefined,
           statuses ? or(isNotNull(issues.assigneeAgentId), eq(issues.status, "in_review")) : undefined,
@@ -139,7 +145,10 @@ export function registerIssueRecoveryWork(
       },
     }, canRun);
   }
-  const assignments = register(DELIVERY_QUEUES.strandedAssignments, ["todo", "in_progress", "in_review"], owner.stranded);
+  // A blocked task is visited too while its person's last message is unanswered
+  // (the stranded sweep's unanswered-message step, Smarty fork, TEMPORARY).
+  const assignments = register(DELIVERY_QUEUES.strandedAssignments, ["todo", "in_progress", "in_review"], owner.stranded,
+    () => unansweredPersonMessageCondition(issues.id, issues.companyId));
   const orphanBlockers = registerCompany(DELIVERY_QUEUES.orphanBlockers, "blockers", async scope => { await owner.orphanBlockers(scope); });
   const recoveryActions = registerCompany(DELIVERY_QUEUES.activeRecoveryActions, "actions", async scope => {
     const result = await owner.recoveryActions(scope);
