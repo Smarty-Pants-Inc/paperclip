@@ -9,7 +9,7 @@ import type {
   PersistedNativeSession,
 } from "../../vendor/paperclip-runner/index.js";
 import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
-import { provesNoNativeRunProviderWork } from "./native-provider-work-proof.js";
+import { provesNativeRunPreSpawnFailure } from "./native-provider-work-proof.js";
 
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
@@ -277,8 +277,9 @@ export async function findNativeSessionResumeRun(db: Db, input: NativeSessionRes
   return inherited ? selected : barrier;
 }
 
-/** The run row, its coordinator, and the absence of controller checkpoints,
- * results and provider events together prove no provider work started. */
+/** An inherited checkpoint may be bypassed only with affirmative pre-spawn
+ * evidence. Missing process/provider telemetry alone never proves a launch did
+ * not happen; an ambiguous predecessor remains the visible progress barrier. */
 async function isUnstartedInheritedFollowUp(
   db: Db,
   input: NativeSessionResumeSelection,
@@ -328,11 +329,11 @@ async function isUnstartedInheritedFollowUp(
       evidence.controllerCheckpoint || evidence.result || evidence.processStart) return false;
   const bootstrap = noProcess && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false && evidence.controllerPid === null;
   if (!bootstrap && !(piRecovery && (noProcess || evidence.inheritedProcess))) return false;
-  // process_start_requested is only pre-launch intent (the real missing-state
-  // failure writes it without spawning). A newly recorded process identity,
-  // controller checkpoint, tool, result, or sourced/provider event is a barrier.
-  // Share cold-start admission's cross-instance durable no-provider-work proof.
-  return provesNoNativeRunProviderWork(db, { companyId: input.companyId, runId: run.id });
+  // Launch intent invalidates an absence-based inference even if identity
+  // retrieval/onSpawn persistence never completed. This selector has no box to
+  // probe: post-dispatch process retirement belongs to the existing executor's
+  // exact-generation prover, not a third "gone" predicate here.
+  return provesNativeRunPreSpawnFailure(db, { companyId: input.companyId, runId: run.id });
 }
 
 async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResumeSelection, skippedRunIds: string[]) {
