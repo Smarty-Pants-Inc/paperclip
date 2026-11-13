@@ -41,6 +41,10 @@ export interface RunnerExecutionDriver {
     connection?: RunnerProcessConnection;
     activate?: () => Promise<void> | void;
     ready?: () => Promise<void>;
+    /** Reopen this same authenticated route before close-time lifecycle commands.
+     * Must obey the deadline/cancellation and never launch or replace a process.
+     * Omission preserves runner-owned/local reconnect behavior. */
+    ensureConnected?: (input: { deadline: number; signal: AbortSignal }) => Promise<void>;
     failure?: Promise<never>;
     startupFailureCode?:
       | "runner_local_connect_failed"
