@@ -81,6 +81,58 @@ describe("runner provider-ingress WebSocket wire", () => {
       expect(terminal).toMatchObject({ causeSummary: { code: "ECONNREFUSED", errno: -111, syscall: "connect" } });
     } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
   });
+  it.each([
+    ["an Authorization header in prose", "upgrade failed: Authorization: Bearer sk-live-SECRET123456789 rejected"],
+    ["a credentialed URL inside a sentence", "could not reach https://user:pa55w0rd-SECRET@ingress.example/x after retry"],
+  ])("never logs raw transport prose carrying %s", async (_label, prose) => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    sockets.create = () => {
+      const socket = new FakeSocket();
+      socket.readyState = WebSocket.CONNECTING;
+      queueMicrotask(() => {
+        socket.readyState = WebSocket.CLOSED;
+        socket.emit("error", Object.assign(new Error(prose), { code: "ECONNRESET" }));
+      });
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-log",
+      secretHeaders: [], generation: "log", refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: vi.fn() } as unknown as DurablePrpControlPlane,
+      endpoint, startupDeadlineMs: 600, random: () => 0.5 });
+    try {
+      const terminal = await (async () => { const o = handle.ready.catch(error => error); await vi.advanceTimersByTimeAsync(600); return o; })();
+      const records = warn.mock.calls.filter(call => (call[0] as Record<string, unknown>)?.event === "runner_ingress_connect_attempt_failed");
+      expect(records.length).toBeGreaterThan(0);
+      expect(records[0]?.[0]).toMatchObject({ code: "ECONNRESET", reason: null });
+      const logged = JSON.stringify(records) + JSON.stringify((terminal as { causeSummary?: unknown }).causeSummary ?? null);
+      expect(logged).not.toContain("SECRET");
+      expect(logged).not.toContain("Bearer");
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+  it("keeps a bare machine reason code", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    sockets.create = () => {
+      const socket = new FakeSocket();
+      socket.readyState = WebSocket.CONNECTING;
+      queueMicrotask(() => { socket.readyState = WebSocket.CLOSED; socket.emit("error", new Error("runner_ingress_upgrade_rejected")); });
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-log",
+      secretHeaders: [], generation: "log", refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: vi.fn() } as unknown as DurablePrpControlPlane,
+      endpoint, startupDeadlineMs: 600, random: () => 0.5 });
+    try {
+      const o = handle.ready.catch(error => error); await vi.advanceTimersByTimeAsync(600); await o;
+      const records = warn.mock.calls.filter(call => (call[0] as Record<string, unknown>)?.event === "runner_ingress_connect_attempt_failed");
+      expect(records[0]?.[0]).toMatchObject({ reason: "runner_ingress_upgrade_rejected" });
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
   it.each(["fresh", "permanently unreachable"] as const)("retries a %s listener only within the startup budget", async mode => {
     vi.useFakeTimers();
     const create = sockets.create;
