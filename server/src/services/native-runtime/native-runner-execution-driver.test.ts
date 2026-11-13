@@ -200,6 +200,56 @@ describe("shared Runner execution driver", () => {
     expect(transport.connect).not.toHaveBeenCalled();
   });
 
+  it("reopens only the existing authenticated ingress before retiring an idle owner", async () => {
+    const ingress = endpoint(), refreshed = endpoint();
+    vi.mocked(ingress.refresh).mockResolvedValue(refreshed);
+    let connections = 1;
+    const core = { activeRunnerConnectionCount: () => connections } as typeof authority;
+    const acquire = vi.fn(async () => ingress);
+    const launch = vi.fn();
+    const driver = createNativeRunnerExecutionDriver({ binding, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted: Promise.resolve(),
+      target: { ...sandbox(), getRunnerIngressEndpoint: acquire } as AdapterExecutionTarget,
+      process: { runnerProcessLauncher: launch } });
+    const registration = await driver.controlPlaneRegistration!(core);
+    await registration.activate!(); await registration.ready!();
+    const original = transport.connect.mock.results[0]!.value;
+    const abort = new AbortController(), deadline = Date.now() + 1_000;
+    await registration.ensureConnected!({ deadline, signal: abort.signal });
+    expect(ingress.refresh).not.toHaveBeenCalled();
+    connections = 0;
+    transport.connect.mockImplementationOnce(() => { connections = 1; return { ready: Promise.resolve(), close: vi.fn() }; });
+    await registration.ensureConnected!({ deadline, signal: abort.signal });
+    expect(ingress.refresh).toHaveBeenCalledOnce();
+    expect(original.close).toHaveBeenCalledOnce();
+    expect(transport.connect).toHaveBeenLastCalledWith(expect.objectContaining({ authority: core, endpoint: refreshed }));
+    expect(acquire).toHaveBeenCalledOnce(); expect(launch).not.toHaveBeenCalled();
+    await registration.release();
+    await expect(registration.ensureConnected!({ deadline, signal: abort.signal })).rejects.toThrow("runner_ingress_reopen_cancelled");
+  });
+
+  it.each(["ambiguous", "refresh failed", "cancelled refresh", "generation changed"])("keeps an idle owner fenced when ingress reopening is %s", async scenario => {
+    const ingress = endpoint(), refreshed = endpoint();
+    const abort = new AbortController();
+    vi.mocked(ingress.refresh).mockImplementation(async () => {
+      if (scenario === "refresh failed") throw new Error("refresh_failed");
+      if (scenario === "generation changed") return { ...refreshed, generation: "another-allocation" };
+      abort.abort(); return refreshed;
+    });
+    let connections = 1;
+    const core = { activeRunnerConnectionCount: () => connections } as typeof authority;
+    const driver = createNativeRunnerExecutionDriver({ binding, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted: Promise.resolve(),
+      target: { ...sandbox(), getRunnerIngressEndpoint: async () => ingress } as AdapterExecutionTarget });
+    const registration = await driver.controlPlaneRegistration!(core);
+    await registration.activate!(); await registration.ready!();
+    connections = scenario === "ambiguous" ? 2 : 0;
+    await expect(registration.ensureConnected!({ deadline: Date.now() + 1_000, signal: abort.signal })).rejects.toThrow({
+      ambiguous: "runner_ingress_owner_ambiguous", "refresh failed": "refresh_failed", "cancelled refresh": "runner_ingress_reopen_cancelled", "generation changed": "runner_ingress_owner_changed",
+    }[scenario]);
+    expect(transport.connect).toHaveBeenCalledOnce();
+    if (scenario === "cancelled refresh" || scenario === "generation changed") expect(refreshed.close).toHaveBeenCalledOnce();
+    await registration.release();
+  });
+
   it("does not fall back to outbound WSS when sandbox ingress is unauthorized", async () => {
     const prepare = vi.fn();
     const acquire = vi.fn();

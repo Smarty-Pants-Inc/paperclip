@@ -5857,7 +5857,9 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
   const refuse = (refused: string) => ({ finished: false as const, refused });
   const lifecycle = input.execution.session.lifecyclePolicy.mode;
   const localRunner = !target || target.kind === "local";
-  if (lifecycle !== "per_turn" && !(lifecycle === "warm" && !localRunner)) return refuse("lifecycle_not_per_turn");
+  // Lost warm owners use the same settled-result and exact process/provider
+  // stop proofs as per-turn owners. A dead ingress alone is never evidence.
+  if (lifecycle !== "per_turn" && lifecycle !== "warm") return refuse("lifecycle_not_per_turn");
   if (!localRunner) {
     if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
       return refuse("target_not_sandbox_runner");
@@ -6086,6 +6088,40 @@ async function recordPriorOwnerFenceRefusal(input: { db: Db; execution: NativeEx
   }).catch(() => undefined);
 }
 
+/** Reuse Pi's private history only after the archived owner passes the same
+ * terminal-result, journal and exact local process/provider stop proofs again.
+ * This is crash retirement, not a new conversation or a fabricated suspend. */
+async function retiredLocalPiConversation(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">,
+  providerSessionId?: string): Promise<{ file: string; runId: string } | null> {
+  if (input.execution.provider.kind !== "pi_rpc" || input.runnerExecutionTarget?.kind === "remote"
+    || input.execution.session.lifecyclePolicy.mode !== "warm" || !isSafeNativeStateDirectory(input.root)) return null;
+  const entries = readdirSync(input.root);
+  if (entries.some(name => !["continuity-breaks", "pi", "runtime-context.json", "diagnostics"].includes(name))) return null;
+  const archives = resolve(input.root, "continuity-breaks");
+  if (!isSafeNativeStateDirectory(archives)) return null;
+  const latest = readdirSync(archives).sort().at(-1);
+  if (!latest || !/^\d+-[0-9a-f-]{36}$/.test(latest)) return null;
+  const archive = resolve(archives, latest);
+  if (!isSafeNativeStateDirectory(archive)) return null;
+  const identity = readRunnerdDurableIdentity(archive);
+  if (!identity || !durableIdentityMatchesSession(identity, input.execution) || identity.runId === input.execution.binding.runId) return null;
+  const directory = resolve(archive, "pi"), file = resolve(directory, `${nativeSessionKey(input.execution)}.jsonl`);
+  const stat = lstatSync(file, { throwIfNoEntry: false });
+  if (!isSafeNativeStateDirectory(directory) || !stat?.isFile() || stat.size === 0) return null;
+  const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, root: archive, identity });
+  if (!proof.finished || await proof.recheck()) return null;
+  if (providerSessionId !== undefined && record(record(proof.run.runnerProfileJson).sessionCheckpoint).providerSessionId !== providerSessionId) return null;
+  // An interrupted reopen may already have copied the history, but never
+  // overwrite an advanced or unsafe conversation with the archived version.
+  if (entries.includes("pi")) {
+    const activeDirectory = resolve(input.root, "pi"), activeFile = resolve(activeDirectory, basename(file));
+    if (!isSafeNativeStateDirectory(activeDirectory) || readdirSync(activeDirectory).some(name => name !== basename(file))
+      || !lstatSync(activeFile, { throwIfNoEntry: false })?.isFile()
+      || createHash("sha256").update(readFileSync(activeFile)).digest("hex") !== createHash("sha256").update(readFileSync(file)).digest("hex")) return null;
+  }
+  return { file, runId: identity.runId! };
+}
+
 async function migrateRunnerdStateRootForExecution(input: {
   db: Db;
   execution: NativeExecutionInput;
@@ -6147,6 +6183,8 @@ async function migrateRunnerdStateRootForExecution(input: {
       await rollBackUndeliveredAttachRotation(scoped, input.execution, input.onLog);
     }
     const identity = readRunnerdDurableIdentity(scoped);
+    if (!identity && !input.restartRecovery && !input.retainedWarmOwnerRunId
+      && await retiredLocalPiConversation({ ...input, root: scoped })) return;
     if (!identity && input.restartRecovery?.kind === "bootstrap_incomplete" &&
         !existsSync(resolve(scoped, "control-plane", "control-plane-state.json")) &&
         (input.runnerExecutionTarget?.kind === "remote" || await noLocalRunnerProcessForRun(input.execution.binding.runId))) {
@@ -18353,7 +18391,13 @@ async function createRunnerdBackendWithinSessionClaim(
         // same-run recovery and remote providers retain their existing path.
         const piFile = resolve(root, "pi", `${nativeSessionKey(input.execution)}.jsonl`);
         const piFileStat = input.execution.provider.kind === "pi_rpc" ? lstatSync(piFile, { throwIfNoEntry: false }) : undefined;
-        const reopenPi = input.execution.provider.kind === "pi_rpc" && !remoteTarget && !input.restartRecovery
+        const retiredPi = !durableIdentity && !input.restartRecovery && snapshot.providerSessionId && snapshot.identity.sessionId === nativeSessionKey(input.execution)
+          ? await retiredLocalPiConversation({ ...input, root }, snapshot.providerSessionId) : null;
+        if (retiredPi && !existsSync(piFile)) {
+          mkdirSync(dirname(piFile), { recursive: true, mode: 0o700 });
+          copyFileSync(retiredPi.file, piFile);
+        }
+        const reopenPi = retiredPi !== null || input.execution.provider.kind === "pi_rpc" && !remoteTarget && !input.restartRecovery
           && durableIdentity && durableIdentity.runId !== input.execution.binding.runId
           && snapshot.identity.sessionId === nativeSessionKey(input.execution)
           && isSafeNativeStateDirectory(resolve(root, "pi"))
