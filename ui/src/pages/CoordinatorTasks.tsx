@@ -1,6 +1,6 @@
 import { companyProjectsQuery } from "@/lib/company-projects-query";
 import { readTaskListSortParams, taskListOrderToIssueSort, type TaskListSort } from "@/lib/task-list";
-import { useDeferredValue, useEffect, useRef, useState, type ReactNode } from "react";
+import { startTransition, useDeferredValue, useEffect, useRef, useState, type ReactNode } from "react";
 import { useWarmTaskDetailCode } from "@/hooks/useWarmTaskDetailCode";
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ListChecks, SearchX } from "lucide-react";
@@ -31,11 +31,78 @@ import { createIssueDetailLocationState } from "@/lib/issueDetailBreadcrumb";
 import { defaultIssueFilterState, type IssueFilterState } from "@/lib/issue-filters";
 import { queryKeys } from "@/lib/queryKeys";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/router";
+import { createUuid } from "@/lib/uuid";
 import { loadTaskListView, saveTaskListView, taskListViews, taskListViewStorageKey, type TaskListView } from "@/lib/task-list-views";
 import { normalizeTaskViewKey, ORGANIZATION_SCOPED_PARAMS, taskView } from "@/lib/task-views";
 import type { Issue } from "@paperclipai/shared";
 
 const pageSize = 200;
+
+// ISSUE_SEARCH_DEBOUNCE_MS, upstream ui/src/components/IssuesList.tsx:111 (paperclipai/paperclip b4861d5e).
+const TASK_SEARCH_DEBOUNCE_MS = 250;
+const TASK_SEARCH_COMMIT = "taskSearchCommit";
+type TaskSearchCommitState = { [TASK_SEARCH_COMMIT]: string };
+
+/** The search field's draft, ported from upstream's IssueSearchInput
+ * (paperclipai/paperclip b4861d5e, ui/src/components/IssuesList.tsx:529-589):
+ * keystrokes update a local draft at once, the draft reaches the URL after a
+ * 250 ms pause inside startTransition, and a change from outside replaces the
+ * draft (upstream's `useEffect(() => setDraftValue(value), [value])`).
+ *
+ * Two adaptations for a URL-backed field (#20378). The outside change is any
+ * navigation, not only a new `q`: Back to an entry with the same `q`, or Clear
+ * filters while `q` is unchanged, must still cancel a pending draft. And our own
+ * commit is recognised by the history-entry state it writes, not by comparing
+ * query strings, so a commit landing after more keys were typed does not
+ * revert them, while Back to an entry whose `q` equals a typed prefix still wins.
+ * The commit id is this mount's random id plus a counter: history entries
+ * outlive the page, so a bare counter restarting at 1 on every mount would let
+ * Back to an entry written by an earlier mount pass for our pending commit.
+ * The callback is read through a ref (upstream lists it as an effect dependency)
+ * because live task updates re-render this page between keystrokes and a new
+ * callback each render would keep restarting the 250 ms timer. */
+function useTaskSearchDraft({ value, location, onDebouncedChange }: {
+  value: string;
+  location: { key: string; state: unknown };
+  onDebouncedChange: (search: string, state: TaskSearchCommitState) => void;
+}) {
+  const [draftValue, setDraftValue] = useState(value);
+  const lastCommittedValueRef = useRef(value);
+  const [mountId] = useState(createUuid);
+  const pendingCommitsRef = useRef<string[]>([]);
+  const nextCommitRef = useRef(0);
+  const onDebouncedChangeRef = useRef(onDebouncedChange);
+  onDebouncedChangeRef.current = onDebouncedChange;
+  const commit = (location.state as Partial<TaskSearchCommitState> | null)?.[TASK_SEARCH_COMMIT];
+
+  useEffect(() => {
+    const acknowledged = typeof commit === "string" ? pendingCommitsRef.current.indexOf(commit) : -1;
+    if (acknowledged !== -1) {
+      pendingCommitsRef.current = pendingCommitsRef.current.slice(acknowledged + 1);
+      return;
+    }
+    pendingCommitsRef.current = [];
+    setDraftValue(value);
+    lastCommittedValueRef.current = value;
+  }, [value, location.key, commit]);
+
+  useEffect(() => {
+    if (draftValue === lastCommittedValueRef.current) return;
+
+    const timeoutId = window.setTimeout(() => {
+      lastCommittedValueRef.current = draftValue;
+      const id = `${mountId}:${++nextCommitRef.current}`;
+      pendingCommitsRef.current.push(id);
+      startTransition(() => {
+        onDebouncedChangeRef.current(draftValue, { [TASK_SEARCH_COMMIT]: id });
+      });
+    }, TASK_SEARCH_DEBOUNCE_MS);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [draftValue, mountId]);
+
+  return [draftValue, setDraftValue] as const;
+}
 
 /** Coordinator's existing IA and attention feed, rendered with the production
  * components reviewed in Design proposals / Pages / Tasks. */
@@ -102,11 +169,15 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   const participantAgentId = params.get("participantAgentId") ?? undefined;
   const workspaces = params.getAll("workspace").filter(Boolean);
   const workspaceIds = [...new Set(workspaces.length ? workspaces : params.getAll("workspaceId").filter(Boolean))];
-  const setQuery = (value: string) => setParams(current => {
+  const setQuery = (value: string, state?: TaskSearchCommitState) => setParams(current => {
     const next = new URLSearchParams(current);
     if (value) next.set("q", value); else next.delete("q");
     return next;
-  }, { replace: true });
+  }, { replace: true, state });
+  const [searchDraft, setSearchDraft] = useTaskSearchDraft({ value: query, location, onDebouncedChange: (value, state) => {
+    setQuery(value, state);
+    collection.setCollapsedIds(new Set());
+  } });
   const setView = (nextView: TaskListView) => setParams(current => {
     const next = new URLSearchParams(current);
     next.set("view", nextView === "blocked" ? "needs_attention" : nextView);
@@ -281,7 +352,7 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   if (!companyId) return <EmptyState icon={ListChecks} message="Select an organization to view tasks." />;
   return <FlyoutAppearanceProvider><TruncatedTextMarqueeProvider><section ref={listRef} className="coordinator-task-list task-row-design-preview flex min-w-0 flex-col gap-8" aria-label="Tasks">
     <TaskListToolbar view={view} onViewChange={setView} viewControl={viewControl}
-      query={collection.query} onQueryChange={collection.setQuery} layout={collection.layout} onLayoutChange={collection.setLayout}
+      query={searchDraft} onQueryChange={setSearchDraft} layout={collection.layout} onLayoutChange={collection.setLayout}
       allExpanded={collection.allExpanded} onToggleExpanded={collection.toggleExpanded} onNewTask={() => openNewIssue()}
       filters={{ enableRoutineTasksFilter: true, state: collection.filters, onChange: updateFilters, activeFilterCount: collection.activeFilterCount,
         agents: agents.data ?? [], projects: projects.data ?? [], labels: labels.data ?? [], currentUserId: userId, creators: collection.creators }} />
