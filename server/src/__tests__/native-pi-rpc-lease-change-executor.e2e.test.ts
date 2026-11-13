@@ -43,14 +43,6 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 // checkpoint publication and receipt persistence remain product code.
 // Core's own idle timer closes the warm Runner between turns.
 const WARM_IDLE_MS = 4_000;
-// Expected to fail until fork-lead's idle5m fix lands (the lost-owner path
-// admits only local Runners). Observed 2026-11-13 on real runnerd + Pi:
-// - 75b4e492: idle -> turn 2 "simulated sandbox environment lease retired:
-//   <turn-1 lease>"; archived -> turn 2 "Durable recovery runner timed out".
-// - prp-final 09321025b: both -> turn 2 "Durable recovery runner timed out"
-//   (no new Runner spawned; provider_ingress reconnects to the exited one).
-// Set PAPERCLIP_PI_IDLE5M_E2E=1 to run it.
-const idle5mEnabled = process.env.PAPERCLIP_PI_IDLE5M_E2E === "1";
 const allocation = vi.hoisted(() => ({ drivers: undefined as import("../services/environment-runtime.js").EnvironmentRuntimeDriver[] | undefined }));
 vi.mock("../services/environment-runtime.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/environment-runtime.js")>();
@@ -109,7 +101,7 @@ function sessionFile(pi: Birth): string {
 // "idle": the box resumes from idle (still running; the first hit).
 // "archived": the box resumes from archived (the sticky loop after a failed
 // run). Turns 2 and 3 must each continue with history.
-it.skipIf(!enabled || !idle5mEnabled).each(["idle", "archived"] as const)("Core's idle close of the warm Runner, then a %s resume of the same box: later turns continue through the executor", async resumedFrom => {
+it.skipIf(!enabled).each(["idle", "archived"] as const)("Core's idle close of the warm Runner, then a %s resume of the same box: later turns continue through the executor", async resumedFrom => {
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR is required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY ?? process.env.PAPERCLIP_RUNNERD_PATH;
