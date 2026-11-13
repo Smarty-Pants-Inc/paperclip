@@ -47,7 +47,7 @@ function parse(raw: Record<string, unknown>): Config {
     ...(typeof raw.boatEnvironment === "string" ? { boatEnvironment: raw.boatEnvironment } : {}),
   };
 }
-async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false): Promise<any> {
+async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: { onHeaders?: (headers: Headers) => void; requireJson?: boolean } = {}): Promise<any> {
   if (init.method && init.method !== "GET") assertBoatActivityAdmission();
   const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
   if (allocation) idleActivity.resource(activityKey(config, decodeURIComponent(allocation)));
@@ -55,9 +55,14 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
   headers.set("Authorization", `Bearer ${config.apiKey}`);
   if (init.body !== undefined) headers.set("Content-Type", "application/json");
   const response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: init.signal ?? AbortSignal.timeout(30_000) });
+  responseOptions.onHeaders?.(response.headers);
   if (allowMissing && response.status === 404) { await response.body?.cancel(); return null; }
-  const body = response.status === 204 ? null : await response.json().catch(() => null);
+  const body = response.status === 204 ? null : await response.json().catch(error => {
+    if (responseOptions.requireJson && response.ok) throw error;
+    return null;
+  });
   if (!response.ok) throw Object.assign(new Error(`Boat ${init.method ?? "GET"} ${path} failed (${response.status}): ${body?.message ?? body?.error?.message ?? response.statusText}`), { httpStatus: response.status });
+  if (responseOptions.requireJson && body === null) throw new Error("Boat inspection response omitted JSON data.");
   return body;
 }
 export type BoatSnapshotIdentity = { provider: "boat"; requestedRef: string; id: string; name: string; createdAt: string };
@@ -413,12 +418,20 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     idleActivity.resource(activityKey(c, params.providerLeaseId));
     const proof = idleActivity.proof(activityKey(c, params.providerLeaseId));
-    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, {}, true);
-    if (!result) { idleActivity.confirm(proof, true); return { providerLeaseId: params.providerLeaseId, state: "destroyed" }; }
+    let observedAt: string | null = null;
+    const result = await request(c, `/sandboxes/${encodeURIComponent(params.providerLeaseId)}`, { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, true, { requireJson: true, onHeaders: headers => {
+      const date = headers.get("Date");
+      if (date !== null && Number.isFinite(Date.parse(date))) observedAt = new Date(date).toISOString();
+    } });
+    if (result === null) { idleActivity.confirm(proof, true); return { providerLeaseId: params.providerLeaseId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt }; }
     const sandbox = result.sandbox ?? result;
     if (sandbox.id !== params.providerLeaseId) throw new Error("Boat inspection returned a different allocation.");
     if (sandbox.state === "archived") idleActivity.confirm(proof, true);
-    return { providerLeaseId: params.providerLeaseId, state: sandbox.state === "archived" ? "stopped" : ["ready", "idle", "running"].includes(sandbox.state) ? "active" : "unknown" };
+    // Boat documents terminal cancelled/404, the state enum, stoppedAt and lastReboot:
+    // https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md
+    const stoppedAt = sandbox.stoppedAt ?? null;
+    const state = sandbox.state === "cancelled" ? "destroyed" : sandbox.state === "archived" && stoppedAt !== null ? "stopped" : ["ready", "idle", "running"].includes(sandbox.state) ? "active" : "unknown";
+    return { providerLeaseId: params.providerLeaseId, state, stoppedAt, lastRebootAt: sandbox.lastReboot?.at ?? null, observedAt };
   },
   async onEnvironmentResumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
     const c = parse(params.config), id = params.providerLeaseId;

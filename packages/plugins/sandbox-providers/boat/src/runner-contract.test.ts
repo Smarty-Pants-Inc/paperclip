@@ -32,7 +32,7 @@ async function ingress(lease = { providerLeaseId: "bx_runner" } as any) {
   if (!plugin.definition.onEnvironmentRunnerIngressEndpoint) throw new Error("Runner ingress hook missing");
   return plugin.definition.onEnvironmentRunnerIngressEndpoint({ ...scope, lease, port: 43127, path });
 }
-afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("Boat Runner contract", () => {
   it("declares only implemented Runner transport and host-owned lifecycle controls", () => {
@@ -199,9 +199,111 @@ describe("Boat Runner contract", () => {
     expect(execution.message).toMatch(/no longer active/);
     expect(f.network.mock.calls.some(([, init]) => String(init?.body).includes("dangerous-command"))).toBe(false);
   });
+  it.each([
+    { state: "cancelled", expected: "destroyed" },
+    { state: "archived", stoppedAt: "2026-11-13T12:00:00+00:00", expected: "stopped" },
+    { state: "archived", stoppedAt: null, expected: "unknown" },
+    { state: "archived", expected: "unknown" },
+    { state: "ready", expected: "active" },
+    { state: "idle", expected: "active" },
+    { state: "running", expected: "active" },
+    { state: "archiving", expected: "unknown" },
+    { state: "error", expected: "unknown" },
+    { state: "provisioning", expected: "unknown" },
+    { state: "provisioned", expected: "unknown" },
+    { state: "cloning", expected: "unknown" },
+    { state: "init", expected: "unknown" },
+    { state: "future-state", expected: "unknown" },
+  ])("inspects $state with stoppedAt=$stoppedAt as $expected", async ({ state, stoppedAt, expected }) => {
+    const sandbox = { id: "bx_inspect", state, ...(stoppedAt === undefined ? {} : { stoppedAt }) };
+    vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox })));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: sandbox.id })).toEqual({
+      providerLeaseId: sandbox.id, state: expected, stoppedAt: stoppedAt ?? null, lastRebootAt: null, observedAt: null,
+    });
+  });
+  it.each([true, false])("preserves liveness timestamps verbatim with response envelope=%s", async wrapped => {
+    const sandbox = { id: "bx_inspect", state: "running", stoppedAt: "2026-11-13T11:30:00+00:00", lastReboot: { at: "2026-11-13T11:31:00.123Z", reason: "crash" } };
+    vi.stubGlobal("fetch", vi.fn(async () => reply(wrapped ? { sandbox } : sandbox)));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: sandbox.id })).toEqual({
+      providerLeaseId: sandbox.id, state: "active", stoppedAt: sandbox.stoppedAt, lastRebootAt: sandbox.lastReboot.at, observedAt: null,
+    });
+  });
+  it.each([null, {}])("reports a null reboot timestamp for lastReboot=%j", async lastReboot => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox: { id: "bx_inspect", state: "ready", lastReboot } })));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ lastRebootAt: null });
+  });
+  it.each([
+    { date: "Fri, 13 Nov 2026 12:00:00 GMT", expected: "2026-11-13T12:00:00.000Z" },
+    { date: "not-a-date", expected: null },
+    { date: undefined, expected: null },
+  ])("uses only the HTTP Date header for observedAt: $date", async ({ date, expected }) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ sandbox: { id: "bx_inspect", state: "ready", observedAt: "1999-01-01T00:00:00Z", updatedAt: "1999-01-01T00:00:00Z" } }), { headers: date === undefined ? {} : { Date: date } })));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ state: "active", observedAt: expected });
+  });
+  it("keeps the HTTP observation timestamp when the sandbox is missing", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404, headers: { Date: "Fri, 13 Nov 2026 12:00:00 GMT" } })));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toEqual({ providerLeaseId: "bx_inspect", state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: "2026-11-13T12:00:00.000Z" });
+  });
+  it("performs a fresh uncached GET for each inspection", async () => {
+    const network = vi.fn().mockResolvedValueOnce(reply({ sandbox: { id: "bx_inspect", state: "ready" } })).mockResolvedValueOnce(reply({ sandbox: { id: "bx_inspect", state: "cancelled" } }));
+    vi.stubGlobal("fetch", network);
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ state: "active" });
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ state: "destroyed" });
+    expect(network).toHaveBeenCalledTimes(2);
+    for (const [url, init] of network.mock.calls) {
+      expect(url).toBe("https://boat.dev/api/v1/sandboxes/bx_inspect");
+      expect(init).toMatchObject({ method: "GET", cache: "no-store" });
+    }
+  });
+  it("throws when the inspection's 10-second deadline expires", async () => {
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => realTimeout(ms === 10_000 ? 10 : ms));
+    vi.stubGlobal("fetch", vi.fn(async (_input: unknown, init?: RequestInit) => {
+      const signal = init!.signal!;
+      return new Promise<Response>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    }));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(timeout).toHaveBeenCalledWith(10_000);
+  });
+  it("throws if the inspection deadline expires while reading the response body", async () => {
+    const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => realTimeout(ms === 10_000 ? 10 : ms));
+    vi.stubGlobal("fetch", vi.fn(async (_input: unknown, init?: RequestInit) => new Response(new ReadableStream({
+      start(controller) {
+        const signal = init!.signal!;
+        if (signal.aborted) controller.error(signal.reason);
+        else signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+      },
+    }))));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toMatchObject({ name: "TimeoutError" });
+    expect(timeout).toHaveBeenCalledWith(10_000);
+  });
+  it.each(["{", "null", "", "false", "0", '""'])("never mistakes an invalid success body for a missing sandbox: %j", async body => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow();
+  });
+  it("throws on an empty 204 inspection response rather than reporting destroyed", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow();
+  });
+  it.each([401, 403, 429, 500, 503])("keeps HTTP %i inspection failures retryable", async status => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply({ message: "provider unavailable" }, status)));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toMatchObject({ httpStatus: status });
+  });
+  it("throws on inspection transport failure rather than returning unknown", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("network unavailable"); }));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow("network unavailable");
+  });
+  it("still rejects a foreign inspection allocation", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox: { id: "bx_foreign", state: "running" } })));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow("different allocation");
+  });
   it("does not report a deleted lease as active or erase a transient inspection failure", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => reply({}, 404)));
-    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_runner" })).toEqual({ providerLeaseId: "bx_runner", state: "destroyed" });
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_runner" })).toEqual({ providerLeaseId: "bx_runner", state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: null });
     vi.stubGlobal("fetch", vi.fn(async () => reply({}, 503)));
     await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_runner" })).rejects.toThrow();
   });

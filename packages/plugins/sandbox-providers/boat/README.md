@@ -1,11 +1,30 @@
-# Boat sandbox provider 0.1.14-runner-envfile-snapid-retain-routea
+# Boat sandbox provider 0.1.15-runner-envfile-snapid-retain-routea
+
+## Provider liveness inspection
+
+Each ordinary `environmentInspectLease` call makes a fresh, uncached
+`GET /sandboxes/{id}` with a 10-second timeout. Transport and HTTP failures throw;
+only 404 and Boat's terminal `cancelled` state report `destroyed`. `archived`
+reports `stopped` only when `stoppedAt` is non-null. `ready`, `idle`, and `running`
+report `active`; all other states report `unknown`, including `archived` without
+a stop timestamp. See Boat's [GET contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).
+
+Observations preserve `stoppedAt` and `lastReboot.at` as `lastRebootAt` verbatim,
+using null when absent. `observedAt` is the HTTP response's `Date` converted to
+ISO, or null when missing or invalid; it is never the plugin's local clock.
+Missing resources also retain the response observation time when available.
+The existing idle-drain accounting and creation-operation inspection are unchanged.
+These fields describe provider observations, not authenticated Runner readiness
+or process continuity. This release adds the three optional observation fields
+to its vendored SDK; the corresponding Core consumer is a separate change.
 
 ## Route A — default off
 
 This build preserves the live env-file, snapshotIdentity and unconditional
 stop-and-retain line and the existing S9 guardian/duplex contract. Its vendored
-Paperclip SDK and shared package come from Core `cl/img1b`
-`ae66270620cb7eeaae2a13fc0aef22e3656d44ad`, without modifying those sources.
+Paperclip SDK and shared package originate from Core `cl/img1b`
+`ae66270620cb7eeaae2a13fc0aef22e3656d44ad`. This release adds only the three
+optional liveness observation fields to the SDK protocol; shared is unchanged.
 The inherited S9 Core-boundary tests use host sources at
 `51d9a5afbd2a99b974ae060a372082352174df71`; the image 1b archive does not contain
 that S9 host module. This build does not qualify carrier-on operation on image 1b.
@@ -54,7 +73,7 @@ Exec env values are uploaded as shell-quoted `export` lines using the files API,
 
 There is no file-mode field in Boat's [write API](https://docs.boat.dev/api/reference/agent/write-sandbox-file.md): permissions use `umask 077` and shell chmod, not an invented API. Values exist briefly on sandbox disk; a snapshot in that window can capture them. They remain in the process environment. Whether file PUT bodies are retained in provider audit/internal logs is **unknown (docs silent)**. [Command history](https://docs.boat.dev/long-running-tasks/command-history.md) retains command text for 90 days and excludes regular-file writes from process-output capture; that is not a guarantee about HTTP-body retention. Cleanup cannot be guaranteed after a provider outage or plugin crash. This does not redact caller-supplied command arguments, stdin, or process output. No live qualification is claimed by these local tests.
 
-Install `paperclipai-plugin-boat-0.1.13-runner-envfile-snapid-retain-routea.tgz` as an instance plugin. Destroy, release, failed-acquisition cleanup, and orphan cleanup always use the same non-force, completion-confirmed stop. The plugin never sends `DELETE /sandboxes/{id}`. The `retainOnDestroy` boolean remains accepted for compatibility, defaults to true, and is ignored: false, absent, and true all stop and keep the sandbox. Configure `"reuseLease": true` to resume the same retained Boat sandbox ID across runs; reuse defaults to false. A successful destroy returns `{ providerLeaseId, state: "stopped" }`, not a false `destroyed` receipt. Stop failures remain failures, without force or a destructive fallback. This is sandbox-lifecycle retention, not a general file-immutability policy: command cancellation and temporary stdin-file housekeeping do not delete the sandbox and are unchanged.
+Install `paperclipai-plugin-boat-0.1.15-runner-envfile-snapid-retain-routea.tgz` as an instance plugin. Destroy, release, failed-acquisition cleanup, and orphan cleanup always use the same non-force, completion-confirmed stop. The plugin never sends `DELETE /sandboxes/{id}`. The `retainOnDestroy` boolean remains accepted for compatibility, defaults to true, and is ignored: false, absent, and true all stop and keep the sandbox. Configure `"reuseLease": true` to resume the same retained Boat sandbox ID across runs; reuse defaults to false. A successful destroy returns `{ providerLeaseId, state: "stopped" }`, not a false `destroyed` receipt. Stop failures remain failures, without force or a destructive fallback. This is sandbox-lifecycle retention, not a general file-immutability policy: command cancellation and temporary stdin-file housekeeping do not delete the sandbox and are unchanged.
 
 Reuse is scoped by the same agent and the same execution workspace. For projectless environments, the issue ID is used instead. Reuse across issues therefore requires a project with a shared execution workspace. This follows Paperclip's `buildReusableSandboxLeaseScope` behavior (`server/src/services/environment-runtime.ts:1016-1043`). Retention without reuse preserves the disk but does not make a subsequent run reuse that allocation. Existing lease configurations are also protected once this plugin version is installed, even if their recorded `retainOnDestroy` is false or absent.
 
