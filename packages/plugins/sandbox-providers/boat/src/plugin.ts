@@ -96,6 +96,24 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     throw requestError(config, init.method ?? "GET", path, httpStatus, category);
   }
 }
+/** The API key's active org, not the user's identity or merely a valid key.
+ * https://docs.boat.dev/api/reference/account/list-organizations.md */
+async function activeBoatOrgId(config: Config): Promise<string | undefined> {
+  const result = await request(config, "/orgs", { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, false, { requireJson: true });
+  if (result?.ok !== true || !Array.isArray(result.orgs)) return undefined;
+  const active = result.orgs.filter((org: { active?: unknown } | null) => org?.active === true);
+  const id = active.length === 1 ? active[0].id : undefined;
+  return typeof id === "string" && id.trim() ? id : undefined;
+}
+async function boatOrgIdForLease(config: Config, ...sandboxes: any[]): Promise<string | undefined> {
+  for (const sandbox of sandboxes) {
+    const id = sandbox?.team?.id;
+    if (typeof id === "string" && id.trim()) return id;
+  }
+  // Older/partial sandbox responses may omit team. An unavailable org lookup
+  // must not invent ownership; such a lease cannot later prove 404 retirement.
+  return activeBoatOrgId(config).catch(() => undefined);
+}
 export type BoatSnapshotIdentity = { provider: "boat"; requestedRef: string; id: string; name: string; createdAt: string };
 /** Resolve the mutable create name to its immutable artifact; never use the UUID as create.from. */
 export async function resolveBoatSnapshotIdentity(config: Record<string, unknown>): Promise<BoatSnapshotIdentity> {
@@ -416,7 +434,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, sb.id, command, timeout),
       });
       await bindDuplexLease(params, sb.id, guardianPreflight);
+      const boatOrgId = await boatOrgIdForLease(c, ready, sb);
       return { providerLeaseId: sb.id, expiresAt: expiry, metadata: { provider: c.provider, sandboxId: sb.id, remoteCwd,
+        ...(boatOrgId ? { boatOrgId } : {}),
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}),
         ...(c.snapshot === undefined ? {} : { snapshot: c.snapshot }),
         ...(snapshotIdentity ? { snapshotIdentity } : {}),
@@ -454,11 +474,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       observedAt = parseHttpDate(headers.get("Date"));
     } });
     if (result === null) {
-      // A missing sandbox is 'destroyed' only when the same key and route still answer
-      // (docs.boat.dev api/v1: 404 not_found covers a sandbox OR a key that does not exist).
+      // A valid key in a different Boat org also sees 404 for a live lease.
+      // Retirement requires the active org to match acquisition's ownership.
       if (!/^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$/.test(params.providerLeaseId)) throw new Error("Boat inspection id is not a sandbox id; refusing to report it destroyed");
-      const listed = await request(c, "/sandboxes?limit=1", { method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000) }, false, { requireJson: true });
-      if (listed?.ok !== true || !Array.isArray(listed?.sandboxes)) throw new Error("Boat could not confirm the sandbox list; refusing to report it destroyed");
+      const boatOrgId = params.leaseMetadata?.boatOrgId;
+      if (typeof boatOrgId !== "string" || !boatOrgId.trim()) throw new Error("Boat lease has no recorded boatOrgId; refusing to report it destroyed");
+      if (await activeBoatOrgId(c) !== boatOrgId) throw new Error("Boat could not confirm the lease organization; refusing to report it destroyed");
       idleActivity.confirm(proof, true);
       return { providerLeaseId: params.providerLeaseId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt };
     }
@@ -484,11 +505,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     // Existing unscoped non-Runner callers retain their SDK behavior. Every new
     // acquired scoped lease carries proof; a Runner lease never uses this branch.
     let sandbox: any;
+    const foundSandboxes: any[] = [];
     if (requiresProof) {
       const found = await request(c, `/sandboxes/${encodeURIComponent(id)}`, {}, true);
       if (!found) return { providerLeaseId: null, metadata: { expired: true } };
       sandbox = found.sandbox ?? found;
       if (sandbox.id !== id) throw new Error("Boat resume returned a different allocation.");
+      foundSandboxes.push(sandbox);
     }
     const resumedFromState = sandbox?.state ?? null;
     if (!sandbox || !["ready", "idle", "running"].includes(sandbox.state)) {
@@ -496,6 +519,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const response = await request(c, `/sandboxes/${encodeURIComponent(id)}/resume`, { method: "POST", body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(c), ...(c.boatEnvironment === undefined ? { noEnv: true } : {}) }) });
       const sb = response.sandbox ?? response;
       if (sb.id !== undefined && sb.id !== id) throw new Error("Boat resume returned a different allocation.");
+      foundSandboxes.push(sb);
       sandbox = await waitReady(c, id, true);
       runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
     } else if (effectiveTtlSeconds(c) > c.ttlSeconds) {
@@ -514,8 +538,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     // A disabled carrier must not inherit an earlier lease's usable receipt.
     const { guardianPreflight: _previousGuardian, runnerGuardianVersion: _previousVersion, ...retainedMetadata } = metadata ?? {};
     await bindDuplexLease(params, id, guardianPreflight);
+    const boatOrgId = await boatOrgIdForLease(c, sandbox, ...foundSandboxes);
     return { providerLeaseId: id, expiresAt: sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
+        ...(boatOrgId ? { boatOrgId } : {}),
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {
