@@ -1,18 +1,19 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sha256DirectoryTree } from "./native-session-executor.js";
 import { sha256DirectoryTreeStreamed } from "./off-loop-file-work.js";
 
 const sha = (text: string) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
-// Load only the real producer's two pure hash functions, never its deploy/build
-// entrypoint. This exercises a tiny fixture rather than rebuilding the full pack.
-const producerSource = readFileSync(new URL("../../../../packages/paperclip-runner/scripts/build-provider-pack.mjs", import.meta.url), "utf8");
-const producerFunctions = producerSource.slice(producerSource.indexOf("function sha256File("), producerSource.indexOf("function writePortableNodeShim("));
-const producerTree = runInNewContext(`${producerFunctions}\nsha256Tree`, { createHash, readFileSync, readdirSync, readlinkSync, join }) as (root: string) => string;
+// Load only the real producer's pure tree-hash helper, never its deploy/build
+// entrypoint. Upstream 9b613562b extracted it from build-provider-pack.mjs into
+// provider-pack-runtime-tree.mjs, which build-provider-pack.mjs and the runner
+// image layout check import. This exercises a tiny fixture rather than
+// rebuilding the full pack.
+const producerModule = new URL("../../../../packages/paperclip-runner/scripts/provider-pack-runtime-tree.mjs", import.meta.url);
+const { sha256Tree: producerTree } = await import(producerModule.href) as { sha256Tree: (root: string) => string };
 
 describe.skipIf(process.platform === "win32")("locale-independent provider pack tree order", () => {
   let root: string;
