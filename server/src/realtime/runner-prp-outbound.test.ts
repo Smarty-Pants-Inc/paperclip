@@ -1,4 +1,6 @@
 import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import pino from "pino";
 import { describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import { logger } from "../middleware/logger.js";
@@ -51,6 +53,43 @@ function openingSocket(socket = new FakeSocket()): FakeSocket {
 sockets.create = () => openingSocket();
 
 describe("runner provider-ingress WebSocket wire", () => {
+  it("serializes only allowlisted ingress diagnostics through Pino", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const destination = new PassThrough();
+    let serialized = "";
+    destination.on("data", chunk => { serialized += chunk.toString(); });
+    const captured = pino(destination);
+    const warn = vi.spyOn(logger, "warn").mockImplementation((...args: Parameters<typeof logger.warn>) => { captured.warn(...args); return logger; });
+    const secretValues = ["sk-live-SECRET123456789", "pa55w0rd-SECRET", "lowercase-secret-token", "sk-secret-code", "secret-syscall"];
+    const failures = [
+      Object.assign(new Error(`Authorization: Bearer ${secretValues[0]}`), { code: "ECONNRESET", syscall: "connect", errno: 7 }),
+      Object.assign(new Error(`could not reach https://user:${secretValues[1]}@ingress.example/x`), { code: "ECONNREFUSED", syscall: "write", errno: 8 }),
+      Object.assign(new Error(secretValues[2]), { code: "ECONNRESET", syscall: "read", errno: 9 }),
+      Object.assign(new Error("runner_ingress_upgrade_rejected"), { code: secretValues[3], syscall: secretValues[4], errno: 10 }),
+      Object.assign(new Error("runner_ingress_unavailable"), { code: "ETIMEDOUT", syscall: "connect", errno: 1.5 }),
+    ];
+    let index = 0;
+    sockets.create = () => {
+      const socket = new FakeSocket(); socket.readyState = WebSocket.CONNECTING;
+      const error = failures[index++];
+      queueMicrotask(() => { socket.readyState = WebSocket.CLOSED; socket.emit("error", error); });
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-log", secretHeaders: [], generation: "log",
+      refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: vi.fn() } as unknown as DurablePrpControlPlane,
+      endpoint, startupDeadlineMs: 5_000, random: () => 0.5 });
+    try {
+      await vi.advanceTimersByTimeAsync(5_000);
+      const lines = serialized.trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
+      expect(lines.length).toBeGreaterThan(0);
+      for (const secret of secretValues) expect(serialized).not.toContain(secret);
+      expect(lines).toEqual(expect.arrayContaining([expect.objectContaining({ code: "other", syscall: "other" })]));
+      expect(lines).toEqual(expect.arrayContaining([expect.objectContaining({ errno: null })]));
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); captured.flush(); destination.destroy(); vi.useRealTimers(); }
+  });
   it("logs each failed ingress connect attempt with timing and errno", async () => {
     vi.useFakeTimers();
     const create = sockets.create;

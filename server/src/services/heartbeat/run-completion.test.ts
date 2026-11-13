@@ -1,4 +1,6 @@
 import { promises as fs } from "node:fs";
+import { PassThrough } from "node:stream";
+import pino from "pino";
 import { createDurableRunLogStore } from "../run-log-store.js";
 import { createServer } from "node:http";
 import { registerLocalRuntimeApiServer } from "../../runtime-api.js";
@@ -933,7 +935,9 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(run).toMatchObject({ status: "failed", errorCode: phase === "setup" ? "setup_failed" : "adapter_failed",
       error: "Usage write failed: Database query failed (40001)", resultJson: { failureCause: "40001" } });
     expect(JSON.stringify(run.resultJson)).not.toMatch(/heartbeat_runs|sk-live-secret|params/);
-    expect(logged).toHaveBeenCalledWith(expect.objectContaining({ runId: f.run.id, failureCause: "40001" }), expect.any(String));
+    expect(logged).toHaveBeenCalledWith(expect.objectContaining(phase === "setup"
+      ? { runId: f.run.id, failureCause: "40001" }
+      : { runId: f.run.id }), expect.any(String));
   });
 
   it("bounds the failure cause to a closed-shape token and falls back to the error class", async () => {
@@ -1537,6 +1541,33 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).not.toHaveBeenCalled();
   });
 
+  it("serializes only allowlisted cause diagnostics through Pino", async () => {
+    const destination = new PassThrough();
+    let serialized = "";
+    destination.on("data", chunk => { serialized += chunk.toString(); });
+    const captured = pino(destination);
+    const logged = vi.spyOn(logger, "error").mockImplementation((...args: Parameters<typeof logger.error>) => { captured.error(...args); return logger; });
+    const secrets = ["sk-live-SECRET123456789", "pa55w0rd-SECRET", "lowercase-secret-token", "sk-secret-code", "secret-syscall"];
+    try {
+      const causes = [
+        Object.assign(new Error(`Authorization: Bearer ${secrets[0]}`), { code: "ECONNRESET", syscall: "connect", errno: 7 }),
+        Object.assign(new Error(`could not reach https://user:${secrets[1]}@ingress.example/x`), { code: "ECONNREFUSED", syscall: "write", errno: 8 }),
+        Object.assign(new Error(secrets[2]), { code: "ETIMEDOUT", syscall: "read", errno: 9 }),
+        Object.assign(new Error("runner_ingress_upgrade_rejected"), { code: secrets[3], syscall: secrets[4], errno: 10 }),
+        Object.assign(new Error("runner_ingress_unavailable"), { code: "ETIMEDOUT", syscall: "connect", errno: 1.5 }),
+      ];
+      for (const cause of causes) {
+        const f = await fixture({}, `LOG${randomUUID().slice(0, 6)}`);
+        await f.completion.failRun(f.failure(new Error("wrapped failure", { cause })));
+      }
+      expect(serialized).not.toMatch(/Authorization|Bearer|SECRET|pa55w0rd|lowercase-secret-token|sk-secret-code|secret-syscall/);
+      const lines = serialized.trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as { causeSummary?: Record<string, unknown> });
+      expect(lines).toHaveLength(5);
+      expect(lines).toEqual(expect.arrayContaining([expect.objectContaining({ causeSummary: expect.objectContaining({ code: "other", syscall: "other" }) })]));
+      expect(lines).toEqual(expect.arrayContaining([expect.objectContaining({ causeSummary: expect.objectContaining({ errno: null }) })]));
+    } finally { logged.mockRestore(); captured.flush(); destination.destroy(); }
+  });
+
   it("saves a bounded cause and keeps the retryable generic code when accounting retries are exhausted", async () => {
     const f = await fixture();
     const logged = vi.spyOn(logger, "error");
@@ -1552,7 +1583,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       resultJson: { failureCause: "40001" } });
     expect(JSON.stringify(failed)).not.toMatch(/heartbeat_runs|secret-run-id|Failed query/);
     const failureLog = logged.mock.calls.find(call => call[1] === "heartbeat execution failed");
-    expect(failureLog?.[0]).toMatchObject({ runId: f.run.id, errorCode: "adapter_failed", failureCause: "40001" });
+    expect(failureLog?.[0]).toMatchObject({ runId: f.run.id, errorCode: "adapter_failed" });
   });
 
   describe("a native run that fails before provider work", () => {
