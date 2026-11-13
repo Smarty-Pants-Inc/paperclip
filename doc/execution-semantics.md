@@ -3449,11 +3449,17 @@ admission applies the same checks as for a per-turn owner. The journal of a
 warm owner has no `runner.suspend` command. A local warm Runner and a resumed
 sandbox that still holds the Runner keep the live adoption path.
 
-A remote Runner whose sandbox lease for the prior run ended (`released` or
-`expired`, with a release time) on a different sandbox than this run's is gone
-by record. No process remains that could act on a command it never
-acknowledged. For such an owner, these unfinished commands do not hold the
-retirement:
+A lease row is a record, never proof that a Runner is gone. When the prior
+run's sandbox leases all ended (`released` or `expired`, with a release time)
+on a different sandbox than this run's, the remote Runner counts as gone only
+when the shared proven-gone predicate (`remoteRunnerGenerationLost`) proves it
+from the provider's fresh record of that predecessor's own sandbox: the
+sandbox no longer exists, it rebooted after the predecessor started, or it
+has been stopped for at least 15 minutes. No probe of this run's sandbox can
+decide it. A running, unreadable or missing record is not proof, and the
+owner stays held. For an owner proven gone, no process remains that could act
+on a command it never acknowledged, so these unfinished commands do not hold
+the retirement:
 
 - its own lifecycle commands (`runner.suspend`, `runner.drain`,
   `runner.shutdown`);

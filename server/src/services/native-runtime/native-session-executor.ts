@@ -5726,8 +5726,9 @@ type SettledRunnerdProjection = { bytes: string; refused?: never } | { bytes?: n
 const LOCAL_RUNNER_LIFECYCLE_COMMANDS = new Set(["runner.suspend", "runner.drain", "runner.shutdown"]);
 /** Commands that only deliver something to the Runner that held this journal:
  * its attachment, an answer to a tool it already called, or a read. None
- * carries new user intent, and none can run without that Runner. When its
- * sandbox lease ended on another sandbox, no process remains to receive them. */
+ * carries new user intent, and none can run without that Runner. When that
+ * Runner is proven gone (priorRemoteRunnerProvenGone: the provider's own record
+ * of its box, not the lease row), no process remains to receive them. */
 const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_tool.result", "session.snapshot",
   "session.goal.get"]);
 
@@ -5752,8 +5753,8 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
     const control = record(JSON.parse(bytes));
     const commands = (Array.isArray(control.commands) ? control.commands : []).map(record);
     // A stopped local Runner can no longer act on its own lifecycle commands.
-    // A remote Runner whose sandbox lease ended elsewhere also cannot receive
-    // a delivery that it never acknowledged.
+    // A remote Runner proven gone from its own box also cannot receive a
+    // delivery that it never acknowledged.
     const goneCommandTypes = options.remoteRunnerGone ? new Set([...LOCAL_RUNNER_LIFECYCLE_COMMANDS, ...GONE_REMOTE_RUNNER_DELIVERY_COMMANDS])
       : LOCAL_RUNNER_LIFECYCLE_COMMANDS;
     // A remote Runner whose own environment restarted can no longer act on its
@@ -5939,10 +5940,12 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   catch { return refuse("journal_unreadable"); }
   const { binding } = input.execution;
   const remoteRunnerStopped = !localRunner && resumedSandboxRunner(target);
-  const remoteRunnerGone = !localRunner && !remoteRunnerStopped && await priorRemoteSandboxLeasesEnded(input.db, {
-    companyId: binding.companyId, runId: identity.runId,
-    currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
-      ? target.sandboxLeaseAcquisition?.providerLeaseId : undefined,
+  // A lease that ended on another box is a record, never proof that its Runner
+  // is gone (RFL lost-owner F1): the gone-Runner relaxations apply only when
+  // the shared predicate proves it from the provider's own record of the
+  // predecessor's box.
+  const remoteRunnerGone = !localRunner && !remoteRunnerStopped && await priorRemoteRunnerProvenGone(input.db, {
+    companyId: binding.companyId, identity, target,
   });
   const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped };
   const projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
@@ -6078,6 +6081,30 @@ async function priorRemoteSandboxLeasesEnded(db: Db, input: {
   } catch {
     return false;
   }
+}
+
+/**
+ * A remote predecessor whose leases all ended on another box is gone only when
+ * remoteRunnerGenerationLost proves it from the provider's FRESH record of the
+ * predecessor's own box (gone, rebooted after it started, or stopped at least
+ * PREDECESSOR_LONG_STOP_MS). The probed box is this run's, never the
+ * predecessor's, so no marker probe can decide; a running, unreadable or
+ * missing record is not proof.
+ */
+async function priorRemoteRunnerProvenGone(db: Db, input: {
+  companyId: string; identity: Record<string, string>; target: AdapterExecutionTarget | null | undefined;
+}): Promise<boolean> {
+  const target = input.target;
+  if (target?.kind !== "remote" || target.transport !== "sandbox" || !target.runner || !target.readPredecessorSandboxRecord) return false;
+  const currentProviderLeaseId = target.sandboxLeaseAcquisition?.providerLeaseId;
+  if (!await priorRemoteSandboxLeasesEnded(db, { companyId: input.companyId, runId: input.identity.runId, currentProviderLeaseId })) return false;
+  const predecessor = await resolvePredecessorRunnerLease(db, { companyId: input.companyId, runId: input.identity.runId });
+  if (!predecessor || predecessor.providerLeaseId === currentProviderLeaseId) return false;
+  const readPredecessor = target.readPredecessorSandboxRecord;
+  return remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity, predecessor: {
+    start: predecessor.start, providerLeaseId: predecessor.providerLeaseId, probedProviderLeaseId: currentProviderLeaseId ?? null,
+    readSandbox: () => readPredecessor({ leaseId: predecessor.leaseId }),
+  } });
 }
 
 function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined): boolean {

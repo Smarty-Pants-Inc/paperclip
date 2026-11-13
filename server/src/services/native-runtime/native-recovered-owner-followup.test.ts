@@ -689,9 +689,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
 
-  // check6: a remote owner whose sandbox lease ended elsewhere counts an
-  // undelivered tool answer as settled only on a committed result. A
-  // Stop-settled owner has none, so that answer keeps it held.
+  // check6: a remote owner proven gone from its box (lease ended elsewhere and
+  // the provider reports that box destroyed) counts an undelivered tool answer
+  // as settled only on a committed result. A Stop-settled owner has none, so
+  // that answer keeps it held.
   it.each([
     { control: "pending-tool-result" as const, outcome: stranded("owner_stop_unsettled") },
     { control: "settled" as const, outcome: ADMITTED },
@@ -703,7 +704,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: `sandbox-${prior.runId}`,
       status: "expired", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
     await stopSettledOwner(prior);
-    expect(await followUp.start()).toBe(outcome);
+    expect(await followUp.start("created", undefined, false, predecessorRecord({ kind: "gone" }))).toBe(outcome);
   }, 60_000);
 
   it("keeps a Stop-settled owner held while its controller is still running", async () => {
@@ -1233,14 +1234,17 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: sameSandbox ? followUp.providerLeaseId : `sandbox-${prior.runId}`,
         status, releasedAt: status === "retained" ? null : new Date(), metadata: { remoteCwd: "/workspace" } });
     }
-    expect(await followUp.start()).toBe(outcome);
+    // The provider reports the predecessor's box destroyed: the named proof
+    // (RFL lost-owner F1). Without an ended lease elsewhere it proves nothing.
+    expect(await followUp.start("created", undefined, false, predecessorRecord({ kind: "gone" }))).toBe(outcome);
   }, 60_000);
 
   // Staging PAP-4196 (run.attach) and PAP-3443 (semantic_tool.result): the
   // per-turn owner committed its result and its sandbox was destroyed after the
   // turn, but its journal still held a delivery that its Runner never
-  // acknowledged. No process remains to receive it, so the follow-up retires
-  // the owner. A Runner whose sandbox may still exist keeps the owner held.
+  // acknowledged. The provider proves that box destroyed, so no process
+  // remains to receive it and the follow-up retires the owner. A Runner whose
+  // sandbox may still exist keeps the owner held.
   it.each([
     { control: "pending-attach", label: "ended on another sandbox", status: "expired", sameSandbox: false, recorded: true,
       outcome: ADMITTED },
@@ -1264,9 +1268,56 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
           heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: sameSandbox ? followUp.providerLeaseId : `sandbox-${prior.runId}`,
           status, releasedAt: status === "retained" ? null : new Date(), metadata: { remoteCwd: "/workspace" } });
       }
-      expect(await followUp.start()).toBe(outcome);
+      expect(await followUp.start("created", undefined, false, predecessorRecord({ kind: "gone" }))).toBe(outcome);
       if (outcome === ADMITTED) expect(followUp.logs.join("")).toContain("finished without a saved runner checkpoint");
     }, 60_000);
+
+  // RFL lost-owner F1: a lease that ended on another box is a record, not
+  // proof that its Runner is gone. The settled-journal relaxations for a gone
+  // remote Runner apply only when the shared predicate proves it from the
+  // provider's own record of the PREDECESSOR's box (rows i, iii, v); without
+  // that, the owner stays held even though no probe could reach it.
+  const predecessorRecord = (record: Awaited<ReturnType<ReturnType<typeof environmentRuntimeService>["readPredecessorSandboxRecord"]>> | Error) => ({
+    readPredecessorSandboxRecord: async () => { if (record instanceof Error) throw record; return record; },
+  }) as unknown as Pick<ReturnType<typeof environmentRuntimeService>, "readPredecessorSandboxRecord">;
+  const minutesAgoIso = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+  it.each([
+    { label: "destroyed at the provider (404)", record: { kind: "gone" } as const, outcome: ADMITTED },
+    { label: "stopped 20 minutes ago per the provider", record: { kind: "present", state: "stopped", stoppedAt: minutesAgoIso(20),
+      lastRebootAt: null, observedAt: null } as const, outcome: ADMITTED },
+  ])("retires a finished remote owner with an unacknowledged delivery on another box when the provider proves it gone: $label",
+    async ({ record, outcome }) => {
+      const prior = await seedRecoveredPriorRun("pending-attach", { provider: "opencode" });
+      const followUp = await admitFollowUp(prior);
+      await db.insert(environments).values({ id: followUp.environmentId, name: `proof-${followUp.environmentId}`, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+        heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: `sandbox-${prior.runId}`,
+        status: "expired", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+      expect(await followUp.start("created", undefined, false, predecessorRecord(record))).toBe(outcome);
+      expect(followUp.logs.join("")).toContain("finished without a saved runner checkpoint");
+      expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    }, 60_000);
+
+  it.each([
+    { label: "no provider inspection (a recorded process may still be alive there)", runtime: undefined },
+    { label: "the provider says it is running", runtime: "running" as const },
+    { label: "the provider read fails", runtime: "error" as const },
+    { label: "stopped only 5 minutes ago", runtime: "short-stop" as const },
+  ])("keeps a finished remote owner with an unacknowledged delivery on another box held without proof: $label", async ({ runtime }) => {
+    const prior = await seedRecoveredPriorRun("pending-attach", { provider: "opencode" });
+    const followUp = await admitFollowUp(prior);
+    await db.insert(environments).values({ id: followUp.environmentId, name: `held-${followUp.environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: `sandbox-${prior.runId}`,
+      status: "expired", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+    const provider = runtime === undefined ? undefined
+      : runtime === "running" ? predecessorRecord({ kind: "present", state: "running", stoppedAt: null, lastRebootAt: null, observedAt: null })
+        : runtime === "error" ? predecessorRecord(new Error("provider unavailable"))
+          : predecessorRecord({ kind: "present", state: "stopped", stoppedAt: minutesAgoIso(5), lastRebootAt: null, observedAt: null });
+    expect(await followUp.start("created", undefined, false, provider)).toBe(stranded("journal_commands_unsettled(run.attach.pending)"));
+    // Zero probes: the predecessor's box is not this run's box.
+    expect(followUp.remoteExecute).not.toHaveBeenCalled();
+  }, 60_000);
 
   it("admits again when a retry rebuilds the same projection from the database", async () => {
     const prior = await seedRecoveredPriorRun();
