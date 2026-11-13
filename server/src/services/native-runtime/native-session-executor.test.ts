@@ -1291,7 +1291,7 @@ exit 23
       await symlink(process.execPath, join(bin, "node"));
       for (const name of ["mkdir", "chmod", "date", "mv"]) await symlink(execFileSync("sh", ["-c", `command -v ${name}`], { encoding: "utf8" }).trim(), join(bin, name));
       const marker = join(root, "identity");
-      const result = execFileSync("/bin/sh", ["-c", script, "launch", marker, "nonce", "runner", join(root, "diagnostics"), "/bin/sh", "-c", "printf launched"], { env: { ...process.env, PATH: bin }, encoding: "utf8" });
+      const result = execFileSync("/bin/sh", ["-c", script, "launch", marker, "nonce", "runner", join(root, "diagnostics"), "/bin/sh", "-c", 'test "${ASCII_TOKEN+x}" != x && test "${ASCII_FUTURE_SECRET+x}" != x && test "$LANGFUSE_SECRET_KEY" = "agent-export" && test "$NO_PROXY" = "localhost" && printf launched'], { env: { ...process.env, PATH: bin, ASCII_TOKEN: "boat-machine-decoy", ASCII_FUTURE_SECRET: "boat-future-decoy", LANGFUSE_SECRET_KEY: "agent-export", NO_PROXY: "localhost" }, encoding: "utf8" });
       expect(result).toBe("launched");
       const lines = (await readFile(marker, "utf8")).split("\n");
       expect(lines[4]).toBe(hasBootIdentity ? "linux:abcd-1234:1234" : "");
@@ -2481,6 +2481,7 @@ describe("remote provider pack manifest", () => {
       });
       Object.assign(artifacts, {
         piRpcProxy: { path: "dist/cli/pi-rpc-app-server-proxy.cjs", sha256: digest },
+        piProcessHardening: { path: "dist/cli/linux-process-hardening.node", sha256: digest },
         piRpcExecutable: { path: "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", sha256: digest },
       });
     }

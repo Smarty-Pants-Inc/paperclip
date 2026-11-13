@@ -227,6 +227,7 @@ async function providerPack() {
     opencodeCommand: "node_modules/.bin/opencode", opencodeExecutable: "node_modules/opencode-ai/bin/opencode.exe",
     opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs", acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs",
     piRpcProxy: "dist/cli/pi-rpc-app-server-proxy.cjs",
+    piProcessHardening: "dist/cli/linux-process-hardening.node",
     piRpcExecutable: "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
   };
   const artifacts = {} as Record<keyof typeof paths, { path: string; sha256: string }>;

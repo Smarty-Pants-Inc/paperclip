@@ -4,6 +4,7 @@ import { createSanitizedCodexEnvironment } from './drivers/codex/app-server-tran
 import { createIsolatedCodexAppServerArgs } from './drivers/codex/codex-security-config.js';
 import { createCapabilityRunnerdProviderEnvironment } from './live/runnerd-codex-transport.js';
 import { spawnRunner } from './control-plane/durable-prp-control-plane.js';
+import { PI_LANGFUSE_ENVIRONMENT_KEYS } from './drivers/pi/pi-process-environment.js';
 
 const pages = {
   PAPERCLIP_PAGE_AWS_ACCESS_KEY_ID: 'fake-page-access-key',
@@ -19,6 +20,17 @@ function shellKeys() {
 }
 
 describe('controller-configured environment across native runner boundaries', () => {
+  it('carries exactly configured Pi Langfuse export names through the controller and runner spawn', () => {
+    const allowed = Object.fromEntries(PI_LANGFUSE_ENVIRONMENT_KEYS.map(name => [name, `configured-${name}`]));
+    const source = { PATH: '/bin', ...configuredEnvironmentProjection({ ...allowed, LANGFUSE_UNLISTED_SECRET: 'must-drop', ASCII_TOKEN: 'must-drop', CUSTOM_FLAG: 'must-drop' }) };
+    const environment = createCapabilityRunnerdProviderEnvironment({ provider: 'pi_rpc', options: { environment: source }, identity, codexHome: '/isolated/pi-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false });
+    let launched: NodeJS.ProcessEnv | undefined;
+    spawnRunner({ connection: { mode: 'connect', connectUrl: 'ws://127.0.0.1:43127' }, stateDirectory: '/tmp/pi-langfuse-env-proof', identity, ticket: 'fake-ticket', maxOutboxBytes: 262144, p0ReserveBytes: 65536, runnerVersion: '0.3.0', runnerDigest: `sha256:${'a'.repeat(64)}`, environment,
+      processLauncher: spec => { launched = spec.environment; return { child: { pid: 42, exitCode: null, signalCode: null, kill: () => true }, completion: Promise.resolve({ code: 0, signal: null, stdout: '', stderr: '' }) }; },
+    });
+    expect(launched).toMatchObject(allowed);
+    for (const name of [CONFIGURED_ENVIRONMENT_KEYS, 'LANGFUSE_UNLISTED_SECRET', 'ASCII_TOKEN', 'CUSTOM_FLAG']) expect(launched).not.toHaveProperty(name);
+  });
   it('retains configured Pages values at the native Codex provider sanitizer', () => {
     expect(createSanitizedCodexEnvironment(source)).toMatchObject(pages);
   });

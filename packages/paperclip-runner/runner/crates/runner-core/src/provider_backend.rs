@@ -2233,7 +2233,10 @@ impl CodexCommandExecutor {
         }
         let mut digest = Sha256::new();
         digest.update(b"paperclip.runner.pi-rpc-launch-profile.v1\0");
-        for artifact in [&profile.command, &profile.proxy_script, &profile.executable] {
+        for artifact in [&profile.command, &profile.proxy_script, &profile.executable]
+            .into_iter()
+            .chain(profile.process_hardening.iter())
+        {
             digest.update(artifact.path.to_string_lossy().as_bytes());
             digest.update(b"\0");
             digest.update(artifact.sha256.as_bytes());
@@ -7928,6 +7931,7 @@ done
                 sha256: format!("sha256:{:x}", Sha256::digest(b"normalization fixture")),
             };
             executor.pi_launch_profile = Some(OpenCodeLaunchProfile {
+                process_hardening: None,
                 command: artifact(config.command.clone()),
                 proxy_script: artifact(directory.join("proxy.js")),
                 executable: artifact(directory.join("pi")),
