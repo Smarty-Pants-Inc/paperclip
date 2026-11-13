@@ -90,6 +90,25 @@ owns deletion and confirms resolution. Failed lookup/transfer records a bounded
 retry and permits other operations to proceed. An attached operation cannot transfer
 to cleanup. Pending creation blocks instance sleep until its obligation transfers.
 
+A pending operation with no resource settles only after its saved
+`creationSettleAt` materialization deadline. A successful inspect reporting
+`destroyed` for that exact operation identity, without a creation lease or cleanup
+envelope, is confirmed absence. Each such post-deadline observation increments
+`metadata.creationRecoveryAttempts`; three confirmed absences resolve the operation
+with `creationReconciliationReason: provider_absent_after_bounded_recovery`.
+If the explicit `creationHeartbeatRunId` instead names a terminal or missing
+same-company run, one confirmed post-deadline absence suffices. An agentless
+correlation `runId` is not a missing heartbeat owner. Live/queued runs and
+agentless intents use the three-observation budget. A successful lookup finding a
+resource still transfers to `cleanup_pending`, regardless of prior absence.
+Failed/unavailable lookups, null or unknown observations, foreign identities, and
+pre-deadline absence do not spend that budget or resolve the operation. They retain
+ownership and a saved backoff; an unknown resource is never treated as absent.
+Unsupported or credential-invalidated generic providers retain their existing
+operator-reconciliation behavior. Counter updates recheck pending state and deadline
+under the operation lock, preserving concurrent ownership transfer. Resolution
+removes the operation from the shared deadline query; no new timer is introduced.
+
 Daytona version 0.1.10 declares creationOperationVersion 1. It uses the committed
 operation UUID in its existing creation name and labels. Recovery uses an explicit
 creationOperation request on the existing read-only inspect hook and strict failed-creation deletion path. Normal lease

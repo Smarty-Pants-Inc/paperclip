@@ -15,6 +15,54 @@ export type SandboxCreationOperation = typeof sandboxCreationOperations.$inferSe
 // A live creator may still be waiting for the provider, and a provider may still
 // materialize an aborted request. Absence is conclusive only after this delay.
 const CREATION_SETTLE_FLOOR_MS = 30 * 60_000;
+const CREATION_RECOVERY_ABSENCE_BUDGET = 3;
+const TERMINAL_CREATION_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
+
+/** Only a successful, operation-scoped provider absence may spend this budget.
+ * An unavailable/unknown inspect is not evidence that a resource does not exist. */
+async function recordSandboxCreationAbsence(db: Db, candidate: SandboxCreationOperation): Promise<boolean> {
+  return db.transaction(async tx => {
+    const [company] = await tx.select({ id: companies.id }).from(companies)
+      .where(eq(companies.id, candidate.companyId)).for("key share");
+    if (!company) throw new Error("Sandbox creation company was deleted");
+    const [operation] = await tx.select().from(sandboxCreationOperations)
+      .where(eq(sandboxCreationOperations.id, candidate.id)).for("update");
+    // Recheck the due predicate under the row lock: concurrent sweeps must not
+    // spend multiple attempts on the same deadline, or overwrite attached work.
+    if (!operation || operation.state !== "pending" || operation.nextAttemptAt.getTime() > Date.now()) return false;
+    if (operation.leaseId || operation.metadata.creationProviderLeaseId) {
+      throw new Error("Sandbox creation has a recorded resource identity");
+    }
+    const now = new Date();
+    const settleAt = Date.parse(typeof operation.metadata.creationSettleAt === "string" ? operation.metadata.creationSettleAt : "");
+    if (!Number.isFinite(settleAt) || now.getTime() < settleAt) {
+      await notifyEnvironmentCleanup(tx, { companyId: operation.companyId });
+      await tx.update(sandboxCreationOperations).set({ updatedAt: now,
+        nextAttemptAt: new Date(Math.max(now.getTime() + ENVIRONMENT_CLEANUP_RETRY_MS, Number.isFinite(settleAt) ? settleAt : 0)),
+      }).where(eq(sandboxCreationOperations.id, operation.id));
+      return false;
+    }
+    const saved = operation.metadata.creationRecoveryAttempts;
+    const attempts = Math.min(CREATION_RECOVERY_ABSENCE_BUDGET, (typeof saved === "number" && Number.isFinite(saved)
+      ? Math.max(0, Math.floor(saved)) : 0) + 1);
+    const heartbeatId = operation.metadata.creationHeartbeatRunId;
+    const [heartbeat] = typeof heartbeatId === "string"
+      ? await tx.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, heartbeatId), eq(heartbeatRuns.companyId, operation.companyId),
+        )).for("key share") : [];
+    // runId can be an agentless correlation id. Only the explicitly saved
+    // heartbeat reference can establish a terminal or missing heartbeat owner.
+    const ownerGone = typeof heartbeatId === "string" && (!heartbeat || TERMINAL_CREATION_RUN_STATUSES.has(heartbeat.status));
+    const resolved = ownerGone || attempts >= CREATION_RECOVERY_ABSENCE_BUDGET;
+    await notifyEnvironmentCleanup(tx, { companyId: operation.companyId });
+    await tx.update(sandboxCreationOperations).set({ state: resolved ? "resolved" : "pending", updatedAt: now,
+      nextAttemptAt: new Date(now.getTime() + ENVIRONMENT_CLEANUP_RETRY_MS),
+      metadata: { ...operation.metadata, creationRecoveryAttempts: attempts,
+        ...(resolved ? { creationReconciliationReason: "provider_absent_after_bounded_recovery" } : {}) },
+    }).where(eq(sandboxCreationOperations.id, operation.id));
+    return resolved;
+  });
+}
 
 function creationAbsenceInconclusive(operation: SandboxCreationOperation): boolean {
   const settleAt = Date.parse(typeof operation.metadata.creationSettleAt === "string" ? operation.metadata.creationSettleAt : "");
@@ -223,11 +271,9 @@ export async function recoverSandboxCreations(db: Db,
         await onTaskRecovered?.(candidate);
         continue;
       }
-      if (existingCompany && candidate.metadata.purpose === "login" && observation?.state === "destroyed" && observation.providerLeaseId === candidate.id) {
-        const settledAt = Date.parse(typeof candidate.metadata.creationSettleAt === "string" ? candidate.metadata.creationSettleAt : "");
-        if (!Number.isFinite(settledAt) || Date.now() < settledAt) throw new Error("Login allocation creation has not settled yet");
-        await writeEnvironmentCleanup(db, tx => tx.update(sandboxCreationOperations).set({ state: "resolved", updatedAt: new Date() })
-          .where(and(eq(sandboxCreationOperations.id, candidate.id), eq(sandboxCreationOperations.state, "pending"))), { companyId: candidate.companyId });
+      if (existingCompany && observation?.state === "destroyed" && observation.providerLeaseId === candidate.id
+        && !observation.creationLease && !observation.creationCleanup) {
+        if (await recordSandboxCreationAbsence(db, candidate) && recoverableTaskCreation(candidate)) await onTaskRecovered?.(candidate);
         continue;
       }
       if (existingCompany && recoverablePluginCreation(candidate)) throw new Error("Plugin allocation creation identity is not available yet");
