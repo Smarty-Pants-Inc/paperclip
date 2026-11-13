@@ -49,6 +49,8 @@ import {
 } from "@paperclipai/shared";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { PgTransaction } from "drizzle-orm/pg-core";
+import { enqueueSecretAccessEvent, enqueueSecretLastResolvedAt, flushSecretResolutionWrites } from "./secret-resolution-writes.js";
 import {
   checkSecretProviders,
   getSecretProvider,
@@ -1192,7 +1194,7 @@ export function secretService(db: Db | DbTransaction) {
     errorCode?: string | null;
   }) {
     if (!input.context) return;
-    await db.insert(secretAccessEvents).values({
+    const event: typeof secretAccessEvents.$inferInsert = {
       companyId: input.companyId,
       secretId: input.secretId,
       userSecretDefinitionId: input.userSecretDefinitionId ?? null,
@@ -1213,7 +1215,11 @@ export function secretService(db: Db | DbTransaction) {
       pluginId: input.context.pluginId ?? null,
       outcome: input.outcome,
       errorCode: input.errorCode ?? null,
-    });
+    };
+    // A caller-owned transaction cannot outlive its callback. Keep its audit
+    // atomic; ordinary pool-based runtime resolutions use the deferred queue.
+    if (db instanceof PgTransaction) await db.insert(secretAccessEvents).values(event);
+    else enqueueSecretAccessEvent(db as Db, event);
   }
 
   async function assertSecretInCompany(
@@ -1414,13 +1420,9 @@ export function secretService(db: Db | DbTransaction) {
           version: resolvedVersion,
         },
       });
-      if (!readOnlyEnvironmentInspection) await Promise.all([
-        db
-          .update(companySecrets)
-          .set({ lastResolvedAt: new Date(), updatedAt: new Date() })
-          .where(eq(companySecrets.id, secret.id))
-          .catch(() => undefined),
-        recordAccessEvent({
+      if (!readOnlyEnvironmentInspection) {
+        if (!(db instanceof PgTransaction)) enqueueSecretLastResolvedAt(db as Db, secret);
+        await recordAccessEvent({
           companyId,
           secretId: secret.id,
           userSecretDefinitionId: secret.userSecretDefinitionId ?? null,
@@ -1432,8 +1434,8 @@ export function secretService(db: Db | DbTransaction) {
           credentialSubjectType: secret.scope === "user" ? "user" : null,
           credentialSubjectId: secret.ownerUserId ?? null,
           outcome: "success",
-        }).catch(() => undefined),
-      ]);
+        });
+      }
       return {
         value,
         manifestEntry: {
@@ -1463,7 +1465,7 @@ export function secretService(db: Db | DbTransaction) {
         credentialSubjectId: secret.ownerUserId ?? null,
         outcome: "failure",
         errorCode,
-      }).catch(() => undefined);
+      });
       throw err;
     }
   }
@@ -3887,12 +3889,14 @@ export function secretService(db: Db | DbTransaction) {
       }));
     },
 
-    listAccessEvents: (companyId: string, secretId: string) =>
-      db
+    listAccessEvents: async (companyId: string, secretId: string) => {
+      if (!(db instanceof PgTransaction)) await flushSecretResolutionWrites(db as Db);
+      return db
         .select()
         .from(secretAccessEvents)
         .where(and(eq(secretAccessEvents.companyId, companyId), eq(secretAccessEvents.secretId, secretId)))
-        .orderBy(desc(secretAccessEvents.createdAt)),
+        .orderBy(desc(secretAccessEvents.createdAt));
+    },
 
     listUserSecretDefinitions: (companyId: string) =>
       db

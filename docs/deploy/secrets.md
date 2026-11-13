@@ -19,6 +19,12 @@ or workload:
 - Audit: each resolution records a non-sensitive event (secret id, version,
   provider id, consumer, outcome) without the value or provider credentials.
 
+Runtime resolutions batch their audit writes outside the turn's critical path.
+Orderly shutdown drains pending records before closing the database. Sandbox
+provider credentials have a short-lived cache with live binding and version
+checks. See [Runtime secret resolution](../../doc/secret-resolution-write-behind.md)
+for batching, invalidation, transaction behavior and crash-durability limits.
+
 Once a value reaches the consuming process, Paperclip can no longer guarantee
 secrecy. The agent (or sandbox, or remote host) can read the value, write it to
 its own logs or transcript, or pass it to downstream tools. Treat any secret
