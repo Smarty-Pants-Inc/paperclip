@@ -431,7 +431,7 @@ describe("agent cross-tenant route authorization", () => {
     expect(mockAgentService.revokeKey).not.toHaveBeenCalled();
   }, 30_000);
 
-  it("requires board access before clearing an agent error", async () => {
+  it("requires direct configuration authority before clearing an agent error", async () => {
     const app = await createApp({
       type: "agent",
       agentId,
@@ -444,7 +444,12 @@ describe("agent cross-tenant route authorization", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("Board access required");
+    expect(res.body.error).toContain("agent_config:update");
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "agent_config:update",
+      resource: { type: "agent", companyId, agentId },
+      scope: { targetAgentId: agentId, requiresChangeGrant: true },
+    }));
     expect(mockAgentService.clearError).not.toHaveBeenCalled();
   });
 
@@ -509,7 +514,7 @@ describe("agent cross-tenant route authorization", () => {
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "agent_config:update",
       resource: { type: "agent", companyId, agentId },
-      scope: { requiresChangeGrant: true },
+      scope: { targetAgentId: agentId, requiresChangeGrant: true },
     }));
     expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
   });
@@ -786,7 +791,7 @@ describe("agent lifecycle retry authorization", () => {
   });
 
   it.each([
-    [{ type: "none" }, 403],
+    [{ type: "none" }, 404],
     [{ type: "agent", agentId, companyId }, 403],
     [{ type: "board", userId: "outsider", source: "session", companyIds: ["other-company"] }, 404],
     [{ type: "board", userId: "reader", source: "session", companyIds: [companyId] }, 403],

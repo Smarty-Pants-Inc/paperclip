@@ -4454,11 +4454,10 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/runtime-state/reset-session", validate(resetAgentSessionSchema), async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
-    const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
+    const agent = await getAccessibleAgent(req, res, id);
     if (!agent) return;
-    await assertBoardCanManageAgentsForCompany(req, agent.companyId);
+    await assertCanManageAgentLifecycle(req, agent);
 
     const taskKey =
       typeof req.body.taskKey === "string" && req.body.taskKey.trim().length > 0
@@ -4466,10 +4465,14 @@ export function agentRoutes(
         : null;
     const state = await heartbeat.resetRuntimeSession(id, { taskKey });
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.runtime_session_reset",
       entityType: "agent",
       entityId: id,
@@ -5918,10 +5921,10 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/lifecycle/retry", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) return;
+    await assertCanManageAgentLifecycle(req, existing);
     await assertCanConfigureAgentSetup(req, existing);
     const agent = await svcLifecycle.retry(id);
     if (!agent) { res.status(404).json({ error: "Agent not found" }); return; }
@@ -5999,12 +6002,12 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
     }
+    await assertCanManageAgentLifecycle(req, existing);
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before clearing its error",
@@ -6018,10 +6021,14 @@ export function agentRoutes(
       return;
     }
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.error_cleared",
       entityType: "agent",
       entityId: agent.id,
@@ -6248,10 +6255,7 @@ export function agentRoutes(
     if (!agent) return;
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
-        res.status(403).json({ error: "Agent can only invoke itself" });
-        return;
-      }
+      if (req.actor.agentId !== id) await assertCanManageAgentLifecycle(req, agent);
     } else {
       await assertBoardCanWakeAgent(req, agent);
     }
@@ -6525,10 +6529,7 @@ export function agentRoutes(
     if (!agent) return;
 
     if (req.actor.type === "agent") {
-      if (req.actor.agentId !== id) {
-        res.status(403).json({ error: "Agent can only invoke itself" });
-        return;
-      }
+      if (req.actor.agentId !== id) await assertCanManageAgentLifecycle(req, agent);
     } else {
       await assertBoardCanWakeAgent(req, agent);
     }
@@ -7348,18 +7349,23 @@ export function agentRoutes(
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
-    assertBoard(req);
     const runId = readHeartbeatRunId(req);
     const existing = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
     if (!existing) return;
+    await assertCanManageAgentLifecycle(req, { id: existing.agentId, companyId: existing.companyId });
     if (!(await assertRunReadAllowed(req, res, existing))) return;
     const requestId = cancellationRequestId(req.body?.cancellationRequestId);
-    // Stamp the cancellation as operator-initiated (this route is board-only).
-    // Recovery reads this to stand down instead of classifying the cancelled
-    // run as agent stranding and re-waking the agent the operator just stopped.
-    const run = await heartbeat.cancelRun(runId, "Cancelled by a board operator", {
+    const actor = getActorInfo(req);
+    // Recovery already treats operator_interrupted as an intentional stop.
+    // Keep that stop intent for a managing agent without attributing it to a user.
+    const run = await heartbeat.cancelRun(runId, req.actor.type === "agent"
+      ? "Cancelled by a managing agent" : "Cancelled by a board operator", {
       ...(requestId ? { cancellationRequestId: requestId, cancellationRequestedByUserId: req.actor.userId ?? null } : {}),
-      resultJson: {
+      ...(req.actor.type === "agent" ? { errorCode: "operator_interrupted" } : {}),
+      resultJson: req.actor.type === "agent" ? {
+        cancelledByActorType: "agent",
+        cancelledByAgentId: actor.agentId,
+      } : {
         cancelledByActorType: "user",
         cancelledByUserId: req.actor.userId ?? null,
       },
@@ -7368,8 +7374,11 @@ export function agentRoutes(
     if (run) {
       await logActivity(db, {
         companyId: run.companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
         action: "heartbeat.cancelled",
         entityType: "heartbeat_run",
         entityId: run.id,
@@ -7378,7 +7387,7 @@ export function agentRoutes(
     }
 
     res.json(run ? await runRedactions.redactForRun(run.companyId, run.id, run,
-      getActorInfo(req).actorId) : null);
+      req.actor.type === "board" ? actor.actorId : null) : null);
   });
 
   router.post(
