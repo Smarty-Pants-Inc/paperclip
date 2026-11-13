@@ -271,10 +271,12 @@ export async function findNativeSessionResumeRun(db: Db, input: NativeSessionRes
   if (!skipped.length) return selected;
   const source = record(selected?.runnerProfileJson.sessionCheckpoint);
   const inherited = selected !== null && typeof source.sessionId === "string" && skipped.every(run => {
+    if (run.runnerProfileJson.sessionCheckpoint == null) return true; // affirmative pre-spawn, no checkpoint to roll back
     const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
     return INHERITED_CHECKPOINT_SOURCE_FIELDS.every(field => checkpoint[field] === source[field]);
   });
-  return inherited ? selected : barrier;
+  const onlyPreSpawnFailures = selected === null && skipped.every(run => run.runnerProfileJson.sessionCheckpoint == null);
+  return inherited || onlyPreSpawnFailures ? selected : barrier;
 }
 
 /** An inherited checkpoint may be bypassed only with affirmative pre-spawn
@@ -286,6 +288,9 @@ async function isUnstartedInheritedFollowUp(
   run: { id: string; runtimeMode: string | null; status: string; processPid: number | null;
     processGroupId: number | null; processStartedAt: Date | null; runnerProfileJson: { sessionCheckpoint: unknown; nativeControllerRecovery: unknown } },
 ): Promise<boolean> {
+  if (run.runtimeMode === "native" && run.status === "failed" && run.runnerProfileJson.sessionCheckpoint == null) {
+    return provesNativeRunPreSpawnFailure(db, { companyId: input.companyId, runId: run.id });
+  }
   const checkpoint = record(run.runnerProfileJson.sessionCheckpoint);
   const identity = record(checkpoint.identity);
   if (run.runtimeMode !== "native" || run.status !== "failed" || run.runnerProfileJson.nativeControllerRecovery != null ||
@@ -347,6 +352,7 @@ async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResu
       processGroupId: heartbeatRuns.processGroupId,
       processStartedAt: heartbeatRuns.processStartedAt,
       hasCheckpoint: sql<boolean>`coalesce(${heartbeatRuns.runnerProfileJson}->'sessionCheckpoint' <> 'null'::jsonb, false)`.as("has_checkpoint"),
+      hasNativeInput: sql<boolean>`coalesce(${heartbeatRuns.runnerProfileJson}->'nativeExecutionInput' <> 'null'::jsonb, false)`.as("has_native_input"),
     })
     .from(heartbeatRuns)
     .where(
@@ -368,6 +374,7 @@ async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResu
       ne(candidates.runtimeMode, "native"),
       not(inArray(candidates.status, terminalStatuses)),
       candidates.hasCheckpoint,
+      and(eq(candidates.status, "failed"), candidates.hasNativeInput), // admitted failure is unknown until affirmatively proved pre-spawn
       isNotNull(candidates.processPid),
       isNotNull(candidates.processGroupId),
       isNotNull(candidates.processStartedAt),
@@ -425,7 +432,7 @@ async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResu
       ...(input.includeProgressBarrier ? [] : [
         eq(barrier.runtimeMode, "native"),
         inArray(barrier.status, terminalStatuses),
-        eq(barrier.hasCheckpoint, true),
+        or(eq(barrier.hasCheckpoint, true), and(eq(barrier.status, "failed"), barrier.hasNativeInput)),
         sql`date_trunc('milliseconds', ${barrier.createdAt}) <= ${input.beforeCreatedAt.toISOString()}::timestamptz`,
       ]),
       sql`${heartbeatRuns.companyId}::text = ${input.companyId}`,

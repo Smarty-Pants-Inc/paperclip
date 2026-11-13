@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, nativeRunResults, toolInvocations, type Db } from "@paperclipai/db";
+import { heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints, toolInvocations, type Db } from "@paperclipai/db";
 /** Durable run events that prove a provider session did work in a run. */
 export const NATIVE_PROVIDER_DURABLE_EVENT_TYPES = new Set([
   "harness.ready", "session.started", "session.resumed", "session.updated",
@@ -9,7 +9,7 @@ export const NATIVE_PROVIDER_DURABLE_EVENT_TYPES = new Set([
 /** No recorded provider work across every runner instance, never just the latest
  * runner. This is NOT proof that no process spawned or that a runner is gone.
  * A read failure or any provider event, tool call, or result denies the proof. */
-export async function provesNoNativeRunProviderWork(db: Db, input: {
+export async function provesNoNativeRunProviderWork(db: Pick<Db, "execute">, input: {
   companyId: string; runId: string; signal?: AbortSignal;
 }): Promise<boolean> {
   input.signal?.throwIfAborted();
@@ -40,7 +40,7 @@ export async function provesNoNativeRunProviderWork(db: Db, input: {
  * Callers accepting copied process fields must separately bind them to their
  * exact source run. Process death after dispatch uses the existing local/remote
  * generation prover, never this absence-of-provider-work query. */
-export async function provesNativeRunPreSpawnFailure(db: Db, input: {
+export async function provesNativeRunPreSpawnFailure(db: Pick<Db, "execute">, input: {
   companyId: string; runId: string;
 }): Promise<boolean> {
   const { companyId, runId } = input;
@@ -56,7 +56,9 @@ export async function provesNativeRunPreSpawnFailure(db: Db, input: {
     exists (select 1 from ${heartbeatRunEvents} event where event.company_id = run.company_id
       and event.run_id = run.id and (event.event_type in ('adapter.invoke', 'native.process_start_requested',
         'native.process_identity_recorded', 'native.process_started')
-        or event.payload->>'span' = 'runner.process.dispatch')) as "launchAttempt"
+        or event.payload->>'span' in ('runner.process.dispatch', 'runner.process.launch'))) as "launchAttempt",
+    exists (select 1 from ${nativeRunnerCheckpoints} checkpoint where checkpoint.company_id = run.company_id
+      and checkpoint.run_id = run.id) as "controllerCheckpoint"
     from ${heartbeatRuns} run inner join ${nativeRunFinalizations} coordinator
       on coordinator.run_id = run.id and coordinator.company_id = run.company_id
         and coordinator.issue_id = run.native_issue_id
@@ -65,6 +67,7 @@ export async function provesNativeRunPreSpawnFailure(db: Db, input: {
       and coordinator.lease_owner is null and coordinator.lease_expires_at is null`);
   const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Array<Record<string, unknown>>;
   const row = rows[0];
-  return Boolean(row && row.launchAttempt === false && (row.preClaim === true || row.fenceRefused === true))
+  return Boolean(row && row.launchAttempt === false && row.controllerCheckpoint === false
+    && (row.preClaim === true || row.fenceRefused === true))
     && await provesNoNativeRunProviderWork(db, input);
 }
