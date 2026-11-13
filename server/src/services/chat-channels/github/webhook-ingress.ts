@@ -98,6 +98,9 @@ export type GitHubWebhookIngressPayload = {
   eventType: string;
   runtimeGeneration: number;
   credentialFingerprint: string;
+  // null marks an original admitted without recovery authority; absent on
+  // receipts staged before this provenance marker was introduced.
+  recoveryActionId?: string | null;
 };
 
 export type RedactedGitHubWebhookIngressPayload = Omit<
@@ -122,7 +125,10 @@ export function githubWebhookIngressPayload(
     !payload.eventType ||
     typeof payload.runtimeGeneration !== "number" ||
     !Number.isSafeInteger(payload.runtimeGeneration) ||
-    typeof payload.credentialFingerprint !== "string"
+    typeof payload.credentialFingerprint !== "string" ||
+    (payload.recoveryActionId !== undefined &&
+      payload.recoveryActionId !== null &&
+      typeof payload.recoveryActionId !== "string")
   ) {
     return null;
   }
@@ -350,6 +356,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         const recoveryReceipts = credentials.appId
           ? await tx
               .select({
+                id: chatActions.id,
                 endpointId: chatActions.endpointId,
                 payload: chatActions.payload,
                 status: chatActions.status,
@@ -548,6 +555,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           eventType,
           runtimeGeneration: context.generation,
           credentialFingerprint: context.credentialFingerprint,
+          recoveryActionId: recoveryReceipts[0]?.id ?? null,
         };
         await notifyChatActionWork(tx, "github_webhook_ingress");
         const inserted = await tx
@@ -826,20 +834,53 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         record.endpoint,
         record.credentialSecretRefs,
       );
-      const recovery = await db
-        .select({ payload: chatActions.payload, status: chatActions.status })
-        .from(chatActions)
-        .where(
-          and(
-            eq(chatActions.endpointId, record.endpoint.id),
-            eq(chatActions.kind, "github_webhook_recovery"),
-            eq(
-              chatActions.providerActionId,
-              `github_webhook_recovery:${payload.deliveryId}`,
+      const recovery = await db.transaction(async (tx) => {
+        // Use the same endpoint fence as callback admission and recovery
+        // writes. A denial learned after local admission cannot revoke the
+        // original's accepted work, including tombstones from an older scan.
+        const current = await runtimeCallbackEndpoint(tx, record.endpoint.id, {
+          generation: payload.runtimeGeneration,
+          credentialFingerprint: payload.credentialFingerprint,
+        }, [record.endpoint.status]);
+        if (!current) return null;
+        const receipt = await tx
+          .select({ id: chatActions.id, payload: chatActions.payload, status: chatActions.status })
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.companyId, current.companyId),
+              eq(chatActions.endpointId, current.id),
+              eq(chatActions.kind, "github_webhook_recovery"),
+              eq(chatActions.providerActionId, `github_webhook_recovery:${payload.deliveryId}`),
             ),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
+          )
+          .then((rows) => rows[0] ?? null);
+        if (!receipt) return null;
+        const admission = await tx
+          .select({ payload: chatActions.payload })
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.companyId, current.companyId),
+              eq(chatActions.endpointId, current.id),
+              eq(chatActions.kind, "github_webhook_ingress"),
+              eq(chatActions.providerActionId, `github_webhook_ingress:${payload.deliveryId}`),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        // Record authority at admission rather than relying on transaction
+        // start timestamps to order callbacks racing a recovery write. Older
+        // envelopes have no marker: a minimal deny tombstone never authorized
+        // their admission, while a full recovery receipt still fences them.
+        const recoveryActionId = admission?.payload.recoveryActionId;
+        const admittedOriginal = admission && (recoveryActionId === undefined
+          ? !(receipt.payload as GitHubRecoveryReceipt).original?.payload
+          : recoveryActionId !== receipt.id);
+        // A genuinely recovered callback must retain its canonical-source
+        // recheck below; a later denial cannot acquire authority over an original.
+        return admittedOriginal ? null : receipt;
+      });
       const original = (recovery?.payload as GitHubRecoveryReceipt | undefined)?.original;
       const currentSource = recovery && recovery.status !== "cancelled" && original
         ? await githubRecoveryCurrentSource(original, credentials)
@@ -1028,6 +1069,7 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
       if (
         !current ||
         !original.repositoryId ||
+        (await githubRecoveryAlreadyReceived(tx, current, original.guid)) ||
         !(await githubRecoveryResource(tx, current, original.repositoryId))
       )
         return;
@@ -1399,8 +1441,6 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           detail.redelivery ||
           detail.url !== webhookUrl ||
           detail.event !== original.event ||
-          detail.deliveredAt !== original.deliveredAt ||
-          detail.statusCode !== original.statusCode ||
           detail.installationId !== original.installationId ||
           detail.repositoryId !== original.repositoryId ||
           detail.action !== original.action ||
@@ -1430,6 +1470,14 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
           );
           continue;
         }
+        // Delivery outcome fields are mutable while GitHub completes an
+        // attempt. A list/detail race is not permanent rejection: leave this
+        // GUID unclaimed so the next tick can observe a consistent snapshot.
+        if (
+          detail.statusCode !== original.statusCode ||
+          detail.deliveredAt !== original.deliveredAt ||
+          detail.throttledAt !== original.throttledAt
+        ) continue;
         if (!(await githubRecoveryCurrentSource(detail, credentials, recoveryFetch))) {
           await rememberGitHubRecoverySkip(
             endpoint,
