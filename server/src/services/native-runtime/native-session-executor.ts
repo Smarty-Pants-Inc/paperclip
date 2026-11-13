@@ -11025,6 +11025,11 @@ async function executePaperclipNativeSessionAttempt(
     // strict predecessor suspension; it cannot run on a failed claim/Stop.
     const ingress = nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget);
     const warmScope = nativeSessionScopeKey(input.execution);
+    // claimedStopCleanup: this attempt is the Stop's own cleanup claim on the
+    // STOPPED run (restart recovery reattaching its remote Runner only to settle
+    // the cancellation; readClaimedNativeStopRecovery), not a new turn. It runs
+    // no new provider work, so it neither probes nor retires the idle owner;
+    // the next real message's attempt (claimedStopCleanup false) does.
     const idleOwner = input.useRunnerd && !claimedStopCleanup ? warmNativeSessions.get(warmScope) : undefined;
     // The identity command is durable maintenance: the completed source writer
     // needs this successor's claimed lease before it may persist that command.
