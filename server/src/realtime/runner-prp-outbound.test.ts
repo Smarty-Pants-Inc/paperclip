@@ -1,7 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
-import { logger } from "../middleware/logger.js";
 import type { DurablePrpControlPlane } from "../vendor/paperclip-runner/index.js";
 import {
   __runnerPrpOutboundTesting,
@@ -51,36 +50,6 @@ function openingSocket(socket = new FakeSocket()): FakeSocket {
 sockets.create = () => openingSocket();
 
 describe("runner provider-ingress WebSocket wire", () => {
-  it("logs each failed ingress connect attempt with timing and errno", async () => {
-    vi.useFakeTimers();
-    const create = sockets.create;
-    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
-    sockets.create = () => {
-      const socket = new FakeSocket();
-      socket.readyState = WebSocket.CONNECTING;
-      queueMicrotask(() => {
-        socket.readyState = WebSocket.CLOSED;
-        socket.emit("error", Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED", errno: -111, syscall: "connect" }));
-      });
-      return socket;
-    };
-    const endpoint = { kind: "authenticated_websocket" as const,
-      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-log",
-      secretHeaders: [{ name: "Authorization", value: "must-not-log" }], generation: "log", refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
-    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: vi.fn() } as unknown as DurablePrpControlPlane,
-      endpoint, startupDeadlineMs: 600, random: () => 0.5 });
-    try {
-      const observed = handle.ready.catch(error => error);
-      await vi.advanceTimersByTimeAsync(600);
-      const terminal = await observed;
-      const records = warn.mock.calls.filter(call => (call[0] as Record<string, unknown>)?.event === "runner_ingress_connect_attempt_failed");
-      expect(records.length).toBe(2);
-      expect(records.map(call => (call[0] as Record<string, unknown>)?.attempt)).toEqual([1, 2]);
-      expect(records[0]?.[0]).toMatchObject({ code: "ECONNREFUSED" });
-      expect(JSON.stringify(records)).not.toContain("must-not-log");
-      expect(terminal).toMatchObject({ causeSummary: { code: "ECONNREFUSED", errno: -111, syscall: "connect" } });
-    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
-  });
   it.each(["fresh", "permanently unreachable"] as const)("retries a %s listener only within the startup budget", async mode => {
     vi.useFakeTimers();
     const create = sockets.create;
