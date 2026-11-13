@@ -125,7 +125,7 @@ describe.skipIf(process.platform === "win32")("run-path file work stays off the 
     const runner = {
       execute: async ({ args }: { args: string[] }) => args[1]?.includes("base64")
         ? { stdout: archive.toString("base64"), stderr: "", exitCode: 0, timedOut: false }
-        : { stdout: "", stderr: "", exitCode: 0, timedOut: false },
+        : { stdout: args[1]?.includes("paperclip_sizes=$(find ") ? "1 11\n" : "", stderr: "", exitCode: 0, timedOut: false },
     };
     const target = join(root, "checkpoint");
 
