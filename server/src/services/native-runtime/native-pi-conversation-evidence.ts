@@ -36,6 +36,8 @@ export function isNativePiConversationDirectoryName(name: string): boolean {
 const MAX_EVIDENCE_ENTRIES = 100_000;
 const MAX_EVIDENCE_DEPTH = 128;
 const MAX_EVIDENCE_HEADER_BYTES = 4 * 1024;
+const MAX_EVIDENCE_MANIFEST_BYTES = 1024 * 1024;
+const PI_SESSION_RECORD_PREFIX = /^\s*\{\s*"type"\s*:\s*"session"/;
 
 async function hasPiSessionHeader(filename: string): Promise<boolean> {
   let file;
@@ -47,11 +49,18 @@ async function hasPiSessionHeader(filename: string): Promise<boolean> {
     const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
     const bytes = buffer.subarray(0, bytesRead);
     const newline = bytes.indexOf(0x0a);
-    if (newline < 0 && stat.size > MAX_EVIDENCE_HEADER_BYTES) return true;
     const firstLine = bytes.subarray(0, newline < 0 ? bytes.length : newline).toString("utf8");
-    return (JSON.parse(firstLine) as { type?: unknown })?.type === "session";
+    // A first line cut by the read cap is undecidable only if it starts as a
+    // Pi session record; keep that. Ordinary readable files (binaries, logs,
+    // locks, empty files, other JSON) are not Pi history.
+    if (newline < 0 && stat.size > MAX_EVIDENCE_HEADER_BYTES) return PI_SESSION_RECORD_PREFIX.test(firstLine);
+    try {
+      return (JSON.parse(firstLine) as { type?: unknown })?.type === "session";
+    } catch {
+      return false;
+    }
   } catch {
-    // An unreadable or malformed candidate cannot authorize its deletion.
+    // Only an I/O failure (EACCES, EIO, ELOOP, ...) is undecidable: keep.
     return true;
   } finally {
     await file?.close().catch(() => undefined);
@@ -79,13 +88,16 @@ export async function hasNativePiConversationEvidence(root: string): Promise<boo
           try {
             manifestFile = await open(filename, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
             const manifestStat = await manifestFile.stat();
-            if (!manifestStat.isFile() || manifestStat.size > MAX_EVIDENCE_HEADER_BYTES) return true;
-            const buffer = Buffer.alloc(MAX_EVIDENCE_HEADER_BYTES);
+            if (!manifestStat.isFile() || manifestStat.size > MAX_EVIDENCE_MANIFEST_BYTES) return true;
+            const buffer = Buffer.alloc(manifestStat.size);
             const { bytesRead } = await manifestFile.read(buffer, 0, buffer.length, 0);
-            const manifest = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+            let manifest: { providerKind?: unknown; driverKind?: unknown; directories?: unknown } | null = null;
+            // A readable manifest that is not JSON is not a Pi manifest.
+            try { manifest = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")); } catch { manifest = null; }
             if (manifest?.providerKind === "pi_rpc" || manifest?.driverKind === "pi_rpc"
-              || manifest?.directories?.some((child: { name?: unknown }) => isNativePiConversationDirectoryName(String(child?.name)))) return true;
+              || (Array.isArray(manifest?.directories) && manifest.directories.some((child: { name?: unknown }) => isNativePiConversationDirectoryName(String(child?.name))))) return true;
           } catch {
+            // I/O failure on the manifest is undecidable: keep.
             return true;
           } finally {
             await manifestFile?.close().catch(() => undefined);
