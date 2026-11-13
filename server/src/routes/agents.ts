@@ -8008,6 +8008,31 @@ export function agentRoutes(
       "Issue not found",
     );
     if (!issue) return;
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "issue:read",
+      resource: {
+        type: "issue",
+        companyId: issue.companyId,
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+        status: issue.status,
+      },
+      scope: {
+        issueId: issue.id,
+        projectId: issue.projectId,
+        parentIssueId: issue.parentId,
+        assigneeAgentId: issue.assigneeAgentId,
+        assigneeUserId: issue.assigneeUserId,
+      },
+    });
+    if (!decision.allowed) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
     res.json(await issueRunPresence.liveRuns(issue));
   });
 

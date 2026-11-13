@@ -184,6 +184,7 @@ it protects:
 | Status-card hydrate and dry-run | `status-cards.test.ts` |
 | Activity stream | `activity-service.test.ts`, `activity-routes.test.ts` |
 | Run list, live run, detail, transcript, events, logs, operation history | `heartbeat-run-privacy-routes.test.ts` |
+| Task live-runs and feedback-votes, UUID/identifier reads and live grant revocation | `issue-private-subresource-routes.test.ts` |
 | Tree holds and tree control | `issue-tree-control-routes.test.ts` |
 | Blocker and mention identifier-only stubs | `issue-access-grants-routes.test.ts` |
 | Attachment content | `issue-attachment-routes.test.ts` |
