@@ -6,6 +6,7 @@
  * never become an accidental runtime dependency.
  */
 export * from "./index.js";
+export { createPiEventProjector } from "./drivers/pi/pi-event-projector.js";
 export * from "./conformance/control-plane-port.js";
 export * from "./conformance/capability-semantic-conformance.js";
 export * from "./conformance/harness-driver.js";
