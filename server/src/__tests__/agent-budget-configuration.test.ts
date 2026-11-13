@@ -7,13 +7,12 @@ const existing = { id: "agent", companyId: "company", status: "idle", budgetMont
 // Preparation queues retention work through the database before reading the patch.
 const fakeDb = () => ({
   execute: async () => [],
-  select: () => ({ from: () => ({ where: () => Object.assign(
-    Promise.resolve([{ id: "ceo", companyId: "company", reportsTo: null, permissions: {} }]),
-    { orderBy: async () => [{ id: "ceo", companyId: "company", reportsTo: null, permissions: {} }] },
-  ) }) }),
+  select: () => ({ from: () => ({ where: () => ({
+    orderBy: async () => [{ id: "ceo", companyId: "company", permissions: {} }],
+  }) }) }),
 }) as unknown as Db;
 describe("budget authority in configuration preparation", () => {
-  it("rejects agent-originated budget changes without subordinate authority before persistence or policy audit", async () => {
+  it("rejects agent-originated budget changes before persistence or policy audit", async () => {
     const db = fakeDb();
     await expect(prepareAgentConfiguration(db, existing, { budgetMonthlyCents: 5000 }, { recordRevision: { createdByAgentId: "ceo" } })).rejects.toMatchObject({ status: 403 });
     await expect(prepareAgentConfiguration(db, existing, { budgetMonthlyCents: 0 }, { recordRevision: { createdByAgentId: "ceo" } })).rejects.toMatchObject({ status: 403 });

@@ -422,7 +422,7 @@ async function loadCompanyAgentHierarchy(db: Db | DbTransaction, companyId: stri
   return new Map(rows.map((agent) => [agent.id, agent]));
 }
 
-export async function isAgentInSubtree(
+async function isAgentInSubtree(
   db: Db | DbTransaction,
   companyId: string,
   rootAgentId: string,

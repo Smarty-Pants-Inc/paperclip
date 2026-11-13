@@ -167,7 +167,6 @@ import { adapterSettingsService } from "../services/adapter-settings.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
-import { assertCanManageSubordinateAgent, assertSubordinateBudgetChange, subordinatePermissionScope } from "../services/agent-subtree-management.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import { AGENT_TERMINATED_STOP_REASON } from "../services/governance-pause-stop.js";
 import {
@@ -5088,25 +5087,24 @@ export function agentRoutes(
         res.status(403).json({ error: "Forbidden" });
         return;
       }
-      await assertCanManageSubordinateAgent(db, req.actor, existing);
-      if (req.body.trustPreset !== undefined || req.body.authorizationPolicy !== undefined) {
-        throw forbidden("Only board operators may change trust or authorization policy");
+      if (actorAgent.role !== "ceo") {
+        res.status(403).json({ error: "Only CEO can manage permissions" });
+        return;
       }
-      if (req.body.canCreateSkills === true) {
-        const decision = await access.decide({ actor: req.actor, action: "skills:create",
-          resource: { type: "agent", companyId: existing.companyId, agentId: existing.id },
-          scope: { targetAgentId: existing.id } });
-        if (!decision.allowed) throw forbidden("Cannot delegate skills:create without holding it");
-      }
-      // This endpoint also writes tasks:assign below; bound that implicit grant too.
-      if (existing.role === "ceo" || req.body.canCreateAgents || req.body.canAssignTasks) {
-        await subordinatePermissionScope(db, req.actor, existing, "tasks:assign", undefined);
+      const configureDecision = await access.decide({
+        actor: req.actor,
+        action: "agent_config:update",
+        resource: { type: "agent", companyId: existing.companyId, agentId: existing.id },
+        scope: { targetAgentId: existing.id, requiresChangeGrant: true },
+      });
+      if (!configureDecision.allowed) {
+        throw forbidden(configureDecision.explanation, authorizationDeniedDetails(configureDecision));
       }
       // Hiring authority is granted only by an actor that holds it. A CEO the
       // board denied hiring must not restore it for itself or pass it to
       // another agent to hire through.
       const savedCanCreateAgents = normalizeAgentPermissions(existing.permissions, { role: existing.role }).canCreateAgents;
-      if (req.body.canCreateAgents === true || req.body.canCreateAgents !== savedCanCreateAgents) {
+      if (typeof req.body.canCreateAgents === "boolean" && req.body.canCreateAgents !== savedCanCreateAgents) {
         await assertCanCreateAgentsForCompany(req, existing.companyId, { hiring: true });
       }
     } else {
@@ -5144,7 +5142,6 @@ export function agentRoutes(
       "tasks:assign",
       effectiveCanAssignTasks,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-      req.actor.type === "agent" ? { subtreeRootAgentId: agent.id } : null,
     );
 
     const actor = getActorInfo(req);
@@ -5170,11 +5167,14 @@ export function agentRoutes(
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
+    if (req.actor.type !== "board") {
+      throw forbidden("Only board-authenticated callers can manage instructions path or bundle configuration");
+    }
+
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
 
-    await assertCanManageSubordinateAgent(db, req.actor, existing);
     await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
@@ -5182,9 +5182,6 @@ export function agentRoutes(
     const explicitKey = asNonEmptyString(req.body.adapterConfigKey);
     const defaultKey = resolveInstructionsPathKey(existing.adapterType);
     const adapterConfigKey = explicitKey ?? defaultKey;
-    if (req.actor.type === "agent" && (!adapterConfigKey || !KNOWN_INSTRUCTIONS_PATH_KEYS.has(adapterConfigKey))) {
-      throw forbidden("Agents may change only a known instructions path adapter key");
-    }
     if (!adapterConfigKey) {
       res.status(422).json({
         error: `No default instructions path key for adapter type '${existing.adapterType}'. Provide adapterConfigKey.`,
@@ -5200,11 +5197,7 @@ export function agentRoutes(
     }
 
     const syncedAdapterConfig = syncInstructionsBundleConfigFromFilePath(existing, nextAdapterConfig);
-    // Legacy agentsMdPath must obey the same managed-vs-external filesystem boundary.
-    const pathPolicyConfig = req.actor.type === "agent" && adapterConfigKey !== "instructionsFilePath"
-      ? syncInstructionsBundleConfigFromFilePath(existing, { ...nextAdapterConfig, instructionsFilePath: nextAdapterConfig[adapterConfigKey] })
-      : syncedAdapterConfig;
-    assertExternalInstructionsAdmin(req, { ...existing, adapterConfig: pathPolicyConfig });
+    assertExternalInstructionsAdmin(req, { ...existing, adapterConfig: syncedAdapterConfig });
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       existing.companyId,
       syncedAdapterConfig,
@@ -5588,10 +5581,10 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    // Budget aliases share the same delegated authority and remaining-budget cap.
-    if (hasOwn(req.body as object, "budgetMonthlyCents")) {
-      if (req.actor.type === "agent") await assertSubordinateBudgetChange(db, req.actor, existing, req.body.budgetMonthlyCents);
-      else if (req.body.budgetMonthlyCents !== existing.budgetMonthlyCents) assertBoard(req, agentBudgetPage(existing.id));
+    // A budget change is the board-only budget control (PATCH /agents/:id/budgets),
+    // so PATCH is never a way around it.
+    if (hasOwn(req.body as object, "budgetMonthlyCents") && req.body.budgetMonthlyCents !== existing.budgetMonthlyCents) {
+      assertBoard(req, agentBudgetPage(existing.id));
     }
 
     if (hasOwn(req.body as object, "permissions")) {

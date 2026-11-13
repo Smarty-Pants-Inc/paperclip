@@ -6,18 +6,18 @@ import { badRequest, conflict, forbidden, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { accessService } from "../services/access.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../services/activity-log.js";
-import { assertAuthenticated, assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { assertCanManageSubordinateAgent, subordinatePermissionScope } from "../services/agent-subtree-management.js";
+import { assertAuthenticated, assertBoard, assertCompanyAccess, hasCompanyAccess } from "./authz.js";
 
 export function agentPermissionGrantRoutes(db: Db) {
   const router = Router();
 
   router.patch("/agents/:id/permission-grants", validate(updateAgentPermissionGrantSchema), async (req, res) => {
     assertAuthenticated(req);
-    if (req.actor.type !== "agent") assertBoard(req);
+    assertBoard(req);
     const id = req.params.id as string;
     if (!isUuidLike(id)) throw badRequest("Agent ID must be a UUID");
     const { permissionKey, enabled, scope } = req.body;
+    const scopeUpdate = scope === undefined ? {} : { scope };
     const publications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
       const agent = await tx.select({ id: agents.id, companyId: agents.companyId, status: agents.status })
@@ -26,26 +26,10 @@ export function agentPermissionGrantRoutes(db: Db) {
       assertCompanyAccess(req, agent.companyId);
       const txDb = tx as unknown as Db;
       const access = accessService(txDb);
-      let effectiveScope = scope;
-      if (req.actor.type === "agent") {
-        await assertCanManageSubordinateAgent(txDb, req.actor, agent);
-        if (enabled) {
-          if (scope === undefined) {
-            const [existingGrant] = await tx.select().from(principalPermissionGrants).where(and(
-              eq(principalPermissionGrants.companyId, agent.companyId),
-              eq(principalPermissionGrants.principalType, "agent"),
-              eq(principalPermissionGrants.principalId, agent.id),
-              eq(principalPermissionGrants.permissionKey, permissionKey),
-            ));
-            effectiveScope = existingGrant?.scope;
-          }
-          effectiveScope = await subordinatePermissionScope(txDb, req.actor, agent, permissionKey, effectiveScope);
-        }
-      } else if (req.actor.source !== "local_implicit"
+      if (req.actor.source !== "local_implicit"
         && !await access.canUser(agent.companyId, req.actor.userId, "users:manage_permissions")) {
         throw forbidden("Missing permission: users:manage_permissions");
       }
-      const scopeUpdate = effectiveScope === undefined ? {} : { scope: effectiveScope };
       if (enabled) {
         if (agent.status === "pending_approval" || agent.status === "terminated") {
           throw conflict("Cannot grant permissions to an unapproved or terminated agent");
@@ -60,7 +44,7 @@ export function agentPermissionGrantRoutes(db: Db) {
         }
         await tx.insert(principalPermissionGrants).values({
           companyId: agent.companyId, principalType: "agent", principalId: agent.id,
-          permissionKey, scope: effectiveScope ?? null, grantedByUserId: req.actor.userId ?? null,
+          permissionKey, scope: scope ?? null, grantedByUserId: req.actor.userId ?? null,
         }).onConflictDoUpdate({
           target: [principalPermissionGrants.companyId, principalPermissionGrants.principalType,
             principalPermissionGrants.principalId, principalPermissionGrants.permissionKey],
@@ -75,10 +59,8 @@ export function agentPermissionGrantRoutes(db: Db) {
           eq(principalPermissionGrants.permissionKey, permissionKey),
         ));
       }
-      const actor = getActorInfo(req);
       await logActivity(txDb, {
-        companyId: agent.companyId, actorType: actor.actorType, actorId: actor.actorId,
-        agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
+        companyId: agent.companyId, actorType: "user", actorId: req.actor.userId ?? "board",
         action: "agent.permission_grant_updated", entityType: "agent", entityId: agent.id,
         details: { permissionKey, enabled, ...scopeUpdate },
       }, publications);
