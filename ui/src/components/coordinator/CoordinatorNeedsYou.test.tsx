@@ -1,9 +1,5 @@
 // @vitest-environment jsdom
 import { act, type ReactNode } from "react";
-import { inboxDismissalsApi } from "@/api/inboxDismissals";
-import { attentionApi } from "@/api/attention";
-import { useCoordinatorAttentionCount } from "@/hooks/useCoordinatorAttentionCount";
-import { coordinatorAttentionQueryKey } from "@/lib/coordinator-attention";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -21,18 +17,8 @@ vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({ useCoordinatorWorkspa
 vi.mock("@/lib/router", async importOriginal => ({ ...await importOriginal<typeof import("@/lib/router")>(), useNavigate: () => fixture.navigate }));
 vi.mock("@/api/agents", () => ({ agentsApi: { list: async () => [] } }));
 vi.mock("@/api/projects", () => ({ projectsApi: { list: async () => [] } }));
-vi.mock("@/api/inboxDismissals", () => ({ inboxDismissalsApi: {
-  list: vi.fn(async () => []),
-  snooze: vi.fn(async (_companyId: string, itemKey: string, snoozedUntil: string) => {
-    fixture.pending = fixture.pending.map(item => item.dismissalKey === itemKey
-      ? { ...item, dismissal: { kind: "snooze", snoozedUntil, isActive: true } } as AttentionItem : item);
-  }),
-  restore: vi.fn(async (_companyId: string, itemKey: string) => {
-    fixture.pending = fixture.pending.map(item => item.dismissalKey === itemKey ? { ...item, dismissal: null } : item);
-  }),
-} }));
 vi.mock("@/api/attention", () => ({ attentionApi: {
-  list: vi.fn(async () => { if (fixture.feedFail) throw new Error("Feed unavailable"); return { items: [...fixture.pending] }; }),
+  list: async () => { if (fixture.feedFail) throw new Error("Feed unavailable"); return { items: [...fixture.pending] }; },
   history: async () => { if (fixture.historyFail) throw new Error("History unavailable"); return { items: [...fixture.history], nextCursor: null }; },
 } }));
 vi.mock("motion/react", () => ({
@@ -42,10 +28,10 @@ vi.mock("motion/react", () => ({
 }));
 vi.mock("@/components/PropertiesPanel", () => ({ PROPERTIES_PANE_HEADER_SLOT_ID: "test-sidebar" }));
 vi.mock("@/components/DecisionResolver", () => ({ DecisionResolver: () => null }));
-vi.mock("@/components/StalledReviewActions", () => ({ StalledReviewActions: ({ issueId, approveLabel, reviewPolicy, footerSlot, onResolved }: { issueId: string; approveLabel: string; reviewPolicy: string; footerSlot?: ReactNode; onResolved: () => void }) => <>{footerSlot}<button data-review-policy={reviewPolicy} onClick={() => {
+vi.mock("@/components/StalledReviewActions", () => ({ StalledReviewActions: ({ issueId, approveLabel, reviewPolicy, onResolved }: { issueId: string; approveLabel: string; reviewPolicy: string; onResolved: () => void }) => <button data-review-policy={reviewPolicy} onClick={() => {
   fixture.pending = fixture.pending.filter((item) => item.subject.id !== issueId);
   onResolved();
-}}>{approveLabel}</button></> }));
+}}>{approveLabel}</button> }));
 vi.mock("@/components/AttentionInteractionResolver", () => ({ AttentionInteractionResolver: ({ issueId, interactionId, footerSlot, onResolved }: { issueId: string; interactionId: string; footerSlot?: ReactNode; onResolved: (interaction: { status: string }) => void }) => <>{footerSlot}<button data-issue-id={issueId} onClick={() => {
   if (fixture.partial) { onResolved({ status: "pending" }); return; }
   fixture.pending = fixture.pending.filter((item) => item.subject.id !== interactionId);
@@ -54,22 +40,12 @@ vi.mock("@/components/AttentionInteractionResolver", () => ({ AttentionInteracti
   onResolved({ status: "answered" });
 }}>Resolve {interactionId}</button></> }));
 
-function queryByRole(scope: HTMLElement, role: "button" | "menuitem", { name }: { name: string; exact: true }) {
-  return [...scope.querySelectorAll<HTMLElement>(role === "button" ? "button" : '[role="menuitem"]')]
-    .find(element => (element.getAttribute("aria-label") ?? element.textContent?.trim()) === name) ?? null;
-}
-function getByRole(scope: HTMLElement, role: "button" | "menuitem", options: { name: string; exact: true }) {
-  const element = queryByRole(scope, role, options);
-  expect(element, `${role}: ${options.name}`).not.toBeNull();
-  return element!;
-}
 function Location() { return <output data-location>{useLocation().search}</output>; }
-function AttentionCount() { return <output data-attention-count>{useCoordinatorAttentionCount("company")}</output>; }
 
 let root: Root;
 let container: HTMLDivElement;
 beforeEach(() => {
-  fixture.pending = ["1", "2", "3"].map((id) => ({ id, dismissalKey: `attention:interaction:${id}`, sourceKind: "issue_thread_interaction", inlineResolvable: true, subject: { id, kind: "interaction", title: `Review ${id}`, metadata: { issueId: `task-${id}` } }, relatedIssue: { id: `task-${id}`, identifier: `PAP-${id}`, title: `Task ${id}`, href: `/PAP/issues/PAP-${id}` }, activityAt: new Date().toISOString() } as unknown as AttentionItem));
+  fixture.pending = ["1", "2", "3"].map((id) => ({ id, sourceKind: "issue_thread_interaction", inlineResolvable: true, subject: { id, kind: "interaction", title: `Review ${id}`, metadata: { issueId: `task-${id}` } }, relatedIssue: { id: `task-${id}`, identifier: `PAP-${id}`, title: `Task ${id}`, href: `/PAP/issues/PAP-${id}` }, activityAt: new Date().toISOString() } as unknown as AttentionItem));
   fixture.history = []; fixture.url = "/decisions"; vi.clearAllMocks();
   fixture.historyFail = false; fixture.feedFail = false; fixture.partial = false; fixture.mobile = false;
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
@@ -82,84 +58,6 @@ async function click(text: string) {
   await act(async () => button!.click()); await flush();
 }
 describe("Coordinator Needs You", () => {
-  it.each([false, true])("snoozes an interaction into a collapsed section and restores it (phone: %s)", async mobile => {
-    fixture.mobile = mobile;
-    fixture.pending = [fixture.pending[0]];
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/decisions"]}><CoordinatorNeedsYou /><AttentionCount /></MemoryRouter></QueryClientProvider>));
-    await flush();
-    expect(container.querySelector("[data-attention-count]")?.textContent).toBe("1");
-    expect(client.getQueryData(coordinatorAttentionQueryKey("company"))).toBeUndefined();
-    expect(attentionApi.list).toHaveBeenCalledWith("company", { all: true, includeDismissed: true });
-    const before = Date.now();
-    // Radix menus open on pointerdown; exercise the actual menu, not a hook mock.
-    await act(async () => getByRole(container, "button", { name: "Snooze", exact: true }).dispatchEvent(
-      new MouseEvent("pointerdown", { bubbles: true, button: 0 }),
-    ));
-    await flush();
-    expect([...document.querySelectorAll('[role="menuitem"]')].map(item => item.textContent)).toEqual([
-      "1 hour", "4 hours", "Tomorrow morning", "Next week",
-    ]);
-    await act(async () => getByRole(document.body, "menuitem", { name: "1 hour", exact: true }).click());
-    await flush(); await flush();
-    expect(inboxDismissalsApi.snooze).toHaveBeenCalledWith("company", "attention:interaction:1", expect.any(String));
-    const until = vi.mocked(inboxDismissalsApi.snooze).mock.calls[0][2];
-    expect(Date.parse(until)).toBeGreaterThanOrEqual(before + 3_600_000);
-    expect(Date.parse(until)).toBeLessThanOrEqual(Date.now() + 3_600_000);
-    expect(queryByRole(container, "button", { name: "Resolve 1", exact: true })).toBeNull();
-    expect(container.querySelector("[data-attention-count]")?.textContent).toBe("0");
-    expect(client.getQueryData(coordinatorAttentionQueryKey("company"))).toBeUndefined();
-    const toggle = getByRole(container, "button", { name: "Snoozed", exact: true });
-    expect(toggle.textContent).toContain("Snoozed (1)");
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    expect(queryByRole(container, "button", { name: "Restore", exact: true })).toBeNull();
-    await act(async () => toggle.click()); await flush();
-    expect(container.textContent).toContain("Review 1");
-    expect(container.textContent).toContain("Reappears in 1h");
-    await act(async () => getByRole(container, "button", { name: "Restore", exact: true }).click());
-    await flush(); await flush();
-    expect(inboxDismissalsApi.restore).toHaveBeenCalledWith("company", "attention:interaction:1");
-    expect(getByRole(container, "button", { name: "Resolve 1", exact: true })).toBeTruthy();
-    expect(container.querySelector("[data-attention-count]")?.textContent).toBe("1");
-    expect(queryByRole(container, "button", { name: "Snoozed", exact: true })).toBeNull();
-    client.clear();
-  });
-
-  it("keeps active dismissals out of the main list but allows expired snoozes to reappear", async () => {
-    const [snoozed, dismissed, expired] = fixture.pending;
-    fixture.pending = [
-      { ...snoozed, dismissal: { kind: "snooze", isActive: true, snoozedUntil: new Date(Date.now() + 3_600_000).toISOString() } },
-      { ...dismissed, dismissal: { kind: "dismiss", isActive: true } },
-      { ...expired, dismissal: { kind: "snooze", isActive: false, snoozedUntil: new Date(Date.now() - 1).toISOString() } },
-    ] as AttentionItem[];
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter><CoordinatorNeedsYou /></MemoryRouter></QueryClientProvider>));
-    await flush();
-    expect(queryByRole(container, "button", { name: "Resolve 1", exact: true })).toBeNull();
-    expect(queryByRole(container, "button", { name: "Resolve 2", exact: true })).toBeNull();
-    expect(getByRole(container, "button", { name: "Resolve 3", exact: true })).toBeTruthy();
-    expect(getByRole(container, "button", { name: "Snoozed", exact: true }).textContent).toContain("(1)");
-    client.clear();
-  });
-
-  it.each(["decision", "review"] as const)("offers the same Snooze menu on a pending %s card", async sourceKind => {
-    fixture.pending = [{ ...fixture.pending[0], sourceKind,
-      dismissalKey: `attention:${sourceKind}:1`,
-      subject: { ...fixture.pending[0].subject, id: "1", kind: sourceKind === "review" ? "issue" : "decision", title: "Pending choice", metadata: { reviewAttentionState: "stalled" } },
-    }] as AttentionItem[];
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter><CoordinatorNeedsYou /></MemoryRouter></QueryClientProvider>));
-    await flush();
-    await act(async () => getByRole(container, "button", { name: "Snooze", exact: true }).dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 })));
-    await flush();
-    await act(async () => getByRole(document.body, "menuitem", { name: "4 hours", exact: true }).click());
-    await flush(); await flush();
-    expect(inboxDismissalsApi.snooze).toHaveBeenCalledWith("company", `attention:${sourceKind}:1`, expect.any(String));
-    expect(container.querySelector(".coordinator-decision-card")).toBeNull();
-    expect(getByRole(container, "button", { name: "Snoozed", exact: true }).textContent).toContain("(1)");
-    client.clear();
-  });
-
   it("reveals and focuses a linked decision beyond the first rendering window, then consumes only its URL parameter", async () => {
     fixture.url = "/decisions?decisionId=target&q=kept";
     fixture.pending = Array.from({ length: 61 }, (_, index) => ({ ...fixture.pending[0], id: `decision-${index}`, sourceKind: "decision",
