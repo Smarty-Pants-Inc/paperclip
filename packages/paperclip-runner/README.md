@@ -571,9 +571,18 @@ proxy launch, and final Pi spawn. Explicit task-environment markers cannot widen
 these boundaries. The three `PAPERCLIP_AGENT_{KEY_ID,PUBLIC_KEY,PRIVATE_KEY}`
 Ed25519 identity values remain available by design; they do not authenticate
 Paperclip API requests. The exact Langfuse export names listed in
-`PI_LANGFUSE_ENVIRONMENT_KEYS` also reach Pi through the agent's configured secret
-environment (see `doc/architecture/runner-pi-capabilities.md`). API bearer/JWT
-secrets, `ASCII_*`, tracing headers, and unknown runner variables do not reach Pi
+`PI_LANGFUSE_ENVIRONMENT_KEYS`, including the nonsecret `LANGFUSE_FLUSH_AT` tuning
+setting, also reach Pi through the agent's configured secret environment (see
+`doc/architecture/runner-pi-capabilities.md`). Process-scoped Git configuration uses
+[git-config(1)'s documented environment pairs](https://git-scm.com/docs/git-config#ENVIRONMENT):
+only `safe.directory`, `user.name`, `user.email`, `gc.auto`, `init.defaultbranch`,
+`pull.rebase`, `fetch.prune`, `advice.*`, `color.*`, and `core.*` are forwarded
+(case-insensitively), excluding `core.sshcommand`, `core.askpass`, `core.gitproxy`,
+`core.hookspath`, `core.fsmonitor`, `core.pager`, and `core.editor`. Accepted pairs
+are renumbered from zero and `GIT_CONFIG_COUNT` is recomputed; no accepted pairs
+means no `GIT_CONFIG_*` variables. A nonnumeric count or any missing key/value
+rejects the entire set. HTTP, credential, URL, remote, and all other config keys
+are excluded. API bearer/JWT secrets, `ASCII_*`, tracing headers, and unknown runner variables do not reach Pi
 or its shell tools.
 Paperclip tools use the existing run-bound host callback instead of an API key
 in the child environment.

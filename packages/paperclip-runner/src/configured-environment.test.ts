@@ -1,10 +1,11 @@
+import { execFileSync } from 'node:child_process';
 import { CONFIGURED_ENVIRONMENT_KEYS, configuredEnvironment, configuredEnvironmentProjection } from './configured-environment.js';
 import { describe, expect, it, vi } from 'vitest';
 import { createSanitizedCodexEnvironment } from './drivers/codex/app-server-transport.js';
 import { createIsolatedCodexAppServerArgs } from './drivers/codex/codex-security-config.js';
 import { createCapabilityRunnerdProviderEnvironment } from './live/runnerd-codex-transport.js';
 import { spawnRunner } from './control-plane/durable-prp-control-plane.js';
-import { PI_LANGFUSE_ENVIRONMENT_KEYS } from './drivers/pi/pi-process-environment.js';
+import { PI_LANGFUSE_ENVIRONMENT_KEYS, piProcessEnvironment } from './drivers/pi/pi-process-environment.js';
 
 const pages = {
   PAPERCLIP_PAGE_AWS_ACCESS_KEY_ID: 'fake-page-access-key',
@@ -20,6 +21,30 @@ function shellKeys() {
 }
 
 describe('controller-configured environment across native runner boundaries', () => {
+  // Keep reason: actual native Pi launch trust boundary, not just the final filter.
+  it.each([2, 33])('carries %s safe Git pairs from the native provider builder through runner spawn to real Git', (count) => {
+    const pairs = [['http.https://github.com/.extraheader', 'Authorization: decoy'], ['safe.directory', '/work/project'],
+      ...Array.from({ length: count - 1 }, () => ['user.name', 'Pi Test'])];
+    const source = { PATH: '/bin', ...configuredEnvironmentProjection({ LANGFUSE_FLUSH_AT: '1' }), GH_TOKEN: 'decoy',
+      GIT_CONFIG_COUNT: String(pairs.length), ...Object.fromEntries(pairs.flatMap(([key, value], index) => [
+        [`GIT_CONFIG_KEY_${index}`, key], [`GIT_CONFIG_VALUE_${index}`, value],
+      ])) };
+    const environment = createCapabilityRunnerdProviderEnvironment({ provider: 'pi_rpc', options: { environment: source }, identity, codexHome: '/isolated/pi-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false });
+    let launched: NodeJS.ProcessEnv | undefined;
+    spawnRunner({ connection: { mode: 'connect', connectUrl: 'ws://127.0.0.1:43127' }, stateDirectory: '/tmp/pi-git-env-proof', identity, ticket: 'fake-ticket', maxOutboxBytes: 262144, p0ReserveBytes: 65536, runnerVersion: '0.3.0', runnerDigest: `sha256:${'a'.repeat(64)}`, environment,
+      piLaunchProfile: { command: '/isolated/node', commandSha256: `sha256:${'b'.repeat(64)}`, proxyScript: '/isolated/pi-proxy.cjs', proxyScriptSha256: `sha256:${'c'.repeat(64)}`, executable: '/isolated/pi.js', executableSha256: `sha256:${'d'.repeat(64)}` },
+      processLauncher: spec => { launched = spec.environment; return { child: { pid: 42, exitCode: null, signalCode: null, kill: () => true }, completion: Promise.resolve({ code: 0, signal: null, stdout: '', stderr: '' }) }; },
+    });
+    const pi = piProcessEnvironment(launched, {});
+    expect(pi).toMatchObject({ GIT_CONFIG_COUNT: String(count), GIT_CONFIG_KEY_0: 'safe.directory', GIT_CONFIG_VALUE_0: '/work/project',
+      GIT_CONFIG_KEY_1: 'user.name', GIT_CONFIG_VALUE_1: 'Pi Test', LANGFUSE_FLUSH_AT: '1' });
+    expect(pi).not.toHaveProperty(`GIT_CONFIG_KEY_${count}`);
+    expect(pi).not.toHaveProperty('GH_TOKEN');
+    expect(Object.values(pi)).not.toContain('Authorization: decoy');
+    expect(execFileSync('git', ['config', '--get-all', 'safe.directory'], {
+      env: { ...pi, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }, encoding: 'utf8',
+    })).toBe('/work/project\n');
+  });
   it('carries exactly configured Pi Langfuse export names through the controller and runner spawn', () => {
     const allowed = Object.fromEntries(PI_LANGFUSE_ENVIRONMENT_KEYS.map(name => [name, `configured-${name}`]));
     const source = { PATH: '/bin', ...configuredEnvironmentProjection({ ...allowed, LANGFUSE_UNLISTED_SECRET: 'must-drop', ASCII_TOKEN: 'must-drop', CUSTOM_FLAG: 'must-drop' }) };

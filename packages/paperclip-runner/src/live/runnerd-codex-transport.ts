@@ -96,7 +96,7 @@ import {
   type QualifiedAcpxAgent,
 } from "../drivers/acpx/qualified-profiles.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createSanitizedAcpxSpawnInput } from "../drivers/acpx/environment.js";
-import { piProxyEnvironment } from "../drivers/pi/pi-process-environment.js";
+import { piGitConfigEnvironment, piProxyEnvironment } from "../drivers/pi/pi-process-environment.js";
 import { PI_SIDECAR_PROVIDER_ROUTE_NAMES } from "../drivers/acpx/pi-provider-config.js";
 import {
   createSanitizedAwsAgentCoreEnvironment,
@@ -3825,7 +3825,12 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     return selected;
   }
   if (input.provider === "pi_rpc") {
-    const selected = { ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env };
+    const selected = {
+      ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env,
+      // Native Pi's safe Git settings are narrower than GitHub credential state
+      // and must survive the earlier ACPX-derived provider builder too.
+      ...piGitConfigEnvironment(input.options.environment ?? {}),
+    };
     // Native Pi bypasses ACPX's home sandbox. Preserve only the explicit
     // server-provided home; PiRpcDriver validates it at the final spawn boundary.
     if (input.options.environment?.AGENT_HOME !== undefined) selected.AGENT_HOME = input.options.environment.AGENT_HOME;
