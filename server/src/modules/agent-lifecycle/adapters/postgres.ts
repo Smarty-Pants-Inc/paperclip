@@ -13,9 +13,18 @@ export function assertRootDatabase(db: Db) {
 type LifecycleRow = typeof agents.$inferSelect;
 type ChangeOptions = { version?: number; owner?: string; reason?: string };
 
+// Legacy startup status is paused too; only an explicit person/policy stop
+// fences startup. The saved pause cause survives changes to the current holds.
+const lifecycleStartupAllowed = sql`(${agents.lifecycleState} not in ('preparing', 'verifying', 'resuming') or (
+  coalesce(${agents.pauseReason}, '') not in ('manual', 'budget', 'company_paused', 'company_archived')
+  and not (coalesce(${agents.lifecycleHolds}, '[]'::jsonb) ?| array['manual', 'budget', 'company_paused', 'company_archived'])
+  and not (coalesce(${agents.lifecycleOperation}->'pauseCause'->'holds', '[]'::jsonb) ?| array['manual', 'budget', 'company_paused', 'company_archived'])
+))`;
+
 // Prepared drafts wait for the wizard; they have no background verification obligation.
 export const pendingLifecycleWork = and(
   inArray(agents.lifecycleState, ["preparing", "verifying", "pausing", "resuming", "terminating", "cleaning_up"]),
+  lifecycleStartupAllowed,
   sql`not (${agents.lifecycleState} = 'verifying' and ${agents.lifecycleHolds} @> '["setup"]'::jsonb)`,
   sql`not (${agents.lifecycleState} in ('verifying', 'resuming') and coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') = 'true')`,
   sql`not (${agents.lifecycleState} = 'verifying' and coalesce(${agents.lifecycleOperation}->>'waitingForSignal', 'false') = 'true')`,
@@ -24,6 +33,7 @@ export const pendingLifecycleWork = and(
 /** A bounded startup pass rechecks this saved wait once, without a timer. */
 export const lifecycleSignalWait = and(
   eq(agents.lifecycleState, "verifying"),
+  lifecycleStartupAllowed,
   sql`coalesce(${agents.lifecycleOperation}->>'waitingForSignal', 'false') = 'true'`,
   sql`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') <> 'true'`,
 );
