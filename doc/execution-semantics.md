@@ -3860,8 +3860,16 @@ permission to continue the cancelled turn.
 Terminal release preserves a selected warm (`keep_running`) reusable sandbox
 for ordinary adapter failure, native session interruption, or completed cancellation,
 as well as success. The failed provider session is still retired; retaining its
-allocation does not grant permission to continue that session. Reuse follows the
-existing handoff and idle timeout, including provider revalidation on acquisition.
+allocation does not grant permission to continue that session. Warm retention is
+bounded: the second consecutive ordinary non-successful turn on the same provider
+allocation stops and retains it. Lease metadata records `warmFailureStreak` and the
+last counted run; a successful turn resets the streak to zero. Same-allocation
+handoff and same-run reacquisition preserve that accounting; a newly created
+allocation starts fresh. Duplicate settlement does not count another failure.
+Limit-triggered stops record `warm_retention_failure_limit` as
+`warmRetentionReasonCode` in both lease metadata and the run's result metadata.
+Reuse follows the existing handoff and idle timeout, including provider
+revalidation on acquisition.
 Integrity/replay conflicts, ambiguous restart recovery, reconciliation-required
 or quarantined cleanup, unknown failure codes, unexported workspace work, and
 explicit stop/destroy decisions retain their existing stop/defer fences. Existing

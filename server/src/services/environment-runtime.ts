@@ -1,3 +1,4 @@
+import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
@@ -4004,7 +4005,7 @@ export function environmentRuntimeService(
       heartbeatRunId: string,
       status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed"> = "released",
       onLeaseReleaseError?: (leaseId: string, error: unknown) => void,
-      providerResourceDisposition?: ProviderResourceDisposition,
+      desiredProviderResourceDisposition?: ProviderResourceDisposition,
       cancelActiveWork?: boolean,
       releaseOptions?: { respectCleanupDeadlines?: boolean },
     ): Promise<EnvironmentRuntimeLeaseRecord[]> {
@@ -4014,7 +4015,7 @@ export function environmentRuntimeService(
         .where(
           and(
             eq(environmentLeases.heartbeatRunId, heartbeatRunId),
-            pendingRunLeaseReleaseCondition(providerResourceDisposition === "destroy"),
+            pendingRunLeaseReleaseCondition(desiredProviderResourceDisposition === "destroy"),
             releaseOptions?.respectCleanupDeadlines ? dueRunLeaseReleaseCondition() : undefined,
           ),
         );
@@ -4029,6 +4030,7 @@ export function environmentRuntimeService(
       const released: EnvironmentRuntimeLeaseRecord[] = [];
       for (let leaseRow of leaseRows) {
         try {
+          let providerResourceDisposition = desiredProviderResourceDisposition;
           if (providerResourceDisposition !== "stop_and_retain" && providerResourceDisposition !== "keep_running"
             && !hasStopOnlyCleanup(leaseRow) && await nativeWorkspaceExportPendingForLease(db, leaseRow)) continue;
           if (!(await allowLegacyShutdownWorkspaceCleanup(db, leaseRow, new Date(), {
@@ -4039,6 +4041,10 @@ export function environmentRuntimeService(
               eq(environmentLeases.id, leaseRow.id), eq(environmentLeases.companyId, leaseRow.companyId),
             )))[0] ?? leaseRow;
           }
+          const warmRetention = await settleWarmRetention(db, leaseRow, providerResourceDisposition);
+          if (!warmRetention) continue; // Another release or handoff already settled this owner.
+          leaseRow = warmRetention.lease;
+          providerResourceDisposition = warmRetention.disposition;
           const environment = leaseRow.environmentId
             ? await environmentsSvc.getById(leaseRow.environmentId)
             : null;

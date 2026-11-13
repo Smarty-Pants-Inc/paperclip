@@ -1,4 +1,5 @@
 import { createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
+import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { clearRemoteWorkspaceLocationForReleasedLease } from "./remote-workspace-snapshot-retention.js";
 import { notifyNativeEnvironmentSettlement } from "./native-environment-settlement-notifications.js";
@@ -1579,7 +1580,8 @@ export function environmentService(db: Db) {
         failureReason: null,
         cleanupStatus: null,
         // The holder stamp is written with the row that makes the lease active.
-        metadata: withEnvironmentLeaseController(withoutReusableLeaseHandoff(withoutCleanupVerification(input.metadata))),
+        metadata: withEnvironmentLeaseController(inheritWarmRetentionMetadata(null,
+          withoutReusableLeaseHandoff(withoutCleanupVerification(input.metadata)))),
         createdAt: now,
         updatedAt: now,
       };
@@ -1658,7 +1660,8 @@ export function environmentService(db: Db) {
                   );
                 }
                 const handoff = createReusableLeaseHandoff(retired[0]!, { ...values, id: replacementLeaseId! });
-                values.metadata = { ...values.metadata, reusableLeasePredecessor: handoff };
+                values.metadata = { ...inheritWarmRetentionMetadata(retired[0]!.metadata, values.metadata),
+                  reusableLeasePredecessor: handoff };
                 await tx.update(environmentLeases).set({ metadata: {
                   ...retired[0]!.metadata, reusableLeaseSuccessor: handoff,
                 } }).where(eq(environmentLeases.id, retired[0]!.id));
@@ -1676,7 +1679,8 @@ export function environmentService(db: Db) {
                     failureReason: null,
                     cleanupStatus: null,
                     metadata: withEnvironmentLeaseController(
-                      preserveReusableLeaseHandoff(previous?.metadata ?? null, withoutCleanupVerification(input.metadata))),
+                      preserveReusableLeaseHandoff(previous?.metadata ?? null,
+                        inheritWarmRetentionMetadata(previous?.metadata, withoutCleanupVerification(input.metadata)))),
                     updatedAt: now,
                   })
                   .where(
