@@ -9473,7 +9473,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       Reflect.deleteProperty(payload, "comment");
     }
     let canonicalComment = { ...comment };
-    let canonicalPullRequest = { ...payload.pull_request! };
+    let canonicalPullRequest = { ...("pull_request" in payload ? payload.pull_request : undefined) };
     let beforeList: (() => Promise<void>) | undefined;
     let beforePost: (() => Promise<void>) | undefined;
     const requests: Array<{ method: string; pathname: string }> = [];
@@ -17038,8 +17038,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       try {
         context.original.action = context.payload.action = action;
         if (bot) {
-          context.payload.pull_request!.user.type = "Bot";
-          context.setCanonicalPullRequest({ user: { ...context.payload.pull_request!.user } });
+          if (!("pull_request" in context.payload)) throw new Error("Expected pull_request recovery fixture");
+          context.payload.pull_request.user.type = "Bot";
+          context.setCanonicalPullRequest({ user: { ...context.payload.pull_request.user } });
         }
         const management = githubChatManagementService(db, context.providerFetch);
         const saved = await management.configuration(endpoint.id, "owner-user");
