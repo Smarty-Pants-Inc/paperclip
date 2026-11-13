@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { and, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
@@ -64,14 +65,18 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   const termination = lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined;
   const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
-  // Warm handoffs leave checkpoint stamps on their original owner rows. The
-  // verified predecessors are newest-first, so check only the newest stamp.
-  // Never skip a newer conflicting checkpoint to authorize an older backup.
+  // Warm handoffs leave stamps on their original owner rows, but owner order
+  // does not establish checkpoint chronology. Select by completion time before
+  // matching the manifest; conflicting latest-time stamps are ambiguous.
   // Retirement and the supersession claim still belong exclusively to the tip.
-  const stamp = [lease, ...predecessors]
+  const stamps = [lease, ...predecessors]
     .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, lease.providerLeaseId!))
-    .find(candidate => candidate !== null);
-  if (!stamp || stamp.manifestSha256 !== input.manifestSha256
+    .filter(candidate => candidate !== null)
+    .sort((left, right) => Date.parse(right.completedAt) - Date.parse(left.completedAt));
+  const stamp = stamps[0];
+  if (!stamp || stamps.some(candidate => Date.parse(candidate.completedAt) === Date.parse(stamp.completedAt)
+    && !isDeepStrictEqual(candidate, stamp))) return false;
+  if (stamp.manifestSha256 !== input.manifestSha256
     || stamp.normalizedSessionId !== input.normalizedSessionId
     || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
   // A released lease can still be selected for resume; only a retired one is final.
