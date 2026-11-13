@@ -452,6 +452,13 @@ projected only into the child process:
 - author and committer identity using
   `<numeric-id>+<login>@users.noreply.github.com`.
 
+Native Pi uses the managed operation launchers and run-scoped broker capabilities
+instead of raw GitHub tokens. Launcher, Git configuration-file, askpass, and SSH
+environment names come only from the controller's current managed projection;
+company/agent configuration and the Runner host's ambient environment cannot
+supply them. Setting `PAPERCLIP_GITHUB_AUTH_MODE` does not authorize a projection.
+Safe process-scoped Git configuration still passes through Pi's existing filter.
+
 Tokens never appear in arguments, URLs, files, logs, events, or model context,
 and the projection never replaces `HOME`.
 

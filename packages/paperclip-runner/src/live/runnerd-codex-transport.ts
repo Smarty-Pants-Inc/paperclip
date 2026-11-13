@@ -3829,15 +3829,10 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
       ...createSanitizedAcpxSpawnInput(input.options.environment ?? {}, "pi").env,
       ...piGitConfigEnvironment(input.options.environment ?? {}),
     };
-    // Match Claude's explicit managed-command projection without widening ACPX
-    // Pi's child allowlist. The launcher installs Git isolation per operation.
-    if (input.options.environment?.PAPERCLIP_GITHUB_LAUNCHER_DIR?.trim()) {
-      for (const name of ["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR",
-        "PAPERCLIP_GITHUB_BROKER_URL", "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN"]) {
-        const value = input.options.environment[name];
-        if (value !== undefined) selected[name] = value;
-      }
-    }
+    // The controller-owned capability payload is not a configured setting or
+    // ACPX provider variable. Carry it explicitly to runnerd, never from ambient.
+    const githubProjection = input.options.environment?.PAPERCLIP_PI_GITHUB_PROJECTION_SECRET;
+    if (githubProjection !== undefined) selected.PAPERCLIP_PI_GITHUB_PROJECTION_SECRET = githubProjection;
     // Native Pi bypasses ACPX's home sandbox. Preserve only the explicit
     // server-provided home; PiRpcDriver validates it at the final spawn boundary.
     if (input.options.environment?.AGENT_HOME !== undefined) selected.AGENT_HOME = input.options.environment.AGENT_HOME;

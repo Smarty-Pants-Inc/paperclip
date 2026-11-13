@@ -40,6 +40,14 @@ describe('controller-configured environment across native runner boundaries', ()
       PAPERCLIP_GITHUB_BROKER_URL: 'http://127.0.0.1:43210', PAPERCLIP_GITHUB_BROKER_TOKEN: 'run-broker-capability' });
     for (const name of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GH_TOKEN', 'GITHUB_TOKEN']) expect(pi).not.toHaveProperty(name);
   });
+  it('carries the controller-only GitHub payload through the real Pi sanitizer to runnerd, but not Pi', () => {
+    const payload = JSON.stringify({ BASH_ENV: '/managed/startup', SSH_AUTH_SOCK: '', GIT_SSH_COMMAND: 'ssh -F /dev/null' });
+    const environment = createCapabilityRunnerdProviderEnvironment({ provider: 'pi_rpc',
+      options: { environment: { PAPERCLIP_PI_GITHUB_PROJECTION_SECRET: payload } }, identity,
+      codexHome: '/isolated/pi-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false });
+    expect(environment.PAPERCLIP_PI_GITHUB_PROJECTION_SECRET).toBe(payload);
+    expect(piProcessEnvironment(environment, {})).not.toHaveProperty('PAPERCLIP_PI_GITHUB_PROJECTION_SECRET');
+  });
   // Keep reason: actual native Pi launch trust boundary, not just the final filter.
   it.each([2, 33])('carries %s safe Git pairs from the native provider builder through runner spawn to real Git', (count) => {
     const pairs = [['http.https://github.com/.extraheader', 'Authorization: decoy'], ['safe.directory', '/work/project'],

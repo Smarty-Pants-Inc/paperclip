@@ -16169,6 +16169,40 @@ describe("runnerd provider runtime wiring", () => {
     expect(hashTree).toHaveBeenCalledTimes(oldCount + 2);
   });
 
+  // Keep reason: I-4 controller -> runnerd projection trust boundary. Exercise
+  // the real executor merge, not just the projection helper in isolation.
+  it.each(["no-connection", "spoofed-auth", "connected"] as const)("native Pi strips configured GitHub authority: %s", async scenario => {
+    const { PI_GITHUB_PROJECTION_KEYS, PI_GITHUB_PROJECTION_ENV } = await import("./native-pi-github-environment.js");
+    const current = { ...scopedNativeExecution(`pi-github-${scenario}`),
+      provider: { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE },
+      session: { ...execution.session, normalizedSessionId: `pi-github-${scenario}`, driverKind: "pi_rpc" },
+    } as NativeExecutionInputV1;
+    const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+    const { packRoot } = await nativePiProviderPackFixture(join(isolatedStateDirectory, `pi-github-pack-${scenario}`));
+    const projection = Object.fromEntries(PI_GITHUB_PROJECTION_KEYS.map((key, index) => [key, index % 2 ? "" : `managed-${key}`]));
+    githubAccess.create.mockReset().mockResolvedValue({ env: projection, ready: true, duplexRequested: false,
+      activate: vi.fn(() => vi.fn()), stop: vi.fn(async () => undefined) });
+    state.execute.mockReset().mockResolvedValue({ result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+      turnId: "turn", normalizedSessionId: current.session.normalizedSessionId, providerSessionId: "pi-test",
+      driverKind: "pi_rpc", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null });
+    await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: `pi-github-${scenario}`,
+      useRunnerd: true, managedGitHub: scenario === "connected", runnerRemoteProviderPackPath: packRoot,
+      runnerEnvironment: { ...configuredEnvironmentProjection(Object.fromEntries(PI_GITHUB_PROJECTION_KEYS.map(key => [key, `configured-${key}`]))),
+        [PI_GITHUB_PROJECTION_ENV]: JSON.stringify({ BASH_ENV: "/configured/spoof" }),
+        ...(scenario === "spoofed-auth" ? { PAPERCLIP_GITHUB_AUTH_MODE: "managed" } : {}) },
+    });
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const environment = state.createTransport.mock.calls.at(-1)![0].environment!;
+    expect(() => configuredEnvironment(environment)).not.toThrow();
+    for (const key of PI_GITHUB_PROJECTION_KEYS) {
+      if (scenario === "connected") expect(environment[key], key).toBe(projection[key]);
+      else expect(environment, key).not.toHaveProperty(key);
+    }
+    if (scenario === "connected") expect(JSON.parse(environment[PI_GITHUB_PROJECTION_ENV]!)).toEqual(projection);
+    else expect(environment[PI_GITHUB_PROJECTION_ENV]).toBe("{}");
+    expect(githubAccess.create).toHaveBeenCalledTimes(scenario === "connected" ? 1 : 0);
+  });
+
   it.each(["low", "xhigh", "max"] as const)("native Pi transport preserves exact model and thinking %s", async piRpcThinkingLevel => {
     const current = { ...scopedNativeExecution(`pi-rpc-${piRpcThinkingLevel}`),
       provider: { kind: "pi_rpc", model: "paperclip/selected-model-exactly", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel },

@@ -1,4 +1,5 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
+import { nativePiGitHubEnvironment } from "./native-pi-github-environment.js";
 import { RUNNER_LAUNCH_ENVIRONMENT_SCRIPT } from "./runner-launch-environment.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
@@ -11769,7 +11770,12 @@ async function executePaperclipNativeSessionAttempt(
         }));
         executionContext?.assertOpen();
         releaseGitHubRun = githubAccess.activate(input.execution.binding);
-        input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
+        if (input.execution.provider.kind !== "pi_rpc") {
+          input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
+        }
+      }
+      if (input.execution.provider.kind === "pi_rpc") {
+        input = { ...input, runnerEnvironment: nativePiGitHubEnvironment(input.runnerEnvironment, githubAccess?.env) };
       }
       return input.runnerEnvironment;
     };
