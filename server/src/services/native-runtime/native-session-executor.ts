@@ -1,4 +1,5 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
+import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -7397,6 +7398,9 @@ export interface NativeHarnessPersistenceDirectory {
   name: "runner" | "codex-home" | "opencode" | "acpx" | "pi-agent" | "pi";
   location: "runner" | "filesystem";
   excludeEntries: readonly string[];
+  /** Cold-resume files whose valid backup can repair missing or invalid history.
+   * An unusable backup remains the provider's ordinary recovery decision. */
+  resumeFiles?: readonly string[];
 }
 
 export interface NativeHarnessPersistenceProfile {
@@ -7489,7 +7493,8 @@ export function resolveNativeHarnessPersistenceProfile(
       ...(providerDirectory ? [providerDirectory] : []),
       // Pi RPC cold-opens conversation JSONL here, not inside pi-agent/.
       ...(execution.provider.kind === "pi_rpc"
-        ? [{ name: "pi" as const, location: "filesystem" as const, excludeEntries: [] }]
+        ? [{ name: "pi" as const, location: "filesystem" as const, excludeEntries: [],
+            resumeFiles: [`${nativeSessionKey(execution)}.jsonl`] }]
         : []),
     ],
   };
@@ -16631,11 +16636,12 @@ async function createRunnerdBackendWithinSessionClaim(
       }
       throw new Error(`runner_harness_state_mismatch: provider_identity_incomplete (${durableProviderCheckpointFailureReason(input.execution, providerState)})`);
     }
-    const previousManifest = compatibleNativeHarnessBackupManifests({
+    const previousBackup = compatibleNativeHarnessBackupManifests({
       root,
       execution: input.execution,
       runnerInstanceId: input.runnerInstanceId,
-    })[0]?.manifest;
+    })[0];
+    const previousManifest = previousBackup?.manifest;
     if (
       previousManifest &&
       !providerSessionIdentityTransitionIsAllowed({
@@ -16645,6 +16651,71 @@ async function createRunnerdBackendWithinSessionClaim(
       })
     ) {
       throw new Error("runner_harness_state_mismatch: provider_identity_changed");
+    }
+    if (source === "host_preparation" && previousBackup) {
+      // Directory existence cannot prove a restore finished. Try the verified
+      // checkpoint before a provider calls missing/invalid/foreign history lost.
+      // Pi's own execution-host validator and quarantine own file semantics.
+      for (const directory of persistenceProfile.directories) {
+        const targetPath = remotePersistencePath(directory);
+        if (!targetPath) continue;
+        for (const file of directory.resumeFiles ?? []) {
+          if (file !== posix.basename(file) || file === "." || file === "..") {
+            throw new Error("runner_harness_state_mismatch: resume_file_path_invalid");
+          }
+          if (!existsSync(resolve(previousBackup.root, directory.name, file))) continue;
+          const packRoot = activeRemoteProviderPackRoot ?? stagedRemoteProviderPackRoot;
+          const piResumeFile = input.execution.provider.kind === "pi_rpc" && directory.name === "pi"
+            ? (() => {
+                if (!packRoot || !expectedProviderPackManifest || typeof providerSessionIdentity.providerSessionId !== "string") {
+                  throw new Error("runner_harness_state_mismatch: resume_file_validator_unavailable");
+                }
+                return { runner: remoteCommandRunner, node: posix.join(packRoot, expectedProviderPackManifest.payload.artifacts.nodeCommand.path),
+                  providerPackRoot: packRoot, directory: targetPath, filename: file,
+                  normalizedSessionId: nativeSessionKey(input.execution)!, providerSessionId: providerSessionIdentity.providerSessionId,
+                  providerBackendSessionId: typeof providerSessionIdentity.providerBackendSessionId === "string" ? providerSessionIdentity.providerBackendSessionId : null,
+                  workingDirectory: remoteTarget!.remoteCwd };
+              })() : null;
+          if (piResumeFile && await probePiSessionResumeFile(piResumeFile) === "valid") continue;
+          const present = piResumeFile ? null : await remoteCommandRunner.execute({ command: "sh", args: ["-c",
+            'test -d "$2" && test -r "$2" && test -x "$2" || exit 2; if test -e "$1" || test -L "$1"; then exit 0; fi; exit 1',
+            "paperclip-runner-resume-file", posix.join(targetPath, file), targetPath],
+            bypassSession: true, timeoutMs: 10_000 });
+          if (present && (present.timedOut || ![0, 1].includes(present.exitCode ?? -1))) {
+            throw new Error("runner_harness_state_mismatch: resume_file_unreadable");
+          }
+          if (present && present.exitCode !== 1) continue;
+          const backup = await verifyNativeHarnessBackupStreamed({ root, execution: input.execution,
+            runnerInstanceId: input.runnerInstanceId });
+          if (!backup) throw new Error("runner_harness_backup_unavailable");
+          // A different allocation still needs the existing full restore and
+          // retired-source lease proof. On this allocation, repair only the
+          // affected file, and only at the EXACT saved checkpoint: never rewind
+          // Runner/provider state or conceal work newer than the backup.
+          if (backup.manifest.sourceProviderLeaseId !== sandboxLeaseAcquisition?.providerLeaseId) {
+            return { complete: false, runnerState: null, providerSessionIdentity: null, incompleteReason: "unavailable" };
+          }
+          const savedRunnerState = JSON.parse(readFileSync(resolve(backup.root, "runner", "runner-state.json"), "utf8"));
+          if (canonicalJson(savedRunnerState) !== canonicalJson(runnerState)
+            || canonicalJson(backup.manifest.providerSessionIdentity) !== canonicalJson(providerSessionIdentity)) {
+            throw new Error("runner_harness_state_mismatch: resume_file_checkpoint_changed");
+          }
+          const conflict = nativeHarnessBackupCursorConflict({ backupRoot: backup.root, stateRoot: root,
+            controllerState: runnerControlPlane?.store.state });
+          if (conflict) throw new Error(conflict);
+          const sourcePath = resolve(backup.root, directory.name, file);
+          if (!existsSync(sourcePath)) throw new Error("runner_harness_backup_unavailable");
+          if (piResumeFile) {
+            await restorePiSessionResumeFile({ ...piResumeFile, sourcePath,
+              stageFile: (sourcePath, targetPath) => stageRemoteRunnerFile({ target: remoteTarget!, runner: remoteCommandRunner,
+                sourcePath, targetPath, mode: 0o600 }),
+            });
+          } else {
+            await stageRemoteRunnerFile({ target: remoteTarget!, runner: remoteCommandRunner,
+              sourcePath, targetPath: posix.join(targetPath, file), mode: 0o600 });
+          }
+        }
+      }
     }
     return {
       complete: true,
