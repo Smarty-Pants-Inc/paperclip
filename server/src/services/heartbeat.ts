@@ -12,6 +12,7 @@ import { registerDeferredReceiptWork } from "./heartbeat/deferred-receipt-work.j
 import { registerProviderLimitResumeWork, type PrepareChatRetry } from "./native-runtime/provider-limit-resume.js";
 import { reconcileTaskChatRetryReceipts } from "./task-retry.js";
 import { registerIssueRecoveryWork } from "./recovery/work.js";
+import { settleUnansweredPersonMessages } from "./recovery/unanswered-person-message.js";
 import { registerRunDispatchWork } from "./heartbeat/dispatch-work.js";
 import { NATIVE_RETAINED_OWNER_WAIT } from "./native-runtime/native-controller-recovery.js";
 import { describeFailedAttachment } from "./native-runtime/remote-warm-session-recovery.js";
@@ -1686,10 +1687,14 @@ export function heartbeatService(
   }
 
   async function reconcileStrandedAssignedIssues(opts?: Parameters<typeof recovery.reconcileStrandedAssignedIssues>[0]) {
-    return recovery.reconcileStrandedAssignedIssues({
-      ...opts,
-      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+    const issueCreatedAtGte = await getWorktreeExecutionCutoff();
+    const result = await recovery.reconcileStrandedAssignedIssues({ ...opts, issueCreatedAtGte });
+    // After recovery has queued whatever it will, a person's last message that
+    // nothing will answer gets its one notice (the conversation clause).
+    const unanswered = await settleUnansweredPersonMessages(db, {
+      companyId: opts?.companyId, issueId: opts?.issueId, issueCreatedAtGte, onDeferredDeadline: opts?.onDeferredDeadline,
     });
+    return { ...result, unansweredMessagesNoticed: unanswered.noticed };
   }
 
   async function sweepStaleIssueLocks(opts?: Parameters<typeof recovery.sweepStaleIssueLocks>[0]) {
