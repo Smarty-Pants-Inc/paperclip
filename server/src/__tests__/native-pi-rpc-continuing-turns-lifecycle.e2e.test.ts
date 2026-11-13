@@ -332,7 +332,9 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
         // Close the settled resident through the production restart boundary.
         // The next real runner must thread/resume, not reuse an in-memory Pi.
         const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
-        expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: 1, busy: 0, failed: 0 });
+        // per_turn already retired the settled resident at the end of turn 1;
+        // only a warm lifecycle still has an idle Pi to close here.
+        expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: lifecycleMode === "per_turn" ? 0 : 1, busy: 0, failed: 0 });
         const files = turnProofs[0]!.sessionFiles as string[];
         for (const file of files) await unlink(file); // turn-1 snapshots retain the deleted history
         stage("saved Pi file deleted after resident shutdown", { files, previousPids: turnProofs[0]!.pids });
