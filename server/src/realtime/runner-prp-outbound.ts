@@ -10,6 +10,12 @@ import type {
 } from "../vendor/paperclip-runner/index.js";
 
 const DEFAULT_STARTUP_DEADLINE_MS = 60_000;
+// The default initial readiness policy is 60 s AND at least three connection
+// attempts. A stalled event loop must not turn that budget into one attempt.
+// Only unavailable transport gets the floor; authentication, cancellation,
+// post-auth reconnects and caller-supplied hard deadlines remain fixed-budget.
+const DEFAULT_STARTUP_MIN_ATTEMPTS = 3;
+const STARTUP_FLOOR_ATTEMPT_DEADLINE_MS = 15_000;
 const DEFAULT_RECOVERY_GRACE_MS = REMOTE_RUNNER_RECONNECT_GRACE_MS;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
@@ -516,6 +522,17 @@ export function connectRunnerPrpIngress(input: {
           );
           if (abort.signal.aborted) return;
           if (Date.now() < recoveryDeadline) continue;
+        }
+        if (!readySettled && input.startupDeadlineMs === undefined
+          && failedAttemptNumber < DEFAULT_STARTUP_MIN_ATTEMPTS
+          && statusCode !== 401 && statusCode !== 403
+          && !(failure instanceof RunnerIngressConnectionError && failure.code !== "runner_ingress_unavailable")) {
+          // No reset of a live recovery budget: this is solely the initial,
+          // never-authenticated route. Give each owed attempt one bounded TLS
+          // handshake window after an event-loop stall consumed the wall time.
+          recoveryDeadline = Date.now() + STARTUP_FLOOR_ATTEMPT_DEADLINE_MS;
+          attempt += 1;
+          continue;
         }
         const terminal =
           leaseFailureCode !== null

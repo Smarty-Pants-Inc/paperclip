@@ -220,6 +220,70 @@ describe("runner provider-ingress WebSocket wire", () => {
     } finally { await handle.close(); sockets.create = create; vi.useRealTimers(); }
   });
 
+  it.each(["third attempt opens", "all attempts fail"] as const)("makes at least three initial connect attempts when the event loop consumes the 60 s budget: %s", async mode => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    let attempts = 0;
+    sockets.create = () => {
+      attempts++;
+      if (attempts === 3 && mode === "third attempt opens") return openingSocket();
+      const socket = new FakeSocket();
+      socket.readyState = WebSocket.CONNECTING;
+      queueMicrotask(() => {
+        // Model a blocked event loop delivering a refusal only after the whole
+        // startup wall budget elapsed. Advancing Date avoids running timers
+        // that would not have been serviced during the stall.
+        vi.setSystemTime(Date.now() + 61_000);
+        socket.readyState = WebSocket.CLOSED;
+        socket.emit("error", Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }));
+        socket.emit("close", 1006, Buffer.alloc(0));
+      });
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-delayed",
+      secretHeaders: [], generation: "delayed", refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: () => ({ isAuthenticated: () => true }) } as unknown as DurablePrpControlPlane,
+      endpoint, random: () => 0.5 });
+    let result: unknown;
+    void handle.ready.then(() => { result = "ready"; }, error => { result = error; });
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(attempts).toBe(3);
+      if (mode === "third attempt opens") expect(result).toBe("ready");
+      else expect(result).toMatchObject({ code: "runner_ingress_unavailable" });
+    } finally { await handle.close(); sockets.create = create; vi.useRealTimers(); }
+  });
+
+  it.each([401, 403])("does not extend the default startup budget for an HTTP %s authorization rejection", async statusCode => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    let attempts = 0;
+    sockets.create = () => {
+      attempts++;
+      const socket = new FakeSocket();
+      socket.readyState = WebSocket.CONNECTING;
+      queueMicrotask(() => {
+        vi.setSystemTime(Date.now() + 61_000);
+        socket.readyState = WebSocket.CLOSED;
+        socket.emit("unexpected-response", {}, { statusCode, resume: vi.fn() });
+        socket.emit("close", 1006, Buffer.alloc(0));
+      });
+      return socket;
+    };
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-auth-delayed",
+      secretHeaders: [], generation: "auth-delayed", refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    const handle = connectRunnerPrpIngress({ authority: { attachWireConnection: vi.fn() } as unknown as DurablePrpControlPlane, endpoint });
+    const observed = handle.ready.catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await observed).toMatchObject({ code: "runner_ingress_auth_failed" });
+      expect(attempts).toBe(1);
+      expect(endpoint.refresh).not.toHaveBeenCalled();
+    } finally { await handle.close(); sockets.create = create; vi.useRealTimers(); }
+  });
+
   it("bounds an in-flight TLS/upgrade handshake by the remaining startup budget", async () => {
     vi.useFakeTimers();
     const create = sockets.create;
