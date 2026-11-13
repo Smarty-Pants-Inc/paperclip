@@ -431,10 +431,19 @@ describe("agent cross-tenant route authorization", () => {
     expect(mockAgentService.revokeKey).not.toHaveBeenCalled();
   }, 30_000);
 
-  it("requires direct configuration authority before clearing an agent error", async () => {
+  it.each([
+    ["an ungranted peer", "44444444-4444-4444-8444-444444444444"],
+    ["an ungranted self", agentId],
+  ])("requires direct configuration authority before clearing an agent error for %s", async (_label, actorAgentId) => {
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      action: "agent_config:update",
+      reason: "deny_no_grant",
+      explanation: "No direct agent configuration grant.",
+    });
     const app = await createApp({
       type: "agent",
-      agentId,
+      agentId: actorAgentId,
       companyId,
       runId: "run-1",
     });
@@ -444,13 +453,22 @@ describe("agent cross-tenant route authorization", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("agent_config:update");
-    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
-      action: "agent_config:update",
-      resource: { type: "agent", companyId, agentId },
-      scope: { targetAgentId: agentId, requiresChangeGrant: true },
-    }));
+    if (actorAgentId === agentId) {
+      expect(res.body).toEqual({ error: "Agents cannot manage their own lifecycle." });
+      expect(mockAccessService.decide).not.toHaveBeenCalled();
+    } else {
+      expect(res.body).toMatchObject({
+        error: "No direct agent configuration grant.",
+        details: { reason: "deny_no_grant" },
+      });
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:update",
+        resource: { type: "agent", companyId, agentId },
+        scope: { targetAgentId: agentId, requiresChangeGrant: true },
+      }));
+    }
     expect(mockAgentService.clearError).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
   it("preserves board resume access", async () => {
@@ -542,10 +560,20 @@ describe("agent cross-tenant route authorization", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body).toMatchObject({
-      error: "No direct agent configuration grant.",
-      details: { reason: "deny_no_grant" },
-    });
+    if (actorAgentId === agentId) {
+      expect(res.body).toEqual({ error: "Agents cannot manage their own lifecycle." });
+      expect(mockAccessService.decide).not.toHaveBeenCalled();
+    } else {
+      expect(res.body).toMatchObject({
+        error: "No direct agent configuration grant.",
+        details: { reason: "deny_no_grant" },
+      });
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:update",
+        resource: { type: "agent", companyId, agentId },
+        scope: { targetAgentId: agentId, requiresChangeGrant: true },
+      }));
+    }
     expect(mockAgentService.resume).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
