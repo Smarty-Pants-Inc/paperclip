@@ -13,8 +13,12 @@ export function providerResourceDispositionForTerminalRun(
   desired: ProviderResourceDisposition | undefined,
   status: string | null | undefined,
   errorCode?: string | null,
+  providerWorkStarted?: unknown,
 ): ProviderResourceDisposition | undefined {
   if (desired !== "keep_running") return desired;
+  if (status === "failed" && errorCode === "adapter_failed" && providerWorkStarted === false) {
+    return "stop_and_retain";
+  }
   if (status === "succeeded") return desired;
   if (!["failed", "cancelled", "interrupted"].includes(status ?? "")) return "stop_and_retain";
   // These are ordinary run outcomes, not integrity/reconciliation failures.
