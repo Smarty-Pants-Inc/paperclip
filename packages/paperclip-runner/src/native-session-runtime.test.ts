@@ -6394,6 +6394,7 @@ describe("executeNativeSession recovery", () => {
     const close = vi.fn(() => new Promise<void>(() => {}));
     const startTurn = vi.fn(async () => ({ turnId: "unexpected" }));
     const onSession = vi.fn();
+    const onRetainedSessionAttachFailed = vi.fn();
     const existingSession: NativeSession = {
       identity: () => structuredClone(retainedIdentity),
       async capabilities() {
@@ -6455,8 +6456,13 @@ describe("executeNativeSession recovery", () => {
         controlPlaneInstanceId: "control-recovery",
         existingSession,
         onSession,
+        onRetainedSessionAttachFailed,
       }),
     ).rejects.toBe(attachmentFailure);
+    // The embedder learns the exact rejection after quarantine, so Core can
+    // retire that runner and take its cold path once (REG-03).
+    expect(onRetainedSessionAttachFailed).toHaveBeenCalledExactlyOnceWith(attachmentFailure);
+    expect(onRetainedSessionAttachFailed.mock.invocationCallOrder[0]).toBeGreaterThan(onSession.mock.invocationCallOrder[0]!);
     // The attaching run's own contract travels with the attachment.
     const completionContract = { revision: "1", criterionIds: ["objective"] };
     expect(attachRun).toHaveBeenCalledWith(provider === "copilot"
