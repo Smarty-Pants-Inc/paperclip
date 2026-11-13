@@ -2605,7 +2605,9 @@ describe("remote provider pack manifest", () => {
       }
       return {
       exitCode: 0, signal: null, timedOut: false, stderr: "",
-      stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
+      stdout: script.includes("paperclip_sizes=$(find ")
+        ? `2 ${Buffer.byteLength(JSON.stringify(suspendedState)) + Buffer.byteLength(JSON.stringify(providerState))}\n`
+        : command.args?.[0] === "--build-metadata" ? JSON.stringify({
         schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
         packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
         durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
@@ -4441,26 +4443,12 @@ describe("remote provider checkpoint snapshots", () => {
   });
 
   it("excludes Codex scratch and credential state without mutating the live provider home", async () => {
-    const execute = vi
-      .fn()
-      .mockResolvedValueOnce({
-        exitCode: 0,
-        timedOut: false,
-        stdout: "",
-        stderr: "",
-      })
-      .mockResolvedValueOnce({
-        exitCode: 0,
-        timedOut: false,
-        stdout: "",
-        stderr: "",
-      })
-      .mockResolvedValueOnce({
-        exitCode: 0,
-        timedOut: false,
-        stdout: "",
-        stderr: "",
-      });
+    const targetPath = await mkdtemp(join(tmpdir(), "checkpoint-test-codex-home-"));
+    onTestFinished(() => rm(targetPath, { recursive: true, force: true }));
+    const execute = vi.fn(async ({ args }: { args: string[] }) => ({
+      exitCode: 0, timedOut: false, stderr: "",
+      stdout: args[1]?.includes("paperclip_sizes=$(find ") ? "0 0\n" : "",
+    }));
     const syncOut = vi.fn(
       async (
         _operations: Array<{
@@ -4477,7 +4465,7 @@ describe("remote provider checkpoint snapshots", () => {
     await syncRemoteRunnerDirectoryOut({
       runner: { execute, syncOut } as never,
       sourcePath: "/remote/session/filesystem/codex-home",
-      targetPath: "/tmp/paperclip-checkpoint-test-codex-home",
+      targetPath,
       mode: 0o700,
       excludeEntries: ["tmp", ".tmp", "auth.json", "config.toml"],
     });
@@ -4488,7 +4476,7 @@ describe("remote provider checkpoint snapshots", () => {
         args: ["-c", "test -d '/remote/session/filesystem/codex-home'"],
       }),
     );
-    const snapshotCommand = String(execute.mock.calls[1]?.[0]?.args?.[1]);
+    const snapshotCommand = String(execute.mock.calls[2]?.[0]?.args?.[1]);
     expect(snapshotCommand).toContain("'--exclude=./tmp'");
     expect(snapshotCommand).toContain("'--exclude=./.tmp'");
     expect(snapshotCommand).toContain("'--exclude=./auth.json'");
@@ -4505,22 +4493,22 @@ describe("remote provider checkpoint snapshots", () => {
       sourcePath: expect.stringMatching(
         /^\/remote\/session\/filesystem\/\.paperclip-checkpoint-/,
       ),
-      targetPath: "/tmp/paperclip-checkpoint-test-codex-home",
+      targetPath,
       kind: "directory",
       mode: 0o700,
     });
-    expect(String(execute.mock.calls[2]?.[0]?.args?.[1])).toMatch(
+    expect(String(execute.mock.calls[3]?.[0]?.args?.[1])).toMatch(
       /^rm -rf -- '\/remote\/session\/filesystem\/\.paperclip-checkpoint-/,
     );
   });
 
   it("omits nested ACPX-Codex scratch aliases without widening the exclusion", async () => {
-    const execute = vi.fn().mockResolvedValue({
-      exitCode: 0,
-      timedOut: false,
-      stdout: "",
-      stderr: "",
-    });
+    const targetPath = await mkdtemp(join(tmpdir(), "checkpoint-test-acpx-"));
+    onTestFinished(() => rm(targetPath, { recursive: true, force: true }));
+    const execute = vi.fn(async ({ args }: { args: string[] }) => ({
+      exitCode: 0, timedOut: false, stderr: "",
+      stdout: args[1]?.includes("paperclip_sizes=$(find ") ? "0 0\n" : "",
+    }));
     const syncOut = vi.fn(async () => undefined);
     const sessionDirectory = acpxRuntimeSessionDirectoryName("session");
     const excluded = [
@@ -4533,12 +4521,12 @@ describe("remote provider checkpoint snapshots", () => {
     await syncRemoteRunnerDirectoryOut({
       runner: { execute, syncOut } as never,
       sourcePath: "/remote/session/filesystem/acpx",
-      targetPath: "/tmp/paperclip-checkpoint-test-acpx",
+      targetPath,
       mode: 0o700,
       excludeEntries: excluded,
     });
 
-    const snapshotCommand = String(execute.mock.calls[1]?.[0]?.args?.[1]);
+    const snapshotCommand = String(execute.mock.calls[2]?.[0]?.args?.[1]);
     for (const entry of excluded) {
       expect(snapshotCommand).toContain(`'--exclude=./${entry}'`);
     }
@@ -4610,6 +4598,7 @@ describe("remote provider checkpoint snapshots", () => {
   ])("removes the partial snapshot and does not widen the copy after $name", async ({ stderr, timedOut }) => {
     const execute = vi.fn()
       .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: "", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, timedOut: false, stdout: "0 0\n", stderr: "" })
       .mockResolvedValueOnce({ exitCode: 2, timedOut, stdout: "", stderr })
       .mockResolvedValue({ exitCode: 0, timedOut: false, stdout: "", stderr: "" });
     const syncOut = vi.fn(async () => undefined);
@@ -4621,8 +4610,8 @@ describe("remote provider checkpoint snapshots", () => {
       excludeEntries: ["tmp", "auth.json"],
     })).rejects.toThrow("runner_remote_checkpoint_snapshot_failed");
     expect(syncOut).not.toHaveBeenCalled();
-    expect(execute).toHaveBeenCalledTimes(3);
-    expect(String(execute.mock.calls[2]?.[0]?.args?.[1])).toMatch(
+    expect(execute).toHaveBeenCalledTimes(4);
+    expect(String(execute.mock.calls[3]?.[0]?.args?.[1])).toMatch(
       /^rm -rf -- '\/remote\/session\/filesystem\/\.paperclip-checkpoint-/,
     );
   });
@@ -4665,6 +4654,12 @@ describe("remote provider checkpoint snapshots", () => {
           exitCode: 0,
           timedOut: false,
           stdout: "",
+          stderr: "",
+        })
+        .mockResolvedValueOnce({
+          exitCode: 0,
+          timedOut: false,
+          stdout: "0 0\n",
           stderr: "",
         })
         .mockResolvedValueOnce({

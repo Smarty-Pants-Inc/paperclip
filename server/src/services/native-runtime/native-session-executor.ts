@@ -1,5 +1,6 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
+import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -14615,6 +14616,9 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   const excludeArgs = archiveExcludeArgs(excluded)
     .map((argument) => `'${argument}'`)
     .join(" ");
+  let manifest = await readRemoteCheckpointManifest({
+    runner: input.runner, sourcePath: input.sourcePath, excluded,
+  });
   if (input.runner.syncOut) {
     let syncSourcePath = input.sourcePath;
     let snapshotPath: string | null = null;
@@ -14654,6 +14658,9 @@ export async function syncRemoteRunnerDirectoryOut(input: {
           throw new Error("runner_remote_checkpoint_snapshot_failed");
         }
         providerExclude = [...excluded];
+        manifest = await readRemoteCheckpointManifest({
+          runner: input.runner, sourcePath: input.sourcePath, excluded, unanchored: true,
+        });
       } else {
         syncSourcePath = snapshotPath;
       }
@@ -14673,6 +14680,7 @@ export async function syncRemoteRunnerDirectoryOut(input: {
           ],
         },
       ]);
+      await verifyLocalCheckpointManifest(input.targetPath, manifest);
     } finally {
       if (snapshotPath) {
         await removeRemoteCheckpointSnapshot(input.runner, snapshotPath);
@@ -14683,7 +14691,13 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   const escapedSource = input.sourcePath.replaceAll("'", "'\\''");
   const result = await input.runner.execute({
     command: "sh",
-    args: ["-c", `tar ${excludeArgs} -czf - -C '${escapedSource}' . | base64`],
+    // POSIX sh/dash/BusyBox do not all support pipefail. Preserve tar's
+    // status separately while still streaming (no remote archive disk needed).
+    args: ["-c", `set -e; umask 077; paperclip_capture=$(mktemp -d); ` +
+      `trap 'rm -rf -- "$paperclip_capture"' 0; ` +
+      `{ set +e; tar ${excludeArgs} -czf - -C '${escapedSource}' .; ` +
+      `printf '%s\\n' "$?" > "$paperclip_capture/tar-status"; } | base64; ` +
+      `test "$(cat "$paperclip_capture/tar-status")" = 0`],
     bypassSession: true,
     timeoutMs: 120_000,
   });
@@ -14719,6 +14733,7 @@ export async function syncRemoteRunnerDirectoryOut(input: {
       { input: archive, maxBuffer: 8 * 1024 * 1024, timeout: 60_000 },
     );
     assertSafeExtractedCheckpoint(stagedTarget);
+    await verifyLocalCheckpointManifest(stagedTarget, manifest);
     chmodSync(stagedTarget, input.mode);
     if (existsSync(input.targetPath)) {
       renameSync(input.targetPath, previousTarget);
