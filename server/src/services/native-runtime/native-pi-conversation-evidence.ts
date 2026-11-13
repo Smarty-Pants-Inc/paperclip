@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, openSync, closeSync, fsyncSync } from "node:fs";
 import { lstat, mkdir, opendir, open, rename } from "node:fs/promises";
 import path from "node:path";
 import { logger } from "../../middleware/logger.js";
@@ -117,10 +117,19 @@ function sourceScope(root: string): { base: string; scope: string } | null {
   return null;
 }
 
+function syncDirectory(directory: string): void {
+  if (process.platform === "win32") return;
+  const descriptor = openSync(directory, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
+  try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
+
 async function privateDirectory(directory: string) {
   await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "EEXIST") throw error;
   });
+  // Persist the new namespace/scope entry before publishing evidence beneath it.
+  syncDirectory(path.dirname(directory));
   const stat = await lstat(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0
     || process.geteuid && stat.uid !== process.geteuid()) throw new Error("native_pi_evidence_directory_unsafe");
@@ -166,6 +175,10 @@ export async function retainNativeRuntimeEvidence(root: string, stateBase?: stri
   const destination = path.join(scoped, randomUUID());
   const inventory = await summarizeNativeRuntimeTree(root);
   await rename(root, destination); // EXDEV also fails closed: never copy then unlink.
+  // Both names changed; persist both directory entries before the caller may
+  // remove or report success for the original scratch.
+  syncDirectory(path.dirname(path.resolve(root)));
+  syncDirectory(scoped);
   logger.info({ event: "native_evidence_retained", source: root, destination, scope, ...inventory });
   return true;
 }
