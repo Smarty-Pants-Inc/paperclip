@@ -34,16 +34,19 @@ const fixture = (runnerInstanceId = randomUUID()) => {
     writeFileSync(join(directory, "runner-process.identity"), `nonce${randomUUID().replaceAll("-", "")}\n${owner.pid}\n2026-11-13T10:00:00.000Z\n${markerRunnerId}\n${fingerprint}\n`);
   const lost = () => remoteRunnerGenerationLost({ runner, remoteCwd, identity: { runnerInstanceId, normalizedSessionId } });
   // The provider's own record of the PREDECESSOR's sandbox, read by the caller.
-  const lostWith = (record: PredecessorSandboxRecord | Error | "hang", options: { longStopProvesLossAlone?: boolean } = {}) => {
+  const lostWith = (record: PredecessorSandboxRecord | Error | "hang",
+    options: { longStopProvesLossAlone?: boolean; probedProviderLeaseId?: string | null } = {}) => {
     const reads: number[] = [];
+    const { probedProviderLeaseId = "bx_predecessor", ...rest } = options;
     return { reads, result: remoteRunnerGenerationLost({ runner, remoteCwd, identity: { runnerInstanceId, normalizedSessionId },
-      predecessor: { start: { at: "2026-11-13T10:00:00.000Z", source: "process" }, readSandbox: async () => {
+      predecessor: { providerLeaseId: "bx_predecessor", probedProviderLeaseId,
+        start: { at: "2026-11-13T10:00:00.000Z", source: "process" }, readSandbox: async () => {
         reads.push(Date.now());
         if (record === "hang") return new Promise<PredecessorSandboxRecord>(() => {});
         if (record instanceof Error) throw record;
         return record;
       } },
-      now: () => Date.parse("2026-11-13T11:00:00.000Z"), ...options }) };
+      now: () => Date.parse("2026-11-13T11:00:00.000Z"), ...rest }) };
   };
   return { owner, mark, lost, lostWith, boot, ticks };
 };
@@ -104,9 +107,10 @@ it.skipIf(process.platform !== "linux")("provider record (3): exactly stopped fo
   expect(await lostWith(present("stopped", minutesAgo(20)), { longStopProvesLossAlone: false }).result).toBe(false);
 });
 
-it.skipIf(process.platform !== "linux")("provider record (4): stopped 14 minutes, still stopping, or no stoppedAt: not proven", async () => {
-  const { mark, lostWith } = fixture();
-  mark();
+it.skipIf(process.platform !== "linux")("provider record (4): stopped 14 minutes, a future stop, still stopping, or no stoppedAt: not proven, with no marker fallback", async () => {
+  const { mark, lostWith, ticks } = fixture();
+  mark(`linux:${randomUUID()}:${ticks}`); // the marker alone would prove a changed generation
+  expect(await lostWith(present("stopped", "2026-11-13T11:01:00.000Z")).result, "future stoppedAt").toBe(false);
   expect(await lostWith(present("stopped", minutesAgo(14))).result).toBe(false);
   expect(await lostWith(present("stopped", minutesAgo(5))).result).toBe(false);
   for (const state of ["archiving", "stopping", "starting", "resuming", "error", "unknown"]) {
@@ -115,18 +119,23 @@ it.skipIf(process.platform !== "linux")("provider record (4): stopped 14 minutes
   expect(await lostWith(present("stopped", null)).result, "missing stoppedAt").toBe(false);
 });
 
-it.skipIf(process.platform !== "linux")("provider record (5): a running predecessor sandbox: the marker probe decides", async () => {
+it.skipIf(process.platform !== "linux")("provider record (5): a running predecessor sandbox probed on that same box: the marker probe decides", async () => {
   const live = fixture();
   live.mark();
   expect(await live.lostWith(present("running")).result).toBe(false);
   const changed = fixture();
   changed.mark(`linux:${randomUUID()}:${changed.ticks}`);
-  expect(await changed.lostWith(present("idle")).result).toBe(true);
+  expect(await changed.lostWith(present("running")).result).toBe(true);
+  // A 47 from a different box says nothing about the predecessor's own box.
+  expect(await changed.lostWith(present("running"), { probedProviderLeaseId: "bx_current" }).result).toBe(false);
+  expect(await changed.lostWith(present("running"), { probedProviderLeaseId: null }).result).toBe(false);
+  // Only "running" reaches the probe; any other state name is not proven.
+  expect(await changed.lostWith(present("idle")).result).toBe(false);
 });
 
-it.skipIf(process.platform !== "linux")("provider record (6): a failed or timed-out provider read proves nothing", async () => {
-  const { mark, lostWith } = fixture();
-  mark();
+it.skipIf(process.platform !== "linux")("provider record (6): a failed or timed-out provider read proves nothing, with no marker fallback", async () => {
+  const { mark, lostWith, ticks } = fixture();
+  mark(`linux:${randomUUID()}:${ticks}`); // the marker alone would prove a changed generation
   expect(await lostWith(new Error("Boat GET /sandboxes/bx_1 failed (502)")).result).toBe(false);
   const started = Date.now();
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

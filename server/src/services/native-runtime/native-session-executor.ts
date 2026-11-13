@@ -15082,21 +15082,22 @@ export type PredecessorStart = { at: string; source: "process" | "run" };
  * rotation). Never on a lease label such as resumedFromState stopped/archived,
  * and never on a failed close.
  *
- * Provider record (optional `predecessor`: `readSandbox` must be a FRESH read
- * of the predecessor's own sandbox id at decision time, never cached state;
- * existing callers pass none):
+ * Provider record (optional `predecessor`; existing callers pass none, and
+ * keep the marker probe alone). `readSandbox` must be a FRESH read of the
+ * predecessor's own sandbox id at decision time, never cached state. RFL's
+ * decision table, fail-closed:
  * - gone (the provider no longer has it): lost;
  * - lastRebootAt later than the predecessor's recorded start: lost;
  * - timestamps must be strict ISO 8601 instants with a zone and real calendar
  *   fields (parseStrictIsoInstant); any other value proves nothing;
- * - state exactly stopped (provider-neutral), with a strict stoppedAt at least
- *   PREDECESSOR_LONG_STOP_MS before now (the provider's clock, observedAt,
- *   when it sent one, else this server's): lost
- *   (PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE; when false, the marker probe
- *   below must fail too);
- * - stopped for less, stopping, starting, running, or any other state, or a
- *   missing stoppedAt: the marker probe decides;
- * - a failed or timed-out provider read proves nothing (the probe still runs).
+ * - state exactly stopped (provider-neutral), with a strict stoppedAt not in
+ *   the future and at least PREDECESSOR_LONG_STOP_MS before now (the
+ *   provider's clock, observedAt, when it sent one, else this server's): lost
+ *   (PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE); any other stop: not proven;
+ * - state running, and the probe reaches that same sandbox
+ *   (providerLeaseId === probedProviderLeaseId): the marker probe below;
+ * - anything else (another state, a different probed box, a failed,
+ *   timed-out or thrown read): NOT proven, with no marker fallback.
  *
  * Marker probe (the current box): the box's launch marker for this session
  * names that runner instance with a recorded start generation
@@ -15112,6 +15113,10 @@ export async function remoteRunnerGenerationLost(input: {
   predecessor?: {
     readSandbox: () => Promise<PredecessorSandboxRecord>;
     start: PredecessorStart | null;
+    /** The predecessor's recorded provider lease id: its own sandbox. */
+    providerLeaseId: string;
+    /** The provider lease id of the box `runner` reaches (the marker probe's box). */
+    probedProviderLeaseId: string | null;
   };
   longStopProvesLossAlone?: boolean;
   now?: () => number;
@@ -15119,20 +15124,29 @@ export async function remoteRunnerGenerationLost(input: {
   const { runnerInstanceId, normalizedSessionId } = input.identity;
   if (typeof runnerInstanceId !== "string" || !runnerInstanceId || typeof normalizedSessionId !== "string" || !normalizedSessionId) return false;
   if (input.predecessor) {
+    // RFL decision table: with a predecessor read requested, only its
+    // conclusive answers decide. A failed, timed-out or thrown read and every
+    // inconclusive observation are NOT proven; nothing falls through to a
+    // probe of some other box.
     const record = await readPredecessorSandbox(input.predecessor.readSandbox);
-    if (record?.kind === "gone") return true;
-    if (record?.kind === "present") {
-      // Strict instants only: an impossible or zone-less timestamp proves nothing.
-      const rebootAt = parseStrictIsoInstant(record.lastRebootAt);
-      const startAt = parseStrictIsoInstant(input.predecessor.start?.at);
-      if (rebootAt !== null && startAt !== null && rebootAt > startAt) return true;
+    if (!record) return false;
+    if (record.kind === "gone") return true;
+    // Strict instants only: an impossible or zone-less timestamp proves nothing.
+    const rebootAt = parseStrictIsoInstant(record.lastRebootAt);
+    const startAt = parseStrictIsoInstant(input.predecessor.start?.at);
+    if (rebootAt !== null && startAt !== null && rebootAt > startAt) return true;
+    if (record.state === "stopped") {
+      // Exactly the provider-neutral "stopped" (the plugin maps Boat's
+      // archived-with-stoppedAt to it); a missing, future or short stop is
+      // not proven.
       const stoppedAt = parseStrictIsoInstant(record.stoppedAt);
       const now = parseStrictIsoInstant(record.observedAt) ?? (input.now ?? Date.now)();
-      // Exactly the provider-neutral "stopped" state (the plugin maps Boat's
-      // archived-with-stoppedAt to it); Core reads no raw provider state names.
-      const longStop = record.state === "stopped" && stoppedAt !== null && now - stoppedAt >= PREDECESSOR_LONG_STOP_MS;
-      if (longStop && (input.longStopProvesLossAlone ?? PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE)) return true;
+      return (input.longStopProvesLossAlone ?? PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE)
+        && stoppedAt !== null && stoppedAt <= now && now - stoppedAt >= PREDECESSOR_LONG_STOP_MS;
     }
+    // Only a running predecessor sandbox may be decided by the marker probe,
+    // and only when the probe reaches that same sandbox.
+    if (record.state !== "running" || input.predecessor.providerLeaseId !== input.predecessor.probedProviderLeaseId) return false;
   }
   const identityPath = posix.join(remoteRunnerStateDirectory(input.remoteCwd, normalizedSessionId), "runner-process.identity");
   try {
