@@ -4612,6 +4612,9 @@ const runnerPlatformEnvironmentKeys = [
 ] as const;
 
 const runnerExplicitProviderEnvironmentKeys = [
+  // Controller-owned current-run projection; never inherited from ambient or
+  // admitted by the configured-key manifest. Rust consumes it before Pi starts.
+  "PAPERCLIP_PI_GITHUB_PROJECTION_SECRET",
   ...PI_LANGFUSE_ENVIRONMENT_KEYS,
   ...ACPX_CREDENTIAL_NAMES.claude.filter(name => !name.startsWith("AWS_")),
   ...CLAUDE_ROUTING_ENV_KEYS,

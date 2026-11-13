@@ -46,7 +46,12 @@ describe('controller-configured environment across native runner boundaries', ()
       options: { environment: { PAPERCLIP_PI_GITHUB_PROJECTION_SECRET: payload } }, identity,
       codexHome: '/isolated/pi-home', runtimeContextPath: '/isolated/runtime-context.json', hasRuntimeContext: false });
     expect(environment.PAPERCLIP_PI_GITHUB_PROJECTION_SECRET).toBe(payload);
-    expect(piProcessEnvironment(environment, {})).not.toHaveProperty('PAPERCLIP_PI_GITHUB_PROJECTION_SECRET');
+    let launched: NodeJS.ProcessEnv | undefined;
+    spawnRunner({ connection: { mode: 'connect', connectUrl: 'ws://127.0.0.1:43127' }, stateDirectory: '/tmp/pi-projection-hop-proof', identity, ticket: 'fake-ticket', maxOutboxBytes: 262144, p0ReserveBytes: 65536, runnerVersion: '0.3.0', runnerDigest: `sha256:${'a'.repeat(64)}`, environment,
+      processLauncher: spec => { launched = spec.environment; return { child: { pid: 42, exitCode: null, signalCode: null, kill: () => true }, completion: Promise.resolve({ code: 0, signal: null, stdout: '', stderr: '' }) }; },
+    });
+    expect(launched?.PAPERCLIP_PI_GITHUB_PROJECTION_SECRET).toBe(payload);
+    expect(piProcessEnvironment(launched, {})).not.toHaveProperty('PAPERCLIP_PI_GITHUB_PROJECTION_SECRET');
   });
   // Keep reason: actual native Pi launch trust boundary, not just the final filter.
   it.each([2, 33])('carries %s safe Git pairs from the native provider builder through runner spawn to real Git', (count) => {
