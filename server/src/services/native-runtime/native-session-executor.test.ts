@@ -11298,6 +11298,166 @@ describe("native warm session supervision", () => {
     }
   });
 
+  // REG-03 (prod I-8g run df2cf036): a Stop mid-tool retained the warm runner;
+  // the next plain message reused it (runner/provider_session "reused"), its
+  // attachRun rejected with "runnerd transport closed during provider startup"
+  // and the run failed with no fallback. Core retires that runner and takes
+  // its cold path once, on the same conversation's saved checkpoint.
+  describe("warm attach failure (REG-03)", () => {
+    const attachFailure = () => new Error("runnerd transport closed during provider startup");
+    const run = async (name: string, second: (options: Parameters<typeof state.execute>[0], session: unknown) => Promise<unknown>,
+      cold?: (options: Parameters<typeof state.execute>[0]) => Promise<unknown>, closeImpl?: () => Promise<void>) => {
+      const home = await mkdtemp(join(tmpdir(), `${name}-`));
+      const previousHome = process.env.PAPERCLIP_HOME;
+      process.env.PAPERCLIP_HOME = home;
+      const current = { ...execution,
+        binding: { ...execution.binding, runId: `${name}-one`, executionWorkspaceId: name },
+        session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+      } as NativeExecutionInputV1;
+      const next = { ...current, binding: { ...current.binding, runId: `${name}-two` } };
+      const close = vi.fn(closeImpl ?? (async () => undefined));
+      const session = { close };
+      const result = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+        turnId: name, normalizedSessionId: name, providerSessionId: `${name}-provider`, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      state.execute.mockReset()
+        .mockImplementationOnce(async options => {
+          await options.onCheckpoint?.({
+            identity: { runId: current.binding.runId, sessionId: name, companyId: current.binding.companyId,
+              issueId: current.binding.issueId, agentId: current.binding.agentId },
+            providerSessionId: `${name}-provider`, activeTurnId: null, semanticResult: null, terminal: null,
+          });
+          await options.onSession?.(session);
+          return result;
+        })
+        .mockImplementationOnce(options => second(options, session));
+      if (cold) state.execute.mockImplementationOnce(cold);
+      const events: Array<{ eventType: string; level?: string; payload?: Record<string, unknown> }> = [];
+      const onLog = vi.fn(async () => undefined);
+      const { logger } = await import("../../middleware/logger.js");
+      const alarm = vi.spyOn(logger, "error").mockImplementation(() => undefined);
+      try {
+        await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: name });
+        // The failure write nests writeExecutionControl inside its transaction.
+        const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+        const base = leaseDb(next, {}, {}, updates) as unknown as { transaction: (operation: (tx: Db) => Promise<unknown>) => Promise<unknown> };
+        const db = { ...base, transaction: (operation: (tx: Db) => Promise<unknown>) => base.transaction(tx =>
+          operation(Object.assign(tx, { transaction: (inner: (tx: Db) => Promise<unknown>) => inner(tx) }))) } as unknown as Db;
+        const outcome = await executePaperclipNativeSession({ db, execution: next, runnerInstanceId: name,
+          onLog, onEvent: async event => { events.push(event as never); } }).then(value => ({ value }), (error: unknown) => ({ error }));
+        const errorCode = updates.find(update => update.table === heartbeatRuns && "errorCode" in update.values)?.values.errorCode;
+        return { outcome, errorCode, close, session, events, onLog,
+          alarm: alarm.mock.calls.filter(call => String(call[1]).includes("Warm runner attach owner alarm")) };
+      } finally {
+        alarm.mockRestore();
+        close.mockImplementation(async () => undefined);
+        await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" });
+        if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+        await rm(home, { recursive: true, force: true });
+      }
+    };
+    // What the runtime does on a failed attach: quarantine (evict, start
+    // close), report the exact rejection, rethrow it unchanged.
+    const rejectAttach = async (options: Parameters<typeof state.execute>[0], session: unknown, error: unknown) => {
+      expect(options.existingSession).toBe(session);
+      expect(options.persistedSession).toBeUndefined();
+      await options.onSession?.(null);
+      options.onRetainedSessionAttachFailed?.(error);
+      throw error;
+    };
+
+    it("retires the runner and resumes the same conversation cold once, visibly", async () => {
+      const failure = attachFailure();
+      let cold: Parameters<typeof state.execute>[0] | undefined;
+      const { outcome, close, events, onLog, alarm } = await run("warm-attach-cold", (options, session) => rejectAttach(options, session, failure),
+        async options => {
+          cold = options;
+          return { result: { summary: "recalled" }, terminal: { runTerminalState: "succeeded" }, turnId: "t",
+            normalizedSessionId: "warm-attach-cold", providerSessionId: "warm-attach-cold-provider", driverKind: "test",
+            driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+        });
+      expect(outcome).toMatchObject({ value: { exitCode: 0 } });
+      expect(state.execute).toHaveBeenCalledTimes(3);
+      // The cold start is the existing checkpoint-resume path: no live runner,
+      // the same normalized conversation and provider session, rebound to this run.
+      expect(cold?.existingSession).toBeUndefined();
+      expect(cold?.persistedSession).toMatchObject({ providerSessionId: "warm-attach-cold-provider",
+        identity: { sessionId: "warm-attach-cold", runId: "warm-attach-cold-two" } });
+      expect(close).toHaveBeenCalledWith({ reason: "warm runner attach failed" });
+      expect(close.mock.invocationCallOrder[0]).toBeLessThan(state.execute.mock.invocationCallOrder[2]!);
+      expect(events.filter(event => event.eventType === "native.warm_attach.failed")).toEqual([expect.objectContaining({
+        level: "warn", payload: { schema: "paperclip.warm-attach-failure.v1", layer: "runner",
+          state: "warm_attach_failed_cold_fallback", reason: "native_warm_attach_failed",
+          error: "runnerd transport closed during provider startup" } })]);
+      // The fresh receipts dominate the earlier "reused" ones: never summarized as warm.
+      const { summarizeStartupReuse } = await import("@paperclipai/adapter-utils/startup-reuse");
+      expect(summarizeStartupReuse(events)).toMatchObject({ layers: {
+        runner: { state: "fresh", reason: "resume_failed" }, provider_session: { state: "fresh", reason: "resume_failed" } } });
+      expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(
+        "warm runner attach failed (native_warm_attach_failed): runnerd transport closed during provider startup"));
+      expect(alarm).toHaveLength(1);
+      expect(alarm[0]![0]).toMatchObject({ runId: "warm-attach-cold-two", code: "native_warm_attach_failed",
+        state: "warm_attach_failed_cold_fallback" });
+    });
+
+    it("fails with a named code when the cold start also fails, and falls back only once", async () => {
+      const coldFailure = new Error("runnerd transport closed during provider startup");
+      const { errorCode } = await run("warm-attach-cold-fails", (options, session) => rejectAttach(options, session, attachFailure()),
+        async options => {
+          // The cold session is not a reused one: a second fallback is impossible.
+          expect(options.existingSession).toBeUndefined();
+          options.onRetainedSessionAttachFailed?.(coldFailure);
+          throw coldFailure;
+        });
+      expect(state.execute).toHaveBeenCalledTimes(3);
+      expect(errorCode).toBe("native_warm_attach_cold_fallback_failed");
+    });
+
+    it("keeps a typed cold-start refusal under its own code", async () => {
+      const refusal = new NativeProviderSideEffectPendingError("pending tool call");
+      const { errorCode } = await run("warm-attach-cold-refused", (options, session) => rejectAttach(options, session, attachFailure()),
+        async () => { throw refusal; });
+      expect(state.execute).toHaveBeenCalledTimes(3);
+      expect(errorCode).toBe("native_provider_side_effect_pending");
+    });
+
+    it("keeps the uncertain side-effect refusal with its reconciliation code", async () => {
+      const { NativeRunnerSourceReconciliationRequiredError } = await import("../../vendor/paperclip-runner/index.js");
+      const { errorCode, close, events, alarm } = await run("warm-attach-side-effect",
+        (options, session) => rejectAttach(options, session, new NativeRunnerSourceReconciliationRequiredError("semantic")));
+      expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(close).not.toHaveBeenCalled();
+      expect(errorCode).toBe("native_provider_side_effect_pending");
+      expect(events.find(event => event.eventType === "native.warm_attach.failed")?.payload).toMatchObject({
+        state: "warm_attach_failed_refused", reason: "native_runner_source_semantic_reconciliation_required", refusal: "side_effect_pending" });
+      expect(alarm).toHaveLength(1);
+    });
+
+    it.each([
+      ["an unproven retirement", attachFailure, "retire_unproven", "native_session_interrupted",
+        async () => { throw new Error("runner did not prove durable suspension"); }],
+      ["the released-runner proof gate", () => new Error("native_runner_reuse_unavailable"), "controller_state_unsettled",
+        "native_session_interrupted", undefined],
+    ] as const)("does not start a second runner after %s", async (_label, error, refusal, code, closeImpl) => {
+      const { errorCode, events, alarm } = await run(`warm-attach-refused-${refusal}`,
+        (options, session) => rejectAttach(options, session, error()), undefined, closeImpl);
+      expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(errorCode).toBe(code);
+      expect(events.find(event => event.eventType === "native.warm_attach.failed")?.payload).toMatchObject({
+        state: "warm_attach_failed_refused", refusal });
+      expect(alarm).toHaveLength(1);
+    });
+
+    it("leaves a Stop during attach to the Stop path", async () => {
+      const { events, alarm, close } = await run("warm-attach-stopped",
+        (options, session) => rejectAttach(options, session, new Error("native_session_cancelled")));
+      expect(state.execute).toHaveBeenCalledTimes(2);
+      expect(close).not.toHaveBeenCalled();
+      expect(events.some(event => event.eventType === "native.warm_attach.failed")).toBe(false);
+      expect(alarm).toHaveLength(0);
+    });
+  });
+
   it.each(["failed", "cancelled"] as const)("checkpoints managed edits before retiring a %s session whose close rejects", async (runTerminalState) => {
     const name = `warm-terminal-close-fails-${runTerminalState}`;
     const current = { ...execution,
