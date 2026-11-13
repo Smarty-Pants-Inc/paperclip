@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -51,7 +51,6 @@ import { conflict, forbidden, HttpError, notFound, unprocessable } from "../erro
 import { logger } from "../middleware/logger.js";
 import { PgTransaction } from "drizzle-orm/pg-core";
 import { enqueueSecretAccessEvent, enqueueSecretLastResolvedAt, flushSecretResolutionWrites } from "./secret-resolution-writes.js";
-import { resolveCachedEnvironmentProviderSecret } from "./environment-provider-secret-cache.js";
 import {
   checkSecretProviders,
   getSecretProvider,
@@ -1182,11 +1181,11 @@ export function secretService(db: Db | DbTransaction) {
 
   async function recordAccessEvent(input: {
     companyId: string;
-    secretId: string | null;
+    secretId: string;
     userSecretDefinitionId?: string | null;
     secretScope?: string | null;
     version: number | null;
-    provider: SecretProvider | "unknown";
+    provider: SecretProvider;
     context: SecretConsumerContext | undefined;
     credentialOwnerUserId?: string | null;
     credentialSubjectType?: string | null;
@@ -1220,7 +1219,7 @@ export function secretService(db: Db | DbTransaction) {
     // A caller-owned transaction cannot outlive its callback. Keep its audit
     // atomic; ordinary pool-based runtime resolutions use the deferred queue.
     if (db instanceof PgTransaction) await db.insert(secretAccessEvents).values(event);
-    else await enqueueSecretAccessEvent(db as Db, event);
+    else enqueueSecretAccessEvent(db as Db, event);
   }
 
   async function assertSecretInCompany(
@@ -1372,7 +1371,6 @@ export function secretService(db: Db | DbTransaction) {
     options?: SecretResolutionOptions,
     readOnlyEnvironmentInspection = false,
     preloaded?: { secret: typeof companySecrets.$inferSelect; version: typeof companySecretVersions.$inferSelect | null },
-    recordResolutionAccess = true,
   ): Promise<RuntimeSecretResolution> {
     const bindingContext = options?.bindingContext;
     const accessContext = options?.accessContext ?? bindingContext;
@@ -1423,8 +1421,8 @@ export function secretService(db: Db | DbTransaction) {
         },
       });
       if (!readOnlyEnvironmentInspection) {
-        if (!(db instanceof PgTransaction)) await enqueueSecretLastResolvedAt(db as Db, secret);
-        if (recordResolutionAccess) await recordAccessEvent({
+        if (!(db instanceof PgTransaction)) enqueueSecretLastResolvedAt(db as Db, secret);
+        await recordAccessEvent({
           companyId,
           secretId: secret.id,
           userSecretDefinitionId: secret.userSecretDefinitionId ?? null,
@@ -1454,7 +1452,7 @@ export function secretService(db: Db | DbTransaction) {
       };
     } catch (err) {
       const errorCode = secretResolutionErrorCode(err);
-      if (!readOnlyEnvironmentInspection && recordResolutionAccess) await recordAccessEvent({
+      if (!readOnlyEnvironmentInspection) await recordAccessEvent({
         companyId,
         secretId: secret.id,
         userSecretDefinitionId: secret.userSecretDefinitionId ?? null,
@@ -1470,59 +1468,6 @@ export function secretService(db: Db | DbTransaction) {
       });
       throw err;
     }
-  }
-
-  /** Audit the handoff, not the cache fill: every caller owns one context/event. */
-  async function resolveSecretValueForEnvironmentRuntime(
-    companyId: string,
-    secretId: string,
-    context: SecretBindingContext & { consumerType: "environment" },
-    configRevision: string,
-  ): Promise<string> {
-    // Transaction-owned handles must keep synchronous atomic audit behavior and
-    // must never leave a plaintext cache entry after a transaction rolls back.
-    if (db instanceof PgTransaction) return resolveSecretValue(companyId, secretId, "latest", context);
-    let metadata: typeof companySecrets.$inferSelect | null = null;
-    let resolvedVersion: number | null = null;
-    const record = (outcome: "success" | "failure", errorCode?: string) => recordAccessEvent({
-      companyId,
-      // Missing/cross-company refs still record failure without attributing
-      // another company's secret metadata to this company.
-      secretId: metadata?.id ?? null,
-      version: resolvedVersion ?? metadata?.latestVersion ?? null,
-      provider: metadata ? metadata.provider as SecretProvider : "unknown",
-      context,
-      outcome,
-      errorCode,
-    });
-    let value: string;
-    try {
-      const candidate = await getById(secretId);
-      if (candidate?.companyId === companyId) metadata = candidate;
-      // Identity/binding/version checks are inside the audited boundary even
-      // when validation rejects before the provider or cache is reached.
-      const identity = await resolveSecretVersionIdentity(companyId, secretId, "latest", context);
-      resolvedVersion = identity.version;
-      if (!metadata || metadata.scope !== "company") throw unprocessable("Environment secrets must be company-scoped");
-      const providerConfig = metadata.providerConfigId ? await getProviderConfigById(metadata.providerConfigId) : null;
-      const revision = createHash("sha256").update(JSON.stringify([
-        configRevision, identity, metadata.updatedAt, metadata.providerConfigId, providerConfig,
-      ])).digest("hex");
-      value = await resolveCachedEnvironmentProviderSecret({
-        db: db as Db,
-        key: JSON.stringify([companyId, context.consumerId, context.configPath, secretId]),
-        revision,
-        // The shared fill must not emit the first caller's event. Each waiter
-        // records its own success/failure below, including single-flight misses.
-        resolve: async () => (await resolveSecretValueInternal(companyId, secretId, identity.version,
-          { bindingContext: context, accessContext: context }, false, undefined, false)).value,
-      });
-    } catch (err) {
-      await record("failure", secretResolutionErrorCode(err));
-      throw err;
-    }
-    await record("success");
-    return value;
   }
 
   function isSecretResolutionOptions(
@@ -4711,7 +4656,6 @@ export function secretService(db: Db | DbTransaction) {
     getByName,
     getByKey,
     resolveSecretValue,
-    resolveSecretValueForEnvironmentRuntime,
     resolveSecretVersion,
     resolveSecretVersionIdentity,
     resolveSecretValueForAgentAccess,

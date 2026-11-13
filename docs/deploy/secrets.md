@@ -19,10 +19,7 @@ or workload:
 - Audit: each resolution records a non-sensitive event (secret id, version,
   provider id, consumer, outcome) without the value or provider credentials.
 
-Runtime resolutions batch their audit writes outside the turn's critical path,
-except at the 10,000-pending-record cap, where producers await capacity without dropping records.
-Accepted trade-off: SIGKILL/host loss can lose unflushed rows (normally up to about one second);
-backpressure bounds the pending count, not its age during a database outage.
+Runtime resolutions batch their audit writes outside the turn's critical path.
 Orderly shutdown drains pending records before closing the database. Sandbox
 provider credentials have a short-lived cache with live binding and version
 checks. See [Runtime secret resolution](../../doc/secret-resolution-write-behind.md)
