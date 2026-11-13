@@ -16873,10 +16873,10 @@ describe("runnerd provider runtime wiring", () => {
     } as unknown as Db;
   }
 
-  async function initializeScopedRunnerRoot(current: NativeExecutionInput, runnerInstanceId: string) {
+  async function initializeScopedRunnerRoot(current: NativeExecutionInput, runnerInstanceId: string, runnerRemoteProviderPackPath?: string) {
     state.createBackend.mockClear();
     state.createTransport.mockClear();
-    await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId });
+    await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId, runnerRemoteProviderPackPath });
     state.createBackend.mock.calls[0]![1].codexTransportFactory!();
     return state.createTransport.mock.calls[0]![0].stateDirectory!;
   }
@@ -18782,19 +18782,25 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
-  it.each(["codex", "opencode", "claude", "pi"] as const)("adopts remote %s with no old controller launch assets", async provider => {
+  it.each(["codex", "opencode", "claude", "pi", "pi_rpc"] as const)("adopts remote %s with no old controller launch assets", async provider => {
     const base = scopedNativeExecution(`missing-launch-assets-${provider}`);
     const current = { ...base,
       provider: provider === "codex" ? base.provider : provider === "opencode"
-        ? { kind: "opencode", model: null }
+        ? { kind: "opencode", model: null } : provider === "pi_rpc"
+        ? { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE }
         : { kind: "acpx", agent: provider, model: null },
       session: { ...base.session, driverKind: provider === "codex" ? "codex_app_server"
-        : provider === "opencode" ? "opencode_server" : "acpx_runtime" },
+        : provider === "opencode" ? "opencode_server" : provider === "pi_rpc" ? "pi_rpc" : "acpx_runtime" },
     } as NativeExecutionInputV1;
     const identity = { runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId!,
       runnerInstanceId: `admitted-${provider}`, environmentLeaseId: "admitted-lease",
       turnId: `turn_attachment_${randomUUID()}`, itemId: `item_attachment_${randomUUID()}` };
-    const root = await initializeScopedRunnerRoot(current, identity.runnerInstanceId);
+    // The original controller qualified Pi at launch; its successor must not need that pack.
+    const pack = provider === "pi_rpc"
+      ? await (await import("./native-pi-provider-pack.test-fixture.js"))
+        .nativePiProviderPackFixture(join(isolatedStateDirectory, "adoption-pi-pack"))
+      : undefined;
+    const root = await initializeScopedRunnerRoot(current, identity.runnerInstanceId, pack?.packRoot);
     await mkdir(join(root, "control-plane"), { recursive: true });
     await writeFile(join(root, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
     const missingBinary = join(root, "absent-old-controller", "runnerd");
@@ -18824,6 +18830,12 @@ describe("runnerd provider runtime wiring", () => {
     expect(state.resolveRemoteRunnerBinary).not.toHaveBeenCalled();
     expect(execute.mock.calls.some(([request]) => request.args.includes("paperclip-runner-launch") || request.args.includes("--build-metadata"))).toBe(false);
     const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { prepareExternalRunnerState: () => Promise<void> };
+    if (provider === "pi_rpc") {
+      expect(options).toMatchObject({ provider: "pi_rpc" });
+      expect(Reflect.get(options, "piCommand")).toBeUndefined();
+      expect(Reflect.get(options, "piProxyPath")).toBeUndefined();
+      expect(Reflect.get(options, "providerNodeCommand")).toBeUndefined();
+    }
     await expect(options.prepareExternalRunnerState()).resolves.toBeUndefined();
     expect(execute.mock.calls.some(([request]) => request.args.includes("paperclip-runner-launch")
       || request.args.includes("paperclip-runner-claim-unstarted-session"))).toBe(false);
