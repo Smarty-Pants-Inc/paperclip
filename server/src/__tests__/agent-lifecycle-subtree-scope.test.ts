@@ -7,7 +7,7 @@ import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, agentApiKeys, authUsers, companies, companyMemberships, createDb,
-  principalPermissionGrants, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  principalPermissionGrants, approvals, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -167,6 +167,24 @@ describe("subtree-scoped agent lifecycle", () => {
       expect(response.status, response.text).toBe(403);
     }
     expect((await f.current(workerId)).lifecycleState).toBe("ready");
+  }, 60_000);
+
+  it("denies agent rejection of a pending hire without a false board decider, but records the real board user", async () => {
+    const f = await seed();
+    await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, f.companyId));
+    const workerId = await f.hire();
+    expect((await f.current(workerId)).status).toBe("pending_approval");
+    const before = await db.select().from(approvals).where(eq(approvals.companyId, f.companyId));
+    expect(before).toHaveLength(1);
+    const denied = await f.post(workerId, "terminate");
+    expect(denied.status, denied.text).toBe(403);
+    expect(denied.body.error).toContain("board user");
+    expect(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toEqual(before);
+    expect((await f.current(workerId)).status).toBe("pending_approval");
+    const allowed = await request(f.board).post(`/api/agents/${workerId}/terminate`).send({});
+    expect(allowed.status, allowed.text).toBe(200);
+    const [decided] = await db.select().from(approvals).where(eq(approvals.companyId, f.companyId));
+    expect(decided).toMatchObject({ status: "rejected", decidedByUserId: f.userId });
   }, 60_000);
 
   it("applies the same subtree and self boundary through PATCH status", async () => {

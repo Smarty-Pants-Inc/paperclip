@@ -105,6 +105,11 @@ wake receipt or Stop intent. Execution/provider cleanup may finish after a later
 reparent; that completes the already-accepted request, not a new grant of access.
 Self-wake remains separate from cross-agent lifecycle management.
 
+An agent cannot terminate a pending hire: that operation rejects its hire
+approval, whose decider schema currently records only a user ID. It returns 403
+and leaves both approval and hire unchanged. A board user can still reject the
+hire, recording that user's ID. Approved hires retain delegated lifecycle control.
+
 ## Named follow-up: target-manager consent-card eligibility
 
 This minimal grant fix does **not** establish or test that only the target
