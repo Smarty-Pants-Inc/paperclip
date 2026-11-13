@@ -73,11 +73,12 @@ const present = (state: string, stoppedAt: string | null = null, lastRebootAt: s
 // "now" is 11:00; the predecessor's process started at 10:00.
 const minutesAgo = (minutes: number) => new Date(Date.parse("2026-11-13T11:00:00.000Z") - minutes * 60_000).toISOString();
 
-it.skipIf(process.platform !== "linux")("provider record (1): the predecessor's sandbox is gone (404 or cancelled): lost", async () => {
+it.skipIf(process.platform !== "linux")("provider record (1): the predecessor's sandbox is gone: lost; a raw provider state name is not gone", async () => {
   const { mark, lostWith } = fixture();
   mark(); // even with the marker's process alive here: the predecessor's own box is gone
   expect(await lostWith({ kind: "gone" }).result).toBe(true);
-  expect(await lostWith(present("cancelled")).result).toBe(true);
+  // The plugin maps 404/cancelled to destroyed (gone); Core reads no raw names.
+  expect(await lostWith(present("cancelled")).result).toBe(false);
 });
 
 it.skipIf(process.platform !== "linux")("provider record (2): a reboot after the predecessor's recorded start: lost; before it: the probe decides", async () => {
@@ -87,30 +88,31 @@ it.skipIf(process.platform !== "linux")("provider record (2): a reboot after the
   expect(await lostWith(present("running", null, "2026-11-13T09:30:00.000Z")).result, "an older reboot proves nothing").toBe(false);
 });
 
-it.skipIf(process.platform !== "linux")("provider record (3): stopped or archived for at least 15 minutes: lost (RFL ruling), by the provider's clock", async () => {
+it.skipIf(process.platform !== "linux")("provider record (3): exactly stopped for at least 15 minutes: lost (RFL ruling), by the provider's clock", async () => {
   expect(PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE).toBe(true);
   const { mark, lostWith } = fixture();
   mark(); // the marker's process is alive here: the long stop alone decides
-  expect(await lostWith(present("archived", minutesAgo(PREDECESSOR_LONG_STOP_MS / 60_000))).result).toBe(true);
+  expect(await lostWith(present("stopped", minutesAgo(PREDECESSOR_LONG_STOP_MS / 60_000))).result).toBe(true);
+  expect(await lostWith(present("archived", minutesAgo(60))).result, "a raw provider state name: not proven").toBe(false);
   expect(await lostWith(present("stopped", minutesAgo(20))).result).toBe(true);
   // Skewed clocks: the provider's Date header wins over this server's clock.
-  expect(await lostWith({ ...present("archived", minutesAgo(20)), observedAt: minutesAgo(10) } as PredecessorSandboxRecord).result,
+  expect(await lostWith({ ...present("stopped", minutesAgo(20)), observedAt: minutesAgo(10) } as PredecessorSandboxRecord).result,
     "server says 20 min, Boat says 10: not proven").toBe(false);
-  expect(await lostWith({ ...present("archived", minutesAgo(10)), observedAt: "2026-11-13T11:10:00.000Z" } as PredecessorSandboxRecord).result,
+  expect(await lostWith({ ...present("stopped", minutesAgo(10)), observedAt: "2026-11-13T11:10:00.000Z" } as PredecessorSandboxRecord).result,
     "server says 10 min, Boat says 20: lost").toBe(true);
   // The switch back to "needs the failed probe too" keeps a live owner.
-  expect(await lostWith(present("archived", minutesAgo(20)), { longStopProvesLossAlone: false }).result).toBe(false);
+  expect(await lostWith(present("stopped", minutesAgo(20)), { longStopProvesLossAlone: false }).result).toBe(false);
 });
 
 it.skipIf(process.platform !== "linux")("provider record (4): stopped 14 minutes, still stopping, or no stoppedAt: not proven", async () => {
   const { mark, lostWith } = fixture();
   mark();
-  expect(await lostWith(present("archived", minutesAgo(14))).result).toBe(false);
-  expect(await lostWith(present("archived", minutesAgo(5))).result).toBe(false);
+  expect(await lostWith(present("stopped", minutesAgo(14))).result).toBe(false);
+  expect(await lostWith(present("stopped", minutesAgo(5))).result).toBe(false);
   for (const state of ["archiving", "stopping", "starting", "resuming", "error", "unknown"]) {
     expect(await lostWith(present(state, minutesAgo(30))).result, state).toBe(false);
   }
-  expect(await lostWith(present("archived", null)).result, "missing stoppedAt").toBe(false);
+  expect(await lostWith(present("stopped", null)).result, "missing stoppedAt").toBe(false);
 });
 
 it.skipIf(process.platform !== "linux")("provider record (5): a running predecessor sandbox: the marker probe decides", async () => {
@@ -136,4 +138,18 @@ it.skipIf(process.platform !== "linux")("provider record (6): a failed or timed-
     expect(hung.reads).toHaveLength(1);
   } finally { vi.useRealTimers(); }
   expect(Date.now() - started).toBeLessThan(PREDECESSOR_SANDBOX_READ_TIMEOUT_MS);
+});
+
+it.skipIf(process.platform !== "linux")("provider record (7): impossible, zone-less or garbage timestamps prove nothing", async () => {
+  const { mark, lostWith } = fixture();
+  mark();
+  for (const bad of ["2026-02-30T10:30:00.000Z", "2026-11-13T10:30:00", "garbage", "2026-11-13T24:00:00Z", "2026-11-13T10:60:00Z"]) {
+    expect(await lostWith(present("running", null, bad)).result, `lastRebootAt ${bad}`).toBe(false);
+    expect(await lostWith(present("stopped", bad)).result, `stoppedAt ${bad}`).toBe(false);
+    expect(await lostWith({ ...present("stopped", minutesAgo(10)), observedAt: bad } as PredecessorSandboxRecord).result,
+      `observedAt ${bad} falls back to this server's clock: 10 min, not proven`).toBe(false);
+  }
+  // An offset zone is a real instant: 10:30+00:30 is 10:00Z, not after the 10:00Z start.
+  expect(await lostWith(present("running", null, "2026-11-13T10:30:00+00:30")).result).toBe(false);
+  expect(await lostWith(present("running", null, "2026-11-13T10:30:00-00:30")).result).toBe(true);
 });
