@@ -3,9 +3,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { remoteRunnerGenerationLost } from "./native-session-executor.js";
+import { PREDECESSOR_LONG_STOP_MS, PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE, PREDECESSOR_SANDBOX_READ_TIMEOUT_MS,
+  remoteRunnerGenerationLost, type PredecessorSandboxRecord } from "./native-session-executor.js";
 
 // RFL F1: a provider "restarted" label is only the trigger to look. The prior
 // Runner is gone only when the box's launch marker names a process that is not
@@ -32,7 +33,19 @@ const fixture = (runnerInstanceId = randomUUID()) => {
   const mark = (fingerprint = `linux:${boot}:${ticks}`, markerRunnerId = runnerInstanceId) =>
     writeFileSync(join(directory, "runner-process.identity"), `nonce${randomUUID().replaceAll("-", "")}\n${owner.pid}\n2026-11-13T10:00:00.000Z\n${markerRunnerId}\n${fingerprint}\n`);
   const lost = () => remoteRunnerGenerationLost({ runner, remoteCwd, identity: { runnerInstanceId, normalizedSessionId } });
-  return { owner, mark, lost, boot, ticks };
+  // The provider's own record of the PREDECESSOR's sandbox, read by the caller.
+  const lostWith = (record: PredecessorSandboxRecord | Error | "hang", options: { longStopProvesLossAlone?: boolean } = {}) => {
+    const reads: number[] = [];
+    return { reads, result: remoteRunnerGenerationLost({ runner, remoteCwd, identity: { runnerInstanceId, normalizedSessionId },
+      predecessor: { start: { at: "2026-11-13T10:00:00.000Z", source: "process" }, readSandbox: async () => {
+        reads.push(Date.now());
+        if (record === "hang") return new Promise<PredecessorSandboxRecord>(() => {});
+        if (record instanceof Error) throw record;
+        return record;
+      } },
+      now: () => Date.parse("2026-11-13T11:00:00.000Z"), ...options }) };
+  };
+  return { owner, mark, lost, lostWith, boot, ticks };
 };
 
 it.skipIf(process.platform !== "linux")("never proves a live owner of the same generation gone", async () => {
@@ -53,4 +66,74 @@ it.skipIf(process.platform !== "linux")("proves the exact owner gone when its pr
   exited.owner.kill("SIGKILL");
   await new Promise(resolve => exited.owner.once("exit", resolve));
   expect(await exited.lost(), "the exact owner process is gone").toBe(true);
+});
+
+const present = (state: string, stoppedAt: string | null = null, lastRebootAt: string | null = null): PredecessorSandboxRecord =>
+  ({ kind: "present", state, stoppedAt, lastRebootAt });
+// "now" is 11:00; the predecessor's process started at 10:00.
+const minutesAgo = (minutes: number) => new Date(Date.parse("2026-11-13T11:00:00.000Z") - minutes * 60_000).toISOString();
+
+it.skipIf(process.platform !== "linux")("provider record (1): the predecessor's sandbox is gone (404 or cancelled): lost", async () => {
+  const { mark, lostWith } = fixture();
+  mark(); // even with the marker's process alive here: the predecessor's own box is gone
+  expect(await lostWith({ kind: "gone" }).result).toBe(true);
+  expect(await lostWith(present("cancelled")).result).toBe(true);
+});
+
+it.skipIf(process.platform !== "linux")("provider record (2): a reboot after the predecessor's recorded start: lost; before it: the probe decides", async () => {
+  const { mark, lostWith } = fixture();
+  mark();
+  expect(await lostWith(present("running", null, "2026-11-13T10:30:00.000Z")).result).toBe(true);
+  expect(await lostWith(present("running", null, "2026-11-13T09:30:00.000Z")).result, "an older reboot proves nothing").toBe(false);
+});
+
+it.skipIf(process.platform !== "linux")("provider record (3): stopped or archived for at least 15 minutes: lost (RFL ruling), by the provider's clock", async () => {
+  expect(PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE).toBe(true);
+  const { mark, lostWith } = fixture();
+  mark(); // the marker's process is alive here: the long stop alone decides
+  expect(await lostWith(present("archived", minutesAgo(PREDECESSOR_LONG_STOP_MS / 60_000))).result).toBe(true);
+  expect(await lostWith(present("stopped", minutesAgo(20))).result).toBe(true);
+  // Skewed clocks: the provider's Date header wins over this server's clock.
+  expect(await lostWith({ ...present("archived", minutesAgo(20)), observedAt: minutesAgo(10) } as PredecessorSandboxRecord).result,
+    "server says 20 min, Boat says 10: not proven").toBe(false);
+  expect(await lostWith({ ...present("archived", minutesAgo(10)), observedAt: "2026-11-13T11:10:00.000Z" } as PredecessorSandboxRecord).result,
+    "server says 10 min, Boat says 20: lost").toBe(true);
+  // The switch back to "needs the failed probe too" keeps a live owner.
+  expect(await lostWith(present("archived", minutesAgo(20)), { longStopProvesLossAlone: false }).result).toBe(false);
+});
+
+it.skipIf(process.platform !== "linux")("provider record (4): stopped 14 minutes, still stopping, or no stoppedAt: not proven", async () => {
+  const { mark, lostWith } = fixture();
+  mark();
+  expect(await lostWith(present("archived", minutesAgo(14))).result).toBe(false);
+  expect(await lostWith(present("archived", minutesAgo(5))).result).toBe(false);
+  for (const state of ["archiving", "stopping", "starting", "resuming", "error", "unknown"]) {
+    expect(await lostWith(present(state, minutesAgo(30))).result, state).toBe(false);
+  }
+  expect(await lostWith(present("archived", null)).result, "missing stoppedAt").toBe(false);
+});
+
+it.skipIf(process.platform !== "linux")("provider record (5): a running predecessor sandbox: the marker probe decides", async () => {
+  const live = fixture();
+  live.mark();
+  expect(await live.lostWith(present("running")).result).toBe(false);
+  const changed = fixture();
+  changed.mark(`linux:${randomUUID()}:${changed.ticks}`);
+  expect(await changed.lostWith(present("idle")).result).toBe(true);
+});
+
+it.skipIf(process.platform !== "linux")("provider record (6): a failed or timed-out provider read proves nothing", async () => {
+  const { mark, lostWith } = fixture();
+  mark();
+  expect(await lostWith(new Error("Boat GET /sandboxes/bx_1 failed (502)")).result).toBe(false);
+  const started = Date.now();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const hung = lostWith("hang");
+    await vi.advanceTimersByTimeAsync(PREDECESSOR_SANDBOX_READ_TIMEOUT_MS + 1);
+    vi.useRealTimers();
+    expect(await hung.result).toBe(false);
+    expect(hung.reads).toHaveLength(1);
+  } finally { vi.useRealTimers(); }
+  expect(Date.now() - started).toBeLessThan(PREDECESSOR_SANDBOX_READ_TIMEOUT_MS);
 });

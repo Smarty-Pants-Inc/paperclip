@@ -14993,16 +14993,71 @@ export async function verifyRemoteRunnerReattachment(input: {
   };
 }
 
+/** Boat (docs.boat.dev/snapshots/stop.md, "Resume within 10 minutes"): after
+ * 10 minutes stopped, a resume always starts a new machine from the snapshot.
+ * Core requires 15. */
+export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
+/** Whether a predecessor sandbox stopped for at least PREDECESSOR_LONG_STOP_MS
+ * proves its Runner gone by itself. RFL ruled yes (2026-11-13) under exact
+ * conditions: a fresh provider read at decision time, state exactly stopped or
+ * archived with a stoppedAt, and the provider's clock when it sends one.
+ * Set false to require a failed marker probe as well. */
+export const PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE = true;
+/** Bound on the caller's read of the predecessor's provider record. */
+export const PREDECESSOR_SANDBOX_READ_TIMEOUT_MS = 15_000;
+
+/** The provider's own record of the PREDECESSOR's sandbox (its own
+ * providerLeaseId, never the current box), as the provider plugin reads it
+ * (Boat: GET /sandboxes/{id}). Never derived from a lease label. */
+export type PredecessorSandboxRecord =
+  /** The provider no longer has the sandbox (Boat: 404; a cancelled sandbox is reported once, then 404). */
+  | { kind: "gone" }
+  | {
+      kind: "present";
+      /** Provider state name, for example running, stopped or archived. */
+      state: string;
+      /** When the sandbox last stopped, by any cause; null while it is not stopped (Boat stoppedAt). */
+      stoppedAt: string | null;
+      /** The sandbox kernel's last restart on its machine: every process running then ended (Boat lastReboot.at). */
+      lastRebootAt: string | null;
+      /** The provider's clock for this answer (the response's Date header), when it sent one. */
+      observedAt?: string | null;
+    };
+
+/** The predecessor Runner's own recorded start, and which record it is. */
+export type PredecessorStart = { at: string; source: "process" | "run" };
+
+// Exactly these states: Boat's API names a stopped sandbox archived (states
+// idle|running|archiving|archived|error|cancelled; get-sandbox reference), and
+// "stopped" is the generic name. A sandbox still stopping (archiving),
+// starting or resuming, or in any other state, is not stopped.
+const LONG_STOP_PROVIDER_STATES = new Set(["stopped", "archived"]);
+
 /**
  * The shared "prior owner proven gone" predicate for a remote Runner (RFL F1).
  * A prior owner is gone ONLY on one of: a different boot generation of its box,
- * its process verified absent, or a successful close of that exact owner
+ * its process verified absent, the provider's own record that its box is gone
+ * or rebooted after it started, or a successful close of that exact owner
  * (runnerd's own `suspended` runner state; checked by the transport's
- * rotation). Never on a provider label such as resumedFromState
- * stopped/archived, and never on a failed close.
+ * rotation). Never on a lease label such as resumedFromState stopped/archived,
+ * and never on a failed close.
  *
- * This function proves the first two: the box's launch marker for this
- * session names that runner instance with a recorded start generation
+ * Provider record (optional `predecessor`: `readSandbox` must be a FRESH read
+ * of the predecessor's own sandbox id at decision time, never cached state;
+ * existing callers pass none):
+ * - gone (404, or cancelled): lost;
+ * - lastRebootAt later than the predecessor's recorded start: lost;
+ * - state exactly stopped or archived, with a stoppedAt at least
+ *   PREDECESSOR_LONG_STOP_MS before now (the provider's clock, observedAt,
+ *   when it sent one, else this server's): lost
+ *   (PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE; when false, the marker probe
+ *   below must fail too);
+ * - stopped for less, stopping, starting, running, or any other state, or a
+ *   missing stoppedAt: the marker probe decides;
+ * - a failed or timed-out provider read proves nothing (the probe still runs).
+ *
+ * Marker probe (the current box): the box's launch marker for this session
+ * names that runner instance with a recorded start generation
  * ("linux:<boot_id>:<start ticks>"), and the process it names is not running
  * (45) or now has a different generation (47): another boot, or a reused pid.
  * A live matching process, a missing or foreign marker, or a failed probe
@@ -15012,9 +15067,30 @@ export async function remoteRunnerGenerationLost(input: {
   runner: CommandManagedRuntimeRunner;
   remoteCwd: string;
   identity: Record<string, unknown>;
+  predecessor?: {
+    readSandbox: () => Promise<PredecessorSandboxRecord>;
+    start: PredecessorStart | null;
+  };
+  longStopProvesLossAlone?: boolean;
+  now?: () => number;
 }): Promise<boolean> {
   const { runnerInstanceId, normalizedSessionId } = input.identity;
   if (typeof runnerInstanceId !== "string" || !runnerInstanceId || typeof normalizedSessionId !== "string" || !normalizedSessionId) return false;
+  if (input.predecessor) {
+    const record = await readPredecessorSandbox(input.predecessor.readSandbox);
+    if (record?.kind === "gone" || (record?.kind === "present" && record.state === "cancelled")) return true;
+    if (record?.kind === "present") {
+      const rebootAt = record.lastRebootAt ? Date.parse(record.lastRebootAt) : Number.NaN;
+      const startAt = input.predecessor.start ? Date.parse(input.predecessor.start.at) : Number.NaN;
+      if (Number.isFinite(rebootAt) && Number.isFinite(startAt) && rebootAt > startAt) return true;
+      const stoppedAt = record.stoppedAt ? Date.parse(record.stoppedAt) : Number.NaN;
+      const providerNow = record.observedAt ? Date.parse(record.observedAt) : Number.NaN;
+      const now = Number.isFinite(providerNow) ? providerNow : (input.now ?? Date.now)();
+      const longStop = LONG_STOP_PROVIDER_STATES.has(record.state) && Number.isFinite(stoppedAt)
+        && now - stoppedAt >= PREDECESSOR_LONG_STOP_MS;
+      if (longStop && (input.longStopProvesLossAlone ?? PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE)) return true;
+    }
+  }
   const identityPath = posix.join(remoteRunnerStateDirectory(input.remoteCwd, normalizedSessionId), "runner-process.identity");
   try {
     const marker = await input.runner.execute({ command: "sh", bypassSession: true, timeoutMs: 10_000,
@@ -15030,6 +15106,20 @@ export async function remoteRunnerGenerationLost(input: {
     return !check.timedOut && (check.exitCode === 45 || check.exitCode === 47);
   } catch {
     return false;
+  }
+}
+
+async function readPredecessorSandbox(read: () => Promise<PredecessorSandboxRecord>): Promise<PredecessorSandboxRecord | null> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      read(),
+      new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), PREDECESSOR_SANDBOX_READ_TIMEOUT_MS); timer.unref?.(); }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
