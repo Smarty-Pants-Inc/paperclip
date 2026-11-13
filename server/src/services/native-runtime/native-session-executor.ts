@@ -740,6 +740,8 @@ type WarmNativeSession = {
 async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, options?: {
   preserveInstructionsForRunId?: string;
   discardUnsettledSession?: boolean;
+  /** The provider woke this allocation from a stopped state: its processes are gone. */
+  allocationRestarted?: boolean;
 }) {
   if (entry.controllerDetachedForRestart) return detachReleasedWarmNativeSession(entry);
   // Revoke before awaiting process retirement/checkpoint IO.
@@ -760,7 +762,10 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
       // session's own state root, and its Runner is stopped. Without a task
       // owner, other close errors can mean controller authority is still live.
       const discardable = options?.discardUnsettledSession === true;
-      const retiredWithoutCheckpoint = discardable && await retainedRunnerContainedAfterFailedClose(entry.session, error);
+      // A restarted allocation is that containment proof too: its machine
+      // stopped, so the old Runner and provider cannot still be running.
+      const retiredWithoutCheckpoint = options?.allocationRestarted === true
+        || discardable && await retainedRunnerContainedAfterFailedClose(entry.session, error);
       if (!retiredWithoutCheckpoint) {
         try { await entry.instructionWorkingCopy?.retirementFailed?.(); }
         catch (receiptError) { throw new AggregateError([error, receiptError], "Warm instruction retirement and receipt both failed"); }
@@ -11715,9 +11720,15 @@ async function executePaperclipNativeSessionAttempt(
       }
     }
     if (entry) {
+      // A resume that woke a stopped allocation restarted its machine: the
+      // retained Runner is gone, so take the cold path (fresh Runner, checkpoint).
+      const allocationRestarted = input.runnerExecutionTarget?.kind === "remote"
+        && input.runnerExecutionTarget.transport === "sandbox"
+        && input.runnerExecutionTarget.sandboxLeaseAcquisition?.restarted === true;
       if (
         ((entry.pluginTaskId ?? entry.sandboxProviderLeaseId) !== undefined && (input.runnerExecutionTarget?.kind !== "remote" || input.runnerExecutionTarget.transport !== "sandbox" ||
           (entry.pluginTaskId ?? entry.sandboxProviderLeaseId) !== input.runnerExecutionTarget.sandboxLeaseAcquisition?.providerLeaseId)) ||
+        allocationRestarted ||
         entry.closeOnReleaseReason !== undefined ||
         entry.configDigest !== warmConfigDigest ||
         !canReuseNativeProcess(input, entry.processConfigDigest) ||
@@ -11731,9 +11742,10 @@ async function executePaperclipNativeSessionAttempt(
         if (entry.busy && !preparedCopy) throw new Error("native_session_supervisor_busy");
         if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
         entry.busy = true;
-        entry.closeOnReleaseReason = "warm native session configuration changed";
+        entry.closeOnReleaseReason = allocationRestarted ? "warm native session allocation restarted" : "warm native session configuration changed";
         try {
-          await closeWarmNativeSession(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
+          await closeWarmNativeSession(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId,
+            ...(allocationRestarted ? { allocationRestarted } : {}) });
           forgetWarmNativeSession(warmSessionId, entry);
         } finally { entry.busy = false; }
         if (preparedCopy) throw new Error("native_instruction_preparation_configuration_changed");
