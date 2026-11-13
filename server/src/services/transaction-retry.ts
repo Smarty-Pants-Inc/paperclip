@@ -1,4 +1,5 @@
 import { PgTransaction } from "drizzle-orm/pg-core";
+import { logger } from "../middleware/logger.js";
 
 /**
  * Bounded retry for transaction OWNERS whose work is database-only.
@@ -21,7 +22,7 @@ export function isRetryableTransactionError(error: unknown): boolean {
 }
 
 /** Process-wide count of retried 40P01/40001 failures (observability and tests). */
-export const transactionRetryStats = { retried: 0 };
+export const transactionRetryStats = { retried: 0, insideTransaction: 0 };
 
 export class TransactionRetryInsideTransactionError extends Error {
   constructor() {
@@ -34,7 +35,19 @@ export class TransactionRetryInsideTransactionError extends Error {
 
 /** Throws when `db` is a drizzle transaction (or savepoint) handle rather than the pool-level db. */
 export function assertNotTransactionBound(db: unknown): void {
-  if (db instanceof PgTransaction) throw new TransactionRetryInsideTransactionError();
+  if (!(db instanceof PgTransaction)) return;
+  const error = new TransactionRetryInsideTransactionError();
+  logger.error({ err: error, count: ++transactionRetryStats.insideTransaction }, "withTransactionRetry was given a transaction-bound db handle");
+  throw error;
+}
+
+/**
+ * For owners that are also called with a caller's transaction handle: retry
+ * when `db` is the pool-level db (this call opens the outermost transaction),
+ * and run once inside a caller's transaction, whose owner decides on a retry.
+ */
+export function retryUnlessTransactionBound<T>(db: object, run: (attempt: number) => Promise<T>): Promise<T> {
+  return db instanceof PgTransaction ? run(1) : withTransactionRetry(db, run);
 }
 
 /**

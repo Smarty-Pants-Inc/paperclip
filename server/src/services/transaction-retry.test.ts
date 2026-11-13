@@ -5,6 +5,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import {
   TRANSACTION_RETRY_ATTEMPTS,
   TransactionRetryInsideTransactionError,
+  retryUnlessTransactionBound,
+  transactionRetryStats,
   withTransactionRetry,
 } from "./transaction-retry.js";
 
@@ -22,11 +24,25 @@ const support = await getEmbeddedPostgresTestSupport();
 
   it("refuses a transaction handle before any attempt, with a clear error", async () => {
     let attempts = 0;
+    const countedBefore = transactionRetryStats.insideTransaction;
     const outcome = await db.transaction(async tx => withTransactionRetry(tx, async () => { attempts++; return "ran"; }))
       .then(() => null, (error: unknown) => error);
     expect(outcome).toBeInstanceOf(TransactionRetryInsideTransactionError);
+    // smarty-dev#20455: the refusal is counted (and logged) so a production occurrence is visible.
+    expect(transactionRetryStats.insideTransaction).toBe(countedBefore + 1);
     expect(String((outcome as Error).message)).toMatch(/transaction-bound db handle/);
     expect(attempts).toBe(0);
+  });
+
+  it("retryUnlessTransactionBound runs once inside a caller's transaction and retries on the pool db", async () => {
+    let inside = 0;
+    await expect(db.transaction(async tx => retryUnlessTransactionBound(tx, async () => { inside++; throw deadlock(); })))
+      .rejects.toMatchObject({ code: "40P01" });
+    expect(inside).toBe(1);
+    let pooled = 0;
+    await expect(retryUnlessTransactionBound(db, async attempt => { pooled++; if (attempt < 2) throw deadlock(); return "ok"; }))
+      .resolves.toBe("ok");
+    expect(pooled).toBe(2);
   });
 
   it("refuses a nested savepoint handle too", async () => {
