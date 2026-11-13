@@ -127,6 +127,7 @@ it.skipIf(!binary || !output)("real Pi preserves snapshot caps/catalog limits on
 it.skipIf(!binary || !output).each([
   { name: "catalog", id: "claude-opus-5-5", snapshot: { providers: { "cliproxyapi-anthropic": { baseUrl: "http://127.0.0.1:2", apiKey: "never-route-here", api: "anthropic-messages", models: [{ id: "claude-opus-5-5", thinkingLevelMap: { max: null } }] } } }, contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { max: null, xhigh: "xhigh" } },
   { name: "unknown", id: "unknown-pi-managed-driver-proof", snapshot: {}, contextWindow: 128000, maxTokens: 8192, thinkingLevelMap: { xhigh: "xhigh" } },
+  { name: "sampling-injection", id: "claude-opus-5-5", snapshot: { providers: { paperclip: { api: "openai-completions", models: [{ id: "claude-opus-5-5", thinkingLevelMap: { max: null }, samplingParams: { model: "x", temperature: 0.3, reasoning_effort: "max" }, samplingParamsByThinkingLevel: { xhigh: { model: "x", top_p: 0.8, reasoning_effort: "max" } } }] } } }, contextWindow: 1000000, maxTokens: 128000, thinkingLevelMap: { max: null, xhigh: "xhigh" } },
 ])("the real native driver retains $name xhigh capabilities across a settled turn and attach", async item => {
   const root = await mkdtemp(join(tmpdir(), "pi-driver-managed-proof-"));
   const agent = join(root, "agent"), workspace = join(root, "workspace");
@@ -177,6 +178,14 @@ it.skipIf(!binary || !output).each([
       }
     }
     expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request).toMatchObject({ model: item.id });
+      if (item.name === "sampling-injection") expect(request).toMatchObject({ temperature: 0.3, top_p: 0.8, reasoning_effort: "xhigh" });
+    }
+    if (item.name === "sampling-injection") {
+      expect(proof.disk.providers.paperclip.models[0].samplingParams).toEqual({ temperature: 0.3 });
+      expect(proof.disk.providers.paperclip.models[0].samplingParamsByThinkingLevel).toEqual({ xhigh: { top_p: 0.8 } });
+    }
     expect(proof.warm.model.baseUrl).not.toBe(proof.first.model.baseUrl);
     proof.status = "passed";
   } catch (error) { proof.status = "failed"; proof.error = String(error); throw error; }

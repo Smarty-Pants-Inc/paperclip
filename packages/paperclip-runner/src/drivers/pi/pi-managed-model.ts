@@ -1,12 +1,20 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isPiModelCompat, PI_MODEL_ROUTING_FIELDS, type PiBindModel, type PiBindProvider, type PiThinkingLevel } from "./pi-bind-protocol.js";
+import { digest, isPiModelCompat, piModelSamplingOverrides, PI_MODEL_ROUTING_FIELDS, type PiBindModel, type PiBindProvider, type PiThinkingLevel } from "./pi-bind-protocol.js";
 
 /** The whole model definition, with upstream routing/auth removed. */
 export type PiManagedModel = PiBindModel;
 type Diagnose = (message: string) => void;
 const diagnose: Diagnose = message => console.warn(`Pi managed model metadata: ${message}`);
+const strippedSamplingDiagnostic = "stripped protected sampling key ";
+function reportDiagnostics(messages: Set<string>, warn: Diagnose): void {
+  // Retain the existing bounded summary for capability fallbacks, but never
+  // truncate away a stripped-key diagnostic or combine away its identity.
+  const summary = [...messages].filter(message => !message.startsWith(strippedSamplingDiagnostic));
+  if (summary.length) warn(summary.sort((a, b) => Number(b.startsWith("compat fallback")) - Number(a.startsWith("compat fallback"))).join("; ").slice(0, 220));
+  for (const message of messages) if (message.startsWith(strippedSamplingDiagnostic)) warn(message.slice(0, 220));
+}
 
 /** Capture before projecting HOME/PI_CODING_AGENT_DIR into a managed sandbox. */
 export function originalPiModelsFile(environment: NodeJS.ProcessEnv): string {
@@ -25,7 +33,7 @@ export async function buildPiManagedModel(input: {
     const configured = await configuredPiManagedModelSources(input.snapshot, input.id, input.originalModelsFile, input.api, message => messages.add(message));
     return resolvePiManagedModel(configured, input.catalog, input.api, message => messages.add(message));
   } finally {
-    if (messages.size) (input.warn ?? diagnose)([...messages].sort((a, b) => Number(b.startsWith("compat fallback")) - Number(a.startsWith("compat fallback"))).join("; ").slice(0, 220));
+    reportDiagnostics(messages, input.warn ?? diagnose);
   }
 }
 export interface PiBuiltinModelCatalog {
@@ -38,18 +46,26 @@ const levels: PiThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "x
 // Negative routing list, deliberately NOT a capability allowlist. New Pi model
 // metadata survives without another Paperclip patch. Provider routing is built
 // independently by createPiProviderBinding; none is inherited from the source.
-const apiShapedFields = ["compat", "samplingParams", "samplingParamsByThinkingLevel"] as const;
+const apiShapedField = (key: string) => key === "compat" || key.startsWith("samplingParams");
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
-export function piManagedModelDefinition(model: PiBindModel): PiManagedModel {
-  return structuredClone(Object.fromEntries(Object.entries(model).filter(([key]) => !PI_MODEL_ROUTING_FIELDS.has(key)))) as PiManagedModel;
+export function piManagedModelDefinition(model: PiBindModel, warn: Diagnose = diagnose): PiManagedModel {
+  const result = structuredClone(Object.fromEntries(Object.entries(model).filter(([key]) => !PI_MODEL_ROUTING_FIELDS.has(key)))) as PiManagedModel;
+  for (const { parameters, key, path } of piModelSamplingOverrides(result)) {
+    delete parameters[key];
+    // Keys/paths only, never request values (which can contain credentials).
+    const message = `${strippedSamplingDiagnostic}${JSON.stringify(key)} at ${JSON.stringify(path)}`;
+    // Keep long paths distinct before operation-local deduplication.
+    warn(message.length <= 220 ? message : `${message.slice(0, 196)}...#${digest(path).slice(0, 20)}`);
+  }
+  return result;
 }
 function forApi(model: PiBindModel, sourceApi: unknown, api?: PiBindProvider["api"], warn: Diagnose = diagnose): PiManagedModel {
-  const result = piManagedModelDefinition(model);
+  const result = piManagedModelDefinition(model, warn);
   if (api === undefined || sourceApi !== api) {
-    if (apiShapedFields.some(field => Object.hasOwn(result, field))) warn("source API mismatch; skipping compat and API-shaped fields");
-    for (const field of apiShapedFields) delete result[field];
+    if (Object.keys(result).some(apiShapedField)) warn("source API mismatch; skipping compat and API-shaped fields");
+    for (const field of Object.keys(result).filter(apiShapedField)) delete result[field];
   }
   return result;
 }
@@ -127,7 +143,7 @@ export async function configuredPiManagedModelSources(snapshot: unknown, id: str
     return { ...fallback, ...primary,
       ...(fallback.thinkingLevelMap || primary.thinkingLevelMap ? { thinkingLevelMap: { ...fallback.thinkingLevelMap, ...primary.thinkingLevelMap } } : {}) };
   } finally {
-    if (messages.size) warn([...messages].join("; "));
+    reportDiagnostics(messages, warn);
   }
 }
 
@@ -141,15 +157,17 @@ export function resolvePiManagedModel(model: PiManagedModel, catalog?: PiBuiltin
   const owner = api === "anthropic-messages" ? "anthropic" : "openai";
   const canonical = api === undefined ? undefined : catalog?.getBuiltinModels(owner).find(entry => entry.id === model.id && entry.api === api);
   const selected = canonical ?? matches[0];
-  const fallback: Partial<PiManagedModel> = selected ? forApi(selected, selected.api, api, () => {}) : {};
+  const fallback: Partial<PiManagedModel> = selected ? forApi(selected, selected.api, api, message => {
+    if (message.startsWith(strippedSamplingDiagnostic)) warn(message);
+  }) : {};
   // Only the canonical API owner may supply catalog dialects (aa685317).
-  if (!canonical) for (const field of apiShapedFields) delete fallback[field];
+  if (!canonical) for (const field of Object.keys(fallback).filter(apiShapedField)) delete fallback[field];
   if (model.compat !== undefined && !isPiModelCompat(model.compat)) throw new Error("Pi configured model has invalid compat");
   if (model.compat === undefined && api !== undefined) {
     if (canonical?.compat !== undefined && isPiModelCompat(canonical.compat)) diagnostics.push(`compat fallback copied from canonical provider ${owner}`);
     else diagnostics.push(`canonical provider ${owner}: no exact API/id compat; skipped`);
   }
-  const definition = { ...fallback, ...piManagedModelDefinition(model) };
+  const definition = { ...fallback, ...piManagedModelDefinition(model, warn) };
   const complete = model.contextWindow !== undefined && model.maxTokens !== undefined && model.reasoning !== undefined;
   const thinkingLevelMap: PiBindModel["thinkingLevelMap"] = {};
   if (!selected && !complete) {
