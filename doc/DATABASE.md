@@ -2245,6 +2245,18 @@ uses ordered `FOR NO KEY UPDATE` locks, which remain compatible with foreign-key
 references while excluding runtime readers' `FOR SHARE` locks. Connector feature
 switches use the same journal; process-start overlays receive a delivery baseline.
 
+Named MCP gateway creation and updates take the complete company runtime-agent
+lock set in ascending agent ID order before locking a scoped configure-permission
+actor or target. Updates take that set before the gateway row as well. Gateway
+writes invalidate the whole company, even when the gateway belongs to one agent;
+locking that agent first would invert a concurrent multi-agent permission read
+when the invalidation trigger visits a lower-ID peer. The service reuses
+`lockToolAssignmentAgents`; the trigger's journal and permission checks remain
+in the same transaction. Native warm-up creation and legacy unbound-gateway
+binding repair follow the same order; the repair retains its null-agent CAS.
+Run `pnpm --filter @paperclipai/server exec vitest run src/__tests__/gateway-runtime-lock-order.test.ts --maxWorkers=2`
+for the real-PostgreSQL create/update concurrency regression.
+
 Migration 0355 extends connector invalidation to tool definitions and
 configuration. Statement triggers cover applications, connections, catalogs,
 profiles and entries, bindings, policies, and MCP gateways. They ignore health

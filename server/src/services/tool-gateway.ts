@@ -1,4 +1,5 @@
 import { assertAgentToolAssignmentInteractions } from "./connection-management.js";
+import { lockToolAssignmentAgents } from "./tool-access/assignment-locks.js";
 import { isNewHumanIntentAfterToolRejection } from "./tool-action-replay-intent.js";
 import { approvalSnapshotsMatch, approvalTargetChangeMessage, oauthApprovalConfig,
   approvalGrantTenantIdentity, externalCredentialApprovalIdentity } from "./tool-approval-target.js";
@@ -9238,6 +9239,12 @@ export function createToolGatewayService(
         input.body.slug ??
         slugSegment(input.body.name, "gateway");
       const gateway = await db.transaction(async tx => {
+        // Gateway mutations invalidate every active agent's connector runtime.
+        // Lock that complete set in ID order before configure-permission checks
+        // lock a scoped (possibly higher-ID) actor/target. Otherwise the trigger
+        // waits on a lower agent while its permission reader waits on our actor.
+        await lockToolAssignmentAgents(tx, input.companyId, [{ targetType: "company", targetId: input.companyId }],
+          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : input.actor?.agentId);
         await assertAgentToolAssignmentInteractions(tx as unknown as Db,
           input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : input.actor?.agentId,
           input.companyId, input.body.agentId ? [input.body.agentId] : []);
@@ -9344,6 +9351,11 @@ export function createToolGatewayService(
     }): Promise<ToolMcpGatewayWithTokens> {
       await input.managementContext?.reauthorize();
       const updated = await db.transaction(async tx => {
+        // Match create and the connector trigger: company agents before scoped
+        // permission checks or gateway locks, so gateway owners cannot invert
+        // the same lock set.
+        await lockToolAssignmentAgents(tx, input.companyId, [{ targetType: "company", targetId: input.companyId }],
+          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : null);
         const [existing] = await tx
           .select()
           .from(toolMcpGateways)
