@@ -787,6 +787,49 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     }
   }
 
+  it("promotes one deferred plugin wake after a native response-wake run is stranded", async () => {
+    const seeded = await strandedMention("native");
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, seeded.issue.id));
+    await db.update(agentWakeupRequests).set({ agentId: seeded.agent.id, payload: {
+      issueId: seeded.issue.id,
+      _paperclipWakeContext: { issueId: seeded.issue.id, wakeReason: "plugin wake", pluginId: "blocker-relay" },
+    } }).where(eq(agentWakeupRequests.id, seeded.pending.id));
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(seeded.recipient);
+    deps.canStartNewExternalBotWork.mockResolvedValue(false);
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => "responsible-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    }), recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+    const controlDeps = runControlCallbacks(db);
+    vi.mocked(controlDeps.wakeQueue.releaseIssueExecution).mockImplementation(release);
+    deps.releaseIssueExecutionAndPromote.mockImplementation(createHeartbeatRunControl(db, controlDeps).releaseIssueExecutionAndPromote);
+
+    await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, seeded.agent.id));
+    expect(runs.filter(run => run.status === "queued")).toHaveLength(1);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, seeded.pending.id)))[0])
+      .toMatchObject({ status: "queued", runId: runs.find(run => run.status === "queued")!.id });
+  });
+
+  it("does not create a run for a response-wake issue with no deferred wake", async () => {
+    const seeded = await fixture("succeeded");
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: seeded.issue.id, finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, seeded.run.id));
+    await db.insert(nativeRunFinalizations).values({ runId: seeded.run.id, companyId: seeded.company.id,
+      issueId: seeded.issue.id, phase: "committed" });
+    await db.update(issues).set({ status: "in_progress", executionRunId: null, checkoutRunId: null }).where(eq(issues.id, seeded.issue.id));
+    const deps = callbacks(db);
+
+    await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, seeded.agent.id)))
+      .toHaveLength(1);
+    expect(deps.executeRun).not.toHaveBeenCalled();
+  });
+
   it.each(["legacy", "native"])("keeps saved %s messages while avoiding repeated native source release", async runtimeMode => {
     const seeded = await strandedMention(runtimeMode);
     const messages = await addStrandedMessages(seeded);
