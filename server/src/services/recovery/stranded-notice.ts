@@ -268,9 +268,14 @@ export function buildStrandedRecoveryEscalationNotice(input: {
   seed?: StrandedRecoveryNoticeSeed | null;
   fallbackBody?: string | null;
   recoveryCause?: string | null;
-  recoveryActionId: string;
+  /** Null only for a notice with no recovery action (an unanswered person message). */
+  recoveryActionId: string | null;
   continuesAutomatically?: boolean;
   recoveryOwner: { id: string; name: string | null } | null | undefined;
+  /** Overrides the cause-derived responsibility: "user" when the person must act. */
+  recoveryResponsibility?: "system" | "user";
+  /** The allowlisted code when there is no source run. */
+  failureCode?: string | null;
   sourceRun: {
     id: string;
     agentId?: string | null;
@@ -300,14 +305,16 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     DEFAULT_STRANDED_RECOVERY_NOTICE_TITLE;
 
   const recoveryRows: NoticeMetadataRow[] = [
-    keyValueRow("Recovery action", input.recoveryActionId),
-    input.recoveryOwner
-      ? agentLinkRow("Recovery owner", input.recoveryOwner)
-      : keyValueRow(
-          "Recovery owner",
-          // A pre-dispatch provider outage needs no board decision, only Retry.
-          input.recoveryCause === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE ? "Retry when ready" : "Waiting for you",
-        ),
+    ...(input.recoveryActionId === null ? [] : [
+      keyValueRow("Recovery action", input.recoveryActionId),
+      input.recoveryOwner
+        ? agentLinkRow("Recovery owner", input.recoveryOwner)
+        : keyValueRow(
+            "Recovery owner",
+            // A pre-dispatch provider outage needs no board decision, only Retry.
+            input.recoveryCause === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE ? "Retry when ready" : "Waiting for you",
+          ),
+    ]),
     keyValueRow(
       "Next action",
       seed?.nextAction ?? (input.recoveryOwner
@@ -323,6 +330,8 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     if (failureCode) runRows.push(keyValueRow("Failure code", failureCode));
     const failureSummary = input.sourceRun.errorSummary?.trim();
     if (failureSummary) runRows.push(keyValueRow("Failure summary", failureSummary));
+  } else if (input.failureCode?.trim()) {
+    runRows.push(keyValueRow("Failure code", input.failureCode.trim()));
   }
 
   const sections: NoticeMetadataSection[] = [
@@ -335,9 +344,9 @@ export function buildStrandedRecoveryEscalationNotice(input: {
     presentation: systemNoticePresentation({ tone: seed?.tone ?? "danger", title }),
     metadata: {
       version: 1,
-      recoveryResponsibility: input.recoveryCause === "configuration_incomplete" ||
+      recoveryResponsibility: input.recoveryResponsibility ?? (input.recoveryCause === "configuration_incomplete" ||
         ["provider_quota", "claude_auth_required", "acpx_auth_required"].includes(input.sourceRun?.errorCode ?? "")
-        ? "user" : "system",
+        ? "user" : "system"),
       sourceRunId: input.sourceRun?.id ?? null,
       sections,
     },
