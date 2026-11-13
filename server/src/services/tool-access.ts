@@ -42,6 +42,7 @@ import { createConnectionCredentialAccess } from "./tool-access/credential-acces
 
 import { createOAuthCredentialStore, actorForSecret } from "./tool-access/oauth/credential-store.js";
 import { managedConnectorProfile } from "./tool-access/oauth/client-settings.js";
+export { appWithDeploymentOAuthClient } from "./tool-access/oauth/client-settings.js";
 import { createOAuthClientRegistration } from "./tool-access/oauth/client-registration.js";
 import { createOAuthRefreshLeases } from "./tool-access/oauth/refresh-leases.js";
 import { createLegacyOAuthRefresh } from "./tool-access/oauth/connection-refresh.js";
@@ -4321,7 +4322,7 @@ export function toolAccessService(
       if (legacyShared && !grantId) return resolveCredentialHeaders(connection, actor);
       let grant = grantId ? allowed.find(candidate => candidate.id === grantId) : allowed.length === 1 ? allowed[0] : undefined;
       if (!grant) throw forbidden("Choose an active GitHub authorization you can use.");
-      if (asRecord(asRecord(connection.config).oauth).connectorProfile === "github.code") {
+      if (connection.authKind === "oauth") {
         grant = await refreshOAuthGrantCredentials({ companyId, connectionId, grantId: grant.id, actor, forceRefresh });
       }
       const ref = grant.credentialSecretRefs.find(ref => ref.configPath === "oauth.access_token" || /authorization|token|api_key/i.test(ref.configPath));
@@ -4435,7 +4436,15 @@ export function toolAccessService(
             } else {
               const headers = await measureRunPhase("connectors.github.credentials", () => initialGrant
                 ? (async () => {
-                    const ref = initialGrant.credentialSecretRefs.find(
+                    const grant = connection.authKind === "oauth"
+                      ? await refreshOAuthGrantCredentials({
+                          companyId,
+                          connectionId: connection.id,
+                          grantId: initialGrant.id,
+                          actor,
+                        })
+                      : initialGrant;
+                    const ref = grant.credentialSecretRefs.find(
                       (ref) =>
                         ref.configPath === "oauth.access_token" ||
                         /authorization|token|api_key/i.test(ref.configPath),
@@ -4446,7 +4455,7 @@ export function toolAccessService(
                       );
                     const secret = await resolveOAuthGrantSecret(
                       connection,
-                      initialGrant,
+                      grant,
                       ref,
                       actor,
                       undefined,
