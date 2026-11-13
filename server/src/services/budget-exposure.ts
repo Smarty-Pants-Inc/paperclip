@@ -1,6 +1,6 @@
 import { addCents, normalizeCents, usdToUnits, unitsToCents } from "@paperclipai/shared";
 import { and, eq, gte, inArray, lt, or, sql, type SQL } from "drizzle-orm";
-import { budgetPolicies, budgetReservations, browserUseRuns, browserUseSessions, costEvents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { budgetPolicies, budgetReservations, browserUseRuns, browserUseSessions, costEvents, heartbeatRuns, issues, runUsageReceipts, type Db } from "@paperclipai/db";
 import { withBudgetSpan } from "./budget-tracing.js";
 
 export interface BudgetExposure {
@@ -147,7 +147,12 @@ async function readObservedSpends(db: Db, policies: SpendPolicy[], now: Date): P
           and (lost_receipt_run.usage_json->>'accountingReceiptUnavailable' = 'true'
             or lost_receipt_run.usage_json->>'accountingClosureTimedOut' = 'true'
             or lost_receipt_run.usage_json->>'accountingCaptureFailed' = 'true'
-            or coalesce(lost_receipt_run.usage_json->'pricingProvenance'->>'evidence', '') like '%lost on restore%')))
+            or exists (select 1 from ${runUsageReceipts} lost_turn_receipt
+              where lost_turn_receipt.run_id = lost_receipt_run.id
+                and lost_turn_receipt.company_id = lost_receipt_run.company_id
+                -- Typed producer marker, derived only from the existing
+                -- provider_turn_lost_on_restore error code. Never match prose.
+                and lost_turn_receipt.receipt_json->'producerEvent'->>'lostOnRestore' = 'true'))))
       or ${costEvents.costCents} > 0
       or (${costEvents.billingType} in ('metered_api', 'api', 'subscription') and ${costEvents.inputTokens} = 0 and ${costEvents.cachedInputTokens} = 0
         and ${costEvents.outputTokens} = 0))`;
