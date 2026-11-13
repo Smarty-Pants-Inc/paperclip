@@ -21,6 +21,14 @@ provider credentials.
   scheduler. A batch of 100 events advances it to now. A flush sends at most
   100 rows per INSERT and uses `ON CONFLICT (id) DO NOTHING`, so a retry after an
   uncertain commit cannot duplicate an audit event.
+- A foreign-key violation retries the batch in a transaction that nulls missing
+  optional secret, user-secret definition, issue, run and plugin references.
+  Existing reference rows are key-share locked through insertion, so concurrent
+  deletion cannot reopen the check/write gap. Every event keeps its original UUID,
+  timestamp and non-reference metadata, including unrelated healthy handoffs.
+  Required company scope is never nulled or reassigned; a missing company remains
+  an explicit persistence failure. Agent and environment identities are not
+  foreign keys in this audit table. Recovery adds no queries to successful batches.
 - Each failed write is logged without its raw SQL/provider error and retried
   once immediately. A second failure retains the whole batch, propagates from
   explicit flush, and establishes a new one-second recovery deadline. Records
@@ -98,6 +106,13 @@ shutdown recovery, caller-owned transaction rollback, one-second/100-event
 batching and quiet settled state. Stalled and failed INSERT tests hold 10,050
 producers at 10,000 admitted records, then require all unique events on recovery;
 a mixed touch/audit test proves the shared capacity also bounds usage metadata.
+`secret-resolution-deletion.test.ts` resolves through the real secret service,
+removes an issue through `issueService.remove`, then requires both that handoff
+(with a null issue reference) and an unrelated healthy handoff to persist and drain.
+It also deletes each other nullable FK target and all targets together, preserving
+live references. A recovery-commit/connection-loss case requires retry without
+duplicates. These tests cover data safety at the real PostgreSQL persistence boundary.
+
 These are data-safety and recorded warm-turn row-contention regressions. They
 are not a claim of a deployed Boat wake-to-start latency improvement; that must
 be measured on the real company after the candidate is integrated.

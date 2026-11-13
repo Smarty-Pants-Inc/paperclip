@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull, lt, or } from "drizzle-orm";
-import { companySecrets, secretAccessEvents, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNull, lt, or } from "drizzle-orm";
+import { companySecrets, heartbeatRuns, issues, plugins, secretAccessEvents, userSecretDefinitions, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { createWorkScheduler } from "./work-scheduler.js";
@@ -97,6 +97,52 @@ async function retryOnce(write: () => Promise<unknown>, kind: string) {
     }
   }
 }
+function isForeignKeyViolation(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  while (error && typeof error === "object" && !seen.has(error)) {
+    seen.add(error);
+    if ("code" in error && error.code === "23503") return true;
+    error = "cause" in error ? error.cause : undefined;
+  }
+  return false;
+}
+
+async function insertAuditBatch(db: Db, batch: AccessEvent[]) {
+  try {
+    await db.insert(secretAccessEvents).values(batch).onConflictDoNothing({ target: secretAccessEvents.id });
+  } catch (error) {
+    if (!isForeignKeyViolation(error)) throw error;
+    // ON DELETE cannot repair references still in memory. Recover only on FK
+    // failure, keeping the normal warm batch to one INSERT and preserving IDs.
+    await db.transaction(async tx => {
+      let normalized = batch;
+      const references = [
+        ["secretId", companySecrets],
+        ["userSecretDefinitionId", userSecretDefinitions],
+        ["issueId", issues],
+        ["heartbeatRunId", heartbeatRuns],
+        ["pluginId", plugins],
+      ] as const;
+      for (const [field, table] of references) {
+        const ids = [...new Set(batch.map(event => event[field]).filter((id): id is string => typeof id === "string"))].sort();
+        if (!ids.length) continue;
+        // Key-share locks close the check/INSERT deletion race. Deterministic
+        // order also keeps concurrent recovery batches' lock order consistent.
+        const rows = await tx.select({ id: table.id }).from(table)
+          .where(inArray(table.id, ids)).orderBy(table.id).for("key share");
+        const existing = new Set(rows.map(row => row.id));
+        normalized = normalized.map(event => ({
+          ...event,
+          [field]: event[field] && existing.has(event[field]) ? event[field] : null,
+        }));
+      }
+      // companyId is required tenant scope, never nulled or reassigned. A
+      // missing company remains a persistence failure rather than a lost audit.
+      await tx.insert(secretAccessEvents).values(normalized).onConflictDoNothing({ target: secretAccessEvents.id });
+    });
+  }
+}
+
 function flush(state: State): Promise<void> {
   if (state.running) return state.running;
   scheduler.cancel(state.key);
@@ -105,7 +151,7 @@ function flush(state: State): Promise<void> {
       // Delete only confirmed inserts. A failed/uncertain batch stays queued.
       if (state.events.length) {
         const batch = state.events.slice(0, BATCH_SIZE);
-        await retryOnce(async () => state.db.insert(secretAccessEvents).values(batch).onConflictDoNothing({ target: secretAccessEvents.id }), "audit");
+        await retryOnce(() => insertAuditBatch(state.db, batch), "audit");
         state.events.splice(0, batch.length);
         releaseCapacity(state);
       }
