@@ -4729,7 +4729,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" },
         };
         if (method === "environmentReleaseLease" || method === "environmentDestroyLease") return undefined;
-        if (method === "environmentExecute") return { exitCode: 0, stdout: `served:${params.config.from}:${params.command}`, stderr: "" };
+        if (method === "environmentExecute") {
+          // This fixture serves the original executable, not the `env` wrapper.
+          // No caller env was supplied by these warm-conversation commands.
+          expect(params.command).toBe("env");
+          expect(params.args).toEqual(["NODE_DISABLE_COMPILE_CACHE=1", expect.any(String)]);
+          expect(params.env).toBeUndefined();
+          return { exitCode: 0, stdout: `served:${params.config.from}:${params.args[1]}`, stderr: "" };
+        }
         throw new Error(`Unexpected compatible-source method: ${method}`);
       }),
     } as unknown as PluginWorkerManager;
@@ -6777,7 +6784,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       command: "echo",
       args: ["ok"],
       cwd: "/workspace/project",
-      env: { FOO: "bar" },
+      env: { FOO: "bar", NODE_DISABLE_COMPILE_CACHE: "1" },
     }), 31000);
     expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", {
       driverKey: "fake-plugin",

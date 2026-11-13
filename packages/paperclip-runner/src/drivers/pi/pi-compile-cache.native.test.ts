@@ -40,13 +40,17 @@ describe.skipIf(!binary || process.platform === "win32" || process.getuid?.() ==
       if (!address || typeof address === "string") throw new Error("No loopback port");
       for (let attempt = 1; attempt <= 2; ++attempt) {
         const run = join(root, String(attempt)), home = join(run, "agent"), workspace = join(run, "workspace"), sessions = join(run, "sessions");
-        const cache = join(sessions, "node-compile-cache"), probe = join(run, "native-cache.json");
+        const cache = join(sessions, "node-compile-cache"), probe = join(run, "native-cache.json"), mcpProbe = join(run, "mcp-cache.json");
         await mkdir(join(home, "extensions"), { recursive: true, mode: 0o700 });
         await mkdir(workspace); await mkdir(sessions, { mode: 0o700 });
         if (kind === "unwritable") await mkdir(cache, { mode: 0o500 });
         if (kind === "absent-cache-directory") await writeFile(cache, "directory unavailable: occupied by a file");
         await writeFile(join(home, "settings.json"), JSON.stringify({ packages: [], cacheWarming: "off", compaction: { enabled: false }, retry: { enabled: false }, defaultProjectTrust: "never" }));
         await writeFile(join(home, "models.json"), JSON.stringify({ providers: { "cache-proof": { baseUrl: `http://127.0.0.1:${address.port}/v1`, api: "openai-completions", apiKey: "unused-loopback-placeholder", models: [{ id: "faux" }] } } }));
+        // Native stdio MCP must inherit the same policy, not merely Pi itself.
+        const mcp = join(run, "cache-mcp.cjs");
+        await writeFile(mcp, `const fs=require('node:fs'); const result=require('node:module').enableCompileCache(); fs.writeFileSync(${JSON.stringify(mcpProbe)},JSON.stringify({pid:process.pid,result,cache:process.env.NODE_COMPILE_CACHE,disabled:process.env.NODE_DISABLE_COMPILE_CACHE})); require('node:readline').createInterface({input:process.stdin}).on('line',line=>{const message=JSON.parse(line); if(message.id===undefined)return; const result=message.method==='initialize'?{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'cache-policy',version:'1'}}:message.method==='tools/list'?{tools:[]}:{}; console.log(JSON.stringify({jsonrpc:'2.0',id:message.id,result}));});\n`);
+        await writeFile(join(home, "mcp.json"), JSON.stringify({ mcpServers: { "cache-policy": { command: process.execPath, args: [mcp], exposure: "direct" } } }));
         // Observe the native Node API INSIDE Pi, not only the driver's env object.
         await writeFile(join(home, "extensions", "cache-probe.ts"), `import {enableCompileCache} from 'node:module'; import {writeFileSync} from 'node:fs'; export default function(pi) { pi.on('session_start', () => writeFileSync(${JSON.stringify(probe)}, JSON.stringify({pid: process.pid, argv: process.argv, result: enableCompileCache(), cache: process.env.NODE_COMPILE_CACHE, disabled: process.env.NODE_DISABLE_COMPILE_CACHE}))); }\n`);
         let transport: PiRpcTransport | undefined, session: PiRpcHarnessSession | undefined;
@@ -97,13 +101,25 @@ describe.skipIf(!binary || process.platform === "win32" || process.getuid?.() ==
             if (["turn.failed", "turn.cancelled"].includes(event.eventType)) throw new Error(JSON.stringify(event));
           }
           expect(reply).toBe("CACHE_POLICY_OK");
-          Object.assign(launch, { status: "passed", native, reply, pid: session.processPid() });
+          const stdio = JSON.parse(await readFile(mcpProbe, "utf8"));
+          expect(stdio.cache).toBe(cache);
+          if (kind === "private") {
+            expect(stdio.disabled).toBeUndefined();
+            expect([1, 2]).toContain(stdio.result.status);
+          } else {
+            expect(stdio.disabled).toBe("1");
+            expect(stdio.result.status).toBe(3);
+          }
+          Object.assign(launch, { status: "passed", native, stdio, reply, pid: session.processPid() });
         } catch (error) { launch.error = String(error); launch.status = "failed"; throw error; }
         finally {
           await session?.close(); await transport?.close();
           launch.processAbsentAfterClose = !transport?.pid || !existsSync(`/proc/${transport.pid}`);
           launch.records = records;
           expect(launch.processAbsentAfterClose).toBe(true);
+          const stdioPid = (launch.stdio as { pid?: number } | undefined)?.pid;
+          launch.stdioProcessAbsentAfterClose = !stdioPid || !existsSync(`/proc/${stdioPid}`);
+          expect(launch.stdioProcessAbsentAfterClose).toBe(true);
           if (kind === "unwritable") await chmod(cache, 0o700);
         }
       }
