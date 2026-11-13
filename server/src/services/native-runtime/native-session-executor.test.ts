@@ -1305,6 +1305,8 @@ describe("remote runner process supervision", () => {
     const marker = join(root, "identity");
     const ok = { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
     let nonce = "", reads = 0, publication: Promise<void> | undefined;
+    let identityPublished = false;
+    const startedAfterPublication: boolean[] = [];
     const execute = vi.fn(async (request: { command: string; args?: string[] }) => {
       const label = request.args?.[2];
       if (label === "paperclip-runner-launch") { nonce = request.args![4]!; return ok; }
@@ -1313,6 +1315,7 @@ describe("remote runner process supervision", () => {
         publication ??= new Promise<void>(resolve => setTimeout(resolve, 500)).then(async () => {
           await writeFile(`${marker}.tmp`, `${nonce}\n4321\n2026-11-12T22:12:00.000Z\nrunner-event\n`);
           await rename(`${marker}.tmp`, marker);
+          identityPublished = true;
         });
         return await new Promise<typeof ok>(resolve => execFile(request.command, request.args ?? [], { timeout: 3000 },
           (error, stdout, stderr) => resolve({ ...ok, stdout, stderr, exitCode: error ? 1 : 0 })));
@@ -1323,11 +1326,14 @@ describe("remote runner process supervision", () => {
       target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: root },
       runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: marker,
       stateDirectory: root, diagnosticsDirectory: join(root, "diagnostics"), runnerInstanceId: "runner-event",
+      onRunnerProcessSpawned: () => startedAfterPublication.push(identityPublished),
+      onSpawn: async () => { expect(startedAfterPublication).toEqual([true]); },
     })({ command: "/runtime/runnerd", args: [], cwd: root, environment: {} });
     try {
       await handle.completion;
       expect(handle.child.pid).toBe(4321);
       expect(reads).toBe(1);
+      expect(startedAfterPublication).toEqual([true]);
       expect(handle.isExitConfirmed?.()).toBe(true);
     } finally {
       await publication;
@@ -1388,18 +1394,21 @@ describe("remote runner process supervision", () => {
     const execute = vi.fn(async () => ({
       exitCode: outcome === "failed" ? 1 : null, signal: null, timedOut: outcome === "timed out", stdout: "", stderr: "",
     }));
+    const onRunnerProcessSpawned = vi.fn();
     const handle = createRemoteRunnerProcessLauncher({
       target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
       runner: { execute } as never,
       remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
       stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-remote",
       ensureArtifact: async () => undefined,
+      onRunnerProcessSpawned,
     })({ command: "/controller/runnerd", args: [], cwd: "/controller", environment: {} });
     await expect(handle.completion).rejects.toThrow(
       outcome === "failed" ? "runner_remote_process_launch_failed" : "runner_remote_process_launch_timed_out",
     );
     expect(execute).toHaveBeenCalledTimes(1);
     expect(handle.isExitConfirmed?.()).toBe(false);
+    expect(onRunnerProcessSpawned).not.toHaveBeenCalled();
   });
 
   it("defers an in-flight launch signal until its exact identity is available", async () => {

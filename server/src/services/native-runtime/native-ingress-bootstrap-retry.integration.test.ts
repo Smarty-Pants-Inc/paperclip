@@ -138,9 +138,16 @@ describeEmbeddedPostgres("native ingress bootstrap retry through the real Runner
     });
     const sockets = new Set<WebSocket>();
     const websocket = new WebSocketServer({ noServer: true });
+    let ingressAttempts = 0;
+    let firstIngressAttemptAt: number | null = null;
     preview.on("upgrade", (request, socket, head) => {
       if (request.url !== `/api/runner/v1/connect/${runId}` || request.headers["x-fixture-preview-token"] !== "fixture-preview") {
         socket.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return;
+      }
+      ingressAttempts++;
+      firstIngressAttemptAt ??= Date.now();
+      if (Date.now() - firstIngressAttemptAt < 250) {
+        socket.end("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); return;
       }
       websocket.handleUpgrade(request, socket, head, front => {
         const back = new WebSocket(`ws://127.0.0.1:${runnerPort}${request.url}`, { perMessageDeflate: false });
@@ -252,6 +259,7 @@ describeEmbeddedPostgres("native ingress bootstrap retry through the real Runner
         })])).resolves.toMatchObject({ exitCode: 0, timedOut: false });
       } finally { if (timer) clearTimeout(timer); }
       expect(acquisitions).toBe(2);
+      expect(ingressAttempts).toBeGreaterThanOrEqual(2);
       expect(handles).toHaveLength(1);
       await assertSealedSkills();
       const completed = await loadNativeRunnerCheckpoint(db, execution.binding);

@@ -34,6 +34,30 @@ The PRP identity binds company, issue, agent, run, environment lease, runner ins
 5. Suspend/drain/revoke commands stop new turns and durably flush terminal events. Paperclip revokes the lease before destroying or recycling the sandbox.
 6. A recovered sandbox reuses its durable runner state and an unexpired connection lease; it must not mint a second provider session when a resumable one exists.
 
+## Startup readiness and retry budget
+
+For a command-launched remote Runner, ingress activation waits for the existing
+nonce- and Runner-bound process identity marker, not merely dispatch of the
+sandbox launch command. The marker is written before `exec`, so it establishes
+launch identity, not that the listener or the provider's preview route is already
+reachable. It does not depend on the optional process-spawn callback or on PRP
+traffic. A released route must not reconnect when a late identity signal arrives.
+
+Paperclip then retries the same authenticated ingress within a fixed 60-second
+startup budget. Backoff is 250 ms, 500 ms, 1 s, 2 s, then 5 s, with 25% jitter.
+Each TLS/WebSocket handshake is limited to the lesser of 15 seconds and the
+remaining budget; backoff cannot start another attempt after that deadline.
+Credential refresh does not reset the budget. Once authenticated, transport loss
+uses the existing separate recovery grace instead. No retry launches another
+Runner or grants a different run authority.
+
+Only PRP authentication makes the transport ready. A process marker, acquired
+preview URL, HTTP response, or WebSocket upgrade alone is insufficient. An ingress
+that remains unreachable still fails as `runner_ingress_unavailable`; the final
+connect failure remains its cause even if the budget expires during backoff.
+Normal TLS certificate and hostname validation, preview authorization, and PRP
+identity checks remain mandatory.
+
 ## Deployment-mode boundary
 
 Daytona always selects provider ingress for `paperclip_runner`; it does not fall

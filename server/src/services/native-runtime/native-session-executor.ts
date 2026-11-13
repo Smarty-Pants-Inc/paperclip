@@ -15141,11 +15141,6 @@ export function createRemoteRunnerProcessLauncher(input: {
       }
       if (pendingSignal) return cancelledBeforeDispatch();
       const launchStartedAtMs = Date.now();
-      // The provider's onSpawn callback is optional and some sandbox command
-      // runners cannot report a remote pid until after the command has begun
-      // streaming. Signal as soon as staging is complete and the launch RPC is
-      // dispatched; this is late enough to avoid preview retries during staging
-      // and early enough to avoid a callback-dependent deadlock.
       await input.trace?.record({
         name: "runner.process.dispatch",
         parentName: "runner.session.startup",
@@ -15154,8 +15149,6 @@ export function createRemoteRunnerProcessLauncher(input: {
         attributes: { target: "remote" },
       });
       // Trace publication can yield after staging; recheck at dispatch.
-      if (pendingSignal) return cancelledBeforeDispatch();
-      input.onRunnerProcessSpawned?.();
       if (pendingSignal) return cancelledBeforeDispatch();
       const identityNonce = randomUUID();
       const remoteArgs = [...spec.args];
@@ -15240,6 +15233,7 @@ export function createRemoteRunnerProcessLauncher(input: {
       launchedIdentity = { nonce: identityNonce, ...identity };
       child.pid = identity.pid;
       if (pendingSignal) child.kill(pendingSignal);
+      else input.onRunnerProcessSpawned?.();
       await input.onSpawn?.({
         pid: identity.pid,
         processGroupId: null,
