@@ -153,9 +153,10 @@ export function taskHistoryHandlingGuidance(commentIds: readonly string[]) {
  * The comment row was taken into an accepted first provider turn of a run of
  * this agent on this task, and not edited after that run sealed its input.
  */
-function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: string) {
+function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: string, runId?: string) {
   return sql`exists (select 1 from ${heartbeatRuns} first_turn_run
       where first_turn_run.company_id = ${companyId} and first_turn_run.agent_id = ${agentId}
+        ${runId ? sql`and first_turn_run.id = ${runId}` : sql``}
         and (first_turn_run.native_issue_id = ${issueId} or first_turn_run.context_snapshot->>'issueId' = ${issueId})
         and first_turn_run.context_snapshot->'firstTurnQueuedInput'->>'schema' = 'paperclip.first-turn-queued-input.v1'
         and first_turn_run.context_snapshot->'firstTurnQueuedInput'->>'runId' = first_turn_run.id::text
@@ -166,13 +167,13 @@ function firstTurnDeliveredSql(companyId: string, issueId: string, agentId: stri
             and accepted.event_type in ('turn.accepted', 'turn.started')))`;
 }
 
-/** Ids that an accepted first provider turn already received (see `deliveredQueuedCommentIds`). */
+/** Ids an accepted first provider turn received; optionally restricted to one exact run. */
 export async function firstTurnDeliveredCommentIds(tx: Pick<Db, "select">, input: {
-  companyId: string; issueId: string; agentId: string; commentIds: string[];
+  companyId: string; issueId: string; agentId: string; commentIds: string[]; runId?: string;
 }): Promise<Set<string>> {
   if (input.commentIds.length === 0) return new Set();
   const rows = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
-    inArray(issueComments.id, input.commentIds), firstTurnDeliveredSql(input.companyId, input.issueId, input.agentId)));
+    inArray(issueComments.id, input.commentIds), firstTurnDeliveredSql(input.companyId, input.issueId, input.agentId, input.runId)));
   return new Set(rows.map(row => row.id));
 }

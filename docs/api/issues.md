@@ -265,6 +265,14 @@ The server snapshots immutable canonical `requestedResolverPolicy` and `effectiv
 
 For `request_confirmation`, `continuationPolicy: "wake_assignee"` wakes the assignee only after acceptance. Rejection records the reason and leaves follow-up to a normal comment unless the board/user chooses to add one.
 
+For `ask_user_questions` with a `sourceRunId` whose context records delivered
+comments, a newer human comment that the run has not received returns `409`
+with reason `newer_comment_not_delivered`. Queued messages sealed into that
+same run's first provider turn count as received after the provider accepts the
+turn. A seal alone, another run's receipt, or an edit made after the seal does
+not prove delivery of the current comment revision. Messages arriving after the
+seal still wait for their own delivery.
+
 ### Resolve Interaction
 
 ```
