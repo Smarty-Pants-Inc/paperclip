@@ -11,6 +11,7 @@ import {
 } from "@paperclipai/db";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
+import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
@@ -207,6 +208,13 @@ function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean
   return ids.includes(messageId);
 }
 
+function wakeCarriesMessage(payload: unknown, messageId: string): boolean {
+  const value = (payload ?? {}) as Record<string, unknown>;
+  const nested = (value._paperclipWakeContext ?? {}) as Record<string, unknown>;
+  return [...queuedCommentIdsFromWakePayload(value), value.commentId, nested.wakeCommentId,
+    ...(Array.isArray(nested.wakeCommentIds) ? nested.wakeCommentIds : [])].includes(messageId);
+}
+
 function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
   const value = (payload ?? {}) as Record<string, unknown>;
   const nested = (value._paperclipWakeContext ?? {}) as Record<string, unknown>;
@@ -248,47 +256,77 @@ export async function settleUnansweredPersonMessage(
           and a.author_type = 'agent' and a.deleted_at is null and a.created_at > m.created_at))`);
   });
 
+  const decision = await decideUnansweredMessage(db, issue, now);
+  if (decision.kind !== "notice") return decision;
+  const commentId = await db.transaction(async tx => {
+    // The issue fence that comment writers, the executor's held-notice writer
+    // and execution admission take. The SAME predicate is evaluated again
+    // under it: an answer (prose or the turn's own card), a held notice, a
+    // newer message, a run or a wake that committed while this sweep waited
+    // means no notice.
+    await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now);
+    if (fenced.kind !== "notice" || fenced.reason !== decision.reason) return null;
+    const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
+      authorType: "system",
+      presentation: fenced.notice.presentation,
+      metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
+    }, tx);
+    return comment?.id ?? null;
+  });
+  return commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" };
+}
+
+type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
+  assigneeAgentId: string | null; assigneeUserId: string | null };
+type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" }>
+  | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice> };
+
+/** The one predicate: run outside the fence to skip the lock in the common
+ * case, and again unchanged inside it before writing. Reads only. */
+async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
   const agentId = issue.assigneeAgentId;
 
-  const [message] = await db.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
+  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   if (!message || message.createdAt.getTime() < now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS) return { kind: "none" };
-  const [answer] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+  const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
-  const [noticed] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+  const [noticed] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
   if (noticed) return { kind: "noticed_before" };
 
   // Something will still answer it by itself: a live or scheduled run.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
-  const [liveRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+  const [liveRun] = await q.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     inArray(heartbeatRuns.status, LIVE))).limit(1);
   if (liveRun) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
 
   // A board-owned hold means nothing moves by itself: queued wakes behind it
   // do not count as a further attempt.
-  const [boardHold] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+  const [boardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   if (!boardHold) {
-    const wakes = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
       inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
     if (wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id))) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
   }
 
   // The run this message started, else the latest run after it.
-  const runs = await db.select({
+  const runs = await q.select({
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
@@ -305,7 +343,7 @@ export async function settleUnansweredPersonMessage(
   // confirmation card that the message's OWN run created stands in for its
   // reply. A card from an earlier turn or one the board addressed to someone
   // else, and any approval, can hold the task but do not answer the message.
-  if (run && !(await conversationTurnAnswered({ db, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) {
+  if (run && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) {
     return { kind: "answered" };
   }
 
@@ -314,10 +352,12 @@ export async function settleUnansweredPersonMessage(
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
     // any wake row existed (the comment route logs and returns 201).
-    const failedWakes = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    const failedWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
       eq(agentWakeupRequests.status, "failed"), gt(agentWakeupRequests.updatedAt, message.createdAt)));
-    const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id));
+    // Only THIS message's own wake (Paperclip's queued-comment attribution) is
+    // evidence; an unrelated failed wake on the issue is not.
+    const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS;
     if (!wakeFailed && due > now.getTime()) return { kind: "pending", recheckAt: due };
     code = UNANSWERED_MESSAGE_NO_RUN_CODE;
@@ -326,7 +366,7 @@ export async function settleUnansweredPersonMessage(
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
     if (run.issueCommentStatus === "retry_queued") return { kind: "pending", recheckAt: now.getTime() + 30_000 };
-    const [coordinator] = await db.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
+    const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id)));
     if (coordinator && !boardHold) {
       if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
@@ -340,7 +380,7 @@ export async function settleUnansweredPersonMessage(
       // attention is the agent's answer: it named whose move it is
       // (upstream's waiting reason "assignee_declared_block").
       // (the stored envelope is { result, terminal }, recovery/service.ts:1572).
-      const [accepted] = await db.select({ resultJson: nativeRunResults.resultJson }).from(nativeRunResults).where(and(
+      const [accepted] = await q.select({ resultJson: nativeRunResults.resultJson }).from(nativeRunResults).where(and(
         eq(nativeRunResults.companyId, issue.companyId), eq(nativeRunResults.runId, run.id),
         eq(nativeRunResults.schemaStatus, "accepted"))).limit(1);
       const envelope = (accepted?.resultJson ?? {}) as Record<string, unknown>;
@@ -353,8 +393,8 @@ export async function settleUnansweredPersonMessage(
 
   // Already explained: the executor's held notice for this conversation, or a
   // person-facing recovery notice posted after the message.
-  if (await readUnsupersededHeldConversationNotice(db, { companyId: issue.companyId, issueId: issue.id })) return { kind: "explained" };
-  const [explained] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+  if (await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id })) return { kind: "explained" };
+  const [explained] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
     sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
@@ -379,46 +419,9 @@ export async function settleUnansweredPersonMessage(
     sourceRun: run ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
     failureCode: run ? undefined : code,
   });
-  const commentId = await db.transaction(async tx => {
-    // The issue fence that comment writers, the executor's held-notice writer
-    // and execution admission take. Everything decided above is re-checked
-    // under it: an answer, a held notice, a newer message or a new run that
-    // committed while this sweep waited means no notice.
-    await tx.select({ id: issues.id }).from(issues)
-      .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const q = tx as unknown as Db;
-    const [existing] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
-      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-      sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
-    if (existing) return null;
-    const [newest] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
-      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-      eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
-      .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
-    if (newest?.id !== message.id) return null;
-    const [answeredNow] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
-      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-      eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt))).limit(1);
-    if (answeredNow) return null;
-    if (run && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) return null;
-    const [liveNow] = await q.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
-      or(inArray(heartbeatRuns.status, LIVE), and(gt(heartbeatRuns.createdAt, message.createdAt),
-        sql`(${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${message.id}
-          or coalesce(${heartbeatRuns.contextSnapshot}->'wakeCommentIds', '[]'::jsonb) @> ${JSON.stringify([message.id])}::jsonb
-          or coalesce(${heartbeatRuns.contextSnapshot}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) @> ${JSON.stringify([message.id])}::jsonb)`,
-        ...(run ? [sql`${heartbeatRuns.id} <> ${run.id}`] : []))))).limit(1);
-    if (liveNow) return null;
-    if (await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id })) return null;
-    const comment = await issueService(tx as unknown as Db).addComment(issue.id, notice.body, {}, {
-      authorType: "system",
-      presentation: notice.presentation,
-      metadata: { ...notice.metadata, authorizationReason: reason },
-    }, tx);
-    return comment?.id ?? null;
-  });
-  return commentId ? { kind: "noticed", code, commentId } : { kind: "noticed_before" };
+  return { kind: "notice", reason, code, notice };
 }
+
 
 /** One task the recovery worker already flagged (its batched page query found
  * a person's message to settle): no candidate lookup of its own. */
