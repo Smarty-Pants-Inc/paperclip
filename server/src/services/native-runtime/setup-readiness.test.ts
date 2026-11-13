@@ -23,6 +23,7 @@ vi.mock("../../realtime/runner-prp-outbound.js", () => ({ connectRunnerPrpIngres
 vi.mock("./native-codex-runner.js", () => ({ resolvePaperclipRunnerBinary: selectedRunner, resolveRemotePaperclipRunnerBinary: selectedRemoteRunner }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({ ...await original<typeof import("../../vendor/paperclip-runner/index.js")>(), probeNativeRunnerEnvironment: nativeProbe }));
 vi.mock("./native-session-executor.js", async original => ({ ...await original<typeof import("./native-session-executor.js")>(), createRemoteNativeArtifactPreparation: nativeArtifacts, createRemoteRunnerProcessLauncher: remoteLauncher,
+  syncRemoteRunnerDirectoryOut: vi.fn(async () => undefined),
   resolveRemoteProviderPackSource: () => ({ configuredRoot: "/controller/pack", manifest: { digest: "sha256:fixture" } }),
   prepareRemoteProviderPackOnTarget: vi.fn(async () => ({ root: "/boat/provider-pack", manifest: { digest: "sha256:fixture", payload: { artifacts: {
     nodeCommand: { path: "node", sha256: "node-digest" }, piRpcExecutable: { path: "pi.js", sha256: "pi-digest" }, piRpcProxy: { path: "proxy.cjs", sha256: "proxy-digest" },
