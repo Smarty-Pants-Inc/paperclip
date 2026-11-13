@@ -4,10 +4,18 @@
 
 Each ordinary `environmentInspectLease` call makes a fresh, uncached
 `GET /sandboxes/{id}` with a 10-second timeout. Transport and HTTP failures throw;
-only 404 and Boat's terminal `cancelled` state report `destroyed`. `archived`
-reports `stopped` only when `stoppedAt` is non-null. `ready`, `idle`, and `running`
-report `active`; all other states report `unknown`, including `archived` without
-a stop timestamp. See Boat's [GET contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).
+only a confirmed sandbox-not-found or Boat's terminal `cancelled` state reports
+`destroyed`. A missing sandbox requires a JSON 404 envelope with
+`code: "not_found"` and no `error.details.path`, an ID matching Boat's
+`^bx_[23456789abcdefghjkmnpqrstuvwxyz]{8}$` pattern, and a fresh, uncached
+`GET /sandboxes?limit=1` with the same key returning `ok: true` and a `sandboxes`
+array (also bounded to 10 seconds). A bare, malformed, route-style, or otherwise
+ambiguous 404, an invalid ID, or a failed list confirmation throws instead.
+Boat's [API error contract](https://docs.boat.dev/api/v1.md) says `not_found`
+can also mean a missing key or saved snapshot, so a 404 alone is not sufficient.
+`archived` reports `stopped` only when `stoppedAt` is non-null. `ready`, `idle`,
+and `running` report `active`; all other states report `unknown`, including
+`archived` without a stop timestamp. See Boat's [GET contract](https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md).
 
 Observations preserve `stoppedAt` and `lastReboot.at` as `lastRebootAt` verbatim,
 using null when absent. `observedAt` is the HTTP response's `Date` converted to

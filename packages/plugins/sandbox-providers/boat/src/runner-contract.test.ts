@@ -9,6 +9,13 @@ const cfg = { apiKey: "boat_test", type: "small", ttlSeconds: 1800, reuseLease: 
 const scope = { driverKey: "boat", companyId: "company", environmentId: "environment", config: cfg };
 const acquire = { ...scope, runId: "run-1", agentId: "agent", executionWorkspaceId: "workspace", adapterType: "paperclip_runner" };
 const path = "/api/runner/v1/connect/run-1";
+const inspectId = "bx_22222222";
+// Measured Boat sandbox-not-found envelope; route 404s instead name details.path.
+const sandboxNotFound = {
+  ok: false, type: "sandbox.error", status: 404, code: "not_found", message: "not_found",
+  error: { code: "not_found", message: "not_found", status: 404, details: { error: "not_found" } },
+  requestId: "inspect-not-found",
+};
 function reply(data: unknown, status = 200) { return new Response(JSON.stringify(data), { status }); }
 function fixture() {
   let state = "ready", revision = "2026-11-12T00:00:00Z", token = "private-token", sentinel: any;
@@ -215,43 +222,52 @@ describe("Boat Runner contract", () => {
     { state: "init", expected: "unknown" },
     { state: "future-state", expected: "unknown" },
   ])("inspects $state with stoppedAt=$stoppedAt as $expected", async ({ state, stoppedAt, expected }) => {
-    const sandbox = { id: "bx_inspect", state, ...(stoppedAt === undefined ? {} : { stoppedAt }) };
+    const sandbox = { id: inspectId, state, ...(stoppedAt === undefined ? {} : { stoppedAt }) };
     vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox })));
     expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: sandbox.id })).toEqual({
       providerLeaseId: sandbox.id, state: expected, stoppedAt: stoppedAt ?? null, lastRebootAt: null, observedAt: null,
     });
   });
   it.each([true, false])("preserves liveness timestamps verbatim with response envelope=%s", async wrapped => {
-    const sandbox = { id: "bx_inspect", state: "running", stoppedAt: "2026-11-13T11:30:00+00:00", lastReboot: { at: "2026-11-13T11:31:00.123Z", reason: "crash" } };
+    const sandbox = { id: inspectId, state: "running", stoppedAt: "2026-11-13T11:30:00+00:00", lastReboot: { at: "2026-11-13T11:31:00.123Z", reason: "crash" } };
     vi.stubGlobal("fetch", vi.fn(async () => reply(wrapped ? { sandbox } : sandbox)));
     expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: sandbox.id })).toEqual({
       providerLeaseId: sandbox.id, state: "active", stoppedAt: sandbox.stoppedAt, lastRebootAt: sandbox.lastReboot.at, observedAt: null,
     });
   });
   it.each([null, {}])("reports a null reboot timestamp for lastReboot=%j", async lastReboot => {
-    vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox: { id: "bx_inspect", state: "ready", lastReboot } })));
-    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ lastRebootAt: null });
+    vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox: { id: inspectId, state: "ready", lastReboot } })));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toMatchObject({ lastRebootAt: null });
   });
   it.each([
     { date: "Fri, 13 Nov 2026 12:00:00 GMT", expected: "2026-11-13T12:00:00.000Z" },
     { date: "not-a-date", expected: null },
     { date: undefined, expected: null },
   ])("uses only the HTTP Date header for observedAt: $date", async ({ date, expected }) => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ sandbox: { id: "bx_inspect", state: "ready", observedAt: "1999-01-01T00:00:00Z", updatedAt: "1999-01-01T00:00:00Z" } }), { headers: date === undefined ? {} : { Date: date } })));
-    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ state: "active", observedAt: expected });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ sandbox: { id: inspectId, state: "ready", observedAt: "1999-01-01T00:00:00Z", updatedAt: "1999-01-01T00:00:00Z" } }), { headers: date === undefined ? {} : { Date: date } })));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toMatchObject({ state: "active", observedAt: expected });
   });
-  it("keeps the HTTP observation timestamp when the sandbox is missing", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 404, headers: { Date: "Fri, 13 Nov 2026 12:00:00 GMT" } })));
-    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toEqual({ providerLeaseId: "bx_inspect", state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: "2026-11-13T12:00:00.000Z" });
+  it("reports destroyed only after a real not-found and preserves that response's Date", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2040-01-01T00:00:00Z"));
+    const network = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(sandboxNotFound), { status: 404, headers: { Date: "Fri, 13 Nov 2026 12:00:00 GMT" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true, sandboxes: [{ id: "bx_33333333", state: "ready" }] }), { headers: { Date: "Fri, 13 Nov 2026 12:01:00 GMT" } }));
+    vi.stubGlobal("fetch", network);
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toEqual({ providerLeaseId: inspectId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: "2026-11-13T12:00:00.000Z" });
+    expect(network.mock.calls).toEqual([
+      [`https://boat.dev/api/v1/sandboxes/${inspectId}`, expect.objectContaining({ method: "GET", cache: "no-store", headers: expect.any(Headers), redirect: "error", signal: expect.any(AbortSignal) })],
+      ["https://boat.dev/api/v1/sandboxes?limit=1", expect.objectContaining({ method: "GET", cache: "no-store", headers: expect.any(Headers), redirect: "error", signal: expect.any(AbortSignal) })],
+    ]);
+    for (const [, init] of network.mock.calls) expect(init.headers.get("Authorization")).toBe("Bearer boat_test");
   });
   it("performs a fresh uncached GET for each inspection", async () => {
-    const network = vi.fn().mockResolvedValueOnce(reply({ sandbox: { id: "bx_inspect", state: "ready" } })).mockResolvedValueOnce(reply({ sandbox: { id: "bx_inspect", state: "cancelled" } }));
+    const network = vi.fn().mockResolvedValueOnce(reply({ sandbox: { id: inspectId, state: "ready" } })).mockResolvedValueOnce(reply({ sandbox: { id: inspectId, state: "cancelled" } }));
     vi.stubGlobal("fetch", network);
-    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ state: "active" });
-    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).toMatchObject({ state: "destroyed" });
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toMatchObject({ state: "active" });
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toMatchObject({ state: "destroyed" });
     expect(network).toHaveBeenCalledTimes(2);
     for (const [url, init] of network.mock.calls) {
-      expect(url).toBe("https://boat.dev/api/v1/sandboxes/bx_inspect");
+      expect(url).toBe(`https://boat.dev/api/v1/sandboxes/${inspectId}`);
       expect(init).toMatchObject({ method: "GET", cache: "no-store" });
     }
   });
@@ -265,7 +281,7 @@ describe("Boat Runner contract", () => {
         else signal.addEventListener("abort", () => reject(signal.reason), { once: true });
       });
     }));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ name: "TimeoutError" });
     expect(timeout).toHaveBeenCalledWith(10_000);
   });
   it("throws if the inspection deadline expires while reading the response body", async () => {
@@ -278,33 +294,64 @@ describe("Boat Runner contract", () => {
         else signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
       },
     }))));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toMatchObject({ name: "TimeoutError" });
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ name: "TimeoutError" });
     expect(timeout).toHaveBeenCalledWith(10_000);
   });
   it.each(["{", "null", "", "false", "0", '""'])("never mistakes an invalid success body for a missing sandbox: %j", async body => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow();
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow();
   });
   it("throws on an empty 204 inspection response rather than reporting destroyed", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 204 })));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow();
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow();
   });
   it.each([401, 403, 429, 500, 503])("keeps HTTP %i inspection failures retryable", async status => {
     vi.stubGlobal("fetch", vi.fn(async () => reply({ message: "provider unavailable" }, status)));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toMatchObject({ httpStatus: status });
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ httpStatus: status });
   });
   it("throws on inspection transport failure rather than returning unknown", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("network unavailable"); }));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow("network unavailable");
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("network unavailable");
   });
   it("still rejects a foreign inspection allocation", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox: { id: "bx_foreign", state: "running" } })));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_inspect" })).rejects.toThrow("different allocation");
+    vi.stubGlobal("fetch", vi.fn(async () => reply({ sandbox: { id: "bx_33333333", state: "running" } })));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("different allocation");
   });
   it("does not report a deleted lease as active or erase a transient inspection failure", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => reply({}, 404)));
-    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_runner" })).toEqual({ providerLeaseId: "bx_runner", state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: null });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(reply(sandboxNotFound, 404)).mockResolvedValueOnce(reply({ ok: true, sandboxes: [] })));
+    expect(await plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).toEqual({ providerLeaseId: inspectId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt: null });
     vi.stubGlobal("fetch", vi.fn(async () => reply({}, 503)));
-    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: "bx_runner" })).rejects.toThrow();
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow();
+  });
+  it("rejects a route-style not-found even if the sandbox list would succeed", async () => {
+    const network = vi.fn().mockResolvedValueOnce(reply({
+      ...sandboxNotFound, message: "Not Found",
+      error: { code: "not_found", message: "Not Found", status: 404, details: { path: `/api/v1/sandboxez/${inspectId}` } },
+    }, 404)).mockResolvedValueOnce(reply({ ok: true, sandboxes: [] }));
+    vi.stubGlobal("fetch", network);
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ message: expect.stringContaining("ambiguous 404"), httpStatus: 404 });
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+  it.each([null, "<html>Not Found</html>", "{"])("rejects a 404 without JSON: %j", async body => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 404 })));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ message: expect.stringContaining("ambiguous 404"), httpStatus: 404 });
+  });
+  it.each([{}, { code: "unauthorized" }, null])("rejects an unrecognized JSON 404 envelope: %j", async body => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(body, 404)));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("ambiguous 404");
+  });
+  it.each([401, 500])("throws if the confirming list returns HTTP %i", async status => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(reply(sandboxNotFound, 404)).mockResolvedValueOnce(reply({ ok: false, code: "unavailable" }, status)));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toMatchObject({ httpStatus: status });
+  });
+  it.each([{ ok: false, sandboxes: [] }, { sandboxes: [] }, { ok: true }, { ok: true, sandboxes: null }, { ok: true, sandboxes: {} }])("rejects a malformed or unsuccessful confirming list: %j", async listed => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(reply(sandboxNotFound, 404)).mockResolvedValueOnce(reply(listed)));
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId: inspectId })).rejects.toThrow("could not confirm the sandbox list");
+  });
+  it.each(["bx_inspect", "bx_runner", "bx_2222222", "bx_222222222", "bx_00000000", "bx_iiiiiiii", "bx_oooooooo", "bx_llllllll", "BX_22222222"])("refuses destroyed for an invalid sandbox id: %s", async providerLeaseId => {
+    const network = vi.fn().mockResolvedValueOnce(reply(sandboxNotFound, 404)).mockResolvedValueOnce(reply({ ok: true, sandboxes: [] }));
+    vi.stubGlobal("fetch", network);
+    await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId })).rejects.toThrow("not a sandbox id");
+    expect(network).toHaveBeenCalledTimes(1);
   });
 });
