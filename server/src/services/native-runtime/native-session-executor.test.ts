@@ -16052,6 +16052,111 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
+  // Keep reason: F2's stale-positive socket can hide a lost generation and
+  // reuse a dead session. Count membership is deliberately independent of
+  // authenticated generation freshness in these real executor admissions.
+  it.each([
+    { name: "stale-positive lost generation", connected: true, ageMs: 20_001, sameGeneration: true, lost: true, probe: true },
+    { name: "fresh same generation", connected: true, ageMs: 1, sameGeneration: true, lost: false, probe: false },
+    { name: "fresh different generation", connected: true, ageMs: 1, sameGeneration: false, lost: true, probe: true },
+    { name: "disconnected lost generation", connected: false, ageMs: 1, sameGeneration: true, lost: true, probe: true },
+    { name: "fresh stopped resume", connected: true, ageMs: 1, sameGeneration: true, lost: false, probe: true, resumedFromState: "stopped" },
+    { name: "fresh archived resume", connected: true, ageMs: 1, sameGeneration: true, lost: false, probe: true, resumedFromState: "archived" },
+  ])("requires fresh authenticated generation liveness: $name", async ({ name, connected, ageMs, sameGeneration, lost, probe, resumedFromState }) => {
+    const first = scopedNativeExecution(`fresh-probe-${name.replaceAll(" ", "-")}`);
+    first.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 60_000 };
+    const next = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
+    const identity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId!,
+      runnerInstanceId: `runner-${first.session.normalizedSessionId}`, environmentLeaseId: first.binding.executionWorkspaceId,
+      turnId: "prior-turn", itemId: "prior-item" };
+    const root = await initializeScopedRunnerRoot(first, identity.runnerInstanceId);
+    await writeRunnerAuthority(root, identity, "ready");
+    const execute = vi.fn(async (request: { args?: string[] }) => ({
+      exitCode: lost && request.args?.[2] === "paperclip-runner-generation-check" ? 45 : 0,
+      timedOut: false, stderr: "", signal: null, pid: 123, startedAt: "2026-11-13T12:00:00.000Z",
+      stdout: request.args?.[2] === "paperclip-runner-generation-marker"
+        ? `nonce\n123\n2026-11-13T12:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:123\n`
+        : request.args?.[1]?.includes("base64 <")
+          ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "ready" })).toString("base64") : "" }));
+    const environmentId = `fresh-probe-${name.replaceAll(" ", "-")}`;
+    const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId,
+      remoteCwd: "/workspace", runner: { execute },
+      sandboxLeaseAcquisition: { outcome: "created" as "created" | "resumed", providerLeaseId: environmentId,
+        ...(resumedFromState ? { resumedFromState } : {}) } };
+    const driver = vi.spyOn(nativeExecutionDriver, "createNativeRunnerExecutionDriver");
+    const restore = vi.spyOn(runnerCheckpoint, "restoreNativeRunnerCheckpoint").mockResolvedValue(null);
+    const retainedBinding = lost ? vi.spyOn(controllerRecovery, "assertNativeRetainedSandboxBinding")
+      .mockResolvedValue({ remoteCwd: "/workspace" }) : undefined;
+    const session = { close: vi.fn(async () => undefined), detachControllerForRestart: vi.fn(async () => undefined) };
+    const replacement = { close: vi.fn(async () => undefined) };
+    const result = { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+      normalizedSessionId: first.session.normalizedSessionId!, providerSessionId: "retained-history",
+      driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    const existingSessions: unknown[] = [];
+    const authenticatedRunnerInstanceId = sameGeneration ? identity.runnerInstanceId : `${identity.runnerInstanceId}-other`;
+    let lastInboundAtMs = 0;
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await driver.mock.calls.at(-1)![0].beforeConnect?.(identity as never, {
+        activeRunnerConnectionCount: () => connected ? 1 : 0,
+        runnerFreshlyAlive: (expectedRunnerInstanceId: string, nowMs: number) => connected
+          && authenticatedRunnerInstanceId === expectedRunnerInstanceId
+          && nowMs >= lastInboundAtMs && nowMs - lastInboundAtMs <= 20_000,
+      } as never);
+      await options.onSession?.(session);
+      return result;
+    }).mockImplementationOnce(async options => {
+      existingSessions.push(options.existingSession);
+      if (lost && options.existingSession === undefined) {
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        expect(state.createTransport.mock.calls.at(-1)![0]).toMatchObject({ lostRunnerSource: identity });
+      }
+      await options.onSession?.(lost ? replacement : session);
+      return result;
+    });
+    const nextDb = leaseDb(next), select = nextDb.select.bind(nextDb);
+    const controller = await currentControllerProcess();
+    nextDb.select = ((fields?: Record<string, unknown>) => {
+      if (fields?.run === heartbeatRuns && fields?.owner === nativeRunFinalizations) {
+        const rows = [{ run: { id: first.binding.runId, runtimeMode: "native", status: "succeeded",
+          runnerProfileJson: { nativeExecutionInput: first } }, owner: { phase: "committed", resultId: "committed-result",
+          leaseOwner: null, recoveryState: null, controllerBootId: controller.bootId,
+          controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt } }];
+        const query = { from: () => query, innerJoin: () => query, where: () => query, limit: async () => rows };
+        return query;
+      }
+      return fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson
+        ? priorNativeRunDb(first).select(fields as never) : select(fields as never);
+    }) as Db["select"];
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(first), execution: first,
+        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target });
+      if (lost) {
+        await rm(join(root, "runner/runner-state.json"));
+        await writeFile(join(root, "control-plane/control-plane-state.json"), JSON.stringify({
+          ...durableControlPlaneState(identity), commands: [],
+          committedEvents: [{ eventType: "run.terminal", envelope: identity }],
+        }));
+      }
+      execute.mockClear(); restore.mockClear();
+      target.sandboxLeaseAcquisition.outcome = "resumed";
+      lastInboundAtMs = Date.now() - ageMs;
+      await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
+        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target })).resolves.toMatchObject({ exitCode: 0 });
+      const probes = execute.mock.calls.filter(([request]) => request.args?.[2] === "paperclip-runner-generation-marker");
+      console.info(`[fresh-probe] ${name}: markers=${probes.length}, totalRemoteExecs=${execute.mock.calls.length}, reused=${existingSessions[0] === session}`);
+      if (probe) expect(probes.length).toBeGreaterThan(0);
+      else expect(probes).toHaveLength(0);
+      expect(existingSessions).toEqual([lost ? undefined : session]);
+      if (!lost) expect(restore).not.toHaveBeenCalled();
+      expect(session.close).not.toHaveBeenCalled();
+      expect(session.detachControllerForRestart).toHaveBeenCalledTimes(lost ? 1 : 0);
+      expect(state.execute).toHaveBeenCalledTimes(2);
+    } finally {
+      await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "fresh probe gate test cleanup" });
+      retainedBinding?.mockRestore(); restore.mockRestore(); driver.mockRestore();
+    }
+  });
+
   it.each(["open-failed", "replacement-failed", "recover-failed", "recover-missing", "close", "cancel", "detach"] as const)(
     "revokes Cursor Cloud relay admission after %s and admits an exact retry", async ending => {
       cursorCloudOrigin();
