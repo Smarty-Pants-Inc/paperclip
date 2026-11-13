@@ -29,6 +29,7 @@ import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provid
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { SecretProviderClientError } from "../secrets/types.js";
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -161,6 +162,7 @@ describeEmbeddedPostgres("secretService", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    await flushSecretResolutionWrites(db);
     await db.delete(activityLog);
     await db.delete(secretAccessEvents);
     await db.delete(userSecretDeclarations);
@@ -1937,6 +1939,7 @@ describeEmbeddedPostgres("secretService", () => {
       }),
     ).rejects.toThrow(/User-scoped secrets/i);
 
+    await flushSecretResolutionWrites(db);
     const events = await db
       .select()
       .from(secretAccessEvents)
@@ -2660,8 +2663,9 @@ describeEmbeddedPostgres("secretService", () => {
     ).rejects.toThrow(/not bound/i);
   });
 
-  it("preserves the original resolution error when failure access logging fails", async () => {
+  it("preserves the original resolution error while failure access logging is deferred and retried", async () => {
     const companyId = await seedCompany();
+    const { heartbeatRunId } = await seedAgentRun(companyId);
     const svc = secretService(db);
     const secret = await svc.create(companyId, {
       name: `resolution-failure-${randomUUID()}`,
@@ -2684,9 +2688,14 @@ describeEmbeddedPostgres("secretService", () => {
         consumerType: "system",
         consumerId: "system",
         configPath: "env.API_KEY",
-        heartbeatRunId: randomUUID(),
+        heartbeatRunId,
       }),
     ).rejects.toThrow("provider resolution failed");
+    vi.spyOn(db, "insert").mockImplementationOnce(() => { throw new Error("audit unavailable"); });
+    await flushSecretResolutionWrites(db);
+    const events = await svc.listAccessEvents(companyId, secret.id);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ outcome: "failure", heartbeatRunId });
   });
 
   it("keeps one default provider vault per company provider", async () => {
