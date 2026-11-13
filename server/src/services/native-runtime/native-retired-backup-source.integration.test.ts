@@ -189,12 +189,12 @@ describeDb("retired native backup source authority", () => {
   it.each([
     ["a destroyed tip", {}],
     ["a settled restore-hold tip", { termination: "stopped" as const, restoreHold: "settled" as const }],
-    ["a newer nonmatching stamp on the tip", { idleWarm: "released" as const, stoppedWarm: true, tipStamp: "different_checkpoint" as const }],
   ])("finds a matching predecessor stamp with %s", async (_label, options) => {
     await expect(fixture({ handoffs: 2, predecessorStamp: true, ...options })).resolves.toBe(true);
   });
 
   it.each([
+    ["a newer nonmatching stamp on the tip", { idleWarm: "released" as const, stoppedWarm: true, tipStamp: "different_checkpoint" as const }],
     ["another manifest sha", { stampSha: `sha256:${"c".repeat(64)}` }],
     ["later provider work", { providerEventAt: new Date(completedAt.getTime() + 60_000) }],
     ["a live tip run", { idleWarm: "run_active" as const }],
