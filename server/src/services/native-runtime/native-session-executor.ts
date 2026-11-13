@@ -7410,11 +7410,12 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
 /** The banner text for a conversation held behind an unfinished predecessor. */
 export const HELD_PREDECESSOR_NOTICE = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
 // The refusals that hold a conversation behind its unfinished predecessor:
-// the prior-owner fences, the retained-sandbox binding, a prior session whose
+// the prior-owner fences (including the legacy migration fence), the
+// retained-sandbox binding, a prior session whose
 // cleanup is still quarantined (it guards process ownership of that session),
 // a predecessor Runner whose termination could not be confirmed, and a warm
 // attachment to a predecessor Runner that had already exited.
-const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch: prior_owner_|native_controller_recovery_missing_evidence:retained_sandbox_binding|native_session_cleanup_quarantined:|runner_process_termination_unconfirmed:|native_runner_warm_attachment_runner_exited:)/;
+const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch: (?:legacy_)?prior_owner_|native_controller_recovery_missing_evidence:retained_sandbox_binding|native_session_cleanup_quarantined:|runner_process_termination_unconfirmed:|native_runner_warm_attachment_runner_exited:)/;
 
 /**
  * A conversation held because its previous run ended without a result (a

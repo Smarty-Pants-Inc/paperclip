@@ -17,6 +17,25 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
   }, 60_000);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
+  it.each(["runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate",
+    "native_runner_warm_attachment_runner_exited: runner exited before authority rotation"])("holds visibly on %s", async message => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Held refusal", issuePrefix: companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Held task", status: "in_progress", assigneeAgentId: agentId });
+    for (const status of ["failed", "running"] as const) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status, runtimeMode: "native", nativeIssueId: issueId,
+        nativeSessionId: sessionId }).returning();
+      if (status === "running") await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
+        binding: { companyId, agentId, issueId, runId: row!.id }, session: { normalizedSessionId: sessionId } } as never }, new Error(message));
+    }
+    const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+      .filter(comment => String((comment.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")
+        === `native_prior_owner_held:${sessionId}`);
+    expect(notices).toHaveLength(1);
+  });
+
   it("writes one notice per hold: none while it stands, one new notice after the same session continued", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID(), contractId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Held writer", issuePrefix: companyId.slice(0, 8) });
