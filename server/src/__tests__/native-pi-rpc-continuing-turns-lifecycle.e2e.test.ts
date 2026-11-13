@@ -81,7 +81,7 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
     stages.push(row); console.log(`[pi-full-server] ${name} ${JSON.stringify(detail)}`);
   };
   const bundles: Bundle[] = [];
-  const requests: Array<{ path: string; model: unknown; lastMessage: unknown; messages: unknown[]; remembersPrivateFact: boolean; tools: string[] }> = [];
+  const requests: Array<{ path: string; model: unknown; lastMessage: unknown; messages: unknown[]; remembersPrivateFact: boolean; remembersFreshFact: boolean; tools: string[] }> = [];
   const packVerificationCommands: Array<Record<string, unknown>> = [];
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
   let helloProbeRequests = 0;
@@ -169,13 +169,14 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
           && latest.content.some((part: { type: string }) => part.type === "tool_result");
         const remembersPrivateFact = (parsed.messages ?? []).some((message: { role: string; content: unknown }) =>
           message.role === "assistant" && JSON.stringify(message.content).includes(privateFact));
+        const remembersFreshFact = (parsed.messages ?? []).some((message: { role: string; content: unknown }) =>
+          message.role === "assistant" && JSON.stringify(message.content).includes(freshFact));
         if (missingFile && activeTurn === 3) {
-          expect((parsed.messages ?? []).some((message: { role: string; content: unknown }) =>
-            message.role === "assistant" && JSON.stringify(message.content).includes(freshFact)), "third turn continues the new private history").toBe(true);
+          expect(remembersFreshFact, "third turn continues the new private history").toBe(true);
           expect(JSON.stringify(latest), "fresh fact is not replayed in the new input").not.toContain(freshFact);
         }
         requests.push({ path: req.url!, model: parsed.model, lastMessage: latest,
-          messages: parsed.messages ?? [], remembersPrivateFact,
+          messages: parsed.messages ?? [], remembersPrivateFact, remembersFreshFact,
           tools: (parsed.tools ?? []).map((tool: { name?: string }) => tool.name ?? "") });
         let contract: { revision: string; criteria: Array<{ id: string }> } | undefined;
         for (const message of parsed.messages ?? []) {
@@ -212,7 +213,9 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
           emit("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
           emit("content_block_stop", { index });
         } else {
-          textBlock(activeTurn === 1 ? "TURN_1_PUBLISHED" : remembersPrivateFact ? `TURN_${activeTurn}_RECALLED_${privateFact}` : `TURN_${activeTurn}_HISTORY_LOST`);
+          textBlock(activeTurn === 1 ? "TURN_1_PUBLISHED"
+            : missingFile && activeTurn === 3 && remembersFreshFact ? `TURN_3_RECALLED_${freshFact}`
+            : remembersPrivateFact ? `TURN_${activeTurn}_RECALLED_${privateFact}` : `TURN_${activeTurn}_HISTORY_LOST`);
         }
         emit("message_delta", { delta: { stop_reason: isToolResult ? "end_turn" : "tool_use", stop_sequence: null }, usage: { output_tokens: 4 } });
         emit("message_stop", {}); res.end();
@@ -462,6 +465,7 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
         nativeProcessStartEvents: events.filter(event => event.eventType === "native.process_start_requested"),
         responsePublicationEvents: events.filter(event => event.eventType.startsWith("run.response_publication.")),
         assistantHistoryRecall: currentRequests[0]?.remembersPrivateFact ?? false,
+        freshHistoryRecall: currentRequests[0]?.remembersFreshFact ?? false,
         latestInputContainsFact: JSON.stringify(currentRequests[0]?.lastMessage).includes(privateFact) };
       turnProofs.push(row);
       await writeFile(join(root, "turns.json"), JSON.stringify(turnProofs, null, 2));
@@ -483,7 +487,9 @@ it.skipIf(!enabled).each([false, true, "invalid", "foreign", "runner-root"] as c
         // intentionally published, so ordinary Paperclip context may include
         // that public reply on turn 3; this is not a history-loss regression.
         if (activeTurn === 2) expect.soft(row.latestInputContainsFact, "first reopen does not replay the Pi-only fact").toBe(false);
-        expect.soft(reply.body).toBe(missingFile || invalidFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
+        expect.soft(reply.body).toBe(missingFile && activeTurn === 3 ? `TURN_3_RECALLED_${freshFact}`
+          : missingFile || invalidFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
+        if (missingFile && activeTurn === 3) expect(row.freshHistoryRecall, "the published answer recalls the fresh Pi-only fact").toBe(true);
         expect.soft(settled!.nativeSessionId, "all three reopened turns use the SAME normalized conversation").toBe(turnProofs[0]!.nativeSessionId);
         if (invalidFile) {
           const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
