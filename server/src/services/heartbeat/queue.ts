@@ -2156,7 +2156,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
-          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
+          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`,
+          sql`nullif(btrim(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}'), '') is not null`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
         scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
@@ -2166,6 +2167,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+        sql`nullif(btrim(${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginId}'), '') is not null`,
         dependencyResolvedWakePayloadSql, assignmentWakePayloadSql),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
@@ -2178,7 +2180,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
       const ownerWake = isDependencyResolvedWakePayload(wake.payload) || isAssignmentWakePayload(wake.payload);
-      if (!ownerWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
+      const pluginWake = readNonEmptyString(parseObject(wake.payload?._paperclipWakeContext).pluginId) !== null;
+      if (!pluginWake && !ownerWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
