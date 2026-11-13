@@ -121,7 +121,7 @@ async function insertAuditBatch(db: Db, batch: AccessEvent[]) {
       // discard only that tenant's deferred events, never reassign their scope.
       const companyIds = [...new Set(batch.map(event => event.companyId))].sort();
       const companyRows = await tx.select({ id: companies.id }).from(companies)
-        .where(inArray(companies.id, companyIds)).orderBy(companies.id).for("key share");
+        .where(inArray(companies.id, companyIds)).orderBy(companies.id);
       const existingCompanies = new Set(companyRows.map(row => row.id));
       let normalized = batch.filter(event => existingCompanies.has(event.companyId));
       const dropped = batch.length - normalized.length;
