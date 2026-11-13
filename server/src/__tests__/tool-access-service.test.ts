@@ -94,6 +94,7 @@ import { createConnectionSetupPolicy } from "../services/tool-access/connections
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import {
   GIT_CREDENTIAL_TOKEN_ENV_KEY,
   buildGitAuthInvocation,
@@ -977,6 +978,7 @@ describeEmbeddedPostgres("tool access service", () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    await flushSecretResolutionWrites(db);
     await db.delete(toolOauthStates);
     await db.delete(connectionTokenIssuances);
     await db.delete(secretAccessEvents);
