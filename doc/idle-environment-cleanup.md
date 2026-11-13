@@ -111,6 +111,13 @@ same-company run, one confirmed post-deadline absence suffices. An agentless
 correlation `runId` is not a missing heartbeat owner. Live/queued runs and
 agentless intents use the three-observation budget. A successful lookup finding a
 resource still transfers to `cleanup_pending`, regardless of prior absence.
+A late successful create reply has the same obligation. Recording its exact
+resource ID atomically restores `pending` and a due deadline when the operation
+was resolved only by bounded absence and has no lease owner. Recovery can finish
+the transfer even if the caller stops before queuing cleanup. Transfer holds the
+existing operation lock, so concurrent positive replies create one cleanup lease.
+A resolution after completed lease cleanup retains its lease ID and does not
+reopen or create another owner.
 Failed/unavailable lookups, null or unknown observations, foreign identities, and
 pre-deadline absence do not spend that budget or resolve the operation. They retain
 ownership and a saved backoff; an unknown resource is never treated as absent.

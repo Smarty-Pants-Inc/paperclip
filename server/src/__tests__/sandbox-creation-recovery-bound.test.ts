@@ -3,7 +3,7 @@ import { agents, companies, createDb, environmentLeases, environments, heartbeat
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { createOwnedSandbox, recoverSandboxCreations, type SandboxCreationOperation } from "../services/sandbox-creation-operations.js";
+import { createOwnedSandbox, recoverSandboxCreations, recordSandboxCreationResource, queueSandboxCreationCleanup, type SandboxCreationOperation } from "../services/sandbox-creation-operations.js";
 import { ENVIRONMENT_CLEANUP_RETRY_MS, nextEnvironmentCleanupAt } from "../services/environment-cleanup-state.js";
 
 // Keep reason: Image B-s4 905542b5 left 375 intents from refused allocations.
@@ -122,6 +122,43 @@ describe("bounded absent sandbox creation recovery", () => {
     expect(await current()).toMatchObject({ state: "pending", metadata: { creationRecoveryAttempts: 1 } });
     await due(); await recoverSandboxCreations(db, absent);
     expect(await current()).toMatchObject({ state: "pending", metadata: { creationRecoveryAttempts: 2 } });
+  });
+  it("recovers a recorded late resource after restart before its caller could queue cleanup", async () => {
+    const operation = await intent();
+    for (let attempt = 0; attempt < 3; attempt++) { await due(); await recoverSandboxCreations(db, absent); }
+    const resource = { id: operation.id, companyId, environmentId, providerLeaseId: "late-before-restart" };
+    await recordSandboxCreationResource(db, resource);
+    expect(await current()).toMatchObject({ state: "pending", leaseId: null });
+    expect((await current()).nextAttemptAt.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(await nextEnvironmentCleanupAt(db)).not.toBeNull();
+    const inspect = vi.fn(absent);
+    await recoverSandboxCreations(db, inspect);
+    expect(inspect).not.toHaveBeenCalled();
+    const row = await current();
+    expect(row.state).toBe("cleanup_pending");
+    expect(await db.select().from(environmentLeases)).toEqual([expect.objectContaining({
+      id: row.leaseId, providerLeaseId: resource.providerLeaseId, status: "pending_cleanup",
+    })]);
+  });
+  it("serializes concurrent late cleanup transfers and never reopens completed cleanup", async () => {
+    const operation = await intent();
+    for (let attempt = 0; attempt < 3; attempt++) { await due(); await recoverSandboxCreations(db, absent); }
+    const resource = { id: operation.id, companyId, environmentId, providerLeaseId: "one-late-resource" };
+    await Promise.all(Array.from({ length: 4 }, () => queueSandboxCreationCleanup(db, resource)));
+    const row = await current();
+    expect(row.state).toBe("cleanup_pending");
+    expect(await db.select().from(environmentLeases)).toEqual([expect.objectContaining({
+      id: row.leaseId, providerLeaseId: resource.providerLeaseId, status: "pending_cleanup",
+    })]);
+    // Completed cleanup, unlike absence, already has a durable lease owner.
+    await db.update(environmentLeases).set({ status: "released" }).where(eq(environmentLeases.id, row.leaseId!));
+    await db.update(sandboxCreationOperations).set({ state: "resolved" });
+    await recordSandboxCreationResource(db, resource);
+    await queueSandboxCreationCleanup(db, resource);
+    expect(await current()).toMatchObject({ state: "resolved", leaseId: row.leaseId });
+    expect(await db.select().from(environmentLeases)).toHaveLength(1);
+    expect(await nextEnvironmentCleanupAt(db)).toBeNull();
+    await expect(recordSandboxCreationResource(db, { ...resource, providerLeaseId: "foreign-resource" })).rejects.toThrow("identity changed");
   });
   it("still transfers a discovered allocation to cleanup even after earlier absence", async () => {
     await intent(); await recoverSandboxCreations(db, absent); await due();
