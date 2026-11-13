@@ -5856,9 +5856,15 @@ async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
       return refuse("target_not_sandbox_runner");
     }
-    // A resume that woke a provider-stopped allocation restarted its machine,
-    // so the prior Runner is no more alive there than on a new sandbox.
-    if (!restartedSandboxResume(target) && !["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
+    // A resume from a provider's stopped state is only the trigger to look:
+    // Boat may resume the same machine with its programs still running. The
+    // prior Runner is treated as stopped only when its exact launch marker on
+    // the box names a process that is gone or of another generation.
+    if (restartedSandboxResume(target)) {
+      if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
+        return refuse("restarted_sandbox_runner_generation_not_lost");
+      }
+    } else if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
   }
@@ -15019,6 +15025,39 @@ export async function verifyRemoteRunnerReattachment(input: {
     isAlive: async () => (await check()).alive,
     signal: async (signal: NodeJS.Signals) => (await check(signal)).alive,
   };
+}
+
+/**
+ * Positive proof that the exact prior Runner's process generation is gone from
+ * its box (RFL F1): the box's launch marker for this session names that runner
+ * instance with a recorded start generation ("linux:<boot_id>:<start ticks>"),
+ * and the process it names is not running (45) or now has a different
+ * generation (47): another boot or a reused pid. A live matching process, a
+ * missing or foreign marker, or a failed probe proves nothing.
+ */
+export async function remoteRunnerGenerationLost(input: {
+  runner: CommandManagedRuntimeRunner;
+  remoteCwd: string;
+  identity: Record<string, unknown>;
+}): Promise<boolean> {
+  const { runnerInstanceId, normalizedSessionId } = input.identity;
+  if (typeof runnerInstanceId !== "string" || !runnerInstanceId || typeof normalizedSessionId !== "string" || !normalizedSessionId) return false;
+  const identityPath = posix.join(remoteRunnerStateDirectory(input.remoteCwd, normalizedSessionId), "runner-process.identity");
+  try {
+    const marker = await input.runner.execute({ command: "sh", bypassSession: true, timeoutMs: 10_000,
+      args: ["-c", REMOTE_RECOVERY_MARKER_READ_SCRIPT, "paperclip-runner-generation-marker", identityPath] });
+    if (marker.exitCode !== 0 || marker.timedOut) return false;
+    const nonce = marker.stdout.split("\n")[0] ?? "";
+    if (!/^[a-zA-Z0-9_-]+$/.test(nonce)) return false;
+    const owner = parseRemoteRunnerProcessIdentity(marker.stdout, { nonce, runnerInstanceId });
+    if (!owner?.processStartFingerprint) return false;
+    const check = await input.runner.execute({ command: "sh", bypassSession: true, timeoutMs: 10_000,
+      args: ["-c", REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT, "paperclip-runner-generation-check", identityPath, nonce,
+        runnerInstanceId, String(owner.pid), owner.processStartFingerprint] });
+    return !check.timedOut && (check.exitCode === 45 || check.exitCode === 47);
+  } catch {
+    return false;
+  }
 }
 
 export async function verifyRemoteRunnerOrSettledExit(
