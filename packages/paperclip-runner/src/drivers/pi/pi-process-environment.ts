@@ -14,6 +14,10 @@ const BASE_KEYS = new Set([
 /** Exact names only. Never replace this with LANGFUSE_* / PAPERCLIP_* prefix
  * inheritance.
  */
+export const PI_LANGFUSE_ENVIRONMENT_KEYS = [
+  "LANGFUSE_BASE_URL", "LANGFUSE_HOST", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY",
+  "LANGFUSE_USER_ID", "LANGFUSE_TRACING_ENABLED", "LANGFUSE_TRACING_ENVIRONMENT", "LANGFUSE_RELEASE", "PI_LANGFUSE_DEBUG",
+] as const;
 export const PI_PROCESS_ENVIRONMENT_KEYS = [
   ...BASE_KEYS,
   "PI_CODING_AGENT_DIR", "PI_OFFLINE", "AGENT_HOME", "PAPERCLIP_PI_AGENT_HOME",
@@ -24,9 +28,8 @@ export const PI_PROCESS_ENVIRONMENT_KEYS = [
   // Langfuse export for Pi's observability plugin, as Paperclip documents it:
   // doc/architecture/runner-pi-capabilities.md:72-76 and :108-111 ("Supply any
   // Langfuse export credentials through the existing configured secret
-  // environment"). Org ruling 11-13 00:45Z: these stay in Pi's environment.
-  "LANGFUSE_BASE_URL", "LANGFUSE_HOST", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY",
-  "LANGFUSE_USER_ID", "LANGFUSE_TRACING_ENABLED", "LANGFUSE_TRACING_ENVIRONMENT", "LANGFUSE_RELEASE", "PI_LANGFUSE_DEBUG",
+  // environment"). Do not forward the configured-env marker or arbitrary names.
+  ...PI_LANGFUSE_ENVIRONMENT_KEYS,
   // Assigned-MCP's existing run-scoped capability, NOT an agent API bearer.
   "PAPERCLIP_NATIVE_MCP_NAME", "PAPERCLIP_NATIVE_MCP_URL", "PAPERCLIP_NATIVE_MCP_TOKEN",
 ] as const;

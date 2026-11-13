@@ -339,6 +339,7 @@ fn opencode_config(state_dir: &Path) -> DurableRunnerConfig {
     }
     let mut config = config(state_dir);
     config.opencode_launch_profile = Some(OpenCodeLaunchProfile {
+        process_hardening: None,
         command: qualified_artifact(command),
         proxy_script: qualified_artifact(proxy_script),
         executable: qualified_artifact(executable),
