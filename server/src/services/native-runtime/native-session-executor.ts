@@ -759,10 +759,7 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
       // session's own state root, and its Runner is stopped. Without a task
       // owner, other close errors can mean controller authority is still live.
       const discardable = options?.discardUnsettledSession === true;
-      const owner = discardable ? pluginTaskSessionOwners.get(entry.session) : undefined;
-      const retiredWithoutCheckpoint = discardable && (owner
-        ? owner.isRetired() || await owner.retireSupersededTask().catch(() => false)
-        : error instanceof NativeSessionCloseUnrecoverableError && error.settlement?.runnerSuspended === true);
+      const retiredWithoutCheckpoint = discardable && await retainedRunnerContainedAfterFailedClose(entry.session, error);
       if (!retiredWithoutCheckpoint) {
         try { await entry.instructionWorkingCopy?.retirementFailed?.(); }
         catch (receiptError) { throw new AggregateError([error, receiptError], "Warm instruction retirement and receipt both failed"); }
@@ -773,6 +770,16 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
     if (entry.instructionCopy?.runId !== options?.preserveInstructionsForRunId) await entry.instructionCopy?.collectStopped();
   }
   finally { await stopping; }
+}
+
+/** A retained Runner whose close rejected is still contained when Launcher
+ * proves its exact task stopped (forcing that stop when unproven) or, without a
+ * task owner, the Runner durably suspended. A local runnerd that died is reaped
+ * by close itself through its lineage journal (runnerd-codex-transport). */
+async function retainedRunnerContainedAfterFailedClose(session: NativeSession, error: unknown): Promise<boolean> {
+  const owner = pluginTaskSessionOwners.get(session);
+  return owner ? owner.isRetired() || await owner.retireSupersededTask().catch(() => false)
+    : error instanceof NativeSessionCloseUnrecoverableError && error.settlement?.runnerSuspended === true;
 }
 
 async function detachReleasedWarmNativeSession(entry: WarmNativeSession) {
@@ -12047,11 +12054,15 @@ async function executePaperclipNativeSessionAttempt(
         return false;
       }
       // Stopped, not left half-quarantined: close is idempotent and joins the
-      // runtime's quarantine close. Without that proof no second Runner starts.
+      // runtime's quarantine close. A dead Runner whose close cannot settle is
+      // accepted only with the existing containment receipt; without it no
+      // second Runner starts.
       try { await retained.close({ reason: "warm runner attach failed" }); }
-      catch {
-        await reportWarmAttachFailure(code, text, "retire_unproven");
-        return false;
+      catch (closeError) {
+        if (!await retainedRunnerContainedAfterFailedClose(retained, closeError)) {
+          await reportWarmAttachFailure(code, text, "retire_unproven");
+          return false;
+        }
       }
       existingWarmSession = undefined;
       reusingReleasedRunner = false;
