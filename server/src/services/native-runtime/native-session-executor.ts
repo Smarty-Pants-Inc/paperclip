@@ -16408,6 +16408,23 @@ export function createRemoteRunnerProcessLauncher(input: {
   const runner = input.runner;
   return (spec) => {
     let exitConfirmed = false;
+    let verificationRequested = false;
+    let wakeVerification: (() => void) | null = null;
+    const requestExitVerification = () => {
+      verificationRequested = true;
+      wakeVerification?.();
+    };
+    const waitForExitVerification = async (pollMs: number) => {
+      if (!verificationRequested) await new Promise<void>((resolve) => {
+        const wake = () => {
+          clearTimeout(timer);
+          wakeVerification = null;
+          resolve();
+        };
+        const timer = setTimeout(wake, pollMs);
+        wakeVerification = wake;
+      });
+    };
     // Set immediately before the launch RPC. Until then no sandbox command
     // could have started runnerd, so a staging failure proves no process.
     let launchDispatched = false;
@@ -16465,7 +16482,7 @@ export function createRemoteRunnerProcessLauncher(input: {
             "stderr",
             "Remote runner signal failed; process termination is not confirmed.\n",
           );
-        }).catch(() => undefined);
+        }).then(requestExitVerification, requestExitVerification);
         return true;
       },
     };
@@ -16609,9 +16626,6 @@ export function createRemoteRunnerProcessLauncher(input: {
       });
 
       let supervisionUnknownSince: number | null = null;
-      // PRP owns authenticated connection-close observation. This detached
-      // launch has no provider child-completion channel (its launch RPC already
-      // finished), so retain exact process verification as the bounded fallback.
       // A socket close alone is never permission to replace a possibly live PID.
       while (true) {
         const supervision = input.sandboxRetention?.supervision;
@@ -16619,6 +16633,7 @@ export function createRemoteRunnerProcessLauncher(input: {
         // Controller detach parks supervision without fabricating remote exit.
         if (supervision?.detached) return await new Promise<Awaited<RunnerProcessHandle["completion"]>>(() => {});
         const monitorGeneration = supervision?.generation;
+        verificationRequested = false;
         const observed = await readRemoteRunnerRecoveryProbe({
           runner,
           stage: "process_verification",
@@ -16646,14 +16661,12 @@ export function createRemoteRunnerProcessLauncher(input: {
         });
         if (supervision && !supervision.accepts(monitorGeneration!)) continue;
         if (!observed) {
-          await new Promise<void>((resolve) => setTimeout(resolve, REMOTE_RUNNER_PROCESS_POLL_MS));
+          await waitForExitVerification(REMOTE_RUNNER_PROCESS_POLL_MS);
           continue;
         }
         supervisionUnknownSince = null;
         if (observed.exitCode === 0 && !observed.timedOut) {
-          await new Promise<void>((resolve) =>
-            setTimeout(resolve, input.processPollMs ?? REMOTE_RUNNER_PROCESS_POLL_MS),
-          );
+          await waitForExitVerification(input.processPollMs ?? REMOTE_RUNNER_PROCESS_POLL_MS);
           continue;
         }
         if (observed.exitCode !== 45) {
@@ -16723,6 +16736,7 @@ export function createRemoteRunnerProcessLauncher(input: {
       completion,
       get startedAt() { return launchedIdentity?.startedAt; },
       isExitConfirmed: () => input.sandboxRetention?.retiredBeforeClaim() === true || exitConfirmed,
+      requestExitVerification,
     };
   };
 }
