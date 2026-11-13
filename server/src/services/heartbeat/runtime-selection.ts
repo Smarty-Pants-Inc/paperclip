@@ -691,6 +691,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             issueId: issueRef.id,
             runId: run.id,
             agentId: agent.id,
+            wakeReason: readNonEmptyString(context.wakeReason) ?? undefined,
             interactionIds: Array.isArray(context.interactionIds)
               ? [
                   ...new Set([
