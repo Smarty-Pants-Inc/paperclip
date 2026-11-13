@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { nextEnvironmentCleanupAt } from "../services/environment-cleanup-state.js";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.js";
@@ -40,6 +40,7 @@ suite("warm sandbox expiry", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(issueRecoveryActions);
     await db.delete(environmentLeases);
     await db.delete(heartbeatRuns);
   });
@@ -179,6 +180,76 @@ suite("warm sandbox expiry", () => {
     expect((await row(recent)).status).toBe("retained");
     const recentRow = await row(recent);
     expect(await nextWarmSandboxStopAt(db)).toBe(recentRow.lastUsedAt.getTime() + 24 * HOUR);
+  });
+
+  // Keep: data safety and the pre-upgrade provider-expired warm-lease leak.
+  // Use the real PostgreSQL deadline/cleanup path; only provider I/O is controlled.
+  async function providerExpiredLegacyLease() {
+    const leaseId = await warmRetained({ releasedAgoMs: HOUR, windowMs: null, runStatus: "failed" });
+    const expiresAt = new Date(Date.now() - 27 * MINUTE);
+    const savedState = { checkpoint: "saved-task-work" };
+    const before = await row(leaseId);
+    await db.update(environmentLeases).set({ expiresAt,
+      metadata: { ...before.metadata, savedState } }).where(eq(environmentLeases.id, leaseId));
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({ id: actionId, companyId, sourceIssueId: issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board",
+      cause: "native_continuation_requires_reconciliation", fingerprint: randomUUID(),
+      evidence: { runId: before.heartbeatRunId }, nextAction: "Reconcile, then continue saved work." });
+    return { leaseId, expiresAt, actionId, savedState };
+  }
+
+  it("bounds a pre-upgrade warm deadline by provider expiry despite an active board recovery action", async () => {
+    const { leaseId, expiresAt } = await providerExpiredLegacyLease();
+    const retained = await row(leaseId);
+    expect(retained.metadata?.[WARM_SANDBOX_IDLE_TIMEOUT_KEY]).toBeUndefined();
+    // Without the provider bound this row waits another 23 hours after upgrade.
+    expect(retained.lastUsedAt.getTime() + 24 * HOUR).toBeGreaterThan(Date.now());
+    expect(await nextWarmSandboxStopAt(db)).toBe(expiresAt.getTime());
+    expect(await nextEnvironmentCleanupAt(db)).toBeLessThanOrEqual(Date.now());
+    expect((await row(leaseId)).status).toBe("retained");
+  });
+
+  it("stops and retains a provider-expired pre-upgrade lease on its first sweep without closing board recovery", async () => {
+    const { leaseId, actionId, savedState } = await providerExpiredLegacyLease();
+    const transitions: string[] = [];
+    const teardown = vi.fn(async ({ lease }: { lease: typeof environmentLeases.$inferSelect }) => {
+      const pending = await row(leaseId);
+      transitions.push(pending.status);
+      expect(pending).toMatchObject({ status: "pending_cleanup", failureReason: "sandbox_stop_pending" });
+      expect(lease.metadata?.sandboxStopAndRetain).toMatchObject({ leaseId, warmWindowExpired: true });
+      return { providerLeaseId: lease.providerLeaseId, state: "stopped" };
+    });
+    const destroy = vi.fn();
+    const service = heartbeatService(db, { environmentRuntime: {
+      retryPendingSandboxTeardown: teardown, destroyRunLease: destroy,
+    } as unknown as HeartbeatEnvironmentRuntime });
+    await service.sweepPendingCleanupLeases({ backoffMs: 5 * MINUTE });
+    const stopped = await row(leaseId);
+    transitions.push(stopped.status);
+    expect(transitions).toEqual(["pending_cleanup", "released"]);
+    expect(teardown).toHaveBeenCalledOnce();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(stopped).toMatchObject({ cleanupStatus: "success", leasePolicy: "reuse_by_environment" });
+    expect(stopped.metadata?.remoteExecutionTermination).toMatchObject({ state: "stopped", leaseId });
+    expect(stopped.metadata?.sandboxStopAndRetainReceipt).toMatchObject({ leaseId,
+      providerLeaseId: stopped.providerLeaseId });
+    expect(stopped.metadata?.sandboxStopAndRetain).toBeUndefined();
+    expect(stopped.metadata?.savedState).toEqual(savedState);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+    expect(action).toMatchObject({ status: "active", ownerType: "board" });
+    expect(await nextEnvironmentCleanupAt(db)).toBeNull();
+    await service.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(teardown).toHaveBeenCalledOnce();
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  it.each([2 * MINUTE, 10 * MINUTE])("uses the earlier saved warm window or provider expiry (%i ms)", async providerRemainingMs => {
+    const leaseId = await warmRetained({ releasedAgoMs: 2 * MINUTE, windowMs: 5 * MINUTE });
+    const expiresAt = new Date(Date.now() + providerRemainingMs);
+    await db.update(environmentLeases).set({ expiresAt }).where(eq(environmentLeases.id, leaseId));
+    const retained = await row(leaseId);
+    expect(await nextWarmSandboxStopAt(db)).toBe(Math.min(retained.lastUsedAt.getTime() + 5 * MINUTE, expiresAt.getTime()));
   });
 
   it("records the run's warm window on the lease only for a warm run", () => {
