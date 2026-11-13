@@ -362,8 +362,14 @@ and the unresolved stop/cleanup proof rather than inventing an invocation ID.
 The phase and all unfinished resources are retained; parking is not stop proof.
 Scans, direct claims, and coordinator deadlines exclude every parked lifecycle
 phase, including an operator's already-set `retryRequired` on stop work. Restart
-and later sweeps do not retry it. After checking the outstanding invocation or
-cleanup, the operator uses the existing Retry action to clear the park and its
+and later sweeps do not retry it. The existing bounded startup recovery pass
+fills in a missing or blank diagnostic on older operator-parked Stop rows,
+including those in paused or archived companies. It changes only the diagnostic,
+not the operation, phase, budget, lease, or deadline. Existing nonblank errors
+and a concurrent Retry or newer lifecycle revision are preserved. The diagnostic
+exposes the existing Retry action; parked Stop guidance never promises automatic
+retry. After checking the outstanding invocation or cleanup, the operator uses
+the existing Retry action to clear the park and its
 Stop budget. A successful stop then completes through the ordinary state path.
 A Retry racing an active attempt is retained; that old result cannot park over it.
 Claims deferred before external work do not consume a Stop attempt.

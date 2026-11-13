@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createAgentLifecycle, createAgentLifecycleEffects } from "../../../services/agent-lifecycle.js";
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
-import { createLifecycleStore } from "../adapters/postgres.js";
+import { createLifecycleStore, surfaceAgentLifecycleStopParkInTransaction } from "../adapters/postgres.js";
 import { createLifecycleWorker } from "../application/worker.js";
 import { startAgentLifecycle } from "../index.js";
 
@@ -107,6 +107,77 @@ describe("bounded lifecycle Stop recovery", () => {
       expect(driver.runHost).not.toHaveBeenCalled();
       expect((await current(agent.id)).lifecycleOperation?.attempts).toBe(0);
     } finally { await worker.stop(); }
+  });
+  it.each(["active", "paused", "archived"])("surfaces old parks without changing their ownership or Retry while company is %s", async status => {
+    const parked = await Promise.all((["pausing", "terminating", "cleaning_up"] as const).map(phase => fixture(phase, {
+      retryRequired: true, attempts: 25, hostComplete: false, completedPluginIds: ["already-done"],
+    })));
+    await db.update(companies).set({ status }).where(eq(companies.id, companyId));
+    const driver = makeDriver();
+    const restarted = startAgentLifecycle(db, createAgentLifecycleEffects(), driver, () => true);
+    try {
+      await restarted.sweep();
+      expect(await restarted.hasPending()).toBe(false);
+      expect(restarted.nextRunAt()).toBeNull();
+      for (const agent of parked) {
+        const row = await current(agent.id);
+        expect(row.lifecycleOperation).toEqual(agent.lifecycleOperation);
+        expect(row.lifecycleVersion).toBe(agent.lifecycleVersion);
+        expect(row.lifecycleError).toContain(`Automatic stop work is paused in ${agent.lifecycleState}`);
+        expect(row.lifecycleError).toContain(agent.lifecycleOperation!.id);
+        expect(row.lifecycleError).toContain("use Retry");
+      }
+      expect(driver.runHost).not.toHaveBeenCalled();
+      driver.runHost.mockResolvedValue("complete");
+      // Use the existing action, not a recovery-only way of un-parking.
+      for (const agent of parked) await createAgentLifecycle(db).retry(agent.id);
+      await restarted.sweep();
+      for (const agent of parked) {
+        const row = await current(agent.id);
+        expect(row.lifecycleError).toBeNull();
+        expect(row.lifecycleOperation?.retryRequired).toBeUndefined();
+        expect(row.lifecycleState).toBe(agent.lifecycleState === "pausing" ? "paused" : "terminated");
+      }
+    } finally { await restarted.stop(); }
+  });
+  it("bounds old-park visibility recovery to existing startup pages without invoking stop work", async () => {
+    await db.insert(agents).values(Array.from({ length: 101 }, () => ({ companyId, name: "Old silent park", status: "paused", lifecycleState: "pausing" as const,
+      lifecycleHolds: ["manual"], lifecycleRequiredPluginIds: [], lifecycleError: "  ",
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 25, retryRequired: true },
+    })));
+    const driver = makeDriver();
+    const restarted = startAgentLifecycle(db, createAgentLifecycleEffects(), driver, () => true);
+    try {
+      await restarted.sweep();
+      const first = await db.select().from(agents).where(eq(agents.companyId, companyId));
+      expect(first.filter(row => row.lifecycleError?.includes("use Retry"))).toHaveLength(100);
+      expect(await restarted.hasPending()).toBe(true);
+      await restarted.sweep();
+      const second = await db.select().from(agents).where(eq(agents.companyId, companyId));
+      expect(second.every(row => row.lifecycleError?.includes("use Retry"))).toBe(true);
+      expect(second.every(row => row.lifecycleOperation?.attempts === 25 && row.lifecycleOperation.retryRequired === true)).toBe(true);
+      expect(await restarted.hasPending()).toBe(false);
+      expect(restarted.nextRunAt()).toBeNull();
+      expect(driver.runHost).not.toHaveBeenCalled();
+    } finally { await restarted.stop(); }
+  });
+  it("does not overwrite a diagnostic, a raced Retry or a newer operation during visibility recovery", async () => {
+    const effects = createAgentLifecycleEffects();
+    const store = createLifecycleStore(db, effects);
+    const repair = (agent: Awaited<ReturnType<typeof fixture>>) => effects.transaction(db, companyId, tx =>
+      surfaceAgentLifecycleStopParkInTransaction(tx, { companyId, agentId: agent.id, expectedVersion: agent.lifecycleVersion }));
+    const detailed = await fixture("pausing", { retryRequired: true });
+    await db.update(agents).set({ lifecycleError: "Specific blocking invocation; use Retry." }).where(eq(agents.id, detailed.id));
+    expect(await repair(detailed)).toBe(false);
+    expect((await current(detailed.id)).lifecycleError).toBe("Specific blocking invocation; use Retry.");
+    const retried = await fixture("pausing", { retryRequired: true });
+    await store.change(retried.id, "retry");
+    expect(await repair(retried)).toBe(false);
+    expect((await current(retried.id)).lifecycleError).toBeNull();
+    const changed = await fixture("pausing", { retryRequired: true });
+    await store.change(changed.id, "terminate");
+    expect(await repair(changed)).toBe(false);
+    expect((await current(changed.id)).lifecycleError).toBeNull();
   });
   it("names the real blocking invocation in a parked Stop error, without treating cancellation as proof", async () => {
     const agent = await fixture("pausing");
