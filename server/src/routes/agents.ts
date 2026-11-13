@@ -1805,6 +1805,7 @@ export function agentRoutes(
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
+      scope: { targetAgentId: targetAgent.id },
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -2556,7 +2557,7 @@ export function agentRoutes(
       throw notFound("Agent not found");
     }
     assertCompanyAccess(req, targetAgent.companyId);
-    const changeScope = { requiresChangeGrant: true };
+    const changeScope = { targetAgentId: targetAgent.id, requiresChangeGrant: true };
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",
@@ -2626,7 +2627,7 @@ export function agentRoutes(
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
-      scope: { requiresChangeGrant: true },
+      scope: { targetAgentId: targetAgent.id, requiresChangeGrant: true },
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
