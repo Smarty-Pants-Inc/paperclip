@@ -17,6 +17,8 @@ import type { ConnectToolAppResult } from "@paperclipai/shared";
 import { getConnectableAppDefinition, recommendedDefaultsForApp } from "@paperclipai/shared";
 import { badRequest, forbidden, HttpError, unprocessable } from "../../../errors.js";
 import { secretService } from "../../secrets.js";
+import { logActivity } from "../../activity-log.js";
+import { loadGitHubGrantMetadata } from "../github-access-discovery.js";
 
 import type { OAuthStateStore } from "./state.js";
 import type { OAuthCredentialStore } from "./credential-store.js";
@@ -160,6 +162,32 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
     const expiresAt = token.expiresIn
       ? new Date(connectedAt.getTime() + token.expiresIn * 1000).toISOString()
       : null;
+    // Account and installation access for a direct GitHub sign-in. An OAuth App
+    // token still proves identity without it, but shell Git and gh need it, so a
+    // failed check is recorded instead of being dropped.
+    const githubSource =
+      (asRecord(connection.config).sourceTemplateKey ??
+        asRecord(connection.transportConfig).sourceTemplateKey) === "github";
+    const githubMetadata = githubSource && stateRow.subjectUserId
+      ? await loadGitHubGrantMetadata(token.accessToken).catch(async (error: unknown) => {
+          await logActivity(db, {
+            companyId: connection.companyId,
+            actorType: input.actor?.actorType ?? "system",
+            actorId: input.actor?.actorId ?? "system",
+            action: "tool_connection.github_access_unverified",
+            entityType: "tool_connection",
+            entityId: connection.id,
+            details: {
+              subjectUserId: stateRow.subjectUserId,
+              code: error instanceof HttpError ? asRecord(error.details).code ?? null : null,
+              message: error instanceof HttpError
+                ? error.message
+                : "GitHub could not verify this account's installation access",
+            },
+          });
+          return null;
+        })
+      : null;
     if (stateRow.subjectUserId) {
       let personalCredentialSecretRefs: typeof connectionGrants.$inferSelect.credentialSecretRefs =
         [];
@@ -276,6 +304,8 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
               tokenType: token.tokenType,
               refreshedAt: connectedAt.toISOString(),
             },
+            // A replaced token must not keep the previous account's GitHub identity.
+            ...(githubSource ? { github: githubMetadata ?? undefined } : {}),
           },
           credentialSecretRefs: nextCredentialSecretRefs,
           status: "active" as const,

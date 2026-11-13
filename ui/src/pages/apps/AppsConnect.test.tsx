@@ -1553,6 +1553,78 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
     }));
   });
 
+  it("allows an organization's own GitHub App from the shared sign-in setup", async () => {
+    listGalleryMock.mockResolvedValue({ apps: [GITHUB_MANAGED] });
+    mockParams.appKey = "github";
+    connectAppMock.mockResolvedValueOnce({
+      connectionId: "conn-github",
+      application: { id: "app-github", name: "GitHub" },
+      connection: { id: "conn-github" },
+      actions: { readOnly: [], canMakeChanges: [] },
+      catalog: [],
+      suggestedDefaults: {},
+      auth: { kind: "oauth", startUrl: "https://github.com/login/oauth/authorize?state=opaque" },
+    });
+    await render();
+    await flushReact();
+    expect(container.querySelector("#curated-oauth-client-id")).toBeNull();
+
+    await openAccessAdvanced();
+    await flushReact();
+    const customApp = radioContaining("Use your own GitHub App");
+    expect(customApp).toBeTruthy();
+    await act(async () => { customApp!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flushReact();
+
+    const clientId = container.querySelector<HTMLInputElement>("#curated-oauth-client-id");
+    const clientSecret = container.querySelector<HTMLInputElement>("#curated-oauth-client-secret");
+    expect(clientId).toBeTruthy();
+    expect(clientSecret).toBeTruthy();
+    await act(async () => {
+      setInputValue(clientId!, "github-app-client");
+      setInputValue(clientSecret!, "github-app-secret");
+    });
+    await flushReact();
+    await act(async () => { buttonByText("Continue to GitHub")!.click(); });
+    await flushReact();
+
+    expect(connectAppMock).toHaveBeenLastCalledWith("company-1", expect.objectContaining({
+      galleryKey: "github", connectionMethodKey: "own-oauth",
+      oauthClient: { clientId: "github-app-client", clientSecret: "github-app-secret" },
+    }));
+  });
+
+  it("does not ask for a client when the server configures its own GitHub App", async () => {
+    listGalleryMock.mockResolvedValue({ apps: [{ ...GITHUB_MANAGED, deploymentOAuthClient: true }] });
+    mockParams.appKey = "github";
+    connectAppMock.mockResolvedValueOnce({
+      connectionId: "conn-github",
+      application: { id: "app-github", name: "GitHub" },
+      connection: { id: "conn-github" },
+      actions: { readOnly: [], canMakeChanges: [] },
+      catalog: [],
+      suggestedDefaults: {},
+      auth: { kind: "oauth", startUrl: "https://github.com/login/oauth/authorize?state=opaque" },
+    });
+    await render();
+    await flushReact();
+    await openAccessAdvanced();
+    await flushReact();
+    await act(async () => { radioContaining("Use your own GitHub App")!.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await flushReact();
+
+    expect(container.querySelector("#curated-oauth-client-id")).toBeNull();
+    expect(container.querySelector("#curated-oauth-client-secret")).toBeNull();
+    expect(container.textContent).toContain("Signs in with the GitHub OAuth app configured on this server.");
+    await act(async () => { buttonByText("Continue to GitHub")!.click(); });
+    await flushReact();
+
+    expect(connectAppMock).toHaveBeenLastCalledWith("company-1", expect.objectContaining({
+      galleryKey: "github", connectionMethodKey: "own-oauth",
+    }));
+    expect(connectAppMock.mock.lastCall?.[1]).not.toHaveProperty("oauthClient");
+  });
+
   it("submits the Postman access mode selected on the setup screen", async () => {
     listGalleryMock.mockResolvedValue({ apps: [POSTMAN] });
     mockParams.appKey = "postman";
@@ -1860,6 +1932,47 @@ describe("AppsConnect — Connect with a link (M4 frame)", () => {
 
     expect(container.textContent).toContain("Connect with Paperclip");
     expect(container.textContent).not.toContain("GitHub token");
+  });
+
+  it("offers the organization's own GitHub App on an unenrolled instance, without Cloud enrollment", async () => {
+    mockParams.appKey = "github";
+    listGalleryMock.mockResolvedValue({ apps: [customerOwnedApp(GITHUB)] });
+    getCloudConnectorEnrollmentMock.mockResolvedValue(unconfiguredConnectorEnrollment());
+    connectAppMock.mockResolvedValueOnce({
+      connectionId: "conn-github",
+      application: { id: "app-github", name: "GitHub" },
+      connection: { id: "conn-github" },
+      actions: { readOnly: [], canMakeChanges: [] },
+      catalog: [],
+      suggestedDefaults: {},
+      auth: { kind: "oauth", startUrl: "https://github.com/login/oauth/authorize?state=opaque" },
+    });
+
+    await render();
+    expect(container.textContent).toContain("Connect with Paperclip");
+    const ownApp = buttonByText("Use your own GitHub OAuth app");
+    expect(ownApp).toBeDefined();
+    await act(async () => { ownApp!.click(); });
+    await flushReact();
+
+    expect(container.textContent).not.toContain("Connect with Paperclip");
+    const clientId = container.querySelector<HTMLInputElement>("#curated-oauth-client-id");
+    const clientSecret = container.querySelector<HTMLInputElement>("#curated-oauth-client-secret");
+    expect(clientId).toBeTruthy();
+    expect(clientSecret).toBeTruthy();
+    await act(async () => {
+      setInputValue(clientId!, "github-app-client");
+      setInputValue(clientSecret!, "github-app-secret");
+    });
+    await flushReact();
+    await act(async () => { buttonByText("Continue to GitHub")!.click(); });
+    await flushReact();
+
+    expect(connectAppMock).toHaveBeenLastCalledWith("company-1", expect.objectContaining({
+      galleryKey: "github", connectionMethodKey: "own-oauth", grantKind: "user",
+      oauthClient: { clientId: "github-app-client", clientSecret: "github-app-secret" },
+    }));
+    expect(startCloudConnectorEnrollmentMock).not.toHaveBeenCalled();
   });
 
   it("restores the setup step after the one-time enrollment callback", async () => {

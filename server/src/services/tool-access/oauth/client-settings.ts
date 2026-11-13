@@ -4,7 +4,7 @@ import { connectionMethodForConnection } from "../connection-methods.js";
 import { stableHash } from "../../tool-catalog-hash.js";
 import { ASANA_CONNECTOR_SCOPES, isAsanaConnectorProfileId, type AsanaConnectorProfileId } from "@paperclipai/shared";
 import { connectionGrants, toolConnections } from "@paperclipai/db";
-import { GITHUB_CONNECTOR_PROFILES, GOOGLE_WORKSPACE_CONNECTOR_PROFILES, getConnectableAppDefinition, isGitHubConnectorProfileId, isGoogleWorkspaceConnectorProfileId, type GitHubConnectorProfileId, type GoogleWorkspaceConnectorProfileId } from "@paperclipai/shared";
+import { GITHUB_CONNECTOR_PROFILES, GOOGLE_WORKSPACE_CONNECTOR_PROFILES, connectionMethodAcceptsCustomerOAuthClient, getConnectableAppDefinition, isGitHubConnectorProfileId, isGoogleWorkspaceConnectorProfileId, type GitHubConnectorProfileId, type GoogleWorkspaceConnectorProfileId, type AppDefinition } from "@paperclipai/shared";
 import { unprocessable } from "../../../errors.js";
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -35,6 +35,15 @@ export function oauthClientConfig(provider: string) {
       process.env.PAPERCLIP_TOOL_OAUTH_CLIENT_SECRET ??
       null,
   };
+}
+
+/** Marks an app whose own-OAuth-app sign-in uses the deployment's client, so setup does not ask for one. */
+export function appWithDeploymentOAuthClient<T extends AppDefinition>(app: T): T {
+  const customerClientMethods = app.methods.filter(connectionMethodAcceptsCustomerOAuthClient);
+  const client = oauthClientConfig(app.slug);
+  if (customerClientMethods.length === 0 || !client.clientId) return app;
+  if (!client.clientSecret && customerClientMethods.some((method) => method.oauthClientSecretRequired)) return app;
+  return { ...app, deploymentOAuthClient: true };
 }
 
 export function configuredOAuthClientForConnection(
