@@ -3717,10 +3717,17 @@ controller re-authenticated, stops its provider, keeps its durable state for a
 cold resume, and exits. A graceful controller shutdown suspends idle warm
 sessions first. A per-turn local runner keeps its connection-lease bound.
 
-Only successful turns retain a live warm provider session. A structured failed
-or cancelled result must retire that session and collect its managed files before
-heartbeat stops the reusable sandbox. A later retry can resume the same sandbox
-without inheriting the stopped provider transport.
+Successful turns retain a live warm provider session. Native Pi can also retain
+its exact resident after an acknowledged board Stop, including on later turns:
+active work must be physically stopped, the session idle with no pending input,
+and the current run's ownership, conversation-generation and newer-owner fences
+must still hold. A prior run's goal projection is not the current run's authority;
+retention verifies that any lagging goal and task-pointer owners are completed
+predecessors in the same source and conversation. This publishes conversation
+bookkeeping, never a successful result. Other structured failed or cancelled
+results retire the session and collect its managed files before heartbeat stops
+the reusable sandbox. A later retry can resume the same sandbox without
+inheriting the stopped provider transport.
 
 A rejected warm-session close retains its owner, even when no managed instruction
 copy exists. Idle expiry, failed-turn release, and restart must not report that

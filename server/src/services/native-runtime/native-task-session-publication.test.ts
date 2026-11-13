@@ -175,7 +175,7 @@ describe("accepted native task session publication", () => {
     expect((await f.read()).session).toEqual(before.session);
   });
 
-  it.each(["clean", "missing", "foreign_epoch", "newer_execution", "generation_reset", "uncertain", "failed", "failed_run", "no_board_stop", "issue_stop", "before_selection_stop"])(
+  it.each(["clean", "completed_warm_predecessor", "older_goal_predecessor", "current_pointer_older_goal", "foreign_predecessor", "foreign_predecessor_epoch", "foreign_pointer", "unfinished_predecessor", "later_predecessor", "newer_goal_owner", "missing", "foreign_epoch", "newer_execution", "generation_reset", "uncertain", "failed", "failed_run", "no_board_stop", "issue_stop", "before_selection_stop"])(
     "publishes clean retained Pi Stop bookkeeping without relaxing %s fences", async kind => {
       const f = await fixture("runner", false, "pi_rpc");
       const cancelled: PersistedNativeSession = { ...f.snapshot, semanticResult: null, terminal: { schema: "paperclip.prp.terminal.v1",
@@ -196,6 +196,29 @@ describe("accepted native task session publication", () => {
       }
       if (kind === "generation_reset") await db.update(issues).set({ conversationAgentId: f.binding.agentId,
         conversationUserId: "publication-test-user", conversationState: "active", conversationSessionGeneration: 2 }).where(eq(issues.id, f.binding.issueId));
+      let priorRunId: string | null = null;
+      const predecessors = ["completed_warm_predecessor", "older_goal_predecessor", "current_pointer_older_goal", "foreign_predecessor", "foreign_predecessor_epoch", "foreign_pointer", "unfinished_predecessor", "later_predecessor", "newer_goal_owner"];
+      if (predecessors.includes(kind)) {
+        priorRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: priorRunId, companyId: f.binding.companyId,
+          agentId: f.binding.agentId, nativeIssueId: f.binding.issueId,
+          nativeSessionId: kind === "foreign_predecessor" ? randomUUID() : f.binding.sessionId,
+          status: kind === "unfinished_predecessor" ? "running" : "succeeded",
+          finishedAt: kind === "unfinished_predecessor" ? null : new Date(Date.now() + (kind === "later_predecessor" ? 10_000 : -5_000)) });
+        let goalRunId = priorRunId;
+        if (["older_goal_predecessor", "current_pointer_older_goal", "newer_goal_owner"].includes(kind)) {
+          goalRunId = randomUUID();
+          await db.insert(heartbeatRuns).values({ id: goalRunId, companyId: f.binding.companyId,
+            agentId: f.binding.agentId, nativeIssueId: f.binding.issueId, nativeSessionId: f.binding.sessionId,
+            status: kind === "newer_goal_owner" ? "running" : "succeeded",
+            finishedAt: kind === "newer_goal_owner" ? null : new Date(Date.now() - 10_000) });
+        }
+        if (kind === "current_pointer_older_goal") priorRunId = f.binding.runId;
+        await db.update(agentTaskSessions).set({ lastRunId: priorRunId,
+          goalSourceId: `${kind === "foreign_predecessor_epoch" ? randomUUID() : f.binding.sourceInstanceId}:${goalRunId}`,
+          sessionParamsJson: { sessionId: kind === "foreign_pointer" ? randomUUID() : f.binding.sessionId } })
+          .where(eq(agentTaskSessions.taskKey, f.binding.issueId));
+      }
       if (kind === "uncertain") cancelled.activeTurnId = "unsettled-turn";
       if (kind === "failed") cancelled.terminal = { ...cancelled.terminal!, runTerminalState: "failed" };
       const publish = (retained: boolean) => db.transaction(async tx => {
@@ -205,11 +228,16 @@ describe("accepted native task session publication", () => {
         return publishPiConversationInTransaction(tx, { binding: f.binding, context: f.context, snapshot: cancelled,
           run, issue }, retained ? { retainedCancelledOwner: true } : undefined);
       });
+      const before = (await f.read()).session;
+      const permitted = ["clean", "completed_warm_predecessor", "older_goal_predecessor", "current_pointer_older_goal"].includes(kind);
       expect(await publish(false)).not.toBe("published");
-      expect(await publish(true)).toBe(kind === "clean" ? "published" : kind === "missing" ? "missing_stub"
-        : ["foreign_epoch", "newer_execution"].includes(kind) ? "suppressed_newer"
+      expect(await publish(true)).toBe(permitted ? "published" : kind === "missing" ? "missing_stub"
+        : ["foreign_epoch", "newer_execution", "foreign_predecessor", "foreign_predecessor_epoch", "foreign_pointer", "unfinished_predecessor", "later_predecessor", "newer_goal_owner"].includes(kind) ? "suppressed_newer"
         : kind === "generation_reset" ? "suppressed_reset" : "suppressed_authority");
-      expect((await f.read()).session?.lastRunId ?? null).toBe(kind === "clean" ? f.binding.runId : null);
+      const after = (await f.read()).session;
+      expect(after?.lastRunId ?? null).toBe(permitted ? f.binding.runId : priorRunId);
+      if (!permitted) expect(after).toEqual(before);
+      else expect(after?.goalSourceId).toBe(before?.goalSourceId);
       expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.binding.runId))).toHaveLength(0);
       expect((await f.read()).run.runnerProfileJson).not.toHaveProperty(NATIVE_TASK_SESSION_PUBLICATION_KEY);
     });

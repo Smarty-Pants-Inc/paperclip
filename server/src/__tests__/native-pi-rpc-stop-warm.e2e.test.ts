@@ -46,7 +46,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant history (thinking=${thinking})`, async () => {
+it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same resident/session and assistant history (thinking=${thinking})`, async stopTurn => {
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -67,6 +67,9 @@ it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant
   let stopRetainedPostgres: (() => Promise<void>) | undefined;
   let helloProbeRequests = 0;
   let replyCount = 0;
+  let warmupCount = 0;
+  const warmupRunIds = new Set<string>();
+  const warmupIdentities: Array<{ runId: string; nativeSessionId: string | null; runnerPid: number; piPid: number }> = [];
   let modelServer: Server | undefined, http: Server | undefined;
   let app: Awaited<ReturnType<typeof import("../app.js").createApp>> | undefined;
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
@@ -146,6 +149,17 @@ it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant
         const parsed = JSON.parse(body);
         if (respondToNativePiHello(parsed, res, "messages")) {
           helloProbeRequests++; stage("faux model answered setup hello", { helloProbeRequests }); return;
+        }
+        if (warmupCount < stopTurn - 1) {
+          warmupCount++;
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          const emit = (type: string, value: Record<string, unknown>) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
+          emit("message_start", { message: { id: `warmup-${warmupCount}`, type: "message", role: "assistant", model: "faux", content: [], stop_reason: null, usage: { input_tokens: 7, output_tokens: 0 } } });
+          emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+          emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: `WARMUP_${warmupCount}` } });
+          emit("content_block_stop", { index: 0 });
+          emit("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } });
+          emit("message_stop", {}); res.end(); return;
         }
         const useTool = requests.length === 0;
         requests.push({ path: req.url!, model: parsed.model, lastMessage: parsed.messages?.at(-1),
@@ -270,13 +284,31 @@ it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant
     stage("PATCH 200", { agentId, lifecycleState: patched.lifecycleState, adapterConfig: patched.adapterConfig });
     const issue = await api("POST", `/companies/${companyId}/issues`, { title: "Reply through native Pi", description: "Reply with the local faux token.", status: "todo", assigneeAgentId: agentId }, 201);
     issueId = issue.id;
-    const admitted = await waitFor("run admitted", async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find(run => run.runtimeMode === "native") ?? null);
+    for (let turn = 1; turn < stopTurn; turn++) {
+      const warmup = await waitFor(`warmup ${turn} settled`, async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+        .find(run => run.status === "succeeded" && !warmupRunIds.has(run.id)) ?? null);
+      const { heartbeatService } = await import("../services/heartbeat.js");
+      await heartbeatService(db).waitForRunExecutionDrain(warmup.id, { timeoutMs: 15_000 });
+      warmupRunIds.add(warmup.id);
+      const runnerPid = bundles.at(-1)?.transport.processInfo?.()?.pid;
+      const piPid = runnerPid ? piDescendant(runnerPid) : null;
+      expect(runnerPid).toBeTruthy(); expect(piPid).toBeTruthy();
+      const identity = { runId: warmup.id, nativeSessionId: warmup.nativeSessionId, runnerPid: runnerPid!, piPid: piPid! };
+      if (warmupIdentities.length) expect(identity).toMatchObject({ ...warmupIdentities[0], runId: warmup.id });
+      warmupIdentities.push(identity);
+      stage("prior warm turn settled", { turn, ...identity });
+      await api("POST", `/issues/${issueId}/comments`, { body: "Continue with the next step." }, 201);
+    }
+    const admitted = await waitFor("run admitted", async () => (await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .find(run => run.runtimeMode === "native" && !warmupRunIds.has(run.id)) ?? null);
     stage("run admitted", { runId: admitted.id, status: admitted.status, runtimeMode: admitted.runtimeMode });
     const pid = await waitFor("runnerd session up / Pi PID", async () => {
       for (const bundle of bundles) { const process = bundle.transport.processInfo?.(); if (process?.pid) { const pid = piDescendant(process.pid); if (pid) return { runnerPid: process.pid, piPid: pid }; } }
       return null;
     });
     stage("runnerd session up", { runnerPid: pid.runnerPid }); stage("Pi PID", { pid: pid.piPid });
+    for (const prior of warmupIdentities) expect({ ...pid, nativeSessionId: admitted.nativeSessionId })
+      .toEqual({ runnerPid: prior.runnerPid, piPid: prior.piPid, nativeSessionId: prior.nativeSessionId });
     const readPiEnvironment = () => Object.fromEntries(readFileSync(`/proc/${pid.piPid}/environ`, "utf8").split("\0").filter(Boolean).map(entry => { const at = entry.indexOf("="); return [entry.slice(0, at), entry.slice(at + 1)]; }));
     const launchEnvironment = readPiEnvironment();
     stage("AGENT_HOME proc at launch", { piPid: pid.piPid, agentHome: launchEnvironment.AGENT_HOME || "EMPTY", tmpdir: launchEnvironment.TMPDIR || "EMPTY" });
@@ -333,7 +365,7 @@ it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant
       return rows.find(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_1")) ?? null;
     });
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
-    const next = runs.find(run => run.id !== admitted.id)!;
+    const next = runs.find(run => !warmupRunIds.has(run.id) && run.id !== admitted.id)!;
     expect(next, "a NEW run, not continuation of stopped run").toBeDefined();
     await heartbeatService(db).waitForRunExecutionDrain(next.id, { timeoutMs: 15_000 });
     const final = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.id)))[0]!;
@@ -354,7 +386,8 @@ it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       return rows.find(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_2")) ?? null;
     });
-    const warm = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).find(run => run.id !== admitted.id && run.id !== final.id)!;
+    const warm = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .find(run => !warmupRunIds.has(run.id) && run.id !== admitted.id && run.id !== final.id)!;
     expect(warm).toBeDefined();
     await heartbeatService(db).waitForRunExecutionDrain(warm.id, { timeoutMs: 15_000 });
     const settledWarm = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, warm.id)))[0]!;
@@ -372,7 +405,7 @@ it.skipIf(!enabled)(`Stop mid-bash keeps the same resident/session and assistant
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;
   } finally {
-    await writeFile(join(root, "proof.json"), JSON.stringify({ stages, requests }, null, 2) + "\n");
+    await writeFile(join(root, "proof.json"), JSON.stringify({ stopTurn, warmupIdentities, stages, requests }, null, 2) + "\n");
     await writeFile(join(root, "remote-pack-verification.json"), JSON.stringify(packVerificationCommands, null, 2) + "\n");
     if (db && agentId) {
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));

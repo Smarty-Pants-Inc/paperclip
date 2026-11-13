@@ -162,17 +162,31 @@ async function publishTaskSessionPointer(tx: Transaction, input: PointerPublicat
   // Supported native turns synchronously project a stub before this terminal
   // snapshot. Absence can be an operator deletion; never recreate it later.
   if (!session) return "missing_stub";
-  const boundSources = [binding.sourceInstanceId, binding.controlPlaneSourceInstanceId]
-    .filter((value): value is string => typeof value === "string" && value.length > 0)
-    .map(source => `${source}:${binding.runId}`);
-  if (!session.goalSourceId || !boundSources.includes(session.goalSourceId)) return "suppressed_newer";
-  if (session.lastRunId && session.lastRunId !== binding.runId) {
+  const sources = [binding.sourceInstanceId, binding.controlPlaneSourceInstanceId]
+    .filter((value): value is string => typeof value === "string" && value.length > 0);
+  const ownsGoalSource = (runId: string) => sources.some(source => session.goalSourceId === `${source}:${runId}`);
+  // A warm-attached turn need not emit a new goal snapshot before Stop. Use
+  // its acknowledged current-run authority, not the lagging goal epoch. Both
+  // the goal owner and pointer owner must be completed predecessors in this
+  // exact source/conversation; consecutive Stops can leave the goal even older.
+  const currentGoalSource = ownsGoalSource(binding.runId);
+  const retainedGoalRunId = !currentGoalSource && retainedCancelledOwner && session.lastRunId
+    && session.sessionParamsJson?.sessionId === run.nativeSessionId
+    ? sources.flatMap(source => session.goalSourceId?.startsWith(`${source}:`)
+      ? [session.goalSourceId.slice(source.length + 1)] : []).find(uuid) : undefined;
+  if (!currentGoalSource && !retainedGoalRunId) return "suppressed_newer";
+  const priorRunIds = new Set([session.lastRunId, retainedGoalRunId]
+    .filter((id): id is string => !!id && id !== binding.runId));
+  for (const priorRunId of priorRunIds) {
     const [prior] = await tx.select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
       issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId, finishedAt: heartbeatRuns.finishedAt,
-    }).from(heartbeatRuns).where(eq(heartbeatRuns.id, session.lastRunId)).limit(1);
+      nativeSessionId: heartbeatRuns.nativeSessionId, status: heartbeatRuns.status,
+    }).from(heartbeatRuns).where(eq(heartbeatRuns.id, priorRunId)).limit(1);
     if (!prior || prior.companyId !== binding.companyId || prior.agentId !== binding.agentId
         || (prior.nativeIssueId ?? prior.issueId) !== binding.issueId || !prior.finishedAt || !run.startedAt
-        || prior.finishedAt > run.startedAt) return "suppressed_newer";
+        || prior.finishedAt > run.startedAt
+        || (retainedGoalRunId && (prior.nativeSessionId !== run.nativeSessionId
+          || !["succeeded", "failed", "cancelled", "timed_out"].includes(prior.status)))) return "suppressed_newer";
   }
   await tx.update(agentTaskSessions).set({
     sessionParamsJson: preservePiConversation(session.sessionParamsJson, { ...context.sessionParamsJson, sessionId: snapshot.identity.sessionId }),
