@@ -27,6 +27,8 @@ const mockProjectService = vi.hoisted(() => ({
 }));
 
 const mockEnvironmentRuntimeService = vi.hoisted(() => ({
+  acquireRunLease: vi.fn(),
+  getDriver: vi.fn(),
   destroyReusableSandboxLeasesForEnvironment: vi.fn(async () => ({ destroyed: 0, failed: 0, skippedLiveRun: 0 })),
   releaseRestoreSourcesForEnvironmentDelete: vi.fn(async () => 0),
 }));
@@ -50,6 +52,7 @@ const mockEnvironmentService = vi.hoisted(() => ({
   hasUnresolvedPendingCleanupLeases: vi.fn(),
   listLeases: vi.fn(),
   getLeaseById: vi.fn(),
+  recordSandboxPlatformProbe: vi.fn(),
 }));
 
 const mockEnvironmentCustomImageService = vi.hoisted(() => ({
@@ -3028,6 +3031,89 @@ describe("environment routes", () => {
     expect(res.status).toBe(422);
     expect(res.body.error).toContain("explicit companyId");
     expect(mockProbeEnvironment).not.toHaveBeenCalled();
+  });
+
+  // Keep: the HTTP trust boundary must not expose credentials held by a provider lease.
+  it("redacts resolved credentials from a real sandbox probe's lease metadata", async () => {
+    const environment = {
+      ...createEnvironment(),
+      driver: "sandbox" as const,
+      config: {
+        provider: "secure-plugin", template: "base", reuseLease: true,
+        apiKey: "11111111-1111-1111-1111-111111111111", // Stored secret ref, not its resolved value.
+      },
+    };
+    const metadata = {
+      apiKey: "sk-test-SECRET",
+      sandboxName: "probe-sandbox",
+      nested: { token: "nested-test-SECRET", region: "test-region" },
+    };
+    mockEnvironmentService.getById.mockResolvedValue(environment);
+    mockEnvironmentRuntimeService.acquireRunLease.mockResolvedValue({
+      lease: { id: "lease-probe", provider: "secure-plugin", providerLeaseId: "sandbox-probe", metadata },
+    });
+    const releaseRunLease = vi.fn(async () => undefined);
+    mockEnvironmentRuntimeService.getDriver.mockReturnValue({ releaseRunLease });
+    const { probeEnvironment } = await vi.importActual<typeof import("../services/environment-probe.js")>(
+      "../services/environment-probe.js",
+    );
+    mockProbeEnvironment.mockImplementationOnce(probeEnvironment);
+
+    const res = await request(createApp(localBoardActor()))
+      .post(`/api/environments/${environment.id}/probe`).send({});
+
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain("sk-test-SECRET");
+    expect(JSON.stringify(res.body)).not.toContain("nested-test-SECRET");
+    expect(res.body).toMatchObject({
+      ok: true, driver: "sandbox", details: {
+        provider: "secure-plugin", leaseId: "lease-probe", providerLeaseId: "sandbox-probe",
+        metadata: { sandboxName: "probe-sandbox", nested: { region: "test-region" } },
+      },
+    });
+    expect(releaseRunLease).toHaveBeenCalledOnce();
+    expect(metadata.apiKey).toBe("sk-test-SECRET"); // Redaction must not mutate runtime cleanup inputs.
+    expect(mockLogActivity.mock.calls[0][1].details).toEqual({
+      driver: "sandbox", ok: true, summary: res.body.summary,
+    });
+  });
+
+  it.each([
+    { draft: false, ok: true }, { draft: false, ok: false },
+    { draft: true, ok: true }, { draft: true, ok: false },
+  ])("redacts nested provider probe details (draft=$draft, ok=$ok)", async ({ draft, ok }) => {
+    const environment = {
+      ...createEnvironment(), driver: "sandbox" as const,
+      config: { provider: "fake-plugin", template: "base" },
+    };
+    const details = {
+      provider: "fake-plugin",
+      metadata: { apiKey: "sk-test-SECRET", image: "ubuntu:24.04" },
+      lease: { id: "lease-probe", metadata: { nested: [[{ token: "nested-test-SECRET", region: "test-region" }]] } },
+      password: "password-test-SECRET",
+    };
+    mockEnvironmentService.getById.mockResolvedValue(environment);
+    mockProbeEnvironment.mockResolvedValue({ ok, driver: "sandbox", summary: "Provider probe finished.", details });
+
+    const res = await request(createApp(localBoardActor(), { pluginWorkerManager: {} }))
+      .post(draft ? "/api/companies/company-1/environments/probe-config" : `/api/environments/${environment.id}/probe`)
+      .send(draft ? { name: "Draft", driver: "sandbox", config: environment.config } : {});
+
+    expect(res.status).toBe(200);
+    for (const secret of ["sk-test-SECRET", "nested-test-SECRET", "password-test-SECRET"]) {
+      expect(JSON.stringify(res.body)).not.toContain(secret);
+      expect(JSON.stringify(mockLogActivity.mock.calls)).not.toContain(secret);
+    }
+    expect(res.body).toEqual({
+      ok, driver: "sandbox", summary: "Provider probe finished.",
+      details: {
+        provider: "fake-plugin", metadata: { image: "ubuntu:24.04" },
+        lease: { id: "lease-probe", metadata: { nested: [[{ region: "test-region" }]] } },
+      },
+    });
+    expect(mockLogActivity.mock.calls[0][1].details).not.toHaveProperty("metadata");
+    expect(mockLogActivity.mock.calls[0][1].details).not.toHaveProperty("details");
+    expect(details.metadata.apiKey).toBe("sk-test-SECRET");
   });
 
   it("probes a sandbox environment and logs the result", async () => {

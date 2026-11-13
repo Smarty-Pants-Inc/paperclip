@@ -3607,11 +3607,12 @@ export function agentRoutes(
         // reports fail even when the adapter probe itself passed.
         const status = environmentEnvChecks.some((c) => c.level === "error") ? "fail" : result.status;
         if (status === "fail") releaseStatus = "failed";
-        res.json({
+        // Adapter diagnostics may include credential-bearing provider metadata.
+        res.json(redactEventPayload({
           ...result,
           status,
           checks: prefixChecks.length > 0 ? [...prefixChecks, ...result.checks] : result.checks,
-        });
+        }));
       } catch (err) {
         releaseStatus = "failed";
         throw err;
