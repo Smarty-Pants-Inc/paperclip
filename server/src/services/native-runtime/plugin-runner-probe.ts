@@ -86,12 +86,14 @@ export async function probePluginRunnerEnvironment(context: AdapterEnvironmentTe
     if (nativePi) {
       const message = error instanceof Error ? error.message : "";
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-      const authentication = /(?:no (?:api[- ]?key|auth(?:entication)?|credentials?)|(?:api[- ]?key|credentials?) (?:is |are )?(?:missing|required|not found)|invalid (?:api[- ]?key|auth(?:entication)? token)|authentication (?:failed|required)|unauthenticated|unauthorized|not authenticated|please (?:log|sign) in|not logged in|\b(?:401|403)\b)/i.test(message);
+      const configurationInvalid = code === "pi_provider_config_invalid";
+      const authentication = !configurationInvalid && /(?:no (?:api[- ]?key|auth(?:entication)?|credentials?)|(?:api[- ]?key|credentials?) (?:is |are )?(?:missing|required|not found)|invalid (?:api[- ]?key|auth(?:entication)? token)|authentication (?:failed|required)|unauthenticated|unauthorized|not authenticated|please (?:log|sign) in|not logged in|\b(?:401|403)\b)/i.test(message);
       const modelUnavailable = /(?:model.*(?:unavailable|not found|not available|not supported|unknown|does not exist|mismatch)|(?:unknown|invalid|unsupported|unavailable) model|pi_(?:probe_)?model_)/i.test(`${code} ${message}`);
       const timedOut = /timed out/i.test(message);
       return { adapterType: "paperclip_runner", status: "fail", testedAt,
-        checks: [{ code: `pi_rpc_hello_probe_${authentication ? "auth_required" : modelUnavailable ? "model_unavailable" : timedOut ? "timed_out" : "failed"}`, level: "error",
-          message: authentication ? "The selected Pi account needs authentication."
+        checks: [{ code: `pi_rpc_hello_probe_${configurationInvalid ? "config_invalid" : authentication ? "auth_required" : modelUnavailable ? "model_unavailable" : timedOut ? "timed_out" : "failed"}`, level: "error",
+          message: configurationInvalid ? "The selected Pi provider configuration is malformed or missing a complete provider route. Check its credential and routing settings."
+            : authentication ? "The selected Pi account needs authentication."
             : modelUnavailable ? "The selected Pi model is unavailable for this account."
             : timedOut ? "The native Pi hello probe timed out."
             : "The selected plugin environment did not complete the native Pi hello probe and confirmed cleanup. Check its runtime, account, and model access." }] };

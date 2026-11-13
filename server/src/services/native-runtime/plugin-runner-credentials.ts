@@ -45,7 +45,10 @@ export async function preparePluginRunnerCredentials(input: {
       "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY",
       "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_AI_PROVIDER_URL", "PAPERCLIP_AI_PROVIDER_PROTOCOL", "PAPERCLIP_AI_PROVIDER_AUTH",
     ].flatMap(key => input.environment[key] ? [[key, input.environment[key]]] : []));
-    return { ...github, accountIdentity, credential: environmentTaskCredentialSchema.parse({ type: "pi-env", environment }) };
+    const credential = environmentTaskCredentialSchema.safeParse({ type: "pi-env", environment });
+    if (!credential.success) throw Object.assign(new Error("Pi provider configuration is malformed or missing a complete provider route"),
+      { code: "pi_provider_config_invalid" });
+    return { ...github, accountIdentity, credential: credential.data };
   }
   if (input.provider === "claude") {
     if (input.environment.ANTHROPIC_BASE_URL || input.environment.ANTHROPIC_AUTH_TOKEN) {

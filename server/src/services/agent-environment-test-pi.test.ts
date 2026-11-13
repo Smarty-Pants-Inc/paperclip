@@ -78,7 +78,9 @@ describe("native managed Pi Setup Test", () => {
   it("verifies managed native Pi through the plugin task instead of refusing the Boat target", async () => {
     const runnerTask = vi.fn(async () => ({ kind: "description", taskId: "boat-task", launchPreparationVersion: 1,
       projectAuthCheckVersion: 1, runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } }));
-    const result = await test(config, { kind: "remote", transport: "sandbox", providerKey: "boat", leaseId: "boat-lease", remoteCwd: ".",
+    const selected = { ...config, env: { ...config.env, PAPERCLIP_AI_PROVIDER_URL: "https://selected-gateway.example/v1",
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "bearer" } };
+    const result = await test(selected, { kind: "remote", transport: "sandbox", providerKey: "boat", leaseId: "boat-lease", remoteCwd: ".",
       runnerTaskProbe: { runId: "boat-probe", sessionId: "boat-session" }, runnerTask });
     expect(result).toMatchObject({ status: "pass", checks: [expect.objectContaining({ code: "pi_rpc_hello_probe_passed" })] });
     expect(() => assertHarnessTestPassed(result)).not.toThrow();
