@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
@@ -87,11 +87,79 @@ async function settle(transport: FakeTransport, id: string) {
 }
 
 describe("Pi RPC live-session L4 wiring", () => {
+  // Keep reason: cold-start and hung-admission failure paths cannot be reached
+  // cheaply/repeatably with a real Pi process. Exercise openSession's deadlines.
+  it("admits a new Pi whose first get_state takes 15 seconds, beyond the admission bound", async () => {
+    const f = await fixture();
+    let entered!: () => void;
+    const entering = new Promise<void>(resolve => { entered = resolve; });
+    f.transport.hold = type => {
+      if (type !== "get_state" || f.transport.commands.length !== 1) return Promise.resolve();
+      return new Promise<void>(resolve => { setTimeout(resolve, 15_000); entered(); });
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let settled = false;
+      const opened = f.open().finally(() => { settled = true; });
+      await entering;
+      await vi.advanceTimersByTimeAsync(14_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      const { session } = await opened;
+      expect(session.ids().providerSessionId).toBe("native-session");
+      expect(f.transport.closed).toBe(false);
+      expect(f.transport.commands.map(command => command.type)).toEqual(["get_state", ...admission, "get_available_models"]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([undefined, 20_000])("bounds an unanswered first get_state by processStartupTimeoutMs=%s", async processStartupTimeoutMs => {
+    const f = await fixture({ processStartupTimeoutMs });
+    let entered!: () => void;
+    const entering = new Promise<void>(resolve => { entered = resolve; });
+    f.transport.hold = () => { entered(); return new Promise<void>(() => {}); };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let settled = false;
+      const opened = f.open().then(() => undefined, error => error).finally(() => { settled = true; });
+      await entering;
+      await vi.advanceTimersByTimeAsync((processStartupTimeoutMs ?? 60_000) - 1);
+      expect(settled).toBe(false);
+      expect(f.transport.closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await opened).toMatchObject({ message: "Pi RPC startup timed out" });
+      expect(f.transport.closed).toBe(true);
+      expect(f.transport.commands.map(command => command.type)).toEqual(["get_state"]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("still bounds a later admission get_state at 10 seconds, not the process startup deadline", async () => {
+    const f = await fixture();
+    let entered!: () => void;
+    const entering = new Promise<void>(resolve => { entered = resolve; });
+    f.transport.hold = type => {
+      if (type !== "get_state" || f.transport.commands.length !== 2) return Promise.resolve();
+      entered(); return new Promise<void>(() => {});
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let settled = false;
+      const opened = f.open().then(() => undefined, error => error).finally(() => { settled = true; });
+      await entering;
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(settled).toBe(false);
+      expect(f.transport.closed).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await opened).toMatchObject({ message: "Pi RPC admission timed out" });
+      expect(f.transport.closed).toBe(true);
+      expect(f.transport.commands.map(command => command.type)).toEqual(["get_state", "get_state"]);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("adapts admission commands to the transport and unwraps response.data before returning a session", async () => {
     const f = await fixture(); const { session } = await f.open();
-    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models"]);
-    expect(f.transport.commands[1]).toEqual({ type: "set_model", params: { provider: "neutral", modelId: "nested/model" } });
-    expect(f.transport.commands[3]).toEqual({ type: "set_thinking_level", params: { level: "high" } });
+    expect(f.transport.commands.map(command => command.type)).toEqual(["get_state", ...admission, "get_available_models"]);
+    expect(f.transport.commands[2]).toEqual({ type: "set_model", params: { provider: "neutral", modelId: "nested/model" } });
+    expect(f.transport.commands[4]).toEqual({ type: "set_thinking_level", params: { level: "high" } });
     expect(session.ids().providerSessionId).toBe("native-session");
   });
 
@@ -131,7 +199,7 @@ describe("Pi RPC live-session L4 wiring", () => {
     expect(f.transport.commands.some(command => command.type === "prompt")).toBe(false);
     release(); await attach; await start;
     expect((await session.snapshot()).runId).toBe("run-b");
-    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models", ...admission, ...admission, "prompt"]);
+    expect(f.transport.commands.map(command => command.type)).toEqual(["get_state", ...admission, "get_available_models", ...admission, ...admission, "prompt"]);
   });
 
   it("failed attach retains the old identity and blocks input until fresh post-claim admission", async () => {
@@ -149,7 +217,7 @@ describe("Pi RPC live-session L4 wiring", () => {
   it("revalidates exact model/effort on reconnect and after claim", async () => {
     const f = await fixture(); const { session } = await f.open();
     await session.reconnect(); await session.revalidateAfterClaim();
-    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models", ...admission, ...admission]);
+    expect(f.transport.commands.map(command => command.type)).toEqual(["get_state", ...admission, "get_available_models", ...admission, ...admission]);
   });
 
   it("rejects a changed native session after claim and cannot prompt with the old admission", async () => {
@@ -165,7 +233,7 @@ describe("Pi RPC live-session L4 wiring", () => {
     const controller = new AbortController(); controller.abort(new Error("claim revoked"));
     await expect(session.attachRun({ runId: "run-b", signal: controller.signal })).rejects.toThrow("claim revoked");
     expect((await session.snapshot()).runId).toBe("run-a");
-    expect(f.transport.commands.map(command => command.type)).toEqual([...admission, "get_available_models"]);
+    expect(f.transport.commands.map(command => command.type)).toEqual(["get_state", ...admission, "get_available_models"]);
     await expect(session.startTurn({ message: { role: "user", text: "must not send" } })).rejects.toThrow(/admission/);
   });
 
