@@ -254,6 +254,7 @@ import {
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueDocuments,
   issueThreadInteractions,
   issueRecoveryActions,
@@ -7457,6 +7458,13 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
       // reader, under this issue lock.
       const standing = await readUnsupersededHeldConversationNotice(tx as unknown as Db, { companyId, issueId });
       if (standing?.normalizedSessionId === normalizedSessionId) return;
+      // The stranded sweep's unanswered-message notice already tells the
+      // person (recovery/unanswered-person-message.ts, same issue fence): a
+      // live one stands until an answer supersedes it. One notice, both orders.
+      const [unanswered] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
+        isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
+      if (unanswered) return;
       await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
       }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,

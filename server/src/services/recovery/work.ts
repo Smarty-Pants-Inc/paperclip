@@ -1,15 +1,16 @@
 import { registerTaskWatchdogWork } from "../task-watchdog-work.js";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
-import { issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
+import { issueComments, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notifications.js";
 import type { IssueRecoveryScope } from "../issue-recovery-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import { recoveryActionSweepCondition } from "./blocker-stall-wakeups.js";
-import { unansweredPersonMessageCondition } from "./unanswered-person-message.js";
+import { unansweredPersonMessageCommentCondition, unansweredPersonMessageCondition } from "./unanswered-person-message.js";
 
-type Entry = { id: string; companyId: string; dueAt: number };
-type Scope = { companyId: string; issueId: string; onDeferredDeadline: (at: number) => void };
+type Entry = { id: string; companyId: string; dueAt: number; unanswered?: boolean };
+/** `unanswered`: whether this task has a person's message to settle (stranded worker only). */
+type Scope = { companyId: string; issueId: string; onDeferredDeadline: (at: number) => void; unanswered?: boolean };
 const PAGE_SIZE = 100;
 
 export function registerIssueRecoveryWork(
@@ -55,12 +56,23 @@ export function registerIssueRecoveryWork(
         )).orderBy(asc(issues.id)).limit(PAGE_SIZE);
         const complete = rows.length < PAGE_SIZE;
         if (complete) cursors.delete(key); else cursors.set(key, rows.at(-1)!.id);
-        return { rows: rows.map(row => ({ ...row, dueAt: Date.now() })), complete };
+        // ONE batched query per page, inside the recovery query budget: which
+        // of these tasks have a person's message to settle. The per-task check
+        // runs the unanswered-message step only for those (Smarty fork, C9).
+        // (It reads issue_comments, not issues: it is a comment scan, budgeted
+        // on its own in unanswered-person-message.test.ts, not a page load.)
+        const flagged = alsoBlockedWhen && rows.length
+          ? new Set((await db.select({ issueId: issueComments.issueId }).from(issueComments)
+            .where(and(inArray(issueComments.issueId, rows.map(row => row.id)), unansweredPersonMessageCommentCondition()))
+            .orderBy(asc(issueComments.issueId)).limit(PAGE_SIZE * 10)).map(row => row.issueId))
+          : null;
+        return { rows: rows.map(row => ({ ...row, dueAt: Date.now(), ...(flagged ? { unanswered: flagged.has(row.id) } : {}) })), complete };
       },
       check: async entry => {
         if (!enabled) return null;
         let next: number | null = null;
         await check({ companyId: entry.companyId, issueId: entry.id,
+          ...(entry.unanswered === undefined ? {} : { unanswered: entry.unanswered }),
           onDeferredDeadline: at => { next = next === null ? at : Math.min(next, at); } });
         return next === null ? null : { ...entry, dueAt: next };
       },
