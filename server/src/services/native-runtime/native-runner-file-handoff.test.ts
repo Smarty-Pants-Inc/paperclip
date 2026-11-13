@@ -9,6 +9,7 @@ import { nativeCompletionFeedback } from "./native-completion-feedback.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { Readable } from "node:stream";
 import {
   mkdtemp,
   link,
@@ -31,12 +32,18 @@ import {
   agents,
   assets,
   companies,
+  companyMemberships,
+  completionContracts,
   createDb,
   heartbeatRuns,
   issueAttachments,
   issueComments,
   issues,
   issueWorkProducts,
+  issueThreadInteractions,
+  nativeRunResults,
+  statusDecisions,
+  workAssessments,
   type Db,
 } from "@paperclipai/db";
 
@@ -53,6 +60,7 @@ import {
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
 import { validateNativeDeliverableEvidence } from "./native-deliverable-feedback.js";
+import { getNativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
 describe("native runner file handoff", () => {
@@ -1553,6 +1561,318 @@ describe("native runner file handoff", () => {
       await db.update(assets).set({ originalFilename: asset.originalFilename, byteSize: asset.byteSize, sha256: asset.sha256 }).where(eq(assets.id, asset.id));
       await db.update(issueAttachments).set({ originatingRunId: attachment.originatingRunId }).where(eq(issueAttachments.id, attachment.id));
       await db.update(heartbeatRuns).set({ resultJson: run.resultJson }).where(eq(heartbeatRuns.id, runId));
+    }
+  });
+
+  async function addressedStagingFixture(fileCount = 1) {
+    const taskId = randomUUID(), kp = randomUUID(), kpRunId = randomUUID(), kaRunId = randomUUID();
+    const root = await mkdtemp(path.join(temporaryRoot, "addressed-staging-"));
+    const storage = createStorageService(createLocalDiskStorageProvider(storageRoot));
+    await db.insert(agents).values({ id: kp, companyId, name: "KP card resolver", status: "active", adapterType: "paperclip_runner" });
+    await db.insert(companyMemberships).values({ companyId, principalType: "agent", principalId: kp, membershipRole: "member", status: "active" });
+    await db.insert(issues).values({ id: taskId, companyId, title: "KA keeps task ownership", status: "in_progress", workMode: "standard", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: kaRunId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: taskId, contextSnapshot: { issueId: taskId } });
+    await db.update(issues).set({ executionRunId: kaRunId }).where(eq(issues.id, taskId));
+    const comment = await issueService(db).addComment(taskId, "Inspect the card's files.", { userId: "inbound-user" });
+    const files = [];
+    for (let index = 0; index < fileCount; index++) {
+      const body = Buffer.from(`CARD_OWNED_STAGING_BYTES_${index}\n`);
+      const stored = await storage.putFile({ companyId, namespace: `issues/${taskId}`, originalFilename: `card-${index}.txt`, contentType: "text/plain", body });
+      const attachment = await issueService(db).createAttachment({ issueId: taskId, issueCommentId: comment.id, provider: stored.provider,
+        objectKey: stored.objectKey, contentType: stored.contentType, byteSize: stored.byteSize, sha256: stored.sha256,
+        originalFilename: stored.originalFilename, createdByUserId: "inbound-user" });
+      files.push({ body, stored, attachment });
+    }
+    const replacementComment = await issueService(db).addComment(taskId, "Another comment with no card files yet.", { userId: "inbound-user" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId, issueId: taskId, kind: "request_confirmation", status: "pending",
+      addresseeAgentId: kp, createdByUserId: "inbound-user", continuationPolicy: "none", sourceCommentId: comment.id, originCommentIds: [comment.id],
+      payload: { version: 1, prompt: "Approve the bounded plan?" } }).returning();
+    const context = { issueId: taskId, wakeReason: "interaction_pending", interactionId: card.id,
+      paperclipWake: { comments: [{ id: comment.id, attachments: files.map(file => ({ id: file.attachment.id })) }] } };
+    await db.insert(heartbeatRuns).values({ id: kpRunId, companyId, agentId: kp, status: "running", runtimeMode: "native", nativeIssueId: taskId, contextSnapshot: context });
+    const binding = { companyId, issueId: taskId, runId: kpRunId, agentId: kp, workspaceRoot: root, executionTargetKind: "local" as const };
+    expect(await getNativeAddressedInteractionGrant(db, binding)).toMatchObject({ interaction: { id: card.id, status: "pending", sourceCommentId: comment.id, originCommentIds: [comment.id] } });
+    const getObject = vi.fn((...args: Parameters<StorageService["getObject"]>) => storage.getObject(...args));
+    const putFile = vi.fn((...args: Parameters<StorageService["putFile"]>) => storage.putFile(...args));
+    const observingStorage: StorageService = { ...storage, getObject, putFile };
+    const revoke = async (status: "cancelled" | "accepted") => {
+      await db.update(issueThreadInteractions).set({ status, resolvedAt: new Date(),
+        ...(status === "accepted" ? { resolvedByAgentId: kp, resolvedByRunId: kpRunId, result: { version: 1 as const, outcome: "accepted" as const } } : {}),
+      }).where(eq(issueThreadInteractions.id, card.id));
+      expect(await getNativeAddressedInteractionGrant(db, binding)).toBeNull();
+    };
+    const assertTaskOwner = async () => {
+      expect(await db.select({ assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, taskId)))
+        .toEqual([{ assigneeAgentId: agentId, executionRunId: kaRunId }]);
+    };
+    return { root, storage, observingStorage, getObject, putFile, binding, files, card, comment, replacementComment, context, kp, kpRunId, kaRunId, taskId, revoke, assertTaskOwner };
+  }
+
+  async function stagedFiles(root: string): Promise<string[]> {
+    const directory = path.join(root, ".paperclip-inbound");
+    const entries = await readdir(directory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    });
+    const files: string[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) throw new Error("unexpected staging entry");
+      for (const file of await readdir(path.join(directory, entry.name))) files.push(path.join(directory, entry.name, file));
+    }
+    return files;
+  }
+
+  it.each(["cancelled", "accepted", "pending"] as const)("revalidates %s card authorization after row lookup before unsupported remote metadata", async status => {
+    const f = await addressedStagingFixture();
+    type RowLookupQuery = { execute: () => Promise<unknown[]> };
+    type RowLookupDb = { select: (fields?: Record<string, unknown>) => { from: (table: unknown) => RowLookupQuery } };
+    const observedDb = db as unknown as RowLookupDb;
+    const select = observedDb.select.bind(observedDb);
+    let rowLookups = 0;
+    let revoked = false;
+    const selectSpy = vi.spyOn(observedDb, "select").mockImplementation(fields => {
+      const builder = select(fields);
+      if (fields?.objectKey === assets.objectKey) {
+        const from = builder.from.bind(builder);
+        builder.from = table => {
+          const query = from(table);
+          const execute = query.execute.bind(query);
+          query.execute = async () => {
+            const rows = await execute();
+            rowLookups++;
+            expect(rows).toEqual([expect.objectContaining({ id: f.files[0]!.attachment.id,
+              issueCommentId: f.comment.id, objectKey: f.files[0]!.stored.objectKey })]);
+            if (status !== "pending") {
+              await f.revoke(status);
+              revoked = true;
+            }
+            return rows;
+          };
+          return query;
+        };
+      }
+      return builder;
+    });
+    let stage: Awaited<ReturnType<typeof stageNativeRunnerWakeAttachments>> | undefined;
+    try {
+      const outcome = await stageNativeRunnerWakeAttachments({ db, binding: { ...f.binding, executionTargetKind: "remote" }, storage: f.observingStorage })
+        .then(stage => ({ stage, error: null }), error => ({ stage: null, error }));
+      stage = outcome.stage ?? undefined;
+      expect.soft(rowLookups).toBe(1);
+      expect.soft(revoked).toBe(status !== "pending");
+      if (status === "pending") {
+        expect.soft(outcome.error).toBeNull();
+        expect.soft(outcome.stage?.attachments).toEqual([{ id: f.files[0]!.attachment.id,
+          filename: f.files[0]!.stored.originalFilename, contentType: f.files[0]!.stored.contentType,
+          byteSize: f.files[0]!.stored.byteSize, workspaceRelativePath: null, unavailableReason: "remote_workspace_staging_unsupported" }]);
+        expect(await getNativeAddressedInteractionGrant(db, f.binding)).toMatchObject({ interaction: { id: f.card.id, status: "pending" } });
+      } else {
+        expect.soft(outcome.error).toMatchObject({ message: "paperclip_runner_attachment_staging_not_authorized" });
+        expect.soft(outcome.stage).toBeNull();
+      }
+      expect.soft(f.getObject).not.toHaveBeenCalled();
+      expect.soft(f.putFile).not.toHaveBeenCalled();
+      expect.soft(await stagedFiles(f.root)).toEqual([]);
+      expect.soft(await readdir(f.root)).toEqual([]);
+      await f.assertTaskOwner();
+    } finally {
+      selectSpy.mockRestore();
+      await stage?.cleanup();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["cancelled", null], ["accepted", null],
+    ["cancelled", "/runner/download-cache/card.txt"], ["accepted", "/runner/download-cache/card.txt"],
+  ] as const)("rejects %s during download before fallback reads or publishing path %s", async (status, runnerLocalPath) => {
+    const f = await addressedStagingFixture();
+    const downloadRemoteAttachment = vi.fn(async () => { await f.revoke(status); return runnerLocalPath; });
+    const outcome = await stageNativeRunnerWakeAttachments({ db, binding: f.binding, storage: f.observingStorage, downloadRemoteAttachment })
+      .then(stage => ({ stage, error: null }), error => ({ stage: null, error }));
+    try {
+      expect.soft(outcome.error).toMatchObject({ message: "paperclip_runner_attachment_staging_not_authorized" });
+      expect.soft(outcome.stage).toBeNull();
+      expect.soft(f.getObject).not.toHaveBeenCalled();
+      expect.soft(f.putFile).not.toHaveBeenCalled();
+      expect.soft(await stagedFiles(f.root)).toEqual([]);
+      expect(downloadRemoteAttachment).toHaveBeenCalledOnce();
+      await f.assertTaskOwner();
+    } finally {
+      await outcome.stage?.cleanup();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["cancelled", "accepted"] as const)("clears the first owned file when %s on the second download without clearing another active stage", async status => {
+    const f = await addressedStagingFixture(2);
+    const independent = await stageNativeRunnerAttachmentBytes({ workspaceRoot: f.root, body: Buffer.from("INDEPENDENT_ACTIVE_BYTES") });
+    const independentPath = path.join(f.root, independent.workspaceRelativePath);
+    let callbackCount = 0;
+    const downloadRemoteAttachment = vi.fn(async () => {
+      callbackCount++;
+      if (callbackCount === 2) {
+        const owned = (await stagedFiles(f.root)).filter(file => file !== independentPath);
+        expect(owned).toHaveLength(1);
+        expect(await readFile(owned[0]!)).toEqual(f.files[0]!.body);
+        await f.revoke(status);
+      }
+      return null;
+    });
+    const outcome = await stageNativeRunnerWakeAttachments({ db, binding: f.binding, storage: f.observingStorage, downloadRemoteAttachment })
+      .then(stage => ({ stage, error: null }), error => ({ stage: null, error }));
+    try {
+      expect.soft(outcome.error).toMatchObject({ message: "paperclip_runner_attachment_staging_not_authorized" });
+      expect.soft(outcome.stage).toBeNull();
+      expect(downloadRemoteAttachment).toHaveBeenCalledTimes(2);
+      expect.soft(f.getObject.mock.calls.map(call => call[1])).toEqual([f.files[0]!.stored.objectKey]);
+      expect.soft(f.putFile).not.toHaveBeenCalled();
+      const owned = (await stagedFiles(f.root)).filter(file => file !== independentPath);
+      expect.soft(owned).toHaveLength(1);
+      for (const file of owned) expect.soft(await readFile(file)).toEqual(Buffer.alloc(0));
+      expect(await readFile(independentPath, "utf8")).toBe("INDEPENDENT_ACTIVE_BYTES");
+      await f.assertTaskOwner();
+    } finally {
+      await outcome.stage?.cleanup();
+      await independent.cleanup();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["origin removed", "comment changed"] as const)("rejects changed card scope after download: %s", async mutation => {
+    const f = await addressedStagingFixture();
+    const downloadRemoteAttachment = async () => {
+      if (mutation === "origin removed") {
+        await db.update(issueThreadInteractions).set({ sourceCommentId: null, originCommentIds: [] }).where(eq(issueThreadInteractions.id, f.card.id));
+      } else {
+        const replacement = f.replacementComment;
+        await db.update(issueAttachments).set({ issueCommentId: replacement.id }).where(eq(issueAttachments.id, f.files[0]!.attachment.id));
+        await db.update(issueThreadInteractions).set({ sourceCommentId: replacement.id, originCommentIds: [replacement.id] }).where(eq(issueThreadInteractions.id, f.card.id));
+      }
+      return null;
+    };
+    const outcome = await stageNativeRunnerWakeAttachments({ db, binding: f.binding, storage: f.observingStorage, downloadRemoteAttachment })
+      .then(stage => ({ stage, error: null }), error => ({ stage: null, error }));
+    try {
+      expect.soft(outcome.error).toMatchObject({ message: "paperclip_runner_attachment_staging_not_authorized" });
+      expect.soft(outcome.stage).toBeNull();
+      expect.soft(f.getObject).not.toHaveBeenCalled();
+      expect.soft(await stagedFiles(f.root)).toEqual([]);
+      await f.assertTaskOwner();
+    } finally {
+      await outcome.stage?.cleanup();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects revocation at storage-read completion before writing local bytes", async () => {
+    const f = await addressedStagingFixture();
+    const storage: StorageService = { ...f.observingStorage, getObject: async (...args) => {
+      const object = await f.observingStorage.getObject(...args);
+      return { ...object, stream: Readable.from((async function* () {
+        for await (const chunk of object.stream) yield chunk;
+        await f.revoke("cancelled");
+      })()) };
+    } };
+    const outcome = await stageNativeRunnerWakeAttachments({ db, binding: f.binding, storage })
+      .then(stage => ({ stage, error: null }), error => ({ stage: null, error }));
+    try {
+      expect.soft(outcome.error).toMatchObject({ message: "paperclip_runner_attachment_staging_not_authorized" });
+      expect.soft(outcome.stage).toBeNull();
+      expect(f.getObject).toHaveBeenCalledOnce();
+      expect.soft(await stagedFiles(f.root)).toEqual([]);
+    } finally {
+      await outcome.stage?.cleanup();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans an owned staged inode when authorization is revoked during the write callback", async () => {
+    const f = await addressedStagingFixture();
+    const cleanups: Array<() => Promise<void>> = [];
+    const stageRemoteAttachment = vi.fn(async ({ body }: { body: Buffer }) => {
+      const written = await stageNativeRunnerAttachmentBytes({ workspaceRoot: f.root, body });
+      cleanups.push(written.cleanup);
+      expect(await readFile(path.join(f.root, written.workspaceRelativePath))).toEqual(f.files[0]!.body);
+      await f.revoke("cancelled");
+      return written;
+    });
+    const outcome = await stageNativeRunnerWakeAttachments({ db, binding: { ...f.binding, executionTargetKind: "remote" }, storage: f.observingStorage, stageRemoteAttachment })
+      .then(stage => ({ stage, error: null }), error => ({ stage: null, error }));
+    try {
+      expect.soft(outcome.error).toMatchObject({ message: "paperclip_runner_attachment_staging_not_authorized" });
+      expect.soft(outcome.stage).toBeNull();
+      expect(stageRemoteAttachment).toHaveBeenCalledOnce();
+      const files = await stagedFiles(f.root);
+      expect(files).toHaveLength(1);
+      for (const file of files) expect.soft(await readFile(file)).toEqual(Buffer.alloc(0));
+    } finally {
+      await outcome.stage?.cleanup();
+      await Promise.all(cleanups.map(cleanup => cleanup()));
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps ordinary storage failures as unavailable descriptors and continues the pending card's other file", async () => {
+    const f = await addressedStagingFixture(2);
+    const storage: StorageService = { ...f.observingStorage, getObject: async (...args) => {
+      if (args[1] === f.files[0]!.stored.objectKey) throw new Error("ordinary storage outage");
+      return f.observingStorage.getObject(...args);
+    } };
+    let stage: Awaited<ReturnType<typeof stageNativeRunnerWakeAttachments>> | undefined;
+    try {
+      stage = await stageNativeRunnerWakeAttachments({ db, binding: f.binding, storage, downloadRemoteAttachment: async () => null });
+      expect(stage.attachments).toEqual([
+        expect.objectContaining({ id: f.files[0]!.attachment.id, workspaceRelativePath: null, unavailableReason: "attachment_staging_failed" }),
+        expect.objectContaining({ id: f.files[1]!.attachment.id, workspaceRelativePath: expect.any(String), unavailableReason: null }),
+      ]);
+      expect(await readFile(path.join(f.root, stage.attachments[1]!.workspaceRelativePath!))).toEqual(f.files[1]!.body);
+      expect(await getNativeAddressedInteractionGrant(db, f.binding)).not.toBeNull();
+      await f.assertTaskOwner();
+    } finally {
+      await stage?.cleanup();
+      await rm(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["execution owner", "native reviewer"] as const)("does not revoke independent %s rights when an unrelated addressed card is cancelled", async rights => {
+    const f = await addressedStagingFixture();
+    let binding = { ...f.binding, agentId, runId: f.kaRunId };
+    if (rights === "native reviewer") {
+      const [sourceIssue] = await db.select({ status: issues.status, statusVersion: issues.statusVersion }).from(issues).where(eq(issues.id, f.taskId));
+      const [contract] = await db.insert(completionContracts).values({ companyId, issueId: f.taskId, revision: 1,
+        schemaVersion: "paperclip.completion-contract.v1", policyVersion: "fixture", risk: "low", completionAuthority: "agent",
+        incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: randomUUID(), createdByActorType: "user", createdByActorId: "inbound-user" }).returning();
+      await db.update(heartbeatRuns).set({ status: "succeeded", completionContractId: contract.id, completionContractSha256: contract.canonicalSha256 }).where(eq(heartbeatRuns.id, f.kaRunId));
+      const [result] = await db.insert(nativeRunResults).values({ companyId, issueId: f.taskId, runId: f.kaRunId, completionContractId: contract.id,
+        serverFingerprint: randomUUID(), schemaStatus: "accepted", resultJson: {}, canonicalSha256: randomUUID() }).returning();
+      const [assessment] = await db.insert(workAssessments).values({ companyId, issueId: f.taskId, runId: f.kaRunId, contractId: contract.id, resultId: result.id,
+        triggerKind: "native_result", triggerActorCompanyId: companyId, priorIssueStatus: sourceIssue.status, priorStatusVersion: sourceIssue.statusVersion,
+        policyVersion: "fixture", assessmentJson: {}, inputDigest: randomUUID() }).returning();
+      const [decision] = await db.insert(statusDecisions).values({ companyId, issueId: f.taskId, runId: f.kaRunId, assessmentId: assessment.id, decisionVersion: 1,
+        policyVersion: "fixture", fromStatus: sourceIssue.status, toStatus: "in_review", reasonCode: "explicit_review", decisionJson: { projectedStatusVersion: sourceIssue.statusVersion + 1 },
+        decisionDigest: randomUUID(), applicationState: "applied" }).returning();
+      const [review] = await db.insert(issueThreadInteractions).values({ companyId, issueId: f.taskId, kind: "request_confirmation", sourceRunId: f.kaRunId,
+        addresseeAgentId: f.kp, createdByAgentId: agentId, payload: { version: 1, prompt: "Review the work.",
+          target: { type: "custom", key: "native_completion_review", revisionId: decision.id } } }).returning();
+      await db.update(issues).set({ status: "in_review", lastStatusDecisionId: decision.id, executionRunId: f.kpRunId }).where(eq(issues.id, f.taskId));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { ...f.context, nativeReviewInteractionId: review.id, nativeReviewDecisionId: decision.id } }).where(eq(heartbeatRuns.id, f.kpRunId));
+      binding = f.binding;
+    } else {
+      await db.update(heartbeatRuns).set({ contextSnapshot: f.context }).where(eq(heartbeatRuns.id, f.kaRunId));
+    }
+    let stage: Awaited<ReturnType<typeof stageNativeRunnerWakeAttachments>> | undefined;
+    try {
+      stage = await stageNativeRunnerWakeAttachments({ db, binding, storage: f.observingStorage, downloadRemoteAttachment: async () => { await f.revoke("cancelled"); return null; } });
+      expect(stage.attachments).toEqual([expect.objectContaining({ id: f.files[0]!.attachment.id, unavailableReason: null })]);
+      expect(await readFile(path.join(f.root, stage.attachments[0]!.workspaceRelativePath!))).toEqual(f.files[0]!.body);
+      expect(f.getObject).toHaveBeenCalledOnce();
+      if (rights === "execution owner") await f.assertTaskOwner();
+      else expect(await db.select({ assigneeAgentId: issues.assigneeAgentId, executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, f.taskId)))
+        .toEqual([{ assigneeAgentId: agentId, executionRunId: f.kpRunId }]);
+    } finally {
+      await stage?.cleanup();
+      await rm(f.root, { recursive: true, force: true });
     }
   });
 });
