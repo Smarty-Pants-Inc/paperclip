@@ -11969,7 +11969,7 @@ async function executePaperclipNativeSessionAttempt(
       remoteCleanupLease = await readRemoteCleanupLease();
       return true;
     };
-    const reportWarmAttachFailure = async (code: string, text: string, refusal?: string) => {
+    const reportWarmAttachFailure = async (code: string, text: string, refusal?: string, ownerAlarm = true) => {
       const state = refusal ? "warm_attach_failed_refused" : "warm_attach_failed_cold_fallback";
       const outcome = refusal ? `cold start refused (${refusal})`
         : "retired that runner; resuming the same conversation cold from its checkpoint";
@@ -11986,7 +11986,7 @@ async function executePaperclipNativeSessionAttempt(
         await emitStartupReuse(input.onEvent, "runner", { state: "fresh", reason: "resume_failed" });
         await emitStartupReuse(input.onEvent, "provider_session", { state: "fresh", reason: "resume_failed" });
       }
-      logger.error({ companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
+      if (ownerAlarm) logger.error({ companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
         issueId: input.execution.binding.issueId, runId: input.execution.binding.runId,
         normalizedSessionId: nativeSessionKey(input.execution), code, state, refusal },
       "Warm runner attach owner alarm: a retained runner failed to attach");
@@ -12000,15 +12000,18 @@ async function executePaperclipNativeSessionAttempt(
       warmAttachFailure = undefined;
       const retained = existingWarmSession;
       if (!failed || failed.error !== error || !retained || warmAttachFallbackTaken || warmConfigDigest === null) return false;
-      // A Stop, an expired startup or a controller restart is the run's own outcome.
-      if (startupForAdmission?.stopRequested || executionContext?.signal.aborted
-        || nativeRunsDetachingForRestart.has(input.execution.binding.runId)
-        || (error instanceof Error && ["native_session_cancelled", "native_execution_startup_expired"].includes(error.message))) {
-        return false;
-      }
       warmAttachFallbackTaken = true;
       const code = warmAttachFailureCode(error);
       const text = redactIdentityText(error instanceof Error ? error.message : String(error)).slice(0, 1_000);
+      // A Stop, an expired startup or a controller restart is the run's own
+      // outcome: the Stop path keeps it. Record the rejection; a user Stop is
+      // not a defect, so no owner alarm.
+      if (startupForAdmission?.stopRequested || executionContext?.signal.aborted
+        || nativeRunsDetachingForRestart.has(input.execution.binding.runId)
+        || (error instanceof Error && ["native_session_cancelled", "native_execution_startup_expired"].includes(error.message))) {
+        await reportWarmAttachFailure(code, text, "stop_owned", false);
+        return false;
+      }
       // An unsettled tool result or runtime input could be repeated or lost by
       // a replacement: keep the refusal under its reconciliation code.
       if (error instanceof NativeRunnerSourceReconciliationRequiredError) {
