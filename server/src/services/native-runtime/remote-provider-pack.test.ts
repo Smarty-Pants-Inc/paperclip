@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { SandboxStoppedError } from "../sandbox-stopped-error.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { prepareVerifiedRemoteProviderPack, useVerifiedPreinstalledRemoteProviderPack, runRemoteProviderVerification, shouldUseBundledAcpxImageAssets } from "./remote-provider-pack.js";
@@ -33,6 +34,12 @@ describe("remote provider verification", () => {
     expect(failure.message).not.toContain("secret-fixture-value");
     expect(execute).toHaveBeenCalledOnce();
   });
+  it("REG-26: propagates a definite stopped allocation without another verification attempt", async () => {
+    const stopped = new SandboxStoppedError("still_stopped", new Error("provider rejected command"));
+    const execute = vi.fn().mockRejectedValue(stopped);
+    await expect(runRemoteProviderVerification(execute, "pack")).rejects.toBe(stopped);
+    expect(execute).toHaveBeenCalledOnce();
+  });
   it("recovers a transport exception and propagates cancellation", async () => {
     const execute = vi.fn().mockRejectedValueOnce(new Error("connection unavailable")).mockResolvedValueOnce(ok);
     await expect(runRemoteProviderVerification(execute, "pack")).resolves.toEqual(ok);
@@ -62,6 +69,21 @@ describe("remote provider verification", () => {
 });
 
 describe("remote provider pack reuse", () => {
+  it.each(["sealed", "staged", "preinstalled"] as const)("REG-26: does not treat stopped %s admission as an incompatible installation", async stage => {
+    const stopped = new SandboxStoppedError("resume_failed", new Error("wake refused"));
+    const order: string[] = [];
+    const verifyAndLink = vi.fn(async () => { throw stopped; });
+    await expect(prepareVerifiedRemoteProviderPack({
+      useSealedPreinstalled: async () => { order.push("sealed"); if (stage === "sealed") throw stopped; return false; },
+      verifyStaged: async () => { order.push("staged"); throw stage === "staged" ? stopped : new Error("not staged"); },
+      usePreinstalled: async () => { order.push("preinstalled"); return useVerifiedPreinstalledRemoteProviderPack({
+        candidates: ["/opt/pack", "/home/user/pack"], verifyAndLink,
+      }); },
+      stageAndVerify: async () => { order.push("upload"); },
+    })).rejects.toBe(stopped);
+    expect(order).toEqual(stage === "sealed" ? ["sealed"] : stage === "staged" ? ["sealed", "staged"] : ["sealed", "staged", "preinstalled"]);
+    expect(verifyAndLink).toHaveBeenCalledTimes(stage === "preinstalled" ? 1 : 0);
+  });
   // Keep: trust-boundary ordering. A cold controller must not hash a staged
   // alias before it tries the matching sealed image; failed seals grant nothing.
   it.each(["sealed", "memo", "full"] as const)("selects seal, staged memo, then full fallback: %s", async hit => {

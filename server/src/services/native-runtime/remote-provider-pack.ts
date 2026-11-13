@@ -1,4 +1,5 @@
 import { redactSensitiveText } from "../../redaction.js";
+import { findSandboxStoppedError } from "../sandbox-stopped-error.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 
@@ -37,7 +38,7 @@ export async function runRemoteProviderVerification(
     try {
       result = await execute();
     } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") throw error;
+      if (findSandboxStoppedError(error) || error instanceof Error && error.name === "AbortError") throw error;
       diagnostic = redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(-1_024);
       continue;
     }
@@ -65,14 +66,15 @@ export async function prepareVerifiedRemoteProviderPack(input: {
   const select = async () => {
     try {
       if (await input.useSealedPreinstalled?.()) return "preinstalled" as const;
-    } catch {
+    } catch (error) {
+      if (findSandboxStoppedError(error)) throw error;
       // An unavailable read-only optimization is not admission. The staged
       // memo/full verifier below must still establish the pack's identity.
     }
     try {
       await input.verifyStaged();
       return "staged" as const;
-    } catch {}
+    } catch (error) { if (findSandboxStoppedError(error)) throw error; }
     if (await input.usePreinstalled()) return "preinstalled" as const;
     await input.stageAndVerify();
     return "uploaded" as const;
@@ -98,8 +100,7 @@ export async function useVerifiedPreinstalledRemoteProviderPack(input: {
     try {
       await input.verifyAndLink(candidate);
       return true;
-    } catch {
-    }
+    } catch (error) { if (findSandboxStoppedError(error)) throw error; }
   }
   return false;
 }

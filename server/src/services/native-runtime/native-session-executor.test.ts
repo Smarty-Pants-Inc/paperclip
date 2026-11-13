@@ -21799,6 +21799,18 @@ it("keeps an ACPX missing runtime package failure actionable and stops automatic
   expect(code).toBe("native_provider_runtime_missing");
   expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({ phase: "terminal_failure", failureCode: code, nextAttemptAt: null });
 });
+it("REG-26: stopped provider startup is typed and terminal after its bounded resume", async () => {
+  const { SandboxStoppedError } = await import("../sandbox-stopped-error.js");
+  const failure = new SandboxStoppedError("still_stopped", new Error("provider command rejected"));
+  const code = nativeSessionFailureSourceCode(new Error("runner process supervision failed", { cause: failure }));
+  expect(code).toBe("sandbox_stopped");
+  expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+    phase: "terminal_failure", failureCode: "sandbox_stopped", nextAttemptAt: null,
+  });
+  // Raw output/unknown transport errors must not be promoted to definite failure.
+  expect(nativeSessionFailureSourceCode(new Error(failure.message))).toBe("native_session_interrupted");
+});
+
 it("classifies only a definite session.open outcome as a bounded pre-session failure", () => {
   const detail = '{"result":{"code":"command_execution_failed","message":"failed to start ACPX provider: ACPX sidecar command session.open was rejected (retryable=false, classification=session_ensure_failed)"},"status":"failed"}';
   for (const status of ["failed", "rejected"]) {
