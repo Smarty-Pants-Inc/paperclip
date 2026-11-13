@@ -14,7 +14,7 @@ import { redactRegisteredSecretValues } from "../run-secret-redaction.js";
 import { nativeSha256 } from "./canonical.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
 import { PaperclipControlPlanePort, type PaperclipControlPlaneBinding } from "./paperclip-control-plane-port.js";
-import { nativeTaskSessionPublicationHandled, publishNativeTaskSessionInTransaction, NATIVE_TASK_SESSION_PUBLICATION_KEY,
+import { nativeTaskSessionPublicationHandled, publishNativeTaskSessionInTransaction, publishPiConversationInTransaction, NATIVE_TASK_SESSION_PUBLICATION_KEY,
   type NativeTaskSessionPublicationContext } from "./native-task-session-publication.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_NATIVE_PUBLICATION_TEST_DATABASE_URL");
@@ -174,6 +174,45 @@ describe("accepted native task session publication", () => {
       terminal: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "cancelled", runTerminalState: "cancelled", reportedWorkDisposition: "needs_review" } });
     expect((await f.read()).session).toEqual(before.session);
   });
+
+  it.each(["clean", "missing", "foreign_epoch", "newer_execution", "generation_reset", "uncertain", "failed", "failed_run", "no_board_stop", "issue_stop", "before_selection_stop"])(
+    "publishes clean retained Pi Stop bookkeeping without relaxing %s fences", async kind => {
+      const f = await fixture("runner", false, "pi_rpc");
+      const cancelled: PersistedNativeSession = { ...f.snapshot, semanticResult: null, terminal: { schema: "paperclip.prp.terminal.v1",
+        turnTerminalState: "cancelled", runTerminalState: "cancelled", reportedWorkDisposition: "yielded" } };
+      await db.update(heartbeatRuns).set({ status: kind === "failed_run" ? "failed" : "cancelled", resultJson: {
+        startupCancellation: { errorCode: "cancelled", beforeNativeSelection: kind === "before_selection_stop" },
+        cancelledByActorType: kind === "no_board_stop" ? "system" : "user", cancelledByUserId: "board",
+        nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.binding.runId,
+          companyId: f.binding.companyId, issueId: f.binding.issueId, scope: kind === "issue_stop" ? "issue" : "run", reasonCode: "cancellation_run_only",
+          dispatchState: "acknowledged", dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack" },
+      } }).where(eq(heartbeatRuns.id, f.binding.runId));
+      if (kind === "missing") await db.delete(agentTaskSessions).where(eq(agentTaskSessions.taskKey, f.binding.issueId));
+      if (kind === "foreign_epoch") await db.update(agentTaskSessions).set({ goalSourceId: `${randomUUID()}:${f.binding.runId}` }).where(eq(agentTaskSessions.taskKey, f.binding.issueId));
+      if (kind === "newer_execution") {
+        const newer = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: newer, companyId: f.binding.companyId, agentId: f.binding.agentId, status: "running" });
+        await db.update(issues).set({ executionRunId: newer }).where(eq(issues.id, f.binding.issueId));
+      }
+      if (kind === "generation_reset") await db.update(issues).set({ conversationAgentId: f.binding.agentId,
+        conversationUserId: "publication-test-user", conversationState: "active", conversationSessionGeneration: 2 }).where(eq(issues.id, f.binding.issueId));
+      if (kind === "uncertain") cancelled.activeTurnId = "unsettled-turn";
+      if (kind === "failed") cancelled.terminal = { ...cancelled.terminal!, runTerminalState: "failed" };
+      const publish = (retained: boolean) => db.transaction(async tx => {
+        await tx.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.binding.runId)).for("update");
+        const [issue] = await tx.select().from(issues).where(eq(issues.id, f.binding.issueId)).for("no key update");
+        const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.binding.runId)).for("update");
+        return publishPiConversationInTransaction(tx, { binding: f.binding, context: f.context, snapshot: cancelled,
+          run, issue }, retained ? { retainedCancelledOwner: true } : undefined);
+      });
+      expect(await publish(false)).not.toBe("published");
+      expect(await publish(true)).toBe(kind === "clean" ? "published" : kind === "missing" ? "missing_stub"
+        : ["foreign_epoch", "newer_execution"].includes(kind) ? "suppressed_newer"
+        : kind === "generation_reset" ? "suppressed_reset" : "suppressed_authority");
+      expect((await f.read()).session?.lastRunId ?? null).toBe(kind === "clean" ? f.binding.runId : null);
+      expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.binding.runId))).toHaveLength(0);
+      expect((await f.read()).run.runnerProfileJson).not.toHaveProperty(NATIVE_TASK_SESSION_PUBLICATION_KEY);
+    });
 
   it.each(["missing", "foreign_epoch", "newer_execution", "generation_reset", "stop", "stale_owner", "wrong_provider"])(
     "fences Pi's pre-acceptance conversation pointer for %s", async kind => {

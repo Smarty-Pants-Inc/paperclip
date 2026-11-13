@@ -346,6 +346,14 @@ export interface ExecuteNativeSessionOptions {
   existingSession?: NativeSession;
   persistedSession?: PersistedNativeSession | null;
   keepSessionOpen?: boolean;
+  /** Embedding policy may retain a checkpointed cancelled turn without inventing
+   * a semantic result. It must prove intentional Stop, settled interruption and
+   * safe reuse of this exact owner. False, errors and absent policy retire it. */
+  retainCancelledSession?: (input: {
+    session: NativeSession;
+    terminalEvent: PrpEvent;
+    signal: AbortSignal;
+  }) => Promise<boolean>;
   /** Apply a structured session-goal control instead of starting an ordinary turn. */
   sessionGoalControl?: NativeSessionGoalControl | null;
   /** Resume the active durable session goal after a bounded heartbeat rollover. */
@@ -2760,6 +2768,7 @@ export async function executeNativeSession(
     return activeClose;
   };
   let executionSucceeded = false;
+  let cancelledSessionRetained = false;
   let goalCheckpointRequiresSuspension = Boolean(
     options.sessionGoalControl || options.resumeSessionGoalHeartbeat || persistedSession?.goal,
   );
@@ -3339,6 +3348,16 @@ export async function executeNativeSession(
           completed = settledCompletion;
         }
         if (settledCompletion === null) {
+          if (options.keepSessionOpen && !sessionQuarantined && !goalCheckpointRequiresSuspension
+            && consumed.event?.eventType === "turn.cancelled" && options.retainCancelledSession) {
+            // The terminal checkpoint above must commit first. Retention does
+            // not authorize completeRun or change the missing-result outcome.
+            const retain = await options.retainCancelledSession({
+              session, terminalEvent: consumed.event, signal,
+            }).catch(() => false);
+            signal.throwIfAborted();
+            cancelledSessionRetained = retain;
+          }
           throw new Error(
             "native_finalization_missing: session returned no semantic result",
           );
@@ -3590,7 +3609,7 @@ export async function executeNativeSession(
     throw error;
   } finally {
     const shouldClose =
-      !options.keepSessionOpen || !executionSucceeded || sessionQuarantined || goalCheckpointRequiresSuspension;
+      !options.keepSessionOpen || (!executionSucceeded && !cancelledSessionRetained) || sessionQuarantined || goalCheckpointRequiresSuspension;
     if (shouldClose && options.requireSessionCloseBeforeReturn) {
       if (!failedCleanupDeferred) {
         closeSession(

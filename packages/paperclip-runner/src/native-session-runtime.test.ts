@@ -260,6 +260,42 @@ function highestContiguous(events: PrpEvent[]): number {
   return cursor;
 }
 
+describe("executeNativeSession cancelled-owner retention (Stop data safety)", () => {
+  it.each(["clean", "refused", "policy-error", "checkpoint-error", "completed", "per-turn"])("retains only a checkpointed, policy-approved cancelled owner: %s", async mode => {
+    const event = runnerEvent(1, mode === "completed" ? "turn.completed" : "turn.cancelled", { status: mode === "completed" ? "completed" : "cancelled" });
+    const close = vi.fn(async () => {});
+    const snapshot: PersistedNativeSession = { backendKind: "mock", sessionId: "cancel-retention", identity,
+      cursor: "1", activeTurnId: null, semanticResult: null, pendingRuntimeRequests: [], terminalTurns: [] };
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() { return { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }; },
+      async *events() { yield event; },
+      async startTurn() { return { turnId: "turn-recovery" }; },
+      async result() { return null; }, async snapshot() { return snapshot; }, close,
+    };
+    const backend: NativeSessionBackend = {
+      async descriptor() { return { kind: "mock", name: "cancel-retention", version: "1", capabilities: await session.capabilities() }; },
+      async openSession() { return session; },
+    };
+    const completeRun = vi.fn(async () => {});
+    const controlPlane: ControlPlanePort = {
+      async openRun() {}, async checkpointSession() { if (mode === "checkpoint-error") throw new Error("checkpoint failed"); },
+      async appendEvent(event) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, completeRun,
+    };
+    const retainCancelledSession = vi.fn(async () => {
+      if (mode === "policy-error") throw new Error("policy unavailable");
+      return mode === "clean";
+    });
+    await expect(executeNativeSession({ input, backend, controlPlane, runnerInstanceId: "runner-recovery",
+      controlPlaneInstanceId: "control-recovery", keepSessionOpen: mode !== "per-turn", retainCancelledSession,
+    })).rejects.toThrow();
+    expect(close).toHaveBeenCalledTimes(mode === "clean" ? 0 : 1);
+    expect(completeRun, "retention must not fabricate successful completion").not.toHaveBeenCalled();
+    expect(retainCancelledSession).toHaveBeenCalledTimes(["clean", "refused", "policy-error"].includes(mode) ? 1 : 0);
+  });
+});
+
 describe("executeNativeSession recovery", () => {
   it("completes Cursor Cloud semantic planning through its default-only harness without losing the pinned revision", async () => {
     await writeFile(join(WORKSPACE, "cloud-plan-instructions.md"), "Make the plan only. Do not implement it.\n");

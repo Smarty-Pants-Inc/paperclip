@@ -5,6 +5,7 @@ import { nativeSha256 } from "./canonical.js";
 import type { PaperclipControlPlaneBinding } from "./paperclip-control-plane-port.js";
 import { readRunCancellation } from "../run-cancellation.js";
 import { preservePiConversation } from "./pi-conversation-record.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 
 /** Prepared once by heartbeat; never copied into recovery metadata or receipts. */
 export interface NativeTaskSessionPublicationContext {
@@ -119,21 +120,36 @@ export async function publishNativeTaskSessionInTransaction(tx: Transaction, inp
 /** Save Pi's conversation identity before a turn can be stopped. This is not a
  * result/publication receipt: successful-result acceptance remains unchanged.
  * The same lease, reset, cancellation and newer-owner fences protect both. */
-export async function publishPiConversationInTransaction(tx: Transaction, input: PointerPublicationInput): Promise<Outcome> {
+export async function publishPiConversationInTransaction(tx: Transaction, input: PointerPublicationInput,
+  options?: { retainedCancelledOwner: true }): Promise<Outcome> {
   const provider = record(record(record(input.run.runnerProfileJson).nativeExecutionInput).provider);
   if (input.context.providerKind !== "pi_rpc" || provider.kind !== "pi_rpc" || !input.snapshot.providerSessionId)
     return "unsupported";
-  if (input.run.status !== "running") return "suppressed_authority";
-  return publishTaskSessionPointer(tx, input);
+  // The executor alone supplies this after proving clean interrupt cleanup and
+  // retaining the exact live owner. It is conversation bookkeeping, never a
+  // result receipt; every reset, epoch and newer-owner fence below still applies.
+  const retained = options?.retainedCancelledOwner === true;
+  if (retained ? !["running", "cancelled"].includes(input.run.status) || !hasAcknowledgedNativeStopIntent(input.run)
+      || input.snapshot.identity.runId !== input.binding.runId || input.snapshot.identity.sessionId !== input.run.nativeSessionId
+      || input.snapshot.semanticResult !== null || input.snapshot.terminal?.runTerminalState !== "cancelled"
+      || input.snapshot.terminal.turnTerminalState !== "cancelled" || input.snapshot.activeTurnId !== null
+      || !Array.isArray(input.snapshot.pendingRuntimeRequests) || input.snapshot.pendingRuntimeRequests.length !== 0
+    : input.run.status !== "running") return "suppressed_authority";
+  return publishTaskSessionPointer(tx, input, retained);
 }
 
-async function publishTaskSessionPointer(tx: Transaction, input: PointerPublicationInput): Promise<Outcome> {
+async function publishTaskSessionPointer(tx: Transaction, input: PointerPublicationInput, retainedCancelledOwner = false): Promise<Outcome> {
   const { binding, context, snapshot, run, issue } = input;
   if (context.taskKey !== binding.issueId || input.recoveryReady === false) return "unsupported";
   const cancellation = record(run.resultJson?.nativeCancellation), stop = readRunCancellation(run.resultJson);
-  if (!issue || ["cancelled", "interrupted", "failed", "timed_out"].includes(run.status) || issue.companyId !== binding.companyId
-      || run.resultJson?.startupCancellation || (stop?.source === "operator" && stop.expected)
-      || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))
+  if (!issue || issue.companyId !== binding.companyId
+      // The Stop route records this even for a turn already running. Only the
+      // explicitly post-selection marker can coexist with a retained live owner.
+      || (run.resultJson?.startupCancellation && (!retainedCancelledOwner
+        || record(run.resultJson.startupCancellation).beforeNativeSelection !== false))
+      || (!retainedCancelledOwner && (["cancelled", "interrupted", "failed", "timed_out"].includes(run.status)
+        || (stop?.source === "operator" && stop.expected)
+        || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))))
       || (issue.conversationAgentId && issue.conversationAgentId !== binding.agentId)) return "suppressed_authority";
   if (issue.conversationAgentId
       && run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return "suppressed_reset";

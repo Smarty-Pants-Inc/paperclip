@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agentTaskSessions, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agentTaskSessions, agents, authUsers, companyMemberships, companySkillRepositorySnapshots, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, costEvents, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, issueComments, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -198,6 +198,17 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     if (!selected.selected || !selected.nativeExecution) throw new Error("Expected selection");
     expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(legacy);
     expect((await read(f.input.run.id)).runnerProfileJson).toMatchObject({ piConversation: { reason: "legacy_binding_unverified" } });
+    const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    expect(await notices()).toMatchObject([{ authorType: "system", createdByRunId: f.run.id,
+      body: "My earlier conversation could not be restored (it predates conversation records). Starting a new one.",
+      presentation: { kind: "system_notice" } }]);
+    // Selection replay and a later ordinary turn must not repeat the notice.
+    await selectHeartbeatRuntime(db, f.input);
+    await nextPiTurn(f);
+    expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: {
+      session: { normalizedSessionId: selected.nativeExecution.session.normalizedSessionId },
+    } });
+    expect(await notices()).toHaveLength(1);
   });
   async function connectorFixture(durable = true) {
     const f = await fixture(), { input } = f;

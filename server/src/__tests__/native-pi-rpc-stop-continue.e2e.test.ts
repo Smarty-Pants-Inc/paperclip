@@ -45,7 +45,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled)(`Stop preserves Pi-only history across a fresh process and the following warm turn (thinking=${thinking})`, async () => {
+it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm turn, and later controller restart (thinking=${thinking})`, async () => {
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -336,8 +336,8 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history across a fresh process and t
     const { heartbeatService } = await import("../services/heartbeat.js");
     await heartbeatService(db).waitForRunExecutionDrain(admitted.id, { timeoutMs: 15_000 });
     stage("Stop drained before NEW wake", { residentAlive: alive(pid.piPid), runnerAlive: alive(pid.runnerPid), bashAlive: alive(bashPid), bundles: bundles.length });
-    expect(alive(pid.piPid), "Pi interrupt contract physically retires resident").toBe(false);
-    expect(alive(pid.runnerPid), "run drain retires original runnerd before any harness teardown").toBe(false);
+    expect(alive(pid.piPid), "clean board Stop keeps the original Pi alive after run drain").toBe(true);
+    expect(alive(pid.runnerPid), "clean board Stop keeps the original runnerd warm").toBe(true);
     expect(existsSync(join(root, "after-stop.txt")), "cancelled command cannot run its trailing effect").toBe(false);
     expect(readFileSync(originalSessionFile, "utf8")).toContain(privateFact);
     stage("Pi session file intact after Stop", { sessionFile: originalSessionFile, nativeSessionId: stopped.nativeSessionId,
@@ -357,16 +357,16 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history across a fresh process and t
       oldNativeSessionId: stopped.nativeSessionId, nativeSessionId: final.nativeSessionId, originalSessionFile });
     expect(final.status).toBe("succeeded");
     const replacement = newPids.find(value => value.piPid !== null)!;
-    expect(replacement, "new wake creates a healthy resident").toBeDefined();
-    expect(replacement.piPid).not.toBe(pid.piPid);
-    expect(replacement.runnerPid).not.toBe(pid.runnerPid);
+    expect(replacement, "new wake attaches to the original healthy resident").toBeDefined();
+    expect(replacement.piPid).toBe(pid.piPid);
+    expect(replacement.runnerPid).toBe(pid.runnerPid);
     const replacementSessionFile = readSessionFile(replacement.piPid!);
     stage("history continuity proof", { oldNativeSessionId: stopped.nativeSessionId, nativeSessionId: final.nativeSessionId,
       originalSessionFile, replacementSessionFile, remembersPrivateFact: requests[1]?.remembersPrivateFact, reply: reply.body });
     await writeFile(join(root, "pi-session-after-reopen.jsonl"), readFileSync(replacementSessionFile));
     expect(final.nativeSessionId, "Stop preserves the logical Pi conversation").toBe(stopped.nativeSessionId);
-    expect(replacementSessionFile, "fresh Pi reopens the exact original file").toBe(originalSessionFile);
-    expect(requests[1]?.remembersPrivateFact, "reopened Pi sends its private assistant history to the model").toBe(true);
+    expect(replacementSessionFile, "the same Pi keeps the exact original file").toBe(originalSessionFile);
+    expect(requests[1]?.remembersPrivateFact, "resident Pi sends its private assistant history to the model").toBe(true);
     expect(JSON.stringify(requests[1]?.lastMessage), "Paperclip did not replay the secret into the new wake").not.toContain(privateFact);
     expect(reply.body).toContain(privateFact);
     // The next ordinary turn must still reuse the replacement process.
@@ -386,8 +386,8 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history across a fresh process and t
     expect(alive(sleepPid)).toBe(false);
     expect(requests).toHaveLength(3);
     stage("replacement stays warm", { ...replacement, runId: settledWarm.id, nativeSessionId: settledWarm.nativeSessionId, reply: warmReply.body });
-    // Exercise the same cold-open step without Stop: retire an idle owner
-    // using the production controller-restart hook, then wake the same task.
+    // Stop no longer retires a healthy resident. Still exercise the genuine
+    // cold-reopen boundary using the production controller-restart hook.
     const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
     const closure = await closeIdleWarmNativeSessionsForRestart();
     expect(closure).toEqual({ closed: 1, busy: 0, failed: 0 });
