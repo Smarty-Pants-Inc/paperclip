@@ -288,6 +288,19 @@ describe("Retry of a task whose saved work recovery settled", () => {
     expect(["queued", "running"]).toContain(successor.status);
   });
 
+  it("does not advertise a Retry refused by admission after saved work is recovered", async () => {
+    const f = await restoredSnapshot();
+    expect((await getExecutionBlocker(db, f.companyId, f.issueId))?.canRetry).toBe(true);
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", triggerDetail: "manual", status: "deferred_issue_execution", reason: "task_retry",
+      payload: { issueId: f.issueId, taskRetry: { sourceRunId: f.sourceId },
+        executionWait: { reason: "previous_execution_unverified" } } });
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker?.canRetry).toBe(false);
+    expect(blocker?.workspaceRecovery?.message).toBe("Saved work recovered.");
+    expect(blocker?.nextAction).toBe("Saved work recovered.");
+  });
+
   it("keeps the repair unverified when the failed preparation may have changed the restored snapshot", async () => {
     const f = await restoredSnapshot();
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceId));

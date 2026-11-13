@@ -497,8 +497,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     agentId: run?.agentId ?? null,
     cause: action.cause,
     nextAction: (refusedRecoveredConversation ? HELD_PREDECESSOR_NOTICE
-      : workspaceRecovery?.status === "recovered" && canRetry && !chatBinding
-      ? "Saved work recovered. Retry or send a message to continue." : workspaceRecovery?.message) ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
+      : workspaceRecovery?.message) ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
 
     ...(workspaceRecovery ? { workspaceRecovery } : {}),
     runStatus: run?.status ?? null,
