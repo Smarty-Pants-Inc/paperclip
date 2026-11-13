@@ -232,23 +232,69 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(agent.id)).lifecycleOperation).toMatchObject({ verificationFailures: 3, retryRequired: true });
   });
 
-  it("keeps checking an outdated remote Runner past the failure budget and becomes ready once it matches", async () => {
+  // Keep reason: Image B-s4 905542b5 retried allocation errors without accounting.
+  it.each(["verifying", "resuming"] as const)("bounds every %s host failure, spaces attempts and survives restart", async phase => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Bounded provider allocation", status: "idle",
+      lifecycleState: phase, lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    const runHost = vi.fn(async () => { throw Object.assign(new Error("private quota detail"), { code: "provider_allocation_failed" }); });
+    const driver = { requiredPluginIds: async () => [], runHost, runPlugin: async () => "complete" as const };
+    const work = configureAgentLifecycle(db, driver); workers.push(work);
+    const store = createLifecycleStore(db, createAgentLifecycleEffects());
+    for (let failure = 1; failure <= 3; failure++) {
+      await work.sweep();
+      const row = await current(agent.id);
+      expect(row.lifecycleOperation?.verificationFailures).toBe(failure);
+      if (failure < 3) {
+        const retryAt = Date.parse(row.lifecycleOperation!.retryAt!);
+        expect(retryAt).toBeGreaterThanOrEqual(Date.now() + 55_000);
+        expect(await store.pending(100, new Date(retryAt - 1))).not.toContain(agent.id);
+        expect(await store.claim(agent.id, "early", new Date(retryAt - 1))).toBeNull();
+        expect(await store.pending(100, new Date(retryAt))).toContain(agent.id);
+        await work.process(agent.id); await work.sweep();
+        expect(runHost).toHaveBeenCalledTimes(failure);
+        // Advance only this row's persisted deadline; no timer sleeps or fake DB clock.
+        await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
+      }
+    }
+    const parked = await current(agent.id);
+    expect(parked.lifecycleOperation).toMatchObject({ verificationFailures: 3, retryRequired: true });
+    expect(parked.lifecycleOperation).not.toHaveProperty("retryAt");
+    expect(parked.lifecycleError).toContain("provider allocation failed");
+    expect(parked.lifecycleError).toContain("Automatic verification is paused");
+    expect(parked.lifecycleError).not.toContain("private quota detail");
+    await work.stop();
+    const restarted = configureAgentLifecycle(db, driver); workers.push(restarted);
+    await restarted.sweep(); await restarted.process(agent.id);
+    expect(await store.claim(agent.id, "tomorrow", new Date(Date.now() + 86_400_000))).toBeNull();
+    expect(runHost).toHaveBeenCalledTimes(3);
+  });
+
+  it("bounds Runner revision failures and accepts an explicit repaired retry", async () => {
     const { agent, work, runHost } = await failed("runner_revision_mismatch");
-    for (let check = 0; check < 5; check++) {
-      const waiting = await current(agent.id);
-      expect(waiting).toMatchObject({ lifecycleState: "verifying", status: "paused" });
-      expect(waiting.lifecycleOperation?.retryRequired).toBeUndefined();
-      expect(waiting.lifecycleOperation?.verificationFailures).toBeUndefined();
-      expect(waiting.lifecycleOperation?.retryAt).toEqual(expect.any(String));
-      expect(waiting.lifecycleError).toContain("Runner is being updated");
-      expect(waiting.lifecycleError).not.toContain("Automatic verification is paused");
+    for (let check = 0; check < 2; check++) {
       await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
       await work.process(agent.id);
     }
+    expect((await current(agent.id)).lifecycleOperation).toMatchObject({ verificationFailures: 3, retryRequired: true });
     runHost.mockImplementation(async () => "complete");
-    await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
+    await createAgentLifecycle(db).retry(agent.id);
     await work.process(agent.id);
     expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle", lifecycleError: null });
+  });
+
+  it("resets consecutive host failures after success even when a plugin remains pending", async () => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Host recovered", status: "idle", lifecycleState: "resuming",
+      lifecycleRequiredPluginIds: ["fixture-plugin"], lifecycleOperation: {
+        id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0, verificationFailures: 2,
+      } }).returning();
+    const work = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runHost: async () => "complete",
+      runPlugin: async () => "pending" }); workers.push(work);
+    await work.process(agent.id);
+    const row = await current(agent.id);
+    expect(row.lifecycleOperation?.hostComplete).toBe(true);
+    expect(row.lifecycleOperation?.verificationFailures ?? 0).toBe(0);
+    expect(row.lifecycleOperation?.retryRequired).toBeUndefined();
   });
 
   it("recovers from a generic failed test before the automatic retry budget is exhausted", async () => {

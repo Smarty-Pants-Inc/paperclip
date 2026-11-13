@@ -334,6 +334,14 @@ The worker starts after a committed command.
 A periodic scan recovers work after a process stops.
 A database lease permits one active attempt for each agent.
 The worker renews that lease during external calls.
+Every host failure during verification or resume spends the operation's consecutive
+`verificationFailures` budget, including provider allocation failures before a test
+starts. Failed attempts wait at least one minute at the saved `retryAt`; scans and
+direct claims both honor that deadline. Three consecutive failures park the
+operation with `retryRequired: true` and a fixed, secret-safe `lifecycleError`
+identifying the last failure category. Known configuration or account failures
+park immediately. Host completion resets the counter. Retry or a configuration
+repair clears the parked operation's budget; a restart alone does not.
 Each result must match the current revision and lease owner.
 Shutdown waits for active work.
 

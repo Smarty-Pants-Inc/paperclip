@@ -243,7 +243,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     },
     async completeHost(agent, owner) {
       const rows = await db.update(agents).set({
-        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation}, '{hostComplete}', 'true'::jsonb)`,
+        lifecycleOperation: sql`jsonb_set(${agents.lifecycleOperation} - 'verificationFailures' - 'retryAt', '{hostComplete}', 'true'::jsonb)`,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });
       return rows.length > 0;
@@ -271,7 +271,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
       const retry: Partial<AgentLifecycleOperation> = options?.retryRequired && ["verifying", "resuming"].includes(agent.lifecycleState)
         ? { retryRequired: true }
         : { retryAt: new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString() };
-      if (options?.verificationFailures !== undefined && agent.lifecycleState === "verifying") {
+      if (options?.verificationFailures !== undefined && ["verifying", "resuming"].includes(agent.lifecycleState)) {
         retry.verificationFailures = options.verificationFailures;
       }
       const rows = await db.update(agents).set({
