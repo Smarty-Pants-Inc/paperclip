@@ -93,7 +93,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   async function seedRecoveredPriorRun(control: "settled" | "pending-command" | "unanswered-tool"
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
-    options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode";
+    options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
       lifecycle?: "warm" } = {}) {
     const issueId = randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
@@ -104,7 +104,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const executionFor = (currentRunId: string) => buildNativeExecutionInput({
       companyId, agentId, runId: currentRunId, provider: options.provider ?? "acpx", acpxAgent: "claude",
       model: options.provider === "codex" ? "gpt-6.1-sol"
-        : options.provider === "opencode" ? "openrouter/deepseek/deepseek-v4.1-flash-1017" : "claude-opus-5-5",
+        : options.provider === "pi_rpc" ? "paperclip/faux"
+          : options.provider === "opencode" ? "openrouter/deepseek/deepseek-v4.1-flash-1017" : "claude-opus-5-5",
       issue: { id: issueId, identifier: "ROF-1", title: "Continue after recovery", description: null, workMode: "standard" },
       taskPrompt: "Continue the conversation.",
       workspace: { id: workspaceId, cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
@@ -953,8 +954,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   /** The state a local per-turn Runner leaves when its result was accepted but
    * its suspend command never finished: the controller journal holds a pending
    * runner.suspend and the Runner's own receipt is still `ready`. */
-  async function seedUnsuspendedLocalOwner(runner: { pid: number; processStartedAt: Date }) {
-    const prior = await seedRecoveredPriorRun("pending-command");
+  async function seedUnsuspendedLocalOwner(runner: { pid: number; processStartedAt: Date }, lifecycle?: "warm", provider?: "pi_rpc") {
+    const prior = await seedRecoveredPriorRun(lifecycle === "warm" ? "pending-attach" : "pending-command", { lifecycle, provider });
     await db.update(heartbeatRuns).set({ processPid: runner.pid, processGroupId: runner.pid, processStartedAt: runner.processStartedAt })
       .where(eq(heartbeatRuns.id, prior.runId));
     const followUp = await admitFollowUp(prior);
@@ -964,6 +965,12 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const root = join(stateDirectory, copy!.split(".")[0]!);
     await rename(join(stateDirectory, "quarantine", copy!), root);
     await rm(join(stateDirectory, "quarantine"), { recursive: true, force: true });
+    if (lifecycle === "warm") {
+      const path = join(root, "control-plane", "control-plane-state.json");
+      const state = JSON.parse(await readFile(path, "utf8"));
+      state.commands = state.commands.filter((command: { type: string }) => command.type !== "run.attach");
+      await writeFile(path, JSON.stringify(state));
+    }
     await mkdir(join(root, "runner"), { recursive: true });
     await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify({
       schema: "paperclip.runner.durable.state.v1", lifecycle: "ready", ...prior.identity }));
@@ -1049,8 +1056,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).toContain("stopped before its runner received the session");
   }, 60_000);
 
-  it("retires a finished local owner whose Runner stopped before it proved suspension", async () => {
-    const { prior, followUp, root } = await seedUnsuspendedLocalOwner(await stoppedRunnerProcess());
+  it.each([undefined, "warm"] as const)("retires a finished %s local owner whose Runner stopped before it proved suspension", async lifecycle => {
+    const { prior, followUp, root } = await seedUnsuspendedLocalOwner(await stoppedRunnerProcess(), lifecycle);
     expect(await followUp.startLocal()).toBe(ADMITTED);
     expect(await quarantined()).toEqual([]);
     expect(existsSync(join(root, "runner"))).toBe(false);
@@ -1058,10 +1065,34 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).toContain(`Run ${prior.runId} finished without a saved runner checkpoint`);
   }, 60_000);
 
-  it("keeps a finished local owner held while its recorded Runner process is alive", async () => {
+  it.each(["settled", "unsettled journal", "foreign session", "advanced history"] as const)(
+    "revalidates a lost Pi owner's archived history before another admission (%s)", async scenario => {
+      const { prior, followUp, root } = await seedUnsuspendedLocalOwner(await stoppedRunnerProcess(), "warm", "pi_rpc");
+      const sessionFile = `${prior.native.normalizedSessionId}.jsonl`;
+      await mkdir(join(root, "pi"));
+      await writeFile(join(root, "pi", sessionFile), "private Pi history\n");
+      expect(await followUp.startLocal()).toBe(ADMITTED);
+      const [archive] = await readdir(join(root, "continuity-breaks"));
+      const path = join(root, "continuity-breaks", archive!, "control-plane", "control-plane-state.json");
+      if (scenario === "unsettled journal" || scenario === "foreign session") {
+        const state = JSON.parse(await readFile(path, "utf8"));
+        if (scenario === "unsettled journal") state.commands.find((command: { type: string }) => command.type === "turn.start").status = "pending";
+        else state.identity.normalizedSessionId = randomUUID();
+        await writeFile(path, JSON.stringify(state));
+      }
+      if (scenario === "advanced history") {
+        await mkdir(join(root, "pi"));
+        await writeFile(join(root, "pi", sessionFile), "advanced Pi history\n");
+      }
+      expect(await followUp.startLocal()).toBe(scenario === "settled" ? ADMITTED : "runner_state_identity_mismatch: durable_identity_unreadable");
+      const preservedRoot = scenario === "settled" ? root : join(stateDirectory, "quarantine", (await quarantined())[0]!);
+      expect(await readFile(join(preservedRoot, "continuity-breaks", archive!, "pi", sessionFile), "utf8")).toBe("private Pi history\n");
+    }, 60_000);
+
+  it.each([undefined, "warm"] as const)("keeps a finished %s local owner held while its recorded Runner process is alive", async lifecycle => {
     const runner = await runnerProcess();
     try {
-      const { followUp } = await seedUnsuspendedLocalOwner(runner);
+      const { followUp } = await seedUnsuspendedLocalOwner(runner, lifecycle);
       expect(await followUp.startLocal()).toBe(stranded("runner_process_alive"));
       expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
     } finally {
@@ -1088,10 +1119,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await archivedOwners(root)).toEqual([prior.runId]);
   }, 60_000);
 
-  it("keeps a stopped local owner held while a provider process from its run events is alive", async () => {
+  it.each([undefined, "warm"] as const)("keeps a stopped %s local owner held while a provider process from its run events is alive", async lifecycle => {
     const provider = await runnerProcess();
     try {
-      const { prior, followUp } = await seedUnsuspendedLocalOwner(await stoppedRunnerProcess());
+      const { prior, followUp } = await seedUnsuspendedLocalOwner(await stoppedRunnerProcess(), lifecycle);
       await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: prior.runId, seq: 901, eventType: "provider.event",
         stream: "system", payload: { prpEvent: { payload: { processId: provider.pid,
           processStartedAt: provider.processStartedAt.toISOString() } } } });
@@ -1101,8 +1132,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     }
   }, 60_000);
 
-  it("keeps a stopped local owner held by an unfinished non-lifecycle command", async () => {
-    const { followUp, root } = await seedUnsuspendedLocalOwner(await stoppedRunnerProcess());
+  it.each([undefined, "warm"] as const)("keeps a stopped %s local owner held by an unfinished non-lifecycle command", async lifecycle => {
+    const { followUp, root } = await seedUnsuspendedLocalOwner(await stoppedRunnerProcess(), lifecycle);
     const path = join(root, "control-plane", "control-plane-state.json");
     const state = JSON.parse(await readFile(path, "utf8"));
     state.commands.find((command: { type: string }) => command.type === "turn.start").status = "pending";

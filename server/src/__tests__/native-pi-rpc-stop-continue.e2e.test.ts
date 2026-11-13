@@ -19,6 +19,7 @@ import { respondToNativePiHello } from "./helpers/native-pi-hello-model.js";
 const enabled = process.env.PAPERCLIP_PI_FULL_SERVER_E2E === "1";
 const thinking = process.env.PAPERCLIP_PI_E2E_THINKING_LEVEL ?? "xhigh";
 const protocol = process.env.PAPERCLIP_PI_E2E_PROTOCOL ?? "messages";
+const loseIdleOwner = process.env.PAPERCLIP_PI_E2E_LOSE_IDLE_OWNER === "1";
 
 type Bundle = ReturnType<typeof import("../vendor/paperclip-runner/index.js").createRunnerdCodexTransport>;
 function piDescendant(runnerPid: number): number | null {
@@ -45,7 +46,7 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm turn, and later controller restart (thinking=${thinking})`, async () => {
+it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm turn, and later ${loseIdleOwner ? "lost owner" : "controller restart"} (thinking=${thinking})`, async () => {
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -386,8 +387,13 @@ it.skipIf(!enabled)(`Stop preserves Pi-only history on the same resident, warm t
     expect(alive(sleepPid)).toBe(false);
     expect(requests).toHaveLength(3);
     stage("replacement stays warm", { ...replacement, runId: settledWarm.id, nativeSessionId: settledWarm.nativeSessionId, reply: warmReply.body });
-    // Stop no longer retires a healthy resident. Still exercise the genuine
-    // cold-reopen boundary using the production controller-restart hook.
+    // Stop no longer retires a healthy resident. Exercise the genuine cold
+    // reopen boundary; the explicit lost-owner leg kills only our exact PID.
+    if (loseIdleOwner) {
+      process.kill(replacement.runnerPid!, "SIGKILL");
+      await waitFor("lost idle runner exited", async () => alive(replacement.runnerPid!) ? null : true);
+      stage("idle owner lost before close", { runnerPid: replacement.runnerPid, piAlive: alive(replacement.piPid!) });
+    }
     const { closeIdleWarmNativeSessionsForRestart } = await import("../services/native-runtime/native-session-executor.js");
     const closure = await closeIdleWarmNativeSessionsForRestart();
     expect(closure).toEqual({ closed: 1, busy: 0, failed: 0 });

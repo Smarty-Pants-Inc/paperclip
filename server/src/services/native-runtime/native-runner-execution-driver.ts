@@ -291,11 +291,19 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           let outbound: ReturnType<typeof connectRunnerPrpIngress> | null =
             null;
           let activation: Promise<void> | null = null;
+          let ingress = transport.ingress;
           let released = false;
+          const openRoute = (startupDeadlineMs?: number) => connectRunnerPrpIngress({
+            authority, endpoint: ingress, startupDeadlineMs,
+            onStateChange: (state, failureCode) => {
+              void input.onLog?.("stderr",
+                `[paperclip-runner] transport mode=provider_ingress state=${state}${failureCode ? ` failure=${failureCode}` : ""}\n`);
+            },
+          });
           const closeRoute = async () => {
             released = true;
             if (outbound) await outbound.close();
-            else await transport.ingress.close();
+            else await ingress.close();
           };
           input.sandboxRetention?.bindRoute({ quiesce: () => outbound?.quiesce(), close: closeRoute });
           return {
@@ -316,16 +324,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                     () => input.processStarted!,
                   );
                   if (released) return;
-                  outbound = connectRunnerPrpIngress({
-                    authority,
-                    endpoint: transport.ingress,
-                    onStateChange: (state, failureCode) => {
-                      void input.onLog?.(
-                        "stderr",
-                        `[paperclip-runner] transport mode=provider_ingress state=${state}${failureCode ? ` failure=${failureCode}` : ""}\n`,
-                      );
-                    },
-                  });
+                  outbound = openRoute();
                 },
                 { parentName: "runner.session.startup" },
               );
@@ -354,6 +353,53 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                 },
                 { parentName: "runner.session.startup" },
               );
+            },
+            ensureConnected: async ({ deadline, signal }) => {
+              const assertOpen = () => {
+                if (released || signal.aborted || Date.now() >= deadline) throw new Error("runner_ingress_reopen_cancelled");
+              };
+              assertOpen();
+              await activation;
+              assertOpen();
+              const count = authority.activeRunnerConnectionCount();
+              if (count === 1) return;
+              if (count !== 0) throw new Error("runner_ingress_owner_ambiguous");
+              // Refresh the existing authenticated capability. Never acquire a
+              // second allocation, change run identity, or launch a process.
+              const refreshed = await ingress.refresh();
+              if (refreshed.generation !== ingress.generation) {
+                await refreshed.close();
+                throw new Error("runner_ingress_owner_changed");
+              }
+              if (released || signal.aborted || Date.now() >= deadline) {
+                await refreshed.close();
+                throw new Error("runner_ingress_reopen_cancelled");
+              }
+              await outbound?.close();
+              if (released || signal.aborted || Date.now() >= deadline) {
+                await refreshed.close();
+                throw new Error("runner_ingress_reopen_cancelled");
+              }
+              ingress = refreshed;
+              const next = outbound = openRoute(Math.max(1, deadline - Date.now()));
+              let onAbort: (() => void) | undefined;
+              try {
+                await Promise.race([
+                  next.ready,
+                  new Promise<never>((_resolve, reject) => {
+                    onAbort = () => { next.quiesce(); reject(new Error("runner_ingress_reopen_cancelled")); };
+                    signal.addEventListener("abort", onAbort, { once: true });
+                    if (signal.aborted) onAbort();
+                  }),
+                ]);
+                assertOpen();
+                if (authority.activeRunnerConnectionCount() !== 1) throw new Error("runner_ingress_owner_ambiguous");
+              } catch (error) {
+                await next.close();
+                throw error;
+              } finally {
+                if (onAbort) signal.removeEventListener("abort", onAbort);
+              }
             },
             get failure() {
               return outbound?.failure;
