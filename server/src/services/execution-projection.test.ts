@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { projectExecution } from "./execution-projection.js";
+import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
 import { startTaskDrain, stopTaskDrain } from "./task-admission.js";
 import { resetStartupRecoveryStateForTests, setStartupRecoveryPhase } from "../startup-recovery-state.js";
 
@@ -144,10 +145,7 @@ describe("execution truth projection", () => {
     }, now).nextAction).toBe(action.nextAction);
   });
 
-  it.each([
-    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
-    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
-  ])("does not offer a message on a recovered run whose conversation was refused ($error)", values => {
+  const recoveredHold = (values: Partial<Run>) => {
     const sourceRunId = "ec036e06-90a3-4b69-81db-a8eab7dbfbac";
     const source = run({ id: sourceRunId, status: "failed", ...values } as Partial<Run>);
     const workspaceRecovery = { schema: "paperclip.workspace-recovery.v1", runId: sourceRunId,
@@ -157,12 +155,42 @@ describe("execution truth projection", () => {
       evidence: { runId: sourceRunId, continuationDelivery: "invalidated",
         automaticRecovery: { policy: "preserve_without_replay_v1", actionOutcome: "unknown", replay: "blocked" },
         workspaceRecovery: { ...workspaceRecovery, status } } });
+    return { source, action };
+  };
+  const ordinary = { errorCode: "native_continuation_requires_reconciliation", error: "Fixture failure" } as Partial<Run>;
+
+  it("shows the held conversation's notice on a recovered run instead of offering a message", () => {
+    const { source, action } = recoveredHold(ordinary);
+    const project = (held: boolean, status = "recovered") => projectExecution(source, coordinator({ phase: "terminal_failure" }),
+      [], action(status), now, undefined, false, undefined, false, held);
+    expect(project(true)).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"],
+      nextAction: HELD_PREDECESSOR_NOTICE });
+    // No standing notice (none, or superseded) and no refusal code: the ordinary wording.
+    expect(project(false).nextAction).toBe("Saved work recovered. Send a message to continue.");
+    // Files not yet recovered are not called kept.
+    expect(project(true, "recovering").nextAction).toBe("Recovering saved work…");
+  });
+
+  it.each([
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
+    { errorCode: "native_session_cleanup_quarantined", error: "Fixture failure" },
+    { errorCode: "adapter_failed", error: "runner_process_termination_unconfirmed" },
+    { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=true" },
+  ])("does not offer a message on a recovered run whose conversation was refused ($errorCode, $error)", values => {
+    const { source, action } = recoveredHold(values as Partial<Run>);
     const projected = projectExecution(source, coordinator({ phase: "terminal_failure" }), [], action("recovered"), now);
     expect(projected).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"] });
     expect(projected.nextAction).not.toMatch(/send a message to continue/i);
-    expect(projected.nextAction).toBe("Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.");
+    expect(projected.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
     // Files not yet recovered are not called kept.
     expect(projectExecution(source, undefined, [], action("recovering"), now).nextAction).toBe("Recovering saved work…");
+  });
+
+  it("keeps the ordinary recovered wording for the no-replay hold code alone", () => {
+    const { source, action } = recoveredHold(ordinary);
+    expect(projectExecution(source, coordinator({ phase: "terminal_failure" }), [], action("recovered"), now).nextAction)
+      .toBe("Saved work recovered. Send a message to continue.");
   });
 
   it("keeps cleanup quarantine visible without a coordinator or recovery row", () => {

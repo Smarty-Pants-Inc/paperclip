@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
-import { agentTaskSessions, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { agentTaskSessions, heartbeatRuns, issueComments, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
@@ -66,6 +66,72 @@ export async function writePiSessionHistoryLossNotice(db: Db,
   }, metadata: { version: 1, authorizationReason,
     sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
   return true;
+}
+
+/** authorizationReason prefix of the durable notice written when a
+ * conversation is held behind an unfinished predecessor; the normalized native
+ * session id follows it. */
+export const HELD_CONVERSATION_NOTICE_REASON_PREFIX = "native_prior_owner_held:";
+
+export type HeldConversationNotice = {
+  commentId: string;
+  issueId: string;
+  normalizedSessionId: string;
+  body: string;
+  createdAt: Date;
+};
+
+/**
+ * The newest held-conversation notice per issue, unless it is superseded: a
+ * LATER run (created after the notice) on the same issue AND the same native
+ * session that succeeded with a committed result. A success on another session
+ * (a fresh conversation for a new task) does not clear it. One set-based read
+ * for the whole batch.
+ */
+export async function readUnsupersededHeldConversationNotices(db: Db,
+  input: { companyId: string; issueIds: readonly string[] }): Promise<Map<string, HeldConversationNotice>> {
+  const notices = new Map<string, HeldConversationNotice>();
+  const issueIds = [...new Set(input.issueIds)];
+  if (!issueIds.length) return notices;
+  const reason = sql<string>`${issueComments.metadata}->>'authorizationReason'`;
+  const sessionOf = sql`substr(${reason}, ${HELD_CONVERSATION_NOTICE_REASON_PREFIX.length + 1})`;
+  const rows = await db.selectDistinctOn([issueComments.issueId], {
+    commentId: issueComments.id,
+    issueId: issueComments.issueId,
+    reason,
+    body: issueComments.body,
+    createdAt: issueComments.createdAt,
+    // Compared in SQL so the notice and run timestamps keep full precision.
+    superseded: sql<boolean>`exists (select 1 from ${heartbeatRuns} later
+      join ${nativeRunFinalizations} finalization on finalization.company_id = later.company_id
+        and finalization.run_id = later.id
+      where later.company_id = issue_comments.company_id
+        and later.native_issue_id = issue_comments.issue_id
+        and later.native_session_id::text = ${sessionOf}
+        and later.status = 'succeeded'
+        and finalization.phase = 'committed'
+        and later.created_at > issue_comments.created_at)`,
+  }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId),
+    inArray(issueComments.issueId, issueIds),
+    eq(issueComments.authorType, "system"),
+    isNull(issueComments.deletedAt),
+    sql`starts_with(${reason}, ${HELD_CONVERSATION_NOTICE_REASON_PREFIX})`,
+  )).orderBy(issueComments.issueId, desc(issueComments.createdAt), desc(issueComments.id));
+  for (const row of rows) {
+    const normalizedSessionId = row.reason.slice(HELD_CONVERSATION_NOTICE_REASON_PREFIX.length);
+    if (row.superseded || !normalizedSessionId) continue;
+    notices.set(row.issueId, { commentId: row.commentId, issueId: row.issueId, normalizedSessionId,
+      body: row.body, createdAt: row.createdAt });
+  }
+  return notices;
+}
+
+/** The issue's held-conversation notice that still stands, or null. */
+export async function readUnsupersededHeldConversationNotice(db: Db,
+  input: { companyId: string; issueId: string }): Promise<HeldConversationNotice | null> {
+  return (await readUnsupersededHeldConversationNotices(db, { companyId: input.companyId, issueIds: [input.issueId] }))
+    .get(input.issueId) ?? null;
 }
 
 /** Both typed history-loss receipts use one authority check, issue lock and

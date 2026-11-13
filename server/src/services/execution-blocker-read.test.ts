@@ -1,9 +1,11 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "./execution-blocker.js";
+import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
+import { writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("execution blocker PostgreSQL read projection", () => {
@@ -152,41 +154,81 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     },
   );
 
-  // A chat's saved files were recovered, but its native controller recovery
-  // refused the conversation. Another message is refused the same way, so the
-  // blocker must not offer one.
-  async function recoveredRefusal(patch: Partial<typeof heartbeatRuns.$inferInsert>) {
+  // A chat's saved files were recovered, but its conversation is held: a new
+  // message is refused the same way, so the blocker must not offer one.
+  async function recoveredRefusal(patch: Partial<typeof heartbeatRuns.$inferInsert>, status = "recovered") {
     const f = await fixture({ runtimeMode: "native", ...patch });
     await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.run.id));
     await db.update(issueRecoveryActions).set({ cause: "native_continuation_requires_reconciliation",
       nextAction: "The original sandbox is retained for workspace repair.",
       evidence: { runId: f.run.id, workspaceRestoreFailure: "restore_failed",
         workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [] },
-        workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId: f.run.id, status: "recovered",
+        workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId: f.run.id, status,
           stage: "saving_receipts", attempt: 1, requestIds: [] } } })
       .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     return f;
   }
-  const refused = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
+  const generic = "Saved work recovered. Send a message to continue.";
+  // The durable notice exactly as the executor writes it (noticeHeldUnfinishedPredecessor).
+  async function heldNotice(f: Awaited<ReturnType<typeof recoveredRefusal>>, sessionId: string) {
+    await db.transaction(tx => writePiSessionHistoryLossNotice(db, tx, { companyId: f.companyId, issueId: f.issueId,
+      runId: f.run.id, agentId: f.agentId, authorizationReason: `native_prior_owner_held:${sessionId}`,
+      body: HELD_PREDECESSOR_NOTICE }));
+  }
+  async function committedSuccess(f: Awaited<ReturnType<typeof recoveredRefusal>>, sessionId: string) {
+    const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId } }).returning();
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: later.id, phase: "committed" });
+  }
+  const ordinary = { errorCode: "native_continuation_requires_reconciliation", error: "Fixture failure" };
 
+  it("shows the held conversation's notice instead of offering a message", async () => {
+    const sessionId = randomUUID();
+    const f = await recoveredRefusal({ ...ordinary, nativeSessionId: sessionId });
+    expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).toBe(generic);
+    await heldNotice(f, sessionId);
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ runId: f.run.id, canContinue: false, workspaceRecovery: { status: "recovered" } });
+    expect(blocker!.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+    expect(blocker!.nextAction).not.toMatch(/send a message to continue/i);
+    // A success on another conversation (a new task) does not clear it.
+    await committedSuccess(f, randomUUID());
+    expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+    // A later committed success on the same conversation supersedes it.
+    await committedSuccess(f, sessionId);
+    expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).toBe(generic);
+  });
+
+  it("does not call files kept before they are recovered, even with a held notice", async () => {
+    const sessionId = randomUUID();
+    const f = await recoveredRefusal({ ...ordinary, nativeSessionId: sessionId }, "recovering");
+    await heldNotice(f, sessionId);
+    expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).toBe("Recovering saved work…");
+  });
+
+  // Runs saved before the held notice existed: the run's own refusal code.
   it.each([
     { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
     { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
     { errorCode: "adapter_failed", error: "native_controller_recovery_unsupported:metadata_format" },
-  ])("does not offer a message when the conversation was refused ($error)", async patch => {
+    { errorCode: "native_session_cleanup_quarantined", error: "Fixture failure" },
+    { errorCode: "adapter_failed", error: "runner_process_termination_unconfirmed" },
+    { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=true" },
+  ])("does not offer a message when the conversation was refused ($errorCode, $error)", async patch => {
     const f = await recoveredRefusal(patch);
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
     expect(blocker).toMatchObject({ runId: f.run.id, canRetry: false, canContinue: false,
       workspaceRecovery: { status: "recovered" } });
     expect(blocker!.nextAction).not.toMatch(/send a message to continue/i);
-    expect(blocker!.nextAction).toBe(refused);
+    expect(blocker!.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
   });
 
   it("keeps the ordinary recovered wording when the conversation was not refused", async () => {
-    const f = await recoveredRefusal({ errorCode: "native_continuation_requires_reconciliation", error: "Fixture failure" });
+    // The no-replay hold code alone is not a refusal.
+    const f = await recoveredRefusal(ordinary);
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
     expect(blocker).toMatchObject({ canRetry: false, canContinue: false, workspaceRecovery: { status: "recovered" } });
-    expect(blocker!.nextAction).toBe("Saved work recovered. Send a message to continue.");
+    expect(blocker!.nextAction).toBe(generic);
   });
 
   it.each([null, [], "scalar", 42, { issueId: 42, taskId: false }].map(context => ({ context })))("preserves decisions for malformed context $context", async ({ context }) => {

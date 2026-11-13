@@ -17,7 +17,9 @@ import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
-import { isNativeContinuationRefusal, NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
+import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
+import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
+import { readUnsupersededHeldConversationNotices } from "./native-runtime/pi-session-recovery-notice.js";
 import { readTaskDrain } from "./task-admission.js";
 import { getStartupRecoveryState } from "../startup-recovery-state.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
@@ -144,6 +146,13 @@ export async function executionProjectionsForRuns(
         )
         .orderBy(desc(issueRecoveryActions.updatedAt)))
     : [];
+  // A held conversation's durable notice is read once for the batch, only for
+  // tasks whose recovered files would otherwise offer another message.
+  const heldIssueIds = [...new Set(recovery.filter(row => row.status === "resolved" && row.evidence.automaticRecovery)
+    .map(row => row.issueId))];
+  const heldNotices = heldIssueIds.length
+    ? await read(() => readUnsupersededHeldConversationNotices(db, { companyId, issueIds: heldIssueIds }))
+    : new Map<string, unknown>();
   // A live controller is not evidence that an external agent accepted work.
   // Read each provider journal once for the batch, never once per task.
   const waitingByRun = new Map<string, WaitingExternalProvider>();
@@ -280,6 +289,7 @@ export async function executionProjectionsForRuns(
         settlingPredecessorKeys.has(run.id),
         setupByAgent.get(run.agentId),
         currentResponseWait(run),
+        !!issueId && heldNotices.has(issueId),
       ),
     );
   }
@@ -307,6 +317,7 @@ export function projectExecution(
   waitingForPredecessor = false,
   setupAgent?: { lifecycleState: string; lifecycleHolds: readonly string[]; retryRequired?: boolean },
   responseWaitCurrent = false,
+  heldConversationNotice = false,
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -342,10 +353,13 @@ export function projectExecution(
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
     const workspaceRecovery = workspaceRecoveryDisplay(recoveryAction.evidence, run.id);
-    // Recovered files do not mean the conversation can continue: a refused
-    // controller recovery refuses the next message the same way.
-    projection.nextAction = (workspaceRecovery?.status === "recovered" && isNativeContinuationRefusal(run)
-      ? NATIVE_CONTINUATION_REFUSED_ACTION : workspaceRecovery?.message)
+    // Recovered files do not mean the conversation can continue: a held
+    // conversation whose durable notice still stands (or, for runs from before
+    // that notice, a refusal code on the run) refuses the next message the
+    // same way.
+    projection.nextAction = (workspaceRecovery?.status === "recovered"
+      && (heldConversationNotice || isNativeContinuationRefusal(run))
+      ? HELD_PREDECESSOR_NOTICE : workspaceRecovery?.message)
       ?? recoveryAction.nextAction;
     const continuation = recoveryAction.evidence.explicitUserContinuation as
       { previousRunId?: unknown; runId?: unknown } | undefined;
