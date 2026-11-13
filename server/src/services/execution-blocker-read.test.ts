@@ -214,6 +214,11 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     { errorCode: "native_session_cleanup_quarantined", error: "Fixture failure" },
     { errorCode: "adapter_failed", error: "runner_process_termination_unconfirmed" },
     { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=true" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "runner_state_identity_mismatch: prior_owner_active" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "runner_state_identity_mismatch: prior_owner_scope_mismatch" },
+    { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate" },
+    { errorCode: "native_runner_warm_attachment_runner_exited", error: "Fixture failure" },
+    { errorCode: "adapter_failed", error: "native_runner_warm_attachment_runner_exited: runner process ended" },
   ])("does not offer a message when the conversation was refused ($errorCode, $error)", async patch => {
     const f = await recoveredRefusal(patch);
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
@@ -221,6 +226,39 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
       workspaceRecovery: { status: "recovered" } });
     expect(blocker!.nextAction).not.toMatch(/send a message to continue/i);
     expect(blocker!.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+  });
+
+  it("shows the notice text, without Retry, for a successor refused behind a succeeded owner that wrote no notice", async () => {
+    const sessionId = randomUUID();
+    const f = await recoveredRefusal({ errorCode: "native_continuation_requires_reconciliation",
+      error: "runner_state_identity_mismatch: prior_owner_active", nativeSessionId: sessionId });
+    // The prior owner on the same conversation committed a success before the successor was refused.
+    const [owner] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      runtimeMode: "native", nativeIssueId: f.issueId, nativeSessionId: sessionId, contextSnapshot: { issueId: f.issueId },
+      createdAt: new Date("2019-12-31T23:00:00Z"), finishedAt: new Date("2019-12-31T23:30:00Z") }).returning();
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: owner.id, phase: "committed" });
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ runId: f.run.id, canContinue: false, canRetry: false, workspaceRecovery: { status: "recovered" } });
+    expect(blocker!.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+    expect(blocker!.nextAction).not.toContain(EXECUTION_BLOCKER_PERSON_RETRY_ACTION);
+  });
+
+  it("does not offer Retry while a held conversation's notice still stands", async () => {
+    const sessionId = randomUUID();
+    // A failed run a person could otherwise retry.
+    const f = await fixture({ runtimeMode: "native", nativeSessionId: sessionId });
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.run.id));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true,
+      nextAction: `Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
+    await heldNotice(f, sessionId);
+    const held = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(held).toMatchObject({ canRetry: false, canContinue: false });
+    expect(held!.nextAction).toBe("Inspect the source run.");
+    expect(held!.nextAction).not.toContain(EXECUTION_BLOCKER_PERSON_RETRY_ACTION);
+    // A committed success on the same conversation supersedes the notice; Retry returns.
+    await committedSuccess(f, sessionId);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true,
+      nextAction: `Inspect the source run. ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
   });
 
   it("keeps the ordinary recovered wording when the conversation was not refused", async () => {

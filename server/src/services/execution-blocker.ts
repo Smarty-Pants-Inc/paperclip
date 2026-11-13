@@ -406,7 +406,12 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   // An intentional Stop keeps "send a new message" as its only continuation.
   const recoveredFailure = Boolean(restoreHold && run?.status === "failed" && !workspaceRepairRequired &&
     workspaceRecovery?.status === "recovered");
-  const canRetry = Boolean((!restoreHold || recoveredFailure) && run && conversation?.assigneeAgentId === run.agentId &&
+  // A held conversation's durable notice that no later committed success on
+  // its session superseded refuses a Retry the same way it refuses a message,
+  // so do not offer Retry (or tell a person to use it) while it stands.
+  const heldConversationNotice = await readUnsupersededHeldConversationNotice(db, { companyId, issueId });
+  const canRetry = Boolean(!heldConversationNotice && (!restoreHold || recoveredFailure) && run &&
+    conversation?.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
   const runError = run && canRetry && isPreDispatchReviewWait(run)
     ? "Waiting for review; this continuation never started."
@@ -461,7 +466,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   // when nothing here can continue it.
   const refusedRecoveredConversation = workspaceRecovery?.status === "recovered" && (
     (!eligibleContinuation && !canRetry && isNativeContinuationRefusal(run))
-    || await readUnsupersededHeldConversationNotice(db, { companyId, issueId }) !== null);
+    || heldConversationNotice !== null);
 
   return {
     recoveryActionId: action.id,

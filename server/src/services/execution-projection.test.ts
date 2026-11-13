@@ -177,6 +177,11 @@ describe("execution truth projection", () => {
     { errorCode: "native_session_cleanup_quarantined", error: "Fixture failure" },
     { errorCode: "adapter_failed", error: "runner_process_termination_unconfirmed" },
     { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=true" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "runner_state_identity_mismatch: prior_owner_active" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "runner_state_identity_mismatch: prior_owner_scope_mismatch" },
+    { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate" },
+    { errorCode: "native_runner_warm_attachment_runner_exited", error: "Fixture failure" },
+    { errorCode: "adapter_failed", error: "native_runner_warm_attachment_runner_exited: runner process ended" },
   ])("does not offer a message on a recovered run whose conversation was refused ($errorCode, $error)", values => {
     const { source, action } = recoveredHold(values as Partial<Run>);
     const projected = projectExecution(source, coordinator({ phase: "terminal_failure" }), [], action("recovered"), now);

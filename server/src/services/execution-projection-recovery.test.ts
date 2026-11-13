@@ -101,6 +101,41 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
       .toBe("Saved work recovered. Send a message to continue.");
   });
+  it("shows the notice text, without Retry, for a successor refused behind a succeeded owner that wrote no notice", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
+    const ownerId = randomUUID(), runId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Refused successor", issuePrefix: companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Owner", adapterType: "paperclip_runner" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Held conversation", assigneeAgentId: agentId });
+    // The prior owner succeeded and committed; its successor was refused as prior_owner_active, and no notice was written.
+    await db.insert(heartbeatRuns).values([
+      { id: ownerId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: sessionId, runtimeMode: "native",
+        status: "succeeded", createdAt: new Date("2026-11-13T10:00:00Z"), finishedAt: new Date("2026-11-13T10:00:30Z"),
+        contextSnapshot: { issueId } },
+      { id: runId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: sessionId, runtimeMode: "native",
+        status: "failed", createdAt: new Date("2026-11-13T10:01:00Z"), finishedAt: new Date("2026-11-13T10:01:05Z"),
+        errorCode: "native_continuation_requires_reconciliation", error: "runner_state_identity_mismatch: prior_owner_active",
+        contextSnapshot: { issueId } },
+    ]);
+    await db.insert(nativeRunFinalizations).values([
+      { companyId, issueId, runId: ownerId, phase: "committed" },
+      { companyId, issueId, runId, phase: "terminal_failure" },
+    ]);
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-workspace:${runId}`,
+      ownerType: "system", status: "resolved", outcome: "blocked", resolvedAt: new Date(),
+      nextAction: "The original sandbox is retained for workspace repair.",
+      evidence: { runId, continuationDelivery: "invalidated",
+        automaticRecovery: { replay: "blocked", actionOutcome: "unknown", policy: "preserve_without_replay_v1" },
+        workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId, status: "recovered",
+          stage: "saving_receipts", attempt: 1, attemptLimit: 6, retryable: true, requestIds: [] },
+      } });
+    const projected = (await executionProjectionsForRuns(db, companyId, [runId])).get(runId);
+    expect(projected).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"],
+      nextAction: HELD_PREDECESSOR_NOTICE });
+    expect(projected?.permittedActions).not.toContain("retry");
+  });
+
   it("advertises Stop for a failed native retry from the real batched coordinator read", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Pending native retry", issuePrefix: "PNR" });
