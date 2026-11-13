@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,7 +6,7 @@ import { RunnerdTraceFrameIndex } from "./runnerd-trace-frame-index.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const fs = await importOriginal<typeof import("node:fs")>();
-  return { ...fs, readSync: vi.fn(fs.readSync) };
+  return { ...fs, readSync: vi.fn(fs.readSync), statSync: vi.fn(fs.statSync) };
 });
 
 type PositionalRead = [fd: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null];
@@ -25,6 +25,7 @@ describe("runnerd trace frame index", () => {
     path = join(directory, "trace.ndjson");
     index = new RunnerdTraceFrameIndex();
     vi.mocked(readSync).mockClear();
+    vi.mocked(statSync).mockClear();
   });
   afterEach(() => {
     index.clear();
@@ -45,6 +46,64 @@ describe("runnerd trace frame index", () => {
     expect(index.locate(path, "missing")).toEqual({ frameId: null, nativeChannelSettled: true });
     expect(readSync).toHaveBeenCalledTimes(2);
     expect(readPosition(1)).toBe(Buffer.byteLength(first));
+  });
+
+  it("shares stat and index work across all retry lookups in a pump snapshot", () => {
+    writeFileSync(path, interpretation(1, "first"));
+    for (let pump = 0; pump < 12; pump++) {
+      index.withSnapshot(() => {
+        for (let pending = 0; pending < 4096; pending++) {
+          expect(index.locate(path, `pending-${pending}`).frameId).toBeNull();
+        }
+        expect(index.locate(path, "first").frameId).toBe(1);
+      });
+    }
+    expect(statSync).toHaveBeenCalledTimes(12);
+    expect(readSync).toHaveBeenCalledTimes(1);
+    appendFileSync(path, interpretation(2, "pending-1"));
+    index.withSnapshot(() => {
+      expect(index.locate(path, "pending-1").frameId).toBe(2);
+      expect(index.locate(path, "first").frameId).toBe(1);
+    });
+    expect(statSync).toHaveBeenCalledTimes(13);
+    expect(readSync).toHaveBeenCalledTimes(2);
+  });
+
+  it("caches missing-file failures only for the current snapshot", () => {
+    index.withSnapshot(() => {
+      for (let pending = 0; pending < 512; pending++) expect(() => index.locate(path, `pending-${pending}`)).toThrow();
+    });
+    expect(statSync).toHaveBeenCalledTimes(1);
+    writeFileSync(path, interpretation(9, "late"));
+    expect(index.withSnapshot(() => index.locate(path, "late").frameId)).toBe(9);
+    expect(statSync).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds reads per snapshot, not per pending entry, and keeps late suffix correlations", () => {
+    writeFileSync(path, interpretation(1, "same") + settled +
+      JSON.stringify({ kind: "frame", rawBase64: "x".repeat(2 * 1024 * 1024) }) + "\n" + interpretation(2, "same"));
+    for (let pass = 0; pass < 3; pass++) {
+      index.withSnapshot(() => {
+        for (let pending = 0; pending < 512; pending++) {
+          expect(index.locate(path, "same").frameId).toBe(pass === 2 ? 2 : null);
+        }
+      });
+    }
+    expect(statSync).toHaveBeenCalledTimes(3);
+    expect(readSync).toHaveBeenCalledTimes(3);
+  });
+
+  it("releases a snapshot after an exception and shares nested passes", () => {
+    writeFileSync(path, interpretation(1, "first"));
+    expect(() => index.withSnapshot(() => {
+      index.locate(path, "first");
+      index.withSnapshot(() => index.locate(path, "first"));
+      throw new Error("stop pass");
+    })).toThrow("stop pass");
+    expect(statSync).toHaveBeenCalledTimes(1);
+    appendFileSync(path, interpretation(2, "second"));
+    expect(index.locate(path, "second").frameId).toBe(2);
+    expect(statSync).toHaveBeenCalledTimes(2);
   });
 
   it("retains partial lines and split UTF-8 until the append is complete", () => {

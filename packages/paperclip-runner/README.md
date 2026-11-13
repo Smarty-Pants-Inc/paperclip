@@ -176,15 +176,26 @@ route/service authorities; it does not copy those rules into this package.
 
 ## Quick start
 
-Native provider debug-trace correlation uses an incremental index owned by its transport. Pending
-event lookups read only newly appended bytes, with a 1 MiB read budget per lookup;
-they retry until the observed suffix is indexed. Partial records remain pending,
-and trace replacement or truncation invalidates the index. Closing a transport
-clears its index. Other active transports cannot evict its progress. Records over
-64 KiB are skipped by the correlation index without buffering or parsing their
-full contents; the original trace file retains them. Do not restore a full
-synchronous trace scan for each pending event: it blocks event delivery and can
-leave the board showing an active run after the provider turn has already ended.
+Native provider debug-trace correlation uses an incremental index owned by its transport.
+All lookups in one event-pump pass share one file stat and at most a 1 MiB read
+of newly appended bytes, including missing-file results. The next pass refreshes
+the snapshot, so late frames and partial records can still resolve. Trace
+replacement or truncation invalidates the index. Other active transports cannot
+evict its progress. Records over 64 KiB are skipped by the correlation index
+without buffering or parsing their full contents; the original trace file retains
+them. Do not restore synchronous filesystem work for each pending event: it
+blocks event delivery and can leave the board showing an active run after the
+provider turn has already ended.
+
+Each interpretation stage holds at most 4,096 distinct pending records and retries
+at most 128 per pump pass in round-robin order. Exact pending duplicates for the
+same file and frame are coalesced; different driver interpretations of a frame
+remain separate. A correlation retires after 4,096 failed retries. This emits a
+`typescript_rehydration_retry_limit` diagnostic and marks the final trace status
+incomplete; it never fails the run or removes the raw trace. Close still attempts
+every remaining record before reporting incomplete correlations and clearing the
+queues and index. Once no work remains, the existing held-work retry timer stops.
+No extra timer or background worker is used.
 
 The package also builds `paperclip-runner-acpx-sidecar`. This bounded v2
 stdin/stdout bridge admits the pinned Claude, Codex, Grok and Cursor ACPX profiles.
