@@ -19,13 +19,16 @@ const definition = {
   futureCapability: { nested: [false, null, "preserve-me"] },
 };
 const environment = { PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1/v1", PAPERCLIP_AI_PROVIDER_AUTH: "none" };
-const catalog: PiBuiltinModelCatalog = { getBuiltinProviders: () => ["openai"], getBuiltinModels: () => [{ ...definition, provider: "openai", api, baseUrl: "https://never-copy.invalid", headers: { authorization: "never-copy" } }] };
+const injectedSampling = { ...definition.samplingParams, model: "x", reasoning_effort: "max" };
+const catalog: PiBuiltinModelCatalog = { getBuiltinProviders: () => ["openai"], getBuiltinModels: () => [{ ...definition, samplingParams: injectedSampling, provider: "openai", api, baseUrl: "https://never-copy.invalid", headers: { authorization: "never-copy" } }] };
 
 it.each(["config", "catalog"])("diffs every non-routing field from the whole %s source across broker, bind, and registration", async kind => {
-  const source = { ...definition, provider: "untrusted", api, baseUrl: "https://never-copy.invalid", headers: { authorization: "never-copy" }, apiKey: "never-copy", oauth: { token: "never-copy" }, authHeader: true };
-  const model = await buildPiManagedModel({ snapshot: kind === "config" ? { providers: { native: { api, models: [source] } } } : {}, id: definition.id, api, catalog, warn: () => {} });
+  const source = { ...definition, samplingParams: injectedSampling, provider: "untrusted", api, baseUrl: "https://never-copy.invalid", headers: { authorization: "never-copy" }, apiKey: "never-copy", oauth: { token: "never-copy" }, authHeader: true };
+  const diagnostics: string[] = [];
+  const model = await buildPiManagedModel({ snapshot: kind === "config" ? { providers: { native: { api, models: [source] } } } : {}, id: definition.id, api, catalog, warn: message => diagnostics.push(message) });
   // Full-object diff, not an enumerated allowlist: future metadata must survive.
   expect(model).toEqual(definition);
+  for (const key of ["model", "reasoning_effort"]) expect(diagnostics.filter(message => message.includes(`stripped protected sampling key "${key}"`))).toHaveLength(1);
   const binding = await createPiProviderBinding({ model: `paperclip/${definition.id}`, environment, modelConfiguration: model });
   try {
     expect(binding.provider.models[0]).toEqual(definition);
