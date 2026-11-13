@@ -950,6 +950,27 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   return closeIdleWarmNativeSessions(input);
 }
 
+/** Retire only the native owner of this lease before its provider can stop the
+ * allocation. A failed/busy close stays fenced and makes the stop retry; it
+ * must never leave a reusable handle to a stopped Runner in the warm map. */
+export async function closeWarmNativeSessionsForLease(input: {
+  companyId: string;
+  heartbeatRunId: string | null;
+  environmentId: string | null;
+  providerLeaseId: string | null;
+  reason: string;
+}): Promise<{ closed: number; busy: number; failed: number }> {
+  return closeIdleWarmNativeSessions({
+    reason: input.reason,
+    closeBusyOnRelease: true,
+    matches: entry => input.heartbeatRunId !== null && entry.companyId === input.companyId
+      && entry.runId === input.heartbeatRunId
+      && (input.environmentId === null || entry.environmentId === input.environmentId)
+      && ((entry.pluginTaskId ?? entry.sandboxProviderLeaseId ?? entry.ingressOwner?.ingress.providerLeaseId) === undefined
+        || (entry.pluginTaskId ?? entry.sandboxProviderLeaseId ?? entry.ingressOwner?.ingress.providerLeaseId) === input.providerLeaseId),
+  });
+}
+
 /** Detach released owners and checkpoint unreleased owners before a controller
  * exits. Active turns keep their separate authenticated restart handoff. */
 export async function closeIdleWarmNativeSessionsForRestart(): Promise<{
@@ -970,6 +991,7 @@ export async function prepareIdleWarmNativeSessionsForSleep(input: {
 
 async function closeIdleWarmNativeSessions(input: {
   environmentId?: string;
+  matches?: (entry: WarmNativeSession) => boolean;
   reason: string;
   closeBusyOnRelease?: boolean;
   detachReleased?: boolean;
@@ -980,7 +1002,8 @@ async function closeIdleWarmNativeSessions(input: {
   let failed = 0;
   for (const [sessionId, entry] of [...warmNativeSessions]) {
     if (input.canRetire && !input.canRetire()) break;
-    if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) {
+    if ((input.environmentId !== undefined && entry.environmentId !== input.environmentId)
+      || (input.matches && !input.matches(entry))) {
       continue;
     }
     if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)

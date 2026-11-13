@@ -1064,6 +1064,35 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect((await environmentService(db).getById(environment.id))?.config.reuseLease).toBe(false);
   });
 
+  it.each(["closed", "busy", "failed"] as const)("retires the exact warm owner before plugin stop dispatch: %s", async outcome => {
+    const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+    const executor = await import("../services/native-runtime/native-session-executor.js");
+    const order: string[] = [];
+    const retirement = vi.spyOn(executor, "closeWarmNativeSessionsForLease").mockImplementation(async input => {
+      expect(input).toMatchObject({ companyId: seeded.companyId, heartbeatRunId: seeded.runId,
+        environmentId: seeded.environment.id, providerLeaseId: seeded.reusableLease.providerLeaseId });
+      order.push("retire");
+      return { closed: outcome === "closed" ? 1 : 0, busy: outcome === "busy" ? 1 : 0, failed: outcome === "failed" ? 1 : 0 };
+    });
+    const call = vi.fn(async (_id: string, method: string) => {
+      expect(method).toBe("environmentStopLease");
+      expect(order).toEqual(["retire"]);
+      order.push("stop");
+      return { providerLeaseId: seeded.reusableLease.providerLeaseId, state: "stopped" };
+    });
+    const controlled = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentStopLease"] }),
+    } as unknown as PluginWorkerManager });
+    try {
+      await controlled.releaseRunLeases(seeded.runId, "released", undefined, "stop_and_retain", true);
+      expect(retirement).toHaveBeenCalledOnce();
+      expect(call).toHaveBeenCalledTimes(outcome === "closed" ? 1 : 0);
+      expect(await environmentService(db).getLeaseById(seeded.reusableLease.id)).toMatchObject({
+        status: outcome === "closed" ? "released" : "pending_cleanup",
+      });
+    } finally { retirement.mockRestore(); }
+  });
+
   it.each(["stopped", "missing", "wrong-lease", "error"])(
     "startup cancellation is run-scoped and needs a matching receipt: %s",
     async (outcome) => {

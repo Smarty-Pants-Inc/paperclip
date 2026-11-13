@@ -17821,6 +17821,117 @@ describe("runnerd provider runtime wiring", () => {
     } finally {owner.mockRestore();await rm(home,{recursive:true,force:true});}
   });
 
+  it.each([false, true])("does not reuse a cancelled released warm transport after recovery stop (stop=%s)", async stop => {
+    const tables = await import("@paperclipai/db");
+    const { eq } = await import("drizzle-orm");
+    const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+    const { prepareNativeHeartbeatRun } = await import("./prepare-native-run.js");
+    const { environmentRuntimeService } = await import("../environment-runtime.js");
+    const { prepareSandboxStopAndRetain, settleStopOnlyCleanup } = await import("../sandbox-stop-and-retain.js");
+    const providers = await import("../sandbox-provider-runtime.js");
+    const database = await startRecoveryPostgres("warm-stop-order-");
+    const db = tables.createDb(database.connectionString);
+    const previousHome = process.env.PAPERCLIP_HOME;
+    process.env.PAPERCLIP_HOME = isolatedStateDirectory;
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), environmentId = randomUUID();
+    const runId = randomUUID(), leaseId = randomUUID();
+    const current = scopedNativeExecution(`recovery-stop-${stop}`);
+    current.binding = { companyId, agentId, issueId, runId, executionWorkspaceId: runId };
+    current.session = { ...current.session, normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } };
+    const source = { runnerInstanceId: "stop-order-runner", environmentLeaseId: leaseId, runId,
+      normalizedSessionId: current.session.normalizedSessionId!, turnId: "settled-turn", itemId: "settled-item" };
+    const root = await initializeScopedRunnerRoot(current, source.runnerInstanceId);
+    await writeRunnerAuthority(root, source, "ready");
+    const home = join(isolatedStateDirectory, "stop-order-account");
+    await mkdir(home);
+    await writeFile(join(home, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "synthetic-fixture" }), { mode: 0o600 });
+    const task = vi.fn(async (input: unknown) => {
+      const operation = input as { kind: string };
+      return operation.kind === "status"
+        ? { kind: "status", taskId: "retained-allocation", phase: "completed", executionStopped: true }
+        : operation.kind === "stop" || operation.kind === "complete" ? { kind: "accepted", taskId: "retained-allocation" }
+        : { kind: "description", taskId: "retained-allocation", launchPreparationVersion: 1,
+          projectAuthCheckVersion: 1, warmTaskVersion: 1, releaseResumeVersion: 1,
+          runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } };
+    });
+    const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "fake", remoteCwd: ".", environmentId,
+      leaseId, runnerTask: task, sandboxLeaseAcquisition: { outcome: "resumed" as const, providerLeaseId: "retained-allocation" } };
+    const order: string[] = [];
+    const session = { release: vi.fn(async () => structuredClone(source)), close: vi.fn(async () => {
+      order.push("close");
+      // Model the controlled transport's retirement, not a live orphan Runner.
+      await rm(root, { recursive: true, force: true });
+    }), detachControllerForRestart: vi.fn(async () => {}) };
+    const validated = validatePrpStructuredRunResult({ schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Completed",
+      completionClaim: { contractRevision: current.completionContract.contract.revision, objectiveSatisfied: true, criteria: [], remainingWork: [] },
+      evidence: [], verification: [], artifacts: [], attentionRequests: [] });
+    if (!validated.ok) throw new Error("Invalid completion fixture");
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onCheckpoint?.({ backendKind: "runner", driverKind: current.session.driverKind, sessionId: "driver-session",
+        identity: { ...current.binding, sessionId: source.normalizedSessionId }, providerSessionId: "provider-session", activeTurnId: null, pendingRuntimeRequests: [] });
+      await options.onSession?.(session);
+      return { result: validated.result, terminal: { runTerminalState: "succeeded" }, turnId: source.turnId,
+        normalizedSessionId: source.normalizedSessionId, providerSessionId: "provider-session", driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    // The provider transport is controlled; Core's warm map, coordinator and leases use PostgreSQL.
+    const createOwner = pluginTaskRuntime.createPluginRunnerTaskOwner;
+    const owners = vi.spyOn(pluginTaskRuntime, "createPluginRunnerTaskOwner").mockImplementation(input => ({ ...createOwner(input), rebind: vi.fn() }));
+    const recovery = vi.spyOn(remoteWarmRecoveryRuntime, "inspectRemoteWarmSessionRecovery").mockResolvedValue(null);
+    const provider = providers.getSandboxProvider("fake")!;
+    const stopLease = vi.fn(async () => { order.push("stop"); return { providerLeaseId: target.sandboxLeaseAcquisition.providerLeaseId, state: "stopped" as const }; });
+    const providerLookup = vi.spyOn(providers, "getSandboxProvider").mockImplementation(key => key === "fake"
+      ? { ...provider, stopLease, configFromLeaseMetadata: () => ({ provider: "fake", image: "fixture", reuseLease: true }) } : null);
+    try {
+      await db.insert(tables.companies).values({ id: companyId, name: "Warm stop order", issuePrefix: "STOP" });
+      await db.insert(tables.agents).values({ id: agentId, companyId, name: "Warm stop agent" });
+      const [issue] = await db.insert(tables.issues).values({ id: issueId, companyId, title: "Stop then type", status: "in_progress", assigneeAgentId: agentId }).returning();
+      await db.insert(tables.environments).values({ id: environmentId, name: "Retained sandbox", driver: "sandbox", config: { provider: "fake", image: "fixture", reuseLease: true } });
+      const [run] = await db.insert(tables.heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId }).returning();
+      await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: leaseId });
+      await db.insert(tables.nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
+      await db.insert(tables.environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: runId, issueId,
+        provider: "fake", providerLeaseId: "retained-allocation", leasePolicy: "reuse_by_environment", metadata: { provider: "fake", image: "fixture", reuseLease: true } });
+      const runNative = (input: NativeExecutionInput) => executePaperclipNativeSession({ db, execution: input,
+        runnerInstanceId: source.runnerInstanceId, useRunnerd: true, runnerIngressAuthorized: true, runnerExecutionTarget: target,
+        managedAiCredentialHome: home, managedAiCredentialIdentity: "selected-revision", managedAiAccountIdentity: "selected-account" });
+      await runNative(current);
+      expect(session.release).toHaveBeenCalledOnce();
+      await db.update(tables.heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), runnerProfileJson: { nativeExecutionInput: current } }).where(eq(tables.heartbeatRuns.id, runId));
+      const runtime = environmentRuntimeService(db);
+      if (stop) {
+        // Same preparation/dispatch/settle seams as workspace-recovery after preservation.
+        const [lease] = await db.select().from(tables.environmentLeases).where(eq(tables.environmentLeases.id, leaseId));
+        const pending = await prepareSandboxStopAndRetain(db, lease);
+        expect(pending).not.toBeNull();
+        const [environment] = await db.select().from(tables.environments).where(eq(tables.environments.id, environmentId));
+        const receipt = await runtime.retryPendingSandboxTeardown({ environment: environment as never, lease: pending as never });
+        await settleStopOnlyCleanup(db, pending!, { attemptId: pending!.metadata!.pendingCleanupAttemptId as string, receipt });
+        expect(stopLease).toHaveBeenCalledOnce();
+        const [stopped] = await db.select().from(tables.environmentLeases).where(eq(tables.environmentLeases.id, leaseId));
+        expect(stopped).toMatchObject({ status: "released", metadata: { remoteExecutionTermination: { state: "stopped" } } });
+      }
+      const settledAt = Date.now();
+      const nextId = randomUUID();
+      const next = { ...current, binding: { ...current.binding, runId: nextId, executionWorkspaceId: nextId } };
+      const [nextRun] = await db.insert(tables.heartbeatRuns).values({ id: nextId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId }).returning();
+      expect(nextRun.createdAt.getTime() - settledAt).toBeLessThan(1000);
+      await prepareNativeHeartbeatRun({ db, run: nextRun, issue, environmentLeaseId: leaseId });
+      await db.insert(tables.nativeRunFinalizations).values({ runId: nextId, companyId, issueId, phase: "observed" });
+      // End at the provider boundary: opening a real provider is deliberately out of scope.
+      let observed: unknown = "not reached";
+      state.execute.mockImplementationOnce(async options => { observed = options.existingSession; throw new Error("fixture provider boundary reached"); });
+      const failure = await runNative(next).catch(error => error);
+      expect(observed, `Stop must retire the released transport; no Stop must retain ordinary warm reuse: ${inspect(failure)}`).toBe(stop ? undefined : session);
+      if (stop) expect(order).toEqual(["close", "stop"]);
+    } finally {
+      await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "fixture cleanup" });
+      providerLookup.mockRestore(); owners.mockRestore(); recovery.mockRestore();
+      await database.cleanup();
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+    }
+  }, 90_000);
+
   it.each((["codex", "claude"] as const).flatMap(provider => [
     ...[[false, false, false, false], [true, false, false, false], [false, true, false, false], [false, false, true, false], ...(provider === "codex" ? [[false, false, false, true]] : [])]
       .map(([unknown, shutdown, journalFailure, deadline]) => [provider, unknown, shutdown, journalFailure, deadline, "idle timeout"] as const),

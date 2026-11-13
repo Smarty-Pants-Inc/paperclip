@@ -1317,6 +1317,20 @@ function adaptDuplexChannelHostSession(
   };
 }
 
+/** The provider worker owns the box; the server owns the warm native map.
+ * Import the same server singleton used by native execution, not a provider RPC
+ * or a post-stop delivery notification. Await retirement before any stop I/O. */
+async function closeWarmNativeSessionsBeforeSandboxStop(lease: EnvironmentLease): Promise<void> {
+  if (!lease.heartbeatRunId) return;
+  const { closeWarmNativeSessionsForLease } = await import("./native-runtime/native-session-executor.js");
+  const retirement = await closeWarmNativeSessionsForLease({
+    companyId: lease.companyId, heartbeatRunId: lease.heartbeatRunId,
+    environmentId: lease.environmentId, providerLeaseId: lease.providerLeaseId,
+    reason: "sandbox lease is stopping",
+  });
+  if (retirement.busy || retirement.failed) throw new Error("Native warm session retirement is pending before sandbox stop.");
+}
+
 function createSandboxEnvironmentDriver(
   db: Db,
   options: {
@@ -2415,6 +2429,9 @@ function createSandboxEnvironmentDriver(
     },
 
     async releaseRunLease(input) {
+      // Ordinary provider release may also stop the box. keep_running never
+      // reaches this driver, so clean warm success/cancel retains its cache.
+      await closeWarmNativeSessionsBeforeSandboxStop(input.lease);
       if (input.status === "expired" && input.lease.leasePolicy === "reuse_by_environment") {
         return await destroyReusableSandboxLease({
           environment: input.environment,
@@ -2511,7 +2528,13 @@ function createSandboxEnvironmentDriver(
           throw new Error("Workspace export resume ownership changed before cleanup.");
         }
       };
-      if (exportResume) await assertExportResumeOwnership();
+      if (exportResume) {
+        await assertExportResumeOwnership();
+        // Shared by watchdog/recovery, export-resume, explicit stop, and retry:
+        // fence/close the cached transport before either built-in stopLease or
+        // plugin environmentStopLease can stop its allocation.
+        await closeWarmNativeSessionsBeforeSandboxStop(input.lease);
+      }
       // Resolve the teardown from the immutable orphan lease row, not from the
       // current environment. The row keeps the provider, the provider lease id,
       // and the sandbox config in its metadata. A provider change re-points the
