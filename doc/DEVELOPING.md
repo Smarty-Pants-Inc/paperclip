@@ -3772,6 +3772,24 @@ stop-only cleanup remains available; neither a retry deadline nor an exhausted
 retry budget authorizes deletion of the only workspace copy. This does not change
 successful warm-session retention or admit another provider turn.
 
+Remote runner directory copy-back verifies a regular-file count and total-byte
+inventory of the source against the local copy before reporting success. Both
+provider sync-out and the streamed tar fallback enforce this check, with the
+same exclusions as their transfer. The streamed fallback also checks tar's own
+exit status under POSIX shells, rather than accepting base64's pipeline status.
+Unreadable sources, a failed inventory, tar failures, or mismatched counts/bytes
+throw and leave destructive cleanup to retain the remote root. Streamed pulls
+verify the private extraction before replacing any previous durable checkpoint.
+The inventory is an immediate completeness check, not a persisted backup format
+or a content hash; existing saved checkpoints keep their current format.
+
+Run the focused, credential-free real-file regression as a non-root user (root
+bypasses the unreadable-file permission check):
+
+```sh
+pnpm exec vitest run server/src/services/native-runtime/remote-checkpoint-completeness.test.ts --maxWorkers=2
+```
+
 Run the credential-free real-process restart suite with:
 
 ```sh
