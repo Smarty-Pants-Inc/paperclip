@@ -11,6 +11,7 @@ const connectionReasons = {
   ai_connection_credential_not_shared: "The credential is not shared with the responsible user. Ask its owner for access or choose an authorized connection.",
 } as const;
 const reasons = {
+  provider_allocation_failed: "The provider allocation failed. Check the environment's provider capacity and quota, then retry.",
   harness_test_failed: "The execution test did not pass. Open Configuration and run the agent test to inspect the failed checks.",
   ai_connection_required: "This agent's environment requires a managed AI connection and an isolated Runner home. Check both in Configuration, then retry.",
   harness_auth_failed: "Authentication failed. Check the agent's AI connection or sign in to its execution tool, then retry.",
@@ -34,8 +35,8 @@ const configurationFailures = new Set([
 export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error: unknown): boolean {
   const code = lifecycleFailureCode(error) ?? "";
   return ["verifying", "resuming"].includes(context.phase ?? "") && context.stage === "host"
-    && (readAiConnectionConfigurationFailure(error) !== null || context.phase === "verifying"
-      && (configurationFailures.has(code) || (code === "harness_test_failed" && (context.verificationFailures ?? 0) >= 3)));
+    && (readAiConnectionConfigurationFailure(error) !== null || configurationFailures.has(code)
+      || (context.verificationFailures ?? 0) >= 3);
 }
 
 export function lifecycleFailureCode(error: unknown): string | undefined {
@@ -58,9 +59,12 @@ export function lifecycleFailureMessage(context: LifecycleFailure, error: unknow
     : ["save_plugins", "complete_host", "complete_plugin", "transition"].includes(context.stage)
       ? `${phase}: saving progress` : phase;
   const code = lifecycleFailureCode(error);
+  const retryRequired = lifecycleVerificationNeedsRetry(context, error);
   const reason = code && Object.hasOwn(connectionReasons, code) ? connectionReasons[code as keyof typeof connectionReasons]
     : code && Object.hasOwn(reasons, code) ? reasons[code as keyof typeof reasons]
-    : "Paperclip could not complete this step. It will retry automatically. If this continues, contact your instance administrator.";
-  return `${step} failed. ${reason}${lifecycleVerificationNeedsRetry(context, error)
+    : retryRequired ? `The host step failed (${code ?? "unclassified"}). Contact your instance administrator.`
+      : "Paperclip could not complete this step. It will retry automatically. If this continues, contact your instance administrator.";
+  const visibleReason = retryRequired ? reason.replace(/Paperclip will (?:retry|check again) automatically\.?/g, "").trim() : reason;
+  return `${step} failed. ${visibleReason}${retryRequired
     ? " Automatic verification is paused. Update Configuration or choose Retry now." : ""}`;
 }
