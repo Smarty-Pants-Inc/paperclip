@@ -967,6 +967,13 @@ export class PaperclipRunnerToolAuthority {
           sourcePlanApproval: await this.#sourcePlanApproval(context),
           childReviewOutcomes: await this.#readableChildReviewOutcomes(context.run),
           ...(this.binding.nativeReview ? {
+            attachmentManifest: (await issueService(this.db).listAttachments(context.issue.id)).map(attachment => ({
+              id: attachment.id,
+              originalFilename: attachment.originalFilename,
+              byteSize: attachment.byteSize,
+              sha256: attachment.sha256,
+              createdAt: attachment.createdAt,
+            })),
             assignedReview: (await getNativeReviewAssignment(this.db, {
               ...this.binding, contextSnapshot: this.binding.nativeReview,
               allowResolvedByRunId: this.binding.runId,

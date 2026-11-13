@@ -343,7 +343,12 @@ and the status decision. Retrying the transaction does not create another wake.
 The reviewer runs on the child task, even when the reviewer's own parent task
 is blocked on that child. The worker remains the child task's assignee. This
 review role gives access to the child context, history, and documents, plus
-`resolve_review`. It does not give access to ordinary task mutation tools.
+`resolve_review`. The authorized `get_task_context` response includes an
+`attachmentManifest` with each attachment's `id`, `originalFilename`, `byteSize`,
+stored `sha256`, and `createdAt`. This server-derived inventory identifies the
+stored bytes; it does not download them or establish their correctness. It does
+not expose storage keys or grant additional tools. The review role does not give
+access to ordinary task mutation tools.
 The usual company, invokability, budget, and workspace gates still apply.
 Human-only requests and governed actions do not acquire this review role.
 
