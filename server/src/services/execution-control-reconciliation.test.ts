@@ -150,7 +150,8 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     for (const state of ["successor", "reset", "done"] as const) {
       const f = await seedAbandonedRunFixture();
       if (state === "done") await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
-      else if (state === "reset") await db.update(issues).set({ conversationAgentId: f.agentId, conversationSessionGeneration: 2 }).where(eq(issues.id, f.issueId));
+      else if (state === "reset") await db.update(issues).set({ conversationAgentId: f.agentId,
+        conversationUserId: "deadline-reset-fixture", conversationState: "active", conversationSessionGeneration: 2 }).where(eq(issues.id, f.issueId));
       else {
         const successor = randomUUID();
         await db.insert(heartbeatRuns).values({ id: successor, companyId: f.companyId, agentId: f.agentId, status: "running" });
