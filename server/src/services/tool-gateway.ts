@@ -6,6 +6,8 @@ import { isToolApprovalConnectionError, toolApprovalConnectionRevision, toolAppr
   TOOL_APPROVAL_CONNECTION_MESSAGE, TOOL_APPROVAL_CONNECTION_REQUIRED } from "./tool-approval-connection.js";
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
 import { writeToolConnectionHealthChange } from "./tool-connection-health-notifications.js";
+import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
+import { publishLiveEvent } from "./live-events.js";
 import { writeApprovalChange } from "./approval-work-notifications.js";
 import { toolReviewProjectionService } from "./tool-review-projection.js";
 import { toolReviewInterruptionService } from "./tool-review-interruption.js";
@@ -6519,7 +6521,6 @@ export function createToolGatewayService(
       let response = await dispatchRemote(endpoint, requestInit);
       if (isInsufficientConnectionScope(response)) {
         await response.body?.cancel().catch(() => undefined);
-        await markCallHealth("degraded", INSUFFICIENT_CONNECTION_SCOPE_MESSAGE);
         throw new ToolGatewayHttpError(403, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE, "oauth_insufficient_scope", { connectionId: connection.id });
       }
       const oauth = asRecord(asRecord(connection.config)?.oauth);
@@ -6647,17 +6648,16 @@ export function createToolGatewayService(
           });
       execution.response.bodySizeBytes = Buffer.byteLength(body, "utf8");
       if (isInsufficientConnectionScope(response, body)) {
-        await markCallHealth("degraded", INSUFFICIENT_CONNECTION_SCOPE_MESSAGE);
         throw new ToolGatewayHttpError(403, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE, "oauth_insufficient_scope", {
           connectionId: connection.id, catalogEntryId: entry.id,
         });
       }
       if (!response.ok) {
-        // Session expiration is recoverable on an explicit retry. Marking the
-        // connection unhealthy here would hide every tool and prevent it.
-        if (response.status === 401 || response.status === 403) {
-          await markCallHealth("error", "Remote MCP server returned an HTTP error.");
-        }
+        // A tools/call denial (including 401/403) is not a connection health
+        // probe: it may be specific to this action, target, or credential grant.
+        // Fail this invocation without hiding every tool in subsequent runs.
+        // Explicit health checks and session-setup authentication still gate
+        // genuinely unavailable connections; never replay a failed action.
         throw new ToolGatewayHttpError(
           502,
           sessionExpired ? "Remote MCP session expired. Retry the action explicitly to start a new session." : "Remote MCP server returned an HTTP error",
@@ -9141,8 +9141,22 @@ export function createToolGatewayService(
       agentId: string;
       runId: string;
       permittedNotInstalledConnections: Array<{ id: string; name: string }>;
+      unavailableConnections?: Array<{ id: string; name: string; enabled: boolean; status: string; healthStatus: string }>;
+      assignmentChanged?: boolean;
+      deliveredServerCount?: number;
     }) {
-      if (input.permittedNotInstalledConnections.length === 0) return;
+      const unavailableConnections = input.unavailableConnections ?? [];
+      if (input.permittedNotInstalledConnections.length === 0 && unavailableConnections.length === 0 && !input.assignmentChanged) return;
+      const reasonCode = input.assignmentChanged ? "native_mcp_assignment_changed"
+        : unavailableConnections.length > 0 ? "assigned_connections_unavailable" : "permitted_connections_not_installed";
+      const details = {
+        decision: "diagnostic",
+        reasonCode,
+        deliveredServerCount: input.deliveredServerCount ?? 0,
+        permittedNotInstalledCount: input.permittedNotInstalledConnections.length,
+        permittedNotInstalledConnections: input.permittedNotInstalledConnections,
+        unavailableConnections,
+      };
       const [run] = await db
         .select({
           issueId: sql<
@@ -9161,19 +9175,27 @@ export function createToolGatewayService(
       await writeAudit({
         companyId: input.companyId,
         agentId: input.agentId,
-        runId: input.runId,
+        runId: run ? input.runId : null,
         issueId: run?.issueId ?? null,
         action: "tool_gateway.runtime_mcp_delivery",
-        details: {
-          decision: "diagnostic",
-          reasonCode: "permitted_connections_not_installed",
-          deliveredServerCount: 0,
-          permittedNotInstalledCount:
-            input.permittedNotInstalledConnections.length,
-          permittedNotInstalledConnections:
-            input.permittedNotInstalledConnections,
-        },
+        details,
       });
+      if (run) {
+        const message = input.assignmentChanged
+          ? "Assigned MCP tools changed during preparation; the gateway was not delivered. Start a new run to use the updated assignment."
+          : unavailableConnections.length > 0
+            ? `Installed MCP connections unavailable for this run: ${unavailableConnections.map(connection => `${connection.name} (status: ${connection.status}, health: ${connection.healthStatus}, enabled: ${connection.enabled})`).join("; ")}.`
+            : `Permitted MCP connections are not installed for this agent: ${input.permittedNotInstalledConnections.map(connection => connection.name).join(", ")}.`;
+        const { row } = await appendHeartbeatRunEvent(db, {
+          companyId: input.companyId, agentId: input.agentId, runId: input.runId,
+          eventType: "tool_gateway.runtime_mcp_delivery", stream: "system", level: "warn", message, payload: details,
+        });
+        publishLiveEvent({
+          companyId: input.companyId, type: "heartbeat.run.event",
+          payload: { runId: input.runId, agentId: input.agentId, issueId: run.issueId, seq: row.seq,
+            eventType: row.eventType, stream: row.stream, level: row.level, message: row.message, payload: row.payload },
+        });
+      }
     },
 
     async listNamedGateways(
