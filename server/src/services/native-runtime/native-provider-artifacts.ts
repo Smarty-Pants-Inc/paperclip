@@ -91,6 +91,7 @@ async function artifactOwnerFence(
     owner,
     await lockNativeRunnerCheckpointOwner(tx, owner),
     false,
+    { checkpointMaintenanceOnly: false },
   );
   const [run] = await tx
     .select({

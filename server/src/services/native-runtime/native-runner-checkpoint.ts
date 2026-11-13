@@ -89,6 +89,7 @@ export async function lockNativeRunnerCheckpointOwner(
 export async function validateNativeRunnerCheckpointOwner(
   tx: CheckpointTransaction, owner: NativeRunnerCheckpointFenceOwner,
   owned: Awaited<ReturnType<typeof lockNativeRunnerCheckpointOwner>>, newWork: boolean,
+  authorization: { checkpointMaintenanceOnly: boolean },
 ): Promise<void> {
   const current = owned;
   const activeOwner = owner.leaseOwner !== null && current.leaseOwner === owner.leaseOwner
@@ -113,10 +114,17 @@ export async function validateNativeRunnerCheckpointOwner(
             .where(eq(nativeRunFinalizations.runId, heartbeatRuns.id))))) : [];
     // A clean retained Stop has no semantic result by design. Its exact
     // controller epoch can still persist maintenance (auth, ACK, snapshots),
-    // never new work. The executor publishes this receipt only after Pi's
-    // cancellation/child cleanup and idle snapshot have all been proved.
+    // never new work or semantic publication. Only the checkpoint writer opts
+    // in; result, session and artifact callers retain the no-result fence.
+    // Any task successor revokes this idle exception (even on the same runner).
+    // It must register its own writer under the successor's verified fence;
+    // generic same-boot/preparing successors cannot revive the cancelled owner.
+    // The executor issues the receipt only after cancellation/child cleanup
+    // and the idle snapshot have all been proved.
     let retainedIdle = false;
-    if (!current.resultId && !newWork && owner.runId === owner.authorityRunId
+    if (authorization.checkpointMaintenanceOnly && !current.resultId && !newWork
+      && (!task?.executionRunId || task.executionRunId === owner.runId)
+      && owner.runId === owner.authorityRunId
       && current.leaseOwner === null && current.phase === "terminal_failure"
       && current.failureCode === "native_retry_cancelled" && current.recoveryState === null) {
       const [run] = await tx.select().from(heartbeatRuns).where(and(
@@ -135,9 +143,10 @@ export async function validateNativeRunnerCheckpointOwner(
   }
 }
 
-export async function assertNativeRunnerCheckpointOwner(tx: CheckpointTransaction, owner: NativeRunnerCheckpointOwner, newWork: boolean) {
+export async function assertNativeRunnerCheckpointOwner(tx: CheckpointTransaction, owner: NativeRunnerCheckpointOwner, newWork: boolean,
+  authorization: { checkpointMaintenanceOnly: boolean }) {
   const locked = await lockNativeRunnerCheckpointOwner(tx, owner);
-  await validateNativeRunnerCheckpointOwner(tx, owner, locked, newWork);
+  await validateNativeRunnerCheckpointOwner(tx, owner, locked, newWork, authorization);
 }
 
 export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpointOwner) {
@@ -151,7 +160,8 @@ export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpoi
         await measureNativeControllerStep("source_coordinator_locks", () => lockSourceRecoveryCoordinators(tx, owner.companyId, [owner.runId, owner.authorityRunId]));
         await assertNativeSourceCheckpointConsumer(tx, owner, checkpoint);
       }
-      await measureNativeControllerStep("runner_checkpoint_owner", () => assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id))));
+      await measureNativeControllerStep("runner_checkpoint_owner", () => assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id)),
+        { checkpointMaintenanceOnly: true }));
       if (checkpoint.reset || checkpoint.changedRecords.has("header") || checkpoint.removedRecords.includes("header")) {
         const [header] = await measureNativeControllerStep("runner_checkpoint_header_read", () => tx.select({ material: nativeRunnerCheckpoints.material }).from(nativeRunnerCheckpoints).where(and(
           eq(nativeRunnerCheckpoints.companyId, owner.companyId), eq(nativeRunnerCheckpoints.runId, owner.runId),
