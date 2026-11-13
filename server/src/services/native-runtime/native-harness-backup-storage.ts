@@ -166,7 +166,7 @@ async function fence(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], owner:
   const committed = owned.phase === "committed" && owned.resultId !== null && owned.leaseOwner === null;
   if (owner.leaseOwner === null && !committed) fail("owner_missing");
   if (task.executionRunId && task.executionRunId !== authorityRunId && !committed) fail("owner_superseded");
-  await validateNativeRunnerCheckpointOwner(tx, owner, owned, false);
+  await validateNativeRunnerCheckpointOwner(tx, owner, owned, false, { checkpointMaintenanceOnly: false });
   if (inactiveSource) {
     if (!committed || task.executionRunId || task.checkoutRunId) fail("prestage_source_active");
     const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
