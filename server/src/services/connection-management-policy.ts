@@ -17,6 +17,14 @@ export function isConnectionManagementAction(action: string): action is Connecti
   return Object.hasOwn(CONNECTION_MANAGEMENT_PERMISSIONS, action);
 }
 
+/** Assignment writes change only named recipients, not the shared resource or
+ * its other consumers. Keep the operation allowlist exact. */
+export function isToolAssignmentOperation(operation: string): boolean {
+  return operation === "PUT /tool-connections/:connectionId/installs"
+    || operation === "POST /companies/:companyId/tools/profiles/:profileId/bind"
+    || operation === "POST /companies/:companyId/tools/profiles/:profileId/unbind";
+}
+
 /** Values come from resolved database rows, never caller-selected identities. */
 export interface ConnectionManagementResource {
   type: "connection_management";

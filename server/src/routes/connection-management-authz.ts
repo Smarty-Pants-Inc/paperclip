@@ -7,7 +7,7 @@ import { type Db, toolConnections, toolApplications, toolProfiles, toolProfileEn
 import { badRequest, forbidden, notFound, HttpError } from "../errors.js";
 import { assertAuthenticated, assertCompanyAccess, hasCompanyAccess, getActorInfo } from "./authz.js";
 import { connectionManagementService, responsibleConnectionUser, type ConnectionManagementContext } from "../services/connection-management.js";
-import type { ConnectionManagementAction, ConnectionManagementResource } from "../services/connection-management-policy.js";
+import { isToolAssignmentOperation, type ConnectionManagementAction, type ConnectionManagementResource } from "../services/connection-management-policy.js";
 
 const contexts = new WeakMap<Request, ConnectionManagementContext>();
 export function connectionRequestContext(req: Request) { return contexts.get(req); }
@@ -116,6 +116,8 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
       const resource: ConnectionManagementResource = { type: "connection_management", companyId: companyId ?? "", purpose, operation,
         readOnly: req.method === "GET" && action !== "connections:gateway" && (action !== "connections:audit" || purpose === "chat") };
       const targets = new Set<string>();
+      const assignmentOnly = isToolAssignmentOperation(operation);
+      const replacesInstalls = operation === "PUT /tool-connections/:connectionId/installs";
       const extraResources: ConnectionManagementResource[] = [];
       const bindingTargets: { targetType: string; targetId: string }[] = [];
       const selectors: Record<string, unknown>[] = [];
@@ -248,8 +250,16 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         resource.selfServiceUserId = connection.createdByUserId;
         if (req.method !== "GET") {
           const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id));
-          addSelectors(installs);
-          if (operation === "PUT /tool-connections/:connectionId/installs" && Array.isArray(body.installs)) {
+          if (!replacesInstalls) addSelectors(installs);
+          if (replacesInstalls && Array.isArray(body.installs)) {
+            // PUT replaces the set, but retained recipients are not mutations.
+            // Recompute on every authorization, including writer revalidation.
+            const key = (row: { targetType: string; targetId: string }) => `${row.targetType}:${row.targetId}`;
+            const existing = new Set(installs.map(key)), requested = new Set(body.installs.map(key));
+            addSelectors([
+              ...installs.filter(row => !requested.has(key(row))),
+              ...body.installs.filter((row: { targetType: string; targetId: string }) => !existing.has(key(row))),
+            ]);
             const keys = (rows: Array<{ targetType: string; targetId: string }>) => new Set(rows.filter(row => row.targetType === "company").map(row => row.targetId));
             const existingCompanies = keys(installs), requestedCompanies = keys(body.installs);
             resource.requestedInstallCompanyIds = [...requestedCompanies];
@@ -273,7 +283,7 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         if (req.method !== "GET") {
           const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, profile.id));
           addSelectors(entries);
-          const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
+          const bindings = assignmentOnly ? [] : await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, profile.id));
           for (const binding of bindings) {
             if (binding.targetType === "agent") targets.add(binding.targetId);
             if (binding.targetType === "company") {
@@ -299,10 +309,10 @@ export function connectionManagementGuard(db: Db, purpose: "tool" | "chat" | "ai
         if (text(id)) targets.add(String(id));
       }
       if (body.targetType === "agent" && text(body.targetId)) targets.add(body.targetId);
-      for (const install of Array.isArray(body.installs) ? body.installs : []) {
+      for (const install of !replacesInstalls && Array.isArray(body.installs) ? body.installs : []) {
         if (install.targetType === "agent" && text(install.targetId)) targets.add(install.targetId);
       }
-      if ((operation.includes("ai-connection-pools") && req.method === "POST") || body.allAgents || body.access === "all_agents" || body.targetType === "company" || body.installs?.some?.((install: { targetType: string }) => install.targetType === "company")) {
+      if ((operation.includes("ai-connection-pools") && req.method === "POST") || body.allAgents || body.access === "all_agents" || body.targetType === "company" || (!replacesInstalls && body.installs?.some?.((install: { targetType: string }) => install.targetType === "company"))) {
         const companyAgents = await db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, companyId));
         companyAgents.forEach(agent => targets.add(agent.id));
       }

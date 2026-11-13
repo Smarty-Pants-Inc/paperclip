@@ -1,4 +1,5 @@
-import { assertAgentToolAssignmentInteractions } from "../../connection-management.js";
+import { assertAgentConnectionInstallAccess, assertAgentToolAssignmentInteractions } from "../../connection-management.js";
+import { lockAccountingCompany } from "../../accounting-transaction.js";
 import type { ConnectionManagementContext } from "../../connection-management.js";
 import { createConnectionProfileConfigurationReader } from "./connection-configuration.js";
 import { connectionActorUserId } from "../actor.js";
@@ -836,6 +837,11 @@ export function createToolProfileService(db: Db, now: () => Date) {
     ): Promise<ToolProfileBinding> => db.transaction(async tx => {
       await actor?.managementContext?.reauthorize();
       const db = tx as unknown as Db;
+      if (actor?.managementContext?.actor.type === "agent") {
+        const candidate = await getProfileRow(profileId, undefined, tx);
+        await lockAccountingCompany(db, candidate.companyId);
+        await actor.managementContext.reauthorize();
+      }
       const [profile] = await tx.select().from(toolProfiles).where(eq(toolProfiles.id, profileId)).for("no key update");
       if (!profile) throw notFound("Tool profile not found");
       await assertTargetExists(
@@ -844,9 +850,14 @@ export function createToolProfileService(db: Db, now: () => Date) {
         input.targetId,
         tx,
       );
-      if (input.targetType === "agent") await assertAgentToolAssignmentInteractions(db,
-        actor?.managementContext?.actor.type === "agent" ? actor.managementContext.actor.agentId : actor?.actorType === "agent" ? actor.actorId : null,
-        profile.companyId, [input.targetId]);
+      if (input.targetType === "agent") {
+        if (actor?.managementContext) {
+          await assertAgentConnectionInstallAccess(db, actor.managementContext.actor, profile.companyId, [input.targetId]);
+        } else {
+          await assertAgentToolAssignmentInteractions(db, actor?.actorType === "agent" ? actor.actorId : null,
+            profile.companyId, [input.targetId]);
+        }
+      }
 
       const [row] = await db
         .insert(toolProfileBindings)
@@ -876,6 +887,11 @@ export function createToolProfileService(db: Db, now: () => Date) {
     ): Promise<{ unbound: number }> => db.transaction(async tx => {
       await managementContext?.reauthorize();
       const db = tx as unknown as Db;
+      if (managementContext?.actor.type === "agent") {
+        const candidate = await getProfileRow(profileId, undefined, tx);
+        await lockAccountingCompany(db, candidate.companyId);
+        await managementContext.reauthorize();
+      }
       const [profile] = await tx.select().from(toolProfiles).where(eq(toolProfiles.id, profileId)).for("no key update");
       if (!profile) throw notFound("Tool profile not found");
       await assertTargetExists(
@@ -884,8 +900,13 @@ export function createToolProfileService(db: Db, now: () => Date) {
         input.targetId,
         tx,
       );
-      if (input.targetType === "agent") await assertAgentToolAssignmentInteractions(db,
-        managementContext?.actor.type === "agent" ? managementContext.actor.agentId : null, profile.companyId, [input.targetId]);
+      if (input.targetType === "agent") {
+        if (managementContext) {
+          await assertAgentConnectionInstallAccess(db, managementContext.actor, profile.companyId, [input.targetId]);
+        } else {
+          await assertAgentToolAssignmentInteractions(db, null, profile.companyId, [input.targetId]);
+        }
+      }
 
       const rows = await db
         .delete(toolProfileBindings)
