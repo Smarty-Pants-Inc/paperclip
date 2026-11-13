@@ -1,4 +1,5 @@
 import { readNativeCheckpointRetirement } from "./native-runner-checkpoint-retirement.js";
+import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { NATIVE_PREPARATION_FENCING_VERSION } from "./native-active-runs.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { and, eq, exists, gt, isNull, lte, inArray, notExists, or, sql } from "drizzle-orm";
@@ -75,8 +76,8 @@ export async function lockNativeRunnerCheckpointOwner(
   // wall time. Sampling in the locking SELECT can precede its lock wait.
   // Keep both steps in one statement without another database round trip.
   const locked = nativeRunnerCheckpointOwnerLock(tx, owner);
-  const [owned] = await tx.with(locked).select({ leaseOwner: locked.leaseOwner,
-    leaseExpiresAt: locked.leaseExpiresAt, resultId: locked.resultId, phase: locked.phase, now: sql<Date>`clock_timestamp()` }).from(locked);
+  const [owned] = await measureNativeControllerStep("coordinator_lock", () => tx.with(locked).select({ leaseOwner: locked.leaseOwner,
+    leaseExpiresAt: locked.leaseExpiresAt, resultId: locked.resultId, phase: locked.phase, now: sql<Date>`clock_timestamp()` }).from(locked));
   if (!owned) throw new Error("native_runner_checkpoint_owner_lost");
   return owned;
 }
@@ -123,16 +124,16 @@ export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpoi
   return async (checkpoint: DurablePrpCheckpoint): Promise<void> => {
     if (checkpoint.runId !== owner.runId) throw new Error("native_runner_checkpoint_binding_mismatch");
     const changed = encryptParts(owner, checkpoint.changedRecords);
-    await persistenceDb.transaction(async tx => {
+    await measureNativeControllerStep("runner_checkpoint_transaction", () => persistenceDb.transaction(async tx => {
       if (owner.runId !== owner.authorityRunId) {
-        await lockSourceRecoveryCoordinators(tx, owner.companyId, [owner.runId, owner.authorityRunId]);
+        await measureNativeControllerStep("source_coordinator_locks", () => lockSourceRecoveryCoordinators(tx, owner.companyId, [owner.runId, owner.authorityRunId]));
         await assertNativeSourceCheckpointConsumer(tx, owner, checkpoint);
       }
-      await assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id)));
+      await measureNativeControllerStep("runner_checkpoint_owner", () => assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id))));
       if (checkpoint.reset || checkpoint.changedRecords.has("header") || checkpoint.removedRecords.includes("header")) {
-        const [header] = await tx.select({ material: nativeRunnerCheckpoints.material }).from(nativeRunnerCheckpoints).where(and(
+        const [header] = await measureNativeControllerStep("runner_checkpoint_header_read", () => tx.select({ material: nativeRunnerCheckpoints.material }).from(nativeRunnerCheckpoints).where(and(
           eq(nativeRunnerCheckpoints.companyId, owner.companyId), eq(nativeRunnerCheckpoints.runId, owner.runId),
-          eq(nativeRunnerCheckpoints.part, "header"))).for("share").limit(1);
+          eq(nativeRunnerCheckpoints.part, "header"))).for("share").limit(1));
         if (header && readNativeCheckpointRetirement(header.material, owner)) throw new Error("native_runner_checkpoint_retired");
       }
       if (checkpoint.predecessor) {
@@ -142,16 +143,16 @@ export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpoi
           eq(heartbeatRuns.nativeSessionId, checkpoint.predecessor.normalizedSessionId)));
         if (!prior) throw new Error("native_runner_checkpoint_binding_mismatch");
       }
-      await notifyLiveRunRecovery(tx, { companyId: owner.companyId, runId: owner.runId });
+      await measureNativeControllerStep("recovery_notify", () => notifyLiveRunRecovery(tx, { companyId: owner.companyId, runId: owner.runId }));
       if (checkpoint.reset) await tx.delete(nativeRunnerCheckpoints).where(and(
         eq(nativeRunnerCheckpoints.companyId, owner.companyId), eq(nativeRunnerCheckpoints.runId, owner.runId)));
       else if (checkpoint.removedRecords.length) await tx.delete(nativeRunnerCheckpoints).where(and(
         eq(nativeRunnerCheckpoints.companyId, owner.companyId), eq(nativeRunnerCheckpoints.runId, owner.runId),
         inArray(nativeRunnerCheckpoints.part, [...checkpoint.removedRecords])));
-      if (changed.length) await tx.insert(nativeRunnerCheckpoints).values(changed)
+      if (changed.length) await measureNativeControllerStep("runner_checkpoint_write", () => tx.insert(nativeRunnerCheckpoints).values(changed)
         .onConflictDoUpdate({ target: [nativeRunnerCheckpoints.runId, nativeRunnerCheckpoints.part],
-          set: { material: sql`excluded.material`, updatedAt: sql`now()` } });
-    });
+          set: { material: sql`excluded.material`, updatedAt: sql`now()` } }));
+    }));
     previousWork = new Set(checkpoint.workCommandIds);
   };
 }
@@ -185,12 +186,12 @@ export async function registerNativeRunnerCheckpoint(input: {
 }): Promise<void> {
   const authorityRunId = typeof input.authorityRunId === "function"
     ? input.authorityRunId() : input.authorityRunId ?? input.binding.runId;
-  const [owner] = await input.db.select().from(nativeRunFinalizations).where(and(
+  const [owner] = await measureNativeControllerStep("finalization_owner_read", () => input.db.select().from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, input.binding.companyId),
     eq(nativeRunFinalizations.issueId, input.binding.issueId),
     eq(nativeRunFinalizations.runId, authorityRunId),
     eq(nativeRunFinalizations.controllerBootId, input.bootId),
-    gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`)));
+    gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`))));
   if (!owner?.leaseOwner) throw new Error("native_runner_checkpoint_owner_lost");
   let writers = authorities.get(input.authority);
   if (!writers) {
@@ -216,7 +217,7 @@ export async function registerNativeRunnerCheckpoint(input: {
       }
     } });
   }
-  await input.authority.flushCheckpoint();
+  await measureNativeControllerStep("runner_checkpoint_flush", () => input.authority.flushCheckpoint());
 }
 
 /** Exact-run bounded metadata read; never loads command/event payload records. */

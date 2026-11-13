@@ -1,4 +1,5 @@
 import { trace, SpanStatusCode, type Context, type Span } from "@opentelemetry/api";
+import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { getActiveStepContext, runWithRuntimeParent } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 
 const phases = new Set(["runner.transport.cold_start", "runner.transport.resume", "runner.transport.attach", "runner.transport.prepare",
@@ -7,6 +8,10 @@ const keys = new Set(["inputBytes", "toolSchemaBytes", "toolCount", "contextReus
 
 // Resolve the parent on every call: a retained transport belongs to several successive runs.
 export function measureRunnerOperation<T>(phase: string, work: () => Promise<T>, attributes?: Record<string, number | boolean>): Promise<T> {
+  return measureNativeControllerStep(phase.replace(/^runner\.transport\./, "transport_"), () => measureTracedRunnerOperation(phase, work, attributes));
+}
+
+function measureTracedRunnerOperation<T>(phase: string, work: () => Promise<T>, attributes?: Record<string, number | boolean>): Promise<T> {
   const parent = getActiveStepContext()?.parentContext;
   if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() || !parent || !phases.has(phase)) return work();
   let operation: Promise<T> | undefined;

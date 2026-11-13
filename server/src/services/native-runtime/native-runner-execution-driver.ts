@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import type { SandboxRunnerRetention } from "./sandbox-runner-retention.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { resolvePaperclipRunnerTransport, type PaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
@@ -46,7 +47,7 @@ async function measureNativeRunnerSpan<T>(
   fn: () => Promise<T>,
   options: { parentName?: string } = {},
 ): Promise<T> {
-  return trace ? trace.measure(name, fn, options) : fn();
+  return measureNativeControllerStep(name.replaceAll(".", "_"), () => trace ? trace.measure(name, fn, options) : fn());
 }
 
 /**
@@ -139,11 +140,11 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
         }
       : undefined,
     controlPlaneRegistration: async (authority, attachmentIdentity) => {
-      await input.beforeConnect?.(attachmentIdentity, authority);
+      await measureNativeControllerStep("before_connect", () => input.beforeConnect?.(attachmentIdentity, authority));
       if (input.controllerPersistence && input.binding.issueId) {
-        await nativeRunnerCheckpointRegistration({ ...input.controllerPersistence,
-          binding: { companyId: input.binding.companyId, issueId: input.binding.issueId, runId: input.binding.runId },
-        })(authority, attachmentIdentity);
+        await measureNativeControllerStep("checkpoint_registration", () => nativeRunnerCheckpointRegistration({ ...input.controllerPersistence!,
+          binding: { companyId: input.binding.companyId, issueId: input.binding.issueId!, runId: input.binding.runId },
+        })(authority, attachmentIdentity));
       }
       return measureNativeRunnerSpan(
         input.trace,
@@ -342,7 +343,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                 input.trace,
                 "runner.transport.ready",
                 async () => {
-                  await activation;
+                  await measureNativeControllerStep("ingress_activation", () => activation);
                   if (!outbound)
                     throw new Error("runner_ingress_unavailable");
                   await measureNativeRunnerSpan(
@@ -350,7 +351,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                     "runner.prp.authenticate",
                     () => outbound!.ready,
                   );
-                  await input.processIdentityReady;
+                  await measureNativeControllerStep("process_identity_ready", () => input.processIdentityReady);
                 },
                 { parentName: "runner.session.startup" },
               );
