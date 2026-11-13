@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { remoteCommandArgv } from "./remote-command-environment.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
@@ -1330,7 +1331,8 @@ export async function runSshCommand(
       "-p",
       String(config.port),
       `${config.username}@${config.host}`,
-      `sh -c ${shellQuote(remoteScript)}`,
+      // Apply the bootstrap policy before profiles too; a profile can run Node.
+      remoteCommandArgv(["sh", "-c", remoteScript]).map(shellQuote).join(" "),
     );
 
     return options.stdin != null
