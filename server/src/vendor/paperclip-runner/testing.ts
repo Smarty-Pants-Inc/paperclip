@@ -26,6 +26,9 @@ const sourceUrl = new URL(
 );
 const runnerTesting = await import(sourceUrl.href) as RunnerTestingModule;
 
+export const createPiEventProjector: RunnerTestingModule["createPiEventProjector"] =
+  runnerTesting.createPiEventProjector;
+
 export const prepareIsolatedCodexHome: RunnerTestingModule["prepareIsolatedCodexHome"] =
   runnerTesting.prepareIsolatedCodexHome;
 export const releaseMaterializedNativeRuntimeSkills: RunnerTestingModule["releaseMaterializedNativeRuntimeSkills"] =

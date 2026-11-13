@@ -481,10 +481,9 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
       }
     } else if (["compaction_start", "compaction_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"].includes(text(event.type))) {
       // Summarization can spend outside assistant-message receipts (native
-      // json.md:128-180). Do not claim complete accounting for an unqualified
-      // capability. The integrator may qualify its native receipt path later.
-      usageComplete = false; costComplete = false;
-      output.push(emit("item.completed", `${prefix}:pi-usage:unaccounted-summary`, { kind: "usage", usage: { source: "pi_summarization_unaccounted", total: { ...totals }, runDelta: { ...totals }, runDeltaComplete: false, costComplete: false, childUsage: "unknown" } }));
+      // json.md:128-180). Unknown summary spend does not invalidate measured
+      // assistant-message receipts. The summary itself remains unaccounted.
+      output.push(emit("item.completed", `${prefix}:pi-usage:unaccounted-summary`, { kind: "usage", usage: { source: "pi_summarization_unaccounted", total: { ...totals }, runDelta: {}, runDeltaComplete: false, costComplete: false, childUsage: "unknown", summaryUsage: "unknown" } }));
       if (event.type === "compaction_start" || event.type === "compaction_end") {
         // Match Codex's contextCompaction item lifecycle, retaining one identity
         // through the native start/end pair (including an end-only receipt).
