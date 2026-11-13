@@ -550,7 +550,7 @@ describe("agent test-environment route", () => {
     const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models")
       .query({ provider: "pi_rpc", agentId: "agent-1", refresh: String(refresh) });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(response.body).toEqual([{ id: "paperclip/nested/claude-opus-5-5", label: "Gateway Opus" }, { id: "paperclip/tenant/custom-model", label: "tenant/custom-model" }]);
+    expect(response.body).toEqual([{ id: "paperclip/nested/claude-opus-5-5", label: "Gateway Opus", thinkingCatalog: [] }, { id: "paperclip/tenant/custom-model", label: "tenant/custom-model", thinkingCatalog: [] }]);
     expect(response.body.every((row: Record<string, unknown>) => !Object.hasOwn(row, "thinkingLevels"))).toBe(true);
     expect(response.headers["cache-control"]).toBe("no-store");
     expect(mockSelectAiConnection).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ companyId: "company-1", agentId: "agent-1", runnerProvider: "pi_rpc", binding }));
@@ -573,10 +573,29 @@ describe("agent test-environment route", () => {
     const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models").query({ provider: "pi_rpc", agentId: "agent-1" });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
     expect(response.body).toEqual([
-      { id: "paperclip/reasoning-model", label: "reasoning-model", thinkingLevels: ["off", "minimal", "medium", "xhigh"] },
-      { id: "paperclip/nonreasoning-model", label: "nonreasoning-model", thinkingLevels: ["off"] },
-      { id: "paperclip/unknown-model", label: "unknown-model" },
+      { id: "paperclip/reasoning-model", label: "reasoning-model", thinkingLevels: ["off", "minimal", "medium", "xhigh"], thinkingCatalog: [] },
+      { id: "paperclip/nonreasoning-model", label: "nonreasoning-model", thinkingLevels: ["off"], thinkingCatalog: [] },
+      { id: "paperclip/unknown-model", label: "unknown-model", thinkingCatalog: [] },
     ]);
+  });
+  // The UI labels Auto by running the shared rule over these exact runtime catalog rows.
+  it("ships the runtime catalog rows the shared default-thinking rule matches", async () => {
+    const { PI_RPC_BUILTIN_THINKING_CATALOG } = await import("../vendor/paperclip-runner/index.js");
+    const { selectPiRpcThinkingLevel } = await import("@paperclipai/adapter-utils");
+    mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });
+    mockSelectAiConnection.mockResolvedValueOnce({ connection: { config: { ai: { provider: "openai", method: "api_key", routing: {
+      kind: "gateway", protocol: "responses", baseUrl: "https://gateway.example", auth: "bearer", models: [{ id: "gpt-5.5" }, { id: "not-a-model" }],
+    } } } } } as never);
+    const response = await request(await createApp()).get("/api/companies/company-1/adapters/paperclip_runner/models").query({ provider: "pi_rpc", agentId: "agent-1" });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const [known, unknown] = response.body as Array<{ id: string; thinkingCatalog: Array<{ id: string; provider?: string; reasoning: boolean }> }>;
+    expect(known.id).toBe("paperclip/gpt-5.5");
+    expect(known.thinkingCatalog.length).toBeGreaterThan(0);
+    expect(known.thinkingCatalog.every(row => row.id === "gpt-5.5" && Object.keys(row).every(key => ["id", "provider", "reasoning", "thinkingLevelMap"].includes(key)))).toBe(true);
+    expect(selectPiRpcThinkingLevel(undefined, known.id, undefined, known.thinkingCatalog))
+      .toEqual(selectPiRpcThinkingLevel(undefined, known.id, undefined, PI_RPC_BUILTIN_THINKING_CATALOG));
+    expect(selectPiRpcThinkingLevel(undefined, known.id, undefined, known.thinkingCatalog)).toEqual({ level: "xhigh" });
+    expect(unknown).toMatchObject({ id: "paperclip/not-a-model", thinkingCatalog: [] });
   });
   it("does not borrow Codex models when the selected Pi connection has no catalog", async () => {
     mockAgentService.getById.mockResolvedValue({ id: "agent-1", companyId: "company-1" });

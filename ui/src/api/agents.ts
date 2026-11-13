@@ -53,6 +53,8 @@ export interface AdapterModel {
   id: string;
   label: string;
   thinkingLevels?: string[];
+  /** Native Pi: runtime catalog rows for the shared default-thinking rule. */
+  thinkingCatalog?: import("@paperclipai/adapter-utils").PiThinkingCatalogModel[];
   family?: string;
 }
 

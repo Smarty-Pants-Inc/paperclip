@@ -298,6 +298,10 @@ export interface AdapterExecutionContext {
 export interface AdapterModel {
   /** Omitted unless the source model catalog declares native reasoning levels. */
   thinkingLevels?: string[];
+  /** Native Pi only: the runtime catalog rows that the shared default-thinking
+   * rule (selectPiRpcThinkingLevel) matches for this ID. Empty when the
+   * catalog does not know the model. */
+  thinkingCatalog?: import("./pi-rpc-default-thinking.js").PiThinkingCatalogModel[];
   family?: string;
   id: string;
   label: string;

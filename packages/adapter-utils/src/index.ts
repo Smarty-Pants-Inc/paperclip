@@ -133,6 +133,13 @@ export {
   PAPERCLIP_RUNNER_PI_RPC_THINKING_LEVELS,
   type PaperclipRunnerPiRpcThinkingLevel,
 } from "./paperclip-runner-permissions.js";
+// Pure, import-free selection rule (browser-safe); the Pi catalog stays runtime-owned.
+export {
+  selectPiRpcThinkingLevel,
+  piThinkingCatalogMatches,
+  type PiThinkingCatalogModel,
+  type PiRpcThinkingSelection,
+} from "./pi-rpc-default-thinking.js";
 export {
   PAPERCLIP_RUNNER_INGRESS_PORT,
   PAPERCLIP_RUNNER_CONNECT_PATH_PREFIX,

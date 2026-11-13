@@ -1,4 +1,4 @@
-import { PI_THINKING_LEVELS } from "../vendor/paperclip-runner/index.js";
+import { PI_RPC_BUILTIN_THINKING_CATALOG, PI_THINKING_LEVELS } from "../vendor/paperclip-runner/index.js";
 import { assertLoginEnvironmentTarget } from "../services/login-environment.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
@@ -57,7 +57,7 @@ import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSki
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { canRetryStoppedRun } from "../services/cancelled-native-startup.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "../services/native-runtime/native-review-participant.js";
-import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider, PAPERCLIP_RUNNER_ACPX_PROFILES } from "@paperclipai/adapter-utils";
+import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider, PAPERCLIP_RUNNER_ACPX_PROFILES, piThinkingCatalogMatches } from "@paperclipai/adapter-utils";
 import { applyMcpReasoningEffort } from "../services/public-mcp/agent-config.js";
 import { executionProjectionForRun, executionProjectionsForRuns } from "../services/execution-projection.js";
 import { issueRunPresenceService } from "../services/issue-run-presence.js";
@@ -3141,10 +3141,19 @@ export function agentRoutes(
       // Pi 1.5.2 docs/rpc-commands.md get_available_thinking_levels is per selected
       // runtime model (off-only for nonreasoning). Preserve an explicitly supplied
       // catalog capability, but an id/label-only connection does not prove any level.
-      res.json((routing?.models ?? []).map(model => ({
-        id: aiRoutingModel(routing!, "pi_runtime", model.id), label: model.label ?? model.id,
-        ...(model.thinkingLevels === undefined ? {} : { thinkingLevels: model.thinkingLevels.filter(level => PI_THINKING_LEVELS.includes(level as typeof PI_THINKING_LEVELS[number])) }),
-      })));
+      // Ship the runtime catalog rows the shared default rule matches, so the UI
+      // runs selectPiRpcThinkingLevel itself to label Auto (smarty: auto-effort-label).
+      res.json((routing?.models ?? []).map(model => {
+        const id = aiRoutingModel(routing!, "pi_runtime", model.id);
+        return {
+          id, label: model.label ?? model.id,
+          ...(model.thinkingLevels === undefined ? {} : { thinkingLevels: model.thinkingLevels.filter(level => PI_THINKING_LEVELS.includes(level as typeof PI_THINKING_LEVELS[number])) }),
+          thinkingCatalog: piThinkingCatalogMatches(id, PI_RPC_BUILTIN_THINKING_CATALOG).map(row => ({
+            id: row.id, ...(row.provider === undefined ? {} : { provider: row.provider }), reasoning: row.reasoning,
+            ...(row.thinkingLevelMap === undefined ? {} : { thinkingLevelMap: row.thinkingLevelMap }),
+          })),
+        };
+      }));
       return;
     }
     if (type === "paperclip_runner" && provider === "acpx" && req.query.acpxAgent === "kimi") {

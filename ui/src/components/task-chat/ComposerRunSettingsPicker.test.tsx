@@ -11,6 +11,7 @@ import { ComposerRunSettingsPicker } from "./ComposerRunSettingsPicker";
 import type { ComposerRunSettings } from "./composer-run-settings";
 import { getLastComposerEffort, rememberComposerEffort } from "@/lib/recent-composer-effort";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { GPT_5_5_THINKING_CATALOG } from "@/lib/pi-rpc-thinking-catalog.fixture";
 
 const agent = {
   id: "a1", companyId: "company-1", name: "Clippy",
@@ -85,6 +86,30 @@ describe("composer assignee picker", () => {
     expect(manual.disabled).toBe(false);
     await act(async () => manual.click());
     expect(changed).toHaveBeenLastCalledWith({ model: "paperclip/manual/nested", effort: "max", fast: false });
+  });
+
+  it.each([false, true])("labels unset native Pi thinking with the runtime default, explicit levels unchanged, unknown models plain (mobile: %s)", async mobile => {
+    const pi = (adapterConfig: Record<string, unknown>) => ({ ...agent, adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/gpt-5.5", ...adapterConfig } } as Agent);
+    const rows = [
+      { id: "paperclip/gpt-5.5", label: "GPT 5.5", thinkingCatalog: GPT_5_5_THINKING_CATALOG },
+      { id: "paperclip/not-a-model", label: "Unknown", thinkingCatalog: [] },
+    ];
+    const label = async (piAgent: Agent, settings: ComposerRunSettings) => {
+      render(vi.fn(), vi.fn(), false, { mobile, settings, agents: new Map([[agent.id, piAgent]]), modelOptionsOverride: rows });
+      await click("Select model and effort");
+      const text = document.querySelector('[data-testid="selected-effort"]')?.textContent;
+      const valueText = document.querySelector('[aria-label="Thinking"]')?.getAttribute("aria-valuetext");
+      flushSync(() => root?.unmount());
+      root = null;
+      container?.remove();
+      container = null;
+      expect(valueText).toBe(text);
+      return text;
+    };
+    expect(await label(pi({}), { model: null, effort: null, fast: false })).toBe("Auto (Extra High)");
+    expect(await label(pi({}), { model: null, effort: "high", fast: false })).toBe("High");
+    expect(await label(pi({ piRpcThinkingLevel: "low" }), { model: null, effort: null, fast: false })).toBe("Auto (Low)");
+    expect(await label(pi({}), { model: "paperclip/not-a-model", effort: null, fast: false })).toBe("Default");
   });
 
   it("scopes native Pi requests and cached rows to each agent, connection and environment", async () => {

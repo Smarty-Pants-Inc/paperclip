@@ -14,6 +14,7 @@ import { buildCodexRunnerConfig } from "./config-fields";
 import { buildPaperclipRunnerConfig } from "@paperclipai/adapter-codex-local/ui";
 import { defaultCreateValues } from "@/components/agent-config-defaults";
 import { resolveCodexLocalCliPolicy } from "@paperclipai/adapter-codex-local";
+import { GPT_5_5_THINKING_CATALOG } from "@/lib/pi-rpc-thinking-catalog.fixture";
 
 beforeAll(() => { Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); });
 
@@ -143,6 +144,29 @@ describe("Paperclip Runner Codex configuration", () => {
       models={[{ id: "paperclip/claude-custom", label: "Claude", thinkingLevels }]} hideInstructionsFile /></TooltipProvider>, undefined, container => {
       const field = container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]')!;
       expect([...field.options].map(option => option.value)).toEqual(["", ...thinkingLevels]);
+    });
+  });
+  it.each([
+    ["unset, catalog-known model", "paperclip/gpt-5.5", undefined, GPT_5_5_THINKING_CATALOG, "", "Auto (Extra High)"],
+    ["set, catalog-known model", "paperclip/gpt-5.5", "high", GPT_5_5_THINKING_CATALOG, "high", "High"],
+    ["unset, unknown model", "paperclip/not-a-model", undefined, [], "", "Auto"],
+  ] as const)("labels native Pi Auto with the runtime default (%s)", async (_case, model, piRpcThinkingLevel, thinkingCatalog, value, selectedText) => {
+    await renderMarkup(<TooltipProvider><CodexLocalConfigFields mode="edit" isCreate={false} adapterType="paperclip_runner" values={null} set={null}
+      config={{ provider: "pi_rpc", model, ...(piRpcThinkingLevel ? { piRpcThinkingLevel } : {}) }}
+      eff={(_group, _field, original) => original} mark={() => undefined}
+      models={[{ id: model, label: "Pi model", thinkingCatalog: [...thinkingCatalog] }]} hideInstructionsFile /></TooltipProvider>, undefined, container => {
+      const field = container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]')!;
+      expect(field.value).toBe(value);
+      expect(field.selectedOptions[0]?.textContent).toBe(selectedText);
+      expect(field.options[0]?.textContent).toBe(model === "paperclip/gpt-5.5" ? "Auto (Extra High)" : "Auto");
+    });
+  });
+  it("caps the native Pi Auto label with the agent's saved thinkingLevelMap", async () => {
+    await renderMarkup(<TooltipProvider><CodexLocalConfigFields mode="edit" isCreate={false} adapterType="paperclip_runner" values={null} set={null}
+      config={{ provider: "pi_rpc", model: "paperclip/gpt-5.5", thinkingLevelMap: { xhigh: null } }}
+      eff={(_group, _field, original) => original} mark={() => undefined}
+      models={[{ id: "paperclip/gpt-5.5", label: "GPT", thinkingCatalog: GPT_5_5_THINKING_CATALOG }]} hideInstructionsFile /></TooltipProvider>, undefined, container => {
+      expect(container.querySelector<HTMLSelectElement>('[aria-label="Pi thinking level"]')!.options[0]?.textContent).toBe("Auto (High)");
     });
   });
   it.each(["", "--sandbox,read-only"])("shows actual automatic Legacy policy and preserves the explicit toggle (%s)", async (extraArgs) => {

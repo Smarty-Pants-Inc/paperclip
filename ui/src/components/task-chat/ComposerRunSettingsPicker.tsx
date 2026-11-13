@@ -1,13 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, Check, ChevronDown, Plus, RotateCcw, Search, X, Zap } from "lucide-react";
-import { aiRuntimeConnectionBindingSchema, agentHarnessType, PI_RPC_PROVIDER, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
+import { aiRuntimeConnectionBindingSchema, agentHarnessType, PI_RPC_PROVIDER, PI_RPC_THINKING_LEVEL_KEY, type Agent, type IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 import { agentsApi, type AdapterModel } from "@/api/agents";
 import { queryKeys } from "@/lib/queryKeys";
 import { ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS, nativeTaskModelCatalogOptions } from "@/lib/native-model-catalog";
 import { cn } from "@/lib/utils";
 import { useMobileEntityPickerViewportStyle } from "@/hooks/useMobileEntityPickerViewportStyle";
 import { getLastComposerEffort, rememberComposerEffort } from "@/lib/recent-composer-effort";
+import { piRpcAutoThinkingLabel, piRpcResolvedThinkingLevel } from "@/lib/pi-rpc-thinking";
 import type { InlineEntityOption } from "@/components/InlineEntitySelector";
 import { Dialog, DialogClose, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -149,7 +150,11 @@ export function ComposerRunSettingsPicker({
   const choices = composerEfforts(agent, model, models);
   const effort = selected.effort && choices.includes(selected.effort) ? selected.effort : null;
   const effortIndex = effort ? choices.indexOf(effort) + 1 : 0;
-  const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : "Default";
+  // Native Pi: unset runs at the agent's level or, without one, the runtime's shared default.
+  const autoLevel = !effort && provider === PI_RPC_PROVIDER && agent
+    ? piRpcResolvedThinkingLevel(model, models.find(item => item.id === model), agent.adapterConfig[PI_RPC_THINKING_LEVEL_KEY], agent.adapterConfig.thinkingLevelMap)
+    : undefined;
+  const effortLabel = effort ? EFFORT_LABELS[effort] ?? effort : piRpcAutoThinkingLabel(autoLevel, "Default");
   const fastAvailable = composerFastAvailable(agent, model);
   const effortChoicesKey = choices.join(",");
   useEffect(() => {

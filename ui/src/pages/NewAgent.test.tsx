@@ -2,6 +2,7 @@
 import { act } from "react";
 import { PAPERCLIP_RUNNER_ACPX_PROFILES } from "@paperclipai/adapter-utils";
 import { describe, expect, it, vi } from "vitest";
+import { GPT_5_5_THINKING_CATALOG } from "@/lib/pi-rpc-thinking-catalog.fixture";
 import { queryKeys } from "@/lib/queryKeys";
 import { ApiError } from "@/api/client";
 import {
@@ -1474,6 +1475,31 @@ describe("New agent setup", () => {
     expect((container.querySelector('[aria-label="Model"]') as HTMLInputElement).value).toBe("paperclip/gpt-private/nested");
     expect(container.querySelector<HTMLSelectElement>('[aria-label="Thinking effort"]')?.value).toBe("max");
     expect(api.adapterModels).toHaveBeenCalledWith("company-1", "paperclip_runner", expect.objectContaining({ provider: "pi_rpc" }));
+  });
+
+  it("labels native Pi Auto thinking with the runtime default for the chosen model", async () => {
+    settings.getExperimental.mockResolvedValue({ enableNativeRunner: true });
+    managedApi.list.mockResolvedValue({ currentUserId: "user-1", canManageConnections: true, connections: [{
+      id: "11111111-1111-4111-8111-111111111111", grantId: "22222222-2222-4222-8222-222222222222", companyId: "company-1", provider: "openrouter", method: "api_key", name: "Saved Pi gateway", ownership: "personal", ownerUserId: "user-1", isDefault: true, status: "connected",
+    }] } as any);
+    api.adapterModels.mockResolvedValue([
+      { id: "paperclip/gpt-5.5", label: "GPT 5.5", thinkingCatalog: GPT_5_5_THINKING_CATALOG },
+      { id: "paperclip/not-a-model", label: "Unknown", thinkingCatalog: [] },
+    ]);
+    await render("paperclip_runner", "pi_rpc");
+    await fill("Model", "paperclip/gpt-5.5");
+    await settle();
+    const field = () => container.querySelector<HTMLSelectElement>('[aria-label="Thinking effort"]')!;
+    expect(field().value).toBe("");
+    expect(field().selectedOptions[0]?.textContent).toBe("Auto (Extra High)");
+    await act(async () => { field().value = "high"; field().dispatchEvent(new Event("change", { bubbles: true })); });
+    expect(field().value).toBe("high");
+    expect(field().selectedOptions[0]?.textContent).toBe("high");
+    expect(field().options[0]?.textContent).toBe("Auto (Extra High)");
+    await fill("Model", "paperclip/not-a-model");
+    await settle();
+    expect(field().value).toBe("");
+    expect(field().selectedOptions[0]?.textContent).toBe("Auto");
   });
 
   it("resumes an empty native Pi draft with account selection and exact thinking controls", async () => {

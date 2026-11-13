@@ -13,6 +13,14 @@ export interface PiRpcThinkingSelection {
   diagnostic?: "pi_rpc_unknown_model" | "pi_rpc_ambiguous_model";
 }
 
+/** Catalog rows the selection rule treats as authority for a model ID. The
+ * runtime owns the catalog; a server can ship these rows to a browser so the
+ * browser runs selectPiRpcThinkingLevel unchanged without loading Pi. */
+export function piThinkingCatalogMatches<Row extends PiThinkingCatalogModel>(model: unknown, catalog: readonly Row[]): Row[] {
+  const id = typeof model === "string" ? model.replace(/^paperclip\//u, "") : "";
+  return catalog.filter(row => row.id === id || `${row.provider}/${row.id}` === id);
+}
+
 /** Pure selection with a runtime-injected catalog; generic/browser consumers do
  * not load Pi. Without catalog authority, use the conservative unknown fallback.
  * Config overrides capabilities, never provider-name policy. */
@@ -34,7 +42,7 @@ export function selectPiRpcThinkingLevel(
   }
   const configuredMap = thinkingLevelMap as PiRpcThinkingLevelMap | undefined;
   const id = typeof model === "string" ? model.replace(/^paperclip\//u, "") : "";
-  const matches = catalog.filter(row => row.id === id || `${row.provider}/${row.id}` === id);
+  const matches = piThinkingCatalogMatches(model, catalog);
   const highest = (row: PiThinkingCatalogModel, fallback = false): PiRpcThinkingLevel => {
     if (!row.reasoning) return "off";
     const map = { ...row.thinkingLevelMap, ...configuredMap };

@@ -6,7 +6,7 @@ import { DotRunnerConnection } from "../../components/DotRunnerConnection";
 import { configFieldsForSection } from "../config-sections";
 import type { AdapterConfigFieldsProps } from "../types";
 import { PI_RPC_PROVIDER, PI_RPC_THINKING_LEVEL_KEY } from "@paperclipai/shared";
-import { piRpcThinkingLevelsForModel } from "@/lib/pi-rpc-thinking";
+import { piRpcAutoThinkingLabel, piRpcResolvedThinkingLevel, piRpcThinkingLabel, piRpcThinkingLevelsForModel } from "@/lib/pi-rpc-thinking";
 import type { CreateConfigValues } from "@paperclipai/adapter-utils";
 import { buildCodexLocalConfig } from "@paperclipai/adapter-codex-local/ui";
 import {
@@ -397,7 +397,10 @@ export function CodexLocalConfigFields({
       )}
       {runnerManaged && runnerProvider === PI_RPC_PROVIDER && (() => {
         const model = String(isCreate ? values!.model : eff("adapterConfig", "model", config.model ?? ""));
-        const levels = piRpcThinkingLevelsForModel(model, models.find(row => row.id === model));
+        const modelRow = models.find(row => row.id === model);
+        const levels = piRpcThinkingLevelsForModel(model, modelRow);
+        // Unset uses the runtime's shared default rule; a saved thinkingLevelMap still caps it.
+        const autoLevel = piRpcResolvedThinkingLevel(model, modelRow, undefined, isCreate ? undefined : config.thinkingLevelMap);
         const thinking = String(runnerSchemaValue(PI_RPC_THINKING_LEVEL_KEY, isCreate ? values!.thinkingEffort : ""));
         return <Field configSection="adapter" label="Pi thinking level" hint="Choose a native thinking level. Provider access and the exact effective level are verified when the run starts.">
           <select className={inputClass} aria-label="Pi thinking level" value={thinking}
@@ -405,9 +408,9 @@ export function CodexLocalConfigFields({
               if (isCreate) set!({ thinkingEffort: "", adapterSchemaValues: { ...values!.adapterSchemaValues, [PI_RPC_THINKING_LEVEL_KEY]: event.target.value || undefined } });
               else updateRunnerSchemaValue(PI_RPC_THINKING_LEVEL_KEY, event.target.value || undefined);
             }}>
-            <option value="">Auto</option>
+            <option value="">{piRpcAutoThinkingLabel(autoLevel)}</option>
             {thinking && !levels.includes(thinking) && <option value={thinking} disabled>Unsupported saved thinking level ({thinking})</option>}
-            {levels.map(level => <option key={level} value={level}>{level === "xhigh" ? "Extra High" : level[0].toUpperCase() + level.slice(1)}</option>)}
+            {levels.map(level => <option key={level} value={level}>{piRpcThinkingLabel(level)}</option>)}
           </select>
         </Field>;
       })()}

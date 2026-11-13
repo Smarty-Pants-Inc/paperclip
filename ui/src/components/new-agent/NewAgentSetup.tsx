@@ -29,7 +29,7 @@ import type {
   Agent,
   EnvBinding,
 } from "@paperclipai/shared";
-import { piRpcThinkingLevelsForModel } from "@/lib/pi-rpc-thinking";
+import { piRpcAutoThinkingLabel, piRpcResolvedThinkingLevel, piRpcThinkingLevelsForModel } from "@/lib/pi-rpc-thinking";
 import { PI_RPC_PROVIDER, PI_RPC_THINKING_LEVEL_KEY, ADAPTER_AUTH_MISSING_CHECK_CODE, isAgentStatusInvokable, paperclipRunnerCreationLifecycle, paperclipRunnerProfileForHarness } from "@paperclipai/shared";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { agentsApi } from "@/api/agents";
@@ -372,7 +372,8 @@ function Setup({
   const antigravityCandidate = brandType === "antigravity_runtime" ? candidateHarnesses?.find(candidate => candidate.agent === "antigravity") : undefined;
   const pendingAntigravity = unreleasedAntigravity && !antigravityCandidate;
   useEffect(() => { if (antigravityCandidate) setModel(current => current || antigravityCandidate.model); }, [antigravityCandidate?.model]);
-  const efforts = nativePi ? piRpcThinkingLevelsForModel(model, (connectionModels?.models ?? models.data ?? []).find(row => row.id === model))
+  const nativePiModelRow = nativePi ? (connectionModels?.models ?? models.data ?? []).find(row => row.id === model) : undefined;
+  const efforts = nativePi ? piRpcThinkingLevelsForModel(model, nativePiModelRow)
     : savedAcpxPi ? ["off", "low", "high", "max"] : isRunner ? [] : setupEfforts(adapterType, model);
   useEffect(() => {
     const transition = qualificationTransition.current;
@@ -1259,7 +1260,7 @@ function Setup({
                                     resetTest();
                                   }}
                                 >
-                                  <option value="">Auto</option>
+                                  <option value="">{nativePi ? piRpcAutoThinkingLabel(piRpcResolvedThinkingLevel(model, nativePiModelRow)) : "Auto"}</option>
                                   {efforts.map((value) => (
                                     <option key={value} value={value}>
                                       {value}
