@@ -494,6 +494,7 @@ function IssueSearchInput({
   const lastCommittedValueRef = useRef(value);
 
   useEffect(() => {
+    if (value === lastCommittedValueRef.current) return;
     setDraftValue(value);
     lastCommittedValueRef.current = value;
   }, [value]);

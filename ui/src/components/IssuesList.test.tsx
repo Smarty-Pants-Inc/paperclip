@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act as reactAct } from "react";
 import { createRoot } from "react-dom/client";
 import { flushSync } from "react-dom";
 import type { AnchorHTMLAttributes, ReactNode } from "react";
@@ -7,6 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Issue, Project } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  IssueSearchInput,
   IssuesList,
   issueAgeBucket,
   issueAgeBucketsCrossed,
@@ -1465,6 +1467,49 @@ describe("IssuesList", () => {
     act(() => {
       root.unmount();
     });
+  });
+
+  it("keeps newer typing when a delayed URL echo returns an older search value", async () => {
+    vi.useFakeTimers();
+
+    let parentValue = "";
+    let emittedValue = "";
+    let root: ReturnType<typeof createRoot>;
+    const renderSearch = () => root.render(
+      <IssueSearchInput
+        value={parentValue}
+        onDebouncedChange={(search) => { emittedValue = search; }}
+      />,
+    );
+    root = createRoot(container);
+    await reactAct(async () => renderSearch());
+
+    const inputElement = container.querySelector('input[aria-label="Search tasks"]') as HTMLInputElement | null;
+    expect(inputElement).not.toBeNull();
+    const input = inputElement!;
+    input.focus();
+    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+    expect(valueSetter).toBeTypeOf("function");
+
+    const type = async (value: string) => {
+      await reactAct(async () => {
+        valueSetter!.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    };
+
+    await type("SMAA");
+    await reactAct(async () => {
+      vi.advanceTimersByTime(250);
+    });
+    expect(emittedValue).toBe("SMAA");
+    await type("SMAA-356");
+    parentValue = "SMAA";
+    await reactAct(async () => renderSearch());
+
+    expect(parentValue).toBe("SMAA");
+    expect(input.value).toBe("SMAA-356");
+    await reactAct(async () => root.unmount());
   });
 
   it("debounces search updates so typing does not notify the page on every keystroke", async () => {
