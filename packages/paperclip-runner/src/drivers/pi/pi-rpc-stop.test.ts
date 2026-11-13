@@ -83,12 +83,20 @@ describe("Pi Stop abort ladder", () => {
       const spans = () => f.events.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
       expect(spans().some(span => span.name === "runner.pi.interrupt_wait")).toBe(false);
       release(); await stopping; await attaching;
+      await f.session.attachRun({ runId: "run-after-stop" });
+      expect(f.events.some(event => event.runId === "run-after-stop" && event.payload.code === "provider_performance_spans")).toBe(false);
+      const next = await f.session.startTurn({ message: { role: "user", text: "after Stop" } });
+      f.transport.send({ type: "agent_start" });
       await vi.waitFor(() => expect(f.events.some(event => event.runId === "run-after-stop"
         && parseProviderPerformanceSpans(event.payload, Date.now()).some(span => span.name === "runner.pi.interrupt_wait"))).toBe(true));
       const span = spans().find(span => span.name === "runner.pi.interrupt_wait")!;
       expect(span.endedAtMs).toBeGreaterThanOrEqual(span.startedAtMs);
-      await f.session.attachRun({ runId: "run-after-stop" });
       expect(spans().filter(span => span.name === "runner.pi.interrupt_wait")).toHaveLength(1);
+      const diagnostics = f.events.filter(event => event.runId === "run-after-stop" && event.payload.code === "provider_performance_spans");
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toMatchObject({ turnId: next.turnId });
+      expect(f.events.findIndex(event => event.eventType === "turn.started" && event.turnId === next.turnId))
+        .toBeLessThan(f.events.indexOf(diagnostics[0]!));
     } finally { release?.(); await f.close(); }
   });
 
