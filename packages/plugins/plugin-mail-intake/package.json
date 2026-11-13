@@ -13,6 +13,6 @@
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
   },
-  "devDependencies": {"@paperclipai/plugin-sdk": "workspace:*", "@types/node": "^24.0.0", "esbuild": "^0.28.2", "typescript": "^7.0.2", "vitest": "^5.0.3"},
+  "devDependencies": {"@paperclipai/plugin-sdk": "workspace:*", "@paperclipai/shared": "workspace:*", "ajv": "^8.20.0", "ajv-formats": "^3.0.1", "@types/node": "^24.0.0", "esbuild": "^0.28.2", "typescript": "^7.0.2", "vitest": "^5.0.3"},
   "engines": {"node": ">=24.11.0"}
 }

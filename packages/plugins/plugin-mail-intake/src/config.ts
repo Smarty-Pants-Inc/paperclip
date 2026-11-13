@@ -29,13 +29,10 @@ export function only(v: Record<string, unknown>, keys: readonly string[]): void 
   if (Object.keys(v).some(k => !keys.includes(k))) fail();
 }
 const uuid = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
-const refSchema = {
-  type: "object", format: "secret-ref", additionalProperties: false, required: ["type", "secretId"],
-  properties: {
-    type: { type: "string", const: "secret_ref" }, secretId: { type: "string", pattern: uuid },
-    version: { anyOf: [{ type: "string", const: "latest" }, { type: "integer", minimum: 1 }] },
-  },
-};
+// Host validation projects a valid binding to its ID before Ajv validation
+// (server/src/services/plugin-config-validator.ts:32–34). The stored/runtime
+// value remains an object: PLUGIN_SPEC.md:1293,1501 and SDK types.ts resolve().
+const refSchema = { type: "string", format: "secret-ref" };
 export const configSchema = {
   type: "object", additionalProperties: false,
   required: ["mailbox", "gmailGrantRef", "routineFireSecretRef", "routineOrigin", "routinePublicId"],
@@ -48,7 +45,9 @@ export const configSchema = {
     routinePublicId: { type: "string", pattern: "^[A-Za-z0-9_-]{1,200}$" },
   },
 };
-function secretRef(v: unknown): SecretRef {
+// The schema's string type is only the host's validation projection. Never
+// accept a raw UUID at runtime; ctx.secrets.resolve needs the stored binding.
+export function parseSecretRef(v: unknown): SecretRef {
   if (!record(v)) fail();
   only(v, ["type", "secretId", "version"]);
   if (v.type !== "secret_ref" || typeof v.secretId !== "string" || !new RegExp(uuid).test(v.secretId) ||
@@ -68,7 +67,7 @@ export function parseConfig(v: unknown): MailConfig {
   if (typeof scanWindowDays !== "number" || !Number.isInteger(scanWindowDays) || scanWindowDays < 1 || scanWindowDays > 30) fail();
   return {
     enabled: v.enabled === true, mailbox: v.mailbox.toLowerCase(),
-    gmailGrantRef: secretRef(v.gmailGrantRef), routineFireSecretRef: secretRef(v.routineFireSecretRef),
+    gmailGrantRef: parseSecretRef(v.gmailGrantRef), routineFireSecretRef: parseSecretRef(v.routineFireSecretRef),
     routineOrigin: v.routineOrigin, routinePublicId: v.routinePublicId, scanWindowDays,
   };
 }
