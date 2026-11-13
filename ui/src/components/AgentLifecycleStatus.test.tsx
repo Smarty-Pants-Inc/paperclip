@@ -32,6 +32,15 @@ it.each(["verifying", "resuming"] as const)("does not promise automatic retry of
   expect(html).not.toContain("Paperclip retries automatically");
 });
 
+it.each(["pausing", "terminating", "cleaning_up"] as const)("does not promise automatic retry for parked Stop work in %s", lifecycleState => {
+  const html = renderToStaticMarkup(<AgentLifecycleStatus agent={{ lifecycleState,
+    lifecycleError: `Automatic stop work is paused in ${lifecycleState}. Recheck the stop evidence, then use Retry.`,
+  }} onRetry={() => {}} retryPending={false} />);
+  expect(html).toContain("Automatic stop work is paused");
+  expect(html).toContain("Retry now");
+  expect(html).not.toContain("Paperclip retries automatically");
+});
+
 it("retries a failed step once while pending and removes the failure after recovery", async () => {
   const container = document.createElement("div");
   const root = createRoot(container);
@@ -41,7 +50,8 @@ it("retries a failed step once while pending and removes the failure after recov
     await act(async () => root.render(<AgentLifecycleStatus agent={agent} onRetry={retry} retryPending={false} />));
     expect(container.textContent).toContain(agent.lifecycleError);
     expect(container.textContent).toContain("Agent cleanup failed");
-    expect(container.textContent).toContain("Paperclip retries automatically");
+    expect(container.textContent).toContain("Retry now checks the outstanding stop or cleanup work again.");
+    expect(container.textContent).not.toContain("Paperclip retries automatically");
     expect(container.textContent).not.toContain("Required resources are being removed");
     await act(async () => container.querySelector("button")!.click());
     expect(retry).toHaveBeenCalledOnce();
