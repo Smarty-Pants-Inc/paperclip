@@ -76,9 +76,14 @@ function toBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+// Provider states in which a resumed allocation kept its processes running
+// (Daytona `started`; `ready`, `idle` and `running` in other providers).
+const RUNNING_SANDBOX_STATES = new Set(["started", "running", "ready", "idle"]);
+
 function sandboxLeaseAcquisitionFromMetadata(
   value: unknown,
   providerLeaseId: string | null | undefined,
+  resumedFromState?: unknown,
 ): SandboxLeaseAcquisition | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
@@ -108,6 +113,9 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? { previousProviderLeaseId: candidate.previousProviderLeaseId }
       : {}),
     ...(reason ? { reason } : {}),
+    // A provider that did not report the prior state leaves reuse unchanged.
+    ...(candidate.outcome === "resumed" && typeof resumedFromState === "string"
+      && !RUNNING_SANDBOX_STATES.has(resumedFromState.toLowerCase()) ? { restarted: true as const } : {}),
   };
 }
 
@@ -476,6 +484,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
       sandboxLeaseAcquisition: sandboxLeaseAcquisitionFromMetadata(
         input.lease?.metadata?.sandboxLeaseAcquisition,
         input.lease?.providerLeaseId,
+        input.lease?.metadata?.resumedFromState,
       ),
       // Attach the host duplex observability recorder next to the runner. The bridge
       // binds it to the fixed observability surface. Absent keeps the no-op
