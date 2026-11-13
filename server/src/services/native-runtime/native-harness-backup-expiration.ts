@@ -21,10 +21,11 @@ import { nativeSessionScopeDigestIsBusy } from "./native-session-executor.js";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import type { NativeHarnessBackupExpirationScope } from "../native-harness-backup-expiration-notifications.js";
-import { deleteRetiredNativeHarnessBackup, durableNativeHarnessStorage } from "./native-harness-backup-storage.js";
+import { deleteRetiredNativeHarnessBackup, durableNativeHarnessStorage, nativeHarnessBackupIsExpirable } from "./native-harness-backup-storage.js";
 import { retireObsoleteNativeHarnessBackup } from "./native-harness-backup-retention.js";
 import type { StorageService } from "../../storage/types.js";
 import { releaseExpiredNativeProviderArtifactRun } from "./native-provider-artifacts.js";
+import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
 
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS = 60 * 60 * 1000;
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS = 2 * 60 * 1000;
@@ -80,6 +81,7 @@ export type NativeHarnessBackupExpirationResult = {
 };
 
 type EvidenceContext = {
+  stateBase: string;
   dryRun: boolean;
   isSessionBusy: (scopeDigest: string) => boolean;
   now: number;
@@ -126,7 +128,8 @@ async function isRealDirectory(target: string): Promise<boolean> {
   return Boolean(stat?.isDirectory() && !stat.isSymbolicLink());
 }
 
-async function removeBackupTree(target: string): Promise<void> {
+async function removeBackupTree(target: string, stateBase?: string): Promise<boolean> {
+  if (await retainNativePiConversationEvidence(target, stateBase)) return false;
   const prepare = async (current: string): Promise<void> => {
     const stat = await fs.lstat(current).catch(() => null);
     if (!stat?.isDirectory()) return;
@@ -135,6 +138,7 @@ async function removeBackupTree(target: string): Promise<void> {
   };
   await prepare(target);
   await fs.rm(target, { recursive: true, force: true });
+  return true;
 }
 
 async function allocatedBytes(target: string): Promise<number> {
@@ -309,7 +313,7 @@ export function nativeHarnessBackupExpirationService(
     if (!storage) return;
     const candidates = await db.select({ id: nativeHarnessBackups.id, scopeDigest: nativeHarnessBackups.scopeDigest,
       companyId: nativeHarnessBackups.companyId, runId: nativeHarnessBackups.runId, survivingRunId: heartbeatRuns.id,
-      sessionId: heartbeatRuns.nativeSessionId, status: nativeHarnessBackups.status })
+      sessionId: heartbeatRuns.nativeSessionId, status: nativeHarnessBackups.status, reference: nativeHarnessBackups.reference })
       .from(nativeHarnessBackups).leftJoin(heartbeatRuns, eq(heartbeatRuns.id, nativeHarnessBackups.runId))
       .where(and(durableBackupCursor ? gt(nativeHarnessBackups.id, durableBackupCursor) : undefined,
         or(eq(nativeHarnessBackups.status, "retired"), lt(nativeHarnessBackups.createdAt, options.closedBefore))))
@@ -320,6 +324,10 @@ export function nativeHarnessBackupExpirationService(
         result.truncated = true; return;
       }
       durableBackupCursor = candidate.id;
+      if (!nativeHarnessBackupIsExpirable(candidate.reference)) {
+        result.skipped.pi_conversation_evidence = (result.skipped.pi_conversation_evidence ?? 0) + 1;
+        continue;
+      }
       if (candidate.survivingRunId && !candidate.sessionId) continue;
       try {
         const retired = candidate.status === "retired" || await db.transaction(async tx => {
@@ -533,9 +541,9 @@ export function nativeHarnessBackupExpirationService(
     if (options.dryRun) return;
     result.clearedTaskSessions += decision.cleared;
     await fs.rename(retiring, trash);
-    await removeBackupTree(trash);
+    const removed = await removeBackupTree(trash);
     result.expired++;
-    result.reclaimedBytes += decision.bytes;
+    if (removed) result.reclaimedBytes += decision.bytes;
   }
 
   async function removeExpiredLeftovers(parent: string, context: EvidenceContext, result: NativeHarnessBackupExpirationResult) {
@@ -549,7 +557,7 @@ export function nativeHarnessBackupExpirationService(
         return;
       }
       result.checked++;
-      await removeBackupTree(path.join(parent, name));
+      await removeBackupTree(path.join(parent, name), context.stateBase);
     }
   }
 
@@ -586,11 +594,17 @@ export function nativeHarnessBackupExpirationService(
       context.retry();
       return skip("session_active");
     }
+    // Preserve the original quarantine name until the atomic evidence move:
+    // it carries the company/agent/conversation scope that .expired-* loses.
+    if (await retainNativePiConversationEvidence(target, context.stateBase)) {
+      result.evidenceRemoved++;
+      return;
+    }
     const trash = path.join(parent, `${EXPIRED_PREFIX}${randomUUID()}`);
     await fs.rename(target, trash);
-    await removeBackupTree(trash);
+    const removed = await removeBackupTree(trash, context.stateBase);
     result.evidenceRemoved++;
-    result.evidenceReclaimedBytes += bytes;
+    if (removed) result.evidenceReclaimedBytes += bytes;
   }
 
   async function retireContinuityBreaks(
@@ -703,6 +717,7 @@ export function nativeHarnessBackupExpirationService(
       }
     }
     const context: EvidenceContext = {
+      stateBase: base,
       dryRun,
       isSessionBusy,
       now,

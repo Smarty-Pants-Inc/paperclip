@@ -66,8 +66,9 @@ After each remote turn, the server copies the sandbox's harness state (runner
 state plus the provider's session home, such as `codex-home`) to
 `<instance>/runtime/paperclip-runner/durable-sessions/<scope>/failover-backups/current`.
 A replacement sandbox restores the session from this copy, and an ephemeral sandbox
-restores it at the start of every turn. Each session keeps one copy, and a single
-copy can reach several gigabytes. Codex copies omit credentials, scratch
+restores it at the start of every turn. Each session keeps one active failover copy, and a single
+copy can reach several gigabytes. Pi conversation evidence has the permanent
+retention exception described below. Codex copies omit credentials, scratch
 directories, and data Codex downloads again on startup: remote plugin bundles under
 `plugins/cache/<remote marketplace>`, the remote plugin catalog cache, and plugin
 install staging. After a restore, remote plugins can be unavailable to a turn until
@@ -110,6 +111,36 @@ unconfirmed `.retiring-*` copy when `current` is missing, drops it when a newer
 `current` exists, and finishes an interrupted deletion.
 The rest of the session directory, including its control-plane state, is kept.
 
+**Pi conversation evidence never expires.** Before shared backup cleanup or this
+sweep removes a tree containing `pi`, `pi-agent`, legacy ACPX `pi-home`, or `.pi`
+history, it atomically moves the entire tree to
+`<durable-sessions>/conversation-evidence/<scope>/<UUID>/`. This includes active
+session JSONL, `.jsonl.invalid-*` originals (including foreign, corrupt, truncated,
+or unreadable files), child sessions, and associated raw artifacts. The original
+company/agent/conversation scope is retained. The evidence and scope directories
+are owner-only (`0700`); symlinks are not followed, and bytes and file modes are
+not changed. Inspection, permission, or cross-filesystem rename errors block
+removal instead of falling back to deletion. An old quarantine `.expired-*`
+tombstone that already lost its scope name is kept in a private, unadmitted
+`unattributed-<path SHA-256>` bucket; it is never guessed into another conversation.
+
+This namespace is not a resume source or a public download API, has no expiration
+consumer, and shared cleanup explicitly refuses to delete it. Ordinary retirement
+can still clear a closed session's resume pointer; preservation does not authorize
+resuming a foreign or invalid session. `expired`/`evidenceRemoved` may count a tree
+retired from the expiring namespace, but its bytes are not reported as reclaimed
+when it was preserved. This is persistent retention on the configured state
+volume, not an additional replicated backup or protection against manual volume
+loss.
+
+Encrypted harness objects are also non-expiring when their capture inventory
+contains Pi history. Both scheduled retirement and direct retired-object deletion
+check that inventory, including superseded and pending uploads. Pre-inventory
+objects are retained conservatively, even if their run or original volume is
+missing. New captures proven Pi-free keep the existing retention behavior. Neither
+Langfuse telemetry nor the presence of another local copy authorizes pruning the
+last conversation evidence.
+
 | Environment variable | Default | Effect |
 | --- | --- | --- |
 | `PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED` | `true` | Set `false` to stop expiring copies |
@@ -122,8 +153,8 @@ bytes, cleared task sessions, and skip reasons.
 
 ### Continuity-break archives and quarantined session state
 
-The same sweep also removes two kinds of evidence that native sessions leave behind
-under the same root:
+The same sweep also retires two kinds of evidence that native sessions leave behind
+under the same root (Pi-bearing trees are preserved under the exception above):
 
 - `<session>/continuity-breaks/<epoch ms>-<UUID>/`, written when a session starts a
   fresh provider session and moves the retired session's state aside. Nothing reads

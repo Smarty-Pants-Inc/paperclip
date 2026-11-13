@@ -1,8 +1,10 @@
 import { chmod, lstat, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
 
 /** Remove a retired controller-owned backup, never a live harness directory. */
 export async function removeNativeHarnessBackup(root: string): Promise<void> {
+  if (await retainNativePiConversationEvidence(root)) return;
   // Archives preserve immutable skill directory modes. Deleting their children
   // requires write permission on those directories, even with rm's force flag.
   // Only change directories in the backup being discarded. lstat deliberately
