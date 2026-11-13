@@ -429,13 +429,20 @@ it.skipIf(!enabled).each([false, true])(`three done/comment-reopened turns (save
           }
         }
       }
-      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      // A fresh HTTP read is the same durable comments surface the chat reloads.
+      const comments = await api("GET", `/issues/${issueId}/comments`) as Array<typeof issueComments.$inferSelect>;
       await writeFile(join(root, `comments-turn-${activeTurn}.json`), JSON.stringify(comments, null, 2));
       const notices = comments.filter(comment => comment.body.startsWith("My earlier conversation could not be restored:"));
       expect(notices).toHaveLength(missingFile && activeTurn >= 2 ? 1 : 0);
       if (notices.length) {
         expect(notices[0]!.body).toBe("My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.");
         expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", tone: "warning" });
+        // Run-owned notices become historical at Done / next admission. This
+        // transcript boundary must instead keep its audit link in the details.
+        expect.soft(notices[0]!.createdByRunId, "reloaded recovery notice is not ephemeral run status").toBeNull();
+        expect(notices[0]!.metadata?.sections).toEqual(expect.arrayContaining([
+          expect.objectContaining({ rows: expect.arrayContaining([expect.objectContaining({ type: "run_link" })]) }),
+        ]));
       }
       previousRuns.push(admitted.id);
     }

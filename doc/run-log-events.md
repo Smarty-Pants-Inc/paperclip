@@ -744,6 +744,12 @@ workspace-ready notices, remain available as progress information. They do not
 occupy the run's final reply slot. Final response selection still preserves
 ordinary explicit agent comments and excludes receipt-bound generated progress.
 
+A Pi history-loss recovery notice is a lasting issue transcript item, not run
+status. It uses the same `system_notice` comment presentation with its source
+run linked in the details, rather than as its creator. It remains visible after
+Done, later turns and chat reloads; replay of the same recovery receipt does not
+add another notice.
+
 ## ACP terminal failure diagnostics
 
 The shared ACP adapter engine preserves typed terminal session failures in the

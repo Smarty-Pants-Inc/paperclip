@@ -52,7 +52,10 @@ export async function materializePiSessionRecoveryNotice(input: {
     if (existing) return;
     await issueService(db).addComment(issueId,
       "My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.",
-      { runId }, { authorType: "system", presentation: {
+      // This is a lasting transcript boundary, not the run's status. Keep
+      // run provenance in its detail link without making chat relevance hide
+      // the notice when this run completes or a later turn is admitted.
+      {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
       }, metadata: { version: 1, authorizationReason: key,
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
