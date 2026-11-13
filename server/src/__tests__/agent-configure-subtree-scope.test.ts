@@ -168,6 +168,9 @@ describe("subtree-scoped agent configuration", () => {
   it("requires target-scoped configure for CEO permission writes even without a hiring change", async () => {
     const f = await seed();
     await db.update(agents).set({ role: "ceo" }).where(eq(agents.id, f.ids.lead));
+    // The permissions endpoint also delegates tasks:assign; the caller must hold it.
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent",
+      principalId: f.ids.lead, permissionKey: "tasks:assign", scope: { subtreeRootAgentId: f.ids.lead } });
     const before = (await db.select().from(agents).where(eq(agents.id, f.ids.unrelated)))[0]!.permissions;
     const denied = await request(f.api).patch(`/api/agents/${f.ids.unrelated}/permissions`).set("Authorization", `Bearer ${f.token}`).send({ canCreateAgents: true, canAssignTasks: true });
     expect(denied.status, denied.text).toBe(403);

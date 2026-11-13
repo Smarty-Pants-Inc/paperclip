@@ -17,16 +17,17 @@ Configuration checks name the target agent. A subtree includes its root and
 transitive reports through `reportsTo`, not siblings, managers or unrelated
 principal agents. Existing `{ allow: ["subtree:<UUID>"] }` grants are also
 supported by the same authorization evaluator. Instruction writes already pass
-the target through the shared instruction authorization service. CEO writes to
-`/agents/:id/permissions` also require target-scoped configuration authority,
-even when the hiring permission is unchanged.
+the target through the shared instruction authorization service. Agent writes to
+`/agents/:id/permissions` require direct target-scoped configuration authority
+and a strict descendant target, even when the hiring permission is unchanged.
+The caller need not be CEO.
 
 Default-grant reconciliation (startup and direct-create follow-up) inserts only
 missing grants; it never replaces an existing scope. A missing root CEO's
 configure grant is inserted with that CEO's subtree scope, not an unscoped grant.
 Existing explicitly unscoped grants are preserved as well.
 
-## Board-only grant updates
+## Grant updates
 
 Use `PATCH /api/agents/:id/permission-grants`, for example:
 
@@ -37,12 +38,58 @@ Use `PATCH /api/agents/:id/permission-grants`, for example:
 The optional `scope` accepts `subtreeRootAgentId` (UUID), nonempty `agentIds`
 (UUIDs), and nonempty `allow` lists containing `subtree:<UUID>` or `agent:<UUID>`.
 Unknown keys, malformed IDs, empty lists and an empty object are rejected.
-Omitting `scope` preserves an existing row's scope; when adding a missing row it
-retains the historical unscoped default. Explicit `scope: null` deliberately
-replaces the scope with an unscoped grant. `enabled: false` revokes the row.
-Read the persisted value in `GET /api/agents/:id` under `access.grants`.
-Only board actors with the existing permission-management authority may write
-these grants. The human-member permissions route does not manage agent grants.
+For board callers, omitting `scope` preserves an existing row's scope; when
+adding a missing row it retains the historical unscoped default. Explicit
+`scope: null` deliberately replaces the scope with an unscoped grant.
+`enabled: false` revokes the row. Read the persisted value in
+`GET /api/agents/:id` under `access.grants`. Board actors retain their existing
+permission-management authority. The human-member permissions route does not
+manage agent grants.
+
+An agent with direct target-scoped `agents:configure` can edit a strict
+reporting descendant's grants. It cannot edit itself, a sibling, an ancestor,
+or an unrelated agent, even with a legacy unscoped configure grant. A later
+`reportsTo` change takes effect on the next request. A suggestion grant or
+accepted consent alone is not enough for this administrative operation.
+
+The caller must hold the permission being enabled. Delegation must fit both
+its existing grant and its current subtree; it cannot issue an unscoped grant.
+For a missing grant, omitted scope defaults to the target's subtree. For an
+existing grant, omission preserves its scope only when that scope is still
+within the caller's authority. Explicit subtree-only source scopes can be
+narrowed to contained subtrees or individual agents. Finite agent sets can be
+narrowed to finite sets, not expanded into subtrees. Compound source constraints
+that cannot be safely narrowed require a board editor rather than silently
+dropping constraints. Revocation requires management authority over the target
+but does not require holding the revoked permission.
+
+The legacy `/permissions` endpoint also requires held hiring/skill authority
+for enabling those settings and a held, contained `tasks:assign` grant whenever
+it enables assignment. Assignment grant writes are scoped to the target's
+subtree. Trust presets and authorization-policy administration stay board-only.
+Agent administrative mutations are attributed to the agent in the activity log.
+
+## Descendant budgets and instruction paths
+
+Both `PATCH /agents/:id/budgets` and a `budgetMonthlyCents` field in
+`PATCH /agents/:id` accept the same direct descendant-management authority.
+The new amount must be positive and no greater than the caller's remaining
+monthly billed budget. The budget engine's exact ledger, live exposure and held
+reservations count toward that remaining amount. A saved active monthly policy
+takes precedence over the legacy amount. A caller without a finite positive
+allowance cannot delegate a budget. Zero disables enforcement, so agents cannot
+use zero as a delegated allowance. Board budget behavior is unchanged. These
+are bounded budget settings, not a transfer/reservation of money between agents.
+Self-budget fields are rejected even when they echo the current amount.
+
+`PATCH /agents/:id/instructions-path` uses the same direct descendant check.
+Agents may set only known instruction-path keys (`instructionsFilePath` and
+`agentsMdPath`), never use the path endpoint to change a host command or another
+adapter field. The existing external-filesystem instance-admin restriction stays
+in place: agents can point to managed instruction files, not arbitrary host
+paths. Board behavior and generic adapter-config protections are unchanged.
+API-key management, company budgets and budget-policy/incident administration
+are not delegated by these changes.
 
 ## Named follow-up: target-manager consent-card eligibility
 
