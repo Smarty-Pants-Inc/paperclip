@@ -5011,14 +5011,17 @@ environment lifecycle setting changes. Recovery uses the persisted execution
 input for both lease acquisition and lifecycle validation.
 
 For an ordinary resumed sandbox lease, the cached warm Runner can avoid the
-process-generation loss probe only when its authenticated connection has
-received a frame or pong within 20 seconds, one outbound WebSocket ping
-interval. The authenticated Runner instance must match the generation captured
-for that warm backend. This is synchronous controller-local evidence, not a
-remote check. A counted but silent connection is insufficient; a missing or
-mismatched generation, stale inbound evidence, or an explicit stopped/archived
-resume keeps the existing loss probe and finished-owner recovery proofs. No
-freshness timestamp is persisted or restored across controller restarts.
+process-generation loss probe only when that Runner itself answers a fresh
+`runner.identity` command over its authenticated, encrypted PRP channel. The
+check runs after the successor's native lease claim and before warm reattach or
+any provider work. The command id is a fresh nonce the result must echo, and
+both the answering connection and the result must name the Runner generation
+captured for that warm backend. A disconnected warm owner may reuse the existing
+authenticated ingress reconnect first; reconnect and answer share one 1.5-second
+budget. Transport pings, pongs and inbound age are never evidence. Any error,
+timeout, mismatched generation, or an explicit stopped/archived resume keeps the
+existing loss probe and finished-owner recovery proofs. The command is
+journaled like other maintenance commands and does not touch the provider.
 
 Controller shutdown and warm idle expiry detach confirmed released plugin
 Runners without stopping them. The host owns parked Runner retention. The next
