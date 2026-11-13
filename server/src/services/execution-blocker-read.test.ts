@@ -183,7 +183,7 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
       .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     return f;
   }
-  const generic = "Saved work recovered. Send a message to continue.";
+  const generic = "Saved work recovered.";
   // The durable notice exactly as the executor writes it (noticeHeldUnfinishedPredecessor).
   async function heldNotice(f: Awaited<ReturnType<typeof recoveredRefusal>>, sessionId: string) {
     await db.transaction(tx => writePiSessionHistoryLossNotice(db, tx, { companyId: f.companyId, issueId: f.issueId,
