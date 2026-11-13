@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, lte, ne } from "drizzle-orm";
 import { agentTaskSessions, heartbeatRuns, issues, type Db } from "@paperclipai/db";
-import { issueService } from "../issues.js";
 import { canBypassFailedNativePredecessor, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 
 /** Server-owned metadata; never handed to a provider as adapter configuration. */
@@ -105,6 +104,7 @@ export async function selectPiConversation(db: Db, input: {
     let previous = readPiConversation(session?.sessionParamsJson);
     let legacyId = session?.sessionParamsJson?.sessionId;
     if (legacyId != null && !uuid(legacyId)) throw new Error("pi_conversation_record_invalid");
+    const legacyProvenanceId = legacyId;
     let legacyUnverified = false;
     if (previous && legacyId && legacyId !== previous.id) throw new Error("pi_conversation_identity_conflict");
     if (!previous && uuid(legacyId)) {
@@ -154,11 +154,10 @@ export async function selectPiConversation(db: Db, input: {
       // The issue lock and this transaction make the notice and first recorded
       // conversation atomic. Replays/later turns read the record, not the legacy
       // pointer, so they cannot repeat it (or lose it after a failed selection).
-      await issueService(db).addComment(input.issueId,
-        "My earlier conversation could not be restored (it predates conversation records). Starting a new one.",
-        { runId: input.runId }, { authorType: "system", presentation: {
-          kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
-        } }, tx);
+      const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
+      await writePiSessionHistoryLossNotice(db, tx, { ...input,
+        authorizationReason: `legacy_binding_unverified:${id}:${legacyProvenanceId}`,
+        body: "My earlier conversation could not be restored (it predates conversation records). Starting a new one." });
     }
     return record;
   });
