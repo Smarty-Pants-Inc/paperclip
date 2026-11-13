@@ -3087,15 +3087,27 @@ impl CodexCommandExecutor {
                         }),
                     })?;
                 }
+                let mut resumed_payload = json!({
+                    "provider": provider_label,
+                    "providerSessionId": thread_id.clone(),
+                    "providerAccountSessionId": resumed_provider_session_id,
+                    "processId": resumed_process_id,
+                });
+                if state.config.provider == "pi_rpc" {
+                    // Recovery must carry the same live admission receipt as
+                    // session.open; the controller must not trust stale state
+                    // or relax exact model/effort checks after runner loss.
+                    resumed_payload["providerDescriptor"] = json!({
+                        "driver": state.config.driver,
+                        "providerVersion": state.config.provider_version,
+                        "effectiveModel": provider.observed_model(),
+                        "piNativeAdmission": provider.observed_pi_admission(),
+                    });
+                }
                 state.push_terminal_event(NormalizedProviderEvent {
                     event_type: "session.resumed".to_owned(),
                     priority: EventPriority::P0,
-                    payload: json!({
-                        "provider": provider_label,
-                        "providerSessionId": thread_id.clone(),
-                        "providerAccountSessionId": resumed_provider_session_id,
-                        "processId": resumed_process_id,
-                    }),
+                    payload: resumed_payload,
                 })?;
             }
             if provider_had_exited
