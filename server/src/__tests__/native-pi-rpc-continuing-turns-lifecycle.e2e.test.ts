@@ -46,9 +46,10 @@ function piDescendant(runnerPid: number): number | null {
   return visit(runnerPid);
 }
 
-it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
-  const missingFile = savedFile === true;
-  const invalidFile = savedFile === "invalid";
+it.skipIf(!enabled).each([false, true, "invalid", "partial", "missing-reread", "invalid-reread"] as const)(`three done/comment-reopened turns (saved file missing=%s, lifecycle=${lifecycleMode}, thinking=${thinking})`, async savedFile => {
+  const reread = savedFile === "missing-reread" || savedFile === "invalid-reread";
+  const missingFile = savedFile === true || savedFile === "missing-reread";
+  const invalidFile = savedFile === "invalid" || savedFile === "invalid-reread";
   const partialFile = savedFile === "partial";
   let preservedBytes: Buffer | undefined;
   let originalSessionFile: string | undefined;
@@ -62,6 +63,10 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
   const root = await mkdtemp(join(process.env.PAPERCLIP_PI_E2E_EVIDENCE ?? tmpdir(), "native-pi-continuing-"));
   const privateFact = `PI_PRIVATE_MEMORY_${randomUUID()}`;
   const freshFact = `PI_FRESH_MEMORY_${randomUUID()}`;
+  const decision = `THREAD_DECISION_${randomUUID()}`;
+  const reason = `THREAD_REASON_${randomUUID()}`;
+  const planFact = `PLAN_GUIDANCE_${randomUUID()}`;
+  const coldReads = new Map<number, string[]>();
   const readSessionFile = (piPid: number) => {
     const args = readFileSync(`/proc/${piPid}/cmdline`, "utf8").split("\0");
     const at = args.indexOf("--session");
@@ -182,7 +187,10 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
           for (const part of typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content ?? []) {
             if (part.type !== "text") continue;
             try {
-              const value = JSON.parse(part.text);
+              // The provider may prepend an owned cold-start directive. The
+              // native envelope itself must still be intact and parseable.
+              const envelopeStart = part.text.indexOf('{"schema":"paperclip.native-');
+              const value = JSON.parse(envelopeStart < 0 ? part.text : part.text.slice(envelopeStart));
               if (value.completionContract) contract = value.completionContract;
               if (value.schema === "paperclip.native-continuation.v1" && value.completion)
                 contract = { revision: value.completion.revision, criteria: value.completion.criterionIds.map((id: string) => ({ id })) };
@@ -198,7 +206,28 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
           emit("content_block_delta", { index, delta: { type: "text_delta", text } });
           emit("content_block_stop", { index: index++ });
         };
-        if (!isToolResult) {
+        // The scripted model follows an explicit cold-start read instruction,
+        // not the test's missing/invalid switch. All recalled values below must
+        // originate in actual tool results through the real controller/DB.
+        const toolResults = (parsed.messages ?? []).flatMap((message: { role: string; content: unknown }) =>
+          message.role === "user" && Array.isArray(message.content)
+            ? message.content.filter((part: { type: string }) => part.type === "tool_result") : []);
+        const readText = JSON.stringify(toolResults);
+        const fromThread = /We decided (THREAD_DECISION_[a-z0-9-]+) because (THREAD_REASON_[a-z0-9-]+)/.exec(readText);
+        const fromPlan = /PLAN_GUIDANCE_[a-z0-9-]+/.exec(readText)?.[0];
+        const readInstruction = activeTurn > 1 && !isToolResult && /before answering/i.test(JSON.stringify(latest))
+          && JSON.stringify(latest).includes("get_task_history") && JSON.stringify(latest).includes("read_document");
+        const reads = coldReads.get(activeTurn) ?? [];
+        const lastTools = Array.isArray(latest?.content) ? latest.content.filter((part: { type: string }) => part.type === "tool_result") : [];
+        const finishResult = lastTools.some((part: { tool_use_id?: string }) => part.tool_use_id === `finish-${activeTurn}`);
+        const needsRead = reread && (readInstruction || reads.length > 0) && reads.length < 3;
+        if (needsRead) {
+          const name = ["get_task_context", "get_task_history", "read_document"][reads.length]!;
+          reads.push(name); coldReads.set(activeTurn, reads);
+          emit("content_block_start", { index, content_block: { type: "tool_use", id: `cold-${activeTurn}-${reads.length}`, name, input: {} } });
+          emit("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(name === "read_document" ? { key: "plan" } : {}) } });
+          emit("content_block_stop", { index });
+        } else if (!isToolResult || (reread && !finishResult)) {
           // The fact originates ONLY in the first assistant response and is not
           // published in the first final chat reply or any Paperclip tool result.
           textBlock(activeTurn === 1 ? `Private fact: ${privateFact}` : missingFile && activeTurn === 2 ? `Fresh private fact: ${freshFact}` : "Completing the reopened issue.");
@@ -211,9 +240,12 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
           emit("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
           emit("content_block_stop", { index });
         } else {
-          textBlock(activeTurn === 1 ? "TURN_1_PUBLISHED" : remembersPrivateFact ? `TURN_${activeTurn}_RECALLED_${privateFact}` : `TURN_${activeTurn}_HISTORY_LOST`);
+          textBlock(activeTurn === 1 ? reread ? `TURN_1_PUBLISHED: We decided ${decision} because ${reason}.` : "TURN_1_PUBLISHED"
+            : reread && fromThread && fromPlan
+              ? `TURN_${activeTurn}_FROM_THREAD: We decided ${fromThread[1]} because ${fromThread[2]}. Plan: ${fromPlan}. The Pi-only fact is not available.`
+              : remembersPrivateFact ? `TURN_${activeTurn}_RECALLED_${privateFact}` : `TURN_${activeTurn}_HISTORY_LOST`);
         }
-        emit("message_delta", { delta: { stop_reason: isToolResult ? "end_turn" : "tool_use", stop_sequence: null }, usage: { output_tokens: 4 } });
+        emit("message_delta", { delta: { stop_reason: needsRead || !isToolResult || (reread && !finishResult) ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } });
         emit("message_stop", {}); res.end();
       });
     });
@@ -318,11 +350,21 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
     expect(patched.adapterConfig).toMatchObject({ provider: "pi_rpc", lifecycleMode, piRpcThinkingLevel: thinking, model: "paperclip/faux" });
     expect(patched.lifecycleState).toBe("ready");
     stage("PATCH 200", { agentId, lifecycleState: patched.lifecycleState, adapterConfig: patched.adapterConfig });
-    const issue = await api("POST", `/companies/${companyId}/issues`, {
-      title: "Three continuing native Pi turns", description: "Keep a private assistant fact, complete the issue, and answer the board.",
-      status: "backlog", assigneeAgentId: agentId,
-    }, 201);
+    // Recovery-reread must exercise a standing conversation: unlike ordinary
+    // issue wakes, chat intentionally omits the old thread and plan from its
+    // delta, relying on the native runtime's copy until it is lost.
+    const issue = reread
+      ? await api("POST", `/companies/${companyId}/chats/${agentId}`)
+      : await api("POST", `/companies/${companyId}/issues`, {
+        title: "Three continuing native Pi turns", description: "Keep a private assistant fact, complete the issue, and answer the board.",
+        status: "backlog", assigneeAgentId: agentId,
+      }, 201);
+    if (reread) expect(issue).toMatchObject({ conversationAgentId: agentId, conversationUserId: "local-board" });
     issueId = issue.id;
+    if (reread) {
+      await api("PUT", `/issues/${issueId}/documents/plan`, { title: "Plan", body: `Follow this saved plan: ${planFact}.`, format: "markdown", baseRevisionId: null }, 201);
+      stage("authoritative plan saved", { issueId, planFact });
+    }
     const { heartbeatService } = await import("../services/heartbeat.js");
     let replayedRecoveryNotices = 0;
     if (missingFile || invalidFile) {
@@ -383,11 +425,12 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
       }
       const requestOffset = requests.length;
       const before = await api("GET", `/issues/${issueId}`);
-      expect(before.status).toBe(activeTurn === 1 ? "backlog" : "done");
+      expect(before.status).toBe(reread ? "in_review" : activeTurn === 1 ? "backlog" : "done");
       // No prior fact is ever present in the incoming message.
       const body = activeTurn === 1
         ? "Invent and privately remember a fact. Finish the issue via paperclip_finish, then publish TURN_1_PUBLISHED."
-        : `Reopen for turn ${activeTurn}. Recall the private fact from your own earlier assistant history; finish the issue and publish your recall.`;
+        : reread ? `Reopen for turn ${activeTurn}. What did we decide earlier, and what does the saved plan say? Be honest about any Pi-only fact you cannot recover.`
+          : `Reopen for turn ${activeTurn}. Recall the private fact from your own earlier assistant history; finish the issue and publish your recall.`;
       expect(body).not.toContain(privateFact);
       const inbound = await api("POST", `/issues/${issueId}/comments`, { body, clientRequestId: randomUUID() }, 201);
       const admitted = await waitFor(`turn ${activeTurn} admitted`, async () =>
@@ -440,15 +483,16 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
       await writeFile(join(root, "turns.json"), JSON.stringify(turnProofs, null, 2));
       stage(`turn ${activeTurn} done and published`, row);
       expect(settled!.status).toBe("succeeded");
-      expect(closed!.status).toBe("done");
+      expect(closed!.status).toBe(reread ? "in_review" : "done");
       expect(settled!.nativeSessionId).toBeTruthy();
       if (lifecycleMode === "warm") expect(pids, "warm conversation owns exactly one real Pi child").toHaveLength(1);
       if (activeTurn === 1) {
-        expect(reply.body).toBe("TURN_1_PUBLISHED");
+        expect(reply.body).toBe(reread ? `TURN_1_PUBLISHED: We decided ${decision} because ${reason}.` : "TURN_1_PUBLISHED");
         const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
         expect(comments.some(comment => comment.body.includes(privateFact)), "fact remains Pi-only before the reopen").toBe(false);
       } else {
-        expect(settled!.contextSnapshot?.wakeReason).toBe("issue_reopened_via_comment");
+        if (reread) expect(settled!.contextSnapshot?.conversationMode).toBe(true);
+        else expect(settled!.contextSnapshot?.wakeReason).toBe("issue_reopened_via_comment");
         // Soft assertions preserve all three regression observations on the
         // baseline, without weakening the test's final pass/fail result.
         expect.soft(row.assistantHistoryRecall, "missing history is fresh, ordinary history is restored").toBe(!missingFile && !invalidFile);
@@ -456,7 +500,19 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
         // intentionally published, so ordinary Paperclip context may include
         // that public reply on turn 3; this is not a history-loss regression.
         if (activeTurn === 2) expect.soft(row.latestInputContainsFact, "first reopen does not replay the Pi-only fact").toBe(false);
-        expect.soft(reply.body).toBe(missingFile || invalidFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
+        expect.soft(reply.body).toBe(reread
+          ? `TURN_${activeTurn}_FROM_THREAD: We decided ${decision} because ${reason}. Plan: ${planFact}. The Pi-only fact is not available.`
+          : missingFile || invalidFile ? `TURN_${activeTurn}_HISTORY_LOST` : `TURN_${activeTurn}_RECALLED_${privateFact}`);
+        if (reread) {
+          expect.soft(reply.body, "never claim an unrecovered Pi-only fact").not.toContain(privateFact);
+          if (activeTurn === 2) {
+            expect.soft(coldReads.get(activeTurn), "recovery reads the same issue context, thread and plan before answering")
+              .toEqual(["get_task_context", "get_task_history", "read_document"]);
+            expect.soft(JSON.stringify(currentRequests[0]?.lastMessage), "decision is not smuggled in the fresh incoming wake").not.toContain(decision);
+            expect.soft(JSON.stringify(currentRequests[0]?.lastMessage), "plan is read via the existing tool").not.toContain(planFact);
+            stage("cold-start read proof", { coldReads: coldReads.get(activeTurn), decision, reason, planFact, reply: reply.body });
+          }
+        }
         expect.soft(settled!.nativeSessionId, "all three reopened turns use the SAME normalized conversation").toBe(turnProofs[0]!.nativeSessionId);
         if (partialFile) {
           const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
@@ -523,6 +579,16 @@ it.skipIf(!enabled).each([false, true, "invalid", "partial"] as const)(`three do
       }
       const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       await writeFile(join(root, `comments-turn-${activeTurn}.json`), JSON.stringify(comments, null, 2));
+      if (reread) {
+        // Reload through the same API the chat uses, after run completion and
+        // again on the third turn; querying only the writer's DB is not proof.
+        const reloaded = await api("GET", `/issues/${issueId}/comments`) as typeof comments;
+        const recoveryNotices = reloaded.filter(comment => comment.body.startsWith("My earlier conversation could not be restored:")
+          || comment.body.includes("pi_session_file_invalid"));
+        expect(recoveryNotices).toHaveLength(activeTurn >= 2 ? 1 : 0);
+        if (activeTurn >= 2) expect(recoveryNotices[0]!.presentation).toMatchObject({ kind: "system_notice", tone: "warning" });
+        await writeFile(join(root, `comments-api-turn-${activeTurn}.json`), JSON.stringify(reloaded, null, 2));
+      }
       const notices = comments.filter(comment => comment.body.startsWith("My earlier conversation could not be restored:"));
       expect(notices).toHaveLength(missingFile && activeTurn >= 2 ? 1 : 0);
       if (notices.length) {
