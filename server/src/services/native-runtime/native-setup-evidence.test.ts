@@ -6,13 +6,16 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { cleanupNativeSetupRuntime, createNativeSetupRuntime } from "./native-setup-evidence.js";
+import { logger } from "../../middleware/logger.js";
+
+vi.mock("../../middleware/logger.js", () => ({ logger: { info: vi.fn() } }));
 
 async function fixture() {
   const state = await mkdtemp(join(tmpdir(), "setup-evidence-safety-"));
   vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", state);
   return state;
 }
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => { vi.unstubAllEnvs(); vi.clearAllMocks(); });
 
 // Keep: company isolation and sole-copy data safety. All filesystem operations
 // are real. Evidence fixtures deliberately survive the test process.
@@ -24,6 +27,9 @@ it("retains metadata-only raw diagnostics in separate private company scopes", a
   await writeFile(join(second, "provider-trace.ndjson"), "opaque second\n");
   await cleanupNativeSetupRuntime(first, true);
   await cleanupNativeSetupRuntime(second, true);
+  for (const [source, totalBytes] of [[first, 13], [second, 14]] as const) expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({
+    event: "native_evidence_retained", source, destination: expect.any(String), scope: expect.any(String), totalBytes, fileCount: 1,
+  }));
   const evidence = join(state, "conversation-evidence");
   expect((await lstat(evidence)).mode & 0o777).toBe(0o700);
   const scopes = await readdir(evidence);
@@ -86,10 +92,20 @@ it("pulls real raw bytes through the existing backup tar path before source reti
     afterSha256: createHash("sha256").update(await readFile(retained)).digest("hex"), sourceRemoved: true }, null, 2));
 }, 60_000);
 
+it("fails closed when a whole-tree probe has no resolvable evidence scope", async () => {
+  const root = await fixture(); // odd/unscoped state path, no sourceScope binding
+  const trace = join(root, "raw-session.ndjson");
+  await writeFile(trace, "sole copy\n");
+  await expect(cleanupNativeSetupRuntime(root, true)).rejects.toThrow("native_setup_evidence_not_retained");
+  expect(await readFile(trace, "utf8")).toBe("sole copy\n");
+  expect(logger.info).not.toHaveBeenCalled();
+});
+
 it("still removes scratch without Pi history for a non-Pi probe", async () => {
   await fixture();
   const root = await createNativeSetupRuntime("company");
   await writeFile(join(root, "scratch.txt"), "disposable scratch");
   await cleanupNativeSetupRuntime(root);
+  expect(logger.info).toHaveBeenCalledWith({ event: "native_scratch_removed", path: root, totalBytes: 18, fileCount: 1 });
   await expect(lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
 });
