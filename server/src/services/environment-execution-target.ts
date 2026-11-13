@@ -76,9 +76,16 @@ function toBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
+// Provider-defined stopped states: a resume from one restarted the machine, so
+// no earlier process survived (Boat archiving/archived per docs.boat.dev/
+// readiness.md "Ready, in one table"; Daytona stopped/archived). Error,
+// starting and unknown states prove nothing.
+const STOPPED_SANDBOX_STATES = new Set(["stopped", "archiving", "archived"]);
+
 function sandboxLeaseAcquisitionFromMetadata(
   value: unknown,
   providerLeaseId: string | null | undefined,
+  resumedFromState?: unknown,
 ): SandboxLeaseAcquisition | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
@@ -108,6 +115,9 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? { previousProviderLeaseId: candidate.previousProviderLeaseId }
       : {}),
     ...(reason ? { reason } : {}),
+    // A provider that did not report the prior state proves no restart.
+    ...(candidate.outcome === "resumed" && typeof resumedFromState === "string"
+      && STOPPED_SANDBOX_STATES.has(resumedFromState) ? { restarted: true as const } : {}),
   };
 }
 
@@ -476,6 +486,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
       sandboxLeaseAcquisition: sandboxLeaseAcquisitionFromMetadata(
         input.lease?.metadata?.sandboxLeaseAcquisition,
         input.lease?.providerLeaseId,
+        input.lease?.metadata?.resumedFromState,
       ),
       // Attach the host duplex observability recorder next to the runner. The bridge
       // binds it to the fixed observability surface. Absent keeps the no-op
