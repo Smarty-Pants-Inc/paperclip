@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
-import { retainNativePiConversationEvidence, retainNativeRuntimeEvidence } from "./native-pi-conversation-evidence.js";
+import { retainNativePiConversationEvidence, retainNativeRuntimeEvidence, summarizeNativeRuntimeTree } from "./native-pi-conversation-evidence.js";
+import { logger } from "../../middleware/logger.js";
 
 /** Setup has no agent/conversation yet. Bind its private evidence to the company
  * and purpose instead, on the same filesystem as the permanent evidence move. */
@@ -19,8 +20,17 @@ export async function createNativeSetupRuntime(companyId: string): Promise<strin
 }
 
 /** Called only after physical retirement. A failed move leaves the source and
- * blocks cleanup. Pi metadata/failure diagnostics are evidence too. */
+ * blocks cleanup. All providers' metadata/failure diagnostics are evidence too.
+ * piProbe is the historical name for whole-tree retention, not a provider gate. */
 export async function cleanupNativeSetupRuntime(root: string, piProbe = false): Promise<void> {
   if (piProbe ? await retainNativeRuntimeEvidence(root) : await retainNativePiConversationEvidence(root)) return;
+  const source = await lstat(root).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!source) return; // A repeated confirmed cleanup has nothing left to remove.
+  if (piProbe) throw new Error("native_setup_evidence_not_retained");
+  const inventory = await summarizeNativeRuntimeTree(root);
   await rm(root, { recursive: true, force: true });
+  logger.info({ event: "native_scratch_removed", path: root, ...inventory });
 }

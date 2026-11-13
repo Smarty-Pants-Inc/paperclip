@@ -12,6 +12,8 @@ import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { resolvePaperclipRunnerTransport } from "@paperclipai/adapter-utils/runner-connectivity";
 import { createNativeRunnerExecutionDriver } from "./native-runner-execution-driver.js";
 import { cleanupNativeSetupRuntime, createNativeSetupRuntime } from "./native-setup-evidence.js";
+import { summarizeNativeRuntimeTree } from "./native-pi-conversation-evidence.js";
+import { logger } from "../../middleware/logger.js";
 
 
 const PROBE_TRANSPORT_ENV_KEYS = ["PATH", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy"];
@@ -72,7 +74,7 @@ async function probePreparedNativeRuntime(runtimeDirectory: string, prepare: () 
     return await probeNativeRunnerEnvironment(options);
   } catch (error) {
     if (!handedOff) {
-      try { await cleanupNativeSetupRuntime(runtimeDirectory); }
+      try { await cleanupNativeSetupRuntime(runtimeDirectory, true); }
       catch (cleanupError) {
         const message = error instanceof Error ? error.message : "Native setup preparation failed.";
         throw new AggregateError([error, cleanupError], `${message}; Native setup preparation cleanup is incomplete.`, { cause: error });
@@ -193,16 +195,17 @@ async function probeRemoteNativeRuntime(options: {
       } } : {}),
       onCleanupConfirmed: async () => {
         if (remoteDirectoryCreated) {
-          if (options.provider === "pi_rpc") {
-            await syncRemoteRunnerDirectoryOut({ runner, sourcePath: remoteRoot,
-              targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700 });
-            await cleanupNativeSetupRuntime(runtimeDirectory, true);
-          }
+          const pulledRuntime = join(runtimeDirectory, "remote-runtime");
+          await syncRemoteRunnerDirectoryOut({ runner, sourcePath: remoteRoot,
+            targetPath: pulledRuntime, mode: 0o700 });
+          const inventory = await summarizeNativeRuntimeTree(pulledRuntime);
+          await cleanupNativeSetupRuntime(runtimeDirectory, true);
           const cleaned = await runner.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 10_000 });
           requireSuccess(cleaned, "Native setup cleanup is incomplete; private recovery state was retained.");
+          logger.info({ event: "native_scratch_removed", path: remoteRoot, ...inventory });
           remoteDirectoryCreated = false;
         }
-        await cleanupNativeSetupRuntime(runtimeDirectory, options.provider === "pi_rpc");
+        await cleanupNativeSetupRuntime(runtimeDirectory, true);
       },
     };
   });
@@ -263,7 +266,7 @@ export async function testNativeRunnerAuthentication(context: AdapterEnvironment
         const probeSourceCodexHome = await prepareProbeCodexSource(runtimeDirectory!, sourceCodexHome ?? "", sourceAuthJson);
         return { runtimeDirectory: runtimeDirectory!, provider, model, environment, timeoutMs,
           ...(provider === "codex" && typeof effort === "string" && effort ? { reasoningEffort: effort } : {}),
-          onCleanupConfirmed: async () => { await cleanupNativeSetupRuntime(runtimeDirectory!, provider === "pi_rpc"); },
+          onCleanupConfirmed: async () => { await cleanupNativeSetupRuntime(runtimeDirectory!, true); },
           transportOptions: { runnerBinary, sourceCodexHome: probeSourceCodexHome, externallySandboxed: false, ...piArtifacts,
             ...(provider === "pi_rpc" ? { piRpcThinkingLevel: context.config.piRpcThinkingLevel as PiThinkingLevel | undefined,
               piRuntimeDirectory: join(runtimeDirectory!, "pi") } : {}) },

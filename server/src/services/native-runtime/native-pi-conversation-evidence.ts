@@ -1,6 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readdir, readFile, rename } from "node:fs/promises";
+import { lstat, mkdir, opendir, readdir, readFile, rename } from "node:fs/promises";
 import path from "node:path";
+import { logger } from "../../middleware/logger.js";
+
+/** Metadata only: never open file contents or follow symlinks. Bound both work
+ * and directory depth; an incomplete inventory blocks destructive cleanup. */
+export async function summarizeNativeRuntimeTree(root: string): Promise<{ totalBytes: number; fileCount: number }> {
+  let totalBytes = 0, fileCount = 0, entries = 0;
+  async function visit(filename: string, depth: number): Promise<void> {
+    if (++entries > 100_000 || depth > 128) throw new Error("native_evidence_inventory_limit");
+    const metadata = await lstat(filename);
+    if (metadata.isDirectory()) {
+      for await (const entry of await opendir(filename)) await visit(path.join(filename, entry.name), depth + 1);
+    } else {
+      totalBytes += metadata.size;
+      fileCount++;
+    }
+  }
+  await visit(root, 0);
+  return { totalBytes, fileCount };
+}
 
 export const NATIVE_PI_CONVERSATION_EVIDENCE_DIRECTORY = "conversation-evidence";
 const SCOPE = /^[a-f0-9]{64}$/;
@@ -68,8 +87,8 @@ export async function retainNativePiConversationEvidence(root: string, stateBase
   return retainNativeRuntimeEvidence(root, stateBase);
 }
 
-/** Known Pi setup probes may contain only raw diagnostics (including failed
- * admission). Their owner retains the complete tree without a history filter. */
+/** Setup probes may contain only raw diagnostics (including failed admission).
+ * Their owner retains the complete tree without a provider/history filter. */
 export async function retainNativeRuntimeEvidence(root: string, stateBase?: string): Promise<boolean> {
   if (path.resolve(root).split(path.sep).includes(NATIVE_PI_CONVERSATION_EVIDENCE_DIRECTORY)) {
     throw new Error("native_pi_evidence_not_expirable");
@@ -91,6 +110,8 @@ export async function retainNativeRuntimeEvidence(root: string, stateBase?: stri
   const scoped = path.join(evidence, scope);
   await privateDirectory(scoped);
   const destination = path.join(scoped, randomUUID());
+  const inventory = await summarizeNativeRuntimeTree(root);
   await rename(root, destination); // EXDEV also fails closed: never copy then unlink.
+  logger.info({ event: "native_evidence_retained", source: root, destination, scope, ...inventory });
   return true;
 }
