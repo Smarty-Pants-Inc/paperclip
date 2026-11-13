@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
@@ -50,7 +50,7 @@ function piDescendant(runnerPid: number): number | null {
 // failed and the plain follow-up died. With killRetainedRunner the retained
 // runnerd is SIGKILLed after the Stop; Core must retire it and resume the same
 // conversation once on a NEW runner from its checkpoint, visibly.
-async function stopWarmProof(stopTurn: number, killRetainedRunner = false) {
+async function stopWarmProof(stopTurn: number, killRetainedRunner = false, deleteRetainedPiFile = false) {
   expect(thinking).toBe("xhigh");
   expect(protocol).toBe("messages");
   expect(process.env.TMPDIR, "dedicated test tmpdir is required").toBeTruthy();
@@ -368,7 +368,41 @@ async function stopWarmProof(stopTurn: number, killRetainedRunner = false) {
       await waitFor("retained runnerd killed", async () => alive(pid.runnerPid) ? null : true, 10_000);
       stage("retained runnerd SIGKILLed after Stop", { runnerPid: pid.runnerPid, residentAlive: alive(pid.piPid) });
     }
+    if (deleteRetainedPiFile) {
+      // The retained conversation's Pi history file is gone (RFL F2). Only
+      // this test's own runner-state tree is touched.
+      const stateRoot = join(root, "runner-state");
+      const removed: string[] = [];
+      for (const scope of readdirSync(stateRoot)) {
+        const piDirectory = join(stateRoot, scope, "pi");
+        if (!existsSync(piDirectory)) continue;
+        for (const name of readdirSync(piDirectory)) {
+          if (!name.endsWith(".jsonl")) continue;
+          rmSync(join(piDirectory, name)); removed.push(join(scope, "pi", name));
+        }
+      }
+      expect(removed, "the retained Pi history file existed before deletion").toHaveLength(1);
+      stage("retained Pi history file deleted", { removed });
+    }
     await api("POST", `/issues/${issueId}/comments`, { body: "New turn after Stop: reply with the next local faux token. No tool needed." }, 201);
+    if (deleteRetainedPiFile) {
+      // Without the Pi file the fallback cannot reach Pi's typed missing-file
+      // ladder; it must refuse under a named code, never answer from a
+      // different Pi session with the history silently gone.
+      const refused = await waitFor("follow-up refused without Pi history", async () => (await db!.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))).find(run => !warmupRunIds.has(run.id) && run.id !== admitted.id && run.status === "failed") ?? null);
+      expect(refused.errorCode).toBe("native_provider_state_incompatible");
+      expect(refused.error).toContain("pi_session_file_missing");
+      const warmAttach = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, refused.id)))
+        .filter(event => event.eventType === "native.warm_attach.failed");
+      expect(warmAttach.map(event => event.payload)).toEqual([expect.objectContaining({ state: "warm_attach_failed_refused", refusal: "pi_history_missing" })]);
+      expect(requests, "no model turn ran on a substitute Pi session").toHaveLength(1);
+      const replies = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_"));
+      expect(replies).toHaveLength(0);
+      stage("GREEN", { refusedRunId: refused.id, errorCode: refused.errorCode, error: refused.error, event: warmAttach[0]!.payload });
+      return;
+    }
     const reply = await waitFor("NEW turn after Stop completes", async () => {
       const rows = await db!.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       return rows.find(row => row.authorAgentId === agentId && row.body.includes("LOCAL_PI_FULL_SERVER_REPLY_1")) ?? null;
@@ -429,7 +463,7 @@ async function stopWarmProof(stopTurn: number, killRetainedRunner = false) {
     stage("BLOCKED", { error: error instanceof Error ? error.stack : String(error), companyId, agentId, issueId });
     throw error;
   } finally {
-    await writeFile(join(root, "proof.json"), JSON.stringify({ stopTurn, killRetainedRunner, warmupIdentities, stages, requests }, null, 2) + "\n");
+    await writeFile(join(root, "proof.json"), JSON.stringify({ stopTurn, killRetainedRunner, deleteRetainedPiFile, warmupIdentities, stages, requests }, null, 2) + "\n");
     await writeFile(join(root, "remote-pack-verification.json"), JSON.stringify(packVerificationCommands, null, 2) + "\n");
     if (db && agentId) {
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
@@ -465,3 +499,6 @@ it.skipIf(!enabled).each([1, 2, 3])(`Stop in turn %s mid-bash keeps the same res
 
 it.skipIf(!enabled)(`REG-03: a Stop, a killed retained runnerd, then a plain message resumes the same session on a new runner (thinking=${thinking})`,
   () => stopWarmProof(1, true), 600_000);
+
+it.skipIf(!enabled)(`REG-03 RFL-F2: a killed retained runnerd whose Pi history file is gone is refused under a named code, never answered from a different Pi session (thinking=${thinking})`,
+  () => stopWarmProof(1, true, true), 600_000);
