@@ -6,7 +6,8 @@ import { badRequest, conflict, forbidden, HttpError } from "../errors.js";
 import { redactSensitiveText } from "../redaction.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { createRunSecretRedactionRegistry } from "./run-secret-redaction.js";
-import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
+import { agentRunWritesRevoked, lockAgentForRunWrite } from "../agent-run-cancellation.js";
+import { withTransactionRetry } from "./transaction-retry.js";
 
 type CommentaryActor = { companyId: string; agentId: string; runId: string; agentApiKeyId?: string | null };
 
@@ -36,7 +37,8 @@ export async function submitAgentCommentary(
   const input = parsed.data;
   const payloadHash = createHash("sha256").update(JSON.stringify([input.kind, input.body])).digest("hex");
   try {
-    const { result, publication } = await db.transaction(async (tx) => {
+    // DB-only: a 40P01/40001 rolls back and is retried; publish only after commit.
+    const { result, publication } = await withTransactionRetry(() => db.transaction(async (tx) => {
       const scopedDb = tx as unknown as Db;
       // Native authority locks issue before run. Legacy follows the same lock order.
       if (authorizeNative) await authorizeNative(scopedDb);
@@ -45,9 +47,13 @@ export async function submitAgentCommentary(
       if (!initialRun) throw forbidden("Feedback requires an authenticated agent run");
       const issueId = boundIssue(initialRun);
       const [issue] = issueId ? await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, actor.companyId))).for("update") : [];
+      // Shared run-write lock order: agents FOR SHARE -> run FOR UPDATE OF
+      // heartbeat_runs only. Locking the agent FOR UPDATE through this join
+      // after the run deadlocked with assertAgentRunWriteAllowed writers.
+      await lockAgentForRunWrite(scopedDb, actor.companyId, actor.agentId);
       const [context] = await tx.select({ run: heartbeatRuns, agent: agents }).from(heartbeatRuns)
         .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId)))
-        .where(predicate).for("update");
+        .where(predicate).for("update", { of: heartbeatRuns });
       if (!context || context.run.status !== "running"
         || agentRunWritesRevoked(context.run)
         || ["paused", "terminated", "pending_approval", "error"].includes(context.agent.status)
@@ -86,7 +92,7 @@ export async function submitAgentCommentary(
         details: { kind: row.kind },
       });
       return { result: { id: row.id, kind: row.kind, createdAt: row.createdAt.toISOString(), replayed: false }, publication };
-    });
+    }));
     if (publication) publishActivity(publication);
     return result;
   } catch (error) {

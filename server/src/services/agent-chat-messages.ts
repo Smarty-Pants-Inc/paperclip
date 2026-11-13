@@ -3,7 +3,8 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import { agentApiKeys, agents, companies, companyMemberships, heartbeatRuns, issueComments, issues, nativeRunResults, type Db } from "@paperclipai/db";
 import { agentApiKeyScopeSchema, isUuidLike, sendChatMessageSchema, type AgentApiKeyScope } from "@paperclipai/shared";
 import { badRequest, conflict, forbidden, notFound, tooManyRequests } from "../errors.js";
-import { agentRunWritesRevoked, assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { agentRunWritesRevoked, assertAgentRunWriteAllowed, lockAgentForRunWrite } from "../agent-run-cancellation.js";
+import { withTransactionRetry } from "./transaction-retry.js";
 import { authorizationService, canActorReadIssuePrivacy, type AuthorizationActor } from "./authorization.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -24,14 +25,6 @@ export interface ChatMessageReceipt {
   chatUrl: string;
   sourceTaskId: string;
   replayed: boolean;
-}
-
-const CHAT_TX_ATTEMPTS = 3;
-function retryableTxError(error: unknown): boolean {
-  for (let e = error as { code?: unknown; cause?: unknown } | undefined, depth = 0; e && depth < 5; e = e.cause as typeof e, depth++) {
-    if (e.code === "40P01" || e.code === "40001") return true;
-  }
-  return false;
 }
 
 function runTask(run: typeof heartbeatRuns.$inferSelect) {
@@ -55,14 +48,7 @@ export async function sendAgentChatMessage(
   // A deadlock (40P01) or serialization failure (40001) rolls the whole
   // transaction back, so a bounded retry cannot double-post: the retry re-reads
   // the comment by clientRequestId and returns a replayed receipt if it exists.
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await sendAgentChatMessageOnce(db, actor, input, contentHash, credentialScope.data, options);
-    } catch (error) {
-      if (attempt >= CHAT_TX_ATTEMPTS || !retryableTxError(error)) throw error;
-      await new Promise(resolve => setTimeout(resolve, 25 * 2 ** attempt + Math.floor(Math.random() * 50)));
-    }
-  }
+  return withTransactionRetry(() => sendAgentChatMessageOnce(db, actor, input, contentHash, credentialScope.data, options));
 }
 
 async function sendAgentChatMessageOnce(
@@ -161,12 +147,10 @@ async function sendAgentChatMessageOnce(
     if (!lockedSource) throw forbidden("This run no longer owns the source task");
     source = lockedSource;
     if (options.authorizeNative) await options.authorizeNative(tx);
-    // Lock order agents -> heartbeat_runs, the same order as concurrent run
-    // writes (an FK insert key-shares the agent row, then
-    // assertAgentRunWriteAllowed share-locks the run). FOR SHARE on the agent
-    // still serializes with pause/terminate but not with FK key-share locks.
-    await tx.select({ id: agents.id }).from(agents)
-      .where(and(eq(agents.id, actor.agentId), eq(agents.companyId, actor.companyId))).for("share");
+    // Shared run-write lock order (lockAgentForRunWrite): agents FOR SHARE ->
+    // heartbeat_runs FOR UPDATE OF heartbeat_runs only. The native authority
+    // above already took the same locks in the same order.
+    await lockAgentForRunWrite(tx, actor.companyId, actor.agentId);
     const [lockedContext] = await contextQuery().for("update", { of: heartbeatRuns });
     const current = validateContext(lockedContext);
     if (current.run.responsibleUserId !== userId) throw forbidden("The responsible human changed before this message was saved");
