@@ -266,6 +266,20 @@ remove obsolete Cloud bindings. Activity records contain event identifiers and
 outcomes but no webhook content. GitHub webhook content is never first-party
 telemetry.
 
+Direct-App endpoints recover recent pre-ingress HTTP 5xx failures by asking
+GitHub to redeliver the original GUID. Deliveries with no HTTP status (`null` or
+`0`, such as connection failures or timeouts) are also eligible, subject to the
+same GUID receipt fence, recovery window, and source validation.
+Eligible events are `issue_comment` and
+`pull_request_review_comment` with action `created`, plus automatic
+`pull_request` actions `opened`, `synchronize`, `reopened`, and `ready_for_review`.
+Comment recovery still requires the unchanged human-authored source. PR recovery
+requires the same PR to remain open; the current PR is fetched again before
+processing, and a moved head is treated as `synchronize` using the current
+snapshot. Normal repository, identity and review-policy checks still apply.
+An existing ingress receipt for the GUID prevents another admission or wake.
+Cloud-managed Apps continue to use the relay's retries, not this scanner.
+
 ## Dedicated agent Apps
 
 The bot wizard uses Cloud gateway protocol version 2. The stack builds the

@@ -4,6 +4,7 @@ import {
   GitHubWebhookRecoveryError,
   getGitHubAppWebhookDelivery,
   getGitHubRecoveryComment,
+  getGitHubRecoveryPullRequest,
   listGitHubAppWebhookDeliveries,
   readGitHubAppWebhookConfig,
   requestGitHubAppWebhookRedelivery,
@@ -619,6 +620,37 @@ describe("GitHub App webhook recovery HTTP boundaries", () => {
       `https://api.github.com/repos/paperclip/example/pulls/comments/${comment.id}`,
     );
     expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("fetches the current PR with read-only pull authority and revokes before returning", async () => {
+    const pull = { id: "9007199254740993", number: 4, state: "open", head: { sha: "a".repeat(40) }, title: "Current title" };
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(json({ token: "installation-test-token" }, 201))
+      .mockResolvedValueOnce(losslessJson(pull))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(getGitHubRecoveryPullRequest({ fetch, appToken,
+      installationId: delivery.installation_id, repositoryFullName, pullRequestNumber: "4",
+    })).resolves.toEqual(pull);
+    expect(JSON.parse(String(fetch.mock.calls[0]?.[1]?.body))).toEqual({
+      repositories: ["example"], permissions: { pull_requests: "read" },
+    });
+    expect(fetch.mock.calls[1]?.[0]).toBe("https://api.github.com/repos/paperclip/example/pulls/4");
+    expect(fetch.mock.calls[2]?.[0]).toBe("https://api.github.com/installation/token");
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([
+    { number: 5 }, { state: "unknown" }, { head: { sha: "not-a-commit" } },
+  ])("rejects malformed canonical PRs and revokes the token (%j)", async change => {
+    const fetch = vi.fn<typeof globalThis.fetch>()
+      .mockResolvedValueOnce(json({ token: "installation-test-token" }, 201))
+      .mockResolvedValueOnce(losslessJson({ id: "9190", number: 4, state: "open", head: { sha: "a".repeat(40) }, ...change }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(getGitHubRecoveryPullRequest({ fetch, appToken,
+      installationId: delivery.installation_id, repositoryFullName, pullRequestNumber: "4",
+    })).rejects.toMatchObject({ code: "github_webhook_recovery_invalid_response" });
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch.mock.calls[2]?.[0]).toBe("https://api.github.com/installation/token");
   });
 
   it.each([

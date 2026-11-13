@@ -29,6 +29,13 @@ export interface GitHubRecoveryComment {
   pullRequestNumber: string | null;
 }
 
+export interface GitHubRecoveryPullRequest extends Record<string, unknown> {
+  id: string;
+  number: number;
+  state: "open" | "closed";
+  head: { sha: string };
+}
+
 export interface GitHubAppWebhookDeliveryDetail extends GitHubAppWebhookDelivery {
   url: string;
   payload: {
@@ -40,6 +47,7 @@ export interface GitHubAppWebhookDeliveryDetail extends GitHubAppWebhookDelivery
     issueNumber: string | null;
     pullRequestId: string | null;
     pullRequestNumber: string | null;
+    pullRequestHeadSha?: string | null;
     comment: GitHubRecoveryComment | null;
     senderId: string | null;
   };
@@ -565,6 +573,9 @@ export async function getGitHubAppWebhookDelivery(
           issueNumber: nestedNumber("issue"),
           pullRequestId: nestedId("pull_request"),
           pullRequestNumber: nestedNumber("pull_request"),
+          ...(metadata.event === "pull_request" ? {
+            pullRequestHeadSha: commitSha(record(record(payload.pull_request).head).sha),
+          } : {}),
           comment:
             payload.comment == null
               ? null
@@ -624,6 +635,56 @@ export async function getGitHubRecoveryComment(
       "github_webhook_recovery_invalid_input",
     );
   }
+  const kind = input.event === "issue_comment" ? "issues" : "pulls";
+  return readGitHubRecoverySource(input, installationId, fullName,
+    `/repos/${fullName}/${kind}/comments/${id}`,
+    { issues: "read", pull_requests: "read" },
+    async (response, signal) => {
+      const comment = commentMetadata(
+        await readLosslessJson(response, MAX_DETAIL_BYTES, signal), fullName,
+      );
+      if (comment.id !== id || (kind === "issues" ? comment.issueNumber : comment.pullRequestNumber) === null)
+        invalidResponse();
+      return comment;
+    });
+}
+
+function commitSha(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{40}$/i.test(value)) invalidResponse();
+  return value;
+}
+
+/** Fetch the canonical PR with a read-only repository token, never the stale
+ * delivery-history body. The caller still applies normal review policy. */
+export async function getGitHubRecoveryPullRequest(
+  input: AppRequest & { installationId: string; repositoryFullName: string; pullRequestNumber: string },
+): Promise<GitHubRecoveryPullRequest> {
+  const number = inputId(input.pullRequestNumber);
+  const installationId = inputId(input.installationId);
+  let fullName: string;
+  try { fullName = repositoryName(input.repositoryFullName); }
+  catch { throw new GitHubWebhookRecoveryError("github_webhook_recovery_invalid_input"); }
+  return readGitHubRecoverySource(input, installationId, fullName,
+    `/repos/${fullName}/pulls/${number}`, { pull_requests: "read" },
+    async (response, signal) => {
+      const row = record(await readLosslessJson(response, MAX_DETAIL_BYTES, signal));
+      const id = decimalId(row.id);
+      if (decimalId(row.number) !== number || !Number.isSafeInteger(Number(number)) ||
+          (row.state !== "open" && row.state !== "closed")) invalidResponse();
+      const head = record(row.head);
+      return { ...row, id, number: Number(number), state: row.state,
+        head: { ...head, sha: commitSha(head.sha) } };
+    });
+}
+
+async function readGitHubRecoverySource<T>(
+  input: AppRequest,
+  installationId: string,
+  fullName: string,
+  path: string,
+  permissions: Record<string, "read">,
+  project: (response: Response, signal: AbortSignal) => Promise<T>,
+): Promise<T> {
   const token = await recoveryRequest({
     ...input,
     token: input.appToken,
@@ -633,7 +694,7 @@ export async function getGitHubRecoveryComment(
     timeoutMs: 10_000,
     body: JSON.stringify({
       repositories: [fullName.split("/")[1]],
-      permissions: { issues: "read", pull_requests: "read" },
+      permissions,
     }),
     project: async (response, signal) => {
       const row = record(await readLosslessJson(response, 16_384, signal));
@@ -646,27 +707,7 @@ export async function getGitHubRecoveryComment(
     },
   });
   try {
-    const kind = input.event === "issue_comment" ? "issues" : "pulls";
-    return await recoveryRequest({
-      ...input,
-      token,
-      path: `/repos/${fullName}/${kind}/comments/${id}`,
-      timeoutMs: 10_000,
-      project: async (response, signal) => {
-        const comment = commentMetadata(
-          await readLosslessJson(response, MAX_DETAIL_BYTES, signal),
-          fullName,
-        );
-        if (
-          comment.id !== id ||
-          (kind === "issues"
-            ? comment.issueNumber
-            : comment.pullRequestNumber) === null
-        )
-          invalidResponse();
-        return comment;
-      },
-    });
+    return await recoveryRequest({ ...input, token, path, timeoutMs: 10_000, project });
   } finally {
     await recoveryRequest({
       ...input,
