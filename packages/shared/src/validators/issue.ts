@@ -685,6 +685,7 @@ export const resolveIssueRecoveryActionSchema = z
       .strict()
       .optional(),
     actionId: z.string().guid().optional(),
+    sourceRunId: z.string().guid().optional(),
     outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
     sourceIssueStatus: z.enum(ISSUE_STATUSES),
     resolutionNote: multilineTextSchema.optional().nullable(),

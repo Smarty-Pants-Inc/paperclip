@@ -10569,6 +10569,7 @@ export function issueRoutes(
 
       const {
         actionId,
+        sourceRunId,
         outcome,
         sourceIssueStatus,
         resolutionNote,
@@ -10612,9 +10613,17 @@ export function issueRoutes(
           recoveryAction.status !== "resolved" || recoveryAction.outcome !== "handed_back"
         ) return null;
         const blocker = await getExecutionBlocker(retryDb, issue.companyId, issue.id);
+        const refusal = parseObject(evidence.taskRetryRefusal);
+        const currentRunId = typeof evidence.latestRunId === "string" ? evidence.latestRunId : null;
+        const currentCardRefresh = refusal.schema === "paperclip.task-retry-source-refusal.v1" &&
+          refusal.recoveryActionId === recoveryAction.id && refusal.sourceRunId === blocker?.runId &&
+          refusal.currentRunId === currentRunId && sourceRunId === currentRunId && typeof currentRunId === "string";
+        const originalCardClick = currentRunId === blocker?.runId &&
+          (sourceRunId === undefined || sourceRunId === blocker.runId);
+        const retrySourceRunId = currentCardRefresh ? currentRunId : originalCardClick ? blocker?.runId : null;
         if (!blocker || blocker.cause !== "native_continuation_requires_reconciliation" ||
             !blocker.recoveryActionId || blocker.recoveryActionId === recoveryAction.id || !blocker.runId ||
-            blocker.agentId !== issue.assigneeAgentId || evidence.latestRunId !== blocker.runId) return null;
+            blocker.agentId !== issue.assigneeAgentId || !retrySourceRunId) return null;
         const [hold] = await retryDb.select().from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.id, blocker.recoveryActionId),
           eq(issueRecoveryActions.companyId, issue.companyId),
@@ -10631,7 +10640,7 @@ export function issueRoutes(
         const { requestTaskRetry } = await import("../services/task-retry.js");
         const receipt = await requestTaskRetry({ db: retryDb, companyId: issue.companyId, issueId: issue.id,
           actorId: actor.actorId, actorSource: req.actor.source,
-          idempotencyKey: recoveryAction.id, observedRunId: blocker.runId,
+          idempotencyKey: recoveryAction.id, observedRunId: retrySourceRunId,
           prepareChatRetry: opts.chatRunRetries?.prepareFailedChatRunRetry });
         if (!receipt.accepted || !receipt.requestId) {
           if (receipt.stale && receipt.observedRunId) staleSourceRefusal = {
@@ -10768,12 +10777,14 @@ export function issueRoutes(
         if (outcome === "restored" && sourceIssueStatus === "todo" &&
             currentRetryRefusal.schema === "paperclip.task-retry-source-refusal.v1" &&
             currentRetryRefusal.currentRunId === currentRecoveryEvidence.latestRunId &&
-            currentRetryRefusal.sourceRunId !== currentRetryRefusal.currentRunId) {
+            currentRetryRefusal.sourceRunId !== currentRetryRefusal.currentRunId &&
+            sourceRunId !== currentRecoveryEvidence.latestRunId) {
           throw conflict(
-            "The current run's recovery card is shown on this task. Use its current recovery outcome; the older run cannot be retried.",
+            "The recovery card changed runs. Refresh the task before trying again.",
             { code: "task_retry_source_changed" },
           );
         }
+
         await requireRecoveryActionAuthority(
           req,
           lockedIssue,

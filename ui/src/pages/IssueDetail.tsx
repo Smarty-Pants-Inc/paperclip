@@ -4650,6 +4650,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   const resolveRecoveryAction = useMutation({
     mutationFn: (data: {
       actionId?: string;
+      sourceRunId?: string;
       outcome: ResolveRecoveryActionOutcome;
       sourceIssueStatus: "todo" | "done" | "in_review" | "blocked";
       resolutionNote?: string | null;
@@ -7166,6 +7167,8 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     await resumeAssigneeAgent.mutateAsync();
   }, [resumeAssigneeAgent.mutateAsync]);
   const activeRecoveryActionId = issue?.activeRecoveryAction?.id;
+  const activeRecoveryActionSourceRunId = typeof issue?.activeRecoveryAction?.evidence?.latestRunId === "string"
+    ? issue.activeRecoveryAction.evidence.latestRunId : undefined;
   const handleResolveRecoveryAction = useCallback(
     (
       outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome,
@@ -7176,6 +7179,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         case "todo":
           void resolveRecoveryAction.mutateAsync({
             actionId,
+            ...(activeRecoveryActionSourceRunId ? { sourceRunId: activeRecoveryActionSourceRunId } : {}),
             outcome: "restored",
             sourceIssueStatus: "todo",
           });
@@ -7210,7 +7214,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           return;
       }
     },
-    [activeRecoveryActionId, resolveRecoveryAction.mutateAsync],
+    [activeRecoveryActionId, activeRecoveryActionSourceRunId, resolveRecoveryAction.mutateAsync],
   );
   const handleTryAgainNoLiveExecutionPath = useCallback(() => {
     handleResolveRecoveryAction("todo");
