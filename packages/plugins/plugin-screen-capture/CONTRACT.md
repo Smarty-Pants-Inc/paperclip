@@ -26,7 +26,7 @@ Parameters $1 company, $2 run, $3 agent come ONLY from trusted context; $4 princ
 
 R1-R3: company/run/agent bindings, primary pin, principal responsible user, running state, same primary-principal conversation, wakeCommentId exists in that conversation, structured author_user_id matches principal, no agent author, not deleted.
 
-R4: no later non-deleted person comment and no later non-deleted agent comment (strict created_at > wake message created_at, per accepted spec). `author_type='system'` or `presentation->>'kind'='system_notice'` is a system note, not an answer. No natural-language body parsing. invocation_source, wakeReason and wakeSource (fallback source) are **logged, NOT eligibility gates**. A continuation/retry with the same still-unanswered person witness may qualify; an answered stale witness is refused.
+R4: no later non-deleted person comment and no later non-deleted agent comment in Paperclip's total `(created_at, id)` order (`server/src/services/issues.ts`, comment listing/latest cursor). Both checks use `(candidate.created_at, candidate.id) > (wake.created_at, wake.id)`: at equal timestamps, a higher ID invalidates the wake; a lower ID precedes it. `author_type='system'` or `presentation->>'kind'='system_notice'` is a system note, not an answer. No natural-language body parsing. invocation_source, wakeReason and wakeSource (fallback source) are **logged, NOT eligibility gates**. A continuation/retry with the same still-unanswered person witness may qualify; an answered stale witness is refused.
 
 ## Refusal and zero-row contract
 
@@ -89,7 +89,9 @@ Apply only on the GATE TEST company at the coordinated proof time, after M1.4a. 
 
 ## Required regression proofs
 
-[test/capture.test.mjs](test/capture.test.mjs) uses an owned disposable REAL PostgreSQL, not an in-memory uniqueness imitation. REDs include stale-retry, newer-person, ops/agent authors, other issue, hire/task, no-witness scheduled/self, deleted/hard-deleted message, cross-company, forged identity args, repeat claim, two genuinely concurrent different-run claims for one message (exactly one winner; loser already_used logged), eligibility change between pre-read/INSERT, and delete-between-claim/use. Also verifies body-free view and audit failure.
+[test/capture.test.mjs](test/capture.test.mjs) uses an owned disposable REAL PostgreSQL, not an in-memory uniqueness imitation. REDs include stale-retry, newer-person, ops/agent authors, other issue, hire/task, no-witness scheduled/self, deleted/hard-deleted message, cross-company, forged identity args, repeat claim, two genuinely concurrent different-run claims for one message (exactly one winner; loser already_used logged), eligibility change between pre-read/INSERT, and delete-between-claim/use. Also verifies body-free view and audit failure. RFL's person/agent timestamp-tie probes are permanent RED regressions: they check core tuple order, zero rows from the actual atomic INSERT, fresh eligibility and the handler's refusal/audit. Lower-ID tied comments remain eligible.
+
+Scope exception: RFL granted the test-only exception for `server/src/__tests__/screen-capture-plugin.test.ts` in the hosts-lead follow-up brief (2026-11-14, `hl-screencap-fix1-1114/BRIEF.md`). It is the only allowed file outside this package and the existing lockfile importer; no runtime file outside the package is permitted or changed.
 
 Permanent host/SDK coverage: `server/src/__tests__/screen-capture-plugin.test.ts` runs in the existing server Vitest lane. It imports the actual host SQL validators, validates the exact migration/statement strings and manifest, and registers the actual worker through the SDK harness, including logged non-primary and forged-argument refusals. Its DB adapter is mocked; it is NOT a substitute for the focused real-PostgreSQL concurrency receipt. The package's native PostgreSQL suite is not automatically selected by the root Vitest projects list.
 

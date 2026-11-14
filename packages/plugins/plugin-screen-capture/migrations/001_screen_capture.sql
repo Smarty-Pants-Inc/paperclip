@@ -64,7 +64,7 @@ SELECT r.company_id, r.id AS run_id, r.agent_id, r.status AS run_status,
       AND newer.deleted_at IS NULL AND newer.author_user_id IS NOT NULL
       AND COALESCE(newer.author_type, 'user') <> 'system'
       AND COALESCE(newer.presentation->>'kind', '') <> 'system_notice'
-      AND newer.created_at > c.created_at
+      AND (newer.created_at, newer.id) > (c.created_at, c.id)
   ) AS has_newer_person,
   EXISTS (
     SELECT 1 FROM public.issue_comments answer
@@ -72,7 +72,7 @@ SELECT r.company_id, r.id AS run_id, r.agent_id, r.status AS run_status,
       AND answer.deleted_at IS NULL AND answer.author_agent_id IS NOT NULL
       AND COALESCE(answer.author_type, 'agent') <> 'system'
       AND COALESCE(answer.presentation->>'kind', '') <> 'system_notice'
-      AND answer.created_at > c.created_at
+      AND (answer.created_at, answer.id) > (c.created_at, c.id)
   ) AS has_later_agent
 FROM public.heartbeat_runs r
 LEFT JOIN public.agents a ON a.id = r.agent_id AND a.company_id = r.company_id

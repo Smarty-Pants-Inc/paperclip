@@ -58,8 +58,8 @@ async function expectRefusal(reason, call = () => handler()({}, context)) {
   return log[0];
 }
 
-async function later({ person = false, authorType, systemNotice = false, deleted = false, sameTime = false } = {}) {
-  await pg.raw(`INSERT INTO public.issue_comments VALUES ('${id(20)}', '${C}', '${I}',
+async function later({ person = false, authorType, systemNotice = false, deleted = false, sameTime = false, commentId = id(20) } = {}) {
+  await pg.raw(`INSERT INTO public.issue_comments VALUES ('${commentId}', '${C}', '${I}',
     ${person ? "'test-principal'" : 'NULL'}, ${person ? 'NULL' : `'${A}'`},
     '${authorType ?? (person ? 'user' : 'agent')}', '2026-01-01T00:00:0${sameTime ? '0' : '1'}Z',
     ${deleted ? "'2026-01-01T00:00:02Z'" : 'NULL'}, ${systemNotice ? "'{\"kind\":\"system_notice\"}'" : 'NULL'}, 'not returned');`);
@@ -124,10 +124,28 @@ for (const person of [false, true]) {
   });
 }
 
-test('R4 strict created_at comparison does not treat equal timestamps as later', async () => {
-  await later({ sameTime: true });
-  assert.deepEqual(await handler()({}, context), { content: STUB_REPLY });
-});
+for (const person of [true, false]) {
+  test(`RED RFL tie: ${person ? 'person' : 'agent'} later in (created_at, id) order invalidates wake`, async () => {
+    await later({ person, sameTime: true });
+    const ordered = await pg.query(`SELECT id FROM public.issue_comments
+      WHERE company_id='${C}' AND issue_id='${I}' ORDER BY created_at, id`);
+    assert.deepEqual(ordered.map(row => row.id), [M, id(20)]);
+    // Exercise the actual atomic INSERT, not only the handler's pre-read.
+    assert.equal((await db.execute(CLAIM, [C, R, A, policy.principalUserId, A, C, id(40)])).rowCount, 0);
+    const [facts] = await db.query(READ_FACTS, [C, R, A, policy.principalUserId, A, C]);
+    assert.equal(facts.reason, 'not_newest_unanswered');
+    assert.equal(person ? facts.has_newer_person : facts.has_later_agent, true);
+    await expectRefusal('not_newest_unanswered');
+  });
+
+  test(`R4 tied ${person ? 'person' : 'agent'} with lower ID precedes wake and does not invalidate it`, async () => {
+    await later({ person, sameTime: true, commentId: id(0) });
+    const ordered = await pg.query(`SELECT id FROM public.issue_comments
+      WHERE company_id='${C}' AND issue_id='${I}' ORDER BY created_at, id`);
+    assert.deepEqual(ordered.map(row => row.id), [id(0), M]);
+    assert.deepEqual(await handler()({}, context), { content: STUB_REPLY });
+  });
+}
 
 test('ops structured author refused and correctly attributed, even with principal responsible user', async () => {
   await pg.raw(`UPDATE public.issue_comments SET author_user_id='test-ops' WHERE id='${M}'`);

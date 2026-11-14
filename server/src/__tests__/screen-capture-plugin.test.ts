@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk";
-import { pluginManifestV1Schema } from "@paperclipai/shared";
+import { pluginManifestV1Schema, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   derivePluginDatabaseNamespace,
   validatePluginMigrationStatement,
@@ -17,7 +17,12 @@ import {
 
 // Permanent CI contract coverage. Real PostgreSQL race/deletion receipts live in
 // the package's focused suite; this file needs no shared DB or running instance.
-const parsedManifest = pluginManifestV1Schema.parse(manifest);
+const validatedManifest = pluginManifestV1Schema.parse(manifest);
+// The schema's optional routine-variable label differs from the SDK type.
+// Narrow this absent field explicitly, without casting away validation errors.
+if (validatedManifest.routines !== undefined) throw new Error("Screen capture must not declare routines");
+const parsedManifest: PaperclipPluginManifestV1 = { ...validatedManifest, routines: undefined };
+const coreReadTables = parsedManifest.database!.coreReadTables!;
 const context = {
   companyId: "00000000-0000-4000-8000-000000000001",
   agentId: "00000000-0000-4000-8000-000000000002",
@@ -34,6 +39,7 @@ describe("screen capture plugin host contract", () => {
   it("passes the real manifest validator with only the documented capabilities", () => {
     expect(parsedManifest.id).toBe("smarty.screen-capture");
     expect(parsedManifest.tools).toEqual([TOOL]);
+    expect(coreReadTables).toEqual(manifest.database.coreReadTables);
     expect(parsedManifest.capabilities).toEqual([
       "agent.tools.register", "database.namespace.migrate",
       "database.namespace.read", "database.namespace.write",
@@ -60,20 +66,20 @@ describe("screen capture plugin host contract", () => {
     expect(statements).toHaveLength(5);
     for (const statement of statements) {
       expect(() => validatePluginMigrationStatement(statement, NAMESPACE,
-        manifest.database.coreReadTables)).not.toThrow();
+        coreReadTables)).not.toThrow();
     }
     const view = statements.find(statement => statement.includes("CREATE VIEW"))!;
     expect(() => validatePluginMigrationStatement(view, NAMESPACE, [])).toThrow(/not whitelisted/);
     expect(() => validatePluginMigrationStatement(
       view.replace("public.heartbeat_runs", "public.user_company_preferences"),
-      NAMESPACE, manifest.database.coreReadTables,
+      NAMESPACE, coreReadTables,
     )).toThrow(/not whitelisted/);
   });
 
   it("admits every exact runtime statement without allowing public writes", () => {
     for (const statement of [READ_FACTS, READ_CLAIM]) {
       expect(() => validatePluginRuntimeQuery(statement, NAMESPACE,
-        manifest.database.coreReadTables)).not.toThrow();
+        coreReadTables)).not.toThrow();
     }
     for (const statement of [CLAIM, START_LOG, UPDATE_LOG, FINISH_CLAIM]) {
       expect(() => validatePluginRuntimeExecute(statement, NAMESPACE)).not.toThrow();
