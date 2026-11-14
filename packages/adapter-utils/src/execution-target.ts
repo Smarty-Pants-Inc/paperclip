@@ -4527,6 +4527,24 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       }
     }
   };
+  const clearHttp2RunState = async (): Promise<void> => {
+    try {
+      const command = `rm -f ${shellQuote(runStatePath)}`;
+      const result = await runSandboxBridgeControlCommand(runner, {
+        command: shellCommand,
+        args: shellCommandArgs(command),
+        cwd: target.remoteCwd,
+        env: { PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge" },
+        timeoutMs: 5_000,
+      });
+      if (result.timedOut || result.exitCode !== 0) throw new Error("run-state clear failed");
+    } catch (error) {
+      if (!runStateWriteFailureLogged) {
+        runStateWriteFailureLogged = true;
+        void Promise.resolve().then(() => onLog("stderr", `[paperclip] Sandbox HTTP/2 bridge could not update run state: ${error instanceof Error ? error.message : String(error)}\n`)).catch(() => undefined);
+      }
+    }
+  };
   const assetRemoteDir = path.posix.join(bridgeRuntimeDir, "server");
   const bridgeToken = createSandboxCallbackBridgeToken();
   const configuredAttachmentBytes = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES);
@@ -4809,7 +4827,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         remoteEntrypoint: assetSync.remoteEntrypoint,
         env: gatewayEnv,
       });
-      await writeHttp2RunState("paused");
+      if (input.startPaused) await writeHttp2RunState("paused");
+      else await clearHttp2RunState();
       openStage = "channel_open";
       channel = await openDuplexChannel({ command });
     } catch (error) {
