@@ -107,8 +107,10 @@ import {
   rejectIssueThreadInteractionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
+  requestConfirmationIssueDocumentTargetSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationResultSchema,
+  requestConfirmationTargetSchema,
   requestItemVerdictsPayloadSchema,
   requestItemVerdictsResultSchema,
   skipIssueThreadInteractionSchema,
@@ -2015,7 +2017,10 @@ async function getIssueDocumentTargetSnapshot(
       latestRevisionNumber: documents.latestRevisionNumber,
     })
     .from(issueDocuments)
-    .innerJoin(documents, eq(issueDocuments.documentId, documents.id))
+    .innerJoin(documents, and(
+      eq(issueDocuments.documentId, documents.id),
+      eq(documents.companyId, args.companyId),
+    ))
     .where(
       and(
         eq(issueDocuments.companyId, args.companyId),
@@ -2056,6 +2061,40 @@ async function getIssueAttachmentTargetSnapshot(db: Db | any, args: {
       eq(issueAttachments.id, args.target.attachmentId), eq(assets.id, args.target.assetId), eq(assets.sha256, args.target.sha256)));
   const rows = await (args.lockForUpdate ? query.for("update", { of: [issueAttachments, assets] }) : query);
   return rows[0] ?? null;
+}
+
+function issueDocumentTargetRevisionMismatch(
+  snapshot: NonNullable<Awaited<ReturnType<typeof getIssueDocumentTargetSnapshot>>>,
+  target: Extract<RequestConfirmationTarget, { type: "issue_document" }>,
+): "revision_id" | "revision_number" | null {
+  if (snapshot.latestRevisionId !== target.revisionId) return "revision_id";
+  if (target.revisionNumber != null && snapshot.latestRevisionNumber !== target.revisionNumber)
+    return "revision_number";
+  return null;
+}
+
+export type SameIssueDocumentConfirmationTargetRefusal =
+  | "invalid" | "unsupported" | "wrong_issue" | "unavailable" | "revision_changed";
+
+/** A response-only caller may confirm only the exact current document on its own issue.
+ * Parsing and document lookup stay with the interaction target's owning module. */
+export async function getSameIssueDocumentConfirmationTargetRefusal(
+  db: Db,
+  args: { companyId: string; issueId: string; target: unknown },
+): Promise<SameIssueDocumentConfirmationTargetRefusal | null> {
+  const parsed = requestConfirmationIssueDocumentTargetSchema.safeParse(args.target);
+  if (!parsed.success) {
+    return requestConfirmationTargetSchema.safeParse(args.target).success ? "unsupported" : "invalid";
+  }
+  const target = parsed.data;
+  if (target.issueId != null && target.issueId !== args.issueId) return "wrong_issue";
+  const snapshot = await getIssueDocumentTargetSnapshot(db, {
+    companyId: args.companyId,
+    issueId: args.issueId,
+    target,
+  });
+  if (!snapshot || !snapshot.latestRevisionId) return "unavailable";
+  return issueDocumentTargetRevisionMismatch(snapshot, target) ? "revision_changed" : null;
 }
 
 function buildIssueDocumentTargetFromSnapshot(args: {
@@ -2125,15 +2164,13 @@ async function assertRequestConfirmationTargetIsCurrent(
     target: args.target,
     lockForUpdate: args.lockForUpdate,
   });
-  if (!snapshot || snapshot.latestRevisionId !== args.target.revisionId) {
+  const mismatch = snapshot ? issueDocumentTargetRevisionMismatch(snapshot, args.target) : "revision_id";
+  if (mismatch === "revision_id") {
     throw unprocessable(
       "request_confirmation target must reference the current issue document revision",
     );
   }
-  if (
-    args.target.revisionNumber &&
-    snapshot.latestRevisionNumber !== args.target.revisionNumber
-  ) {
+  if (mismatch === "revision_number") {
     throw unprocessable(
       "request_confirmation target revisionNumber must match the current issue document revision",
     );
