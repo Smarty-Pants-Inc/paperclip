@@ -1982,6 +1982,9 @@ it("stamps every lifecycle issue, preserves the original issuer on replay/restor
     core.setCommandIssuer({ bootId: "new-controller", generation: 8 });
     expect(core.queueCommand("runner.drain", {}, "old-drain").issuer).toEqual({ bootId: "old-controller", generation: 7 });
     for (const type of ["runner.suspend", "runner.shutdown"]) expect(core.queueCommand(type).issuer).toEqual({ bootId: "new-controller", generation: 8 });
+    core.setCommandIssuer(null);
+    expect(core.queueCommand("runner.drain", {}, "old-drain").issuer).toEqual({ bootId: "old-controller", generation: 7 });
+    expect(core.queueCommand("runner.shutdown", {}, "unstamped-shutdown").issuer).toBeUndefined();
     await core.start();
     const client = (await authenticate(core, core.issueBootstrapTicket()))!;
     try {

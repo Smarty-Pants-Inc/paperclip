@@ -3062,8 +3062,8 @@ export class DurablePrpControlPlane {
     this.#store.commit(candidate);
   }
 
-  /** Bind future lifecycle issuance to the server's fenced DB owner. Replays retain their original stamp. */
-  setCommandIssuer(issuer: { bootId: string; generation: number }): void {
+  setCommandIssuer(issuer: { bootId: string; generation: number } | null): void {
+    if (issuer === null) { this.#commandIssuer = undefined; return; }
     if (!issuer.bootId || !Number.isSafeInteger(issuer.generation) || issuer.generation < 1) {
       throw new Error("native_runner_command_issuer_invalid");
     }
