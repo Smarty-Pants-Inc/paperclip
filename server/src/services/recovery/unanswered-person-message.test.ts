@@ -269,6 +269,42 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(codeOf(notices[0]!)).toBe("no_reply");
   });
 
+  // app-lead's real-browser capture on the lab (M1.2, SMAA-1909, 13:23Z): the person sent "/new" (Paperclip's session
+  // reset, agent-conversations.ts isConversationReset); the chat showed only the "New session" divider, but B' wrote
+  // "This run finished without a reply to your message" 16 s later. A reset is a COMMAND, not a message owed a reply,
+  // and it is a boundary: no B' note for it, and none for a message sent before it.
+  const flaggedCount = async (f: Awaited<ReturnType<typeof fixture>>) => (await db.select({ id: issueComments.id }).from(issueComments)
+    .where(and(eq(issueComments.issueId, f.issueId), unansweredPersonMessageCommentCondition()))).length;
+
+  it("SMAA-1909: the person sends '/new' and the reset run ends with no reply -> NO B' note, and discovery does not flag it", async () => {
+    const f = await fixture({ status: "in_review" });
+    await f.run({ commentId: await f.message("/new"), status: "succeeded" });
+    await f.sweep(); await f.sweep();
+    expect(await f.history(), "no note at all").toHaveLength(0);
+    expect(await flaggedCount(f), "a reset command is not a person message owed a reply").toBe(0);
+  });
+
+  it("SMAA-1909: an unanswered message BEFORE '/new' is behind the reset boundary -> no note for it either", async () => {
+    const f = await fixture({ status: "in_review" });
+    await f.run({ commentId: await f.message("Please continue."), status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await f.run({ commentId: await f.message(" /new\n"), status: "succeeded" });
+    await f.sweep(); await f.sweep();
+    expect(await f.history(), "no note for the reset or the message before it").toHaveLength(0);
+    expect(await flaggedCount(f)).toBe(0);
+  });
+
+  it("SMAA-1909 control: a real message AFTER '/new' that gets no reply DOES get exactly one note", async () => {
+    const f = await fixture({ status: "in_review" });
+    await f.run({ commentId: await f.message("/new"), status: "succeeded" });
+    const real = await f.message("What was the word?");
+    await f.run({ commentId: real, status: "succeeded" });
+    await f.sweep(); await f.sweep();
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toBe(NO_REPLY);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${real}`);
+  });
+
   it("conversation clause: an ANSWERED waiting chat is a valid wait (no notice); an UNANSWERED one is not (one notice)", async () => {
     const answered = await fixture({ status: "in_review" });
     await answered.reply(await answered.run({ commentId: await answered.message(), status: "succeeded" }));
