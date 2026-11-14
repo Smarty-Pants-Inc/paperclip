@@ -39,9 +39,18 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
       createdByRunId: other.id, body: "Unrelated work" });
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
+    // RFL 20:06Z (J3'/J6'): a reply by a run whose context held only an EARLIER person comment does not answer this one.
+    const [earlier] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: "board",
+      body: "Earlier", createdAt: new Date(f.message.createdAt.getTime() - 60_000) }).returning();
+    const [earlierRun] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: earlier.id } }).returning();
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: earlierRun.id, body: "Answer to the earlier one" });
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ wakeCommentIds: [f.message.id] });
     await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
       createdByRunId: f.run.id, body: "COBALT" });
-    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toMatchObject({ commentContinuation: true, wakeCommentIds: [f.message.id], wakeCommentId: f.message.id });
+    // RFL ruling (1), 20:06Z: the parent's OWN published reply answers the comment (carrying it would answer it twice).
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
   });
 
   it("keeps all live comment authors within the source company and task", async () => {
