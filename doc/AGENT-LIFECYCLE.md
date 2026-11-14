@@ -333,6 +333,15 @@ Task requests can enter the durable run queue during preparation, verification,
 and resume. Execution waits for readiness. Queue recovery does not require
 periodic agent heartbeats to be enabled.
 
+Resume can remove the last hold while the agent is still `pausing`. The existing
+Stop operation must settle before the worker completes resume; removing a hold
+is not proof that an external stop or plugin cleanup was cancelled. During this
+hold-free transition, stranded-task recovery leaves assigned work in place
+instead of escalating it because the compatibility status is still `paused`.
+A never-run task remains `todo`; readiness notifies recovery to reconsider it
+through normal admission. Remaining manual, budget, and company holds retain
+their existing behavior.
+
 A cancelled run record does not prove that execution stopped.
 The host also checks process ownership, controller leases, and environment cleanup.
 Required plugin cleanup cannot start while these checks are incomplete.
