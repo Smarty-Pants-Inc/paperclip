@@ -24,6 +24,7 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "./unanswered-person-message.js";
+import { freshContinuationVerdict } from "../fresh-continuation-fallback.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -654,6 +655,78 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const kept = history.find(note => note.id === retrying.id)!;
     expect(kept.body, "the retrying note is kept unchanged").toBe(retrying.body);
     expect((kept.metadata as Record<string, unknown> | null)?.supersededBy, "and marked superseded by the held note").toBe(notes[0]!.id);
+  });
+
+  // RFL ruling (0), 18:04Z (b3 G1): a message BEFORE a reset whose run failed on Paperclip's fallback lane never
+  // consults the fallback verdict (current state); a message AFTER the last /new keeps the full verdict path.
+  const seedAFailure = async (f: Awaited<ReturnType<typeof fixture>>, message: string, blockedAtFailure = true) => {
+    const failed = await f.run({ commentId: message, status: "failed", errorCode: "native_session_interrupted",
+      error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    if (blockedAtFailure) {
+      const [failedRow] = await db.select({ finishedAt: heartbeatRuns.finishedAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
+      await db.update(issues).set({ blockedTransitionAt: failedRow!.finishedAt }).where(eq(issues.id, f.issueId));
+    }
+    return failed;
+  };
+  const refusedContinuation = (f: Awaited<ReturnType<typeof fixture>>, message: string, failed: string) => f.run({ commentId: message,
+    status: "failed", errorCode: "native_continuation_requires_reconciliation",
+    error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", retryOfRunId: failed });
+
+  it("ruling (0), condition 1: a message AFTER the last /new keeps the full recovery-verdict path (wait, then 'retrying automatically', then the held note)", async () => {
+    const f = await fixture({ status: "blocked" });
+    await f.message("/new");
+    const message = await f.message("What word did I ask you to remember?");
+    const failed = await seedAFailure(f, message);
+    await settleAt(f, 0);
+    expect(await f.history(), "within T0: waiting for Paperclip's own recovery").toHaveLength(0);
+    await settleAt(f, 3 * 60_000);
+    expect((await f.visible()).map(note => note.body)).toEqual([RETRYING]);
+    await refusedContinuation(f, message, failed);
+    await settleAt(f, 5 * 60_000);
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toBe(CHAT_HELD);
+  });
+
+  it("ruling (0), condition 2: a note posted BEFORE the reset is left as it is: no second note, no withdrawal, one current note", async () => {
+    const f = await fixture({ status: "blocked" });
+    const message = await f.message("What word did I ask you to remember?");
+    const failed = await seedAFailure(f, message);
+    await settleAt(f, 0);
+    await settleAt(f, 3 * 60_000);
+    const [retrying] = await f.visible();
+    expect(retrying!.body).toBe(RETRYING);
+    // The person resets after that note was posted; the recovery verdict (a refusal) only comes after the reset.
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: "/new", authorType: "user",
+      authorUserId: f.userId, createdAt: new Date(Date.now() + 3 * 60_000 + 1_000) });
+    await refusedContinuation(f, message, failed);
+    for (const ms of [4, 5, 6]) {
+      await settleAt(f, ms * 60_000);
+      const current = await f.visible();
+      expect(current, "one current note at every point").toHaveLength(1);
+      expect(current[0]!.id, "the pre-reset note stands").toBe(retrying!.id);
+    }
+    const kept = (await f.history()).find(note => note.id === retrying!.id)!;
+    expect(kept.body).toBe(retrying!.body);
+    expect(await f.history(), "no second note").toHaveLength(1);
+  });
+
+  // RFL b3 on c8c1e72f, G3 (b): seed A's fixture keeps BOTH shapes. With no block time the task's block is not the
+  // failure's own (Paperclip's verdict: person_owned "blocked_by_another_decision"), so no automatic retry is claimed.
+  it.each([true, false])("seed A, no block timestamp (chat=%s): Paperclip's verdict is person-owned -> no wait, no 'retrying automatically', ONE note at once", async chat => {
+    const f = await fixture({ status: "blocked", chat });
+    const message = await f.message("What word did I ask you to remember?");
+    const failed = await seedAFailure(f, message, false);
+    expect(await freshContinuationVerdict(db, { companyId: f.companyId, runId: failed }))
+      .toEqual({ kind: "person_owned", reason: "blocked_by_another_decision" });
+    await settleAt(f, 0);
+    const notes = await f.visible();
+    expect(notes, "Paperclip will not retry it: the note comes at once").toHaveLength(1);
+    expect(notes[0]!.body).not.toBe(RETRYING);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+    await settleAt(f, 3 * 60_000);
+    expect((await f.history()).some(note => note.body === RETRYING), "never claims an automatic retry").toBe(false);
+    expect(await f.visible()).toHaveLength(1);
   });
 
   it("M1.1 (1): a queued wake carrying the issue that never runs -> no notice inside the bound, exactly one after it", async () => {
