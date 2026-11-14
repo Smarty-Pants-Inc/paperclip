@@ -2528,6 +2528,47 @@ fn process_command<E: CommandExecutor>(
     Ok((result, CommandLifecycle::for_terminal(command)))
 }
 
+// Provider regressions use the same journal, lifecycle-before-delivery and
+// post-ACK cleanup as runnerd. Only the authenticated controller's ACK is local.
+#[cfg(test)]
+pub(crate) fn suspend_for_provider_test<E: CommandExecutor>(
+    config: &DurableRunnerConfig,
+    executor: &mut E,
+) -> Result<DurableState, DurableRunnerError> {
+    let store = DurableStateStore::new(&config.state_dir)?;
+    let (mut state, _) = store.load_or_create(config)?;
+    for (seq, kind) in [(1, "runner.drain"), (2, "runner.suspend")] {
+        let command = Command {
+            schema: "paperclip.prp.command.v1".to_owned(),
+            command_id: format!("suspended-handoff-{seq}"),
+            controller_seq: seq,
+            command_type: kind.to_owned(),
+            issued_at: "2026-11-14T00:00:00Z".to_owned(),
+            deadline_at: None,
+            precondition: None,
+            payload: json!({}),
+        };
+        let (result, lifecycle) = process_command(&mut state, &store, config, executor, &command)?;
+        assert_eq!(result.status, "completed", "{result:?}");
+        if let Some(lifecycle) = lifecycle.durable_state() {
+            persist_lifecycle_before_command_delivery(&mut state, &store, lifecycle, &result)?;
+            finish_terminal_transition_after_ack(&mut state, &store, config, executor, |state| {
+                state.apply_ack(state.highest_source_seq(), super::PROTOCOL_VERSION)?;
+                store.save(state)
+            })?;
+        } else {
+            state.apply_ack(state.highest_source_seq(), super::PROTOCOL_VERSION)?;
+            store.save(&state)?;
+        }
+    }
+    let (saved, recovered) = store.load_or_create(config)?;
+    assert!(recovered);
+    assert_eq!(saved.lifecycle, "suspended");
+    assert!(saved.pending_terminal_delivery.is_none());
+    assert!(saved.pending_provider_cleanup.is_none());
+    Ok(saved)
+}
+
 fn event_envelope_for_protocol(event: &StoredOutboxEvent, protocol_version: u64) -> Value {
     let mut envelope = event.envelope.clone();
     if envelope
