@@ -12,7 +12,7 @@ describe.skipIf(!support.supported)('M15b independent reset boundary audit',()=>
  let temp: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>, db: ReturnType<typeof createDb>;
  const receipt: Record<string,unknown>={};
  beforeAll(async()=>{temp=await startEmbeddedPostgresTestDatabase('m15b-boundary-');db=createDb(temp.connectionString)},60000);
- afterAll(async()=>{writeFileSync(process.env.TASK_OUT+'/reset-boundary-receipt.json',JSON.stringify(receipt,null,2));await db?.$client.end();await temp?.cleanup()});
+ afterAll(async()=>{if (process.env.TASK_OUT) writeFileSync(process.env.TASK_OUT+'/reset-boundary-receipt.json',JSON.stringify(receipt,null,2));await db?.$client.end();await temp?.cleanup()});
  async function fixture(chat=true){
   const companyId=randomUUID(),agentId=randomUUID(),issueId=randomUUID(),userId=randomUUID();
   const t=Date.now()-600000, at=(ms:number)=>new Date(t+ms);
