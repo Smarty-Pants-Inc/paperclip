@@ -500,6 +500,25 @@ export async function freshContinuationIsolatesRun(db: Db, input: { companyId: s
 }
 
 export async function ensureFreshContinuation(db: Db, input: Input): Promise<FreshContinuationResult> {
+  // A stranded observed predecessor still owns its running claim even after
+  // cleanup records physical stop. Ask that existing fenced owner to settle
+  // before taking continuation locks; the proof reader cannot retire it.
+  const [source] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+  if (source && isFreshThreadRefusal(source) && source.nativeIssueId && source.nativeSessionId) {
+    const predecessors = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, source.agentId),
+      eq(heartbeatRuns.nativeIssueId, source.nativeIssueId), eq(heartbeatRuns.nativeSessionId, source.nativeSessionId),
+      eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
+      eq(heartbeatRuns.errorCode, "native_execution_ownership_unverified"),
+      sql`${heartbeatRuns.createdAt} < ${source.createdAt.toISOString()}::timestamptz`,
+      sql`coalesce(${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration', '0'::jsonb)
+        = ${JSON.stringify(object(source.contextSnapshot).conversationSessionGeneration ?? 0)}::jsonb`));
+    if (predecessors.length) {
+      const { settleStoppedRemoteNativeOwner } = await import("./native-runtime/native-failed-run-owner-release.js");
+      for (const predecessor of predecessors) await settleStoppedRemoteNativeOwner(db, predecessor.id);
+    }
+  }
   return db.transaction(tx => continueFreshInTransaction(tx as unknown as Db, input));
 }
 
