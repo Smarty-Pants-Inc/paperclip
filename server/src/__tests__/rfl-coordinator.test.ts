@@ -37,7 +37,7 @@ describe('RFL coordinator failure and queue observations', () => {
     expect(f.delivery.current('p')!.pending.size).toBe(0);
   });
 
-  it('measures 1000 queued same-revision events: all are retained and all reread the DB', async () => {
+  it('coalesces 1000 same-revision events into at most one pending delivery', async () => {
     const f = fixture(); const gate = deferred();
     f.call.mockReturnValueOnce(gate.promise);
     const first = f.delivery.deliver('p','c');
@@ -48,21 +48,23 @@ describe('RFL coordinator failure and queue observations', () => {
     expect(completed).toBe(0);
     gate.resolve(); await Promise.all([first, ...burst]);
     console.log('RFL_QUEUE_SUCCESS', JSON.stringify({ enqueued: burst.length, reads: read.mock.calls.length, rpcCalls: f.call.mock.calls.length, completed }));
-    // This is an observational assertion, NOT a claim that the queue is bounded.
-    expect(read).toHaveBeenCalledTimes(1001);
+    // RFL 09:08Z ruling: one active read and at most one pending read.
+    expect(read.mock.calls.length).toBeLessThanOrEqual(2);
     expect(f.call).toHaveBeenCalledTimes(1);
   });
 
-  it('measures 64 queued failure events: each one becomes a separate RPC attempt', async () => {
+  it('coalesces 64 failure events into at most two reads and RPC attempts', async () => {
     const f = fixture(); const gate = deferred();
     f.call.mockImplementation(async () => { await gate.promise; throw new Error('unavailable'); });
     const results = Array.from({ length: 64 }, () => f.delivery.deliver('p','c').catch(() => undefined));
     await vi.waitFor(() => expect(f.call).toHaveBeenCalledTimes(1));
     gate.resolve(); await Promise.all(results);
     console.log('RFL_QUEUE_FAILURE', JSON.stringify({ events: results.length, reads: read.mock.calls.length, rpcCalls: f.call.mock.calls.length }));
-    expect(f.call).toHaveBeenCalledTimes(64);
+    expect(read.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(f.call.mock.calls.length).toBeLessThanOrEqual(2);
     await new Promise(resolve => setTimeout(resolve, 20));
-    expect(f.call).toHaveBeenCalledTimes(64);
+    expect(read.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(f.call.mock.calls.length).toBeLessThanOrEqual(2);
     expect(f.delivery.current('p')!.pending.size).toBe(0);
   });
 
