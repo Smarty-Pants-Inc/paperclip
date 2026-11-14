@@ -3883,7 +3883,7 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
     // Pi's child allowlist. The launcher installs Git isolation per operation.
     if (input.options.environment?.PAPERCLIP_GITHUB_LAUNCHER_DIR?.trim()) {
       for (const name of ["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR",
-        "PAPERCLIP_GITHUB_BROKER_URL", "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN"]) {
+        "PAPERCLIP_GITHUB_BROKER_URL", "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN", "PAPERCLIP_GITHUB_RUN_TICKET"]) {
         const value = input.options.environment[name];
         if (value !== undefined) selected[name] = value;
       }

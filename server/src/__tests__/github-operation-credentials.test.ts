@@ -775,9 +775,13 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         scope: input, target: null, cwd: process.cwd(), env: { PATH: process.env.PATH },
         resolveCredentials: (binding) => resolveGitHubOperationCredentials(db, binding),
       });
-      const post = () => fetch(`${broker.env.PAPERCLIP_GITHUB_BROKER_URL}/runtime-tools/github/credentials`, {
-        method: "POST", headers: { authorization: `Bearer ${broker.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}` },
-      });
+      const post = () => {
+        const env = broker.env;
+        return fetch(`${env.PAPERCLIP_GITHUB_BROKER_URL}/runtime-tools/github/credentials`, {
+          method: "POST", headers: { authorization: `Bearer ${env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`,
+            "x-paperclip-github-run-ticket": env.PAPERCLIP_GITHUB_RUN_TICKET },
+        });
+      };
       try {
         const releaseA = await broker.activate(input);
         const a = await post();

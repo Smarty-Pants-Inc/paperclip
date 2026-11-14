@@ -31,6 +31,10 @@ export async function createNativeGitHubAccess(input: {
   const location = { runId: `native-session-${randomUUID()}`, target: input.target };
   let active: Binding | null = null;
   let activeGeneration: string | null = null;
+  // Unlike the marker written into the sandbox for bridge bookkeeping, this
+  // unguessable ticket is supplied only in the activated run's process env.
+  let activeTicket: string | null = null;
+  const runTicketGenerations = new Map<string, string>();
   let stopped = false;
   let ready = true;
   let stopping: Promise<void> | undefined;
@@ -61,10 +65,17 @@ export async function createNativeGitHubAccess(input: {
     const binding = active;
     const requestGeneration = req.headers["x-paperclip-bridge-generation"];
     const capturedGeneration = activeGeneration;
-    if (!binding || stopped) {
+    // A readable attached:<generation> marker is not caller proof. Authenticate
+    // with the ticket held by the requesting run's own inherited environment.
+    const ticket = req.headers["x-paperclip-github-run-ticket"];
+    const ticketGeneration = typeof ticket === "string" ? runTicketGenerations.get(ticket) : undefined;
+    if (!binding || stopped || typeof ticket !== "string" || !activeTicket ||
+        Buffer.byteLength(ticket) !== Buffer.byteLength(activeTicket) ||
+        !timingSafeEqual(Buffer.from(ticket), Buffer.from(activeTicket)) || ticketGeneration !== capturedGeneration) {
       reply(403, { error: "No active GitHub run" });
       return;
     }
+    const capturedTicket = activeTicket;
     const bridgedRequest = typeof req.headers["x-paperclip-run-id"] === "string";
     const queuedBridgeRequest = req.headers["x-paperclip-bridge-transport"] === "queue_v1";
     if (queuedBridgeRequest && typeof requestGeneration !== "string") {
@@ -73,14 +84,16 @@ export async function createNativeGitHubAccess(input: {
     }
     try {
       await bodyComplete;
-      if (stopped || active !== binding || activeGeneration !== capturedGeneration ||
+      if (stopped || active !== binding || activeGeneration !== capturedGeneration || activeTicket !== capturedTicket ||
+          runTicketGenerations.get(capturedTicket) !== capturedGeneration ||
           ((queuedBridgeRequest || bridgedRequest) && typeof requestGeneration === "string" && requestGeneration !== capturedGeneration)) {
         reply(403, { error: "GitHub bridge request belongs to an inactive run generation" });
         return;
       }
       // Bind at receipt; body/headers cannot select a run or responsible user.
       const result = await input.resolveCredentials({ ...binding });
-      if (active !== binding || stopped) {
+      if (active !== binding || stopped || activeTicket !== capturedTicket || activeGeneration !== capturedGeneration ||
+          runTicketGenerations.get(capturedTicket) !== capturedGeneration) {
         reply(403, { error: "GitHub run ended during credential acquisition" });
         return;
       }
@@ -98,6 +111,8 @@ export async function createNativeGitHubAccess(input: {
     stopped = true;
     active = null;
     activeGeneration = null;
+    activeTicket = null;
+    runTicketGenerations.clear();
     bridge?.markOrderlyCompletion?.();
     server.closeAllConnections();
     const bridgeStop = await Promise.allSettled([bridge?.stop()]);
@@ -141,7 +156,7 @@ export async function createNativeGitHubAccess(input: {
       await new Promise<void>(resolve => server.close(() => resolve()));
       await input.onLog?.("stderr", "[paperclip] GitHub runtime transport unavailable; continuing without managed GitHub access.\n").catch(() => undefined);
     }
-    const env = await prepareGitHubOperationLaunchers({
+    const baseEnv = await prepareGitHubOperationLaunchers({
       ...location, cwd: input.cwd,
       env: {
         ...githubBrokerEnvironment({ PATH: input.env.PATH }, {
@@ -153,7 +168,9 @@ export async function createNativeGitHubAccess(input: {
       },
     });
     return {
-      env,
+      get env() {
+        return { ...baseEnv, PAPERCLIP_GITHUB_RUN_TICKET: ready ? activeTicket ?? "" : "" };
+      },
       get ready() { return ready && !stopped && bridge?.readRunDisposition?.().failed !== true; },
       duplexRequested,
       async activate(binding: Binding) {
@@ -163,14 +180,19 @@ export async function createNativeGitHubAccess(input: {
         // Quarantine requests left by the previous run and resume polling before
         // publishing this run's authority. The broker stays inactive throughout.
         const generation = randomUUID();
+        const ticket = randomBytes(32).toString("hex");
         await bridge?.resume?.(generation);
         const owner = { ...binding };
         active = owner;
         activeGeneration = generation;
+        activeTicket = ticket;
+        runTicketGenerations.set(ticket, generation);
         return async () => {
           if (active === owner) {
             active = null;
             activeGeneration = null;
+            if (activeTicket) runTicketGenerations.delete(activeTicket);
+            activeTicket = null;
             await bridge?.pause?.();
           }
         };

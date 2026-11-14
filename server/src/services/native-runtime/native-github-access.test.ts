@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { spawn, execFile } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { mkdtemp, mkdir, readFile, rm, writeFile, access } from "node:fs/promises";
 import { promisify } from "node:util";
 import type { CommandManagedDuplexChannel, CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -9,7 +10,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { createNativeGitHubAccess, type NativeGitHubAccess } from "./native-github-access.js";
-import { OpenCodeServerDriver } from "@paperclipai/paperclip-runner";
 import { createCapabilityRunnerdProviderEnvironment } from "@paperclipai/paperclip-runner/live";
 const scope = { companyId: "company-a", agentId: "agent-a", issueId: "task-a" };
 const run = (runId: string) => ({ ...scope, runId });
@@ -79,48 +79,37 @@ duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; record
   return Object.assign(result, { root, resolveCredentials, execute, openDuplexChannel, bridgeModes });
 }
 function request(broker: NativeGitHubAccess, extra: RequestInit = {}, endpoint = "/runtime-tools/github/credentials") {
-  return fetch(broker.env.PAPERCLIP_GITHUB_BROKER_URL + endpoint, {
-    method: "POST", body: "{}", headers: { authorization: `Bearer ${broker.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`, "content-type": "application/json" }, ...extra,
+  const env = broker.env;
+  return fetch(env.PAPERCLIP_GITHUB_BROKER_URL + endpoint, {
+    method: "POST", body: "{}", ...extra,
+    headers: { authorization: `Bearer ${env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`,
+      "x-paperclip-github-run-ticket": env.PAPERCLIP_GITHUB_RUN_TICKET, "content-type": "application/json",
+      ...(extra.headers as Record<string, string> | undefined) },
   });
 }
-it.each([false, true])("resolves managed GitHub credentials from OpenCode shell operations (runner projection: %s)", async throughRunner => {
+it.each([false, true])("resolves managed GitHub credentials from a fresh per-run launcher environment (runner projection: %s)", async throughRunner => {
   const b = await broker();
-  const command = path.join(b.root, "fake-opencode-server.mjs");
-  const fixture = new URL("../../../../packages/paperclip-runner/test/fixtures/fake-opencode-server.mjs", import.meta.url);
-  await writeFile(command, await readFile(fixture), { mode: 0o700 });
-  const source = { ...b.env, OPENROUTER_API_KEY: "fixture-provider-key", PAPERCLIP_API_KEY: "controller-must-not-cross" };
-  const environment = throughRunner ? createCapabilityRunnerdProviderEnvironment({
-    provider: "opencode",
-    options: { environment: source, stateDirectory: b.root },
-    identity: { runnerInstanceId: "runner-a", environmentLeaseId: "lease-a", runId: "a", normalizedSessionId: "github", turnId: "turn-a", itemId: "item-a" },
-    codexHome: path.join(b.root, "codex-home"),
-    runtimeContextPath: path.join(b.root, "context.json"),
-    hasRuntimeContext: false,
-  }) : source;
-  const driver = new OpenCodeServerDriver({
-    model: "openrouter/z-ai/glm-5.3", runtimeDirectory: b.root, command, environment,
-  });
-  const session = await driver.openSession({ runId: "a", normalizedSessionId: "github", workingDirectory: b.root });
-  cleanups.push(() => session.close({ reason: "test complete" }));
-  const operate = async () => {
-    await session.startTurn({ message: { role: "user", text: "managed-github-operation" } });
-    for await (const event of session.events()) {
-      if (event.eventType === "turn.completed") break;
-      if (event.eventType === "turn.failed") throw new Error("OpenCode fixture turn failed");
-    }
-    return JSON.parse(await readFile(path.join(b.root, "github", "data", "fake-github-operation.json"), "utf8"));
+  const launch = async (runId: string) => {
+    const source = { ...b.env, OPENROUTER_API_KEY: "fixture-provider-key", PAPERCLIP_API_KEY: "controller-must-not-cross" };
+    const environment = throughRunner ? createCapabilityRunnerdProviderEnvironment({
+      provider: "opencode",
+      options: { environment: source, stateDirectory: b.root },
+      identity: { runnerInstanceId: "runner-a", environmentLeaseId: "lease-a", runId, normalizedSessionId: "github", turnId: `turn-${runId}`, itemId: "item-a" },
+      codexHome: path.join(b.root, "codex-home"),
+      runtimeContextPath: path.join(b.root, "context.json"),
+      hasRuntimeContext: false,
+    }) : source;
+    return promisify(execFile)(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), [], {
+      env: { ...process.env, ...environment }, timeout: 15_000, maxBuffer: 1024 * 1024,
+    });
   };
   const releaseA = await b.activate(run("a"));
-  expect(await operate()).toMatchObject({ stdout: "fixture-a", error: null });
+  expect((await launch("a")).stdout).toBe("fixture-a");
   await releaseA();
   const releaseB = await b.activate(run("b"));
-  expect(await operate()).toMatchObject({ stdout: "fixture-b", error: null });
+  expect((await launch("b")).stdout).toBe("fixture-b");
   await releaseB();
-  expect(await operate()).toMatchObject({ stdout: "anonymous", error: null });
   expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["a", "b"]);
-  const childEnvironment = JSON.parse(await readFile(path.join(b.root, "github", "data", "fake-environment.json"), "utf8"));
-  expect(childEnvironment.keys).not.toContain("PAPERCLIP_API_KEY");
-  expect(childEnvironment.githubTokenPresent).toBe(false);
 }, 30000);
 it("uses the selected duplex transport across credential rotation without file polling", async () => {
   const recorder = { recordSpan: vi.fn(), incrementCounter: vi.fn(), emitEvent: vi.fn() };
@@ -181,7 +170,7 @@ it.each([
   await release();
   expect((await request(b)).status).toBe(503);
 });
-it.each([false, true])("keeps one live parent and its original launcher environment across two authorized runs (callback bridge: %s)", async (remote) => {
+it.each([false, true])("keeps an old process anonymous across later runs (callback bridge: %s)", async (remote) => {
   const b = await broker(undefined, remote);
   const parent = spawn(process.execPath, ["-e", `
     const {execFile}=require('node:child_process');
@@ -197,16 +186,16 @@ it.each([false, true])("keeps one live parent and its original launcher environm
   expect((await request(b)).status).toBe(remote ? 503 : 403);
   const releaseA = await b.activate(run("run-a"));
   const a = await operation();
-  expect(a.value).toBe("fixture-run-a");
+  expect(a.value).toBe("anonymous");
   await releaseA();
   expect((await request(b)).status).toBe(remote ? 503 : 403);
   expect((await operation()).value).toBe("anonymous");
   const releaseB = await b.activate(run("run-b"));
   await releaseA(); // A's delayed cleanup cannot revoke B.
   const second = await operation();
-  expect(second.value).toBe("fixture-run-b");
+  expect(second.value).toBe("anonymous");
   expect(second.pid).toBe(a.pid);
-  expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["run-a", "run-b"]);
+  expect(b.resolveCredentials.mock.calls).toEqual([]);
   expect(await readFile(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), "utf8")).not.toContain(b.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
   await releaseB(); await b.stop();
   await expect(access(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).rejects.toThrow();
@@ -232,6 +221,80 @@ it("rejects other scopes, concurrent bindings, browser requests and forged autho
   await release(); await b.stop();
   await expect(b.activate(run("b"))).rejects.toThrow("closed");
 });
+it("keeps concurrent requests on the same active run ticket", async () => {
+  const b = await broker();
+  const release = await b.activate(run("concurrent"));
+  const responses = await Promise.all(Array.from({ length: 8 }, () => request(b)));
+  expect(responses.map(response => response.status)).toEqual(Array(8).fill(200));
+  expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(Array(8).fill("concurrent"));
+  await release();
+});
+
+it("binds new requests to the activation ticket, not a readable generation marker", async () => {
+  const b = await broker();
+  const releaseA = await b.activate(run("a"));
+  const envA = b.env;
+  const ticketA = envA.PAPERCLIP_GITHUB_RUN_TICKET;
+  expect(ticketA).toMatch(/^[a-f0-9]{64}$/);
+  expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-a" } });
+  const leftover = spawn(process.execPath, ["-e", `
+    require('node:readline').createInterface({input:process.stdin}).on('line', async () => {
+      const response=await fetch(process.env.PAPERCLIP_GITHUB_BROKER_URL+'/runtime-tools/github/credentials', {
+        method:'POST', headers:{authorization:'Bearer '+process.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN,
+          'x-paperclip-github-run-ticket':process.env.PAPERCLIP_GITHUB_RUN_TICKET}, body:'{}'});
+      console.log(JSON.stringify({status:response.status,body:await response.text()}));
+    });
+  `], { env: { ...process.env, ...envA }, stdio: ["pipe", "pipe", "pipe"] });
+  const leftoverClosed = new Promise<void>(resolve => leftover.once("exit", () => resolve()));
+  cleanups.push(async () => { leftover.kill(); await leftoverClosed; });
+  const leftoverLines = createInterface({ input: leftover.stdout });
+  const requestFromA = () => new Promise<{ status: number; body: string }>(resolve => {
+    leftoverLines.once("line", line => resolve(JSON.parse(line))); leftover.stdin.write("request\n");
+  });
+  await releaseA();
+  const releaseB = await b.activate(run("b"));
+  const ticketB = b.env.PAPERCLIP_GITHUB_RUN_TICKET;
+  expect(ticketB).toMatch(/^[a-f0-9]{64}$/);
+  expect(ticketB).not.toBe(ticketA);
+  const stale = await requestFromA();
+  expect(stale.status).toBe(403);
+  expect(stale.body).not.toContain("fixture-b");
+  const forgedMarkerOnly = await request(b, { headers: { "x-paperclip-github-run-ticket": "",
+    "x-paperclip-bridge-generation": "attached:forged-from-marker" } });
+  expect(forgedMarkerOnly.status).toBe(403);
+  expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["a"]);
+  expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-b" } });
+  expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["a", "b"]);
+  await releaseB();
+});
+
+it("rejects a valid run-A ticket when body completion crosses into run B", async () => {
+  const b = await broker();
+  const releaseA = await b.activate(run("a"));
+  const envA = b.env;
+  let pending: ReturnType<typeof httpRequest> | undefined;
+  const response = new Promise<{ status: number; body: string }>((resolve, reject) => {
+    pending = httpRequest(`${envA.PAPERCLIP_GITHUB_BROKER_URL}/runtime-tools/github/credentials`, {
+      method: "POST", headers: { authorization: `Bearer ${envA.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`,
+        "x-paperclip-github-run-ticket": envA.PAPERCLIP_GITHUB_RUN_TICKET,
+        "content-type": "application/json", "content-length": "2" },
+    }, res => {
+      let body = ""; res.setEncoding("utf8"); res.on("data", part => { body += part; });
+      res.on("end", () => resolve({ status: res.statusCode!, body }));
+    });
+    pending.on("error", reject); pending.flushHeaders(); pending.write("{");
+  });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  await releaseA();
+  const releaseB = await b.activate(run("b"));
+  pending!.end("}");
+  const received = await response;
+  expect(received.status).toBe(403);
+  expect(received.body).not.toContain("fixture-b");
+  expect(b.resolveCredentials.mock.calls).toEqual([]);
+  await releaseB();
+});
+
 it("does not release an in-flight credential after its run has been replaced", async () => {
   let complete!: (value: { status: string; env: { GH_TOKEN: string } }) => void;
   const resolver = vi.fn(() => new Promise<{ status: string; env: { GH_TOKEN: string } }>(resolve => { complete = resolve; }));
@@ -259,7 +322,7 @@ it.each([false, true])("keeps anonymous launchers usable when the remote broker 
   expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("continuing without managed GitHub access"));
   await b.activate(run("a"));
   expect(b.ready).toBe(false);
-  expect(b.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("");
+  expect(b.env.PAPERCLIP_GITHUB_RUN_TICKET).toBe("");
   const result = await promisify(execFile)(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), [], {
     env: { ...process.env, ...b.env, GH_TOKEN: "ambient-must-not-leak" },
   });

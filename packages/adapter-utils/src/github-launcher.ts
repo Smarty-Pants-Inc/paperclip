@@ -113,7 +113,8 @@ ${options.brokerFile ? String.raw`
           response = await fetch(url, {
             method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
             headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
-              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
+              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN,
+              'x-paperclip-github-run-ticket': env.PAPERCLIP_GITHUB_RUN_TICKET, 'content-type': 'application/json' },
             body: '{}',
           });
           if (response.status === 409 && conflicts < 29) {
@@ -193,5 +194,6 @@ export function githubBrokerEnvironment(input: Record<string, unknown>, broker: 
   env.SSH_AUTH_SOCK = "";
   env.PAPERCLIP_GITHUB_BROKER_URL = broker.url;
   env.PAPERCLIP_GITHUB_BROKER_TOKEN = broker.token;
+  env.PAPERCLIP_GITHUB_RUN_TICKET = "";
   return env;
 }

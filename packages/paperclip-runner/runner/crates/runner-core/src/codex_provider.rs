@@ -1020,6 +1020,7 @@ const GITHUB_CREDENTIAL_ENVIRONMENT_KEYS: &[&str] = &[
     "BASH_ENV",
     "PAPERCLIP_GITHUB_BROKER_URL",
     "PAPERCLIP_GITHUB_BROKER_TOKEN",
+    "PAPERCLIP_GITHUB_RUN_TICKET",
     "PAPERCLIP_GITHUB_LAUNCHER_DIR",
     "GH_CONFIG_DIR",
     "GH_ENTERPRISE_TOKEN",
@@ -7918,7 +7919,7 @@ done
 
     #[test]
     fn github_credentials_cross_only_the_bounded_provider_environment() {
-        assert_eq!(GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.len(), 95);
+        assert_eq!(GITHUB_CREDENTIAL_ENVIRONMENT_KEYS.len(), 96);
         for key in [
             "PAPERCLIP_RUNNER_NETWORK_ACCESS",
             "PAPERCLIP_RUNNER_NETWORK_ROOTS",
@@ -7928,6 +7929,7 @@ done
             "GIT_SSH",
             "PAPERCLIP_GITHUB_BROKER_URL",
             "PAPERCLIP_GITHUB_BROKER_TOKEN",
+            "PAPERCLIP_GITHUB_RUN_TICKET",
             "PAPERCLIP_GITHUB_LAUNCHER_DIR",
             "GH_CONFIG_DIR",
             "PAPERCLIP_GITHUB_BRIDGE_TOKEN",

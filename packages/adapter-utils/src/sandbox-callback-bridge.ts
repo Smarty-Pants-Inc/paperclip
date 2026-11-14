@@ -251,6 +251,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "if-match",
   "if-none-match",
   "x-paperclip-github-capability",
+  "x-paperclip-github-run-ticket",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest extends SandboxCallbackBridgeBody {
