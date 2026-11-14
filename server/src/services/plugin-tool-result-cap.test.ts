@@ -2,7 +2,10 @@
 import { describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
 import { pluginToolFinalBudget } from "../__tests__/fixtures/plugin-tool-final-budget.js";
-import { MAX_PLUGIN_TOOL_RESULT_BYTES, preparePluginToolResult, validatePluginToolResult } from "./plugin-tool-result.js";
+import { MAX_PLUGIN_TOOL_RESULT_BYTES, preparePluginToolResult, pluginGatewayToolResult, validatePluginToolResult, validatePluginGatewayToolResult } from "./plugin-tool-result.js";
+import { validateToolContent } from "./tool-content-guards.js";
+import { buildGatewayToolCallResult } from "./tool-gateway-mcp-result.js";
+import { REDACTED_EVENT_VALUE } from "../redaction.js";
 
 function storage(): StorageService {
   return { provider: "local_disk", deleteObject: vi.fn(async () => {}), putFile: vi.fn(async (input: any) => ({
@@ -34,6 +37,22 @@ describe("final plugin result cap including host references", () => {
     catch (error) { rejected = true; expect((error as Error).message).toContain("10 MiB"); }
     expect(rejected).toBe(true);
     expect(store.putFile).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 1])("enforces the governed forwarded budget at exactly 10 MiB + %i bytes", async over => {
+    const growth = Buffer.byteLength(REDACTED_EVENT_VALUE, "utf8") - Buffer.byteLength("x", "utf8");
+    const fixture = pluginToolFinalBudget({ over: over - growth, metadata: { password: "x" } });
+    const prepared = await preparePluginToolResult(execution(fixture.result), { companyId: "c", invocationId: "i", storage: storage() });
+    const checked = await validateToolContent({ value: pluginGatewayToolResult(prepared), direction: "result" });
+    const governed = checked.value as any;
+    const { content, ...metadata } = governed.data;
+    const actualBudget = Buffer.from(fixture.block.data, "base64").length + Buffer.byteLength(JSON.stringify({ data: metadata }), "utf8");
+    expect(actualBudget).toBe(MAX_PLUGIN_TOOL_RESULT_BYTES + over);
+    if (over) expect(() => validatePluginGatewayToolResult(governed)).toThrow("10 MiB");
+    else {
+      expect(() => validatePluginGatewayToolResult(governed)).not.toThrow();
+      expect(buildGatewayToolCallResult({ text: "", structuredContent: governed.data }).content).toEqual(content);
+    }
   });
 
   it("rejects unexpectedly larger storage metadata after write and cleans the private object", async () => {

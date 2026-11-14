@@ -6577,7 +6577,9 @@ rl.on("line", (line) => {
       const response = await request(createGatewayRouteApp(db, gateway)).post(named.endpointPath).set("authorization", `Bearer ${token.token}`)
         .send({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "demo.budget:frame", arguments: {} } });
       expect(response.status).not.toBe(200);
-      expect(response.body.error?.message).toContain("10 MiB");
+      // The existing generic Error mapping is HTTP 500 + { error: string },
+      // not the ToolGatewayHttpError JSON-RPC envelope. Assert its real wire.
+      expect(response.body.error).toContain("10 MiB");
       expect(response.body.result).toBeUndefined();
     } else {
       let rejected = false;
@@ -6591,7 +6593,10 @@ rl.on("line", (line) => {
     expect(invocations).toHaveLength(1);
     expect(invocations[0]!.status).toBe("failed");
     const events = await db.select().from(toolCallEvents).where(eq(toolCallEvents.companyId, company.id));
-    expect(events.some(event => event.outcome === "success")).toBe(false);
+    // Policy admission can succeed before execution fails. Only a terminal
+    // call_completed success would contradict the failed invocation receipt.
+    expect(events.some(event => event.eventType === "call_completed" && event.outcome === "success")).toBe(false);
+    expect(events).toContainEqual(expect.objectContaining({ eventType: "call_failed", outcome: "failure" }));
     expect(JSON.stringify({ invocations, events })).not.toContain(fixture.block.data);
   });
 

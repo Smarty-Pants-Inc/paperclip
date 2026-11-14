@@ -55,7 +55,7 @@ describe("plugin native MCP tool result", () => {
     expect(JSON.stringify(checked.value)).toBe(JSON.stringify(legacy));
   });
 
-  it.each([null, [], [{ type: "image", data: "bad!", mimeType: "image/png" }], [image(undefined, "image/gif")]])("rejects explicitly opted-in malformed mcpContent without downgrading it to legacy text", async mcpContent => {
+  it.each([null, [], [{ type: "image", data: "bad!", mimeType: "image/png" }], [image(undefined, "image/gif")]].map(mcpContent => ({ mcpContent })))("rejects explicitly opted-in malformed mcpContent without downgrading it to legacy text", async ({ mcpContent }) => {
     const storage = store();
     const raw = { pluginId: "capture", toolName: "frame", result: { content: "one frame", mcpContent } };
     await expect(preparePluginToolResult(raw as any, { companyId: "c", invocationId: "i", storage })).rejects.toThrow("Invalid plugin tool content");
@@ -77,7 +77,7 @@ describe("plugin native MCP tool result", () => {
     expect(() => validatePluginToolResult({ mcpContent: [image()] as any, data: { other: "x".repeat(MAX_PLUGIN_TOOL_RESULT_BYTES) } })).toThrow("10 MiB");
   });
 
-  it.each([null, [], Array(65).fill({ type: "text", text: "x" }), [{ type: "image", data: "bad!", mimeType: "image/png" }], [image(undefined, "image/gif")], [{ ...image(), data: "cGl4ZWxz\n" }], [{ ...image(), data: "ZE==" }], [{ ...image(), url: "https://invalid" }], [{ type: "audio", data: "AA==", mimeType: "audio/wav" }]])("fails malformed native content loudly: %j", content => {
+  it.each([null, [], Array(65).fill({ type: "text", text: "x" }), [{ type: "image", data: "bad!", mimeType: "image/png" }], [image(undefined, "image/gif")], [{ ...image(), data: "cGl4ZWxz\n" }], [{ ...image(), data: "ZE==" }], [{ ...image(), url: "https://invalid" }], [{ type: "audio", data: "AA==", mimeType: "audio/wav" }]].map(content => ({ content })))("fails malformed native content loudly: %j", ({ content }) => {
     expect(() => validatePluginToolResult(result(content))).toThrow("Invalid plugin tool content");
   });
 
