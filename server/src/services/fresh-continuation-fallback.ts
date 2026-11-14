@@ -18,7 +18,7 @@ import { isInterruptedNativePreparationCandidate } from "./cancelled-native-star
 import { notifyDeferredWakesForIssue } from "./deferred-execution-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { issueService } from "./issues.js";
-import { conversationRunsForLastMessages, isConversation } from "./agent-conversations.js";
+import { conversationRunsForLastMessages, isConversation, isWaitingConversation } from "./agent-conversations.js";
 import { conversationTurnAnswered } from "./native-runtime/native-governance.js";
 import { holdOwnsBlockedStatus } from "./recovery-hold-blocked-status.js";
 import { proveRunProcessGone } from "./run-process-owner.js";
@@ -36,8 +36,10 @@ import { readSystemRecovery } from "./system-recovery-state.js";
  * When a run ended without finishing its work and nothing exact follows it
  * (no resumed session, no replacement, no scheduled retry, no saved input),
  * `ensureFreshContinuation` starts the task again in a fresh session from its
- * last verified saved workspace and its conversation. It needs no person and
- * no proof that the old executor stopped:
+ * last verified saved workspace and its conversation. The only succeeded-run
+ * exception is an unanswered latest person message on a still-waiting in-review
+ * chat; it is not a general eligibility rule for completed runs. It needs no
+ * person and no proof that the old executor stopped:
  *
  * - The old run keeps its own fencing. Its remote workspace epoch is abandoned
  *   when it still owns it, so its writer can never publish again and the next
@@ -425,7 +427,13 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
     eq(heartbeatRuns.id, input.runId))).for("update");
   if (!issue || !run) return { kind: "not_applicable", reason: "run_missing" };
-  if (!UNFINISHED_STATUSES.includes(run.status) || !run.finishedAt) return { kind: "not_applicable", reason: "run_not_unfinished" };
+  // A succeeded run is not generally eligible for fresh fallback. The sole
+  // exception is a still-waiting in-review chat whose exact person message is
+  // proved unanswered below; the ordinary assigned-work sweep remains the
+  // discovery/continuation path for this state.
+  const completedUnansweredChatCandidate = run.status === "succeeded" && isWaitingConversation(issue);
+  if ((!UNFINISHED_STATUSES.includes(run.status) && !completedUnansweredChatCandidate) || !run.finishedAt)
+    return { kind: "not_applicable", reason: "run_not_unfinished" };
   if (!issue.assigneeAgentId || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId
     || ["done", "cancelled"].includes(issue.status)) return { kind: "not_applicable", reason: "task_changed" };
 
@@ -503,6 +511,13 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   if (newer || typeof object(coordinator?.failureDetail).successorRunId === "string"
     || holds.some(hold => hold.evidence.executionReconciliation && ["pending", "delivered", "delegated"]
       .includes(String(hold.evidence.continuationDelivery)))) return { kind: "successor_exists" };
+  if (completedUnansweredChatCandidate) {
+    const [pendingWake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, run.agentId),
+      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`)).limit(1);
+    if (pendingWake) return { kind: "successor_exists" };
+  }
 
   // Exact recovery that is still under way keeps its chance, for a bounded
   // number of checks; each owner below also bounds itself.
@@ -740,7 +755,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     details: { recoveryActionId: primaryId, sourceRunId: run.id, failureCode: run.errorCode ?? null, trigger: input.trigger,
       delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length } });
   logger.info({ runId: run.id, issueId: issue.id, failureCode: run.errorCode, trigger: input.trigger, delivery },
-    "Unfinished run continues in a fresh run from saved work");
+    "Run continues in a fresh run from saved work");
   return { kind: "continued", recoveryActionId: primaryId, delivery, isolation };
 }
 

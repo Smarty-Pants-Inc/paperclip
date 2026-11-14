@@ -63,7 +63,7 @@ export const ASSIGNED_WORK_REPAIRS_PER_MINUTE = 10;
 /** Upper bound on tasks one report reads. */
 export const ASSIGNED_WORK_REPORT_LIMIT = 2_000;
 
-const OPEN_STATUSES = ["todo", "in_progress", "blocked"] as const;
+const OPEN_STATUSES = ["todo", "in_progress", "blocked", "in_review"] as const;
 const PENDING_WAKE_STATUSES = ["queued", "deferred_issue_execution", "claimed"];
 const DEFERRED_WAKE_PENDING_BOUND_MS = 5 * 60_000;
 export { PENDING_CONTINUATION_BOUND_MS };
@@ -181,11 +181,14 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     };
     const agentIds = [...new Set(issueRows.flatMap(issue => issue.assigneeAgentId ? [issue.assigneeAgentId] : []))];
     const blockedRows = issueRows.filter(issue => issue.status === "blocked");
+    const inReviewChatIds = issueRows.filter(issue => issue.status === "in_review"
+      && (issue.conversationAgentId || issue.originKind === "chat_channel")).map(issue => issue.id);
     const notSupersededByUserContinuation = interactionNotSupersededSql(issueThreadInteractions.companyId,
       sql`${issueThreadInteractions.issueId}::text`, issueThreadInteractions.createdAt);
 
     const [activeRuns, latestRuns, wakes, chatWakes, nativePending, handoffs, goals, interactions, approvalRows,
-      blockerRows, resolvedBlockerRows, childRows, actionMap, agentRows, companyRows, onboardingRows, blockActivity, interruptions] = await Promise.all([
+      blockerRows, resolvedBlockerRows, childRows, actionMap, agentRows, companyRows, onboardingRows, blockActivity, interruptions,
+      inReviewPersonMessages] = await Promise.all([
       database.select(runColumns).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         inArray(heartbeatRuns.status, NON_TERMINAL_RUN_STATUSES), sql`${runIssue} = any(${idParam})`)),
       // The newest run per task, read through the (company, issueId, created) index.
@@ -278,6 +281,10 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         ) latest`) : [],
       taskInterruptionPresentations(database, companyId, issueRows.map(issue => ({ id: issue.id, companyId: issue.companyId,
         status: issue.status, assigneeAgentId: issue.assigneeAgentId, projectId: issue.projectId }))),
+      inReviewChatIds.length ? database.selectDistinct({ issueId: issueComments.issueId }).from(issueComments).where(and(
+        eq(issueComments.companyId, companyId), inArray(issueComments.issueId, inReviewChatIds),
+        sql`${issueComments.authorUserId} is not null and ${issueComments.authorAgentId} is null
+          and ${issueComments.createdByRunId} is null and ${issueComments.deletedAt} is null`)) : [],
     ]);
 
     const rowsOf = <T>(value: unknown): T[] => Array.isArray(value) ? value as T[] : ((value as { rows?: T[] })?.rows ?? []);
@@ -331,6 +338,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const resolvedBlockerAt = new Map(resolvedBlockerRows.filter(row => row.at).map(row => [row.issueId, new Date(row.at!)]));
     const childCounts = counts(childRows.map(row => ({ issueId: row.parentId, count: row.count })));
     const onboardingIds = new Set(onboardingRows.map(row => row.id));
+    const inReviewPersonMessageIds = new Set((inReviewPersonMessages as Array<{ issueId: string }>).map(row => row.issueId));
     const latestByIssue = new Map(rowsOf<RunRow>(latestRuns).map(row => [row.issueId, row]));
     const blockActivityByIssue = new Map(rowsOf<{ issueId: string; actorType: string; actorId: string; agentId: string | null; details: unknown }>(blockActivity)
       .map(row => [row.issueId, row]));
@@ -378,6 +386,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
           unblockOwner: (issue.unblockDescriptor?.owner ?? null) as AssignedWorkFacts["issue"]["unblockOwner"],
           monitorNextCheckAt: issue.monitorNextCheckAt,
           isConversation: Boolean(issue.conversationAgentId) || issue.originKind === "chat_channel",
+          conversationHasPersonMessage: inReviewPersonMessageIds.has(issue.id),
           conversationAnswered: answeredConversationIds.has(issue.id),
           awaitingFirstMessage: onboardingIds.has(issue.id),
         },
@@ -434,6 +443,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       readCondition,
       issueId ? eq(issues.id, issueId) : undefined,
       inArray(issues.status, [...OPEN_STATUSES]),
+      sql`(${issues.status} <> 'in_review' or (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'))`,
       sql`${issues.assigneeAgentId} is not null`,
       isNull(issues.assigneeUserId),
       isNull(issues.hiddenAt),
@@ -454,12 +464,15 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         and r.status in ('queued', 'running', 'scheduled_retry')
         and not (r.status = 'running' and r.runtime_mode = 'legacy' and r.controller_lease_expires_at is not null
           and r.controller_lease_expires_at < ${at.toISOString()}::timestamptz))`;
-    return db.select({ id: issues.id, companyId: issues.companyId, updatedAt: issues.updatedAt }).from(issues).where(and(
+    const candidates = await db.select({ id: issues.id, companyId: issues.companyId, updatedAt: issues.updatedAt,
+      conversationAgentId: issues.conversationAgentId, assigneeAgentId: issues.assigneeAgentId, originKind: issues.originKind })
+      .from(issues).where(and(
       scope.companyId ? eq(issues.companyId, scope.companyId) : undefined,
       scope.issueId ? eq(issues.id, scope.issueId) : undefined,
       cursor ? sql`${issues.id} > ${cursor}` : undefined,
       scope.createdAfter ? gte(issues.createdAt, scope.createdAfter) : undefined,
       inArray(issues.status, [...OPEN_STATUSES]),
+      sql`(${issues.status} <> 'in_review' or (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'))`,
       sql`${issues.assigneeAgentId} is not null`,
       isNull(issues.assigneeUserId),
       isNull(issues.hiddenAt),
@@ -545,6 +558,27 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       sql`(${issues.status} <> 'blocked' or ${issues.unblockDescriptor} is null
         or (${issues.unblockDescriptor}->'owner'->>'agentId') = ${issues.assigneeAgentId}::text)`,
     )).orderBy(issues.id).limit(limit);
+    // Keep the indexed SQL prefilter, then verify the shared answer predicate
+    // across qualified continuation ancestry before exposing a chat as suspect.
+    const byCompany = new Map<string, typeof candidates>();
+    for (const candidate of candidates) {
+      if (!candidate.conversationAgentId && candidate.originKind !== "chat_channel") continue;
+      const rows = byCompany.get(candidate.companyId) ?? [];
+      rows.push(candidate);
+      byCompany.set(candidate.companyId, rows);
+    }
+    const answered = new Set<string>();
+    for (const [companyId, rows] of byCompany) {
+      const carriers = await conversationReplyRunsForLastMessages(db, { companyId, issues: rows.flatMap(row => {
+        const agentId = row.conversationAgentId ?? row.assigneeAgentId;
+        return agentId ? [{ issueId: row.id, agentId }] : [];
+      }) });
+      await Promise.all(carriers.map(async carrier => {
+        if (await conversationTurnAnswered({ db, companyId, issueId: carrier.issueId, runId: carrier.runId })) answered.add(carrier.issueId);
+      }));
+    }
+    return candidates.filter(candidate => !answered.has(candidate.id))
+      .map(({ id, companyId, updatedAt }) => ({ id, companyId, updatedAt }));
   }
 
   /** Evaluate one task, and repair it when it violates the invariant. */

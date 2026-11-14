@@ -167,6 +167,23 @@ describe("assigned-work invariant", () => {
         .toEqual({ kind: "violation", reason: "no_pending_path", stale: false });
     });
 
+    it("repairs only an unanswered in_review conversation with a succeeded run", () => {
+      const source = { id: "run-1", status: "succeeded", errorCode: null, finishedAt: ago(3 * 60 * 60_000),
+        settlingUntil: null, operatorStopped: false };
+      expect(evaluateAssignedWork(facts({ issue: { status: "in_review", isConversation: true,
+        conversationHasPersonMessage: true, conversationAnswered: false }, latestRun: source }), now))
+        .toEqual({ kind: "violation", reason: "no_pending_path", stale: false });
+      for (const overrides of [
+        { issue: { status: "in_review", isConversation: false, conversationHasPersonMessage: true, conversationAnswered: false } },
+        { issue: { status: "in_review", isConversation: true, conversationAnswered: false } },
+        { issue: { status: "in_review", isConversation: true, conversationHasPersonMessage: true, conversationAnswered: true } },
+        { issue: { status: "in_review", isConversation: true, conversationHasPersonMessage: true, conversationAnswered: false },
+          latestRun: { ...source, status: "failed" } },
+      ] as Overrides[]) {
+        expect(evaluateAssignedWork(facts(overrides), now)).toEqual({ kind: "not_applicable" });
+      }
+    });
+
     it("a task offering a Retry only the system can act on", () => {
       expect(evaluateAssignedWork(facts({ interruption: { responsibility: "system", state: "failed", userAction: null,
         nextRetryAt: null, canRetry: true } }), now)).toEqual({ kind: "violation", reason: "retry_offered", stale: false });

@@ -52,18 +52,22 @@ export function isWaitingConversation(
   );
 }
 
-/** Runs that actually carried the last person message, with whether each run
- * materialized its own prose reply. First-turn receipts are accepted only by
- * upstream's reader, which rejects malformed and copied predecessor receipts. */
+/** Runs that actually carried the last person message, including a qualified
+ * assigned-work continuation chain, with whether each run materialized its own
+ * prose reply. First-turn receipts are accepted only by upstream's reader,
+ * which rejects malformed and copied predecessor receipts. */
 export async function conversationRunsForLastMessages(
   db: Db,
   input: { companyId: string; issues: Array<{ issueId: string; agentId: string }>; runId?: string },
 ): Promise<Array<{ issueId: string; runId: string; lastPersonCommentId: string; hasReply: boolean }>> {
   if (!input.issues.length) return [];
   const requested = JSON.stringify(input.issues.map(({ issueId, agentId }) => ({ issue_id: issueId, agent_id: agentId })));
-  const result = await db.execute<{ issueId: string; runId: string; lastPersonCommentId: string; contextSnapshot: unknown; hasReply: boolean }>(sql`
-    select requested.issue_id::text as "issueId", response_run.id::text as "runId",
-      last_person.id::text as "lastPersonCommentId", response_run.context_snapshot as "contextSnapshot",
+  type CarrierRow = { issueId: string; agentId: string; runId: string; lastPersonCommentId: string;
+    lastPersonCreatedAt: Date | string; contextSnapshot: unknown; hasReply: boolean };
+  const directResult = await db.execute<CarrierRow>(sql`
+    select requested.issue_id::text as "issueId", requested.agent_id::text as "agentId", response_run.id::text as "runId",
+      last_person.id::text as "lastPersonCommentId", last_person.created_at as "lastPersonCreatedAt",
+      response_run.context_snapshot as "contextSnapshot",
       exists (
         select 1 from issue_comments reply
         where reply.company_id = task.company_id and reply.issue_id = task.id
@@ -85,18 +89,64 @@ export async function conversationRunsForLastMessages(
       and response_run.context_snapshot->>'issueId' = task.id::text
       and (response_run.context_snapshot->>'wakeCommentId' = last_person.id::text
         or response_run.context_snapshot->>'commentId' = last_person.id::text
-        or response_run.context_snapshot->'firstTurnQueuedInput'->'commentIds' @> jsonb_build_array(last_person.id::text))
-      and (${input.runId ?? null}::uuid is null or response_run.id = ${input.runId ?? null}::uuid)`);
-  const rows = Array.isArray(result) ? result as Array<{ issueId: string; runId: string; lastPersonCommentId: string; contextSnapshot: unknown; hasReply: boolean }>
-    : ((result as { rows?: Array<{ issueId: string; runId: string; lastPersonCommentId: string; contextSnapshot: unknown; hasReply: boolean }> }).rows ?? []);
-  return rows.filter(row => {
+        or response_run.context_snapshot->'firstTurnQueuedInput'->'commentIds' @> jsonb_build_array(last_person.id::text))`);
+  const directRows = Array.isArray(directResult) ? directResult as CarrierRow[]
+    : ((directResult as { rows?: CarrierRow[] }).rows ?? []);
+  const roots = directRows.filter(row => {
     const context = row.contextSnapshot && typeof row.contextSnapshot === "object" && !Array.isArray(row.contextSnapshot)
       ? row.contextSnapshot as Record<string, unknown> : {};
     if (context.wakeCommentId === row.lastPersonCommentId || context.commentId === row.lastPersonCommentId) return true;
     return readFirstTurnQueuedInputReceipt({ id: row.runId, contextSnapshot: context })?.commentIds.includes(row.lastPersonCommentId) === true;
-  }).map(({ issueId, runId, lastPersonCommentId, hasReply }) => ({
-    issueId, runId, lastPersonCommentId, hasReply: hasReply === true,
-  }));
+  });
+  const allRows: Array<Pick<CarrierRow, "issueId" | "runId" | "lastPersonCommentId" | "hasReply">> = roots;
+  if (roots.length) {
+    const ancestry = JSON.stringify(roots.map(row => ({ issue_id: row.issueId, agent_id: row.agentId, run_id: row.runId,
+      last_person_comment_id: row.lastPersonCommentId,
+      last_person_created_at: row.lastPersonCreatedAt instanceof Date ? row.lastPersonCreatedAt.toISOString() : row.lastPersonCreatedAt })));
+    const continuationResult = await db.execute<Pick<CarrierRow, "issueId" | "runId" | "lastPersonCommentId" | "hasReply">>(sql`
+      with recursive roots as (
+        select root.issue_id, root.agent_id, root.run_id, root.last_person_comment_id, root.last_person_created_at
+        from jsonb_to_recordset(${ancestry}::jsonb) as root(
+          issue_id uuid, agent_id uuid, run_id uuid, last_person_comment_id uuid, last_person_created_at timestamptz)
+      ), chain as (
+        select roots.issue_id, roots.agent_id, roots.run_id, roots.last_person_comment_id, roots.last_person_created_at,
+          array[roots.run_id]::uuid[] as path, 0 as depth
+        from roots
+        union all
+        select chain.issue_id, chain.agent_id, successor.id, chain.last_person_comment_id, chain.last_person_created_at,
+          chain.path || successor.id, chain.depth + 1
+        from chain
+        join heartbeat_runs successor on successor.company_id = ${input.companyId}::uuid
+          and successor.agent_id = chain.agent_id
+          and successor.context_snapshot->>'issueId' = chain.issue_id::text
+          and successor.context_snapshot->>'previousRunId' = chain.run_id::text
+          and successor.context_snapshot->>'source' = 'issue.assigned_work_invariant'
+        where chain.depth < 32 and not (successor.id = any(chain.path))
+      )
+      select chain.issue_id::text as "issueId", chain.run_id::text as "runId",
+        chain.last_person_comment_id::text as "lastPersonCommentId",
+        exists (
+          select 1 from issue_comments reply
+          where reply.company_id = ${input.companyId}::uuid and reply.issue_id = chain.issue_id
+            and reply.created_by_run_id = chain.run_id and reply.author_agent_id = chain.agent_id
+            and reply.origin = 'comment' and reply.deleted_at is null
+            and (reply.created_at, reply.id) > (chain.last_person_created_at, chain.last_person_comment_id)
+        ) as "hasReply"
+      from chain where chain.depth > 0`);
+    type ContinuationRow = Pick<CarrierRow, "issueId" | "runId" | "lastPersonCommentId" | "hasReply">;
+    const continuationRows: ContinuationRow[] = Array.isArray(continuationResult) ? continuationResult as ContinuationRow[]
+      : ((continuationResult as { rows?: ContinuationRow[] }).rows ?? []);
+    allRows.push(...continuationRows);
+  }
+  const unique = new Map<string, { issueId: string; runId: string; lastPersonCommentId: string; hasReply: boolean }>();
+  for (const row of allRows) {
+    if (input.runId && row.runId !== input.runId) continue;
+    const key = `${row.issueId}:${row.runId}`;
+    const existing = unique.get(key);
+    unique.set(key, { issueId: row.issueId, runId: row.runId, lastPersonCommentId: row.lastPersonCommentId,
+      hasReply: row.hasReply === true || existing?.hasReply === true });
+  }
+  return [...unique.values()];
 }
 
 /** Find runs that carried the last person message and materialized their own reply.

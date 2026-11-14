@@ -2787,6 +2787,34 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       return carriers.length === 1 && carriers[0]!.hasReply === false;
     };
+    const permitsUnansweredAssignedWorkContinuation = async (reader: Db, currentIssueId: string): Promise<boolean> => {
+      const previousRunId = readNonEmptyString(enrichedContextSnapshot.previousRunId);
+      if (executionReconciliationWake || source !== "automation" || triggerDetail !== "system"
+        || reason !== "issue_continuation_needed" || opts.requestedByActorType !== "system"
+        || opts.requestedByActorId !== null || opts.manualUserWake || opts.failedRunId || opts.taskRetryRequestId
+        || opts.durableChatRequest || enrichedContextSnapshot.source !== "issue.assigned_work_invariant"
+        || enrichedContextSnapshot.assignedWorkViolation !== "no_pending_path"
+        || enrichedContextSnapshot.issueId !== currentIssueId || !previousRunId || !isUuidLike(previousRunId)
+        || payload?.issueId !== currentIssueId || payload?.mutation !== "assigned_work_invariant") return false;
+      const [currentIssue] = await reader.select({ status: issues.status, conversationAgentId: issues.conversationAgentId,
+        conversationUserId: issues.conversationUserId, conversationState: issues.conversationState }).from(issues)
+        .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, currentIssueId))).limit(1);
+      if (!currentIssue || !isWaitingConversation(currentIssue) || currentIssue.conversationAgentId !== agentId) return false;
+      const [previousRun] = await reader.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.id, previousRunId), eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${currentIssueId}`)).limit(1);
+      if (previousRun?.status !== "succeeded") return false;
+      if (await hasAutomaticInteractionDeliveryHold(reader, {
+        companyId: agent.companyId, issueId: currentIssueId, agentId, payload, context: enrichedContextSnapshot,
+        actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
+      })) return false;
+      if (await hasPendingConversationResponseCard({ db: reader, companyId: agent.companyId,
+        issueId: currentIssueId, runId: previousRunId })) return false;
+      const carriers = await conversationRunsForLastMessages(reader, {
+        companyId: agent.companyId, issues: [{ issueId: currentIssueId, agentId }],
+      });
+      return carriers.some(row => row.runId === previousRunId) && carriers.every(row => !row.hasReply);
+    };
     if (issueId) {
       const [pending] = await db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, agent.companyId), eq(caseHandoffs.issueId, issueId),
         inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1);
@@ -2807,7 +2835,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (agent.id !== conversation!.conversationAgentId) return null;
         if (!(await instanceSettings.getExperimental()).enableAgentChat) return null;
         if (isWaitingConversation(conversation) && !hasIndependentConversationWakeCause()
-          && !(await permitsUnansweredConversationContinuation(db, issueId))) return null;
+          && !(await permitsUnansweredConversationContinuation(db, issueId))
+          && !(await permitsUnansweredAssignedWorkContinuation(db, issueId))) return null;
       }
     }
     if (agent.adapterType === "paperclip_runner") {
@@ -3766,8 +3795,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // provenance before persisting a saved-work continuation.
           const allowsUnansweredConversationContinuation = isConversation(issue)
             && await permitsUnansweredConversationContinuation(tx as unknown as Db, issue.id);
+          const allowsUnansweredAssignedWorkContinuation = isConversation(issue)
+            && await permitsUnansweredAssignedWorkContinuation(tx as unknown as Db, issue.id);
           if (isWaitingConversation(issue) && !hasIndependentConversationWakeCause()
-            && !allowsUnansweredConversationContinuation) {
+            && !allowsUnansweredConversationContinuation && !allowsUnansweredAssignedWorkContinuation) {
             return { kind: "skipped" as const };
           }
 

@@ -2,7 +2,8 @@ import { SERVER_RESTART_RETRY_MAX_ATTEMPTS, SERVER_RESTART_RETRY_WINDOW_MS } fro
 
 /**
  * The assigned-work invariant. Every open task assigned to an agent (`todo`,
- * `in_progress`, or `blocked` where the block is not a person's to resolve)
+ * `in_progress`, or `blocked` where the block is not a person's to resolve;
+ * also a waiting in-review conversation with an unanswered person message)
  * has, at all times, exactly one of:
  *
  * 1. a live run (queued or running) whose owner is not proven gone;
@@ -127,7 +128,9 @@ export type AssignedWorkFacts = {
     unblockOwner: { agentId: string } | { userId: string } | "board" | null;
     monitorNextCheckAt: Date | null;
     isConversation: boolean;
-    /** The last person message has a reply from the run that carried it. */
+    /** At least one non-deleted person-authored message exists. */
+    conversationHasPersonMessage?: boolean;
+    /** The last person message has a reply from its carrier or recovery successor. */
     conversationAnswered?: boolean;
     awaitingFirstMessage: boolean;
   };
@@ -179,11 +182,13 @@ export type AssignedWorkVerdict =
   | { kind: "settling"; recheckAt: Date }
   | { kind: "violation"; reason: ViolationReason; runId?: string; stale: boolean };
 
-const IN_SCOPE_STATUSES = new Set(["todo", "in_progress", "blocked"]);
+const IN_SCOPE_STATUSES = new Set(["todo", "in_progress", "blocked", "in_review"]);
 
 export function evaluateAssignedWork(facts: AssignedWorkFacts, now: Date = new Date()): AssignedWorkVerdict {
   const { issue } = facts;
-  if (!IN_SCOPE_STATUSES.has(issue.status) || !issue.assigneeAgentId || issue.assigneeUserId || issue.hidden) {
+  if (!IN_SCOPE_STATUSES.has(issue.status) || !issue.assigneeAgentId || issue.assigneeUserId || issue.hidden
+    || (issue.status === "in_review" && (!issue.isConversation || issue.conversationHasPersonMessage !== true
+      || issue.conversationAnswered !== false || facts.latestRun?.status !== "succeeded"))) {
     return { kind: "not_applicable" };
   }
 
