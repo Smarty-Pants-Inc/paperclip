@@ -183,15 +183,20 @@ describe('RFL round 2 independent process acceptance', () => {
     try {
       await f.save(f.a, { revision: 2, enabled: true, gate: f.gate });
       await f.crash(); await f.waitEntered();
-      // The save queues behind A until the old RPC times out, while the child
-      // is still executing A. Then it delivers revision 3 successfully.
+      // RFL 09:08Z ruling also applies to this retained initial judge copy:
+      // timeout retires the old process before applying the current revision.
+      const oldPid = f.handle.diagnostics().pid;
       await f.httpSave(f.a, { revision: 3, enabled: false });
-      expect((await f.state()).latest[f.a]).toEqual({ revision: 3, enabled: false });
-      f.release();
-      await vi.waitFor(async () => expect((await f.state()).history.some((x: any) => x.companyId === f.a && x.revision === 2)).toBe(true), { timeout: 5000 });
+      await vi.waitFor(async () => {
+        expect(f.handle.diagnostics().pid).not.toBe(oldPid);
+        expect((await f.state()).latest[f.a]?.revision).toBe(3);
+      }, { timeout: 10000 });
+      f.release(); await pause(200);
       const state = await f.state();
-      console.log('RFL_TIMEOUT', JSON.stringify({ history: state.history, persisted: (await f.registry.getConfig(f.id, f.a))?.configJson }));
-      expect(state.latest[f.a]).toEqual({ revision: 3, enabled: false });
+      const persisted = (await f.registry.getConfig(f.id, f.a))!.configJson;
+      console.log('RFL_TIMEOUT', JSON.stringify({ oldPid, pid: state.pid, history: state.history, persisted }));
+      expect(state.latest[f.a]).toEqual(persisted);
+      expect(state.history.filter((x: any) => x.companyId === f.a).map((x: any) => x.revision)).toEqual([3]);
     } finally { spy.mockRestore(); await f.close(); }
   }, 20000);
 

@@ -40,7 +40,7 @@ describe('RFL round 2 independent process acceptance', () => {
   });
   afterAll(async () => { await database?.cleanup(); });
 
-  async function setup() {
+  async function setup(workerFixture = './fixtures/rfl-round2-worker.mjs') {
     const [a, b, denied] = [randomUUID(), randomUUID(), randomUUID()].sort();
     for (const id of [a,b,denied]) await db.insert(companies).values({ id, name: 'RFL local fixture', issuePrefix: `R${id.replaceAll('-', '').slice(0,8).toUpperCase()}` });
     const id = randomUUID();
@@ -53,7 +53,7 @@ describe('RFL round 2 independent process acceptance', () => {
     };
     writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: '@rfl/round2', version: '0.0.1', type: 'module', paperclipPlugin: { manifest: 'manifest.js', worker: 'worker.js' } }));
     writeFileSync(path.join(root, 'manifest.js'), `export default ${JSON.stringify(manifest)};`);
-    const worker = fileURLToPath(new URL('./fixtures/rfl-round2-worker.mjs', import.meta.url));
+    const worker = fileURLToPath(new URL(workerFixture, import.meta.url));
     writeFileSync(path.join(root, 'worker.js'), `import { start } from ${JSON.stringify(pathToFileURL(worker).href)}; start(${JSON.stringify(denied)});`);
     await db.insert(plugins).values({ id, pluginKey: manifest.id, packageName: '@rfl/round2', version: '0.0.1', apiVersion: 1, categories: ['automation'], manifestJson: manifest, status: 'ready', installOrder: 1, packagePath: root });
     const registry = pluginRegistryService(db);
@@ -186,15 +186,20 @@ describe('RFL round 2 independent process acceptance', () => {
     try {
       await f.save(f.a, { revision: 2, enabled: true, gate: f.gate });
       await f.crash(); await f.waitEntered();
-      // The save queues behind A until the old RPC times out, while the child
-      // is still executing A. Then it delivers revision 3 successfully.
+      const oldPid = f.handle.diagnostics().pid;
+      // RFL 09:08Z ruling: a timed-out callback is retired, not allowed to
+      // complete after a newer apply. Do not release the old gate until replay.
       await f.httpSave(f.a, { revision: 3, enabled: false });
-      expect((await f.state()).latest[f.a]).toEqual({ revision: 3, enabled: false });
-      f.release();
-      await vi.waitFor(async () => expect((await f.state()).history.some((x: any) => x.companyId === f.a && x.revision === 2)).toBe(true), { timeout: 5000 });
+      await vi.waitFor(async () => {
+        expect(f.handle.diagnostics().pid).not.toBe(oldPid);
+        expect((await f.state()).latest[f.a]?.revision).toBe(3);
+      }, { timeout: 10000 });
+      f.release(); await pause(200);
       const state = await f.state();
-      console.log('RFL_TIMEOUT', JSON.stringify({ history: state.history, persisted: (await f.registry.getConfig(f.id, f.a))?.configJson }));
-      expect(state.latest[f.a]).toEqual({ revision: 3, enabled: false });
+      const persisted = (await f.registry.getConfig(f.id, f.a))!.configJson;
+      console.log('RFL_TIMEOUT', JSON.stringify({ oldPid, pid: state.pid, history: state.history, persisted }));
+      expect(state.latest[f.a]).toEqual(persisted);
+      expect(state.history.filter((x: any) => x.companyId === f.a).map((x: any) => x.revision)).toEqual([3]);
     } finally { spy.mockRestore(); await f.close(); }
   }, 20000);
 
@@ -206,14 +211,60 @@ describe('RFL round 2 independent process acceptance', () => {
       const began = Date.now();
       await f.httpSave(f.a, { revision: 3, enabled: false });
       const elapsed = Date.now() - began;
-      expect((await f.state()).latest[f.a]).toEqual({ revision: 3, enabled: false });
-      f.release();
-      await vi.waitFor(async () => expect((await f.state()).history.some((x: any) => x.companyId === f.a && x.revision === 2)).toBe(true), { timeout: 5000 });
+      // RFL 09:08Z ruling supersedes the requirement that old revision 2
+      // complete after revision 3. A hung apply must be killed at the deadline.
+      await vi.waitFor(async () => expect((await f.state()).latest[f.a]?.revision).toBe(3), { timeout: 10000 });
+      f.release(); await pause(200);
       const state = await f.state();
-      console.log('RFL_DEFAULT_TIMEOUT', JSON.stringify({ elapsed, history: state.history, persisted: (await f.registry.getConfig(f.id, f.a))?.configJson }));
-      expect(state.latest[f.a]).toEqual({ revision: 3, enabled: false });
+      const persisted = (await f.registry.getConfig(f.id, f.a))!.configJson;
+      console.log('RFL_DEFAULT_TIMEOUT', JSON.stringify({ elapsed, history: state.history, persisted }));
+      expect(elapsed).toBeGreaterThanOrEqual(29000);
+      expect(state.latest[f.a]).toEqual(persisted);
+      expect(state.history.filter((x: any) => x.companyId === f.a).map((x: any) => x.revision)).toEqual([3]);
     } finally { await f.close(); }
   }, 50000);
+
+  it('a callback that never returns is killed and the restarted worker ends on DB revision 3', async () => {
+    const f = await setup('./fixtures/rfl-config-hung-worker.mjs');
+    const call = f.manager.call.bind(f.manager) as any;
+    const spy = vi.spyOn(f.manager, 'call').mockImplementation(((id: string, method: string, params: any, ...rest: any[]) =>
+      method === 'configChanged' ? call(id, method, params, 150) : call(id, method, params, ...rest)) as any);
+    try {
+      await f.save(f.a, { revision: 2, enabled: true, gate: f.gate });
+      await f.crash(); await f.waitEntered();
+      const oldPid = f.handle.diagnostics().pid;
+      await f.httpSave(f.a, { revision: 3, enabled: false });
+      await vi.waitFor(async () => {
+        expect(f.handle.diagnostics().pid).not.toBe(oldPid);
+        expect((await f.state()).latest[f.a]?.revision).toBe(3);
+      }, { timeout: 10000 });
+      await pause(200);
+      const state = await f.state();
+      expect(state.latest[f.a]).toEqual((await f.registry.getConfig(f.id, f.a))!.configJson);
+      expect(state.history.filter((x: any) => x.companyId === f.a).map((x: any) => x.revision)).toEqual([3]);
+      expect(() => process.kill(oldPid!, 0)).toThrow();
+      console.log('RFL_NEVER_RETURNS', JSON.stringify({ oldPid, pid: state.pid, history: state.history }));
+    } finally { spy.mockRestore(); await f.close(); }
+  }, 20000);
+
+  it('revision 3 waits for revision 2 to return when the callback completes before timeout', async () => {
+    const f = await setup();
+    let save: Promise<void> | undefined;
+    try {
+      await f.save(f.a, { revision: 2, enabled: true, gate: f.gate });
+      await f.crash(); await f.waitEntered();
+      const pid = f.handle.diagnostics().pid;
+      save = f.httpSave(f.a, { revision: 3, enabled: false });
+      await vi.waitFor(async () => expect((await f.registry.getConfig(f.id, f.a))!.configJson.revision).toBe(3));
+      expect((await f.state()).latest[f.a]).toBeUndefined();
+      f.release(); await save;
+      const state = await f.state();
+      expect(f.handle.diagnostics().pid).toBe(pid);
+      expect(state.history.filter((x: any) => x.companyId === f.a).map((x: any) => x.revision)).toEqual([2,3]);
+      expect(state.latest[f.a]).toEqual((await f.registry.getConfig(f.id, f.a))!.configJson);
+      console.log('RFL_SERIAL_COMPLETION', JSON.stringify({ pid, history: state.history }));
+    } finally { f.release(); await save; await f.close(); }
+  }, 20000);
 
   it('four respawns interleaved with saves do not starve the new generation', async () => {
     const f = await setup();
