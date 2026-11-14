@@ -626,10 +626,14 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
       const gate = await freshThreadStopGate(tx, run, issue.id, input.retryStop);
       if (!gate.gone) return { kind: "exact_recovery_pending", reason: gate.reason,
         retryAt: new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS) };
+      const noticeAuthorizationReason = input.delivery !== "caller_owns"
+        || await hasFreshThreadNotice(tx, companyId, issue.id, gate.noticeAuthorizationReason)
+        ? gate.noticeAuthorizationReason : undefined;
+      const { noticeAuthorizationReason: _oldNoticeReason, ...fresh } = object(prior.evidence.freshContinuation);
       await tx.update(issueRecoveryActions).set({ evidence: { ...prior.evidence,
-        freshContinuation: { ...object(prior.evidence.freshContinuation), previousExecutionGone: true,
-          noticeAuthorizationReason: gate.noticeAuthorizationReason } } }).where(eq(issueRecoveryActions.id, prior.id));
-      await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
+        freshContinuation: { ...fresh, previousExecutionGone: true,
+          ...(noticeAuthorizationReason ? { noticeAuthorizationReason } : {}) } } }).where(eq(issueRecoveryActions.id, prior.id));
+      if (input.delivery !== "caller_owns") await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
     }
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now,
       ownsBlock: holds.filter(isOwnedReconciliationHold).some(ownsBlockedStatus) });
@@ -849,11 +853,18 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
       : isolation === "fresh_isolated_workspace"
         ? `The previous writer of run ${run.id} is not proven stopped, so the continuation starts in a new isolated workspace; no unverified files are applied.`
         : `The continuation of run ${run.id} starts from the task's last saved workspace; no unverified files are applied.` };
+  // A caller-owned wake has not consumed its thread boundary yet. Reuse a
+  // waiting notice only if one actually exists; otherwise admission owns the
+  // first notice and its action-specific key, after rechecking later answers.
+  const noticeAuthorizationReason = strictBoundary && (delivery !== "caller_owns"
+    || await hasFreshThreadNotice(tx, companyId, issue.id, strictBoundary.noticeAuthorizationReason))
+    ? strictBoundary.noticeAuthorizationReason : undefined;
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: run.id, trigger: input.trigger,
     chainRootRunId: chain.rootRunId, chainAttempt: chain.attempts + 1,
     failureCode: run.errorCode ?? null, delivery, recordedAt: now.toISOString(), isolation,
     stopProof: isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
-    ...(strictBoundary ? { previousExecutionGone: true, noticeAuthorizationReason: strictBoundary.noticeAuthorizationReason } : {}),
+    ...(strictBoundary ? { previousExecutionGone: true } : {}),
+    ...(noticeAuthorizationReason ? { noticeAuthorizationReason } : {}),
     unverifiedActions: unverified, createdObjects: created, ...(fenced ? { workspace: fenced } : {}) };
   const reconciliation = { ...decision, actorId: FRESH_CONTINUATION_ACTOR, recordedAt: now.toISOString() };
   // Who, what, why and when. A fresh run is not a replay: the interrupted turn
@@ -940,10 +951,19 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     action: "issue.continued_from_saved_work", entityType: "issue", entityId: issue.id, agentId: run.agentId, runId: run.id,
     details: { recoveryActionId: primaryId, sourceRunId: run.id, failureCode: run.errorCode ?? null, trigger: input.trigger,
       delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length } });
-  if (strictBoundary) await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
+  if (strictBoundary && delivery !== "caller_owns") await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
   logger.info({ runId: run.id, issueId: issue.id, failureCode: run.errorCode, trigger: input.trigger, delivery },
     "Unfinished run continues in a fresh run from saved work");
   return { kind: "continued", recoveryActionId: primaryId, delivery, isolation };
+}
+
+async function hasFreshThreadNotice(tx: Db, companyId: string, issueId: string, authorizationReason: string) {
+  const [notice] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`)).limit(1);
+  return notice !== undefined;
 }
 
 async function settleLateHolds(tx: Db, input: { companyId: string; issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect;
