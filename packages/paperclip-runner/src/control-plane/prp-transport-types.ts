@@ -32,6 +32,10 @@ export interface DurableRecoveryCoreCommand {
   controllerSeq: number;
   type: string;
   issuedAt: string;
+  /** Server journal provenance only; never sent to runnerd. Absent on legacy commands. */
+  issuer?: { bootId: string; generation: number };
+  /** Server-only terminal disposition. Never interpreted as a runner result. */
+  abandonment?: { disposition: "ABANDONED"; abandonedAt: string; settledByBootId: string };
   payload: Record<string, unknown>;
   /**
    * `indeterminate` is the runner's crash-recovery verdict: the command was
