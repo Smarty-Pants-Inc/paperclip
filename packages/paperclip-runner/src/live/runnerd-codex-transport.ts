@@ -9211,11 +9211,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     >,
   ): void {
     let checking = false;
+    let verificationRequested = false;
     let unverifiedSince: number | null = null;
     const inactive = () => this.#verifyAdoptedRunner !== verify || this.#adoptedRunnerMonitor === null
       || this.#closed || this.#failure !== null || (this.#releaseEpisode && !this.#releaseEpisode.claimed);
     const verify = () => {
-      if (checking || inactive()) return;
+      if (inactive()) return;
+      verificationRequested = true;
+      if (checking) return;
+      verificationRequested = false;
       checking = true;
       void Promise.resolve().then(() => adoptedRunner.isAlive())
         .then((alive) => {
@@ -9244,6 +9248,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         })
         .finally(() => {
           checking = false;
+          const requested = verificationRequested;
+          verificationRequested = false;
+          if (requested && !inactive()) verify();
         });
     };
     this.#verifyAdoptedRunner = verify;

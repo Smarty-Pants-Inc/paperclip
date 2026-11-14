@@ -29,7 +29,7 @@ async function verifyLiveRunnerAdoption(
   semanticRecoveryMode?: "denied-before-cancel" | "cleanup-only",
   stopExitProofFault?: "missing" | "false",
   livenessUnverifiedWhileConnected?: "within-grace" | "past-grace" | "reset-by-success",
-  idleProbeBudget: boolean | "disconnect" = false,
+  idleProbeBudget: boolean | "disconnect" | "inflight" | "inflight-detach" = false,
 ) {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-live-adopt-"));
   const pendingCompletion = toolHandlerOrder?.startsWith("completion-") === true;
@@ -55,8 +55,26 @@ async function verifyLiveRunnerAdoption(
   const address = server.address();
   if (!address || typeof address === "string")
     throw new Error("Expected adoption test listener");
+  let authenticatedCloseDeliveries = 0;
   const registration = vi.fn(async (next: DurablePrpControlPlane) => {
     authority = next;
+    if (idleProbeBudget === "inflight" || idleProbeBudget === "inflight-detach") {
+      const attach = next.attachWireConnection.bind(next);
+      next.attachWireConnection = wire => {
+        let connection: ReturnType<typeof attach> | undefined;
+        connection = attach({
+          sendJson: value => wire.sendJson(value),
+          close: code => wire.close(code),
+          onJson: listener => wire.onJson(listener),
+          onClose: listener => wire.onClose(error => {
+            const authenticated = connection?.isAuthenticated() === true;
+            listener(error);
+            if (authenticated) authenticatedCloseDeliveries++;
+          }),
+        });
+        return connection;
+      };
+    }
     return {
       connectUrl: `ws://127.0.0.1:${address.port}/runner`,
       ...(mismatchedArtifact || uncertainAtClose || semanticRecoveryMode === "cleanup-only" ? { checkpoint } : {}),
@@ -121,6 +139,7 @@ async function verifyLiveRunnerAdoption(
   let adopted: ReturnType<typeof createCapabilityRunnerdCodexTransport> | null =
     null;
   let restoreIntervalSpies: () => void = () => undefined;
+  let releaseProbe: (() => void) | undefined;
   try {
     let opened: Record<string, unknown>;
     try {
@@ -210,6 +229,7 @@ async function verifyLiveRunnerAdoption(
     const probeError = new Error("fixture remote process identity is unavailable");
     let rejectLiveness = false;
     let livenessProbes = 0;
+    let holdProbe = false;
     if (idleProbeBudget || livenessUnverifiedWhileConnected) vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
     const intervals = uncertainAtClose ? vi.spyOn(globalThis, "setInterval") : null;
     const clearedIntervals = uncertainAtClose ? vi.spyOn(globalThis, "clearInterval") : null;
@@ -247,6 +267,9 @@ async function verifyLiveRunnerAdoption(
           if (rejectLiveness) return Promise.reject(probeError);
           try {
             process.kill(runnerPid!, 0);
+            if (holdProbe) return new Promise<boolean>(resolve => {
+              releaseProbe = () => { holdProbe = false; resolve(true); };
+            });
             return true;
           } catch {
             return false;
@@ -320,11 +343,33 @@ async function verifyLiveRunnerAdoption(
     if (idleProbeBudget) {
       // Real authenticated adoption, with only the recurring clock faked.
       livenessProbes = 0;
-      if (idleProbeBudget === "disconnect") {
+      authenticatedCloseDeliveries = 0;
+      if (idleProbeBudget === "inflight" || idleProbeBudget === "inflight-detach") {
+        holdProbe = true;
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(livenessProbes).toBe(1);
+        authority!.disconnectActiveRunner();
+        const deadline = performance.now() + 1_000;
+        while (authenticatedCloseDeliveries === 0 && performance.now() < deadline) {
+          await new Promise<void>(resolve => setTimeout(resolve, 5));
+        }
+        expect(authenticatedCloseDeliveries).toBeGreaterThan(0);
+        await vi.advanceTimersByTimeAsync(50_000);
+        expect(livenessProbes).toBe(1);
+        if (idleProbeBudget === "inflight-detach") await adopted.detachControllerForRestart();
+        releaseProbe!();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(livenessProbes).toBe(idleProbeBudget === "inflight-detach" ? 1 : 2);
+        expect(adopted.evidence().runnerExited).toBe(false);
+      } else if (idleProbeBudget === "disconnect") {
         authority!.disconnectActiveRunner();
         // No fake-clock advance: an authenticated channel close must probe now,
         // rather than waiting for the five-second safety net.
-        await vi.waitFor(() => expect(livenessProbes).toBe(1));
+        const deadline = performance.now() + 1_000;
+        while (livenessProbes === 0 && performance.now() < deadline) {
+          await new Promise<void>(resolve => setTimeout(resolve, 5));
+        }
+        expect(livenessProbes).toBe(1);
       } else {
         await vi.advanceTimersByTimeAsync(4_999);
         expect(livenessProbes, "no idle probe before the 5 s fallback").toBe(0);
@@ -534,6 +579,7 @@ async function verifyLiveRunnerAdoption(
       expect(commandTypes).not.toContain("runner.suspend");
     }
   } finally {
+    releaseProbe?.();
     if (idleProbeBudget || livenessUnverifiedWhileConnected) vi.useRealTimers();
     releaseRecovery();
     await adopted?.transport.close().catch(() => undefined);
@@ -586,6 +632,9 @@ it.each([1, 2, 3])("bounds idle adopted transport %i to one fallback probe per 5
 
 it("probes an adopted runner immediately on authenticated channel close", () =>
   verifyLiveRunnerAdoption(false, false, false, false, false, false, "allow", undefined, false, undefined, undefined, undefined, "disconnect"), 30_000);
+
+it.each(["inflight", "inflight-detach"] as const)("coalesces adopted probe wakes without reviving a detached watcher (%s)", mode =>
+  verifyLiveRunnerAdoption(false, false, false, false, false, false, "allow", undefined, false, undefined, undefined, undefined, mode), 30_000);
 
 it("retains authenticated adopted-runner ownership when a close probe rejects", () => verifyLiveRunnerAdoption(false, false, false, false, false, false, "allow", undefined, true), 30_000);
 
