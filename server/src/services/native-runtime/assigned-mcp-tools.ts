@@ -296,7 +296,9 @@ export async function createAssignedMcpTools(input: {
     bearerToken: input.bearerToken,
   });
   const provenance = input.provenanceBinding && listed.length ? await assignedToolConnectionProvenance(input.provenanceBinding.db, input.provenanceBinding) : new Map<string, ConnectionProvenance>();
-  const provenanceDescriptors = new Map<string, ToolGatewayDescriptor>();
+  // Keep only session authority here, not each descriptor's full schema: the
+  // upstream shared catalog owns those large immutable definitions.
+  const provenanceDescriptors = new Map<string, Pick<ToolGatewayDescriptor, "connectionId">>();
   const listing: AssignedListingEntry[] = [];
   const listedNames = new Map<string, string>();
   for (const descriptor of deduplicateToolDescriptors(listed)) {
@@ -308,7 +310,7 @@ export async function createAssignedMcpTools(input: {
         "assigned_mcp_tool_name_collision");
     }
     listedNames.set(name, descriptor.name);
-    provenanceDescriptors.set(name, descriptor);
+    provenanceDescriptors.set(name, { connectionId: descriptor.connectionId });
     const raw = (descriptor.parametersSchema ?? { type: "object", properties: {} }) as Record<string, unknown>;
     const serialized = JSON.stringify(raw);
     listing.push({
