@@ -112,26 +112,34 @@ fn ingress_idle_backlog_does_not_delay_next_connect() {
 }
 
 #[test]
-fn ingress_second_controller_is_rejected_promptly() {
+fn ingress_second_controller_is_rejected_after_its_wait_deadline() {
     let (endpoint, address, path) = endpoint();
-    let (_controller, _peer) = upgrade(&endpoint, address, path.clone());
+    let (mut controller, peer) = upgrade(&endpoint, address, path.clone());
+    let RunnerSocket::Listen(socket) = &mut controller else {
+        unreachable!()
+    };
+    socket.authenticated().unwrap();
     let started = Instant::now();
     let stream = TcpStream::connect(address).unwrap();
-    stream.set_read_timeout(Some(CLIENT_BUDGET)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(18)))
+        .unwrap();
     let result = tungstenite::client(format!("ws://{address}{path}"), stream);
     eprintln!(
-        "second controller elapsed_ms={} result={result:?}",
+        "second controller wait elapsed_ms={}",
         started.elapsed().as_millis()
     );
-    match result {
-        Err(HandshakeError::Failure(tungstenite::Error::Http(response))) => {
-            assert!(matches!(response.status().as_u16(), 409 | 503));
-        }
-        other => panic!("second controller must receive prompt HTTP rejection: {other:?}"),
-    }
-    assert!(started.elapsed() < Duration::from_secs(1));
-    drop(_controller);
-    drop(_peer);
+    assert!(matches!(result,
+        Err(HandshakeError::Failure(tungstenite::Error::Http(response)))
+            if response.status().as_u16() == 503));
+    assert!(started.elapsed() >= Duration::from_secs(15));
+    assert!(started.elapsed() < Duration::from_secs(17));
+    assert!(endpoint
+        .open(1024 * 1024, None, Instant::now() + CLIENT_BUDGET)
+        .unwrap()
+        .is_none());
+    drop(controller);
+    drop(peer);
     let (_controller, _peer) = upgrade(&endpoint, address, path);
 }
 
@@ -283,11 +291,15 @@ fn ingress_total_deadline_releases_unauthenticated_active_slot() {
     let (_controller, _peer) = upgrade(&endpoint, address, path.clone());
     drop(expired);
     let stream = TcpStream::connect(address).unwrap();
-    stream.set_read_timeout(Some(CLIENT_BUDGET)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
     assert!(
-        matches!(tungstenite::client(format!("ws://{address}{path}"), stream),
-        Err(HandshakeError::Failure(tungstenite::Error::Http(response)))
-            if response.status().as_u16() == 503)
+        matches!(
+            tungstenite::client(format!("ws://{address}{path}"), stream),
+            Err(HandshakeError::Interrupted(_))
+        ),
+        "dropping the expired handle must not release the current controller"
     );
 }
 

@@ -1,6 +1,8 @@
 //! Always-on ingress admission. TCP accept sleeps in the kernel when idle;
 //! only pending upgrades retry nonblocking I/O, for at most two seconds.
+//! Valid upgrades wait on controller release, not an idle polling timer.
 use super::DurableRunnerError;
+use std::cell::Cell;
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
@@ -14,8 +16,12 @@ use tungstenite::{accept_hdr_with_config, WebSocket};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_HANDSHAKES: usize = 16;
-/// One accept-to-authentication budget: HTTP upgrade, ready wait, and mutual
-/// authentication share this deadline. Authenticated welcome keeps its own budget.
+/// Match the server's 15-second per-attempt HTTP upgrade budget. Waiting for
+/// admission is separate from the short unauthenticated I/O budget below.
+const CONTROLLER_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// HTTP upgrade I/O, ready wait, and mutual authentication share this deadline,
+/// excluding time a validated upgrade waits for the previous controller.
+/// Authenticated welcome keeps its own budget.
 const UNAUTHENTICATED_TIMEOUT: Duration = Duration::from_millis(2500);
 
 struct ReadySocket {
@@ -29,6 +35,7 @@ struct Admission {
     ready: Option<ReadySocket>,
     active: Option<Instant>,
     active_deadline: Option<Instant>,
+    reserved: Option<Instant>,
     accept_error: Option<String>,
 }
 
@@ -81,6 +88,7 @@ impl ListenerIngress {
             ready: None,
             active: None,
             active_deadline: None,
+            reserved: None,
             accept_error: None,
         }));
         let stopping = Arc::new(AtomicBool::new(false));
@@ -132,10 +140,6 @@ impl ListenerIngress {
                     let (path, generation, evicted) = {
                         let mut state = shared.lock().unwrap();
                         state.expire_ready();
-                        if state.active.is_some() || state.ready.is_some() {
-                            reject_busy(&mut stream);
-                            continue;
-                        }
                         let evicted = if pending.len() >= MAX_PENDING_HANDSHAKES {
                             let Some(oldest) = pending.iter().position(|pending| {
                                 pending.control.upgrading.load(Ordering::Acquire)
@@ -146,6 +150,7 @@ impl ListenerIngress {
                             let pending = pending.remove(oldest);
                             pending.control.cancelled.store(true, Ordering::Release);
                             pending.control.shutdown();
+                            wake.notify_all();
                             Some(pending)
                         } else {
                             None
@@ -266,6 +271,24 @@ fn reject_busy(stream: &mut TcpStream) {
     );
 }
 
+/// Release a callback's reservation even if the response write fails or the
+/// unfinished upgrade is evicted. The same mutex protects every handover.
+struct UpgradeReservation<'a> {
+    admission: &'a Mutex<Admission>,
+    changed: &'a Condvar,
+    id: Instant,
+}
+
+impl Drop for UpgradeReservation<'_> {
+    fn drop(&mut self) {
+        let mut state = self.admission.lock().unwrap();
+        if state.reserved == Some(self.id) {
+            state.reserved = None;
+        }
+        self.changed.notify_all();
+    }
+}
+
 fn upgrade(
     stream: TcpStream,
     path: String,
@@ -276,12 +299,17 @@ fn upgrade(
     stopping: &AtomicBool,
     changed: &Condvar,
 ) {
-    let upgrade_deadline = accepted + HANDSHAKE_TIMEOUT;
-    let deadline = accepted + UNAUTHENTICATED_TIMEOUT;
+    let _reservation = UpgradeReservation {
+        admission,
+        changed,
+        id: accepted,
+    };
+    let waited = Cell::new(Duration::ZERO);
+    let upgrade_deadline = || accepted + HANDSHAKE_TIMEOUT + waited.get();
     let expired = || {
         stopping.load(Ordering::Acquire)
             || control.cancelled.load(Ordering::Acquire)
-            || Instant::now() >= upgrade_deadline
+            || Instant::now() >= upgrade_deadline()
     };
     if expired() || stream.set_nonblocking(true).is_err() {
         return;
@@ -299,13 +327,35 @@ fn upgrade(
                 *rejection.status_mut() = tungstenite::http::StatusCode::BAD_REQUEST;
                 return Err(rejection);
             }
-            let state = admission.lock().unwrap();
-            if state.active.is_some() || state.ready.is_some() || state.generation != generation {
-                let mut rejection = ErrorResponse::new(None);
-                *rejection.status_mut() = tungstenite::http::StatusCode::SERVICE_UNAVAILABLE;
-                return Err(rejection);
+            let mut state = admission.lock().unwrap();
+            let waiting_since = Instant::now();
+            let wait_deadline = accepted + CONTROLLER_WAIT_TIMEOUT;
+            loop {
+                state.expire_ready();
+                if stopping.load(Ordering::Acquire)
+                    || control.cancelled.load(Ordering::Acquire)
+                    || state.generation != generation
+                    || Instant::now() >= wait_deadline
+                {
+                    let mut rejection = ErrorResponse::new(None);
+                    *rejection.status_mut() = tungstenite::http::StatusCode::SERVICE_UNAVAILABLE;
+                    return Err(rejection);
+                }
+                if state.active.is_none() && state.ready.is_none() && state.reserved.is_none() {
+                    // Reserve before sending HTTP 101: simultaneous waiters
+                    // must not both upgrade into the one controller slot.
+                    state.reserved = Some(accepted);
+                    waited.set(waiting_since.elapsed());
+                    return Ok(response);
+                }
+                state = changed
+                    .wait_timeout(
+                        state,
+                        wait_deadline.saturating_duration_since(Instant::now()),
+                    )
+                    .unwrap()
+                    .0;
             }
-            Ok(response)
         },
         None,
     );
@@ -324,8 +374,13 @@ fn upgrade(
                     return;
                 }
                 control.upgrading.store(false, Ordering::Release);
-                if state.active.is_none() && state.ready.is_none() && state.generation == generation
+                if state.active.is_none()
+                    && state.ready.is_none()
+                    && state.generation == generation
+                    && state.reserved == Some(accepted)
                 {
+                    state.reserved = None;
+                    let deadline = accepted + UNAUTHENTICATED_TIMEOUT + waited.get();
                     state.ready = Some(ReadySocket {
                         socket,
                         expires: deadline,
@@ -361,6 +416,7 @@ fn upgrade(
                         }
                         state = changed.wait_timeout(state, remaining).unwrap().0;
                     }
+                    changed.notify_all();
                 }
                 return;
             }
@@ -368,7 +424,7 @@ fn upgrade(
                 if admission.lock().unwrap().generation != generation {
                     return;
                 }
-                let remaining = upgrade_deadline.saturating_duration_since(Instant::now());
+                let remaining = upgrade_deadline().saturating_duration_since(Instant::now());
                 thread::sleep(Duration::from_millis(5).min(remaining));
                 if expired() {
                     return;

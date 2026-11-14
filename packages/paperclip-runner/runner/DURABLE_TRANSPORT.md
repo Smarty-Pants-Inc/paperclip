@@ -27,20 +27,28 @@ partial, and malformed HTTP peers are dropped without failing a controller
 connect attempt or consuming a ticket. Only unfinished upgrades retry
 nonblocking I/O (at most every 5 ms).
 
-Each unauthenticated connection has **one 2.5-second deadline from TCP accept**:
-HTTP upgrade, waiting for a connecting tick, and receiving and validating the
-controller's proof all spend that same budget. HTTP upgrade also retains its
-shorter 2-second sub-limit.
+Each unauthenticated connection has **one 2.5-second I/O deadline from TCP
+accept**, excluding only the time a validated HTTP request waits for controller
+admission. HTTP upgrade I/O, waiting for a connecting tick, and receiving and
+validating the controller's proof all spend that same budget. HTTP upgrade I/O
+also retains its shorter 2-second sub-limit. Silent and partial requests cannot
+claim the admission-wait allowance.
 The first completed upgrade waits only for the remaining total budget; there is
 no fresh ready grace or authentication budget at handover. The connection closes
 at the total deadline even without another connect tick or incoming peer, or if
 authentication stalls inside a frame. Expiry releases unauthenticated admission;
 dropping an expired handle cannot release a newer controller's slot.
 
-Further arrivals while a completed upgrade is waiting or a controller socket is
-live receive HTTP 503 immediately, rather than joining a FIFO backlog. Dropping
-the controller socket releases admission for the next retry. Once the controller
-proof is validated within the total deadline, its socket is protected before
+A validated upgrade arriving while a completed upgrade or live controller holds
+admission waits on the existing condition variable. Its own wait deadline is
+**15 seconds from TCP accept**, matching the server's maximum per-attempt HTTP
+upgrade budget (`HANDSHAKE_TIMEOUT_MS` in `server/src/realtime/runner-prp-outbound.ts`).
+Expiry returns HTTP 503. Dropping or expiring the old controller wakes waiters;
+one reserves admission before sending HTTP 101, and only that socket can be
+handed to the Runner. Waiters have no FIFO guarantee and remain unfinished
+upgrades eligible for oldest-first eviction under the 16-worker cap. Cancellation,
+rotation, and shutdown wake them too. A completed upgrade remains protected.
+Once the controller proof is validated within the total I/O deadline, its socket is protected before
 the Runner sends its authentication response. Response I/O uses the existing
 authentication/lifecycle budget; authenticated welcome and runtime budgets apply
 without an ingress deadline. The execution/reconnect lifecycle deadline can
