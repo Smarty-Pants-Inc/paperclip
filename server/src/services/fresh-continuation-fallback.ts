@@ -408,40 +408,96 @@ export async function ensureFreshContinuation(db: Db, input: Input): Promise<Fre
   return db.transaction(tx => continueFreshInTransaction(tx as unknown as Db, input));
 }
 
+type FreshContinuationSubject = {
+  input: Pick<Input, "delivery">;
+  now: Date;
+  companyId: string;
+  issue: typeof issues.$inferSelect;
+  coordinator: typeof nativeRunFinalizations.$inferSelect | undefined;
+  run: typeof heartbeatRuns.$inferSelect & { finishedAt: Date };
+  holds: Array<typeof issueRecoveryActions.$inferSelect>;
+};
+
+/** What "(d) Continue" needs from the decision. */
+type FreshContinuationProceed = {
+  kind: "continue";
+  chain: Awaited<ReturnType<typeof freshContinuationChain>>;
+  owned: Array<typeof issueRecoveryActions.$inferSelect>;
+  refused: { id: string } | undefined;
+  personAsked: boolean;
+  waitBounded: boolean;
+  step: number;
+  pending: (reason: string, retryAt: Date) => FreshContinuationResult | null;
+  delivery: "recorded" | "caller_owns" | "saved_input";
+};
+
+/** The subject guards of the fallback (moved out of continueFreshInTransaction unchanged). */
+function freshContinuationSubjectRefusal(issue: typeof issues.$inferSelect,
+  run: typeof heartbeatRuns.$inferSelect): Extract<FreshContinuationResult, { kind: "not_applicable" }> | null {
+  if (!UNFINISHED_STATUSES.includes(run.status) || !run.finishedAt) return { kind: "not_applicable", reason: "run_not_unfinished" };
+  if (!issue.assigneeAgentId || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId
+    || ["done", "cancelled"].includes(issue.status)) return { kind: "not_applicable", reason: "task_changed" };
+  return null;
+}
+
+/** The fallback's own record for this run, if it already continued it. */
+function priorFreshContinuation(holds: Array<typeof issueRecoveryActions.$inferSelect>, run: typeof heartbeatRuns.$inferSelect) {
+  return holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
+}
+
 /**
- * The fallback inside the caller's transaction. Locks in the shared order
- * (task, coordinator, run, recovery actions, workspace); rows the caller
- * already locked are locked again harmlessly.
+ * Paperclip's fallback verdict for one run, READ-ONLY: the same loads, subject
+ * guards and decision (decideFreshContinuation) as continueFreshInTransaction,
+ * without "(d) Continue". It takes no lock, writes nothing (an existing
+ * continuation is reported, its late holds are not settled) and never probes a
+ * process. `will_continue`: it would continue now (a remote source).
+ * `needs_stop_proof`: it would continue once the previous local writer's end
+ * is proven, the process probe that only the writer path runs.
  */
-export async function continueFreshInTransaction(tx: Db, input: Input): Promise<FreshContinuationResult> {
+export type FreshContinuationVerdict = Exclude<FreshContinuationResult, { kind: "continued" }>
+  | { kind: "will_continue" } | { kind: "needs_stop_proof" };
+
+export async function freshContinuationVerdict(db: Db, input: { companyId: string; runId: string; now?: Date }): Promise<FreshContinuationVerdict> {
   const now = input.now && Number.isFinite(input.now.getTime()) ? input.now : new Date();
   const { companyId } = input;
-  const [peek] = await tx.select({ issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
+  const [peek] = await db.select({ issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
     contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, input.runId)));
   if (!peek) return { kind: "not_applicable", reason: "run_missing" };
   const contextIssueId = object(peek.contextSnapshot).issueId;
   const issueId = peek.nativeIssueId ?? peek.issueId ?? (typeof contextIssueId === "string" ? contextIssueId : null);
   if (!issueId) return { kind: "not_applicable", reason: "run_has_no_task" };
-  const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("update");
-  const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
-    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, input.runId))).for("update");
-  const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
-    eq(heartbeatRuns.id, input.runId))).for("update");
+  const [issue] = await db.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+  const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, input.runId)));
+  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+    eq(heartbeatRuns.id, input.runId)));
   if (!issue || !run) return { kind: "not_applicable", reason: "run_missing" };
-  if (!UNFINISHED_STATUSES.includes(run.status) || !run.finishedAt) return { kind: "not_applicable", reason: "run_not_unfinished" };
-  if (!issue.assigneeAgentId || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId
-    || ["done", "cancelled"].includes(issue.status)) return { kind: "not_applicable", reason: "task_changed" };
-
-  const holds = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
+  const unfit = freshContinuationSubjectRefusal(issue, run);
+  if (unfit) return unfit;
+  const holds = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issue.id),
     or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`, sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`)))
-    .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
-  const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
-  if (prior) {
-    await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
-    return { kind: "already_continued", recoveryActionId: prior.id };
-  }
+    .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id));
+  const prior = priorFreshContinuation(holds, run);
+  if (prior) return { kind: "already_continued", recoveryActionId: prior.id };
+  const decided = await decideFreshContinuation(db, { input: {}, now, companyId, issue, coordinator,
+    run: run as typeof run & { finishedAt: Date }, holds });
+  // The decision never yields "continued": only "(d) Continue" records one.
+  if (decided.kind !== "continue") return decided as FreshContinuationVerdict;
+  const remoteSource = remoteWorkspaceRunReferenceSchema.safeParse(object(run.runnerProfileJson).remoteWorkspace).success;
+  return remoteSource ? { kind: "will_continue" } : { kind: "needs_stop_proof" };
+}
+
+/**
+ * The fallback's decision for one unfinished run (moved out of
+ * continueFreshInTransaction unchanged): every verdict up to "(d) Continue",
+ * or what the continuation needs. Reads only: no lock, write or process probe.
+ * Its caller supplies the loaded rows; continueFreshInTransaction locks them,
+ * freshContinuationVerdict reads them plainly.
+ */
+async function decideFreshContinuation(tx: Db, subject: FreshContinuationSubject): Promise<FreshContinuationResult | FreshContinuationProceed> {
+  const { input, now, companyId, issue, coordinator, run, holds } = subject;
   // A refusal cannot be made continuable by repeatedly creating new run IDs.
   // Use the same classification as the execution blocker and projection.
   if (isNativeContinuationRefusal(run)) return { kind: "not_applicable", reason: "native_continuation_refused" };
@@ -616,6 +672,49 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   }
   let delivery: "recorded" | "caller_owns" | "saved_input" = input.delivery === "caller_owns" ? "caller_owns"
     : savedInput ? "saved_input" : "recorded";
+
+  return { kind: "continue" as const, chain, owned, refused, personAsked, waitBounded, step, pending, delivery };
+}
+
+/**
+ * The fallback inside the caller's transaction. Locks in the shared order
+ * (task, coordinator, run, recovery actions, workspace); rows the caller
+ * already locked are locked again harmlessly.
+ */
+export async function continueFreshInTransaction(tx: Db, input: Input): Promise<FreshContinuationResult> {
+  const now = input.now && Number.isFinite(input.now.getTime()) ? input.now : new Date();
+  const { companyId } = input;
+  const [peek] = await tx.select({ issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
+    contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, input.runId)));
+  if (!peek) return { kind: "not_applicable", reason: "run_missing" };
+  const contextIssueId = object(peek.contextSnapshot).issueId;
+  const issueId = peek.nativeIssueId ?? peek.issueId ?? (typeof contextIssueId === "string" ? contextIssueId : null);
+  if (!issueId) return { kind: "not_applicable", reason: "run_has_no_task" };
+  const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("update");
+  const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, input.runId))).for("update");
+  const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+    eq(heartbeatRuns.id, input.runId))).for("update");
+  if (!issue || !run) return { kind: "not_applicable", reason: "run_missing" };
+  const unfit = freshContinuationSubjectRefusal(issue, run);
+  if (unfit) return unfit;
+
+  const holds = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
+    eq(issueRecoveryActions.sourceIssueId, issue.id),
+    or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`, sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`)))
+    .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
+  const prior = priorFreshContinuation(holds, run);
+  if (prior) {
+    await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
+    return { kind: "already_continued", recoveryActionId: prior.id };
+  }
+  // The decision, shared with the read-only freshContinuationVerdict.
+  const decided = await decideFreshContinuation(tx, { input, now, companyId, issue, coordinator,
+    run: run as typeof run & { finishedAt: Date }, holds });
+  if (decided.kind !== "continue") return decided;
+  const { chain, owned, refused, personAsked, waitBounded, step, pending } = decided;
+  let { delivery } = decided;
 
   // (d) Continue: fence the old workspace epoch, settle every hold of the run,
   // release the Blocked status this failure owns, and record one continuation.

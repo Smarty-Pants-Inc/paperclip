@@ -846,34 +846,40 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 }
 
 /**
- * RFL (A) on seed A: true while Paperclip's OWN recovery, the fresh-continuation
- * fallback (fresh-continuation-fallback.ts), will act on this ended run and has
- * not given its verdict yet, by Paperclip's existing classifications only: a
- * fallback source code (BACKLOG_CONTINUATION_SOURCE_CODES, within its max age),
- * not a refusal (isNativeContinuationRefusal), not person-owned
- * (isPersonOwnedFailureCode), its chain not exhausted (freshContinuationChain,
- * FRESH_CONTINUATIONS_PER_CHAIN), and no fresh-continuation record for it yet.
- * The caller also requires no board-owned hold and no native same-run retry.
+ * RFL (A) on seed A, b2 F3: true while Paperclip's OWN recovery will act on this
+ * ended run and has not given its verdict yet. Both halves are Paperclip's:
+ * - it invokes the fresh-continuation fallback by itself for this run: a code
+ *   its held-executions lane continues (BACKLOG_CONTINUATION_SOURCE_CODES),
+ *   within that lane's max age;
+ * - its COMPLETE decision for the run, freshContinuationVerdict (the same
+ *   decision continueFreshInTransaction makes, read-only), is to continue
+ *   (will_continue, needs_stop_proof) or to look again (exact_recovery_pending,
+ *   backoff). person_owned (in_review, a Stop, an operator decision, ...),
+ *   not_applicable, successor_exists and dependency_wait are not a retry.
+ * As of a past instant (a reset, b2 F2) only the recovery facts that existed
+ * then count: a continuation recorded later, or a chain step recorded later,
+ * was still to come then; a later verdict never revokes a completed reset.
  */
 async function recoveryVerdictPending(q: Db, issue: DecisionIssue, run: { id: string; status: string; errorCode: string | null;
   error: string | null; finishedAt: Date | null }, now: Date, asOf = false): Promise<boolean> {
   // Imported at use: fresh-continuation-fallback.ts imports modules that import this one.
   const fallback = await import("../fresh-continuation-fallback.js");
-  if (!["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) || !run.finishedAt) return false;
-  if (!run.errorCode || !(fallback.BACKLOG_CONTINUATION_SOURCE_CODES as readonly string[]).includes(run.errorCode)) return false;
+  if (!run.finishedAt || !run.errorCode
+    || !(fallback.BACKLOG_CONTINUATION_SOURCE_CODES as readonly string[]).includes(run.errorCode)) return false;
   if (run.finishedAt.getTime() + fallback.BACKLOG_CONTINUATION_MAX_AGE_MS <= now.getTime()) return false;
-  if (isNativeContinuationRefusal(run) || fallback.isPersonOwnedFailureCode(run.errorCode)) return false;
-  // As of a past instant (a reset, RFL b2 F2): only the recovery facts that
-  // existed then. A record or chain step written later is a later verdict and
-  // never revokes a completed reset boundary.
-  const chain = await freshContinuationChain(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id,
-    ...(asOf ? { asOf: now } : {}) });
-  if (chain.attempts >= fallback.FRESH_CONTINUATIONS_PER_CHAIN) return false;
-  const [record] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-    sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${run.id}`,
-    ...(asOf ? [lte(issueRecoveryActions.createdAt, now)] : []))).limit(1);
-  return !record;
+  const verdict = await fallback.freshContinuationVerdict(q, { companyId: issue.companyId, runId: run.id, now });
+  if (["will_continue", "needs_stop_proof", "exact_recovery_pending", "backoff"].includes(verdict.kind)) return true;
+  if (!asOf) return false;
+  if (verdict.kind === "already_continued") {
+    const [record] = await q.select({ createdAt: issueRecoveryActions.createdAt }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.id, verdict.recoveryActionId)));
+    return Boolean(record && record.createdAt > now);
+  }
+  if (verdict.kind === "not_applicable" && verdict.reason === "fresh_continuation_chain_exhausted") {
+    const chain = await freshContinuationChain(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id, asOf: now });
+    return chain.attempts < fallback.FRESH_CONTINUATIONS_PER_CHAIN;
+  }
+  return false;
 }
 
 /**
