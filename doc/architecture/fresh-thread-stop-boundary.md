@@ -77,6 +77,25 @@ introduced by the server policy.
   hooks do not renew that budget. Repaired evidence allows the existing delivery
   owner to start exactly one fresh continuation. Repeated keys join the receipt.
 
+## Settled owner with a later refused message
+
+An observed owner and the refused follow-up can be different runs in the same
+native conversation. The existing stopped-owner settlement records
+`releasedOwner.reason = stopped_remote_owner` on the older coordinator. After
+that durable settlement, the disposition/backlog owner routes the older hold to
+the latest refused follow-up, rather than excluding it merely because a later
+failed run exists. The continuation decision remains under the existing task
+lock; it requires the same agent, native session and conversation generation.
+A newer answer, another conversation or a still-live owner is not skipped.
+
+The same decision consumes system reconciliation holds on physically settled
+predecessors and clears only the Blocked status those holds still own. Human
+holds, newer status decisions and all existing approval/Stop gates remain in
+force. The strict stop gate re-proves physical exclusion before recording the
+later source's one continuation and current history note. Existing saved-input
+or continuation delivery then admits the next run; there is no new worker,
+polling loop or provider call inside the decision transaction.
+
 ## Preparation failure on a warm allocation
 
 A new lease can name the same still-warm allocation while the old session's
