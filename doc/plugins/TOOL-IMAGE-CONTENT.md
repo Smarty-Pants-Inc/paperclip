@@ -54,7 +54,7 @@ capture or run events:
 | --- | --- |
 | Gateway audit summaries and invocation receipts | `server/src/services/tool-content-guards.ts:300` replaces native image blocks with SHA-256 + decoded size + reference before redaction, hashing and bounded previews. The prepared result also carries private storage references. |
 | Prompt-injection model capture and regex fallback | `tool-content-guards.ts:321` creates the referenced view before classifier serialization. Text still passes through the existing guards. `:368` restores only opaque image bodies into the governed return value for the caller/model. |
-| Server logging | The bridge adds no body logging; validation errors are static reasons, never interpolated plugin bodies. Plugin authors must not manually log or stringify images into text, errors or arbitrary metadata. |
+| Server logging | Native-validation and SDK parser errors use content-free reasons. `server/src/services/plugin-worker-manager.ts:1201` logs malformed frames as byte count + SHA-256 + reference, never raw prefixes or parser error prose; the real-worker regression covers malformed JSON and hostile JSON-RPC versions. Plugin authors must not manually log or stringify images into text, errors or arbitrary metadata. |
 | Runner/run-event display | `packages/paperclip-runner/src/drivers/pi/pi-event-projector.ts:52` replaces each image with an omission marker plus SHA-256, decoded size, MIME and a content-address reference before tool-output projection. Native input is not mutated. Existing display bounds still apply. |
 | Native model/history | Actual MCP/Pi image blocks, intentionally including the body. This is distinct from the projections above. |
 | Langfuse cloud export | **Open upstream tracker below. Not reference-only today.** |

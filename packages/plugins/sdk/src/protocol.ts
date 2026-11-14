@@ -2723,7 +2723,8 @@ export function parseMessage(line: string): JsonRpcMessage {
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    throw new JsonRpcParseError(`Invalid JSON: ${trimmed.slice(0, 200)}`);
+    // Error messages can escape to host logs: never include a payload preview.
+    throw new JsonRpcParseError("Invalid JSON");
   }
 
   if (typeof parsed !== "object" || parsed === null) {
@@ -2734,7 +2735,7 @@ export function parseMessage(line: string): JsonRpcMessage {
 
   if (obj.jsonrpc !== JSONRPC_VERSION) {
     throw new JsonRpcParseError(
-      `Invalid or missing jsonrpc version (expected "${JSONRPC_VERSION}", got ${JSON.stringify(obj.jsonrpc)})`,
+      `Invalid or missing jsonrpc version (expected "${JSONRPC_VERSION}")`,
     );
   }
 

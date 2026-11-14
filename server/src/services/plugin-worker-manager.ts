@@ -1199,11 +1199,11 @@ export function createPluginWorkerHandle(
     try {
       message = parseMessage(line);
     } catch (err) {
-      if (err instanceof JsonRpcParseError) {
-        log.warn({ rawLine: line.slice(0, 200) }, "unparseable message from worker");
-      } else {
-        log.warn({ err }, "error parsing worker message");
-      }
+      // A malformed frame can contain private image bytes, including inside
+      // parser error prose. Never log either the frame or the thrown error.
+      const sha256 = createHash("sha256").update(line).digest("hex");
+      log.warn({ reason: err instanceof JsonRpcParseError ? "invalid_jsonrpc" : "parse_failed",
+        sizeBytes: Buffer.byteLength(line, "utf8"), sha256, reference: `sha256:${sha256}` }, "unparseable message from worker");
       return;
     }
 
