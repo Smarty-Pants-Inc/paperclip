@@ -1174,6 +1174,9 @@ export const issueCommentMetadataSchema = z
     }).strict().optional(),
     recoveryResponsibility: z.enum(["system", "user"]).optional(),
     attachmentPreparation: z.object({ attachmentId: z.uuid() }).strict().optional(),
+    // A notice's wording is immutable. Later state appends a new notice and
+    // points the previous one at it instead of rewriting conversation history.
+    supersededByCommentId: z.uuid().optional(),
     sourceChannel: z.enum(CHAT_PROVIDERS).optional(),
     sourceRunId: z.string().guid().nullable().optional(),
     authorizationReason: z

@@ -537,6 +537,24 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     if (taskWait) return { kind: "person_owned", reason: taskWait };
   }
   const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
+  // Do not touch the old executor or narrate a restart after the conversation
+  // has moved on. This fence precedes EVERY strict stop-gate call, including
+  // the upgrade of an older isolation-only settlement. An earlier live turn
+  // is not a successor: the gate below must wait for it without stopping it.
+  if (isFreshThreadRefusal(run) && (!prior || object(prior.evidence.freshContinuation).previousExecutionGone !== true)) {
+    const [newer] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${run.id}`,
+      or(eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.issueId, issue.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+      sql`not coalesce(${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null
+        and ${heartbeatRuns.errorCode} = 'execution_reconciliation_required', false)`,
+      sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${run.createdAt.toISOString()}::timestamptz, ${run.id}::uuid)`)).limit(1);
+    if (newer || await hasAnswerSinceSettlement(tx, run, issue.id, run.createdAt.toISOString())
+      || typeof object(coordinator?.failureDetail).successorRunId === "string"
+      || holds.some(hold => hold !== prior && hold.evidence.executionReconciliation
+        && ["pending", "delivered", "delegated"].includes(String(hold.evidence.continuationDelivery))))
+      return { kind: "successor_exists" };
+  }
   if (prior) {
     const recordedAt = object(prior.evidence.freshContinuation).recordedAt;
     if (typeof recordedAt === "string" && await hasAnswerSinceSettlement(tx, run, issue.id, recordedAt)) {

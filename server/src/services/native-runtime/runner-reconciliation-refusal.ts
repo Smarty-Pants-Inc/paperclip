@@ -26,8 +26,13 @@ export function freshThreadRefusalCode(error: unknown, depth = 0): FreshThreadRe
   return freshThreadRefusalCode(value.cause, depth + 1);
 }
 
-export function isFreshThreadRefusal(run: { errorCode?: string | null; resultJson?: Record<string, unknown> | null }): boolean {
-  return isCode(run.errorCode) || isCode((run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown } | undefined)?.code);
+export function isFreshThreadRefusal(run: { errorCode?: string | null; error?: string | null; resultJson?: Record<string, unknown> | null }): boolean {
+  // Older controller rows saved the exact reserved code in `error` under the
+  // generic reconciliation envelope. They need the SAME strict stop gate,
+  // not the generic upstream isolation fallback. Only a whole code is accepted;
+  // embedded diagnostic text and provider messages never grant this boundary.
+  return isCode(run.errorCode) || isCode(run.error)
+    || isCode((run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown } | undefined)?.code);
 }
 
 export function nativeReconciliationError(code: string, options?: ErrorOptions): Error & { code: string } {

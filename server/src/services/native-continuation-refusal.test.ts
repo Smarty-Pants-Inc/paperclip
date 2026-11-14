@@ -58,6 +58,22 @@ describe("native continuation refusal", () => {
     expect(isNativeContinuationRefusal({ errorCode: value })).toBe(false);
   });
 
+  it.each([
+    "native_controller_recovery_missing_evidence:snapshot_binding",
+    "native_controller_recovery_unsupported:metadata_format",
+    "runner_remote_state_unavailable", "native_runner_refresh_required", "native_runner_launch_profile_mismatch",
+    "provider_active_turn", "provider_live_descendants", "provider_active_goal", "provider_prepare_refused",
+  ])("RFL extra: the permanent refusal set never swallows D10 code %s", code => {
+    expect(isNativeContinuationRefusal({ errorCode: code })).toBe(false);
+    expect(isNativeContinuationRefusal({ error: code })).toBe(false);
+    // A legacy generic run code must not override a precise D10 code in its
+    // owned refusal receipt (including the specific C1 prepare channel).
+    expect(isNativeContinuationRefusal({ errorCode: "native_continuation_requires_reconciliation",
+      error: "native_controller_recovery_unsupported:metadata_format",
+      resultJson: { nativeFreshContinuationRefusal: { code: "native_runner_refresh_required", prepareRefusalCode: code } },
+    } as Parameters<typeof isNativeContinuationRefusal>[0])).toBe(false);
+  });
+
   it("does not treat the no-replay hold code alone as a refusal", () => {
     // An ordinary recovered native hold carries this code and continues on the next message.
     expect(isNativeContinuationRefusal({ error: null, errorCode: "native_continuation_requires_reconciliation" })).toBe(false);

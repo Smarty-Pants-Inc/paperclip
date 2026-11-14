@@ -4,9 +4,6 @@ import { agentTaskSessions, heartbeatRuns, issueComments, issues, nativeRunFinal
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
-import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
-import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
-import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { readPiConversation } from "./pi-conversation-record.js";
 
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -63,25 +60,18 @@ export async function writePiSessionHistoryLossNotice(db: Db,
   const [existing] = await tx.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`,
     sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`)).limit(1);
-  if (existing) {
-    if (input.replaceExisting && existing.body !== body) {
-      const updatedAt = new Date();
-      await tx.update(issueComments).set({ body, updatedAt }).where(and(
-        eq(issueComments.companyId, companyId), eq(issueComments.id, existing.id)));
-      await tx.update(issues).set({ updatedAt }).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
-      // Same transaction-scoped invalidations as the shared comment writer.
-      // Rechecking an unchanged waiting note must not generate more work.
-      await notifyStatusCardIssueChange(tx, companyId);
-      await notifyIssueRecovery(tx, { companyId, issueId });
-      await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, `company:${companyId}`);
-    }
-    return false;
-  }
-  await issueService(db).addComment(issueId, body, {}, { authorType: "system", presentation: {
+  if (existing && (!input.replaceExisting || existing.body === body)) return false;
+  // Changing state appends history; never rewrite what a person already read.
+  // The issue lock makes replay idempotent and the supersession atomic.
+  const next = await issueService(db).addComment(issueId, body, {}, { authorType: "system", presentation: {
     kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
   }, metadata: { version: 1, authorizationReason,
     sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
+  if (existing) await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
+    '{supersededByCommentId}', to_jsonb(${next.id}::text))` }).where(and(
+    eq(issueComments.companyId, companyId), eq(issueComments.id, existing.id)));
   return true;
 }
 
@@ -134,6 +124,7 @@ export async function readUnsupersededHeldConversationNotices(db: Db,
     eq(issueComments.authorType, "system"),
     isNull(issueComments.deletedAt),
     sql`starts_with(${reason}, ${HELD_CONVERSATION_NOTICE_REASON_PREFIX})`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`,
   )).orderBy(issueComments.issueId, desc(issueComments.createdAt), desc(issueComments.id));
   for (const row of rows) {
     const normalizedSessionId = row.reason.slice(HELD_CONVERSATION_NOTICE_REASON_PREFIX.length);

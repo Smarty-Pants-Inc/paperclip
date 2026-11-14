@@ -4,6 +4,7 @@
 // modules that import this one. This module only recognises runs from before
 // that notice existed.
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/held-predecessor-notice-text.js";
+import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 
 /** The action shown for a refused conversation: the held notice's one wording. */
 export const NATIVE_CONTINUATION_REFUSED_ACTION = HELD_PREDECESSOR_NOTICE;
@@ -13,7 +14,7 @@ export const NATIVE_CONTINUATION_REFUSED_ACTION = HELD_PREDECESSOR_NOTICE;
 // controller state cannot be read. Each fails the same way on every later
 // message:
 // - a retained sandbox whose binding cannot be proven;
-// - a saved controller format this release cannot read;
+// - a saved controller format outside the D10 fresh-history family;
 // - a completed turn whose cleanup is quarantined;
 // - a Runner process whose termination was never confirmed;
 // - a warm attachment whose Runner exited;
@@ -37,7 +38,10 @@ const REFUSAL = new RegExp("(?:^|[\\s:])(?:"
  * ordinary recovered hold with that code does continue on the next message.
  */
 export function isNativeContinuationRefusal(
-  run: { error?: string | null; errorCode?: string | null } | null | undefined,
+  run: { error?: string | null; errorCode?: string | null; resultJson?: Record<string, unknown> | null } | null | undefined,
 ): boolean {
+  // D10 has an automatic, physically fenced end. A broader legacy permanent
+  // refusal must not hide that owner or turn its next message into a dead end.
+  if (run && isFreshThreadRefusal(run)) return false;
   return [run?.error, run?.errorCode].some(value => typeof value === "string" && REFUSAL.test(value));
 }

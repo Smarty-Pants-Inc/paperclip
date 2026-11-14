@@ -33,6 +33,8 @@ import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
+import { writeFreshThreadNotice, FRESH_THREAD_STOPPING_NOTE, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
+import { createReusableLeaseHandoff } from "./environment-lease-handoff.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -141,6 +143,146 @@ suite("fresh-continuation fallback", () => {
     expect(record!.ownerType).toBe("system");
     return next[0]!;
   }
+
+  // RFL 12:36Z regression probes. Keep reasons: executor exclusion is a data
+  // safety boundary; these reproduce the recorded D10 failure paths.
+  it.each(["queued", "succeeded", "older_answer"])("RFL F1 checks %s before any stop or note", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const sessionId = randomUUID();
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, nativeIssueId: f.issueId,
+      nativeSessionId: sessionId, status: shape === "queued" ? "queued" : "succeeded",
+      createdAt: new Date(source.createdAt.getTime() + (shape === "older_answer" ? -1000 : 1000)),
+      finishedAt: shape === "queued" ? null : new Date() });
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
+      provider: "boat", providerLeaseId: `rfl-f1-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "successor_exists" });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0])
+      .toMatchObject({ status: "retained", metadata: { pluginId: "fixture-boat" } });
+  });
+
+  it("RFL extra legacy code-only rows still require physical stop, never generic isolation", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "native_controller_recovery_unsupported:metadata_format" });
+    await db.insert(environmentLeases).values({ companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+      provider: "boat", providerLeaseId: `legacy-d10-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } });
+    for (const now of [new Date(), new Date(Date.now() + 30 * 24 * 3600_000)]) {
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now }))
+        .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+    }
+    expect(await successors(f.runId)).toHaveLength(0);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
+      .not.toHaveProperty("freshContinuation");
+  });
+
+  it.each(["no_lease", "local", "no_provider_id"])("RFL F2 nothing to stop ends and delivers (%s)", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    if (shape !== "no_lease") await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId,
+      issueId: f.issueId, provider: shape === "local" ? "local" : "boat", providerLeaseId: null, status: "released" });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+    await expectOneFreshSuccessor(f);
+  });
+
+  it("RFL F2 an unbound local owner with a recorded live process is not an empty owner set", async () => {
+    const f = await unfinishedRun({ runtime: "legacy", errorCode: "runner_remote_state_unavailable" });
+    await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+    expect(await successors(f.runId)).toHaveLength(0);
+  });
+
+  it("RFL F3 appends changed notes, supersedes without rewriting another owner's note, and is idempotent", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const sessionId = randomUUID();
+    const [run] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    const [held] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
+      body: "The prior owner is held.", metadata: { version: 1, authorizationReason: `native_prior_owner_held:${sessionId}`,
+        sections: [{ rows: [{ type: "text", text: "Original held notice" }] }] } }).returning();
+    for (const body of [FRESH_THREAD_STOPPING_NOTE, FRESH_THREAD_STOPPING_NOTE, FRESH_THREAD_STARTED_NOTE, FRESH_THREAD_STARTED_NOTE])
+      await db.transaction(tx => writeFreshThreadNotice(tx as unknown as typeof db, run, f.issueId, body));
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(notes).toHaveLength(3);
+    expect(notes.find(note => note.id === held.id)).toMatchObject({ body: held.body,
+      metadata: { authorizationReason: held.metadata!.authorizationReason, supersededByCommentId: expect.any(String) } });
+    expect(notes.filter(note => !note.metadata?.supersededByCommentId).map(note => note.body))
+      .toEqual([FRESH_THREAD_STARTED_NOTE]);
+    expect(notes.find(note => note.body === FRESH_THREAD_STOPPING_NOTE)?.metadata)
+      .toMatchObject({ supersededByCommentId: notes.find(note => note.body === FRESH_THREAD_STARTED_NOTE)!.id });
+  });
+
+  it.each([
+    ["runner_remote_state_unavailable", undefined, "environment"],
+    ["native_controller_recovery_missing_evidence:snapshot_binding", undefined, "saved"],
+    ["native_controller_recovery_unsupported:metadata_format", undefined, "saved"],
+    ["native_runner_refresh_required", "provider_live_descendants", "configuration"],
+    ["native_runner_refresh_required", "provider_active_goal", "configuration"],
+    ["native_runner_launch_profile_mismatch", "provider_launch_profile_mismatch", "configuration"],
+  ])("RFL F4 turn-wait wording is true for %s / %s", async (code, prepareRefusalCode, expected) => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: code });
+    const sessionId = randomUUID();
+    const [source] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId,
+      resultJson: { nativeFreshContinuationRefusal: { code, prepareRefusalCode, waitForTurn: true } } })
+      .where(eq(heartbeatRuns.id, f.runId)).returning();
+    await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, nativeIssueId: f.issueId,
+      nativeSessionId: sessionId, status: "running", createdAt: new Date(source.createdAt.getTime() - 1000) });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending", reason: "active_provider_turn" });
+    const [note] = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(note.body).toContain(expected);
+    expect(note.body).not.toMatch(/skill change/i);
+  });
+
+  it("RFL F7 real cleanup dispatch produces stop proof then one fresh wake across a reuse chain", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const sessionId = randomUUID(), predecessorId = randomUUID();
+    const [source] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    await db.insert(heartbeatRuns).values({ id: predecessorId, companyId, agentId, issueId: f.issueId, nativeIssueId: f.issueId,
+      nativeSessionId: sessionId, status: "failed", createdAt: new Date(source.createdAt.getTime() - 60_000),
+      finishedAt: new Date(source.createdAt.getTime() - 30_000) });
+    const [environment] = await db.insert(environments).values({ name: "RFL stop boundary", driver: "sandbox", config: {} }).returning();
+    const acquiredAt = new Date(Date.now() - 60_000), providerLeaseId = `rfl-chain-${randomUUID()}`;
+    const common = { companyId, issueId: f.issueId, environmentId: environment.id, provider: "boat", providerLeaseId,
+      leasePolicy: "reuse_by_environment", metadata: { agentId, pluginId: "fixture-boat" } };
+    const [predecessor] = await db.insert(environmentLeases).values({ ...common, heartbeatRunId: predecessorId,
+      status: "expired", cleanupStatus: "success", acquiredAt: new Date(acquiredAt.getTime() - 60_000), releasedAt: acquiredAt }).returning();
+    const [tip] = await db.insert(environmentLeases).values({ ...common, heartbeatRunId: f.runId, status: "retained", acquiredAt }).returning();
+    const handoff = createReusableLeaseHandoff(predecessor, tip);
+    await db.update(environmentLeases).set({ metadata: { ...common.metadata, reusableLeaseSuccessor: handoff } })
+      .where(eq(environmentLeases.id, predecessor.id));
+    await db.update(environmentLeases).set({ metadata: { ...common.metadata, reusableLeasePredecessor: handoff } })
+      .where(eq(environmentLeases.id, tip.id));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending" });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, predecessor.id)))[0].status).toBe("expired");
+    // Fake only the external provider boundary. The real sweep claims cleanup,
+    // consumes this provider response, binds/persists proof, and emits its work
+    // notifications; no test writes remoteExecutionTermination metadata.
+    const providerStop = vi.fn(async ({ lease }: { lease: typeof environmentLeases.$inferSelect }) => {
+      expect(lease.id).toBe(tip.id);
+      expect(lease.metadata).toHaveProperty("sandboxStopAndRetain");
+      return { providerLeaseId: lease.providerLeaseId!, state: "stopped" };
+    });
+    const runtime = { retryPendingSandboxTeardown: providerStop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"];
+    const cleanup = heartbeatService(db, { environmentRuntime: runtime });
+    expect(await cleanup.sweepPendingCleanupLeases()).toMatchObject({ destroyed: 1 });
+    expect(providerStop).toHaveBeenCalledOnce();
+    const rows = await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, f.issueId));
+    expect(rows.find(row => row.id === predecessor.id)).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect(rows.find(row => row.id === tip.id)).toMatchObject({ status: "released", cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: { state: "stopped", leaseId: tip.id, runId: f.runId } } });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+    await expectOneFreshSuccessor(f);
+    await db.delete(environmentLeases).where(eq(environmentLeases.environmentId, environment.id));
+    await db.delete(environments).where(eq(environments.id, environment.id));
+  });
 
   it.each([
     "native_controller_recovery_missing_evidence:snapshot_binding",

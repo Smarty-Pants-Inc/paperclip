@@ -1454,7 +1454,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const settleAgent = () => finalizeAgentStatus(agent.id, "failed", message, {
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       keepIdleOnFailure:
-        Boolean(nonRetryablePreflightFailureCode(err)) ||
+        Boolean(freshRefusal) || Boolean(nonRetryablePreflightFailureCode(err)) ||
         isWorkspaceSyncConflictFailure(thrownMessage),
     });
     await setWakeupStatus(run.wakeupRequestId, "failed", {
