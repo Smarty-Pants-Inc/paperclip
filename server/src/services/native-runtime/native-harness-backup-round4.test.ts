@@ -85,6 +85,24 @@ describe('independent round 3 safety',()=>{
     await fs.writeFile(path.join(OUT,'drain-coordinator-race.json'),JSON.stringify(result,null,2));
     expect(result.warnings>0 || result.nextWakeAt!==null).toBe(true);
   });
+  it('retains discovery when admission closes inside pending-root enumeration and reopens in a microtask',async()=>{
+    const r=await root(); const p=await pending(r); vi.useFakeTimers({toFake:['Date','setTimeout','clearTimeout']});
+    let closed=false, reopened=false;
+    const {coordinator,svc}=setup(r,()=>{
+      if(closed) { closed=false; queueMicrotask(()=>{reopened=true;}); return false; }
+      return reopened || !closed;
+    });
+    const original=fs.readdir.bind(fs);
+    vi.spyOn(fs,'readdir').mockImplementation(async(...args:Parameters<typeof fs.readdir>)=>{
+      const out=await original(...args);
+      if(String(args[0]).endsWith('failover-backups')) closed=true;
+      return out;
+    });
+    await svc.registerStalePendingScan(coordinator).ready;
+    const result={warnings:vi.mocked(logger.warn).mock.calls.length,nextWakeAt:coordinator.nextWakeAt(),pendingRoot:p};
+    await fs.writeFile(path.join(OUT,'inner-drain.json'),JSON.stringify(result,null,2));
+    expect(result.warnings>0 || result.nextWakeAt!==null).toBe(true);
+  });
   it('retains an interrupted scan even when admission resumes before hasPending',async()=>{
     const r=await root(); await pending(r);
     let allowed=true;

@@ -1,6 +1,6 @@
 import { readNativeCheckpointRetirement, nativeCheckpointRetirement, MAX_NATIVE_CHECKPOINT_RETIREMENT_RUNS } from "./native-runner-checkpoint-retirement.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { and, asc, eq, gt, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
@@ -474,48 +474,29 @@ export function nativeHarnessBackupExpirationService(
   const lastWarnedAt = new Map<string, number>();
   async function warnStalePendingOnce(scopeDigest: string, pendingRoot: string,
     ageMs: number, hasCurrent: boolean, now: number): Promise<void> {
-    const markerRoot = path.join(path.resolve(defaults.stateBase ?? nativeHarnessStateBase()), ".pending-warning-state");
-    await fs.mkdir(markerRoot, { recursive: true });
-    const key = createHash("sha256").update(pendingRoot).digest("hex");
-    const marker = path.join(markerRoot, key);
-    const lock = `${marker}.lock`;
-    let acquired = false;
-    for (let attempt = 0; attempt < 100 && !acquired; attempt++) {
-      try { const handle = await fs.open(lock, "wx"); await handle.close(); acquired = true; }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const lockStat = await fs.stat(lock).catch(missingPath);
-        if (!lockStat || now - lockStat.mtimeMs > 30_000) await fs.unlink(lock).catch(() => undefined);
-        else await new Promise(resolve => setTimeout(resolve, 10));
-      }
-    }
-    if (!acquired) return;
-    try {
-      const markerStat = await fs.stat(marker).catch(missingPath);
-      const last = Math.max(lastWarnedAt.get(pendingRoot) ?? 0, markerStat?.mtimeMs ?? 0);
-      if (now - last < PENDING_WARNING_INTERVAL_MS) return;
-      const handle = await fs.open(marker, "a"); await handle.close();
-      await fs.utimes(marker, new Date(now), new Date(now));
-      lastWarnedAt.set(pendingRoot, now);
-      reportNativeHarnessBackupStalePending({ scopeDigest, pendingRoot, ageMs, hasCurrent });
-    } finally { await fs.unlink(lock).catch(() => undefined); }
+    const last = lastWarnedAt.get(pendingRoot) ?? 0;
+    if (now - last < PENDING_WARNING_INTERVAL_MS) return;
+    lastWarnedAt.set(pendingRoot, now);
+    reportNativeHarnessBackupStalePending({ scopeDigest, pendingRoot, ageMs, hasCurrent });
   }
 
-  async function reportStalePending(backupRoot: string, scopeDigest: string, now: number, canContinue = () => true): Promise<number | null> {
+  async function reportStalePending(backupRoot: string, scopeDigest: string, now: number,
+    canContinue = () => true): Promise<{ next: number | null; complete: boolean }> {
     // The read-only monitor supplies cancellation. Expiration callers already
     // own their budget/admission checks; do not consume their predicate here.
-    if (!canContinue() || !(await isRealDirectory(backupRoot))) return null;
+    if (!canContinue()) return { next: null, complete: false };
+    if (!(await isRealDirectory(backupRoot))) return { next: null, complete: canContinue() };
     const hasCurrent = await isRealDirectory(path.join(backupRoot, "current"));
-    if (!canContinue()) return null;
+    if (!canContinue()) return { next: null, complete: false };
     let next: number | null = null;
     for (const name of (await fs.readdir(backupRoot).catch(missingPath)) ?? []) {
-      if (!canContinue()) break;
+      if (!canContinue()) return { next, complete: false };
       if (!name.startsWith(".pending-")) continue;
       const pendingRoot = path.join(backupRoot, name);
       const stat = await fs.lstat(pendingRoot).catch(missingPath);
       // Never follow links or recover/delete an incomplete capture. A concurrent
       // publication can remove this name; only inspect entries still present.
-      if (!canContinue()) break;
+      if (!canContinue()) return { next, complete: false };
       if (!stat?.isDirectory() || stat.isSymbolicLink()) continue;
       const ageMs = now - stat.mtimeMs;
       const dueAt = ageMs > PENDING_STALE_AFTER_MS ? now + NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS
@@ -525,7 +506,7 @@ export function nativeHarnessBackupExpirationService(
       noteNativeHarnessBackupStalePendingObserved();
       await warnStalePendingOnce(scopeDigest, pendingRoot, ageMs, hasCurrent, now);
     }
-    return next;
+    return { next, complete: canContinue() };
   }
 
   async function reportStalePendingBackups(signal?: AbortSignal): Promise<{ next: number | null; complete: boolean }> {
@@ -533,28 +514,35 @@ export function nativeHarnessBackupExpirationService(
     let after: string | undefined;
     let next: number | null = null;
     const report = async (backupRoot: string, scopeDigest: string) => {
-      const dueAt = await reportStalePending(backupRoot, scopeDigest, Date.now(), () => canReportPending(signal));
-      if (dueAt !== null) next = next === null ? dueAt : Math.min(next, dueAt);
+      const result = await reportStalePending(backupRoot, scopeDigest, Date.now(), () => canReportPending(signal));
+      if (result.next !== null) next = next === null ? result.next : Math.min(next, result.next);
+      return result.complete;
     };
     while (canReportPending(signal)) {
       const page = await backupScopes(after, 100);
       for (const scopeDigest of page.names) {
         if (!canReportPending(signal)) return { next, complete: false };
         const scopeRoot = path.join(base, scopeDigest);
-        if (!(await isRealDirectory(scopeRoot))) continue;
-        await report(path.join(scopeRoot, "failover-backups"), scopeDigest);
+        const hasScope = await isRealDirectory(scopeRoot);
+        if (!canReportPending(signal)) return { next, complete: false };
+        if (!hasScope) continue;
+        if (!(await report(path.join(scopeRoot, "failover-backups"), scopeDigest))) return { next, complete: false };
         if (!canReportPending(signal)) return { next, complete: false };
         const continuityRoot = path.join(scopeRoot, "continuity-breaks");
-        if (!(await isRealDirectory(continuityRoot))) continue;
+        const hasContinuity = await isRealDirectory(continuityRoot);
         if (!canReportPending(signal)) return { next, complete: false };
-        for (const archive of (await fs.readdir(continuityRoot).catch(missingPath)) ?? []) {
+        if (!hasContinuity) continue;
+        const archives = (await fs.readdir(continuityRoot).catch(missingPath)) ?? [];
+        if (!canReportPending(signal)) return { next, complete: false };
+        for (const archive of archives) {
           if (!canReportPending(signal)) return { next, complete: false };
           const archiveRoot = path.join(continuityRoot, archive);
-          if (await isRealDirectory(archiveRoot)) {
-            await report(path.join(archiveRoot, "failover-backups"), scopeDigest);
-          }
+          const hasArchive = await isRealDirectory(archiveRoot);
+          if (!canReportPending(signal)) return { next, complete: false };
+          if (hasArchive && !(await report(path.join(archiveRoot, "failover-backups"), scopeDigest))) return { next, complete: false };
         }
       }
+      if (!canReportPending(signal)) return { next, complete: false };
       if (page.complete) return { next, complete: true };
       after = page.names.at(-1);
     }
