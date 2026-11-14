@@ -316,9 +316,12 @@ restricted to namespace-local `INSERT`, `UPDATE`, and `DELETE`.
 Scheduled jobs run in a host-issued plugin-instance invocation, independent of
 any event handlers on the same worker. A job can use its capability-gated
 `ctx.db` namespace even while an event is running or its notification scope is
-retained. This invocation carries no company authority: it does not inherit an
-event's company or authorize company-scoped API calls. Missing or unknown
-invocation IDs remain subject to the existing proactive-call checks.
+retained. This invocation does not inherit an event's company. A company-scoped
+host call, such as `ctx.config.get(companyId)`, must explicitly reference one of
+the plugin's configured companies, using the same allowlist as proactive calls.
+Unconfigured companies and wildcard company access remain denied. Calls without
+invocation IDs keep the existing proactive-call checks; unknown or retired
+invocation IDs remain denied.
 
 ### Scoped plugin API routes
 
