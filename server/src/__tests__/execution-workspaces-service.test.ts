@@ -636,6 +636,43 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     } finally { scan.mockRestore(); }
   });
 
+  it("retains inspection backoff across a rotation larger than the old 256-entry cache", async () => {
+    const seed = await seedTerminalWorkspace();
+    const [original] = await db.select().from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, seed.executionWorkspaceId));
+    await db.insert(executionWorkspaces).values(Array.from({ length: 256 }, (_, index) => ({
+      ...original!, id: randomUUID(), name: `Retained terminal workspace ${index}`,
+    })));
+    let clock = Date.now();
+    const service = executionWorkspaceService(db, {
+      workspaceReaperCooldownDays: 0, terminalWorkspaceInspectionBackoffMs: 300_000,
+      now: () => new Date(clock),
+    });
+    const scan = vi.spyOn(workspaceGitOperationScheduler, "run");
+    const rotate = async () => {
+      let checked = 0, skippedBackoff = 0;
+      for (let page = 0; page < 6; page++) {
+        const result = await service.sweepTerminalWorkspaces(50);
+        checked += result.checked;
+        skippedBackoff += result.skippedBackoff;
+      }
+      expect(checked).toBe(257);
+      return skippedBackoff;
+    };
+    try {
+      await rotate();
+      const firstScans = scan.mock.calls.length;
+      expect(firstScans).toBeGreaterThan(0);
+      expect(await rotate()).toBe(257);
+      expect(scan).toHaveBeenCalledTimes(firstScans);
+      // Expiry still refreshes Git; the cache never authorizes deletion.
+      clock += 300_000;
+      expect(await rotate()).toBe(0);
+      expect(scan.mock.calls.length).toBeGreaterThan(firstScans);
+      expect(await fs.readFile(path.join(seed.worktreePath, "delivered.txt"), "utf8")).toBe("delivered\n");
+    } finally { scan.mockRestore(); }
+  }, 30_000);
+
   it("invalidates a candidate backoff after its real PR producer commits", async () => {
     const seed = await seedTerminalWorkspace();
     const service = executionWorkspaceService(db, {
