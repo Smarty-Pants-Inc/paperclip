@@ -641,12 +641,14 @@ export function createHeartbeatScheduling(
   }
 
   async function readIssueMonitorPause(companyId: string, agentId: string) {
-    const [row] = await db.select({ name: agents.name, status: agents.status,
+    const [row] = await db.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
       pauseReason: agents.pauseReason, holds: agents.lifecycleHolds, companyStatus: companies.status })
       .from(agents).innerJoin(companies, eq(companies.id, agents.companyId))
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
     return {
-      paused: row?.status === "paused" || row?.companyStatus === "paused",
+      companyPaused: row?.companyStatus === "paused",
+      resuming: row?.status === "paused" && row.lifecycleState === "resuming" && row.holds.length === 0,
+      paused: row?.status === "paused",
       importOnly: row?.companyStatus === "active" && row.status === "paused" && row.pauseReason === "import"
         && row.holds.every(hold => hold === "import"),
       name: row?.name ?? null,
@@ -761,11 +763,12 @@ export function createHeartbeatScheduling(
       : {};
 
     const pause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
-    if (pause.importOnly && input.clearOnClientError) {
+    if ((pause.companyPaused || pause.importOnly || pause.resuming) && input.clearOnClientError) {
+      const reason = pause.companyPaused ? "company_paused" : pause.resuming ? "agent_resuming" : "import_paused";
       await releaseIssueMonitorWithDiagnostic(claimed, input, {
-        action: "issue.monitor_deferred", reason: "import_paused",
+        action: "issue.monitor_deferred", reason,
       });
-      return { outcome: "skipped" as const, reason: "import_paused" };
+      return { outcome: "skipped" as const, reason };
     }
     if (pause.paused && input.clearOnClientError) {
       return clearSkippedIssueMonitor(claimed, input, policy, "Agent is paused", pause.name);
@@ -935,13 +938,14 @@ export function createHeartbeatScheduling(
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
           // Pause may have arrived after the preflight read but before queue
-          // admission. Preserve import intent on that path as well.
+          // admission. Company pause retains upstream intent, as does import.
           const currentPause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
-          if (currentPause.importOnly) {
+          if (currentPause.companyPaused || currentPause.importOnly || currentPause.resuming) {
+            const reason = currentPause.companyPaused ? "company_paused" : currentPause.resuming ? "agent_resuming" : "import_paused";
             await releaseIssueMonitorWithDiagnostic(claimed, input, {
-              action: "issue.monitor_deferred", reason: "import_paused",
+              action: "issue.monitor_deferred", reason,
             });
-            return { outcome: "skipped" as const, reason: "import_paused" };
+            return { outcome: "skipped" as const, reason };
           }
           return clearSkippedIssueMonitor(claimed, input, policy, err.message,
             currentPause.paused ? currentPause.name : null);
@@ -967,14 +971,17 @@ export function createHeartbeatScheduling(
               and monitor_finalization.phase not in ('committed', 'terminal_failure'))))`;
   }
 
-  function noImportOnlyPausedMonitorAssignee() {
-    // A retained import schedule is not a runnable deadline. Resume/hold
-    // changes notify the existing delivery queue; do not hot-loop while held.
+  function noRetainedPausedMonitorAssignee() {
+    // Import holds and the paused projection while Resume finishes are not
+    // runnable deadlines. Lifecycle changes notify this queue; never hot-loop.
     return sql`not exists (select 1 from ${agents} monitor_agent
       where monitor_agent.id = ${issues.assigneeAgentId}
         and monitor_agent.company_id = ${issues.companyId}
-        and monitor_agent.status = 'paused' and monitor_agent.pause_reason = 'import'
-        and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) <@ '["import"]'::jsonb)`;
+        and monitor_agent.status = 'paused'
+        and ((monitor_agent.pause_reason = 'import'
+          and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) <@ '["import"]'::jsonb)
+          or (monitor_agent.lifecycle_state = 'resuming'
+            and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) = '[]'::jsonb)))`;
   }
 
   async function triggerIssueMonitor(
@@ -1082,8 +1089,8 @@ export function createHeartbeatScheduling(
       .innerJoin(companies, eq(companies.id, issues.companyId))
       .where(
         and(
-          inArray(companies.status, ["active", "paused"]),
-          or(eq(companies.status, "paused"), noImportOnlyPausedMonitorAssignee()),
+          eq(companies.status, "active"),
+          noRetainedPausedMonitorAssignee(),
           noActiveNativeMonitorRun(),
           sql`${issues.monitorNextCheckAt} is not null`,
           lte(issues.monitorNextCheckAt, now),
@@ -1116,9 +1123,10 @@ export function createHeartbeatScheduling(
           .where(
             and(
               eq(issues.id, due.id),
-              // Recheck import eligibility at the claim, not just the scan.
-              or(sql`exists (select 1 from ${companies} monitor_company where monitor_company.id = ${issues.companyId}
-                and monitor_company.status = 'paused')`, noImportOnlyPausedMonitorAssignee()),
+              // Recheck company/import eligibility at the claim, not just the scan.
+              sql`exists (select 1 from ${companies} monitor_company where monitor_company.id = ${issues.companyId}
+                and monitor_company.status = 'active')`,
+              noRetainedPausedMonitorAssignee(),
               noActiveNativeMonitorRun(),
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),
@@ -1177,8 +1185,8 @@ export function createHeartbeatScheduling(
     const [row] = await db.select({ at: sql<string | null>`min(greatest(${issues.monitorNextCheckAt},
       ${issues.monitorWakeRequestedAt} + interval '5 minutes' + interval '1 millisecond'))` })
       .from(issues).innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(and(inArray(companies.status, ["active", "paused"]),
-        or(eq(companies.status, "paused"), noImportOnlyPausedMonitorAssignee()), noActiveNativeMonitorRun(),
+      .where(and(eq(companies.status, "active"),
+        noRetainedPausedMonitorAssignee(), noActiveNativeMonitorRun(),
         sql`${issues.monitorNextCheckAt} is not null`, isNull(issues.assigneeUserId),
         sql`${issues.assigneeAgentId} is not null`, inArray(issues.status, ["in_progress", "in_review"])));
 
