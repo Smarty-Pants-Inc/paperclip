@@ -1,3 +1,60 @@
+# F1 proof repair (2026-11-14)
+
+Resumed on intel1 at 18:55Z, base `d7f7090bd00719f156f207cad14e14a09882c64d`, scope `f1-brief4.md` INCLUDING both addenda.
+Judge inputs remain byte-identical (SHA-256 prefixes `27c5fee1`, `de4321cd`, `60b47c81`).
+No new loop, no agents, no push, no GitHub writes, no credential access.
+Evidence is retained under `/srv/scratch/paul/tasks/direct/f1-proof7/artifacts/`.
+
+## SEED-B predicate investigation (before implementation)
+
+The supplied `SEED-B/followup-before.json` and `before-runs.json` prove lease
+`465b4eb1-e6c7-4107-93a0-a903997ada1c` was released with cleanup success at
+`2026-11-14T13:37:51.697Z`; `boat-archive-readback.json` independently records
+completed stop `stop_82fa9f88255de1ce` on `bx_ysh5xvy5`. The API capture only
+contains the projected environmentLease, NOT its metadata. A recursive search
+of every supplied SEED-B JSON finds no `remoteExecutionTermination`,
+`confirmedAt`, `sandboxStopAndRetain`, or `pendingCleanupController` field.
+Therefore the exact failed subpredicate of the real receipt CANNOT be established
+from these inputs; do not mistake a synthesized legacy receipt test for the real
+metadata. Lead must supply the immutable pre-rewrite lease metadata to close
+this evidence gap. No remote access or credentials were used to fill it in.
+
+Source facts at this base: `fresh-thread-stop-gate.ts` first refuses any earlier
+running row (before reading physical proof); its lease loop additionally
+requires confirmedAt in acquiredAt..releasedAt even though the existing bound
+receipt owner `hasRemoteTerminationReceipt` does not require confirmedAt.
+An ordinary idle/warm release writes only remoteExecutionTermination, not the
+dedicated sandboxStopAndRetainReceipt. Thus missing legacy confirmedAt would
+fail BOTH gate alternatives. The gate then calls prepareUnconfirmedSourceSandboxStop,
+which accepts released rows and removes both receipts in prepareStopAndRetain.
+This destructive proof-read side effect is the independently reproducible source
+bug; its repair must preserve bound receipt identity and peer ownership fences.
+
+The supplied person judge intentionally ASSERTS the broken silence (running
+observed owner, zero provider calls, zero notes). It is a diagnostic reproduction,
+not a passing designed-end contract; importing it unchanged means an actual fix
+can turn its silence assertions RED. Report its exact outcome without flipping it.
+
+## RED checkpoint (before production edits)
+
+`base-rfl-v3.json`: unchanged three imported judges, 1,869 tests,
+1,853 passed / 16 failed. Per file: person 109/2; independent 119/13;
+started 1,625/1 (passed/failed). Person failures stop at its missing
+responsible-user fixture authority; this is not an end-to-end person pass.
+`base-typecheck.log`: three existing errors, all in unchanged person judge
+(out-of-root UI import and two mock signature incompatibilities).
+`base-seed-v3.json`: 9 tests, 4 passed / 5 failed: idle receipt rewritten,
+observed source stop preparation wrongly permitted, provider observation never
+called, peer-holder note changes/reposts, idle TL07 never admits an answer.
+Running/stopping/unknown and actual-turn TL07 controls passed.
+The earlier base-seed/base-seed-v2 attempts failed fixture setup and are not RED
+behavior evidence; v3 corrects only initial agent/lease fixture eligibility.
+The test intentionally synthesizes legacy missing-confirmedAt because the raw
+incident metadata is absent. TL07 writes an instruction edit and starts at its
+persisted typed refusal; it does not claim to reproduce the runner prepare RPC.
+
+## Prior provenance
+
 # Pi warm reattach: step one, not a PRP shortcut
 
 > Historical implementation/proof notes from source commit `48c7bf23` (base
