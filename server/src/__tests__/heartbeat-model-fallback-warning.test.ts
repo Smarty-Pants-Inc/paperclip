@@ -14,6 +14,8 @@ describe("model fallback warning", () => {
     expect(addComment).toHaveBeenCalledExactlyOnceWith("issue", expect.stringContaining("Work will continue with the compatible model"),
       { runId: "run" }, { authorType: "system",
         presentation: { kind: "system_notice", tone: "warning", title: "Using gpt-5.6-sol", density: "compact", detailsDefaultOpen: false } });
+    // RFL 20:36Z: a routine 'Using …' note stays folded; only the notes a person must read are open.
+    expect((addComment.mock.calls[0] as unknown[])[3]).toMatchObject({ presentation: { detailsDefaultOpen: false } });
     expect(onEvent.mock.invocationCallOrder[0]).toBeLessThan(addComment.mock.invocationCallOrder[0]!);
   });
 });

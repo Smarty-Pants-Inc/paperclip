@@ -49,6 +49,13 @@ describe.skipIf(!support.supported)("held conversation notice", () => {
     expect(await readUnsupersededHeldConversationNotice(db, { companyId: randomUUID(), issueId: f.issueId })).toBeNull();
   });
 
+  it("writes the fresh-thread / waiting note open (RFL 20:36Z)", async () => {
+    const f = await heldConversation();
+    const written = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(written).toHaveLength(1);
+    expect(written[0]!.presentation).toMatchObject({ kind: "system_notice", detailsDefaultOpen: true });
+  });
+
   it("is superseded by a later committed success on the same conversation", async () => {
     const f = await heldConversation();
     await laterRun(f, { sessionId: f.sessionId });

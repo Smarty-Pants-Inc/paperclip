@@ -143,6 +143,8 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
       metadata: { sourceRunId: f.runId,
         authorizationReason: `execution_finalization_deadline_exceeded:${f.runId}` },
     });
+    // RFL 20:36Z: 'Reply could not finish' is written open.
+    expect(comments[0].presentation).toMatchObject({ detailsDefaultOpen: true });
     expect(JSON.stringify(comments[0].metadata)).toContain(f.runId);
     expect(comments[0].body).not.toMatch(/starting fresh|history (was |is )?lost|automatically retr/i);
   });
