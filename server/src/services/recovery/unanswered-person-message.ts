@@ -26,7 +26,6 @@ import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { conversationResetSql, currentNoticeSql } from "../issue-comment-current.js";
-import { isConversationReset } from "../agent-conversations.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -395,20 +394,9 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
         or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text)))`;
 }
 
-/** SQL over alias m: a person message, not a "/new" session reset and not
- * behind a later one (the reset is a command and a boundary, SMAA-1909). */
-function notResetOrBeforeResetSql(alias: string): SQL {
-  const m = (column: string) => sql.raw(`${alias}.${column}`);
-  return sql`(not ${conversationResetSql({ body: m("body"), authorUserId: m("author_user_id") })}
-    and not exists (select 1 from ${issueComments} reset where reset.company_id = ${m("company_id")}
-      and reset.issue_id = ${m("issue_id")} and reset.author_type = 'user' and reset.deleted_at is null
-      and (reset.created_at, reset.id) > (${m("created_at")}, ${m("id")})
-      and ${conversationResetSql({ body: sql.raw("reset.body"), authorUserId: sql.raw("reset.author_user_id") })}))`;
-}
-
 /**
- * SQL: this issue row has a person's message within the lookback that no agent
- * answered and that has no notice yet, or an unanswered-message notice that a
+ * SQL: this issue row has a person's message (never a "/new" session reset)
+ * within the lookback that no agent answered and that has no notice yet, or an unanswered-message notice that a
  * later agent comment answered. The stranded sweep visits such tasks in every
  * open status, including blocked.
  */
@@ -417,7 +405,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
   return sql`(exists (select 1 from ${issueComments} m
       where m.company_id = ${companyId} and m.issue_id = ${issueId} and m.author_type = 'user'
         and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
-        and ${notResetOrBeforeResetSql("m")}
+        and not ${conversationResetSql({ body: sql.raw("m.body"), authorUserId: sql.raw("m.author_user_id") })}
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
@@ -451,10 +439,6 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and ${inScopeSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }, since)}
       and not ${conversationResetSql({ body: issueComments.body, authorUserId: issueComments.authorUserId })}
-      and not exists (select 1 from ${issueComments} reset where reset.company_id = ${issueComments.companyId}
-        and reset.issue_id = ${issueComments.issueId} and reset.author_type = 'user' and reset.deleted_at is null
-        and (reset.created_at, reset.id) > (${issueComments.createdAt}, ${issueComments.id})
-        and ${conversationResetSql({ body: sql.raw("reset.body"), authorUserId: sql.raw("reset.author_user_id") })})
       and not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
@@ -828,20 +812,38 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
-  const agentId = issue.assigneeAgentId;
-
-  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt, body: issueComments.body,
-    authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+  const isReset = conversationResetSql({ body: issueComments.body, authorUserId: issueComments.authorUserId });
+  // The person's latest MESSAGE: a "/new" session reset (Paperclip's
+  // isConversationReset, SMAA-1909) is a command, never a message owed a reply.
+  const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
+    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), sql`not ${isReset}`))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
   // No age cut here: discovery (inScopeSql) decides which messages are in
   // scope, so an open obligation is never dropped silently by age.
   if (!message) return { kind: "none" };
-  // A person's "/new" (Paperclip's session reset, isConversationReset) is a
-  // command, not a message owed a reply, and a boundary: nothing before it is
-  // owed one either (SMAA-1909).
-  if (message.authorUserId && isConversationReset(message.body)) return { kind: "none" };
+  const decision = await decideForMessage(q, issue, message, now, nativeBlockedRepairApplies);
+  if (decision.kind !== "notice" && decision.kind !== "pending") return decision;
+  // A reset after the message is a boundary (RFL 13:51Z): a message the person
+  // reset away from WITHIN its note window goes without a note, but one whose
+  // window had already passed keeps it, however late the sweep (no false
+  // silence). The window is this same decision's deadline, judged at the
+  // reset's created_at: still pending then means it was not yet due.
+  const [boundary] = await q.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+    eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), isReset,
+    sql`(${issueComments.createdAt}, ${issueComments.id}) > (${message.createdAt.toISOString()}::timestamptz, ${message.id}::uuid)`))
+    .orderBy(issueComments.createdAt, issueComments.id).limit(1);
+  if (boundary && (await decideForMessage(q, issue, message, boundary.createdAt, nativeBlockedRepairApplies)).kind === "pending") {
+    return { kind: "none" };
+  }
+  return decision;
+}
+
+/** The decision for one person message at a given time. Reads only. */
+async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: string; createdAt: Date }, now: Date,
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
+  const agentId = issue.assigneeAgentId!;
   const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.id, message.id), answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
