@@ -6290,13 +6290,35 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       expect(anchor("bprime-no-run-notice")!.textContent).toContain(BPRIME_NO_RUN);
     });
 
+    it("judge: expanding full history makes the kept superseded row reachable", () => {
+      const notice = { ...bPrimeNoRunNotice(5), metadata: { ...bPrimeNoRunNotice(5).metadata, supersededBy: "new-notice" } };
+      const comments = [personMessage("person-message", "Please continue.", 0), notice];
+      let expanded = false;
+      const repaint = () => paint({ comments, linkedRuns: [], issueStatus: "in_progress", compactHistory: !expanded,
+        historyControl: expanded ? <span>All history loaded</span> : <button data-testid="judge-expand" onClick={() => { expanded = true; repaint(); }}>More messages</button>,
+      });
+      repaint();
+      expect(anchor("bprime-no-run-notice")).toBeNull();
+      flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="judge-expand"]')!.click());
+      expect(container.textContent).toContain("All history loaded");
+      expect(notice.deletedAt).toBeNull();
+      expect(anchor("bprime-no-run-notice"), "kept row must be reachable in full history, not merely present in the input array").not.toBeNull();
+    });
+
+    it.skipIf(conversationMode)("judge: Classic task UI must not display superseded notes as current", () => {
+      const notice = { ...bPrimeNoRunNotice(5), metadata: { ...bPrimeNoRunNotice(5).metadata, supersededBy: "new-notice" } };
+      render(<IssueChatThread comments={[personMessage("person-message", "Please continue.", 0), notice]}
+        onAdd={async () => {}} issueStatus="in_progress" linkedRuns={[]} currentUserId="viewer" />);
+      expect(container.textContent).not.toContain(BPRIME_NO_RUN);
+    });
+
     it("hides a superseded no-run notice from the live thread without deleting its history row", () => {
       const notice = {
         ...bPrimeNoRunNotice(5),
         metadata: { ...bPrimeNoRunNotice(5).metadata, supersededBy: "answer-comment" },
       };
       const comments = [personMessage("person-message", "Please continue.", 0), notice];
-      paint({ comments, linkedRuns: [], issueStatus: "in_progress" });
+      paint({ comments, linkedRuns: [], issueStatus: "in_progress", compactHistory: true });
       expect(anchor("bprime-no-run-notice")).toBeNull();
       expect(comments).toContain(notice);
       expect(notice.deletedAt).toBeNull();
