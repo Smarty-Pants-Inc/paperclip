@@ -1,3 +1,4 @@
+import { environmentConfigRevision } from "./environment-config-revision.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
@@ -1599,33 +1600,27 @@ function createSandboxEnvironmentDriver(
     return { state: "worker_unavailable" as const, resolved: installed };
   }
 
-  const probeRuntimeConfigs = new WeakMap<object, { key: string; config: Promise<Record<string, unknown>> }>();
+  const probeRuntimeConfigs = new WeakMap<object, { key: string; revision: number; config: Promise<Record<string, unknown>> }>();
 
   async function resolvePluginSandboxExecutionConfig(input: EnvironmentDriverExecuteInput, provider: string) {
     const scope = input.probeRuntimeConfigScope!;
-    // Read only the non-secret revision/raw config, never resolved credentials.
-    // Handles retain snapshots, so checking input.environment.updatedAt alone
-    // would miss an operator's edit while a warm runner remains alive.
-    // Environment definitions are instance-wide; the cache identity below and
-    // the ordinary secret resolver retain the lease's company boundary.
-    const [current] = await db.select({ updatedAt: environments.updatedAt, driver: environments.driver,
-      config: environments.config }).from(environments).where(eq(environments.id, input.environment.id));
-    if (!current || current.driver !== input.environment.driver) {
-      probeRuntimeConfigs.delete(scope);
-      throw new Error("environment_missing_or_driver_changed");
-    }
-    const environment = { ...input.environment, config: current.config };
-    const key = JSON.stringify([input.lease.companyId, environment.id, current.updatedAt,
-      environment.driver, environment.config, input.lease.id, input.lease.providerLeaseId,
+    const revision = await environmentConfigRevision(db);
+    const key = JSON.stringify([input.lease.companyId, input.environment.id, input.environment.updatedAt,
+      input.environment.driver, input.environment.config, input.lease.id, input.lease.providerLeaseId,
       input.lease.heartbeatRunId, input.lease.metadata, provider]);
     const cached = probeRuntimeConfigs.get(scope);
-    if (input.readOnlyProbe && cached?.key === key) return await cached.config;
-    // Ordinary commands still own their audited handoff. They seed/refresh the
-    // runner's probe config, so subsequent observations do not resolve secrets.
-    // A cold scope or revision change is also audited; never borrow the signed
-    // Cloud inspection path to suppress runtime audit writes.
-    const config = resolvePluginSandboxRuntimeConfig({ environment, lease: input.lease, provider });
-    const entry = { key, config };
+    if (input.readOnlyProbe && cached?.key === key && cached.revision === revision) return await cached.config;
+    // Resolve once per owner/adoption and definition change, not per liveness
+    // tick. Ordinary commands still resolve/audit each handoff. Store the
+    // promise before awaiting so concurrent observations share the cold read.
+    const config = (async () => {
+      const [current] = await db.select({ updatedAt: environments.updatedAt, driver: environments.driver,
+        config: environments.config }).from(environments).where(eq(environments.id, input.environment.id));
+      if (!current || current.driver !== input.environment.driver) throw new Error("environment_missing_or_driver_changed");
+      return resolvePluginSandboxRuntimeConfig({ environment: { ...input.environment, config: current.config },
+        lease: input.lease, provider });
+    })();
+    const entry = { key, revision, config };
     probeRuntimeConfigs.set(scope, entry);
     try { return await config; }
     catch (error) {

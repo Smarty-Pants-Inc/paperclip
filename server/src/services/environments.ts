@@ -1,3 +1,4 @@
+import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
@@ -308,7 +309,7 @@ function countFromRows(rows: Array<{ count: number | string | null | undefined }
 }
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type EnvironmentWriteDb = Pick<Db | DbTransaction, "select" | "insert" | "update" | "delete">;
+type EnvironmentWriteDb = Pick<Db | DbTransaction, "select" | "insert" | "update" | "delete" | "transaction">;
 
 const MANAGED_ENVIRONMENT_BUNDLE_KEY = "managed-sandbox-environment";
 const MANAGED_ENVIRONMENT_RESOURCE_KIND = "environment";
@@ -692,6 +693,7 @@ export function environmentService(db: Db) {
                 bindingDefaults[MANAGED_ENVIRONMENT_ARCHIVE_TOKEN_DEFAULTS_KEY] === rowArchiveToken;
             });
           if (archivedByReconciler) {
+            await notifyEnvironmentConfigChange(tx);
             const reactivated = await tx
               .update(environments)
               .set({
@@ -764,6 +766,7 @@ export function environmentService(db: Db) {
           };
         }
 
+        await notifyEnvironmentConfigChange(tx);
         const updated = await tx
           .update(environments)
           .set({
@@ -882,6 +885,7 @@ export function environmentService(db: Db) {
         ...(existing.metadata ?? {}),
         [MANAGED_ENVIRONMENT_ARCHIVE_TOKEN_METADATA_KEY]: archiveToken,
       };
+      await notifyEnvironmentConfigChange(tx);
       const archived = await tx
         .update(environments)
         .set({
@@ -1261,12 +1265,12 @@ export function environmentService(db: Db) {
         if (changesTarget) metadataUpdate = preserveInvalidatedSnapshotProofs(sql`${metadataUpdate} - ${SANDBOX_PLATFORM_PROBE_METADATA_KEY}`);
       }
 
-      const row = await writeDb
+      const row = await withEnvironmentConfigChange(writeDb, async tx => tx
         .update(environments)
         .set({ ...values, ...(metadataUpdate ? { metadata: metadataUpdate } : {}) })
         .where(eq(environments.id, id))
         .returning()
-        .then((rows) => rows[0] ?? null)
+        .then((rows) => rows[0] ?? null))
         .catch((error) => {
           if (hasConstraintName(error, "environments_name_idx")) {
             throw conflict(`An environment named "${patch.name}" already exists for this instance.`);
@@ -1280,16 +1284,16 @@ export function environmentService(db: Db) {
     },
 
     remove: async (id: string): Promise<Environment | null> => {
-      const row = await db
+      const row = await withEnvironmentConfigChange(db, async tx => tx
         .delete(environments)
         .where(eq(environments.id, id))
         .returning()
-        .then((rows) => rows[0] ?? null);
+        .then((rows) => rows[0] ?? null));
       return row ? toEnvironment(row) : null;
     },
 
     removeIfDeletable: async (id: string): Promise<Environment | null> => {
-      const row = await db
+      const row = await withEnvironmentConfigChange(db, async tx => tx
         .delete(environments)
         .where(
           and(
@@ -1326,7 +1330,7 @@ export function environmentService(db: Db) {
           ),
         )
         .returning()
-        .then((rows) => rows[0] ?? null);
+        .then((rows) => rows[0] ?? null));
       return row ? toEnvironment(row) : null;
     },
 
