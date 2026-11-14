@@ -22,13 +22,19 @@ function fixture(initial: unknown = []) {
     ? state(initial) : structuredClone(initial);
   const pages: unknown[] = [{ messages: [message("aa"), message("bb")] }];
   const writes: unknown[] = [], fires: { payload: unknown; key: string }[] = [], order: string[] = [];
+  // Seen state is the single `saved` slot; a pending initialize-seen request lives
+  // under its own init:* key, as on the host (plugin_state is keyed by stateKey).
+  let pending: unknown = null;
+  const isInit = (key: unknown) => String((key as { stateKey?: string } | null)?.stateKey ?? "").startsWith("init:");
   const ctx = {
     logger: { warn: vi.fn() },
     state: {
-      get: vi.fn(async () => structuredClone(saved)),
-      set: vi.fn(async (_key: unknown, value: unknown) => {
+      get: vi.fn(async (key?: unknown) => structuredClone(isInit(key) ? pending : saved)),
+      set: vi.fn(async (key: unknown, value: unknown) => {
+        if (isInit(key)) { pending = structuredClone(value); return; }
         saved = structuredClone(value); writes.push(saved); order.push("save");
       }),
+      delete: vi.fn(async (key: unknown) => { if (isInit(key)) pending = null; }),
     },
     secrets: { resolve: vi.fn(async (_ref: unknown, options?: { configPath?: string }) =>
       options?.configPath === "gmailGrantRef"
@@ -46,7 +52,7 @@ function fixture(initial: unknown = []) {
       return json({ id, threadId: "ff", internalDate: "1700000000000" });
     }) },
   };
-  return { ctx, pages, writes, fires, order, saved: () => saved };
+  return { ctx, pages, writes, fires, order, saved: () => saved, pending: () => pending };
 }
 beforeEach(() => {
   vi.spyOn(Date, "now").mockReturnValue(1700000000001);
@@ -280,12 +286,20 @@ describe("registered job and explicit company binding", () => {
     f.ctx.config.get.mockResolvedValue({ ...config, enabled: false });
     const params = { companyId: company, mailbox: config.mailbox, seenIds: ["aa"] };
     await expect(f.seed(params, "other-company")).rejects.toThrow("actor/company mismatch");
-    await expect(f.seed({ ...params, seenIds: ["private subject"] })).rejects.toThrow("config invalid");
-    await expect(f.seed({ ...params, mailbox: "other@example.com" })).rejects.toThrow("config invalid");
+    await expect(f.seed({ ...params, seenIds: ["private subject"] })).rejects.toThrow("params invalid");
+    await expect(f.seed({ ...params, mailbox: "other@example.com" })).rejects.toThrow("params invalid");
+    expect(f.saved()).toBeNull(); expect(f.pending()).toBeNull();
+    // The action only records the approved request: no secret, no mail, no network.
+    await expect(f.seed(params)).resolves.toEqual({ accepted: true });
+    expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(f.saved()).toBeNull();
-    await expect(f.seed(params)).resolves.toEqual({ initialized: true });
-    expect(f.saved()).toEqual(state(["aa"]));
+    expect(await f.plugin.onHealth!()).toMatchObject({ status: "ok", message: "initializing" });
+    await expect(f.seed(params)).rejects.toThrow("initialization pending");
+    // The next job tick does the read, inside the job budget, and writes the baseline.
+    await f.tick();
+    expect(f.saved()).toEqual(state(["aa"])); expect(f.pending()).toBeNull(); expect(f.fires).toEqual([]);
     expect(f.ctx.http.fetch.mock.calls.some(([url]) => new URL(url).searchParams.get("q") === `${INCOMING_QUERY} newer_than:7d`)).toBe(true);
+    expect(await f.plugin.onHealth!()).toEqual({ status: "ok", details: { parked: [] } });
     await expect(f.seed({ ...params, seenIds: [] })).rejects.toThrow("state exists");
     f.ctx.config.get.mockResolvedValue({ ...config });
     f.pages.push({ messages: [message("aa"), message("bb")] });
@@ -297,6 +311,8 @@ describe("registered job and explicit company binding", () => {
     await f.plugin.onConfigChanged!(disabled, { companyId: company });
     f.ctx.config.get.mockResolvedValue(disabled);
     await f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] });
+    expect(f.saved()).toBeNull();
+    await f.tick();
     expect(f.saved()).toEqual({ version: 2, notBefore: Date.now() - 3 * 86_400_000, seen: [], failures: [] });
   });
   it("health exposes parked IDs, attempt counts and last failure times from durable state only", async () => {
@@ -357,9 +373,20 @@ describe("registered job and explicit company binding", () => {
     const original = f.ctx.http.fetch.getMockImplementation()!;
     f.ctx.http.fetch.mockImplementation(async (url, init) => url.includes("/aa?")
       ? json({ id: "aa", threadId: "ff", internalDate: String(1700000000001 - 4 * 86_400_000) }) : original(url, init));
-    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: ["aa"] })).rejects.toThrow("mailbox read failed");
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: ["aa"] })).resolves.toEqual({ accepted: true });
+    await expect(f.tick()).rejects.toThrow("seenIds not in window");
     expect(f.saved()).toBeNull(); expect(f.fires).toEqual([]);
     expect(f.ctx.http.fetch.mock.calls.some(([url]) => new URL(url).searchParams.get("q") === `${INCOMING_QUERY} newer_than:3d`)).toBe(true);
+    expect(await f.plugin.onHealth!()).toMatchObject({ status: "error", message: "seenIds not in window",
+      details: { initialization: "rejected" } });
+    // A rejected request is final: later ticks do not re-read mail until a new explicit request.
+    const reads = f.ctx.http.fetch.mock.calls.length;
+    await expect(f.tick()).rejects.toThrow("seenIds not in window");
+    expect(f.ctx.http.fetch.mock.calls.length).toBe(reads);
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).resolves.toEqual({ accepted: true });
+    f.pages.push({ messages: [message("aa")] });
+    await f.tick();
+    expect(f.saved()).toEqual({ version: 2, notBefore: Date.now() - 3 * 86_400_000, seen: [], failures: [] });
   });
   it("initialization does not write on an incomplete bounded scan", async () => {
     const f = await worker(null);
@@ -367,14 +394,18 @@ describe("registered job and explicit company binding", () => {
     await f.plugin.onConfigChanged!(disabled, { companyId: company });
     f.ctx.config.get.mockResolvedValue(disabled);
     f.pages.splice(0, 1, { nextPageToken: "repeat" }, { nextPageToken: "repeat" });
-    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow("mailbox read failed");
-    expect(f.saved()).toBeNull(); expect(f.ctx.state.set).not.toHaveBeenCalled();
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).resolves.toEqual({ accepted: true });
+    await expect(f.tick()).rejects.toThrow("mailbox read failed");
+    expect(f.saved()).toBeNull(); expect(f.writes).toEqual([]);
+    expect(f.pending()).toMatchObject({ seenIds: [], failure: "mailbox read failed", final: false });
+    expect(await f.plugin.onHealth!()).toMatchObject({ status: "error", message: "mailbox read failed",
+      details: { initialization: "retrying" } });
   });
   it("cannot initialize while enabled", async () => {
     const f = await worker(null);
     await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
-    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow("config invalid");
-    expect(f.saved()).toBeNull();
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow("config enabled");
+    expect(f.saved()).toBeNull(); expect(f.pending()).toBeNull();
   });
   it("no config fails visibly; saved config re-reads only the explicit company and fires", async () => {
     const f = await worker([], false);
@@ -408,7 +439,7 @@ describe("registered job and explicit company binding", () => {
     const gate = new Promise<void>(resolve => { release = resolve; });
     f.ctx.config.get.mockImplementationOnce(async () => { await gate; return { ...config, enabled: false }; });
     const first = f.tick();
-    await expect(f.tick()).rejects.toThrow("state exists");
+    await expect(f.tick()).rejects.toThrow("busy");
     release(); await first;
   });
 });

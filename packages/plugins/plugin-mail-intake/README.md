@@ -43,6 +43,27 @@ with saved config but **zero plugin_state rows**, without a config re-save.
   Bad action input now reports `params invalid`. An enabled tick with missing or
   malformed seen state now reports `state invalid`, not `mailbox read failed`.
 
+### 0.1.5 (review-fleet-2 F1/F2, live prod F3)
+
+- F3: on prod, `initialize-seen` hit the host's 30 s action cap (`RPC call
+  "performAction" timed out after 30000ms`, `server/src/services/
+  plugin-worker-manager.ts:82`) while reading 58 messages. The action now only
+  validates and records the request and returns `{accepted:true}`; the next job
+  tick (5-minute cap, `plugin-job-scheduler.ts:50`) reads the mailbox and writes
+  the baseline. Health reports `initializing`, then `ok`. Metadata reads run in
+  a fixed pool of 8 (same request count, bounded by the 240 s read signal).
+- F1: a scope denial is skipped only for companies the host never reported as
+  configured. The host replays `configChanged` for each saved config row at
+  worker start (`plugin-loader.ts:2497-2501`) and on each save; a denied company
+  in that set fails the job and health with `config read failed`.
+  `multiCompanyConfig: true` lets a second company's `configChanged` reach the
+  plugin (SDK `worker-rpc-host.ts:1979-1997`); the plugin still fails closed on
+  two configured companies.
+- F2: one code per step: `params invalid`, `host read failed`, `config read
+  failed`, `config invalid`, `config enabled`, `state read failed`, `state
+  invalid`, `state exists`, `state write failed`, `initialization pending`,
+  `seenIds not in window`, `mailbox read failed`, `busy`.
+
 Discovery requires the documented `companies.read` capability (SDK README:413).
 It is the only added capability; an upgrade may require the host's normal
 capability approval before activation (PLUGIN_SPEC.md:1595). Do not bypass it.

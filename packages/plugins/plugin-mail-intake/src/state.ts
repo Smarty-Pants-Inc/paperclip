@@ -6,6 +6,8 @@ export interface Seen { id: string; internalDate: number }
 export interface Failure extends Seen { attempts: number; nextRetryAt: number; lastFailureAt?: number }
 export interface MailState { version: 2; seen: Seen[]; failures: Failure[]; notBefore?: number }
 export const MAX_FAILURES = 10;
+/** The scanner's own bound: at most 100 list pages of 500 IDs (intake.ts). */
+export const MAX_SEEN_IDS = 50_000;
 export const PARKED_WARNING = "mail intake has parked deliveries";
 export function parkedWarning(parked: readonly Failure[]): string {
   return `${PARKED_WARNING}: ${parked.map(m => m.id).sort().join(", ")}`;
@@ -41,4 +43,25 @@ export function failedDelivery(id: string, internalDate: number, prior?: Failure
   const lastFailureAt = Date.now();
   return { id, internalDate, attempts, lastFailureAt,
     nextRetryAt: lastFailureAt + Math.min(120_000 * 2 ** (attempts - 1), 6 * 3_600_000) };
+}
+/**
+ * A board-approved initialize-seen request, recorded by the action and completed by
+ * the next job tick (the action cannot read the mailbox inside the host's 30 s cap).
+ * IDs only; `failure` is one fixed step code, never provider text.
+ */
+export interface PendingInit {
+  version: 1; seenIds: string[]; requestedAt: number;
+  failure?: string; final?: boolean; failedAt?: number;
+}
+const PENDING_FAILURES = ["mailbox read failed", "seenIds not in window"];
+export function parsePending(value: unknown): PendingInit {
+  if (!record(value)) fail();
+  only(value, ["version", "seenIds", "requestedAt", "failure", "final", "failedAt"]);
+  if (value.version !== 1 || !Array.isArray(value.seenIds) || value.seenIds.length > MAX_SEEN_IDS ||
+      !value.seenIds.every(isId) || new Set(value.seenIds).size !== value.seenIds.length ||
+      !timestamp(value.requestedAt) ||
+      (value.failure !== undefined && !(typeof value.failure === "string" && PENDING_FAILURES.includes(value.failure))) ||
+      (value.final !== undefined && typeof value.final !== "boolean") ||
+      (value.failedAt !== undefined && !timestamp(value.failedAt))) fail();
+  return value as unknown as PendingInit;
 }
