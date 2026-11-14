@@ -45,7 +45,7 @@ import { logger } from "../middleware/logger.js";
 import { pluginManifestValidator } from "./plugin-manifest-validator.js";
 import { pluginCapabilityValidator } from "./plugin-capability-validator.js";
 import { pluginRegistryService } from "./plugin-registry.js";
-import type { PluginWorkerManager, WorkerStartOptions, WorkerToHostHandlers } from "./plugin-worker-manager.js";
+import type { PluginWorkerHandle, PluginWorkerManager, WorkerStartOptions, WorkerToHostHandlers } from "./plugin-worker-manager.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginJobScheduler } from "./plugin-job-scheduler.js";
 import type { PluginJobStore } from "./plugin-job-store.js";
@@ -1231,6 +1231,7 @@ export function pluginLoader(
 
   async function stopActivationTimeoutRecovery() {
     shuttingDown = true;
+    unsubscribeConfigReplay?.();
     activationRetryScheduler.stop();
     while (activeActivationRecoveries.size > 0) await Promise.allSettled([...activeActivationRecoveries]);
   }
@@ -1254,6 +1255,58 @@ export function pluginLoader(
   const capabilityValidator = pluginCapabilityValidator();
   const log = logger.child({ service: "plugin-loader" });
   const hostVersion = runtimeServices?.instanceInfo.hostVersion;
+
+  const configReadyWorkers = new WeakSet<PluginWorkerHandle>();
+  const unsubscribeConfigReplay = runtimeServices?.workerManager.onWorkerReady?.((pluginId) => {
+    if (shuttingDown) return;
+    const worker = runtimeServices.workerManager.getWorker(pluginId);
+    if (!worker) return;
+    if (!configReadyWorkers.has(worker)) {
+      configReadyWorkers.add(worker);
+      return;
+    }
+    trackActivationRecovery(async () => {
+      const plugin = await registry.getById(pluginId);
+      if (plugin?.status !== "ready") return;
+      const rows = await listStoredConfigs(plugin);
+      if (shuttingDown || runtimeServices.workerManager.getWorker(pluginId) !== worker || worker.status !== "running") return;
+      await deliverStoredConfigs(plugin, rows);
+    }, "plugin-loader: config replay after worker respawn failed", pluginId);
+  });
+
+  type StoredConfigRows = Awaited<ReturnType<typeof registry.listConfigs>>;
+
+  async function listStoredConfigs(plugin: Pick<PluginRecord, "id" | "pluginKey">): Promise<StoredConfigRows> {
+    try {
+      return await registry.listConfigs(plugin.id);
+    } catch (err) {
+      log.debug({ pluginId: plugin.id, pluginKey: plugin.pluginKey, err: err instanceof Error ? err.message : String(err) },
+        "plugin-loader: could not list stored configs for worker startup");
+      return [];
+    }
+  }
+
+  async function deliverStoredConfigs(plugin: Pick<PluginRecord, "id" | "pluginKey">, rows: StoredConfigRows): Promise<void> {
+    for (const row of rows) {
+      try {
+        await runtimeServices!.workerManager.call(plugin.id, "configChanged", {
+          config: (row.configJson ?? {}) as Record<string, unknown>,
+          companyId: row.companyId,
+        });
+      } catch (configErr) {
+        const code = (configErr as { code?: number } | null)?.code;
+        const details = {
+          pluginId: plugin.id, pluginKey: plugin.pluginKey, companyId: row.companyId, code,
+          err: configErr instanceof Error ? configErr.message : String(configErr),
+        };
+        if (code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
+          log.warn(details, "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies");
+        } else {
+          log.debug(details, "plugin-loader: startup config delivery skipped for company");
+        }
+      }
+    }
+  }
 
   async function assertPageRoutePathsAvailable(manifest: PaperclipPluginManifestV1): Promise<void> {
     const requestedRoutePaths = getDeclaredPageRoutePaths(manifest);
@@ -2419,19 +2472,7 @@ export function pluginLoader(
       // (eventSubscriptions: 0) for the worker's life (LOOA-695). The same rows
       // drive startup config delivery in step 5b below. Listing is best-effort:
       // if it fails the worker still starts, just with no proactive access.
-      let configRows: Awaited<ReturnType<typeof registry.listConfigs>> = [];
-      try {
-        configRows = await registry.listConfigs(pluginId);
-      } catch (listErr) {
-        log.debug(
-          {
-            pluginId,
-            pluginKey,
-            err: listErr instanceof Error ? listErr.message : String(listErr),
-          },
-          "plugin-loader: could not list stored configs before worker start",
-        );
-      }
+      const configRows = await listStoredConfigs(activePlugin);
 
       // ------------------------------------------------------------------
       // 5. Spawn worker process
@@ -2494,36 +2535,7 @@ export function pluginLoader(
       // Reuses the `configRows` loaded in step 4b (which also seeded the
       // worker's proactive company scopes before startup); no second listConfigs
       // round-trip is needed here.
-      for (const row of configRows) {
-        try {
-          await workerManager.call(pluginId, "configChanged", {
-            config: (row.configJson ?? {}) as Record<string, unknown>,
-            companyId: row.companyId,
-          });
-        } catch (configErr) {
-          // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
-          // than collapse onto a second company's config — surface that at
-          // warn so the misconfiguration (multiple distinct companies
-          // configured for a single-tenant plugin) is visible, instead of
-          // being lost in the best-effort debug stream.
-          const code = (configErr as { code?: number } | null)?.code;
-          const details = {
-            pluginId,
-            pluginKey,
-            companyId: row.companyId,
-            code,
-            err: configErr instanceof Error ? configErr.message : String(configErr),
-          };
-          if (code === PLUGIN_RPC_ERROR_CODES.CROSS_TENANT_CONFIG) {
-            log.warn(
-              details,
-              "plugin-loader: startup config delivery rejected — single-tenant plugin configured for multiple companies",
-            );
-          } else {
-            log.debug(details, "plugin-loader: startup config delivery skipped for company");
-          }
-        }
-      }
+      await deliverStoredConfigs(activePlugin, configRows);
 
       // ------------------------------------------------------------------
       // 6. Sync job declarations and register with scheduler
