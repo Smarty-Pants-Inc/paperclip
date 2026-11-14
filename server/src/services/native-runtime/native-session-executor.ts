@@ -5955,7 +5955,7 @@ const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_to
   "session.goal.get"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
-  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean;
+  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWaitInputId?: string | null;
     settledLifecycleCommands?: readonly Record<string, unknown>[] } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
@@ -6012,9 +6012,11 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
     // tool input unanswered by design: the answer reaches a new provider turn
     // through that interaction, never this Runner. Once that Runner is gone,
     // the committed park settles the input.
-    if (!(options.remoteRunnerGone && options.parkedGovernedWait) && (control.committedEvents as unknown[]).map(record).some(event =>
+    if ((control.committedEvents as unknown[]).map(record).some(event =>
       (event.eventType === "semantic_tool.input" || event.eventType === "mcp_app.tool_input") &&
-      !answered.has(event.sourceEventId))) return refuse("journal_tool_input_unanswered");
+      !answered.has(event.sourceEventId) && event.sourceEventId !== options.parkedGovernedWaitInputId)) {
+      return refuse("journal_tool_input_unanswered");
+    }
     return { bytes };
   } catch {
     return refuse("journal_unreadable");
@@ -6124,11 +6126,17 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
       ? target.sandboxLeaseAcquisition?.providerLeaseId : undefined,
   });
-  const parkedGovernedWait = remoteRunnerGone && await priorRunParkedOnGovernedWait(input.db, {
-    companyId: binding.companyId, issueId: binding.issueId, runId: identity.runId });
+  // Reuse the STANDING generation-loss proof above. For a resumed same box
+  // remoteRunnerGenerationLost requires an exact marker/process generation
+  // result (exit 45/47), never a timeout or an unresponsive channel. For a
+  // different box, priorRemoteSandboxLeasesEnded proves all prior leases ended.
+  const parkedGovernedWaitInputId = (remoteRunnerGone || generationLost)
+    ? await priorRunParkedOnGovernedWait(input.db, {
+      companyId: binding.companyId, issueId: binding.issueId, runId: identity.runId,
+      controlBytes: input.projectedControlBytes ?? originalBytes }) : null;
   const lifecycleSettlement = input.projectedControlBytes ? null : await planNativeLifecycleSettlement({ db: input.db,
     root: input.root, bytes: originalBytes, identity, ...binding, currentRunId: binding.runId }).catch(() => null);
-  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait,
+  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWaitInputId,
     settledLifecycleCommands: lifecycleSettlement?.commands };
   const projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
   if (projection.refused !== undefined) return refuse(projection.refused);
@@ -6205,7 +6213,7 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     for (const name of readdirSync(quarantine)) {
       if (!name.startsWith(`${basename(input.root)}.`)) continue;
       if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
-      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait,
+      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWaitInputId,
         settledLifecycleCommands: lifecycleSettlement?.commands });
       if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
     }
@@ -6251,20 +6259,58 @@ export function quarantinedBootstrapOfOwnerHeldNoProviderWork(root: string, iden
 }
 
 /** The prior run committed a governed-wait park: its accepted result waits on a durable task interaction. */
-async function priorRunParkedOnGovernedWait(db: Db, input: { companyId: string; issueId: string; runId: string }): Promise<boolean> {
+async function priorRunParkedOnGovernedWait(db: Db, input: {
+  companyId: string; issueId: string; runId: string; controlBytes: string;
+}): Promise<string | null> {
   try {
     const [row] = await db.select({ result: nativeRunResults.resultJson }).from(nativeRunFinalizations)
       .innerJoin(nativeRunResults, and(eq(nativeRunResults.id, nativeRunFinalizations.resultId),
         eq(nativeRunResults.companyId, nativeRunFinalizations.companyId), eq(nativeRunResults.runId, nativeRunFinalizations.runId)))
       .where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.issueId, input.issueId),
-        eq(nativeRunFinalizations.runId, input.runId), eq(nativeRunFinalizations.phase, "committed")))
+        eq(nativeRunFinalizations.runId, input.runId), eq(nativeRunFinalizations.phase, "committed"),
+        eq(nativeRunResults.schemaStatus, "accepted")))
       .limit(1);
-    const result = record(row?.result);
-    return record(result.continuation).kind === "response_wake" && Array.isArray(result.artifacts)
-      && result.artifacts.some(artifact => record(artifact).kind === "issue_thread_interaction"
-        && typeof record(artifact).ref === "string" && String(record(artifact).ref).startsWith("interaction:"));
+    // completeRun stores the canonical result inside resultJson.result. Older
+    // imported checkpoints used the unwrapped shape; both retain one owner.
+    const saved = record(row?.result);
+    const result = saved.result === undefined ? saved : record(saved.result);
+    if (record(result.continuation).kind !== "response_wake" || !Array.isArray(result.artifacts)) return null;
+    const artifacts = result.artifacts.map(record).filter(artifact => artifact.kind === "issue_thread_interaction"
+      && typeof artifact.ref === "string" && artifact.ref.startsWith("interaction:"));
+    if (artifacts.length !== 1) return null;
+    const interactionId = String(artifacts[0]!.ref).slice("interaction:".length);
+    if (record(result.continuation).idempotencyKey !== `interaction-response:${interactionId}`) return null;
+    const [card] = await db.select().from(issueThreadInteractions).where(and(
+      eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.companyId, input.companyId),
+      eq(issueThreadInteractions.issueId, input.issueId), eq(issueThreadInteractions.sourceRunId, input.runId)));
+    if (!card?.idempotencyKey || !card.createdByAgentId) return null;
+    const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, card.createdByAgentId)));
+    if (!run) return null;
+    const control = record(JSON.parse(input.controlBytes));
+    const events = Array.isArray(control.committedEvents) ? control.committedEvents.map(record) : [];
+    const candidates = events.filter(event => {
+      if (event.eventType !== "semantic_tool.input" || typeof event.sourceEventId !== "string") return false;
+      const envelope = record(event.envelope);
+      if (envelope.runId !== input.runId) return false;
+      const semantic = record(record(record(envelope.payload).payload).semantic_tool), args = record(semantic.input);
+      if (semantic.operationId === "request_human_input") {
+        const kinds: Record<string, string> = { questions: "ask_user_questions", confirmation: "request_confirmation",
+          checkbox: "request_checkbox_confirmation", suggest_tasks: "suggest_tasks", item_verdicts: "request_item_verdicts" };
+        return kinds[String(args.interactionKind)] === card.kind && args.idempotencyKey === card.idempotencyKey;
+      }
+      // Connection requests without a mutation receipt still have an exact
+      // server-generated interaction key. Do not guess for access/setup cards.
+      const payload = record(card.payload), upstream = record(payload.upstreamService);
+      return semantic.operationId === "connections_request" && card.kind === "connection_intent"
+        && !payload.accessRequest && !payload.agentSetup && !payload.purpose && !!run.responsibleUserId
+        && args.service === payload.serviceSlug && (args.targetService ?? null) === (upstream.slug ?? null)
+        && card.idempotencyKey === `connection-intent:${input.runId}:${run.responsibleUserId}:${String(payload.serviceSlug)}${upstream.slug ? `:${String(upstream.slug)}` : ""}`;
+    });
+    // A park grants one exact input, never all inputs from this turn or card.
+    return candidates.length === 1 ? String(candidates[0]!.sourceEventId) : null;
   } catch {
-    return false;
+    return null;
   }
 }
 

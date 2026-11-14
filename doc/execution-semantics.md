@@ -3823,8 +3823,29 @@ journaled answer still holds it with `journal_tool_input_unanswered`. A
 retained lease, a lease on this run's sandbox, or a missing lease record keeps
 every unfinished command decisive.
 
+A committed governed-wait result can settle only its exact parked tool input.
+The accepted result names one durable interaction and the matching
+`interaction-response:<id>` continuation key. The server resolves that card's
+source-run and agent scope, then matches one journal input by its interaction
+idempotency key (or the exact server-generated connection-intent key). Two
+matching inputs, a missing card, or an unrelated unanswered input keep the
+owner held. Neither settlement nor authority rotation deletes or answers the
+card. A later card answer follows ordinary question-response delivery and
+materialization into the new turn; a plain message follows ordinary task
+history and does not fabricate a card answer.
+
+On a resumed **same** sandbox this exception is considered only after the
+standing `remoteRunnerGenerationLost` probe positively proves the recorded
+process absent (exit 45) or its boot/process generation changed (exit 47).
+A missing marker, probe timeout, thrown probe, or live matching process proves
+nothing. On a different sandbox the existing all-prior-leases-ended record
+proof applies. The exception never changes delivery or tool-answer settlement,
+never exempts all tool inputs, and adds nothing to the fork's `holdLostOwner`
+guard: it belongs in upstream's parked-governed-wait predicate.
+
 The provider session then follows the normal resume-or-replace policy. A
-resumed sandbox, a local warm session, a plugin task, a restart claim, or any
+resumed sandbox without the standing generation-loss proof, a local warm
+session, a plugin task, a restart claim, or any
 missing proof keeps the existing `prior_owner_terminal_state_indeterminate`
 rejection. When admission attempted the retirement, the error names the first
 proof that failed, for example
