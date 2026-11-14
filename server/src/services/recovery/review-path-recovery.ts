@@ -115,7 +115,10 @@ export function decideIssueReviewPathRecovery(input: {
   });
   if (input.existingWake) return { kind: "skip", reason: "review-path recovery wake already exists" };
 
-  const source = readNonEmptyString(context.source) ?? "heartbeat.review_path_disposition";
+  const inheritedSource = readNonEmptyString(context.source);
+  const source = inheritedSource === "issue.assigned_work_invariant"
+    ? "heartbeat.review_path_disposition"
+    : inheritedSource ?? "heartbeat.review_path_disposition";
   const chatCommentIds = boundExternalChatProvider(source) ? extractWakeCommentIds(context) : [];
 
   const payload = withRecoveryContext({
