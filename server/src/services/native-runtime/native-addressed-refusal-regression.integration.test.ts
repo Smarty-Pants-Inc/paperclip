@@ -250,9 +250,9 @@ async function expectNotes(input: Fixture, count: number, connection = db) {
     expect(note).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null, issueId: input.issueId, companyId });
     expect(typeof note.clientRequestId).toBe("string");
     expect(note.clientRequestId?.length).toBeGreaterThan(0);
-    expect(JSON.stringify([note.body, note.presentation, note.metadata])).not.toContain(CANARY);
+    expect(JSON.stringify([note.body, note.presentation, note.metadata]).toLowerCase()).not.toContain(CANARY.toLowerCase());
   }
-  expect(JSON.stringify(audits.map(audit => audit.details))).not.toContain(CANARY);
+  expect(JSON.stringify(audits.map(audit => audit.details)).toLowerCase()).not.toContain(CANARY.toLowerCase());
   const [card] = await connection.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId));
   expect(card).toMatchObject({ status: "pending", resolvedByAgentId: null, resolvedByRunId: null, resolvedByUserId: null, resolvedAt: null });
   return notes;
@@ -290,7 +290,7 @@ const REFUSALS: RefusalCase[] = [
     apply: async () => { await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, responderAgentId)); } },
   { name: "unavailable document target", reason: "target", details: { targetReason: "unavailable" }, cause: /exact linked document.*current revision is unavailable/i,
     apply: async input => { await setPayload(input, { target: { type: "issue_document", issueId: input.issueId,
-      documentId: randomUUID(), key: CANARY, revisionId: randomUUID(), revisionNumber: 1, label: CANARY } }); } },
+      documentId: randomUUID(), key: CANARY.toLowerCase(), revisionId: randomUUID(), revisionNumber: 1, label: CANARY } }); } },
   { name: "governed tool action", reason: "tool_action", cause: /governed tool action.*independent authorization/i,
     apply: async input => { await setPayload(input, { toolAction: { toolName: CANARY, arguments: { privateValue: CANARY } } }); } },
   { name: "protected secret proposal", reason: "secret_proposal", cause: /protected secret change.*independent authorization/i,
