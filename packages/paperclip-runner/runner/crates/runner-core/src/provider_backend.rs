@@ -3479,14 +3479,15 @@ impl CodexCommandExecutor {
                         && !provider.has_active_goal()
                         && !provider.has_known_descendants()
                 });
-            // Pi attachment already refreshes run instructions. Compare the
-            // stable profile here, without letting a same-run or live-work
-            // request disguise an instruction change as a context refresh.
+            // Instructions belong to the attaching invocation, not the saved
+            // conversation. Pi refreshes them in place; Codex checkpoints and
+            // resumes the same thread with current developer instructions.
+            // Same-run, live-work and every other profile fence stay strict.
             let mut stable_config = config.clone();
             if rebind_run
                 && state.thread_id.is_some()
-                && state.config.provider == "pi_rpc"
-                && config.provider == "pi_rpc"
+                && state.config.provider == config.provider
+                && matches!(config.provider.as_str(), "pi_rpc" | "codex")
             {
                 stable_config.instructions = state.config.instructions.clone();
             }
@@ -3938,7 +3939,33 @@ impl CodexCommandExecutor {
             .map_err(|_| {
                 DurableRunnerError::invalid("run.attach runtime launch arguments are invalid")
             })?;
+        let next_run_identity: Option<ProviderEventIdentity> = payload
+            .pointer("/paperclipNextAuthority/identity")
+            .map(|identity| {
+                serde_json::from_value(json!({
+                    "runnerInstanceId": identity["runnerInstanceId"],
+                    "runId": identity["runId"],
+                    "normalizedSessionId": identity["normalizedSessionId"],
+                    "turnId": identity["turnId"],
+                    "itemId": identity["itemId"],
+                }))
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "run.attach provider run identity is invalid: {error}"
+                    ))
+                })
+            })
+            .transpose()?
+            .or_else(|| self.event_identity.clone())
+            .or_else(|| next_state.run_identity.clone());
+        let different_run = next_run_identity.as_ref().is_some_and(|next| {
+            next_state
+                .run_identity
+                .as_ref()
+                .is_none_or(|saved| saved.run_id != next.run_id)
+        });
         let mut upgraded_skill_config = false;
+        let mut refreshed_codex_instructions = false;
         if let Some(provider) = payload.get("provider") {
             let mut config: CodexProviderConfig = serde_json::from_value(provider.clone())
                 .map_err(|error| {
@@ -3974,6 +4001,23 @@ impl CodexCommandExecutor {
                 && next_state.lifecycle == "prepared"
             {
                 next_state.config.instructions = config.instructions.clone();
+            }
+            if different_run
+                && next_state.config.provider == "codex"
+                && config.provider == "codex"
+                && next_state.descendant_thread_ids.is_empty()
+                && next_state.pi_deferred_terminal.is_none()
+                && self
+                    .provider
+                    .as_ref()
+                    .is_none_or(|provider| !provider.has_known_descendants())
+                && next_state.config.instructions != config.instructions
+            {
+                // Codex has no Pi-style run.attach instruction RPC. Reopen the
+                // saved thread so developerInstructions reaches the provider;
+                // retaining its process here would silently keep stale text.
+                next_state.config.instructions = config.instructions.clone();
+                refreshed_codex_instructions = true;
             }
             if next_state.config.provider == "pi_rpc" && config.provider == "pi_rpc" {
                 // Only run instructions/context may refresh; equality below
@@ -4032,25 +4076,7 @@ impl CodexCommandExecutor {
                 identity,
                 provider_turn_id,
             });
-        next_state.run_identity = payload
-            .pointer("/paperclipNextAuthority/identity")
-            .map(|identity| {
-                serde_json::from_value(json!({
-                    "runnerInstanceId": identity["runnerInstanceId"],
-                    "runId": identity["runId"],
-                    "normalizedSessionId": identity["normalizedSessionId"],
-                    "turnId": identity["turnId"],
-                    "itemId": identity["itemId"],
-                }))
-                .map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "run.attach provider run identity is invalid: {error}"
-                    ))
-                })
-            })
-            .transpose()?
-            .or_else(|| self.event_identity.clone())
-            .or_else(|| next_state.run_identity.clone());
+        next_state.run_identity = next_run_identity;
         next_state.completion_contract = completion_contract;
         next_state.completed_turn_authoritative = false;
         next_state.completed_turn_process_generation = None;
@@ -4089,7 +4115,11 @@ impl CodexCommandExecutor {
         };
         let mut attachment_accounting = Vec::new();
         let retention = if let Some(provider) = self.provider.as_mut() {
-            if refresh_provider || runtime_launch_changed || upgraded_skill_config {
+            if refresh_provider
+                || runtime_launch_changed
+                || upgraded_skill_config
+                || refreshed_codex_instructions
+            {
                 // prepare's changed Pi startup context must reload company skills,
                 // even when an ordinary warm run.attach could refresh in place.
                 // The predecessor's tail was retained before cloning next_state.
@@ -8487,6 +8517,7 @@ done
     include!("provider_backend_tests/reopen_done.rs");
     include!("provider_backend_tests/reopen_suspended.rs");
     include!("provider_backend_tests/replay_agent_home.rs");
+    include!("provider_backend_tests/skill_edit.rs");
 
     fn prepared_skill_checkpoint(
         provider: &str,

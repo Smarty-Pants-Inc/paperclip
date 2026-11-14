@@ -16,6 +16,16 @@ execution and finalization path.
   by one `run.terminal`; server finalization accepts only that bound pair.
 - `session.open` initializes Codex and starts a thread. A recovered runner
   resumes the recorded thread and reads it before accepting another turn.
+- A different run may refresh composed instructions on a settled conversation,
+  including after the previous task reported DONE. Codex checkpoints its old
+  process and resumes the same thread with the current `developerInstructions`;
+  Pi uses its existing run-instruction refresh. Same-run `run.prepare`
+  instruction mutations and all other immutable provider-profile changes
+  remain refused. Live work,
+  deferred terminal results, pending tools, active goals and descendants do not
+  become settled merely because instructions changed. Checkpoints written by
+  the preceding release retain their existing shape and thread identity; no
+  migration or destructive reset is needed for this instructions-only refresh.
 - `turn.start` requires bounded non-empty `payload.text`. `turn.steer`,
   `turn.interrupt`, `turn.stop`, and `run.cancel` use Codex's native turn IDs,
   while PRP continues to use its own stable run and turn identities.
