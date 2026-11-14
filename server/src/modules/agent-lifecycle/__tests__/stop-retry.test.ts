@@ -95,6 +95,35 @@ describe("bounded lifecycle Stop recovery", () => {
       } finally { await restarted.stop(); }
     } finally { await worker.stop(); }
   });
+  it.each([
+    { phase: "pausing", attempts: 235 },
+    { phase: "terminating", attempts: 42 },
+  ] as const)("bounds a legacy $phase loop with $attempts prior claims even without a saved Stop budget", async ({ phase, attempts }) => {
+    const agent = await fixture(phase, { attempts });
+    // The reported pause had already lost its manual hold through Resume.
+    if (phase === "pausing") await db.update(agents).set({ lifecycleHolds: [], pauseReason: null }).where(eq(agents.id, agent.id));
+    const store = createLifecycleStore(db, createAgentLifecycleEffects());
+    const driver = makeDriver();
+    const worker = createLifecycleWorker(store, driver, () => {});
+    try {
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        await due(agent.id);
+        await worker.process(agent.id);
+        expect((await current(agent.id)).lifecycleOperation).toMatchObject({ attempts: attempts + attempt, stopFailures: attempt });
+      }
+      const parked = await current(agent.id);
+      expect(parked.lifecycleState).toBe(phase);
+      expect(parked.lifecycleOperation?.retryRequired).toBe(true);
+      expect(parked.lifecycleError).toContain("Automatic stop work is paused after 5 incomplete attempts");
+      expect(await store.claim(agent.id, "legacy-loop-parked", new Date(Date.now() + 86_400_000))).toBeNull();
+      await worker.process(agent.id);
+      expect(driver.runHost).toHaveBeenCalledTimes(5);
+      await createAgentLifecycle(db).retry(agent.id);
+      driver.runHost.mockResolvedValue("complete");
+      await worker.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe(phase === "pausing" ? "ready" : "terminated");
+    } finally { await worker.stop(); }
+  });
   it.each(["pausing", "terminating", "cleaning_up"] as const)("honors an operator's already-set retryRequired on %s", async phase => {
     const agent = await fixture(phase, { retryRequired: true });
     const store = createLifecycleStore(db, createAgentLifecycleEffects());
