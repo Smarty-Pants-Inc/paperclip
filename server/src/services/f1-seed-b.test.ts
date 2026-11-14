@@ -1,0 +1,172 @@
+import { randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { eq, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { agents, authUsers, companies, createDb, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
+import { answerWithNativePeer } from "../__tests__/helpers/native-answer-peer.js";
+import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
+import { canonicalNativeRuntimeContextDigest } from "../vendor/paperclip-runner/index.js";
+import { buildNativeRuntimeContext } from "./native-runtime/runtime-context.js";
+import { prepareNativeWorkspaceSync } from "./native-runtime/native-workspace-sync.js";
+import { resolveHeartbeatNativeRuntimeMode } from "./native-runtime/runtime-mode.js";
+import { createNativeSessionHandoffLoader } from "./native-runtime/native-session-handoff.js";
+import { selectHeartbeatRuntime, type HeartbeatRuntimeSelectionInput } from "./heartbeat/runtime-selection.js";
+import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
+import { listFreshContinuations } from "./fresh-continuation-fallback.js";
+import { heartbeatService } from "./heartbeat.js";
+import { getExecutionBlocker } from "./execution-blocker.js";
+import { prepareUnconfirmedSourceSandboxStop, retryUnconfirmedSourceSandboxStop } from "./sandbox-stop-and-retain.js";
+
+// Keep reason: SEED-B's recorded data-loss/silence incident, and the allocation
+// ownership trust boundary. Only context materialization/sandbox I/O are peers;
+// proof, cleanup claims, disposition, wake admission, history and native result
+// settlement are the real owners. This is local deterministic qualification,
+// not a claim that a live Boat deployment was repaired.
+vi.mock("./native-runtime/runtime-context.js", async original => ({
+  ...await original<typeof import("./native-runtime/runtime-context.js")>(),
+  buildNativeRuntimeContext: vi.fn(async () => nativeRuntimeContextFixture()),
+}));
+vi.mock("./native-runtime/native-workspace-sync.js", async original => ({
+  ...await original<typeof import("./native-runtime/native-workspace-sync.js")>(),
+  prepareNativeWorkspaceSync: vi.fn(async () => null),
+}));
+const support = await getEmbeddedPostgresTestSupport();
+describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
+  let db: Db;
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let root: string;
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), "f1-seed-b-"));
+    await writeFile(join(root, "AGENTS.md"), "Read the saved conversation and answer the person's message.\n");
+    database = await startEmbeddedPostgresTestDatabase("f1-seed-b");
+    db = createDb(database.connectionString);
+    vi.mocked(buildNativeRuntimeContext).mockImplementation(async () => {
+      const context = nativeRuntimeContextFixture();
+      context.instructions.bundle.rootPath = root;
+      return { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) };
+    });
+    vi.mocked(prepareNativeWorkspaceSync).mockResolvedValue(null);
+  }, 60_000);
+  afterEach(async () => {
+    vi.useRealTimers();
+    await heartbeatService(db).drainActiveRunExecutions();
+    await db.execute(sql`truncate table companies cascade`);
+  });
+  afterAll(async () => { await db?.$client.end(); await database?.cleanup(); if (root) await rm(root, { recursive: true, force: true }); });
+
+  it.each(["idle-release", "observed-owner", "proof-arrives", "running", "stopping", "unknown", "other-lease", "tl07-idle", "tl07-running"] as const)(
+    "%s: immutable receipt, one current note, no impossible run; proof wakes the saved message", async shape => {
+    const t0 = Date.now();
+    const tl07 = shape.startsWith("tl07-");
+    const liveTurn = shape === "tl07-running";
+    const observedOwner = shape === "observed-owner";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const userId = randomUUID();
+    await db.insert(authUsers).values({ id: userId, name: "Board", email: `${userId}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    const [company] = await db.insert(companies).values({ name: "SEED-B replay", issuePrefix: "FSB", defaultResponsibleUserId: userId, requireBoardApprovalForNewAgents: false }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Seed B agent", role: "engineer", status: "running", adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.6-luna" }, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1 } } }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Remember the word", status: "in_progress", assigneeAgentId: agent.id, responsibleUserId: userId }).returning();
+    const [old] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, status: "running", responsibleUserId: userId, createdAt: new Date(t0 - 600_000), contextSnapshot: { issueId: issue.id } }).returning();
+    const readRun = async (id: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0]!;
+    const inputFor = (run: typeof old): HeartbeatRuntimeSelectionInput => ({
+      run, agent,
+      nativeRuntimeResolution: resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: true, runtimeConfig: {}, adapterConfig: agent.adapterConfig, agent, issue, target: null, workspaceId: null }),
+      task: { issueRef: issue, issueContext: null, context: run.contextSnapshot ?? {}, executionContinuation: null, safeWakeComments: [], safeWakeCommentContext: null, paperclipWakePayload: null, acceptedPlanContinuationWake: false },
+      session: { persistedNativeExecutionInput: null, persistedRunnerProfile: {}, taskResumeSessionId: null, isFailedChatRunRetry: false, getFreshSessionHandoff: createNativeSessionHandoffLoader({ db, companyId: company.id, agentId: agent.id, issueId: issue.id, before: run.createdAt }) },
+      workspace: { persistedExecutionWorkspace: null, executionWorkspace: { cwd: root, repoUrl: null, repoRef: null, branchName: null }, executionTarget: null, isDotRun: false, projectRepositoryPaths: [], activeEnvironmentLease: { lease: { id: randomUUID(), companyId: company.id, environmentId: null, executionWorkspaceId: null, issueId: issue.id, heartbeatRunId: run.id, status: "active", leasePolicy: "ephemeral", provider: null, providerLeaseId: null, acquiredAt: new Date(), lastUsedAt: new Date(), expiresAt: null, releasedAt: null, failureReason: null, cleanupStatus: null, metadata: null, createdAt: new Date(), updatedAt: new Date() } } },
+      config: { runtimeConfig: {}, runtimeSkillEntries: [], runScopedMentionedSkillKeys: [], instructionCopy: null, agentIdentity: undefined, issueAssigneeOverrides: null, resolvedConfig: {}, managedAiRuntime: undefined },
+      recovery: {}, trace: { providerTraceRequested: false, providerTraceCapture: null }, issuesSvc: { addComment: vi.fn() }, runtimeEnv: {}, onAdapterEvent: vi.fn(async () => {}), onNativeLifecycleSelected: vi.fn(), onProviderResourceDisposition: vi.fn(), onNativeOwnershipHeld: vi.fn(), stopControllerLease: vi.fn(),
+    });
+    const first = await selectHeartbeatRuntime(db, inputFor(old));
+    if (!first.selected || !first.nativeExecution) throw new Error("Initial native session not selected");
+    const sessionId = first.nativeExecution.session.normalizedSessionId!;
+    await db.update(heartbeatRuns).set({ status: observedOwner || liveTurn ? "running" : "succeeded", finishedAt: observedOwner || liveTurn ? null : new Date(t0 - 500_000), errorCode: observedOwner ? "native_execution_ownership_unverified" : null }).where(eq(heartbeatRuns.id, old.id));
+    await db.update(nativeRunFinalizations).set({ phase: observedOwner || liveTurn ? "observed" : "committed", leaseOwner: observedOwner || liveTurn ? "departed-owner" : null, leaseExpiresAt: new Date(liveTurn ? t0 + 3600_000 : 0), resultId: null, nextAttemptAt: null }).where(eq(nativeRunFinalizations.runId, old.id));
+    // The exact saved input wording/word and provider allocation are from the
+    // supplied SEED-B capture. Legacy missing-confirmedAt is an explicit variant:
+    // the capture omits raw lease metadata, so it is NOT asserted to be its bytes.
+    await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId, body: "Remember the word ALDER-B. Reply only: noted.", createdAt: new Date(t0 - 600_000) });
+    await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId, body: "TEST: What word did I ask you to remember? Reply with that word only.", createdAt: new Date(t0 - 60_000) });
+    // TL07 is the persisted instruction-edit refusal on an OPEN task. Idle
+    // must ANSWER, not merely post a waiting note; a genuinely in-flight turn
+    // keeps its owner and one note. Dev-lead owns the runner's prepare change.
+    if (tl07) await writeFile(join(root, "AGENTS.md"), "Updated assigned skill: answer the saved word from history.\n");
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, nativeIssueId: issue.id, nativeSessionId: sessionId, runtimeMode: "native", status: "failed", nativePhase: "terminal_failure", errorCode: tl07 ? "native_runner_refresh_required" : "native_controller_recovery_missing_evidence:retained_sandbox_binding", resultJson: tl07 ? { nativeFreshContinuationRefusal: { code: "native_runner_refresh_required", prepareRefusalCode: "provider_instructions_changed", waitForTurn: liveTurn } } : null, responsibleUserId: userId, createdAt: new Date(t0 - 60_000), finishedAt: new Date(t0 - 30_000), contextSnapshot: { issueId: issue.id } }).returning();
+    await db.insert(nativeRunFinalizations).values({ runId: source.id, companyId: company.id, issueId: issue.id, phase: "terminal_failure", failureCode: source.errorCode, recoveryState: "blocked" });
+    const [blocked] = await db.update(issues).set({ status: "blocked", blockedTransitionAt: source.finishedAt }).where(eq(issues.id, issue.id)).returning();
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId: company.id, sourceIssueId: issue.id, kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "board", returnOwnerAgentId: agent.id, fingerprint: `f1-seed-b:${source.id}`, nextAction: "Attempt 1/3: do not open a replacement", evidence: { runId: source.id, nativeFailureBlock: { runId: source.id, statusVersion: blocked.statusVersion } } }).returning();
+    const preconfirmed = ["idle-release", "observed-owner", "other-lease"].includes(shape);
+    const [lease] = await db.insert(environmentLeases).values({ companyId: company.id, issueId: issue.id, heartbeatRunId: old.id, provider: "boat", providerLeaseId: "bx_ysh5xvy5", leasePolicy: "reuse_by_environment", status: preconfirmed ? "released" : "retained", cleanupStatus: preconfirmed ? "success" : null, acquiredAt: new Date(t0 - 590_000), releasedAt: preconfirmed ? new Date(t0 - 300_000) : null, metadata: { pluginId: "fixture-boat" } }).returning();
+    if (preconfirmed) await db.update(environmentLeases).set({ metadata: { ...lease.metadata, remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: company.id, runId: old.id, leaseId: lease.id, provider: "boat", providerLeaseId: lease.providerLeaseId, state: "stopped" } } }).where(eq(environmentLeases.id, lease.id));
+    const before = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]!;
+    if (shape === "other-lease") await db.insert(environmentLeases).values({ companyId: company.id, provider: "boat", providerLeaseId: lease.providerLeaseId, status: "active" });
+    let providerState: string = shape === "running" ? "active" : shape;
+    const inspectLeaseResource = vi.fn(async () => ({ providerLeaseId: lease.providerLeaseId!, state: providerState }));
+    const stop = vi.fn(async () => undefined);
+    const hb = heartbeatService(db, { environmentRuntime: { inspectLeaseResource, retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
+    const tick = async (n: number) => {
+      vi.setSystemTime(t0 + n * 300_000);
+      await hb.reapOrphanedRuns();
+      await settleUnrecoverableExecutions(db);
+      await hb.sweepPendingCleanupLeases();
+      await settleUnrecoverableExecutions(db);
+    };
+    const notes = async () => (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).filter(c => c.authorType === "system");
+    const current = async () => (await notes()).filter(c => !c.metadata?.supersededByCommentId);
+    const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issue.id))).length;
+    for (let n = 0; n < 3; n++) {
+      await tick(n);
+      if ((!preconfirmed && shape !== "tl07-idle") || shape === "other-lease") {
+        expect(await runCount()).toBe(2);
+        expect(await listFreshContinuations(db, { companyId: company.id, issueId: issue.id })).toHaveLength(0);
+        expect(await current()).toHaveLength(1);
+        expect((await current())[0].body).toMatch(liveTurn ? /current step must finish/ : /earlier attempt.*stop|stopping the earlier attempt/);
+        expect(await notes()).toHaveLength(1); // no repeated note at ~5-min sweeps
+      }
+    }
+    if (preconfirmed) {
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(before);
+      expect(await prepareUnconfirmedSourceSandboxStop(db, before)).toBeNull();
+      expect(await retryUnconfirmedSourceSandboxStop(db, before)).toBeNull();
+      expect(stop).not.toHaveBeenCalled();
+      expect(inspectLeaseResource).not.toHaveBeenCalled();
+    }
+    if (!["idle-release", "observed-owner", "proof-arrives", "tl07-idle"].includes(shape)) {
+      expect(await runCount()).toBe(2);
+      return;
+    }
+    if (shape === "proof-arrives") { providerState = "stopped"; await tick(3); expect(inspectLeaseResource).toHaveBeenCalled(); }
+    // Occupy the agent slot so real delivery/admission leaves its automatically
+    // admitted run observable as queued. No test mints a successor run or resends
+    // input. Then exercise that run's real selection/executor with a native peer.
+    const [busy] = await db.insert(issues).values({ companyId: company.id, title: "Other work", status: "in_progress", assigneeAgentId: agent.id }).returning();
+    await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: busy.id, status: "running", contextSnapshot: { issueId: busy.id } });
+    await deliverReconciledExecutions(db, hb.wakeup);
+    await hb.drainActiveRunExecutions();
+    const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id));
+    expect(successors).toHaveLength(1);
+    expect(successors[0].status).toBe("queued");
+    expect(successors[0].contextSnapshot).toMatchObject({ forceFreshSession: true, previousRunId: source.id });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id)))[0]).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).not.toBe("blocked");
+    expect(await getExecutionBlocker(db, company.id, issue.id)).toBeNull();
+    const [next] = await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successors[0].id)).returning();
+    await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, issue.id));
+    const selected = await selectHeartbeatRuntime(db, inputFor(next));
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Fresh selection not admitted");
+    expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(sessionId);
+    const answer = await answerWithNativePeer({ db, execution: selected.nativeExecution, runnerInstanceId: selected.nativeRunnerInstanceId!, text: "ALDER-B", getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+    expect(answer.settled.status).toBe("succeeded");
+    expect(JSON.stringify(answer.prompts)).toContain("ALDER-B");
+    expect(JSON.stringify(answer.prompts)).toContain("What word did I ask you to remember?");
+    for (let n = 4; n < 7; n++) { await settleUnrecoverableExecutions(db); await deliverReconciledExecutions(db, hb.wakeup); }
+    expect(await runCount()).toBe(3);
+    expect(await current()).toHaveLength(1);
+    expect((await current())[0].body).toContain("fresh thread");
+    expect(await notes()).toHaveLength(shape === "proof-arrives" ? 2 : 1);
+    if (shape === "observed-owner") expect(await readRun(old.id)).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
+  }, 60_000);
+});
