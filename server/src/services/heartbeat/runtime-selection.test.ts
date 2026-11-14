@@ -598,7 +598,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   // not a stand-in success from a classifier or a note-only recovery.
   it.each(["confirmed-stop", "unconfirmed-stop", "metadata-format", "already-stranded", "idle-descendants", "active-turn", "held-notice", "already-stranded-unconfirmed",
     "codex-confirmed-stop", "codex-unconfirmed-stop", "codex-metadata-format", "codex-already-stranded", "codex-idle-descendants", "codex-active-turn", "codex-held-notice", "codex-already-stranded-unconfirmed",
-    "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare",
+    "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare", "cold-restore", "codex-cold-restore",
     "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed", "codex-seed-a-adopted",
     "codex-tl08", "codex-tl08-unconfirmed", "codex-tl08-retained", "codex-tl08-retained-unconfirmed"] as const)(
     "designed end answers from history with one note and no Retry (%s)", async shape => {
@@ -647,6 +647,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       seq: 64, stream: "system", eventType: "native.process_start_requested", createdAt: new Date("2026-11-14T08:16:07.439508Z") });
     const error = tl08Retained ? "native_controller_recovery_missing_evidence:retained_sandbox_binding"
       : tl08 ? "runner_harness_state_mismatch: resumed_unavailable"
+      : scenario === "cold-restore" ? "runner_harness_state_mismatch: backup_without_reusable_lease"
       : scenario === "backup-without-lease" ? "runner_harness_state_mismatch: backup_without_reusable_lease"
       : scenario === "retained-binding" || scenario.startsWith("seed-a") ? "native_controller_recovery_missing_evidence:retained_sandbox_binding"
       : scenario === "launch-profile" ? "native_runner_launch_profile_mismatch"

@@ -23326,7 +23326,12 @@ describe("runnerd provider runtime wiring", () => {
         }) } }),
       })]);
     } else {
-      await expect(options.prepareExternalRunnerState()).rejects.toThrow("backup_without_reusable_lease");
+      const refusal = await options.prepareExternalRunnerState().catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toContain("runner_harness_state_mismatch: backup_without_reusable_lease");
+      // Cold restore must refuse exact replay AND hand its typed refusal to
+      // the existing proven-gone fresh-history owner, not generic isolation.
+      expect(nativeSessionFailureSourceCode(refusal)).toBe("runner_harness_state_mismatch: backup_without_reusable_lease");
       expect(syncIn).not.toHaveBeenCalled();
       expect(updates.filter(update => update.table === environmentLeases)).toEqual([]);
     }

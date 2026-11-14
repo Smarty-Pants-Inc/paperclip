@@ -1193,7 +1193,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   it.each([
     "native_controller_recovery_missing_evidence:snapshot_binding",
     "native_controller_recovery_unsupported:metadata_format", "runner_remote_state_unavailable",
-    "native_runner_refresh_required", "native_runner_launch_profile_mismatch",
+    "native_runner_refresh_required", "native_runner_launch_profile_mismatch", "runner_harness_state_mismatch: backup_without_reusable_lease",
     "runner_harness_state_mismatch: resumed_unavailable",
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
@@ -1207,6 +1207,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   it.each([
     "native_controller_recovery_missing_evidence:snapshot_binding",
     "native_controller_recovery_unsupported:metadata_format", "runner_remote_state_unavailable", "native_runner_refresh_required",
+    "runner_harness_state_mismatch: backup_without_reusable_lease",
     "runner_harness_state_mismatch: resumed_unavailable",
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
