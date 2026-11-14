@@ -250,7 +250,7 @@ describe.skipIf(!support.supported)("RFL M1.5 judge extra checks (independent)",
       expect.soft((l.metadata as Record<string, unknown> | null)?.supersededBy).toBe((n.metadata as Record<string, unknown>)?.supersededBy);
       expect.soft((e?.metadata as Record<string, unknown> | null)?.supersededBy).toBe((n.metadata as Record<string, unknown>)?.supersededBy);
     }
-    expect((listed.find(x => x.id === superseded.id)!.metadata as Record<string, unknown>).supersededBy).toBe(currentNote.id);
+    expect((listed.find(x => x.id === superseded.id)!.metadata as unknown as Record<string, unknown>).supersededBy).toBe(currentNote.id);
     const lg = listedG.find(x => x.id === cardNote!.id)!; const eg = await svc.getComment(cardNote!.id);
     expect((lg.metadata as Record<string, unknown> | null)?.supersededByInteractionId).toBe(c.id);
     expect((eg?.metadata as Record<string, unknown> | null)?.supersededByInteractionId).toBe(c.id);
