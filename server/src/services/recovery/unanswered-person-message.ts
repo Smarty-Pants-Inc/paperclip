@@ -1,6 +1,7 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
   agentWakeupRequests,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -10,6 +11,7 @@ import {
 } from "@paperclipai/db";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
@@ -37,6 +39,10 @@ export const UNANSWERED_MESSAGE_REASON_PREFIX = "unanswered_message:";
 /** A transient-retry line for the same message (heartbeat retries) is superseded the same way. */
 const RETRYING_MESSAGE_REASON_PREFIX = "retrying_message:";
 export const UNANSWERED_MESSAGE_LOOKBACK_MS = 24 * 60 * 60_000;
+/** The native blocked-request repair publishes on the sweep pass after its run
+ * ends. Deferring to it is bounded by this fixed time after the run's durable
+ * finish (D4 visibility); after it, this step posts the message's notice. */
+export const NATIVE_REPAIR_PUBLISH_BOUND_MS = 2 * 60_000;
 /** After the run ends, retries and recovery are scheduled; let them land first. */
 export const UNANSWERED_MESSAGE_SETTLE_MS = 15_000;
 /** A saved message that no run took (its wake failed or is held). */
@@ -164,6 +170,26 @@ const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: 
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
 /**
+ * SQL: message m is still in scope. It is within the lookback, or its own
+ * obligation saw durable activity within it: a run that carries it finished,
+ * or a wake for it changed. An obligation that is still open never ages out
+ * silently because the message itself is old.
+ */
+function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }, since: string): SQL {
+  return sql`(${m.createdAt} > ${since}::timestamptz
+    or exists (select 1 from ${heartbeatRuns} r where r.company_id = ${m.companyId} and r.native_issue_id = ${m.issueId}
+      and coalesce(r.finished_at, r.updated_at) > ${since}::timestamptz
+      and (r.context_snapshot->>'wakeCommentId' = ${m.id}::text or r.context_snapshot->>'commentId' = ${m.id}::text
+        or r.context_snapshot->>'conversationReplyBoundaryCommentId' = ${m.id}::text
+        or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text
+        or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${m.id}::text))
+    or exists (select 1 from ${agentWakeupRequests} w where w.company_id = ${m.companyId} and w.updated_at > ${since}::timestamptz
+      and (w.payload->>'commentId' = ${m.id}::text
+        or w.payload->'_paperclipWakeContext'->>'wakeCommentId' = ${m.id}::text
+        or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text)))`;
+}
+
+/**
  * SQL: this issue row has a person's message within the lookback that no agent
  * answered and that has no notice yet, or an unanswered-message notice that a
  * later agent comment answered. The stranded sweep visits such tasks in every
@@ -173,7 +199,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
   const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
   return sql`(exists (select 1 from ${issueComments} m
       where m.company_id = ${companyId} and m.issue_id = ${issueId} and m.author_type = 'user'
-        and m.deleted_at is null and m.created_at > ${since}::timestamptz
+        and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text))
@@ -195,7 +221,8 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
 export function unansweredPersonMessageCommentCondition(): SQL {
   const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
   return sql`((${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
-      and ${issueComments.createdAt} > ${since}::timestamptz
+      and ${inScopeSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }, since)}
       and not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
@@ -281,6 +308,15 @@ export async function settleUnansweredPersonMessage(
   });
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
+  if (decision.kind === "pending") {
+    if (decision.recordDeferral) {
+      await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
+        agentId: decision.recordDeferral.agentId, eventType: NATIVE_REPAIR_DEFERRAL_EVENT, stream: "system", level: "info",
+        message: "The unanswered-message notice waits for the native blocked-request repair to publish.",
+        payload: { messageId: decision.recordDeferral.messageId, boundMs: NATIVE_REPAIR_PUBLISH_BOUND_MS } });
+    }
+    return { kind: "pending", recheckAt: decision.recheckAt };
+  }
   if (decision.kind !== "notice") return decision;
   const commentId = await db.transaction(async tx => {
     // The issue fence that comment writers, the executor's held-notice writer
@@ -304,8 +340,13 @@ export async function settleUnansweredPersonMessage(
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
-type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" }>
+type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
+  | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice> };
+
+/** The run event that records, once and durably, when this step first deferred
+ * a person message's notice to the native blocked-request repair (T0). */
+export const NATIVE_REPAIR_DEFERRAL_EVENT = "unanswered_message.native_repair_deferral";
 
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
@@ -319,7 +360,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt)))
     .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
-  if (!message || message.createdAt.getTime() < now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS) return { kind: "none" };
+  // No age cut here: discovery (inScopeSql) decides which messages are in
+  // scope, so an open obligation is never dropped silently by age.
+  if (!message) return { kind: "none" };
   const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.id, message.id), answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
@@ -407,9 +450,23 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // blocked-request repair applies: that path publishes the unblock request
     // as its own visible notice on this sweep's next pass, so it owns the
     // disposition (and its notice then explains the message).
-    if (run.status === "succeeded" && nativeBlockedRepairApplies
-      && await nativeBlockedRepairApplies({ companyId: issue.companyId, issueId: issue.id, runId: run.id }, q)) {
-      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    // The deferral is BOUNDED by a fixed durable time: T0, recorded ONCE as a
+    // run event the first time this step defers this message to the repair,
+    // + NATIVE_REPAIR_PUBLISH_BOUND_MS (D4). If a guard of the repair (an
+    // edited carried message, a newer status decision, a board-owned hold)
+    // keeps it from publishing, this step posts the notice after that bound.
+    if (run.status === "succeeded" && nativeBlockedRepairApplies) {
+      const [deferral] = await q.select({ at: sql<Date>`min(${heartbeatRunEvents.createdAt})` }).from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, issue.companyId), eq(heartbeatRunEvents.runId, run.id),
+        eq(heartbeatRunEvents.eventType, NATIVE_REPAIR_DEFERRAL_EVENT),
+        sql`${heartbeatRunEvents.payload}->>'messageId' = ${message.id}`));
+      const t0 = deferral?.at ? new Date(deferral.at).getTime() : null;
+      const bound = (t0 ?? now.getTime()) + NATIVE_REPAIR_PUBLISH_BOUND_MS;
+      if (bound > now.getTime()
+        && await nativeBlockedRepairApplies({ companyId: issue.companyId, issueId: issue.id, runId: run.id }, q)) {
+        return { kind: "pending", recheckAt: bound,
+          ...(t0 === null ? { recordDeferral: { runId: run.id, agentId: run.agentId, messageId: message.id } } : {}) };
+      }
     }
     code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
