@@ -3,7 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   activityLog, agentApiKeys, agentWakeupRequests, boardApiKeys, heartbeatRunEvents, heartbeatRuns,
-  issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, type Db,
+  issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, pluginDatabaseNamespaces, type Db,
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -44,7 +44,7 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     core = heartbeatService(db);
     if (mode === "locked") {
       // Retained only for skipped 8u; no obsolete no-person seed in v0.
-      parkedFixture = await seed(false);
+      parkedFixture = await seed(false, true, false);
       const lifecycle = createAgentLifecycle(db);
       await lifecycle.pauseAgent(parkedFixture.agent.id);
       await lifecycle.resumeAgent(parkedFixture.agent.id);
@@ -97,12 +97,37 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     optedIn.clear();
   });
 
-  async function seed(personComment = true, backdate = true) {
+  async function guardianNamespace() {
+    const [record] = await db.select().from(pluginDatabaseNamespaces).where(eq(pluginDatabaseNamespaces.pluginId, pluginId));
+    if (!record || !/^[a-z0-9_]+$/.test(record.namespaceName)) throw new Error("Invalid guardian namespace metadata");
+    return record.namespaceName;
+  }
+
+  async function readEnabledAt(companyId: string) {
+    const namespace = await guardianNamespace();
+    const rows = await db.$client.unsafe(`SELECT enabled_at FROM "${namespace}".configured_companies WHERE company_id = $1::uuid AND enabled = true`, [companyId]);
+    expect(rows).toHaveLength(1);
+    return new Date(rows[0].enabled_at);
+  }
+
+  async function enableFixtureCompany(companyId: string, testClock: boolean) {
+    await runtime.setCompanyConfig(pluginId, companyId, { enabled: true });
+    optedIn.add(companyId);
+    if (testClock) {
+      const namespace = await guardianNamespace();
+      // TEST CLOCK: backdate enabled_at by 10 min so backdated messages are eligible
+      const updated = await db.$client.unsafe(`UPDATE "${namespace}".configured_companies SET enabled_at = now() - interval '10 minutes' WHERE company_id = $1::uuid AND enabled = true RETURNING company_id`, [companyId]);
+      expect(updated).toHaveLength(1);
+    }
+  }
+
+  async function seed(personComment = true, backdate = true, configure = true) {
     const suffix = randomUUID().slice(0, 8);
     const [company] = await db.insert(companies).values({ name: `Guardian judge ${suffix}`, issuePrefix: `G${suffix}`,
       defaultResponsibleUserId: "local-board" }).returning();
     await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: "local-board",
       status: "active", membershipRole: "operator" });
+    if (configure) await enableFixtureCompany(company.id, backdate);
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Guardian assignee", role: "engineer",
       adapterType: "process", adapterConfig: { command: "/bin/true" }, status: "idle", lifecycleState: "ready",
       runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false, intervalSec: 0 } } }).returning();
@@ -159,12 +184,8 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
   }
 
   async function sweep(f: Fixture, count = 1) {
-    // Opt in only AFTER every input is persisted: startup reconciliation must
-    // not observe a half-seeded running/answered control and post a false note.
-    if (!optedIn.has(f.company.id)) {
-      optedIn.add(f.company.id);
-      await runtime.setCompanyConfig(pluginId, f.company.id, { enabled: true });
-    }
+    // Fixture setup opts in before person messages; later sweeps never reset enabled_at.
+    if (!optedIn.has(f.company.id)) await enableFixtureCompany(f.company.id, false);
     for (let i = 0; i < count; i++) await runtime.runJob(pluginId);
   }
 
@@ -338,26 +359,74 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
 
   it("1 / I1 timing: real cron posts at 60–150 seconds, no manual trigger", async () => {
     const f = await seed(true, false);
-    // Minute cron drives delivery; bounded API reads only observe it.
-    optedIn.add(f.company.id);
-    await runtime.setCompanyConfig(pluginId, f.company.id, { enabled: true });
+    // Minute cron drives delivery; bounded API reads only observe it. No TEST CLOCK or message backdate.
+    const enabledAt = await readEnabledAt(f.company.id);
     const start = f.request!.createdAt.getTime();
+    expect(start).toBeGreaterThanOrEqual(enabledAt.getTime());
     const deadline = start + 150_000;
     let seen = await runtime.comments(f.issue.id);
     while (!seen.some(row => row.authorType === "system") && Date.now() < deadline) {
       await delay(Math.min(500, Math.max(0, deadline - Date.now())));
       seen = await runtime.comments(f.issue.id);
     }
-    const jobs = (await runtime.jobRuns(pluginId)).filter(run => new Date(run.createdAt).getTime() >= start);
-    console.log("GUARDIAN_CRON_TIMING", JSON.stringify({ requestId: f.request!.id, messageAt: f.request!.createdAt,
-      observedAt: new Date(), jobs, comments: seen }));
+    const evidence = await runtime.jobRunEvidence(pluginId);
+    const jobs = evidence.runs.filter(run => new Date(run.createdAt).getTime() >= start);
+    console.log("GUARDIAN_CRON_TIMING", JSON.stringify({ requestId: f.request!.id, enabledAt: enabledAt.toISOString(),
+      messageAt: f.request!.createdAt, observedAt: new Date().toISOString(), jobProofPath: evidence.path, jobs, comments: seen }));
     expect(jobs.some(run => run.trigger === "schedule" && run.status === "succeeded"), "real scheduled job completed").toBe(true);
     const note = await oneNote(f, "hasn't been picked up", "1 / real cron");
     const elapsedMs = new Date(note.createdAt).getTime() - start;
-    console.log("GUARDIAN_CRON_ELAPSED", JSON.stringify({ elapsedMs, requestId: f.request!.id, noteId: note.id }));
+    console.log("GUARDIAN_CRON_ELAPSED", JSON.stringify({ elapsedMs, requestId: f.request!.id, noteId: note.id,
+      enabledAt: enabledAt.toISOString(), messageAt: f.request!.createdAt, noteAt: note.createdAt, jobProofPath: evidence.path }));
     expect(elapsedMs).toBeGreaterThanOrEqual(60_000);
     expect(elapsedMs).toBeLessThanOrEqual(150_000);
   }, 165_000);
+
+  it("0.0.2 cutoff: pre-enable message stays uncovered; post-enable message gets one note", async () => {
+    const suffix = randomUUID().slice(0, 8);
+    const [company] = await db.insert(companies).values({ name: `Guardian cutoff ${suffix}`, issuePrefix: `C${suffix}`,
+      defaultResponsibleUserId: "local-board" }).returning();
+    await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: "local-board",
+      status: "active", membershipRole: "operator" });
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Cutoff assignee", role: "engineer",
+      adapterType: "process", adapterConfig: { command: "/bin/true" }, status: "idle", lifecycleState: "ready",
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false, intervalSec: 0 } } }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Backlog cutoff", status: "todo",
+      assigneeAgentId: agent.id, responsibleUserId: "local-board" }).returning();
+    const oldMessage = await runtime.api<{ id: string; authorType: string; createdAt: string }>(`/issues/${issue.id}/comments`, {
+      body: "This request predates guardian enablement.",
+    });
+    expect(oldMessage.authorType).toBe("user");
+    await enableFixtureCompany(company.id, false);
+    const enabledAt = await readEnabledAt(company.id);
+    const newMessage = await runtime.api<{ id: string; authorType: string; createdAt: string }>(`/issues/${issue.id}/comments`, {
+      body: "This request follows guardian enablement.",
+    });
+    expect(newMessage.authorType).toBe("user");
+    const oldAt = new Date(oldMessage.createdAt);
+    const newAt = new Date(newMessage.createdAt);
+    expect(oldAt.getTime()).toBeLessThan(enabledAt.getTime());
+    expect(newAt.getTime()).toBeGreaterThanOrEqual(enabledAt.getTime());
+    await delay(Math.max(0, newAt.getTime() + 60_000 - Date.now()));
+    expect(Date.now() - newAt.getTime()).toBeGreaterThanOrEqual(60_000);
+    const completed = await runtime.runJob(pluginId);
+    const evidence = await runtime.jobRunEvidence(pluginId);
+    expect(completed.status).toBe("succeeded");
+    const comments = await runtime.comments(issue.id);
+    const oldMarker = `<!-- conversation-guardian:note:${oldMessage.id} -->`;
+    const newMarker = `<!-- conversation-guardian:note:${newMessage.id} -->`;
+    const oldNotes = comments.filter(row => row.body.includes(oldMarker));
+    const newNotes = comments.filter(row => row.body.includes(newMarker));
+    console.log("GUARDIAN_BACKLOG_CUTOFF_REAL", JSON.stringify({ enabledAt: enabledAt.toISOString(),
+      oldMessageAt: oldMessage.createdAt, oldMessageId: oldMessage.id, newMessageAt: newMessage.createdAt,
+      newMessageId: newMessage.id, jobId: completed.id, jobStatus: completed.status,
+      jobProofPath: evidence.path, jobRuns: evidence.runs.map(run => ({ id: run.id, trigger: run.trigger, status: run.status })),
+      oldMarkerPresent: oldNotes.length > 0, newNotes: newNotes.map(note => ({ id: note.id, createdAt: note.createdAt, authorType: note.authorType })) }));
+    expect(oldNotes, "pre-enable backlog must remain untouched after a successful durable job").toHaveLength(0);
+    expect(newNotes, "post-enable message must receive exactly one note after its real 60s age").toHaveLength(1);
+    expect(newNotes[0].authorType).toBe("system");
+    expect(newNotes[0].body).toContain(newMarker);
+  }, 120_000);
 
   it("2 / I1: queued run never started", async () => {
     const f = await seed();
@@ -440,20 +509,33 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
       expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, finishedAt: null });
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id))).toHaveLength(1);
       console.log("GUARDIAN_C35_ROLLBACK", JSON.stringify({ hits: await fault.hits(), wake: await readWake(wake.id) }));
-      await oneNote(f, /hasn't been picked up|waiting/, "C35 / rollback");
+      const note = await oneNote(f, "read this and finished without a reply", "C35 / rollback");
+      expect(note.body).toContain(f.agent.name);
+      expect(note.body).toContain(`/agents/${f.agent.id}/runs/${source.id}`);
     } finally { await fault.close(); }
   });
 
-  it("E3.01 / stalled execution lock: deferred message receives one note", async () => {
+  it("E3.01 / stalled execution lock: deferred message receives one note with the actual owner/run link", async () => {
     const { f, source, wake } = await deferredFollowup();
+    const staleAt = new Date(Date.now() - 6 * 60_000);
+    await db.update(heartbeatRuns).set({ lastOutputAt: staleAt, lastUsefulActionAt: staleAt, updatedAt: staleAt })
+      .where(eq(heartbeatRuns.id, source.id));
     expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, source.id))).toHaveLength(0);
-    expect(Date.now() - source.updatedAt.getTime()).toBeGreaterThan(60_000);
+    const stalled = await readRun(source.id);
+    expect(stalled.status).toBe("running");
+    expect(stalled.lastOutputAt?.getTime()).toBe(staleAt.getTime());
+    expect(stalled.lastUsefulActionAt?.getTime()).toBe(staleAt.getTime());
+    expect(stalled.updatedAt.getTime()).toBe(staleAt.getTime());
+    expect(Date.now() - Math.max(stalled.lastOutputAt!.getTime(), stalled.lastUsefulActionAt!.getTime(), stalled.updatedAt.getTime()))
+      .toBeGreaterThan(5 * 60_000);
     await sweep(f, 2);
     const [issue] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
     expect(issue.executionRunId).toBe(source.id);
-    expect(await readRun(source.id)).toMatchObject({ status: "running", updatedAt: source.updatedAt });
+    expect(await readRun(source.id)).toMatchObject({ status: "running", updatedAt: staleAt, lastOutputAt: staleAt, lastUsefulActionAt: staleAt });
     expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
-    await oneNote(f, /hasn't been picked up|waiting/, "E3.01 / stalled lock");
+    const note = await oneNote(f, /hasn't been picked up|waiting/, "E3.01 / stalled lock");
+    expect(note.body).toContain(f.agent.name);
+    expect(note.body).toContain(`/agents/${f.agent.id}/runs/${source.id}`);
   });
 
   it("E3.01 / I3 control: event-emitting live lock-holder gets no note across three jobs", async () => {
