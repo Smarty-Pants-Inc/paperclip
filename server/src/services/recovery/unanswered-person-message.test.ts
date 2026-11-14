@@ -150,6 +150,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices).toHaveLength(1);
     expect(notices[0]!.body).toContain("cannot confirm that the earlier attempt stopped");
     expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without|Sending it again is safe/);
+    // RFL 16:5xZ: superseded rule. D10's waiting notice is Paperclip's own, not a person-responsibility
+    // note; both fields are absent by design (the missing failure code is filed as a gold finding).
+    expect(codeOf(notices[0]!)).toBeUndefined();
+    expect(notices[0]!.metadata?.recoveryResponsibility).toBeUndefined();
     await f.sweep();
     await settleUnrecoverableExecutions(db);
     expect(await f.visible()).toHaveLength(1);
