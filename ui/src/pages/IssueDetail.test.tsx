@@ -1,4 +1,6 @@
 import { TaskChatPausedTakeover, type TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
+import { readFileSync, writeFileSync } from "node:fs";
+import { IssueRecoveryActionCard } from "../components/IssueRecoveryActionCard";
 // @vitest-environment jsdom
 
 import type { Breadcrumb } from "../context/BreadcrumbContext";
@@ -440,6 +442,8 @@ vi.mock("../components/IssueChatThread", () => ({
 // the IssueChatThread stub above.
 vi.mock("../components/TaskChatThread", () => ({
   TaskChatThread: (props: {
+    recoveryAction?: NonNullable<Issue["activeRecoveryAction"]>;
+    onResolveRecoveryAction?: (outcome: import("../components/IssueRecoveryActionCard").RecoveryResolveOutcome) => void;
     comments?: Array<{ metadata?: { recovery?: DispositionRecoverySnapshot } | null }>;
     workProducts?: IssueWorkProduct[];
     threadHeader?: ReactNode;
@@ -463,6 +467,9 @@ vi.mock("../components/TaskChatThread", () => ({
       <div data-testid="task-chat-thread">
         {props.threadHeader}
         Task chat thread
+        {process.env.JUDGE_EVIDENCE_DIR && props.recoveryAction ? (
+          <IssueRecoveryActionCard action={props.recoveryAction} onResolve={props.onResolveRecoveryAction} />
+        ) : null}
         {props.comments?.map((comment, index) => comment.metadata?.recovery ? <DispositionRecoveryNotice key={index} snapshot={comment.metadata.recovery} /> : null)}
         {props.workProducts?.map((workProduct) => (
           <RichWorkProductCard
@@ -1479,6 +1486,78 @@ describe("IssueDetail", () => {
     mockRouteParams.issueId = "PAP-1";
     mockRouteParams.companyPrefix = "PAP";
   });
+
+  if (process.env.JUDGE_EVIDENCE_DIR) {
+    it("R6 real IssueDetail path renders the system-interrupted refreshed card and retries current B", async () => {
+      const dir = process.env.JUDGE_EVIDENCE_DIR!;
+      const manifest = JSON.parse(readFileSync(`${dir}/ui-loopback.json`, "utf8"));
+      vi.mocked(globalThis.fetch).mockRestore();
+      const trace: Array<Record<string, any>> = [];
+      const http = async (method: string, path: string, body?: unknown) => {
+        const reply = await fetch(`${manifest.origin}${path}`, {
+          method,
+          headers: { "Content-Type": "application/json" },
+          ...(body ? { body: JSON.stringify(body) } : {}),
+        });
+        const value = await reply.json();
+        trace.push({ method, path, request: body, status: reply.status,
+          actionId: value.activeRecoveryAction?.id,
+          sourceRunId: value.activeRecoveryAction?.evidence?.latestRunId,
+          responsibility: value.interruption?.responsibility,
+          error: value.error, details: value.details,
+        });
+        writeFileSync(`${dir}/ui-request-trace.json`, JSON.stringify(trace, null, 2));
+        if (!reply.ok) throw new ApiError(value.error, reply.status, value);
+        return value;
+      };
+      mockRouteParams.issueId = manifest.issueId;
+      mockLocation.pathname = `/issues/${manifest.issueId}`;
+      mockIssuesApi.get.mockImplementation((id: string) => http("GET", `/api/issues/${id}`));
+      mockIssuesApi.resolveRecoveryAction.mockImplementation((id: string, body: unknown) =>
+        http("POST", `/api/issues/${id}/recovery-actions/resolve`, body));
+      mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ companyIds: [manifest.companyId], isInstanceAdmin: true,
+        source: "local_implicit", keyId: null, user: null, userId: manifest.userId });
+      mockAgentsApi.list.mockResolvedValue([manifest.agent]);
+      mockAuthApi.getSession.mockResolvedValue({ session: { userId: manifest.userId }, user: { id: manifest.userId } });
+
+      const initial = await http("GET", `/api/issues/${manifest.issueId}`);
+      expect(initial.interruption?.responsibility).toBe("system");
+      expect(initial.activeRecoveryAction?.status).toBe("active");
+      expect(initial.activeRecoveryAction?.evidence.latestRunId).toBe(manifest.B);
+      expect(initial.activeRecoveryAction?.evidence.taskRetryRefusal.currentRunId).toBe(manifest.B);
+      mockRouteParams.issueId = initial.identifier ?? initial.id;
+      mockLocation.pathname = `/issues/${mockRouteParams.issueId}`;
+      queryClient.setQueryData([...queryKeys.issues.detail(mockRouteParams.issueId), "core"], initial);
+      await act(async () => renderIssueView());
+
+      let pageProps: any;
+      await waitForAssertion(() => {
+        pageProps = mockIssueChatThreadRender.mock.calls.at(-1)?.[0];
+        expect(pageProps?.issueId).toBe(manifest.issueId);
+        expect(pageProps?.recoveryAction?.id).toBe(initial.activeRecoveryAction.id);
+        expect(document.querySelector('[data-testid="task-retry-source-refusal"]')).not.toBeNull();
+      }, 100);
+      const trigger = document.querySelector<HTMLButtonElement>('[data-testid="recovery-action-resolve-trigger"]');
+      expect(trigger).not.toBeNull();
+      await act(async () => trigger!.click());
+      const retry = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+        .find(button => button.querySelector("span")?.textContent?.trim() === "Try again");
+      expect(retry).toBeDefined();
+      expect(retry!.disabled).toBe(false);
+      await act(async () => retry!.click());
+      await waitForAssertion(() => expect(trace.filter(entry => entry.method === "POST")).toHaveLength(1), 100);
+      const post = trace.find(entry => entry.method === "POST")!;
+      expect(post.status).toBe(200);
+      expect(post.request).toEqual({ actionId: manifest.actionId, sourceRunId: manifest.B,
+        outcome: "restored", sourceIssueStatus: "todo" });
+      await waitForAssertion(() => expect(trace.some(entry => entry.method === "GET" && entry.sourceRunId === manifest.B)).toBe(true), 100);
+      writeFileSync(`${dir}/ui-loopback-result.json`, JSON.stringify({ post, pageProps: {
+        recoveryActionId: pageProps.recoveryAction.id,
+        recoverySourceRunId: pageProps.recoveryAction.evidence.latestRunId,
+        interruptionResponsibility: initial.interruption.responsibility,
+      }, passed: true }, null, 2));
+    }, 60_000);
+  }
 
   it("clears only the monitor after confirmation and refreshes the task", async () => {
     const nextCheckAt = new Date(Date.now() + 60_000).toISOString();
