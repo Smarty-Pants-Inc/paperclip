@@ -5,7 +5,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companyPortabilityService } from "../services/company-portability.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -116,12 +116,22 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
 
   it("an additional manual hold still posts B's true paused note even when import remains the primary pause reason", async () => {
     const f = await imported(false);
+    // RFL ruling 20:43Z: the bundle message is imported history (never noticed). The note is driven by a LIVE
+    // person message posted after the import: the import arrived 8 min ago, the live message 5 min ago.
+    const [importedMessage] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id),
+      eq(issueComments.authorType, "user")));
+    await db.execute(sql`update activity_log set created_at = now() - interval '8 minutes'
+      where action = 'issue.imported' and entity_type = 'issue' and entity_id = ${f.issue.id}`);
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issue.id, authorType: "user", authorUserId: "m12-board",
+      body: "A live follow-up after the import.", createdAt: new Date(Date.now() - 5 * 60_000) });
     await createAgentLifecycle(db).pauseAgent(f.agentId, "manual");
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
     expect((await notes(f.issue.id)).map(n => n.body)).toEqual([
       "Import Coder is paused. Your message is saved, and it will run when Import Coder is resumed. "
       + "A board user or Import Coder's manager can resume Import Coder.",
     ]);
+    expect((await notes(f.issue.id)).filter(n => (n.metadata as Record<string, unknown> | null)?.authorizationReason
+      === `unanswered_message:${importedMessage!.id}`), "the imported bundle message gets no paused note (imported history)").toHaveLength(0);
   });
 
   it("an armed monitor survives import-pause recovery and its timer admits a run after resume", async () => {
