@@ -3,6 +3,10 @@ import { measureNativeControllerStep } from "./native-controller-step-timing.js"
 import { NATIVE_PREPARATION_FENCING_VERSION } from "./native-active-runs.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { createHash } from "node:crypto";
+import { closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { newerSettledNativeJournal } from "./native-settled-journal.js";
 import { and, eq, exists, gt, isNull, lte, inArray, notExists, or, sql, type SQL } from "drizzle-orm";
 import { checkpointDb, heartbeatRuns, issues, nativeRunFinalizations, nativeRunnerCheckpoints, type Db } from "@paperclipai/db";
 import { inspectDurablePrpCheckpointHeader, inspectUnauthenticatedBootstrapCheckpoint, inspectUnclaimedBootstrapCheckpoint, decodeDurablePrpCheckpoint, type DurablePrpCheckpoint, type DurablePrpControlPlane, type DurableRecoveryIdentity } from "../../vendor/paperclip-runner/index.js";
@@ -229,6 +233,15 @@ export function nativeRunnerCheckpointRegistration(input: Omit<Parameters<typeof
   });
 }
 
+export async function stampNativeRunnerCommandIssuer(db: Pick<Db, "select">, binding: Binding, bootId: string,
+  authority: DurablePrpControlPlane): Promise<void> {
+  const [owner] = await db.select().from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, binding.companyId), eq(nativeRunFinalizations.issueId, binding.issueId),
+    eq(nativeRunFinalizations.runId, binding.runId), eq(nativeRunFinalizations.controllerBootId, bootId)));
+  if (!owner || owner.controllerGeneration < 1) throw new Error("native_runner_command_issuer_missing");
+  authority.setCommandIssuer({ bootId, generation: owner.controllerGeneration });
+}
+
 export async function registerNativeRunnerCheckpoint(input: {
   db: Db; binding: Binding; bootId: string; authority: DurablePrpControlPlane;
   authorityRunId?: string | (() => string);
@@ -243,6 +256,7 @@ export async function registerNativeRunnerCheckpoint(input: {
     eq(nativeRunFinalizations.controllerBootId, input.bootId),
     gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`))));
   if (!owner?.leaseOwner) throw new Error("native_runner_checkpoint_owner_lost");
+  input.authority.setCommandIssuer({ bootId: input.bootId, generation: owner.controllerGeneration });
   let writers = authorities.get(input.authority);
   if (!writers) {
     writers = new Map();
@@ -403,14 +417,66 @@ export async function nativeRunnerCheckpointRemoteBootstrapEvidence(
   }
 }
 
+/** A local ACK may be newer than the last DB checkpoint at the same ordinal.
+ * Never overwrite that settled, same-authority journal with pending commands.
+ * All other cases keep the existing exact checkpoint restore behavior. */
+export function restoreNewestNativeRunnerCheckpoint(checkpoint: DurablePrpCheckpoint, root: string): "local" | "checkpoint" {
+  const scratch = mkdtempSync(join(tmpdir(), "paperclip-restore-compare-"));
+  try {
+    checkpoint.restoreSessionDirectory(scratch);
+    try {
+      for (const directory of [root, join(root, "control-plane")]) {
+        if (!lstatSync(directory).isDirectory()) throw new Error("native_runner_checkpoint_invalid");
+      }
+      const fd = openSync(join(root, "control-plane", "control-plane-state.json"), constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const stat = fstatSync(fd);
+        if (!stat.isFile() || stat.size > 32 * 1024 * 1024) throw new Error("native_runner_checkpoint_invalid");
+        const localBytes = readFileSync(fd, "utf8");
+        const savedBytes = readFileSync(join(scratch, "control-plane", "control-plane-state.json"), "utf8");
+        if (newerSettledNativeJournal(localBytes, savedBytes)) return "local";
+      } finally { closeSync(fd); }
+    } catch (error) {
+      // An absent projection is the ordinary diskless restore. Other unsafe
+      // paths are still rejected by checkpoint.restoreSessionDirectory.
+      if (!(error instanceof Error)) throw error;
+    }
+    checkpoint.restoreSessionDirectory(root);
+    return "checkpoint";
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+}
+
 export async function restoreNativeRunnerCheckpoint(db: Db, binding: Binding, root: string, normalizedSessionId?: string) {
   const checkpoint = await loadNativeRunnerCheckpoint(db, binding);
   if (!checkpoint) return null;
   if (normalizedSessionId !== undefined && checkpoint.recoveryEvidence.normalizedSessionId !== normalizedSessionId) {
     throw new Error("native_runner_checkpoint_binding_mismatch");
   }
-  checkpoint.restoreSessionDirectory(root);
+  restoreNewestNativeRunnerCheckpoint(checkpoint, root);
   return checkpoint;
+}
+
+/** Settlement runs under the source coordinator lock, after fencing the issuer.
+ * Keep the abandonment in the encrypted command record itself so diskless
+ * restore and cached command-id replay can never requeue it. */
+export async function abandonNativeRunnerCheckpointCommands(tx: CheckpointTransaction, binding: Binding,
+  expected: readonly Record<string, unknown>[], abandonedAt: string, settledByBootId: string): Promise<void> {
+  const cipher = createLocalEncryptedCipher("read");
+  for (const command of expected) {
+    const part = `command:${command.controllerSeq}`;
+    const [row] = await tx.select({ material: nativeRunnerCheckpoints.material }).from(nativeRunnerCheckpoints).where(and(
+      eq(nativeRunnerCheckpoints.companyId, binding.companyId), eq(nativeRunnerCheckpoints.issueId, binding.issueId),
+      eq(nativeRunnerCheckpoints.runId, binding.runId), eq(nativeRunnerCheckpoints.part, part))).for("update");
+    if (!row) throw new Error("native_lifecycle_settlement_checkpoint_missing");
+    const saved = JSON.parse(decryptPart(cipher, binding, part, row.material));
+    if (JSON.stringify(saved) !== JSON.stringify(command)) throw new Error("native_lifecycle_settlement_checkpoint_changed");
+    const settled = { ...saved, status: "rejected", result: { status: "rejected", code: "controller_command_abandoned" },
+      abandonment: { disposition: "ABANDONED", abandonedAt, settledByBootId } };
+    const [encrypted] = encryptParts(binding, new Map([[part, JSON.stringify(settled)]]));
+    await tx.update(nativeRunnerCheckpoints).set({ material: encrypted!.material, updatedAt: new Date() }).where(and(
+      eq(nativeRunnerCheckpoints.companyId, binding.companyId), eq(nativeRunnerCheckpoints.runId, binding.runId),
+      eq(nativeRunnerCheckpoints.part, part)));
+  }
 }
 
 export async function hasNativeRunnerCheckpoint(db: Pick<Db, "select">, binding: Binding): Promise<boolean> {

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
+  agents, companies, completionContracts, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
   nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
@@ -15,7 +15,7 @@ import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
-import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
+import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
@@ -66,6 +66,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     process.env.PAPERCLIP_HOME = home.home;
     database = await startRecoveryPostgres("native-recovered-owner-");
     db = createDb(database.connectionString);
+    const current = await currentNativeControllerIdentity();
+    await db.insert(controllerInstances).values({ bootId: current.bootId, processSpace: "settlement-test-current",
+      pid: current.pid, startedAt: current.processStartedAt, leaseExpiresAt: new Date(Date.now() + 3_600_000) });
     await db.insert(companies).values({ id: companyId, name: "Recovered owner", issuePrefix: "ROF" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Runner", adapterType: "paperclip_runner",
       adapterConfig: { provider: "acpx", acpxAgent: "claude" } });
@@ -97,7 +100,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
-      lifecycle?: "warm"; governedWait?: boolean } = {}) {
+      lifecycle?: "warm"; governedWait?: boolean; interruptedLifecycle?: boolean; activeAfterTerminal?: boolean;
+      lifecycleIssuedAt?: string; stamped?: boolean; deliveryCount?: number } = {}) {
     const issueId = randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
@@ -124,6 +128,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const priorController = options.controller ?? { bootId: randomUUID(), pid: 2_147_483_000,
       processStartedAt: new Date(Date.now() - 60_000) };
     const owner = { companyId, issueId, runId, authorityRunId: runId, bootId: priorController.bootId, generation: 1, leaseOwner: randomUUID() };
+    if (options.interruptedLifecycle && priorController.bootId !== (await currentNativeControllerIdentity()).bootId) {
+      await db.insert(controllerInstances).values({ bootId: priorController.bootId, processSpace: "settlement-test-old",
+        pid: priorController.pid, startedAt: priorController.processStartedAt, leaseExpiresAt: new Date(Date.now() - 30_000),
+        ...(options.stamped ? { fencedAt: new Date() } : { stoppedAt: new Date() }) }).onConflictDoNothing();
+    }
     await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "observed",
       controllerBootId: owner.bootId, controllerGeneration: 1, controllerPid: priorController.pid,
       controllerProcessStartedAt: priorController.processStartedAt, leaseOwner: owner.leaseOwner,
@@ -154,6 +163,15 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         Object.assign(commands.find(command => command.type === "turn.start")!, unknownOutcome);
       }
       if (control === "failed-suspend") Object.assign(commands.at(-1)!, { status: "failed", result: { status: "failed" } });
+      if (options.interruptedLifecycle) {
+        Object.assign(controller.queueCommand("turn.interrupt"), { status: "completed", result: { status: "completed" } });
+        if (options.stamped) controller.setCommandIssuer({ bootId: priorController.bootId, generation: 1 });
+        for (const type of ["runner.drain", "runner.suspend"]) {
+          const command = controller.queueCommand(type);
+          command.issuedAt = options.lifecycleIssuedAt ?? new Date(priorController.processStartedAt.getTime() + 1_000).toISOString();
+          if (options.deliveryCount !== undefined) controller.store.state.commandDeliveryCounts[command.commandId] = options.deliveryCount;
+        }
+      }
       // Staging PAP-4196 and PAP-3443: the controller journaled a delivery to the
       // per-turn Runner that the Runner never acknowledged before its sandbox was
       // destroyed after the turn.
@@ -164,8 +182,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         priority: 0 as const, envelope: { ...identity }, deliveryCount: 1, logicalEffectCount: 1 });
       controller.store.state.committedEvents.push(
         ...(toolInput ? [event(1, "unanswered-tool-input", "semantic_tool.input")] : []),
-        event(2, "recovered-terminal", "run.terminal"));
-      controller.store.state.ackedSourceSeq = 2;
+        ...(options.interruptedLifecycle ? [event(1, "interrupted-turn", "turn.interrupted")] : []),
+        event(2, "recovered-terminal", "run.terminal"),
+        ...(options.activeAfterTerminal ? [event(3, "active-successor-turn", "turn.started")] : []));
+      controller.store.state.ackedSourceSeq = options.activeAfterTerminal ? 3 : 2;
       controller.setCheckpointPersistence(nativeRunnerCheckpointWriter(db, owner));
       await controller.flushCheckpoint();
     } finally {
@@ -192,7 +212,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         { configDigest: `sha256:${"b".repeat(64)}`, processConfigDigest: null },
         { runId, runnerInstanceId: native.runnerInstanceId, normalizedSessionId: native.normalizedSessionId }),
     } }).where(eq(heartbeatRuns.id, runId));
-    return { issueId, runId, native, identity, executionFor };
+    return { issueId, runId, native, identity, executionFor, priorController };
   }
 
   /** Mirrors runtime selection: the follow-up inherits the selected source's
@@ -1117,6 +1137,144 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect(retry.selectedRunId).toBe(failed);
       expect(await retry.start()).toBe("native_controller_recovery_unsupported:metadata_format");
     }, 60_000);
+
+  // Keep: SMA-122 restart regression; exercise the real encrypted DB checkpoint
+  // and file-backed journal boundary, not a synthetic settlement predicate.
+  it("stale-restore: never resurrects pending lifecycle from an older checkpoint over a settled same-owner journal", async () => {
+    const prior = await seedRecoveredPriorRun("pending-command");
+    const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
+    const binding = { companyId, issueId: prior.issueId, runId: prior.runId };
+    const checkpoint = await loadNativeRunnerCheckpoint(db, binding);
+    checkpoint!.restoreSessionDirectory(root);
+    const path = join(root, "control-plane", "control-plane-state.json");
+    const local = JSON.parse(await readFile(path, "utf8"));
+    const drain = local.commands.at(-1);
+    expect(drain.status).toBe("pending");
+    Object.assign(drain, { status: "completed", result: { status: "completed" } });
+    await writeFile(path, JSON.stringify(local));
+    await restoreNativeRunnerCheckpoint(db, binding, root);
+    const restored = JSON.parse(await readFile(path, "utf8"));
+    expect(restored.commands.at(-1).controllerSeq).toBe(drain.controllerSeq);
+    expect(restored.commands.at(-1).status).toBe("completed");
+  }, 60_000);
+
+  it("SMA-122 RED: continues an interrupted terminal warm owner after controller restart with drain/suspend pending", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true });
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(ADMITTED);
+  }, 60_000);
+
+  it("SMA-122 stamped command: fenced issuer settles without timestamp inference and keeps its immutable stamp", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, stamped: true,
+      lifecycleIssuedAt: new Date().toISOString() });
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(ADMITTED);
+    const root = await sessionRoot();
+    const [archive] = await readdir(join(root, "continuity-breaks"));
+    const state = JSON.parse(await readFile(join(root, "continuity-breaks", archive!, "control-plane", "control-plane-state.json"), "utf8"));
+    for (const command of state.commands.filter((value: { type: string }) => ["runner.drain", "runner.suspend"].includes(value.type))) {
+      expect(command).toMatchObject({ status: "rejected", issuer: { bootId: prior.priorController.bootId, generation: 1 },
+        abandonment: { disposition: "ABANDONED" } });
+    }
+    expect(followUp.logs.join("")).not.toContain("native_legacy_lifecycle_abandoned");
+  }, 60_000);
+
+  it("SMA-122 B1 negative: a second unfenced controller keeps legacy lifecycle pending", async () => {
+    const other = randomUUID();
+    await db.insert(controllerInstances).values({ bootId: other, processSpace: "other-live-controller", pid: process.pid,
+      leaseExpiresAt: new Date(Date.now() + 60_000) });
+    try {
+      const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true });
+      const followUp = await admitFollowUp(prior);
+      expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
+    } finally { await db.delete(controllerInstances).where(eq(controllerInstances.bootId, other)); }
+  }, 60_000);
+
+  it.each([{ offset: -1, admitted: true }, { offset: 0, admitted: false }, { offset: 1, admitted: false }])(
+    "SMA-122 B2 strict skew boundary offset=$offset", async ({ offset, admitted }) => {
+      const boot = await currentNativeControllerIdentity();
+      const issuedAt = new Date(boot.processStartedAt.getTime() - 5_000 + offset).toISOString();
+      const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, lifecycleIssuedAt: issuedAt });
+      const followUp = await admitFollowUp(prior);
+      expect(await followUp.start()).toBe(admitted ? ADMITTED : stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
+      expect(followUp.logs.join("").includes("native_legacy_lifecycle_abandoned count=2")).toBe(admitted);
+    }, 60_000);
+
+  it("SMA-122 B3 negative: another in-flight session run keeps legacy lifecycle pending", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true });
+    const followUp = await admitFollowUp(prior);
+    const [active] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId }).returning();
+    try {
+      const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
+      (await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }))!.restoreSessionDirectory(root);
+      const proof = await inspectFinishedPerTurnRunnerdOwner({ db, root, identity: prior.identity, execution: prior.executionFor(followUp.runId),
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute: followUp.remoteExecute },
+          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: followUp.providerLeaseId } } as never });
+      expect(proof).toMatchObject({ finished: false, refused: "journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)" });
+      expect(await followUp.start()).toBe("native_controller_recovery_missing_evidence:newer_progress_barrier");
+    } finally { await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, active!.id)); }
+  }, 60_000);
+
+  it("SMA-122 B4 negative: never abandons a stale drain already released to runnerd", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, deliveryCount: 1 });
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
+  }, 60_000);
+
+  it("SMA-122 B4: durably abandons old drain/suspend before admitting and never requeues them after checkpoint restore", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true });
+    const followUp = await admitFollowUp(prior);
+    const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
+    (await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }))!.restoreSessionDirectory(root);
+    const proof = await inspectFinishedPerTurnRunnerdOwner({ db, root, identity: prior.identity, execution: prior.executionFor(followUp.runId),
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute: followUp.remoteExecute },
+        sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: followUp.providerLeaseId } } as never });
+    expect(proof.finished).toBe(true);
+    const checkpoint = (await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }))!;
+    const restoredRoot = await mkdtemp(join(tmpdir(), "abandoned-drain-replay-"));
+    try {
+      checkpoint.restoreSessionDirectory(restoredRoot);
+      const core = new DurablePrpControlPlane({ stateDirectory: join(restoredRoot, "control-plane"), identity: prior.identity,
+        expectedRunnerVersion: checkpoint.runnerVersion, expectedRunnerDigest: checkpoint.runnerDigest });
+      try {
+        const abandoned = core.store.state.commands.filter(command => ["runner.drain", "runner.suspend"].includes(command.type));
+        expect(abandoned).toHaveLength(2);
+        for (const command of abandoned) {
+          expect(command).toMatchObject({ status: "rejected", abandonment: { disposition: "ABANDONED" } });
+          expect(core.queueCommand(command.type, command.payload, command.commandId).status).toBe("rejected");
+        }
+        const turn = core.queueCommand("turn.start", { text: "new work after abandonment" });
+        expect(core.store.state.commands.filter(command => command.status === "pending").map(command => command.commandId)).toEqual([turn.commandId]);
+      } finally { await core.stop(); }
+      expect(await followUp.start()).toBe(ADMITTED);
+    } finally { await rm(restoredRoot, { recursive: true, force: true }); }
+  }, 60_000);
+
+  it("SMA-145 control: continues a plain terminal warm owner after controller restart", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm" });
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(ADMITTED);
+  }, 60_000);
+
+  it("SMA-122 negative: a pending delivery remains decisive after controller restart", async () => {
+    const prior = await seedRecoveredPriorRun("pending-attach", { lifecycle: "warm" });
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(run.attach.pending)"));
+  }, 60_000);
+
+  it("SMA-122 negative: an active journal turn remains decisive after controller restart", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", activeAfterTerminal: true });
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(stranded("journal_terminal_unsettled"));
+  }, 60_000);
+
+  it("SMA-122 negative: same controller boot keeps pending lifecycle commands decisive", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true,
+      controller: await currentNativeControllerIdentity() });
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
+  }, 60_000);
 
   it.each([
     { control: "failed-turn-start", outcome: ADMITTED },

@@ -1267,6 +1267,12 @@ function isStoredCoreState(
         commandTypes.has(command.type) &&
         typeof command.issuedAt === "string" &&
         isRecord(command.payload) &&
+        (command.issuer === undefined || (isRecord(command.issuer) && typeof command.issuer.bootId === "string"
+          && command.issuer.bootId.length > 0 && Number.isSafeInteger(command.issuer.generation)
+          && (command.issuer.generation as number) > 0)) &&
+        (command.abandonment === undefined || (isRecord(command.abandonment)
+          && command.abandonment.disposition === "ABANDONED" && command.status === "rejected"
+          && typeof command.abandonment.abandonedAt === "string" && typeof command.abandonment.settledByBootId === "string")) &&
         [
           "pending",
           "completed",
@@ -2220,6 +2226,7 @@ export class DurablePrpControlPlane {
   #onCommittedEvent?: DurablePrpControlPlaneOptions["onCommittedEvent"];
   #recoverSemanticToolInput?: DurablePrpControlPlaneOptions["recoverSemanticToolInput"];
   #beforeAuthenticatedConnection?: DurablePrpControlPlaneOptions["beforeAuthenticatedConnection"];
+  #commandIssuer?: { bootId: string; generation: number };
   #onProtocolIntegrityError?: DurablePrpControlPlaneOptions["onProtocolIntegrityError"];
   #onAuthenticatedConnection?: DurablePrpControlPlaneOptions["onAuthenticatedConnection"];
   readonly #runnerExitListeners = new Set<() => void>();
@@ -3055,6 +3062,14 @@ export class DurablePrpControlPlane {
     this.#store.commit(candidate);
   }
 
+  /** Bind future lifecycle issuance to the server's fenced DB owner. Replays retain their original stamp. */
+  setCommandIssuer(issuer: { bootId: string; generation: number }): void {
+    if (!issuer.bootId || !Number.isSafeInteger(issuer.generation) || issuer.generation < 1) {
+      throw new Error("native_runner_command_issuer_invalid");
+    }
+    this.#commandIssuer = { ...issuer };
+  }
+
   queueCommand(
     type: string,
     payload: Record<string, unknown> = {},
@@ -3159,6 +3174,8 @@ export class DurablePrpControlPlane {
       controllerSeq,
       type,
       issuedAt: new Date().toISOString(),
+      ...(["runner.drain", "runner.suspend", "runner.shutdown"].includes(type) && this.#commandIssuer
+        ? { issuer: { ...this.#commandIssuer } } : {}),
       // The journal owns its copy: checkpoints reuse a command's JSON while
       // its fields keep the same values, so a caller must not edit it later.
       payload: structuredClone(payload),
@@ -4237,8 +4254,8 @@ export class DurablePrpControlPlane {
 
   #wireCommand(
     command: DurableRecoveryCoreCommand,
-  ): Omit<DurableRecoveryCoreCommand, "status" | "result"> {
-    const { status: _status, result: _result, ...wire } = command;
+  ): Omit<DurableRecoveryCoreCommand, "status" | "result" | "issuer" | "abandonment"> {
+    const { status: _status, result: _result, issuer: _issuer, abandonment: _abandonment, ...wire } = command;
     return wire;
   }
 
