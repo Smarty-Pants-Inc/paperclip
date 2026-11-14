@@ -779,3 +779,156 @@ describe("M1.4 addressed provider failures must never silently strand a review-v
     await expectHeldOwnerUnchanged(input);
   }, 120_000);
 });
+
+// RED derived directly from the kept authenticated-HTTP judge case. Only the
+// post-accept supersession expectation and fresh service readback are tightened.
+import { writeFileSync } from "node:fs";
+import { createApp } from "../../app.js";
+import { createLocalAgentJwt } from "../../agent-auth-jwt.js";
+import { heartbeatService } from "../heartbeat.js";
+import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
+import { escalateExhaustedIssueReviewPathRecovery } from "../recovery/review-path-recovery-escalation.js";
+import { agentWakeupRequests } from "@paperclipai/db";
+
+const judgeResults: unknown[] = [];
+afterAll(() => {
+  if (process.env.JUDGE_REPORT) writeFileSync(process.env.JUDGE_REPORT, JSON.stringify(judgeResults, null, 2));
+});
+
+it.each([false, true])("M1.5: same-card HTTP acceptance supersedes the original failure note (document=%s)", async documentTarget => {
+  const input = await fixture("addressed", false, { issueStatus: "in_review", reviewPolicy: "not_creator" });
+  const personMessage = await issueService(db).addComment(input.issueId, "Please review the current work.", { userId: humanUserId });
+  await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: input.issueId, wakeCommentId: personMessage.id } })
+    .where(eq(heartbeatRuns.id, input.ownerRunId));
+  await db.update(issueThreadInteractions).set({ sourceCommentId: personMessage.id, originCommentIds: [personMessage.id] })
+    .where(eq(issueThreadInteractions.id, input.interactionId!));
+  if (documentTarget) {
+    const { document } = await documentService(db).upsertIssueDocument({ issueId: input.issueId, key: "judge-review", title: "Judge review", format: "markdown", body: "Current review evidence", createdByAgentId: ownerAgentId, createdByRunId: input.ownerRunId });
+    const target = {
+      type: "issue_document" as const, issueId: input.issueId, documentId: document.id, key: document.key,
+      revisionId: document.latestRevisionId!, revisionNumber: document.latestRevisionNumber,
+    };
+    const current = await documentService(db).getIssueDocumentByKey(input.issueId, target.key);
+    expect(current).toMatchObject({ id: target.documentId, issueId: input.issueId, key: target.key,
+      latestRevisionId: target.revisionId, latestRevisionNumber: target.revisionNumber });
+    const revision = await documentService(db).getIssueDocumentRevision(input.issueId, target.key, target.revisionId);
+    expect(revision).toMatchObject({ id: target.revisionId, documentId: target.documentId, issueId: input.issueId,
+      createdByAgentId: ownerAgentId, createdByRunId: input.ownerRunId, isLatest: true });
+    await db.update(issueThreadInteractions).set({ payload: { version: 1, prompt: "Review this revision", target } })
+      .where(eq(issueThreadInteractions.id, input.interactionId!));
+  }
+  const [issue] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+  const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+  expect(await isIssueReviewVerdictInteraction(db, { issue, interaction: card })).toBe(true);
+  expect(await decideNativeAddressedInteractionGrant(db, input.execution.binding)).toMatchObject({ allowed: true });
+  await executeFailure(input, { failure: new Error("provider_stdout_closed") });
+  const readNotes = () => db.select().from(issueComments).where(and(
+    eq(issueComments.companyId, companyId), eq(issueComments.issueId, input.issueId), eq(issueComments.authorType, "system"),
+  ));
+  const firstNotes = await readNotes();
+  expect(firstNotes).toHaveLength(1);
+  const [firstNote] = firstNotes;
+  expect(firstNote).toMatchObject({ body: NATIVE_ADDRESSED_INTERACTION_PENDING_FAILURE_MESSAGE,
+    createdByRunId: input.runId, deletedAt: null, presentation: { kind: "system_notice", tone: "danger" } });
+  const { run: failedRun } = await settled(input);
+  expect(await escalateExhaustedIssueReviewPathRecovery(db, { run: failedRun, issueId: input.issueId })).toBeNull();
+  const heartbeat = heartbeatService(db);
+  const activeOwnerSweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: input.issueId, unanswered: true });
+  const firstBprime = await settleUnansweredPersonMessage(db, { companyId, issueId: input.issueId, now: new Date(Date.now() + 20 * 60_000) });
+  expect(firstBprime.kind).toBe("answered");
+  expect(await readNotes()).toEqual(firstNotes);
+
+  // The creator legitimately finishes its review handoff; no active owner can mask the pending-card path.
+  await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, input.ownerRunId));
+  await db.update(issues).set({ executionRunId: null, checkoutRunId: null, executionAgentNameKey: null, executionLockedAt: null }).where(eq(issues.id, input.issueId));
+  const [waitingIssue] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+  const attention = (await issueService(db).listReviewAttention(companyId, [waitingIssue])).get(input.issueId);
+  const afterOwnerExitSweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: input.issueId, unanswered: true });
+  const secondSweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: input.issueId, unanswered: true });
+  const secondBprime = await settleUnansweredPersonMessage(db, { companyId, issueId: input.issueId, now: new Date(Date.now() + 20 * 60_000) });
+  expect(await readNotes()).toEqual(firstNotes);
+  const wakes = await db.select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload })
+    .from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+
+  // A new authorized response run answers the very same card via the real authenticated loopback route.
+  const responseRunId = randomUUID();
+  await db.insert(heartbeatRuns).values({ id: responseRunId, companyId, agentId: responderAgentId, status: "running",
+    runtimeMode: "native", nativeIssueId: input.issueId, issueId: input.issueId, scopeKind: "issue",
+    contextSnapshot: input.runContextSnapshot });
+  expect(await decideNativeAddressedInteractionGrant(db, { ...input.execution.binding, runId: responseRunId })).toMatchObject({ allowed: true });
+  vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", randomUUID()); // isolated test-only signing key; never printed
+  const app = await createApp(db, { uiMode: "none", serverPort: 0, bindHost: "127.0.0.1", allowedHostnames: ["127.0.0.1"],
+    deploymentMode: "authenticated", deploymentExposure: "private", authReady: true, companyDeletionEnabled: false,
+    managedPluginAutoInstall: [], localPluginDir: path.join(home.home, "plugins"),
+    storageService: createStorageService(createLocalDiskStorageProvider(path.join(home.home, "storage"))),
+    decisionServiceOptions: { wakeOriginAgent: async () => null } });
+  let server: ReturnType<typeof app.listen> | undefined;
+  try {
+    await app.locals.bundledPluginsStartup;
+    server = app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => { server!.once("listening", resolve); server!.once("error", reject); });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("judge_loopback_address_missing");
+    const token = createLocalAgentJwt(responderAgentId, companyId, "paperclip_runner", responseRunId);
+    if (!token) throw new Error("judge_test_token_missing");
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/issues/${input.issueId}/interactions/${input.interactionId}/accept`, {
+      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: "{}",
+    });
+    const body = await response.json();
+    expect({ status: response.status, body }).toMatchObject({ status: 200, body: {
+      status: "accepted", resolvedByAgentId: responderAgentId, resolvedByRunId: responseRunId, resolvedByUserId: null,
+    } });
+  } finally {
+    await app.locals.paperclipShutdown?.();
+    if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve()));
+  }
+  await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, responseRunId));
+  const postAnswerSweep = await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: input.issueId, unanswered: true });
+  const postAnswerBprime = await settleUnansweredPersonMessage(db, { companyId, issueId: input.issueId, now: new Date(Date.now() + 20 * 60_000) });
+  const finalNotes = await readNotes();
+  const [finalCard] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+  const activities = await db.select({ action: activityLog.action, actorType: activityLog.actorType, actorId: activityLog.actorId,
+    agentId: activityLog.agentId, runId: activityLog.runId, details: activityLog.details })
+    .from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, input.issueId)));
+  const [finalNote] = finalNotes;
+  const finalMetadata = finalNote?.metadata as Record<string, unknown> | null;
+  const { supersededByInteractionId: reportedSupersession, ...reportedHistoryMetadata } = finalMetadata ?? {};
+  const noteHistoricalContentPreserved = Boolean(finalNote && firstNote && finalNote.id === firstNote.id
+    && finalNote.body === firstNote.body && JSON.stringify(finalNote.presentation) === JSON.stringify(firstNote.presentation)
+    && JSON.stringify(reportedHistoryMetadata) === JSON.stringify(firstNote.metadata) && finalNote.deletedAt === null);
+  judgeResults.push({ documentTarget, issueId: input.issueId, interactionId: input.interactionId, failedRunId: input.runId,
+    responseRunId, attention, firstBprime, activeOwnerSweep, afterOwnerExitSweep, secondSweep, secondBprime,
+    postAnswerSweep, postAnswerBprime, wakeCount: wakes.length, firstNotes, finalNotes,
+    finalCard: { status: finalCard.status, resolvedByAgentId: finalCard.resolvedByAgentId, resolvedByRunId: finalCard.resolvedByRunId },
+    activities, reportedSupersession, noteHistoricalContentPreserved });
+
+  expect(finalNotes).toHaveLength(firstNotes.length);
+  expect(finalNotes.map(note => note.id)).toEqual(firstNotes.map(note => note.id));
+  const { supersededByInteractionId, ...retainedMetadata } = finalMetadata ?? {};
+  // RED on ef821: require the same card ID marker after a real HTTP 200 accept.
+  expect(supersededByInteractionId).toBe(input.interactionId);
+  expect(supersededByInteractionId).not.toBe(responseRunId);
+  expect(finalNote.body).toBe(firstNote.body);
+  expect(finalNote.presentation).toEqual(firstNote.presentation);
+  expect(retainedMetadata).toEqual(firstNote.metadata);
+  expect(finalNote.createdByRunId).toBe(input.runId);
+  expect(finalNote.createdAt).toEqual(firstNote.createdAt);
+  expect(finalNote.deletedAt).toBeNull();
+  expect(finalCard).toMatchObject({ status: "accepted", resolvedByAgentId: responderAgentId,
+    resolvedByRunId: responseRunId, resolvedByUserId: null });
+  const acceptedAudit = activities.find(row => row.action === "issue.thread_interaction_accepted");
+  expect(acceptedAudit).toMatchObject({ actorType: "agent", actorId: responderAgentId, agentId: responderAgentId,
+    runId: responseRunId, details: expect.objectContaining({ interactionId: input.interactionId, interactionStatus: "accepted" }) });
+
+  // A new service read must retain the durable marker and historical note bytes.
+  const service = issueService(db);
+  const listed = await service.listComments(input.issueId, { companyId, order: "asc" });
+  const listedFailureNote = listed.find(comment => comment.id === firstNote.id);
+  const fetchedFailureNote = await service.getComment(firstNote.id);
+  for (const freshNote of [listedFailureNote, fetchedFailureNote]) {
+    expect(freshNote).toMatchObject({ id: firstNote.id, body: firstNote.body, presentation: firstNote.presentation, deletedAt: null });
+    expect((freshNote?.metadata as Record<string, unknown> | null)?.supersededByInteractionId).toBe(input.interactionId);
+  }
+  expect(activities).toEqual(expect.arrayContaining([expect.objectContaining({ action: "issue.thread_interaction_accepted",
+    details: expect.objectContaining({ interactionId: input.interactionId }) })]));
+}, 120_000);
