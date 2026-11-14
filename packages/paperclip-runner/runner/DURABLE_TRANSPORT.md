@@ -11,48 +11,6 @@ agent or recovery of its persisted run. On a fresh launch or restart,
 Choose one form. Both require `PAPERCLIP_RUNNER_BOOTSTRAP_TICKET`.
 Recovery uses the same entry point. The Runner rejects `--source-reconcile`.
 
-## Listener admission
-
-Listener mode accepts TCP connections independently of controller connect ticks,
-including while runnerd is idle or already connected. A blocking accept worker
-sleeps in the kernel when there is no ingress. At most 16 upgrade workers run
-concurrently. If those slots are full, a new arrival **closes the oldest
-unfinished upgrade** and joins its worker before replacing it. Continuously
-replenished silent or partial-HTTP peers therefore cannot reject a controller
-merely by keeping the upgrade cap full **if it completes its HTTP upgrade within
-about 40 ms**. A slower-upgrading controller can itself be evicted under a
-replenished flood; that admission limitation remains for v3 (N2). Completed
-upgrades and live controller sockets are never eviction candidates. Silent,
-partial, and malformed HTTP peers are dropped without failing a controller
-connect attempt or consuming a ticket. Only unfinished upgrades retry
-nonblocking I/O (at most every 5 ms).
-
-Each unauthenticated connection has **one 2.5-second deadline from TCP accept**:
-HTTP upgrade, waiting for a connecting tick, and receiving and validating the
-controller's proof all spend that same budget. HTTP upgrade also retains its
-shorter 2-second sub-limit.
-The first completed upgrade waits only for the remaining total budget; there is
-no fresh ready grace or authentication budget at handover. The connection closes
-at the total deadline even without another connect tick or incoming peer, or if
-authentication stalls inside a frame. Expiry releases unauthenticated admission;
-dropping an expired handle cannot release a newer controller's slot.
-
-Further arrivals while a completed upgrade is waiting or a controller socket is
-live receive HTTP 503 immediately, rather than joining a FIFO backlog. Dropping
-the controller socket releases admission for the next retry. Once the controller
-proof is validated within the total deadline, its socket is protected before
-the Runner sends its authentication response. Response I/O uses the existing
-authentication/lifecycle budget; authenticated welcome and runtime budgets apply
-without an ingress deadline. The execution/reconnect lifecycle deadline can
-shorten any of these budgets.
-
-Path, query and extension checks are unchanged. Warm path rotation invalidates
-pending and completed upgrades for the old path without rebinding the listener.
-Endpoint shutdown wakes accept and cancels/joins outstanding upgrade workers.
-Authentication proofs, PRP, ticket handling, reconnect bookkeeping and dial mode
-are unchanged. Only listener pre-authentication I/O uses the shared admission
-deadline; authenticated welcome retains its existing budget.
-
 ## Trust boundary
 
 - For outbound `ws://`, every resolved address must be loopback. The Runner
