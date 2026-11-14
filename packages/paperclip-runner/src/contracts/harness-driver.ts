@@ -523,10 +523,31 @@ export const PROVIDER_LAUNCH_PROFILE_MISMATCH = "provider_launch_profile_mismatc
  * result. Replacing the session could repeat or lose that external action. */
 export const PROVIDER_SIDE_EFFECT_PENDING = "provider_side_effect_pending";
 
+export const PROVIDER_REFRESH_REQUIRED = "provider_refresh_required";
+
+export class NativeRunnerLaunchProfileMismatchError extends Error {
+  readonly code = "native_runner_launch_profile_mismatch";
+  constructor(reason: string) {
+    super(`native_session_recovery_failed: ${reason}`);
+    this.name = "NativeRunnerLaunchProfileMismatchError";
+  }
+}
+
+/** Prepare refused; its typed code, never diagnostic prose, owns the wait. */
+export class NativeRunnerRefreshRequiredError extends Error {
+  readonly code = "native_runner_refresh_required";
+  constructor(readonly waitForTurn: boolean, readonly prepareRefusalCode?: RunnerPrepareRefusalCode) {
+    super("native_runner_refresh_required");
+    this.name = "NativeRunnerRefreshRequiredError";
+  }
+}
+
 export type RunnerRecoveryFailureClass =
   | typeof PROVIDER_STATE_INCOMPATIBLE
   | typeof PROVIDER_ATTACH_REFUSED
-  | typeof PROVIDER_SIDE_EFFECT_PENDING;
+  | typeof PROVIDER_SIDE_EFFECT_PENDING
+  | typeof PROVIDER_LAUNCH_PROFILE_MISMATCH
+  | typeof PROVIDER_REFRESH_REQUIRED;
 
 const RUNNER_RECOVERY_FAILURE_CLASSES: ReadonlySet<string> = new Set([
   PROVIDER_STATE_INCOMPATIBLE,
@@ -564,6 +585,13 @@ export function isRunnerResumeStateUnavailable(error: unknown, depth = 0): boole
   return isRunnerResumeStateUnavailable((error as { cause?: unknown }).cause, depth + 1);
 }
 
+export function runnerRefreshWaitForTurn(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== "object" || depth > 5) return false;
+  if (error instanceof NativeRunnerRefreshRequiredError) return error.waitForTurn;
+  return runnerPrepareRefusalCode(error) === "provider_active_turn"
+    || runnerRefreshWaitForTurn((error as { cause?: unknown }).cause, depth + 1);
+}
+
 export interface HarnessSessionRecoveryResult {
   recovered: boolean;
   session?: HarnessSession;
@@ -575,6 +603,8 @@ export interface HarnessSessionRecoveryResult {
    * the checkpoint had no turn or runtime request in flight. */
   resumeStateUnavailable?: true;
   runnerExitConfirmed?: true;
+  refreshWaitForTurn?: true;
+  prepareRefusalCode?: RunnerPrepareRefusalCode;
 }
 
 /** The additive prepare/attach channel. Unknown and old no-code receipts map
@@ -582,7 +612,7 @@ export interface HarnessSessionRecoveryResult {
  * This reader does not change the existing recovery-class policy. */
 export const RUNNER_PREPARE_REFUSAL_CODES = [
   "provider_active_turn", "provider_live_descendants", "provider_active_goal",
-  "provider_config_changed", "provider_contract_changed_same_run",
+  "provider_config_changed", "provider_contract_changed_same_run", "provider_contract_changed",
   "provider_launch_profile_mismatch", "provider_session_closed",
   "provider_reconciliation_required", "provider_pending_tool_calls",
   "provider_prepare_refused",
@@ -590,6 +620,7 @@ export const RUNNER_PREPARE_REFUSAL_CODES = [
 export type RunnerPrepareRefusalCode = typeof RUNNER_PREPARE_REFUSAL_CODES[number];
 export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepareRefusalCode | undefined {
   if (!error || typeof error !== "object" || depth > 5) return undefined;
+  if (error instanceof NativeRunnerRefreshRequiredError && error.prepareRefusalCode) return error.prepareRefusalCode;
   const value = error as Record<string, unknown>;
   const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
     ? v as Record<string, unknown> : {};
@@ -597,14 +628,25 @@ export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepa
   const detail = record(receipt.result);
   if (["run.attach", "run.prepare"].includes(String(receipt.commandType)) && receipt.status === "failed"
     && detail.code === "command_execution_failed") {
+    if (detail.refusalCode === PROVIDER_REFRESH_REQUIRED) return "provider_prepare_refused";
     return (RUNNER_PREPARE_REFUSAL_CODES as readonly unknown[]).includes(detail.refusalCode)
       ? detail.refusalCode as RunnerPrepareRefusalCode : "provider_prepare_refused";
   }
   return runnerPrepareRefusalCode(value.cause, depth + 1);
 }
 
-/** Existing recovery classification is deliberately unchanged by the additive
- * refusal channel. In particular old receipts still reach replacement policy. */
+/** C3 decision owner, separate from the unchanged legacy classifier. */
+export function runnerReconciliationFailureClass(error: unknown, depth = 0): RunnerRecoveryFailureClass | undefined {
+  if (!error || typeof error !== "object" || depth > 5) return undefined;
+  if (error instanceof NativeRunnerLaunchProfileMismatchError) return PROVIDER_LAUNCH_PROFILE_MISMATCH;
+  if (error instanceof NativeRunnerRefreshRequiredError) return PROVIDER_REFRESH_REQUIRED;
+  const refusal = runnerPrepareRefusalCode(error);
+  if (refusal === PROVIDER_LAUNCH_PROFILE_MISMATCH) return PROVIDER_LAUNCH_PROFILE_MISMATCH;
+  if (refusal) return PROVIDER_REFRESH_REQUIRED;
+  return runnerRecoveryFailureClass(error) ?? runnerReconciliationFailureClass((error as { cause?: unknown }).cause, depth + 1);
+}
+
+/** Legacy recovery classification; C1 remains independently decision-neutral. */
 export function runnerRecoveryFailureClass(
   error: unknown,
   depth = 0,

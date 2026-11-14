@@ -20,6 +20,8 @@ import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-ses
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
+import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -422,7 +424,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
   const runs = await q.select({
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
-    errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
+    errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
@@ -439,6 +441,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // else, and any approval, can hold the task but do not answer the message.
   if (run && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) {
     return { kind: "answered" };
+  }
+
+  // Impossible reconciliation has its own one-note, proven-stop owner. A
+  // generic 'send again' notice must never race or time out that ownership.
+  if (run && isFreshThreadRefusal(run)) {
+    await notifyDeliveryWork(q, DELIVERY_QUEUES.executionDisposition);
+    return { kind: "pending", recheckAt: now.getTime() + 60_000 };
   }
 
   // Every wait for a further attempt is BOUNDED, except a turn in progress:

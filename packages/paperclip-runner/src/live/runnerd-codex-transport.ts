@@ -78,7 +78,7 @@ import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
 } from "../contracts/harness-driver.js";
-import { isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
+import { RUNNER_PREPARE_REFUSAL_CODES, type RunnerPrepareRefusalCode, NativeRunnerRefreshRequiredError, isRunnerResumeStateUnavailable, NativeRunnerResumeStateUnavailableError, NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
   inspectStagedRunAttachment,
@@ -4300,6 +4300,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #lastRunnerRestoreAt: number | null = null;
   #unstableRunnerRestores = 0;
   #startupComplete = false;
+  #refreshAdmissionRefused = false;
   readonly #authorityRunId: () => string | undefined;
   #startupFailureCode = "native_runner_process_exited";
   #controlPlaneCheckpoint:
@@ -5859,7 +5860,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       this.#core !== null &&
       (this.#handle !== null || adoptedRunner !== undefined) &&
       (adoptedRunner === undefined || this.#adoptedRunnerAuthenticated) &&
-      (this.#failure === null || this.#startupComplete)
+      (this.#failure === null || this.#startupComplete) &&
+      // A refusing contender never opened the provider. Retire only its own
+      // process below, checkpoint unsettled, and leave predecessor cleanup to
+      // the physical-stop owner. Its provider state cannot prove suspension.
+      !this.#refreshAdmissionRefused
     ) {
       // A terminal provider frame can become visible one control loop before
       // its durable provider suffix is ACKed. Drain it before suspension so a
@@ -6678,8 +6683,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     core.persistRunAttachTemplate(runAttachTemplate);
     if (!unclaimedBootstrap) {
       core.queueCommand("run.prepare", runAttachTemplate);
-      const opening: { commandId?: string } | undefined = core.queueCommand("session.open", { reuse: "same_session" });
-      this.#openingCommandId = opening?.commandId ?? null;
+      // Preparation may refuse admission while the old turn still owns work.
+      // Do not put session.open on the wire until its decision is consumed.
     }
     const registration = this.options.controlPlaneRegistration
       ? await this.#registerControlPlane(core)
@@ -6732,7 +6737,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       refreshBootstrapTicket: () => this.#refreshBootstrapTicket(core),
     });
     this.#handle = handle;
-    this.#watchRunner(handle);
+    const runnerObservation = this.#watchRunner(handle);
     // A remote launcher returns before runnerd exists; only a local spawn reaches this gap.
     if (!this.options.runnerProcessLauncher) crashPoint("runner.process.after_spawn_before_identity");
     await this.#publishSpawnedProcess(handle);
@@ -6746,13 +6751,39 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         );
       });
     }
+    // Prepare can be answered while an external route's readiness callback
+    // is pending. Consume its admission before opening, but do not make route
+    // readiness depend on a session.open we have not delivered yet.
+    try {
+      await this.#waitCommand("run.prepare", undefined, admissionDeadline, true);
+    } catch (error) {
+      // Process completion may win before its observer classifies the ingress
+      // failure. Preserve that structured startup diagnosis, not a generic
+      // command-wait error, while still leaving cancellation fail-closed.
+      if (!this.#closed && await this.#runnerHasExited()) {
+        await runnerObservation;
+        this.#throwIfFailed();
+      }
+      throw error;
+    }
+    const preparation = core.store.state.commands.findLast(command => command.type === "run.prepare");
+    const decision = record(record(preparation?.result).result);
+    if (decision.refusalCode === "provider_refresh_required" && ["refresh_wait", "refresh_fresh"].includes(String(decision.status))) {
+      this.#refreshAdmissionRefused = true;
+      const prepareRefusalCode = (RUNNER_PREPARE_REFUSAL_CODES as readonly unknown[]).includes(decision.prepareRefusalCode)
+        ? decision.prepareRefusalCode as RunnerPrepareRefusalCode : "provider_prepare_refused";
+      throw new NativeRunnerRefreshRequiredError(decision.waitForTurn === true, prepareRefusalCode);
+    }
+    if (!unclaimedBootstrap) {
+      const opening = core.queueCommand("session.open", { reuse: "same_session" }, undefined, true);
+      this.#openingCommandId = opening?.commandId ?? null;
+    }
     await this.#awaitRegistrationReady(registration?.ready);
     this.#assertStartupOpen();
     this.#evidence.runnerPid = handle.child.pid ?? null;
     this.#evidence.runnerProcessGroupId = handle.processGroupId ?? null;
     this.#publish();
     this.#startPump();
-    await this.#waitCommand("run.prepare", undefined, undefined, true);
     this.#startupSteps?.advance("runner.process.launch", "provider.session.load");
     await this.#waitCommand("session.open", undefined, admissionDeadline, true);
     await this.#waitForProviderIdentity(undefined, admissionDeadline);
@@ -9298,13 +9329,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     );
   }
 
-  #watchRunner(handle: RunnerProcessHandle): void {
+  #watchRunner(handle: RunnerProcessHandle): Promise<void> {
     const carriedSuspendExit = handle.completion.then(
       (result) => this.#settledOnlyCarriedSuspend(handle, result.code),
       () => false,
     );
     this.#carriedSuspendExits.set(handle, carriedSuspendExit);
-    void handle.completion.then(
+    return handle.completion.then(
       async (result) => {
         const exitConfirmed = handle.isExitConfirmed?.() ?? true;
         this.#evidence.runnerExited = exitConfirmed;

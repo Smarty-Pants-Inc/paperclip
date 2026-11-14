@@ -138,6 +138,45 @@ suite("fresh-continuation fallback", () => {
     return next[0]!;
   }
 
+  it.each(["void-release", "stopping", "foreign-run", "foreign-lease", "bad-time", "live-peer"])(
+    "impossible reconciliation never treats %s as proof, regardless of time", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_controller_recovery_missing_evidence:snapshot_binding" });
+    await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
+    const acquiredAt = new Date(Date.now() - 120_000), releasedAt = new Date();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
+      provider: "boat", providerLeaseId: `fresh-stop-${randomUUID()}`, status: "released", cleanupStatus: "success", acquiredAt, releasedAt,
+      metadata: { pluginId: "fixture-boat" } }).returning();
+    const receipt = { schema: "paperclip.remote-termination.v1", companyId, runId: f.runId, leaseId: lease.id,
+      provider: lease.provider, providerLeaseId: lease.providerLeaseId, state: "stopped", confirmedAt: releasedAt.toISOString() };
+    await db.update(environmentLeases).set({ metadata: { pluginId: "fixture-boat", ...(shape === "void-release" ? {} : {
+      remoteExecutionTermination: { ...receipt, ...(shape === "stopping" ? { state: "stopping" } : {}),
+        ...(shape === "foreign-run" ? { runId: randomUUID() } : {}), ...(shape === "foreign-lease" ? { leaseId: randomUUID() } : {}),
+        ...(shape === "bad-time" ? { confirmedAt: "not a time" } : {}) } }) } }).where(eq(environmentLeases.id, lease.id));
+    let peerId: string | undefined;
+    if (shape === "live-peer") {
+      const [peer] = await db.insert(environmentLeases).values({ companyId, issueId: f.issueId, provider: lease.provider,
+        providerLeaseId: lease.providerLeaseId, status: "active" }).returning();
+      peerId = peer.id;
+    }
+    for (const now of [new Date(), new Date(Date.now() + 24 * 3600_000)]) expect(await ensureFreshContinuation(db, {
+      companyId, runId: f.runId, trigger: "held_recovery", now })).toMatchObject({ kind: "exact_recovery_pending" });
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))))
+      .toMatchObject([{ authorType: "system", body: expect.stringContaining("stopping the earlier attempt before starting fresh") }]);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
+      .not.toHaveProperty("freshContinuation");
+    if (peerId) await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, peerId));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { pluginId: "fixture-boat", remoteExecutionTermination: receipt } }).where(eq(environmentLeases.id, lease.id));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toContain("fresh thread in this conversation");
+    // Exercise the real delivery owner and heartbeat admission, not only a
+    // continuation record. It queues exactly one fresh-history successor
+    // without a person's Retry or a new message after stop proof lands.
+    await expectOneFreshSuccessor(f);
+  });
+
   // The five most frequent endings on staging (2026-11-12): each left the task
   // Blocked for a person with no successor run.
   it.each([

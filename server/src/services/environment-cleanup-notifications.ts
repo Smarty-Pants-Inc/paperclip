@@ -34,6 +34,8 @@ export async function notifyEnvironmentCleanup(transaction: object, scope?: Envi
   if (scope?.runId) {
     await notifyDeliveryWork(transaction, DELIVERY_QUEUES.executionFinalization);
     await notifyDeliveryWork(transaction, DELIVERY_QUEUES.executionReplacement);
+    // Impossible reconciliation waits on physical stop proof, not a retry timer.
+    await notifyDeliveryWork(transaction, DELIVERY_QUEUES.executionDisposition);
   }
   await notifyDeliveryWork(transaction, DELIVERY_QUEUES.environmentCleanup);
   await notifyDeliveryWork(transaction, DELIVERY_QUEUES.historicalCleanup);
