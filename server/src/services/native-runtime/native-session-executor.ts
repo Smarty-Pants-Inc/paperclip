@@ -3,6 +3,7 @@ import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-sessi
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
+import { currentNoticeSql } from "../issue-comment-current.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
 import { captureRemoteNativeProviderArtifacts, shareNativeProviderArtifactCapture } from "./native-provider-artifact-capture.js";
 import { NativeSessionDiagnostics, nativeSessionDiagnostics, type NativeDiagnosticLease } from "./native-session-diagnostics.js";
@@ -7798,8 +7799,8 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
       const [unanswered] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
         isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`,
-        // never-delete (org 09:18Z): a superseded B' note is history, not a live notice.
-        sql`not coalesce(${issueComments.metadata} ? 'supersededBy', false)`)).limit(1);
+        // never-delete (org 09:18Z): a superseded B' note is history, not a live notice (the shared rule).
+        currentNoticeSql(issueComments.metadata))).limit(1);
       if (unanswered) return;
       await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,

@@ -25,6 +25,7 @@ import { keyValueRow } from "./notice-format.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
+import { currentNoticeSql } from "../issue-comment-current.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -250,8 +251,8 @@ function answeringCommentIdSql(m: { id: SQL; companyId: SQL; issueId: SQL; creat
             or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text)))
     order by a.created_at, a.id limit 1)`;
 }
-/** A note marked superseded (metadata.supersededBy) is history, never a live note. */
-const notSupersededSql = (metadata: SQL | AnyPgColumn) => sql`not coalesce(${metadata} ? 'supersededBy', false)`;
+/** A superseded note is history, never a live note: the ONE shared CURRENT rule (RFL 11:43Z). */
+const notSupersededSql = currentNoticeSql;
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
@@ -728,7 +729,7 @@ export async function settleUnansweredPersonMessage(
       await tx.execute(sql`update ${issueComments} set metadata = coalesce(metadata, '{}'::jsonb)
         || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
         where id = ${fenced.supersedeCommentId} and company_id = ${issue.companyId} and deleted_at is null
-          and not coalesce(metadata ? 'supersededBy', false)`);
+          and ${currentNoticeSql(sql.raw("metadata"))}`);
     }
     if (comment?.id && fenced.replacesEarlier) {
       const messageId = fenced.reason.slice(UNANSWERED_MESSAGE_REASON_PREFIX.length);
@@ -736,7 +737,7 @@ export async function settleUnansweredPersonMessage(
       await tx.execute(sql`update ${issueComments} n set metadata = coalesce(n.metadata, '{}'::jsonb)
           || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
         where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
-          and not coalesce(n.metadata ? 'supersededBy', false)
+          and ${currentNoticeSql(sql.raw("n.metadata"))}
           and n.presentation->>'title' = ${HELD_NOTE_TITLE}
           and n.id <> ${comment.id} and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
           and exists (select 1 from ${issueComments} m, ${issueComments} latest
@@ -802,10 +803,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`,
-    // A superseded progress note is history, not this message's standing note.
-    sql`not coalesce(${issueComments.metadata} ? 'supersededBy', false)`)).limit(1);
+    // A superseded note is history, not this message's standing note.
+    currentNoticeSql(issueComments.metadata))).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
+  if (!noticed) {
+    // Every note for this message is superseded (by an answer, a reply, a
+    // later note or a card, RFL 11:43Z): the obligation was handed on and its
+    // history kept. Never post a second note for the same message.
+    const [handedOn] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+      sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+    if (handedOn) return { kind: "noticed_before" };
+  }
   const upgrading = noticed?.waiting ? noticed.id : null;
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
@@ -1100,7 +1111,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
     sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
     sql`${issueComments.presentation}->>'tone' in ('danger', 'warning')`,
-    sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`,
+    sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`, currentNoticeSql(issueComments.metadata),
     sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
   if (explained) return { kind: "explained" };
   // The continuation path ended on its own notice (the stranded sweep's "Task
@@ -1113,6 +1124,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
       sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
       sql`${issueComments.metadata}->>'sourceRunId' in (${sql.join(continuationRuns.map(id => sql`${id}`), sql`, `)})`,
+      currentNoticeSql(issueComments.metadata),
       sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
     if (pathNotice) return { kind: "explained" };
   }
