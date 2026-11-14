@@ -1457,8 +1457,9 @@ async function restoreCommittedGovernedResponseAfterWorkspaceRetry(input: {
   const marker = record(resultJson.externalChatReviewPresentation);
   if (
     input.workspaceFinalizeStatus !== "succeeded" ||
-    resultJson.finalizationPhase !== "retryable_failure" ||
-    resultJson.failureCode !== "native_workspace_sync_out_failed" ||
+    !(resultJson.finalizationPhase === "committed" ||
+      (resultJson.finalizationPhase === "retryable_failure" &&
+        resultJson.failureCode === "native_workspace_sync_out_failed")) ||
     !coordinator.decisionId || !coordinator.resultId || !coordinator.assessmentId ||
     marker.schema !== "paperclip.chat_review_response_presentation.v1" ||
     marker.runId !== run.id || marker.decisionId !== coordinator.decisionId ||
@@ -1520,8 +1521,9 @@ async function restoreCommittedGovernedResponseAfterWorkspaceRetry(input: {
     const currentMarker = record(currentResult.externalChatReviewPresentation);
     if (
       currentIssue?.lastStatusDecisionId !== decisionId ||
-      currentResult.finalizationPhase !== "retryable_failure" ||
-      currentResult.failureCode !== "native_workspace_sync_out_failed" ||
+      !(currentResult.finalizationPhase === "committed" ||
+        (currentResult.finalizationPhase === "retryable_failure" &&
+          currentResult.failureCode === "native_workspace_sync_out_failed")) ||
       currentMarker.decisionId !== decisionId || currentMarker.resultId !== resultId
     ) return null;
     const now = new Date();
