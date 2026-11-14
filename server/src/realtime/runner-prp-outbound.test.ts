@@ -113,8 +113,8 @@ describe("runner provider-ingress WebSocket wire", () => {
       await vi.advanceTimersByTimeAsync(600);
       const terminal = await observed;
       const records = warn.mock.calls.filter(call => (call[0] as Record<string, unknown>)?.event === "runner_ingress_connect_attempt_failed");
-      expect(records.length).toBe(1);
-      expect(records.map(call => (call[0] as Record<string, unknown>)?.attempt)).toEqual([1]);
+      expect(records.length).toBe(2);
+      expect(records.map(call => (call[0] as Record<string, unknown>)?.attempt)).toEqual([1, 2]);
       expect(records[0]?.[0]).toMatchObject({ code: "ECONNREFUSED" });
       expect(JSON.stringify(records)).not.toContain("must-not-log");
       expect(terminal).toMatchObject({ causeSummary: { code: "ECONNREFUSED", errno: -111, syscall: "connect" } });
