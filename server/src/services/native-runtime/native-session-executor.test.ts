@@ -23490,7 +23490,10 @@ describe("runnerd provider runtime wiring", () => {
     await writeFile(join(root, "provider-artifacts", "opencodeProxy"), "retained prior launch bytes");
     // Ambiguous ordinary recovery must still fail closed. Only the runtime's
     // explicitly admitted replacement may retire these prior-session backups.
-    await expect(prepareReplacement()).rejects.toThrow("runner_harness_state_mismatch: backup_without_reusable_lease");
+    await expect(prepareReplacement()).rejects.toMatchObject({
+      message: "runner_harness_state_mismatch: backup_without_reusable_lease",
+      code: "runner_harness_state_mismatch: backup_without_reusable_lease",
+    });
     await expect(backend.openReplacementSession!({
       identity: { runId: execution.binding.runId }, workingDirectory: execution.workspace.cwd,
     } as never, {} as never)).resolves.toBe(replacement);

@@ -6717,12 +6717,18 @@ describe("executeNativeSession recovery", () => {
 
   // Keep: real driver -> HarnessDriverBackend -> runtime recovery boundary,
   // the recorded D10 row-5 refusal must not become a generic retry/replacement.
-  it.each(["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const)(
-    "RFL round4 F2 row5 preserves structured remote-state refusal across actual recovery (%s)", async providerRecoveryPolicy => {
+  it.each([
+    "runner_remote_state_unavailable",
+    "runner_harness_state_mismatch: backup_without_reusable_lease",
+    "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+  ] as const)("D10b preserves exact refusal through actual driver recovery (%s)", async refusalCode => {
+    for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
+      for (const structuredPrepare of refusalCode === "runner_remote_state_unavailable" ? [false] : [false, true]) {
       const executionInput = { ...input, workspace: { ...input.workspace, cwd: WORKSPACE } };
       const transport = new FakeCodexTransport();
       transport.rejectMethods.set("initialize", Object.assign(new Error("opaque remote read failure"),
-        { code: "runner_remote_state_unavailable" }));
+        structuredPrepare ? { runnerCommandResult: { commandType: "run.prepare", status: "failed",
+          result: { code: "command_execution_failed", refusalCode, message: "opaque" } } } : { code: refusalCode }));
       const transportFactory = vi.fn(() => transport);
       const backend = createCodexNativeSessionBackend(executionInput, {
         runnerInstanceId: "runner-recovery", transportFactory,
@@ -6737,11 +6743,13 @@ describe("executeNativeSession recovery", () => {
           replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
         },
       }).catch((error: unknown) => error);
-      expect(failure).toMatchObject({ code: "runner_remote_state_unavailable" });
+      expect(failure).toMatchObject({ code: refusalCode });
       expect(openRun).not.toHaveBeenCalled();
       expect(completeRun).not.toHaveBeenCalled();
       expect(transport.calls.some(call => ["thread/start", "turn/start"].includes(call.method))).toBe(false);
       expect(transportFactory).toHaveBeenCalledOnce();
+      }
+    }
     });
 
   it("C3 retains launch-profile refusal before every legacy replacement callback", async () => {
