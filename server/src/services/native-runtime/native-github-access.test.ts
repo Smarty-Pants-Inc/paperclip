@@ -182,7 +182,7 @@ it.each(["lost", "unreachable"] as const)("recovers a %s GitHub bridge after its
   expect(b.bridgeModes).toEqual(["http2_v1", "queue_v1"]);
   expect(b.ready).toBe(true);
   expect(b.resolveCredentials).not.toHaveBeenCalled();
-  const release = b.activate(run("recovered"));
+  const release = await b.activate(run("recovered"));
   const result = await promisify(execFile)(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), [], {
     env: { ...process.env, ...b.env, GH_TOKEN: "ambient-must-not-leak" },
     timeout: 15_000,
@@ -190,7 +190,7 @@ it.each(["lost", "unreachable"] as const)("recovers a %s GitHub bridge after its
   expect(result.stdout).toBe("fixture-recovered");
   expect(result.stderr).toBe("");
   expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["recovered"]);
-  release();
+  await release();
 }, 30_000);
 it("keeps host credentials isolated when neither GitHub startup transport works", async () => {
   const b = await broker(undefined, true, false, undefined, {
@@ -199,7 +199,7 @@ it("keeps host credentials isolated when neither GitHub startup transport works"
   expect(b.ready).toBe(false);
   expect(b.openDuplexChannel).toHaveBeenCalledOnce();
   expect(b.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("");
-  b.activate(run("unavailable"));
+  await b.activate(run("unavailable"));
   const result = await promisify(execFile)(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), [], {
     env: { ...process.env, ...b.env, GH_TOKEN: "ambient-must-not-leak" },
   });
