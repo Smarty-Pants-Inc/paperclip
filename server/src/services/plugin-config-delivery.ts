@@ -2,11 +2,16 @@ import type { Db } from "@paperclipai/db";
 import { pluginRegistryService } from "./plugin-registry.js";
 import type { PluginWorkerHandle, PluginWorkerManager } from "./plugin-worker-manager.js";
 
+interface CompanyDelivery {
+  active: Promise<void>;
+  next?: Promise<void>;
+}
+
 /** A ready event identifies a process, not a reusable worker handle. */
 interface ConfigGeneration {
   worker: PluginWorkerHandle;
   delivered: Map<string, { rowId: string; updatedAt: number }>;
-  pending: Map<string, Promise<void>>;
+  pending: Map<string, CompanyDelivery>;
 }
 
 const deliveries = new WeakMap<PluginWorkerManager, ReturnType<typeof createConfigDelivery>>();
@@ -47,30 +52,52 @@ function createConfigDelivery(db: Db, manager: PluginWorkerManager) {
     generation.worker.status === "running" &&
     generations.get(generation.worker) === generation;
 
-  async function deliver(pluginId: string, companyId: string, generation = current(pluginId)): Promise<void> {
-    if (!generation || !isCurrent(pluginId, generation)) return;
-    const previous = generation.pending.get(companyId);
-    const work = (async () => {
-      // Serialize only this company: a slow A must not block saving B.
-      await previous?.catch(() => {});
-      if (!isCurrent(pluginId, generation)) return;
-      // List snapshots identify companies only. Re-read the authoritative row
-      // after waiting, so saves and deletions during replay are respected.
-      const row = await registry.getConfig(pluginId, companyId);
-      if (!isCurrent(pluginId, generation) || !row) return;
-      const revision = row.updatedAt.getTime();
-      const last = generation.delivered.get(companyId);
-      if (last?.rowId === row.id && revision <= last.updatedAt) return;
-      await manager.call(pluginId, "configChanged", {
-        companyId,
-        config: (row.configJson ?? {}) as Record<string, unknown>,
+  async function apply(pluginId: string, companyId: string, generation: ConfigGeneration): Promise<void> {
+    if (!isCurrent(pluginId, generation)) return;
+    // Read only when admitted work starts, never from an old list snapshot.
+    const row = await registry.getConfig(pluginId, companyId);
+    if (!isCurrent(pluginId, generation) || !row) return;
+    const revision = row.updatedAt.getTime();
+    const last = generation.delivered.get(companyId);
+    if (last?.rowId === row.id && revision <= last.updatedAt) return;
+    await manager.call(pluginId, "configChanged", {
+      companyId,
+      config: (row.configJson ?? {}) as Record<string, unknown>,
+    });
+    generation.delivered.set(companyId, { rowId: row.id, updatedAt: revision });
+  }
+
+  function deliver(pluginId: string, companyId: string, generation = current(pluginId)): Promise<void> {
+    if (!generation || !isCurrent(pluginId, generation)) return Promise.resolve();
+    const target = generation;
+    const previous = target.pending.get(companyId);
+    if (previous) {
+      // One active operation and at most one successor per company. All callers
+      // arriving before that successor starts share its fresh authoritative read,
+      // including under failure; do not retain a promise chain per request.
+      if (previous.next) return previous.next;
+      previous.next = previous.active.catch(() => {}).then(() => {
+        previous.next = undefined;
+        return start(previous);
       });
-      generation.delivered.set(companyId, { rowId: row.id, updatedAt: revision });
-    })();
-    generation.pending.set(companyId, work);
-    try { await work; }
-    finally {
-      if (generation.pending.get(companyId) === work) generation.pending.delete(companyId);
+      return previous.next;
+    }
+    const entry: CompanyDelivery = { active: Promise.resolve() };
+    target.pending.set(companyId, entry);
+    return start(entry);
+
+    function start(entry: CompanyDelivery): Promise<void> {
+      const work = apply(pluginId, companyId, target);
+      entry.active = work;
+      const cleanup = () => {
+        if (!entry.next && target.pending.get(companyId) === entry) {
+          target.pending.delete(companyId);
+        }
+      };
+      // Use both settlement handlers: a rejected delivery is not applied, and
+      // cleanup must not create an unobserved rejected finally() promise.
+      void work.then(cleanup, cleanup);
+      return work;
     }
   }
 
