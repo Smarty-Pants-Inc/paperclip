@@ -57,6 +57,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { createStorageService } from "../storage/service.js";
 import type { StorageService } from "../storage/types.js";
+import { pluginToolFinalBudget } from "./fixtures/plugin-tool-final-budget.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
@@ -6546,6 +6547,52 @@ rl.on("line", (line) => {
     expect(response.text).toBe(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { content: [{ type: "text", text: JSON.stringify(oldEnvelope) }], isError: false } }));
     expect(response.body.result.content.every((block: { type: string }) => block.type === "text")).toBe(true);
     expect(putFile).not.toHaveBeenCalled();
+  });
+
+  // R3 keep: final deliverable/receipt trust boundary, both gateway paths.
+  // Real registry, policy and DB; synthetic worker and storage isolate the
+  // cheaply unreachable edge where secret redaction expands a full budget.
+  it.each(["MCP", "direct"])("rejects a final governed cap overflow in %s without a successful receipt", async channel => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { project, run } = await createIssueAndRun(db, company.id, agent.id);
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const fixture = pluginToolFinalBudget({ companyId: company.id, invocationId: "0".repeat(36), metadata: { password: "x" } });
+    const worker = { isRunning: () => true, call: vi.fn(async () => fixture.result) } as unknown as PluginWorkerManager;
+    const dispatcher = createPluginToolDispatcher({ workerManager: worker });
+    dispatcher.registerPluginTools("demo.budget", {
+      id: "demo.budget", apiVersion: 1, version: "1.0.0", displayName: "Budget", description: "Budget", author: "Paperclip",
+      categories: ["automation"], capabilities: [], entrypoints: { worker: "unused" },
+      tools: [{ name: "frame", displayName: "Frame", description: "Frame", parametersSchema: { type: "object", properties: {} } }],
+    } as unknown as PaperclipPluginManifestV1, randomUUID());
+    const putFile = vi.fn(async (input: any) => ({ objectKey: input.objectKey, provider: "local_disk", contentType: input.contentType,
+      byteSize: Buffer.from(fixture.block.data, "base64").length, sha256: fixture.imageReferences[0]!.sha256, originalFilename: null }));
+    const storage = { provider: "local_disk", putFile, deleteObject: vi.fn(async () => {}) } as unknown as StorageService;
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher, toolResultStorage: storage });
+    if (channel === "MCP") {
+      const [profile] = await db.insert(toolProfiles).values({ companyId: company.id, profileKey: `budget-${randomUUID()}`, name: "Budget", defaultAction: "deny" }).returning();
+      await db.insert(toolProfileEntries).values({ companyId: company.id, profileId: profile.id, selectorType: "tool_name", effect: "include", toolName: "demo.budget:frame" });
+      const named = await gateway.createNamedGateway({ companyId: company.id, body: { name: "Budget", profileId: profile.id, agentId: agent.id } });
+      const token = await gateway.createNamedGatewayToken({ companyId: company.id, gatewayId: named.id, body: { name: "Test", clientLabel: "Test", ownerNote: "", subjectType: "heartbeat_run", subjectId: run.id } });
+      const response = await request(createGatewayRouteApp(db, gateway)).post(named.endpointPath).set("authorization", `Bearer ${token.token}`)
+        .send({ jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "demo.budget:frame", arguments: {} } });
+      expect(response.status).not.toBe(200);
+      expect(response.body.error?.message).toContain("10 MiB");
+      expect(response.body.result).toBeUndefined();
+    } else {
+      let rejected = false;
+      try { await gateway.executePluginTool({ actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+        tool: "demo.budget:frame", parameters: {}, runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id } }); }
+      catch (error) { rejected = true; expect((error as Error).message).toContain("10 MiB"); }
+      expect(rejected).toBe(true);
+    }
+    expect(putFile).toHaveBeenCalledTimes(1);
+    const invocations = await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id));
+    expect(invocations).toHaveLength(1);
+    expect(invocations[0]!.status).toBe("failed");
+    const events = await db.select().from(toolCallEvents).where(eq(toolCallEvents.companyId, company.id));
+    expect(events.some(event => event.outcome === "success")).toBe(false);
+    expect(JSON.stringify({ invocations, events })).not.toContain(fixture.block.data);
   });
 
   // Keep: plugin/MCP trust boundary and persistence safety. Real dispatcher,

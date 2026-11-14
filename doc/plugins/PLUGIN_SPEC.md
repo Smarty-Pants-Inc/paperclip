@@ -883,6 +883,11 @@ legacy envelope and HTTP bytes, including arbitrary `data.content` metadata. Nat
 most 64 blocks including legacy text. Bad MIME, malformed base64, unsupported
 blocks and excessive size fail the call; they are never silently trimmed.
 Images are stored through company-scoped storage before the call succeeds.
+The total includes host-added transport, digest and storage-reference metadata:
+that final budget is checked before any image write, again against actual
+storage metadata, and after governance before forwarding or a success receipt.
+An over-budget result fails without trimming, including a late expansion from
+secret redaction.
 
 [SDK seam decision](./TOOL-IMAGE-SDK-SEAM.md) records the upstream check and why
 this additive SDK field is needed instead of reinterpreting legacy metadata.

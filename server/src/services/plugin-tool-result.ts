@@ -58,34 +58,48 @@ export async function preparePluginToolResult(
 ): Promise<ToolExecutionResult> {
   const content = validatePluginToolResult(execution.result);
   if (!content) return execution;
-  const imageReferences = [];
+  context.signal?.throwIfAborted();
   let storage = context.storage;
+  if (content.some(item => item.type === "image")) storage ??= getStorageService();
+  const plannedReferences = content.flatMap(item => {
+    if (item.type !== "image") return [];
+    const reference = toolImageReference(item.data);
+    return [{ ...reference, objectKey: `${context.companyId}/tool-results/${context.invocationId}/${reference.sha256}`,
+      provider: storage!.provider, mimeType: item.mimeType }];
+  });
+  const withReferences = (imageReferences: typeof plannedReferences): ToolExecutionResult => ({
+    ...execution,
+    result: { ...execution.result, mcpContent: content, data: { ...record(execution.result.data), transport: "paperclip_plugin", imageReferences } },
+  });
+  // Host metadata is part of the advertised total, not a post-validation bonus.
+  // Reject its entire known budget before the first private image write.
+  validatePluginToolResult(withReferences(plannedReferences).result);
+  const imageReferences: typeof plannedReferences = [];
   try {
     for (const item of content) {
       if (item.type !== "image") continue;
       context.signal?.throwIfAborted();
-      storage ??= getStorageService();
-      const reference = toolImageReference(item.data);
-      const stored = await storage.putFile({
+      const planned = plannedReferences[imageReferences.length]!;
+      const stored = await storage!.putFile({
         companyId: context.companyId,
         namespace: "tool-results",
-        objectKey: `${context.companyId}/tool-results/${context.invocationId}/${reference.sha256}`,
+        objectKey: planned.objectKey,
         originalFilename: null,
         contentType: item.mimeType,
         body: Buffer.from(item.data, "base64"),
         signal: context.signal,
       });
-      imageReferences.push({ ...reference, objectKey: stored.objectKey, provider: stored.provider, mimeType: item.mimeType });
+      imageReferences.push({ ...planned, objectKey: stored.objectKey, provider: stored.provider });
     }
+    const prepared = withReferences(imageReferences);
+    // Do not trust a provider to return metadata of the planned byte length.
+    validatePluginToolResult(prepared.result);
+    return prepared;
   } catch (error) {
-    // Earlier writes from this failed result must not become successful receipts.
+    // Earlier writes, including a late metadata-cap failure, are not success.
     await Promise.allSettled(imageReferences.map(image => storage!.deleteObject(context.companyId, image.objectKey)));
     throw error;
   }
-  return {
-    ...execution,
-    result: { ...execution.result, mcpContent: content, data: { ...record(execution.result.data), transport: "paperclip_plugin", imageReferences } },
-  };
 }
 
 /** Only opted-in native content unwraps; historical text-only envelopes stay byte-identical. */
@@ -95,4 +109,13 @@ export function pluginGatewayToolResult(execution: ToolExecutionResult): unknown
   // Adapt only explicit native results into #16517's existing governed shape.
   // No second wire projection, and no duplicate body in structured metadata.
   return { ...result, data: { ...record(result.data), transport: "paperclip_plugin", content: mcpContent } };
+}
+
+/** Reuse the same validator on #16517's governed deliverable before success. */
+export function validatePluginGatewayToolResult(value: unknown): void {
+  const result = record(value);
+  const data = record(result?.data);
+  if (data?.transport !== "paperclip_plugin") return;
+  const { content: mcpContent, ...metadata } = data;
+  validatePluginToolResult({ ...result, data: metadata, mcpContent } as ToolResult);
 }

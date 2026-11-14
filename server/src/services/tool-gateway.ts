@@ -1,5 +1,5 @@
 import { assertAgentToolAssignmentInteractions } from "./connection-management.js";
-import { preparePluginToolResult, pluginGatewayToolResult } from "./plugin-tool-result.js";
+import { preparePluginToolResult, pluginGatewayToolResult, validatePluginToolResult, validatePluginGatewayToolResult } from "./plugin-tool-result.js";
 import type { ToolExecutionResult } from "./plugin-tool-registry.js";
 import type { StorageService } from "../storage/types.js";
 import { isNewHumanIntentAfterToolRejection } from "./tool-action-replay-intent.js";
@@ -13124,6 +13124,9 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block", classifier: resultClassifier(session, tool, invocationId, { approvedAction: Boolean(input.approvedActionRequestId), signal: input.signal }),
         });
+        // Redaction can expand metadata. Validate the actual governed result
+        // before committing a success receipt or forwarding native content.
+        if (tool.providerType === "paperclip_plugin") validatePluginGatewayToolResult(resultValidation.value);
         const completedAt = new Date();
         const validatedMcpResult = connectedMcpExecution
           ? asRecord(resultValidation.value)
@@ -13550,6 +13553,7 @@ export function createToolGatewayService(
           sensitiveMode: "redact",
           promptInjectionMode: "block", classifier: resultClassifier(sessionLike, tool, invocationId, { signal: input.signal }),
         });
+        validatePluginToolResult((resultValidation.value as typeof result).result);
         await db
           .update(toolInvocations)
           .set({
