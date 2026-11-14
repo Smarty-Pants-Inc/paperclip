@@ -597,7 +597,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   // completed Boat stop are extracted from the gate's actual pre-followup rows;
   // original lease metadata is not in those dumps, so only the existing bound
   // stop protocol is reconstructed. Provider execution below is controlled.
-  it.each(["follow-up", "stop-owner-replay", "late-receipt"])("F1b seed-B preserves released proof and answers ONE follow-up (%s)", async shape => {
+  it.each(["follow-up", "stop-owner-replay", "late-receipt", "proof-arrives"])("F1b seed-B preserves released proof and answers ONE follow-up (%s)", async shape => {
     const seed = JSON.parse(await readFile(new URL("./f1b-seed-b.fixture.json", import.meta.url), "utf8"));
     const f = await piFixture();
     f.input.workspace.executionWorkspace.cwd = instructionRoot;
@@ -627,6 +627,35 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       errorCode: "runner_harness_state_mismatch: backup_without_reusable_lease" }).where(eq(heartbeatRuns.id, f.run.id));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null, leaseExpiresAt: null,
       recoveryState: "blocked" }).where(eq(nativeRunFinalizations.runId, f.run.id));
+    if (shape === "proof-arrives") {
+      await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, nativePhase: "observed" })
+        .where(eq(heartbeatRuns.id, prior.id));
+      await db.insert(nativeRunFinalizations).values({ companyId: prior.companyId, issueId: f.issue.id,
+        runId: prior.id, phase: "observed", attempt: 2, leaseOwner: "seed-b-stranded", leaseExpiresAt: new Date(0) });
+      await db.update(environmentLeases).set({ status: "pending_cleanup", cleanupStatus: "failed", releasedAt: null,
+        metadata: { pluginId: "fixture-boat" } }).where(eq(environmentLeases.id, lease.id));
+      await db.insert(issueRecoveryActions).values({ companyId: f.agent.companyId, sourceIssueId: f.issue.id,
+        kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "system",
+        returnOwnerAgentId: f.agent.id, fingerprint: `seed-b-wait:${f.run.id}`,
+        nextAction: "attempt 1/3, do not open a replacement", evidence: { runId: f.run.id } });
+      for (let sweep = 0; sweep < 3; sweep++) {
+        await settleUnrecoverableExecutions(db);
+        expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id)))).toHaveLength(2);
+        const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+          .filter(c => c.authorType === "system" && !c.metadata?.supersededByCommentId);
+        expect(notes).toHaveLength(1);
+        expect(await getExecutionBlocker(db, f.agent.companyId, f.issue.id)).not.toBeNull();
+      }
+      // Cleanup's receipt arrives, not a Retry or a second person message.
+      await db.update(environmentLeases).set({ status: lease.status, cleanupStatus: lease.cleanupStatus,
+        releasedAt: lease.releasedAt, metadata: lease.metadata, updatedAt: lease.updatedAt })
+        .where(eq(environmentLeases.id, lease.id));
+      await settleUnrecoverableExecutions(db);
+      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(1);
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.id)))[0])
+        .toMatchObject({ phase: "terminal_failure", leaseOwner: null, resultId: null });
+    }
     if (shape === "stop-owner-replay") {
       const { prepareUnconfirmedSourceSandboxStop, retryUnconfirmedSourceSandboxStop } = await import("../sandbox-stop-and-retain.js");
       expect(await prepareUnconfirmedSourceSandboxStop(db, lease)).toBeNull();
@@ -636,8 +665,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       trigger: "held_recovery", delivery: "caller_owns" });
     // Compare the WHOLE row: no healing after status/metadata destruction passes.
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
-    expect(result.kind).toBe("continued");
-    if (result.kind !== "continued") throw new Error(JSON.stringify(result));
+    expect(result.kind).toBe(shape === "proof-arrives" ? "already_continued" : "continued");
+    if (result.kind !== "continued" && result.kind !== "already_continued") throw new Error(JSON.stringify(result));
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
       issueId: f.issue.id, scopeKind: "issue", status: "running", createdAt: new Date(Date.now() + 1000),
       contextSnapshot: { issueId: f.issue.id, previousRunId: f.run.id, recoveryActionId: result.recoveryActionId,
@@ -655,10 +684,16 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(answer.settled.status).toBe("succeeded");
     expect(JSON.stringify(answer.prompts)).toContain(message.body);
     expect(JSON.stringify(answer.prompts)).toContain("Remember the word ALDER-B");
-    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
+    const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
+    const notes = allNotes.filter(c => !c.metadata?.supersededByCommentId);
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toContain("Starting a fresh thread");
+    await settleUnrecoverableExecutions(db); await settleUnrecoverableExecutions(db);
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system")).toHaveLength(allNotes.length);
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
+    expect(await getExecutionBlocker(db, f.agent.companyId, f.issue.id)).toBeNull();
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issue.id)))
+      .filter(action => ["active", "escalated"].includes(action.status))).toEqual([]);
   }, 60000);
 
   // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.
