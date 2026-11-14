@@ -539,4 +539,124 @@ if (printf x >> "$1") 2>/dev/null; then exit 72; fi
         assert!(!downloads.directory.exists());
         fs::remove_dir(root).unwrap();
     }
+
+    fn downloader_with_partial_file() -> (PathBuf, AttachmentDownloads, PathBuf) {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir(&root).unwrap();
+        let mut downloads = AttachmentDownloads::new(&root);
+        downloads.initialize().unwrap();
+        let partial = downloads.directory.join("partial.bin");
+        fs::write(&partial, vec![b'p'; 35]).unwrap();
+        assert_eq!(fs::metadata(&partial).unwrap().len(), 35);
+        (root, downloads, partial)
+    }
+
+    #[test]
+    fn finish_turn_clears_partial_files() {
+        let (root, mut downloads, partial) = downloader_with_partial_file();
+        downloads.finish_turn();
+        assert!(!partial.exists());
+        assert!(!downloads.directory.exists());
+        drop(downloads);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn open_next_turn_keeps_a_download_completed_before_turn_start() {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir(&root).unwrap();
+        let mut downloads = AttachmentDownloads::new(&root);
+        downloads.initialize().unwrap();
+        let input = grant(b"turn N attachment");
+        let id = downloads
+            .start_worker(move || {
+                Ok(read_verified(b"turn N attachment".as_slice(), &input).unwrap())
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let event = loop {
+            if let Some(event) = downloads.take_result_event() {
+                break event;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(event.event_type, DOWNLOAD_RESULT_EVENT);
+        assert_eq!(event.payload["downloadId"], id.to_string());
+        assert_eq!(event.payload["status"], "ready");
+        let path = PathBuf::from(event.payload["path"].as_str().unwrap());
+        assert!(path.exists());
+        assert_eq!(fs::read(&path).unwrap(), b"turn N attachment");
+
+        // The attachment is already staged for turn N before the next turn.start boundary.
+        downloads.open_next_turn();
+        assert!(path.exists());
+        assert_eq!(fs::read(&path).unwrap(), b"turn N attachment");
+        assert_eq!(event.payload["status"], "ready");
+        drop(downloads);
+        assert!(!path.exists());
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn close_clears_partial_files() {
+        let (root, mut downloads, partial) = downloader_with_partial_file();
+        downloads.close();
+        assert!(!partial.exists());
+        assert!(!downloads.directory.exists());
+        drop(downloads);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn reset_clears_partial_files() {
+        let (root, mut downloads, partial) = downloader_with_partial_file();
+        downloads.reset();
+        assert!(!partial.exists());
+        assert!(!downloads.directory.exists());
+        drop(downloads);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn drop_clears_partial_files() {
+        let (root, downloads, partial) = downloader_with_partial_file();
+        drop(downloads);
+        assert!(!partial.exists());
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn late_worker_after_cancel_does_not_resurrect_file_or_result() {
+        let root = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        fs::create_dir(&root).unwrap();
+        let mut downloads = AttachmentDownloads::new(&root);
+        downloads.initialize().unwrap();
+        let partial = downloads.directory.join("partial.bin");
+        let worker_partial = partial.clone();
+        let (partial_ready, ready) = mpsc::channel();
+        let (release_worker, blocked) = mpsc::channel();
+        downloads
+            .start_worker(move || {
+                fs::write(&worker_partial, vec![b'p'; 35]).unwrap();
+                partial_ready.send(()).unwrap();
+                blocked.recv().unwrap();
+                Ok(DownloadedAttachment {
+                    bytes: b"late complete attachment".to_vec(),
+                    extension: ".png",
+                })
+            })
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(partial.exists());
+        downloads.close();
+        assert!(!partial.exists());
+        release_worker.send(()).unwrap();
+        downloads.pending.take().unwrap().worker.join().unwrap();
+        assert!(!partial.exists());
+        assert!(!downloads.directory.exists());
+        assert!(downloads.take_result_event().is_none());
+        drop(downloads);
+        fs::remove_dir(root).unwrap();
+    }
 }
