@@ -12,7 +12,7 @@ const eligibility = `CASE
     OR f.conversation_agent_id IS DISTINCT FROM $3::uuid THEN 'not_this_conversation'
   WHEN NULLIF(f.wake_comment_id, '') IS NULL THEN 'no_person_message'
   WHEN f.existing_comment_id IS NULL THEN 'missing_message'
-  WHEN f.message_conversation_id IS DISTINCT FROM f.conversation_id THEN 'not_this_conversation'
+  WHEN f.message_conversation_id IS DISTINCT FROM (f.conversation_id) THEN 'not_this_conversation'
   WHEN f.message_deleted THEN 'deleted'
   WHEN f.author_user_id IS DISTINCT FROM $4::text OR f.author_agent_id IS NOT NULL
     OR f.message_kind = 'agent' OR f.system_note IS TRUE THEN 'not_paul'

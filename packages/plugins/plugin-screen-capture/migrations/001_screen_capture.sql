@@ -62,7 +62,6 @@ SELECT r.company_id, r.id AS run_id, r.agent_id, r.status AS run_status,
     SELECT 1 FROM public.issue_comments newer
     WHERE newer.company_id = r.company_id AND newer.issue_id = i.id
       AND newer.deleted_at IS NULL AND newer.author_user_id IS NOT NULL
-      AND newer.author_agent_id IS NULL
       AND COALESCE(newer.author_type, 'user') <> 'system'
       AND COALESCE(newer.presentation->>'kind', '') <> 'system_notice'
       AND newer.created_at > c.created_at

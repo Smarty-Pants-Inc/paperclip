@@ -4,8 +4,8 @@ import {
 } from './sql.mjs';
 
 export const REFUSAL = 'Only Paul can ask me to look at his screen, from his own conversation.';
-export const DISCLOSURE = "A capture stores what's on your screen in this chat's history; don't ask while client data is open.";
-export const STUB_REPLY = 'No screen was captured and no image was stored. The recorder is a stub.';
+export const DISCLOSURE = "A capture is stored in this chat's history AND sent to our Langfuse tracing (EU); don't ask while client data is on screen.";
+export const STUB_REPLY = `No screen was captured and no image was stored. The recorder is a stub. Real-capture policy (not performed here): ${DISCLOSURE}`;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const BUNDLE_ID = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
 

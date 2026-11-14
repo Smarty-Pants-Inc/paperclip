@@ -1,8 +1,7 @@
 import { readFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { before, beforeEach, test } from 'node:test';
-import { createCaptureHandler, REFUSAL, STUB_REPLY } from '../capture.mjs';
+import { createCaptureHandler, DISCLOSURE, REFUSAL, STUB_REPLY } from '../capture.mjs';
 import { NAMESPACE, CLAIM, READ_FACTS } from '../sql.mjs';
 import { postgres } from './postgres.mjs';
 
@@ -59,15 +58,18 @@ async function expectRefusal(reason, call = () => handler()({}, context)) {
   return log[0];
 }
 
-async function later({ person = false, system = false, deleted = false } = {}) {
+async function later({ person = false, authorType, systemNotice = false, deleted = false, sameTime = false } = {}) {
   await pg.raw(`INSERT INTO public.issue_comments VALUES ('${id(20)}', '${C}', '${I}',
     ${person ? "'test-principal'" : 'NULL'}, ${person ? 'NULL' : `'${A}'`},
-    '${system ? 'system' : person ? 'user' : 'agent'}', '2026-01-01T00:00:01Z',
-    ${deleted ? "'2026-01-01T00:00:02Z'" : 'NULL'}, ${system ? "'{\"kind\":\"system_notice\"}'" : 'NULL'}, 'not returned');`);
+    '${authorType ?? (person ? 'user' : 'agent')}', '2026-01-01T00:00:0${sameTime ? '0' : '1'}Z',
+    ${deleted ? "'2026-01-01T00:00:02Z'" : 'NULL'}, ${systemNotice ? "'{\"kind\":\"system_notice\"}'" : 'NULL'}, 'not returned');`);
 }
 
 test('qualified newest unanswered request claims once, stores witness, and explicitly returns no image in stub', async () => {
-  assert.deepEqual(await handler()({ windowApp: 'com.apple.Notes' }, context), { content: STUB_REPLY });
+  const reply = await handler()({ windowApp: 'com.apple.Notes' }, context);
+  assert.deepEqual(reply, { content: STUB_REPLY });
+  assert.ok(reply.content.includes(DISCLOSURE));
+  assert.ok(reply.content.includes('No screen was captured and no image was stored.'));
   assert.equal(uses, 1);
   const [claim] = await rows('capture_claims');
   assert.equal(claim.wake_comment_id, M);
@@ -97,8 +99,33 @@ test('RED newest person message supersedes wakeCommentId', async () => {
   await expectRefusal('not_newest_unanswered');
 });
 
-test('system notes are not answers, and deleted later comments are ignored', async () => {
-  await later({ system: true });
+test('R4b author_type=system alone is not an answer, even with an agent ID', async () => {
+  await later({ authorType: 'system' });
+  const [note] = await pg.query(`SELECT author_type, author_agent_id, presentation FROM public.issue_comments WHERE id='${id(20)}'`);
+  assert.equal(note.author_type, 'system');
+  assert.equal(note.author_agent_id, A);
+  assert.equal(note.presentation, null);
+  assert.deepEqual(await handler()({}, context), { content: STUB_REPLY });
+});
+
+test('R4b presentation.kind=system_notice alone is not an answer with author_type=agent', async () => {
+  await later({ systemNotice: true });
+  const [note] = await pg.query(`SELECT author_type, author_agent_id, presentation FROM public.issue_comments WHERE id='${id(20)}'`);
+  assert.equal(note.author_type, 'agent');
+  assert.equal(note.author_agent_id, A);
+  assert.deepEqual(note.presentation, { kind: 'system_notice' });
+  assert.deepEqual(await handler()({}, context), { content: STUB_REPLY });
+});
+
+for (const person of [false, true]) {
+  test(`R4 ignores a deleted later ${person ? 'person' : 'agent'} comment`, async () => {
+    await later({ person, deleted: true });
+    assert.deepEqual(await handler()({}, context), { content: STUB_REPLY });
+  });
+}
+
+test('R4 strict created_at comparison does not treat equal timestamps as later', async () => {
+  await later({ sameTime: true });
   assert.deepEqual(await handler()({}, context), { content: STUB_REPLY });
 });
 
@@ -107,6 +134,16 @@ test('ops structured author refused and correctly attributed, even with principa
   const log = await expectRefusal('not_paul');
   assert.equal(log.author_user_id, 'test-ops');
   assert.equal(log.responsible_user_id, 'test-principal');
+});
+
+test('responsible user is independently checked, not inherited from message author', async () => {
+  await pg.raw(`UPDATE public.heartbeat_runs SET responsible_user_id='test-ops' WHERE id='${R}'`);
+  await expectRefusal('not_paul');
+});
+
+test('non-running run refused', async () => {
+  await pg.raw(`UPDATE public.heartbeat_runs SET status='cancelled' WHERE id='${R}'`);
+  await expectRefusal('run_not_running');
 });
 
 test('agent-authored comment cannot impersonate principal', async () => {
@@ -119,7 +156,7 @@ test('wake comment on another issue refused', async () => {
   await expectRefusal('not_this_conversation');
 });
 
-test('hire does not inherit primary permission', async () => {
+test('RED non-primary/hire calling the tool gets logged not_primary refusal', async () => {
   await pg.raw(`UPDATE public.heartbeat_runs SET agent_id='${H}' WHERE id='${R}'`);
   await expectRefusal('not_primary', () => handler()({}, { ...context, agentId: H }));
 });
@@ -129,7 +166,7 @@ test('task, not personal conversation, refused', async () => {
   await expectRefusal('not_this_conversation');
 });
 
-for (const source of ['timer', 'automation', 'on_demand']) {
+for (const source of ['timer', 'automation', 'on_demand', 'monitor']) {
   test(`scheduled/self run with no person witness refused (${source})`, async () => {
     await pg.raw(`UPDATE public.heartbeat_runs SET context_snapshot='{}', invocation_source='${source}' WHERE id='${R}'`);
     await expectRefusal('no_person_message');
@@ -221,6 +258,55 @@ test('fresh claim SQL rechecks eligibility after initial read; zero rows classif
   } };
   await expectRefusal('not_newest_unanswered', () => createCaptureHandler({ ...deps, db: changingDb })({}, context));
   assert.equal(inserts, 1);
+});
+
+test('one active run claim excludes a different newer message until recorder finishes', async () => {
+  let entered, finish;
+  const using = new Promise(resolve => { entered = resolve; });
+  const release = new Promise(resolve => { finish = resolve; });
+  const recorder = { async use() {
+    uses++;
+    entered();
+    await release;
+    return { outcome: 'not_captured', reason: 'stub_recorder' };
+  } };
+  const capture = createCaptureHandler({ ...deps, recorder });
+  const first = capture({}, context);
+  try {
+    await using;
+    await later({ person: true });
+    await pg.raw(`UPDATE public.heartbeat_runs SET context_snapshot=jsonb_set(context_snapshot,
+      '{wakeCommentId}', to_jsonb('${id(20)}'::text)) WHERE id='${R}'`);
+    assert.deepEqual(await handler()({}, context), { content: REFUSAL });
+    assert.equal((await rows('capture_log')).filter(row => row.reason === 'capture_in_flight').length, 1);
+    assert.equal((await rows('capture_claims')).length, 1);
+  } finally {
+    finish();
+    await first;
+  }
+  assert.equal(uses, 1);
+});
+
+test('expired reservation refused before stub use and never reopened', async () => {
+  const expiredDb = { ...db, async execute(sql, params) {
+    const result = await db.execute(sql, params);
+    if (sql === CLAIM && result.rowCount === 1) await pg.raw(`UPDATE ${NAMESPACE}.capture_claims SET expires_at='2000-01-01T00:00:00Z'`);
+    return result;
+  } };
+  assert.deepEqual(await createCaptureHandler({ ...deps, db: expiredDb })({}, context), { content: REFUSAL });
+  assert.equal(uses, 0);
+  assert.equal((await rows('capture_log'))[0].reason, 'claim_expired');
+  assert.equal((await rows('capture_claims'))[0].in_flight, false);
+});
+
+test('zero rows without a current conflict witness logs observation, never guesses or retries', async () => {
+  let attempts = 0;
+  const noClaimDb = { ...db, async execute(sql, params) {
+    if (sql === CLAIM) { attempts++; return { rowCount: 0 }; }
+    return db.execute(sql, params);
+  } };
+  await expectRefusal('claim_not_acquired', () => createCaptureHandler({ ...deps, db: noClaimDb })({}, context));
+  assert.equal(attempts, 1);
 });
 
 test('view exposes metadata only, never comment body or whole context/presentation', async () => {
