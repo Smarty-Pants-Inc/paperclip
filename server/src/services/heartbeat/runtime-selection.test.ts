@@ -593,6 +593,74 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(old.metadata?.supersededByCommentId).toBe(currentNotices(allNotes)[0].id);
   });
 
+  // Keep: recorded SEED-B data-safety incident. Allocation timestamps and the
+  // completed Boat stop are extracted from the gate's actual pre-followup rows;
+  // original lease metadata is not in those dumps, so only the existing bound
+  // stop protocol is reconstructed. Provider execution below is controlled.
+  it.each(["follow-up", "stop-owner-replay", "late-receipt"])("F1b seed-B preserves released proof and answers ONE follow-up (%s)", async shape => {
+    const seed = JSON.parse(await readFile(new URL("./f1b-seed-b.fixture.json", import.meta.url), "utf8"));
+    const f = await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected selection");
+    const oldId = first.nativeExecution.session.normalizedSessionId!;
+    const [prior] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+      issueId: f.issue.id, nativeIssueId: f.issue.id, nativeSessionId: oldId, runtimeMode: "native", status: "succeeded",
+      finishedAt: new Date(seed.lease.releasedAt), createdAt: new Date(seed.lease.acquiredAt) }).returning();
+    for (const comment of [...seed.comments].reverse()) await db.insert(issueComments).values({
+      companyId: f.agent.companyId, issueId: f.issue.id, authorType: comment.authorType,
+      ...(comment.authorType === "agent" ? { authorAgentId: f.agent.id } : { authorUserId: "local-board" }),
+      body: comment.body, createdAt: new Date(seed.lease.acquiredAt) });
+    const [message] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+      authorType: "user", authorUserId: "local-board", body: "What word did I ask you to remember? Reply with that word only." }).returning();
+    const confirmedAt = shape === "late-receipt" ? new Date(new Date(seed.lease.releasedAt).getTime() + 1).toISOString() : seed.stop.endedAt;
+    const [lease] = await db.insert(environmentLeases).values({ id: seed.lease.id, companyId: f.agent.companyId,
+      heartbeatRunId: prior.id, issueId: f.issue.id, provider: seed.lease.provider, providerLeaseId: seed.boxId,
+      status: seed.lease.status, leasePolicy: seed.lease.leasePolicy, cleanupStatus: seed.lease.cleanupStatus,
+      acquiredAt: new Date(seed.lease.acquiredAt), releasedAt: new Date(seed.lease.releasedAt), metadata: {
+        pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
+          companyId: f.agent.companyId, runId: prior.id, leaseId: seed.lease.id,
+          provider: seed.lease.provider, providerLeaseId: seed.boxId, state: "stopped", confirmedAt },
+        boatStop: seed.stop, boatState: seed.state,
+      } }).returning();
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+      errorCode: "runner_harness_state_mismatch: backup_without_reusable_lease" }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null, leaseExpiresAt: null,
+      recoveryState: "blocked" }).where(eq(nativeRunFinalizations.runId, f.run.id));
+    if (shape === "stop-owner-replay") {
+      const { prepareUnconfirmedSourceSandboxStop, retryUnconfirmedSourceSandboxStop } = await import("../sandbox-stop-and-retain.js");
+      expect(await prepareUnconfirmedSourceSandboxStop(db, lease)).toBeNull();
+      expect(await retryUnconfirmedSourceSandboxStop(db, lease)).toBeNull();
+    }
+    const result = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
+      trigger: "held_recovery", delivery: "caller_owns" });
+    // Compare the WHOLE row: no healing after status/metadata destruction passes.
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
+    expect(result.kind).toBe("continued");
+    if (result.kind !== "continued") throw new Error(JSON.stringify(result));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", status: "running", createdAt: new Date(Date.now() + 1000),
+      contextSnapshot: { issueId: f.issue.id, previousRunId: f.run.id, recoveryActionId: result.recoveryActionId,
+        forceFreshSession: true } }).returning();
+    f.input.run = run; f.input.task.context = run.contextSnapshot!;
+    f.input.session.persistedNativeExecutionInput = null; f.input.session.persistedRunnerProfile = {};
+    f.input.session.getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+      agentId: f.agent.id, issueId: f.issue.id, before: run.createdAt });
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected fresh selection");
+    expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(oldId);
+    await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, f.issue.id));
+    const answer = await answerWithNativePeer({ db, execution: selected.nativeExecution,
+      runnerInstanceId: selected.nativeRunnerInstanceId!, text: "ALDER-B", getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+    expect(answer.settled.status).toBe("succeeded");
+    expect(JSON.stringify(answer.prompts)).toContain(message.body);
+    expect(JSON.stringify(answer.prompts)).toContain("Remember the word ALDER-B");
+    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toContain("Starting a fresh thread");
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
+  }, 60000);
+
   // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.
   // These exercise the durable disposition -> mint -> history -> executor answer,
   // not a stand-in success from a classifier or a note-only recovery.

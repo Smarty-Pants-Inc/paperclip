@@ -1,0 +1,37 @@
+{
+  "lease": {
+    "id": "465b4eb1-e6c7-4107-93a0-a903997ada1c",
+    "status": "released",
+    "leasePolicy": "reuse_by_environment",
+    "provider": "boat",
+    "providerLeaseId": "bx_ysh5xvy5",
+    "executionWorkspaceId": "5b98168b-af29-4265-a74d-4343738e4431",
+    "workspacePath": "/home/user/paperclip-workspace",
+    "failureReason": null,
+    "cleanupStatus": "success",
+    "acquiredAt": "2026-11-14T13:22:11.225Z",
+    "releasedAt": "2026-11-14T13:37:51.697Z"
+  },
+  "stop": {
+    "id": "stop_82fa9f88255de1ce",
+    "status": "completed",
+    "requestedAt": null,
+    "lastAttemptAt": "2026-11-14T13:37:50.735Z",
+    "error": null,
+    "endedAt": "2026-11-14T13:37:50.735Z",
+    "forced": false
+  },
+  "boxId": "bx_ysh5xvy5",
+  "state": "archived",
+  "stoppedAt": "2026-11-14T13:37:50.716Z",
+  "comments": [
+    {
+      "body": "noted.",
+      "authorType": "agent"
+    },
+    {
+      "body": "Remember the word ALDER-B. Reply only: noted.",
+      "authorType": "user"
+    }
+  ]
+}
