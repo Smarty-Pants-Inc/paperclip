@@ -5,6 +5,8 @@ import { agentWakeupRequests, heartbeatRuns, issueComments, issues } from "@pape
 import { recoveryService } from "../services/recovery/service.js";
 import { describeIssueRecovery, issueRecoveryFixture } from "./issue-recovery.test-fixture.js";
 
+type RecoveryEnqueueWakeup = NonNullable<Parameters<typeof recoveryService>[1]["enqueueWakeup"]>;
+
 // Keep: the recorded RFL duplicate-successor incident crosses two independently
 // registered recovery owners. Exercise their durable ownership signal through
 // the production selector/checker against PostgreSQL.
@@ -42,7 +44,7 @@ describeIssueRecovery("RFL round 7 review-path ownership", () => {
         wakeReason: "issue_review_path_lost", reviewPathRecoveryAttempt: 1,
       } });
 
-    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const enqueueWakeup = vi.fn<RecoveryEnqueueWakeup>(async () => ({ id: randomUUID() } as never));
     const assignedWork = recoveryService(state.db, { enqueueWakeup }).assignedWork;
     const suspects = await assignedWork.listSuspects({ companyId: f.companyId }, null, 100);
     const check = await assignedWork.checkIssue({ companyId: f.companyId, issueId: f.issueId });
@@ -65,7 +67,7 @@ describeIssueRecovery("RFL round 7 review-path ownership", () => {
       payload: { issueId: f.issueId, taskId: f.issueId, reviewPathRecoveryAttempt: 1 },
       idempotencyKey: `issue_review_path_lost:${f.issueId}:fixture` });
 
-    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const enqueueWakeup = vi.fn<RecoveryEnqueueWakeup>(async () => ({ id: randomUUID() } as never));
     const assignedWork = recoveryService(state.db, { enqueueWakeup }).assignedWork;
     const suspects = await assignedWork.listSuspects({ companyId: f.companyId }, null, 100);
     const check = await assignedWork.checkIssue({ companyId: f.companyId, issueId: f.issueId });
@@ -82,7 +84,7 @@ describeIssueRecovery("RFL round 7 review-path ownership", () => {
 
   it("continues a NULL-channel unanswered chat when no review-path owner signal exists", async () => {
     const f = await seed();
-    const enqueueWakeup = vi.fn(async () => ({ id: "one-chat-gap-successor" }));
+    const enqueueWakeup = vi.fn<RecoveryEnqueueWakeup>(async () => ({ id: "one-chat-gap-successor" } as never));
     const assignedWork = recoveryService(state.db, { enqueueWakeup }).assignedWork;
     const suspects = await assignedWork.listSuspects({ companyId: f.companyId }, null, 100);
     const check = await assignedWork.checkIssue({ companyId: f.companyId, issueId: f.issueId });

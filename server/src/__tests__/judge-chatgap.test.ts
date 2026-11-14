@@ -188,7 +188,7 @@ suite("RFL chat-gap independent acceptance", () => {
     { status: "in_progress", state: "active" },
     { status: "in_review", state: "waiting" },
     { status: "in_review", state: "active" },
-  ])("holds an unanswered failed $status/$state chat until its executor is proven gone", async ({ status, state }) => {
+  ] as const)("holds an unanswered failed $status/$state chat until its executor is proven gone", async ({ status, state }) => {
     const f = await seed(status);
     await db.update(issues).set({ conversationState: state }).where(eq(issues.id, f.issueId));
     await finalizeFixture(f);
