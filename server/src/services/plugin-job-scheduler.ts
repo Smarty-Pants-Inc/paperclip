@@ -1,4 +1,5 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { pluginJobs, pluginJobRuns, type Db } from "@paperclipai/db";
 import { pluginJobStore, type PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -81,6 +82,19 @@ export function createPluginJobScheduler(options: PluginJobSchedulerOptions): Pl
     if (pendingSettlements.get(jobId) === entry) pendingSettlements.delete(jobId);
   }
 
+  // One restart per plugin at a time, however many of its jobs time out.
+  const restarts = new Map<string, Promise<void>>();
+  function restartWorker(pluginId: string) {
+    let restart = restarts.get(pluginId);
+    if (!restart) {
+      restart = Promise.resolve().then(() => workerManager.getWorker(pluginId)?.restart())
+        .catch(err => log.error({ pluginId, err }, "plugin worker restart after job timeout failed"))
+        .finally(() => restarts.delete(pluginId));
+      restarts.set(pluginId, restart);
+    }
+    return restart;
+  }
+
   async function execute(job: Job, runId: string, trigger: Trigger) {
     const startedAt = Date.now();
     let error: string | undefined;
@@ -93,6 +107,9 @@ export function createPluginJobScheduler(options: PluginJobSchedulerOptions): Pl
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
       log.error({ jobId: job.id, runId, err }, "plugin job failed");
+      // A timeout only stops the wait; the worker may still run the job.
+      // Stop it before the run settles, so the job never runs twice at once.
+      if ((err as { code?: unknown } | null)?.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) await restartWorker(job.pluginId);
     }
     const finishedAt = new Date();
     pendingSettlements.set(job.id, { persist: () => db.transaction(async tx => {

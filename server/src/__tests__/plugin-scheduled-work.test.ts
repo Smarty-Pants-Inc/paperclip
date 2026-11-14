@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { createDb, plugins, pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { createPluginJobScheduler } from "../services/plugin-job-scheduler.js";
@@ -133,6 +134,23 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     finish();
     await completed();
     expect((await runs()).map(run => [run.id, run.status])).toEqual([[own.id, "succeeded"]]);
+  });
+
+  it("restarts a worker whose job timed out before the run settles, so the job never overlaps itself", async () => {
+    await due();
+    let restarted!: () => void;
+    const restart = vi.fn(() => new Promise<void>(resolve => { restarted = resolve; }));
+    Object.assign(events, { restart });
+    rpc.mockRejectedValueOnce(new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT, message: 'RPC call "runJob" timed out after 300000ms' }));
+    await start();
+    await vi.waitFor(async () => { await vi.advanceTimersByTimeAsync(100); expect(restart).toHaveBeenCalledOnce(); }, { timeout: 5000 });
+    // The timed-out execution may still run until its worker is replaced.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect((await runs()).map(run => run.status)).toEqual(["running"]);
+    expect(rpc).toHaveBeenCalledOnce();
+    restarted();
+    await completed();
+    expect((await runs())[0]).toMatchObject({ status: "failed", error: expect.stringContaining("timed out") });
   });
 
   it("does not query repeatedly after an empty startup reconciliation", async () => { await start(); await quiet(); });
