@@ -744,6 +744,10 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     await sweep(f, 0);
     // Config reload reconciles at startup. Arm a fresh request first so that
     // startup cannot post before the two racing jobs under test.
+    const namespace = await guardianNamespace();
+    // TEST CLOCK: backdate enabled_at by 10 min so backdated messages are eligible
+    const updated = await db.$client.unsafe(`UPDATE "${namespace}".configured_companies SET enabled_at = now() - interval '10 minutes' WHERE company_id = $1::uuid AND enabled = true RETURNING company_id`, [f.company.id]);
+    expect(updated).toHaveLength(1);
     f.old = new Date(Date.now() - 180_000);
     await db.update(issueComments).set({ createdAt: f.old }).where(eq(issueComments.id, f.request!.id));
     expect(await notes(f, "I4 / before racing triggers")).toHaveLength(0);
@@ -762,6 +766,10 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
   it("I4 / mid-post worker restart: blocked real comment insert reconciles to at most one note", async () => {
     const f = await seed(true, false);
     await sweep(f, 0);
+    const namespace = await guardianNamespace();
+    // TEST CLOCK: backdate enabled_at by 10 min so backdated messages are eligible
+    const updated = await db.$client.unsafe(`UPDATE "${namespace}".configured_companies SET enabled_at = now() - interval '10 minutes' WHERE company_id = $1::uuid AND enabled = true RETURNING company_id`, [f.company.id]);
+    expect(updated).toHaveLength(1);
     f.old = new Date(Date.now() - 180_000);
     await db.update(issueComments).set({ createdAt: f.old }).where(eq(issueComments.id, f.request!.id));
     expect(await notes(f, "I4 / before mid-post trigger")).toHaveLength(0);
