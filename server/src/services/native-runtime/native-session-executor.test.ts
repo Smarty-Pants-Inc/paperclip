@@ -88,6 +88,7 @@ import { nativeSha256 } from "./canonical.js";
 import { resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT, RemoteRunnerRecoveryError, readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "./native-runner-recovery-contract.js";
+import { createSandboxRunnerSupervision } from "./sandbox-runner-retention.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { AgentDirectoryOperationBusyError, agentDirectoryWorkingCopyService } from "../agent-directory-working-copies.js";
 import { probeAgentDirectory } from "../agent-directory-probe.js";
@@ -1709,6 +1710,56 @@ describe.skipIf(!existsSync("/proc/self/cmdline"))("remote runner launch stale s
 });
 
 describe("remote runner process supervision", () => {
+  it("parks an unverified idle retained runner and re-arms one check on reattach", async () => {
+    vi.useFakeTimers();
+    const supervision = createSandboxRunnerSupervision();
+    const idleSupervision = supervision as typeof supervision & { pauseForIdle?: () => void; resumeForRun?: () => void };
+    let nonce = "";
+    let probes = 0;
+    let dead = false;
+    const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+    const execute = vi.fn(async (request: { args?: string[] }) => {
+      const label = request.args?.[2];
+      if (label === "paperclip-runner-launch") { nonce = request.args![4]!; return ok; }
+      if (label === "paperclip-runner-process-identity") return { ...ok, stdout: `${nonce}\n4321\n2026-09-06T00:00:00.000Z\nrunner-idle\n` };
+      if (label === "paperclip-runner-monitor") { probes++; return { ...ok, exitCode: dead ? 45 : 0 }; }
+      return { ...ok, exitCode: 1 };
+    });
+    const handle = createRemoteRunnerProcessLauncher({
+      target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
+      runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
+      stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-idle",
+      sandboxRetention: { supervision, launch: async (request: { identityNonce: string }) => { nonce = request.identityNonce; }, retiredBeforeClaim: () => false } as never,
+    })({ command: "/runtime/runnerd", args: [], cwd: "/workspace", environment: {} });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(probes).toBe(1);
+      // Native run finalization parks the still-retained lease. A living process
+      // is not proof of exit, and the idle monitor must stop sending commands.
+      idleSupervision.pauseForIdle!();
+      await vi.advanceTimersByTimeAsync(125_000);
+      const parkedCount = probes;
+      await vi.advanceTimersByTimeAsync(125_000);
+      expect(probes).toBe(parkedCount);
+      expect(handle.isExitConfirmed?.()).toBe(false);
+
+      // A real reattach resumes supervision and gets one fresh observation.
+      idleSupervision.resumeForRun!();
+      handle.requestExitVerification?.();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(probes).toBe(parkedCount + 1);
+      expect(handle.isExitConfirmed?.()).toBe(false);
+      supervision.pauseForIdle();
+    } finally {
+      dead = true;
+      idleSupervision.resumeForRun?.();
+      handle.requestExitVerification?.();
+      await vi.advanceTimersByTimeAsync(5_000);
+      await handle.completion.catch(() => undefined);
+      vi.useRealTimers();
+    }
+  });
+
   // Keep reason: measured production command/audit amplification (cl-poll-bound).
   it("bounds ten warm runner probes to one per 5 seconds and detects exit 45 on the next probe", async () => {
     vi.useFakeTimers();
