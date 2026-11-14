@@ -1124,7 +1124,7 @@ describe("PaperclipRunnerToolAuthority", () => {
   it("marks host-owned tools core and passes pinned connection provenance only to Pi", () => {
     const assignedTool = { name: "app_github_read", description: "Read GitHub", inputSchema: { type: "object" }, paperclipToolSource: { kind: "core" } };
     const source = { connectionId: "github-id", connectionName: "Renamed GitHub", installedAt: "2026-01-01T00:00:00.000Z" };
-    const assignedMcpTools = { definitions: () => [assignedTool], has: (name: string) => name === assignedTool.name, execute: vi.fn(), provenance: () => source };
+    const assignedMcpTools = { definitions: () => [assignedTool], has: (name: string) => name === assignedTool.name, execute: vi.fn(), close: vi.fn(), provenance: () => source };
     const binding = { companyId, agentId, issueId, runId, assignedMcpTools };
     const ordinary = new PaperclipRunnerToolAuthority(db, binding).definitions();
     const pi = new PaperclipRunnerToolAuthority(db, { ...binding, toolProvenance: true }).definitions();
