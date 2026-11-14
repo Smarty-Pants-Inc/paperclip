@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, lte, or, sql, type SQL } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -405,7 +405,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
   return sql`(exists (select 1 from ${issueComments} m
       where m.company_id = ${companyId} and m.issue_id = ${issueId} and m.author_type = 'user'
         and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
-        and not ${conversationResetSql({ body: sql.raw("m.body"), authorUserId: sql.raw("m.author_user_id") })}
+        and not ${conversationResetSql({ body: sql.raw("m.body"), authorUserId: sql.raw("m.author_user_id"), issueId: sql.raw("m.issue_id") })}
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
@@ -438,7 +438,7 @@ export function unansweredPersonMessageCommentCondition(): SQL {
   return sql`((${issueComments.authorType} = 'user' and ${issueComments.deletedAt} is null
       and ${inScopeSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }, since)}
-      and not ${conversationResetSql({ body: issueComments.body, authorUserId: issueComments.authorUserId })}
+      and not ${conversationResetSql({ body: issueComments.body, authorUserId: issueComments.authorUserId, issueId: issueComments.issueId })}
       and not ${answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
@@ -812,7 +812,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
   if (issue.hiddenAt || !issue.assigneeAgentId || issue.assigneeUserId
     || !["todo", "in_progress", "in_review", "blocked"].includes(issue.status)) return { kind: "out_of_scope" };
-  const isReset = conversationResetSql({ body: issueComments.body, authorUserId: issueComments.authorUserId });
+  const isReset = conversationResetSql({ body: issueComments.body, authorUserId: issueComments.authorUserId, issueId: issueComments.issueId });
   // The person's latest MESSAGE: a "/new" session reset (Paperclip's
   // isConversationReset, SMAA-1909) is a command, never a message owed a reply.
   const [message] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt }).from(issueComments).where(and(
@@ -824,26 +824,47 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (!message) return { kind: "none" };
   const decision = await decideForMessage(q, issue, message, now, nativeBlockedRepairApplies);
   if (decision.kind !== "notice" && decision.kind !== "pending") return decision;
-  // A reset after the message is a boundary (RFL 13:51Z): a message the person
-  // reset away from WITHIN its note window goes without a note, but one whose
-  // window had already passed keeps it, however late the sweep (no false
-  // silence). The window is this same decision's deadline, judged at the
-  // reset's created_at: still pending then means it was not yet due.
+  // A reset after the message is a boundary (RFL 13:51Z, m15b B1): a message
+  // the person reset away from WITHIN its note window NEVER gets a note; one
+  // whose window had already passed keeps it, however late the sweep (no false
+  // silence). The window is this same decision, decided ONCE for the reset's
+  // created_at from the message's state AS OF then (durable timestamps), so a
+  // later failure cannot revive it: still pending then means not yet due.
   const [boundary] = await q.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), isReset,
     sql`(${issueComments.createdAt}, ${issueComments.id}) > (${message.createdAt.toISOString()}::timestamptz, ${message.id}::uuid)`))
     .orderBy(issueComments.createdAt, issueComments.id).limit(1);
-  if (boundary && (await decideForMessage(q, issue, message, boundary.createdAt, nativeBlockedRepairApplies)).kind === "pending") {
+  if (boundary && (await decideForMessage(q, issue, message, boundary.createdAt, nativeBlockedRepairApplies, true)).kind === "pending") {
     return { kind: "none" };
   }
   return decision;
 }
 
-/** The decision for one person message at a given time. Reads only. */
+/**
+ * The decision for one person message at `now`. Reads only. With `asOf`, `now`
+ * is a past instant (a reset's created_at) and the run and wake evidence is
+ * read AS OF then from durable timestamps (RFL m15b B1): a run or wake created
+ * later did not exist; one that ended later was still live (running if it had
+ * started, queued if not); a wake that failed later had not failed; a wait T0,
+ * a native-repair deferral or a hold recorded later had not been recorded;
+ * and a native finalization updated later is read as still pending.
+ */
 async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: string; createdAt: Date }, now: Date,
-  nativeBlockedRepairApplies?: NativeBlockedRepairApplies): Promise<Decision> {
+  nativeBlockedRepairApplies?: NativeBlockedRepairApplies, asOf = false): Promise<Decision> {
   const agentId = issue.assigneeAgentId!;
+  const existedBy = (column: AnyPgColumn) => (asOf ? [lte(column, now)] : []);
+  type RunState = { status: string; startedAt: Date | null; finishedAt: Date | null; updatedAt: Date };
+  // When a run ended: its finish, or (terminal without one) its last update.
+  const runEndedAt = sql`coalesce(${heartbeatRuns.finishedAt}, case when ${heartbeatRuns.status} in (${sql.join(TERMINAL.map(status => sql`${status}`), sql`, `)}) then ${heartbeatRuns.updatedAt} end)`;
+  // A run's state at `now` when reading as of a past instant.
+  const asOfRun = <T extends RunState>(r: T): T => {
+    if (!asOf) return r;
+    const endedAt = r.finishedAt ?? (TERMINAL.includes(r.status) ? r.updatedAt : null);
+    if (endedAt && endedAt <= now) return r;
+    return { ...r, status: r.startedAt && r.startedAt <= now ? "running" : "queued", finishedAt: null,
+      error: null, errorCode: null, resultJson: null, issueCommentStatus: null } as T;
+  };
   const [answer] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.id, message.id), answeredSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
@@ -875,16 +896,16 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
 
   // The run this message started (the latest run that carries it), if any.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
-  const runs = await q.select({
+  const runs = (await q.select({
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson,
     contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
-    retryOfRunId: heartbeatRuns.retryOfRunId,
+    retryOfRunId: heartbeatRuns.retryOfRunId, startedAt: heartbeatRuns.startedAt,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
-    gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000))))
-    .orderBy(desc(heartbeatRuns.createdAt)).limit(20);
+    gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000)), ...existedBy(heartbeatRuns.createdAt)))
+    .orderBy(desc(heartbeatRuns.createdAt)).limit(20)).map(asOfRun);
   // Only a run that carries THIS message is evidence about it. An unrelated
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
@@ -913,7 +934,7 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
       const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
         eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id),
         eq(activityLog.action, PENDING_WAIT_ACTION), sql`${activityLog.details}->>'messageId' = ${message.id}`,
-        sql`coalesce(${activityLog.details}->>'runId', '') = ${messageRun?.id ?? ""}`));
+        sql`coalesce(${activityLog.details}->>'runId', '') = ${messageRun?.id ?? ""}`, ...existedBy(activityLog.createdAt)));
       waitT0 = wait?.at ? new Date(wait.at).getTime() : null;
     }
     const bound = (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
@@ -934,10 +955,12 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
   // the person silent. When the run that waits carries the message, the note
   // says it is waiting to start, not that it failed.
   const live = runs.filter(candidate => LIVE.includes(candidate.status));
-  const [otherLive] = live.length ? [] : await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
-    contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+  const [otherLive] = live.length ? [] : (await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+    contextSnapshot: heartbeatRuns.contextSnapshot, startedAt: heartbeatRuns.startedAt, finishedAt: heartbeatRuns.finishedAt,
+    updatedAt: heartbeatRuns.updatedAt }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
-    inArray(heartbeatRuns.status, LIVE))).limit(1);
+    asOf ? and(lte(heartbeatRuns.createdAt, now), sql`(${runEndedAt} is null or ${runEndedAt} > ${now.toISOString()}::timestamptz)`)
+      : inArray(heartbeatRuns.status, LIVE))).limit(1)).map(asOfRun);
   const liveRuns = otherLive ? [...live, otherLive] : live;
   if (liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
@@ -960,7 +983,7 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
   const [reconciliationHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board"),
-    eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"))).limit(1);
+    eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"), ...existedBy(issueRecoveryActions.createdAt))).limit(1);
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
@@ -979,12 +1002,16 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
   // do not count as a further attempt.
   const [boardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
+    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board"),
+    ...existedBy(issueRecoveryActions.createdAt)))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   if (!boardHold && !agentPaused) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
+      asOf
+        ? and(lte(agentWakeupRequests.createdAt, now), or(inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+          sql`coalesce(${agentWakeupRequests.finishedAt}, ${agentWakeupRequests.updatedAt}) > ${now.toISOString()}::timestamptz`))
+        : inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
     if (wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id))) {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
@@ -1062,7 +1089,9 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
     // any wake row existed (the comment route logs and returns 201).
     const failedWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      eq(agentWakeupRequests.status, "failed"), gt(agentWakeupRequests.updatedAt, message.createdAt)));
+      eq(agentWakeupRequests.status, "failed"), gt(agentWakeupRequests.updatedAt, message.createdAt),
+      ...(asOf ? [sql`coalesce(${agentWakeupRequests.finishedAt}, ${agentWakeupRequests.updatedAt}) <= ${now.toISOString()}::timestamptz`,
+        lte(agentWakeupRequests.createdAt, now)] : [])));
     // Only THIS message's own wake (Paperclip's queued-comment attribution) is
     // evidence; an unrelated failed wake on the issue is not.
     const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
@@ -1077,8 +1106,11 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
     }
-    const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
+    const [recorded] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
+      updatedAt: nativeRunFinalizations.updatedAt })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id)));
+    // As of a past instant, a finalization that changed later is read as still pending then.
+    const coordinator = recorded && asOf && recorded.updatedAt > now ? { ...recorded, phase: NATIVE_PENDING_PHASES[0]! } : recorded;
     if (coordinator && !boardHold) {
       if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) {
         const wait = await bounded(now.getTime() + 30_000);
@@ -1115,7 +1147,7 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
       const [deferral] = await q.select({ at: sql<Date>`min(${heartbeatRunEvents.createdAt})` }).from(heartbeatRunEvents).where(and(
         eq(heartbeatRunEvents.companyId, issue.companyId), eq(heartbeatRunEvents.runId, run.id),
         eq(heartbeatRunEvents.eventType, NATIVE_REPAIR_DEFERRAL_EVENT),
-        sql`${heartbeatRunEvents.payload}->>'messageId' = ${message.id}`));
+        sql`${heartbeatRunEvents.payload}->>'messageId' = ${message.id}`, ...existedBy(heartbeatRunEvents.createdAt)));
       const t0 = deferral?.at ? new Date(deferral.at).getTime() : null;
       const bound = (t0 ?? now.getTime()) + NATIVE_REPAIR_PUBLISH_BOUND_MS;
       if (bound > now.getTime()
