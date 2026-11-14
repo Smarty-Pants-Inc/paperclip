@@ -264,6 +264,17 @@ impl Drop for ListenerIngress {
     }
 }
 
+fn peer_connected(stream: &TcpStream) -> bool {
+    let mut byte = [0_u8; 1];
+    match stream.peek(&mut byte) {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => true,
+        Err(_) => false,
+    }
+}
+
 fn reject_busy(stream: &mut TcpStream) {
     // Best effort on a fresh nonblocking stream: never wait on an extra peer.
     let _ = stream.write_all(
@@ -314,6 +325,9 @@ fn upgrade(
     if expired() || stream.set_nonblocking(true).is_err() {
         return;
     }
+    let Ok(peer) = stream.try_clone() else {
+        return;
+    };
     let mut handshake = accept_hdr_with_config(
         stream,
         |request: &tungstenite::handshake::server::Request, response| {
@@ -341,6 +355,11 @@ fn upgrade(
                     *rejection.status_mut() = tungstenite::http::StatusCode::SERVICE_UNAVAILABLE;
                     return Err(rejection);
                 }
+                if !peer_connected(&peer) {
+                    let mut rejection = ErrorResponse::new(None);
+                    *rejection.status_mut() = tungstenite::http::StatusCode::SERVICE_UNAVAILABLE;
+                    return Err(rejection);
+                }
                 if state.active.is_none() && state.ready.is_none() && state.reserved.is_none() {
                     // Reserve before sending HTTP 101: simultaneous waiters
                     // must not both upgrade into the one controller slot.
@@ -348,11 +367,9 @@ fn upgrade(
                     waited.set(waiting_since.elapsed());
                     return Ok(response);
                 }
+                let remaining = wait_deadline.saturating_duration_since(Instant::now());
                 state = changed
-                    .wait_timeout(
-                        state,
-                        wait_deadline.saturating_duration_since(Instant::now()),
-                    )
+                    .wait_timeout(state, Duration::from_millis(10).min(remaining))
                     .unwrap()
                     .0;
             }
@@ -365,7 +382,7 @@ fn upgrade(
         }
         match handshake {
             Ok(mut socket) => {
-                if socket.get_mut().set_nonblocking(false).is_err() {
+                if !peer_connected(socket.get_ref()) {
                     return;
                 }
                 let mut state = admission.lock().unwrap();
@@ -378,7 +395,11 @@ fn upgrade(
                     && state.ready.is_none()
                     && state.generation == generation
                     && state.reserved == Some(accepted)
+                    && peer_connected(socket.get_ref())
                 {
+                    if socket.get_mut().set_nonblocking(false).is_err() {
+                        return;
+                    }
                     state.reserved = None;
                     let deadline = accepted + UNAUTHENTICATED_TIMEOUT + waited.get();
                     state.ready = Some(ReadySocket {
