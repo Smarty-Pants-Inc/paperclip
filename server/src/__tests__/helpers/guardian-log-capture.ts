@@ -59,6 +59,10 @@ const captureStream = new Writable({
   },
 });
 
+// Pino's documented stdout-tampering path checks for an own write function.
+// Bind this real Writable's implementation so it remains the actual destination.
+captureStream.write = captureStream.write.bind(captureStream);
+
 try {
   process.env.NODE_ENV = "production";
   Object.defineProperty(process, "stdout", { configurable: true, enumerable: true, value: captureStream });
