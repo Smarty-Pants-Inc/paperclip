@@ -79,6 +79,16 @@ export function agentPausedText(name: string) {
   return `${name} is paused. Your message is saved, and it will run when ${name} is resumed. `
     + `A board user or ${name}'s manager can resume ${name}.`;
 }
+/** The conversation's saved state cannot be proven: Paperclip's native
+ * controller recovery refused it for missing evidence (for example
+ * snapshot_binding). A later message or Retry meets the same refusal, so every
+ * person message after it gets the held-conversation note (the one wording for
+ * a refused conversation, HELD_PREDECESSOR_NOTICE) and never "send it again".
+ * SMA-183. The error code native_continuation_requires_reconciliation alone is
+ * not this signal (an ordinary recovered hold with it does continue).
+ * TODO(M1.3, cluster-lead): when the designed end lands (a fresh thread from
+ * history + one true note), B' yields to it and this rule goes. */
+const RECONCILIATION_REFUSAL = /^(?:Error: )?native_controller_recovery_missing_evidence:/;
 
 export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
@@ -377,6 +387,21 @@ export async function settleUnansweredPersonMessage(
       presentation: fenced.notice.presentation,
       metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
     }, tx);
+    // One note per held conversation (SMA-183): a held-conversation note for
+    // the person's latest message replaces B''s live note for an earlier
+    // message (soft-deleted, as an answer supersedes one; its key still marks
+    // that message noticed). Other notes stay one per message.
+    if (comment?.id && fenced.replacesEarlier) {
+      const messageId = fenced.reason.slice(UNANSWERED_MESSAGE_REASON_PREFIX.length);
+      await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+        where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
+          and n.id <> ${comment.id} and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+          and exists (select 1 from ${issueComments} m, ${issueComments} latest
+            where m.company_id = n.company_id and m.issue_id = n.issue_id
+              and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
+              and latest.id::text = ${messageId} and latest.company_id = n.company_id
+              and (m.created_at, m.id) < (latest.created_at, latest.id))`);
+    }
     return comment?.id ?? null;
   });
   return commentId ? { kind: "noticed", code: decision.code, commentId } : { kind: "noticed_before" };
@@ -389,7 +414,9 @@ type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" 
       recordWait?: { messageId: string; runId: string | null } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
       /** Set when this replaces the message's standing waiting note. */
-      upgradeCommentId?: string };
+      upgradeCommentId?: string;
+      /** A held-conversation note: it replaces B''s live note for an earlier message. */
+      replacesEarlier?: boolean };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
@@ -442,6 +469,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
+    retryOfRunId: heartbeatRuns.retryOfRunId,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000))))
@@ -550,6 +578,42 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
+  // The continuation path decides after a failed run (SMAAA-1907). The
+  // message's run lineage is its carrying run (or, when no run carries it,
+  // the task's latest run) and every automatic continuation of it
+  // (retryOfRunId). While the fallback has recorded a fresh continuation of
+  // that lineage that is not admitted yet (continuationDelivery pending or
+  // coalesced, fresh-continuation-fallback.ts), or a continuation that just
+  // ended has not settled, this step waits (bounded by T0); the queued or
+  // running continuation itself is a live run above. A conversation whose
+  // saved state was refused for missing evidence (SMA-183) does not wait: its
+  // note says so.
+  const lineage = new Set<string>();
+  const root = messageRun ?? latest;
+  if (root) {
+    lineage.add(root.id);
+    for (const candidate of [...runs].reverse()) {
+      if (candidate.retryOfRunId && lineage.has(candidate.retryOfRunId)) lineage.add(candidate.id);
+    }
+  }
+  const lineageLatest = runs.find(candidate => lineage.has(candidate.id)) ?? null;
+  const refusedRun = latest && latest.status === "failed" && RECONCILIATION_REFUSAL.test(latest.error ?? "") ? latest : null;
+  if (!agentPaused && !refusedRun && lineage.size) {
+    if (lineageLatest && lineageLatest.id !== root?.id && TERMINAL.includes(lineageLatest.status)) {
+      const settled = (lineageLatest.finishedAt ?? lineageLatest.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
+      if (settled > now.getTime()) return { kind: "pending", recheckAt: settled };
+    }
+    const ids = sql.join([...lineage].map(id => sql`${id}`), sql`, `);
+    const [continuation] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+      sql`${issueRecoveryActions.evidence}->>'continuationDelivery' in ('pending', 'coalesced')`,
+      sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' in (${ids})`)).limit(1);
+    if (continuation) {
+      const wait = await bounded(now.getTime() + 30_000);
+      if (wait) return wait;
+    }
+  }
+
   let code: string;
   if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
@@ -575,7 +639,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS;
     if (!wakeFailed && due > now.getTime()) return { kind: "pending", recheckAt: due };
-    code = UNANSWERED_MESSAGE_NO_RUN_CODE;
+    code = refusedRun ? unansweredMessageCode(refusedRun) : UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
@@ -621,7 +685,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
           ...(t0 === null ? { recordDeferral: { runId: run.id, agentId: run.agentId, messageId: message.id } } : {}) };
       }
     }
-    code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
+    code = refusedRun && run.status !== "succeeded" ? unansweredMessageCode(refusedRun)
+      : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
 
   // Already explained: the executor's held notice for this conversation, or a
@@ -635,7 +700,22 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`,
     sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
   if (explained) return { kind: "explained" };
+  // The continuation path ended on its own notice (the stranded sweep's "Task
+  // could not continue" for the failed continuation, SMAAA-1907): it speaks,
+  // with the task's banner, whatever its recoveryResponsibility. One notice.
+  const continuationRuns = [...lineage].filter(id => id !== root?.id);
+  if (continuationRuns.length) {
+    const [pathNotice] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
+      sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
+      sql`${issueComments.metadata}->>'sourceRunId' in (${sql.join(continuationRuns.map(id => sql`${id}`), sql`, `)})`,
+      sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
+    if (pathNotice) return { kind: "explained" };
+  }
 
+  // The refused run is the one the note names when the refusal decided the code.
+  const refused = Boolean(refusedRun) && refusedRun !== run && code === unansweredMessageCode(refusedRun!);
   const held = isNativeContinuationRefusal(run) || HELD_CODES.has(code);
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
@@ -656,12 +736,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
     recoveryResponsibility: "user",
-    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
+    sourceRun: refused && refusedRun ? { id: refusedRun.id, agentId: refusedRun.agentId, status: refusedRun.status,
+      errorCode: unansweredMessageCode(refusedRun) }
+      : run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
-    failureCode: waiting ? undefined : run ? undefined : code,
+    failureCode: waiting ? undefined : run || (refused && refusedRun) ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
-  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}),
+    ...(held && !paused && !waiting ? { replacesEarlier: true } : {}) };
 }
 
 
