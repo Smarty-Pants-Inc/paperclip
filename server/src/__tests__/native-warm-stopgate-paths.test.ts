@@ -98,7 +98,7 @@ suite("one native warm checkpoint gate across every sandbox stop path", () => {
     const f = await fixture({ status: "retained", runStatus: "succeeded", idleAgoMs: 8 * MINUTE });
     const calls = providerSpies();
     await stopWarmSandboxesPastWindow(db);
-    expect(await savedLease(f.leaseId)).toMatchObject({ status: "pending_cleanup" });
+    expect(await savedLease(f.leaseId)).toMatchObject({ status: "retained" });
     await sweep();
     expect(calls.stop).not.toHaveBeenCalled();
     await publishValidCheckpoint(f);
