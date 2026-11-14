@@ -17,7 +17,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack --pack-destination /approved/artifacts
-sha256sum /approved/artifacts/smarty-plugin-mail-intake-0.1.4.tgz
+sha256sum /approved/artifacts/smarty-plugin-mail-intake-0.1.5.tgz
 ```
 
 Only GitHub automation commits the root lockfile; do not commit install churn.
@@ -36,7 +36,7 @@ local-path installer, for example on a non-managed authorized TEST instance:
 ```sh
 mkdir -p /approved/plugins/mail-intake
 # Verify the supplied SHA-256 before extracting.
-tar -xzf /approved/artifacts/smarty-plugin-mail-intake-0.1.4.tgz \
+tar -xzf /approved/artifacts/smarty-plugin-mail-intake-0.1.5.tgz \
   -C /approved/plugins/mail-intake --strip-components=1
 paperclipai plugin install /approved/plugins/mail-intake --api-base https://TEST-ORIGIN
 ```
@@ -46,7 +46,7 @@ Cloud-managed hosts reject arbitrary local/npm paths; the image owner must
 confirm its approved day-one staging/admission route. A tgz alone does not
 bypass that guard. Catalog/image integration is deferred, not silently added.
 
-## Upgrading to 0.1.4 (from 0.1.2 or earlier)
+## Upgrading to 0.1.5 (from 0.1.4 or earlier)
 
 Approve the added `companies.read` capability through the host's normal upgrade
 flow if requested. Discovery uses only documented SDK calls; no core change or
@@ -54,7 +54,7 @@ database edit is required. Exactly one company may have a nonempty saved plugin
 config. Existing saved config is recovered at startup and every tick, including
 an install with zero plugin_state rows; do not re-save config just to wake it.
 Missing configuration fails the job and health reports `mail intake is not
-configured`; invalid/ambiguous config reports the fixed `could not read mail`.
+configured`; invalid or ambiguous config reports `config invalid` or `multiple companies configured`.
 
 A restart does not authorize a new baseline. Keep existing seen state intact.
 If state was never initialized, use the disabled, company-scoped action below;
@@ -116,8 +116,16 @@ Using the authenticated company-scoped actions bridge documented in
 The host injects the authorized company into params and immutable actor context.
 This action requires disabled config, matching company/mailbox, IDs-only input
 and an absent state row. It cannot reset existing state or run during a tick.
-It performs the same complete, bounded Gmail scan as a tick and gets internalDate
-metadata before writing version-2 state. Every supplied ID must be present within
+Since 0.1.5 the action only validates and records the request (plugin state
+`init:<sha256(mailbox)>`), then returns `{"accepted":true}` within a few host
+calls: the host caps an action RPC at 30 s (`server/src/services/
+plugin-worker-manager.ts:82`), and reading a real mailbox takes longer. The next
+job tick (5-minute host budget, `plugin-job-scheduler.ts:50`) does the same
+complete, bounded Gmail scan as a tick and gets internalDate metadata before
+writing version-2 state. Health shows `initializing` until then, `ok` after; a
+failed read shows `mailbox read failed` and the next tick retries; rejected IDs
+show `seenIds not in window` and need a new request (a failed request may be
+replaced; a pending one may not). Enabling before that tick does not complete it. Every supplied ID must be present within
 that window; out-of-window/unknown IDs and incomplete reads fail without writing.
 The scan's window start is persisted as the epoch-ms `notBefore` floor. Each
 complete tick can advance, but never lower, that floor. Widening `scanWindowDays`

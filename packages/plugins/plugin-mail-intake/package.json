@@ -1,6 +1,6 @@
 {
   "name": "@smarty/plugin-mail-intake",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "description": "Code-only Gmail intake through a company-scoped Paperclip scheduled job",

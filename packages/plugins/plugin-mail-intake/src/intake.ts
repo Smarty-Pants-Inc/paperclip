@@ -16,6 +16,17 @@ export function seenKey(companyId: string, mailbox: string) {
   return { scopeKind: "company" as const, scopeId: companyId, namespace: "mail-intake",
     stateKey: `seen:${createHash("sha256").update(mailbox).digest("hex")}` };
 }
+/** Pending explicit initialize-seen request for the same company and mailbox. */
+export function initKey(companyId: string, mailbox: string) {
+  return { ...seenKey(companyId, mailbox), stateKey: `init:${createHash("sha256").update(mailbox).digest("hex")}` };
+}
+/**
+ * Fixed number of metadata reads in flight. The request count is unchanged (one per
+ * new ID, at most 100 pages x 500 IDs); only wall time shrinks, by up to this factor.
+ * Gmail's per-user limit is 250 quota units/s and messages.get costs 5, so 8 in
+ * flight stays far below it. The whole read stays bounded by the caller's signal.
+ */
+export const METADATA_CONCURRENCY = 8;
 /** Every request, including refresh and delivery, passes this fail-closed boundary. */
 export function safeHttp(ctx: Pick<Context, "http">, config: MailConfig, signal: AbortSignal) {
   const fireUrl = `${config.routineOrigin}/api/routine-triggers/public/${config.routinePublicId}/fire`;
@@ -90,9 +101,10 @@ export async function readMailbox(ctx: Pick<Context, "http" | "secrets">, compan
     if (pageTokens.has(result.next)) fail();
     pageTokens.add(result.next); pageToken = result.next;
   }
-  const messages: MailMessage[] = [];
-  for (const m of all) {
-    if (skip.has(m.id)) continue;
+  const todo = all.filter(m => !skip.has(m.id));
+  const messages: MailMessage[] = new Array(todo.length);
+  let next = 0, failed = false;
+  const readOne = async (m: { id: string; threadId: string }): Promise<MailMessage> => {
     const query = new URLSearchParams({ format: "metadata", fields: "id,threadId,internalDate" });
     const meta: unknown = await (await http(`${base}/${m.id}?${query}`, { method: "GET", headers })).json();
     if (!record(meta)) fail();
@@ -101,8 +113,17 @@ export async function readMailbox(ctx: Pick<Context, "http" | "secrets">, compan
         !/^\d{1,16}$/.test(meta.internalDate)) fail();
     const internalDate = Number(meta.internalDate);
     if (!timestamp(internalDate)) fail();
-    messages.push({ ...m, internalDate });
-  }
+    return { ...m, internalDate };
+  };
+  // Bounded pool; the first failure stops new requests and fails the whole read.
+  const lane = async () => {
+    while (!failed && next < todo.length) {
+      const i = next++;
+      try { messages[i] = await readOne(todo[i]!); } catch (error) { failed = true; throw error; }
+    }
+  };
+  const lanes = await Promise.allSettled(Array.from({ length: Math.min(METADATA_CONCURRENCY, todo.length) }, lane));
+  if (failed || lanes.some(l => l.status === "rejected")) fail();
   return messages;
 }
 export async function runTick(ctx: Context, companyId: string, config: MailConfig): Promise<void> {

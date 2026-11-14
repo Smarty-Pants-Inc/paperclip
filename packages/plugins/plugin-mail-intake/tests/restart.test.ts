@@ -38,6 +38,7 @@ function host(savedConfig: Record<string, unknown> | null = config, baseline = t
     state: {
       get: vi.fn(async (key: unknown) => structuredClone(states.get(keyOf(key)) ?? null)),
       set: vi.fn(async (key: unknown, value: unknown) => { states.set(keyOf(key), structuredClone(value)); }),
+      delete: vi.fn(async (key: unknown) => { states.delete(keyOf(key)); }),
     },
     logger: { warn: vi.fn() },
     secrets: { resolve: vi.fn(async (_ref: unknown, options?: { configPath?: string }) =>
@@ -98,7 +99,9 @@ describe("durable worker startup and board initialization", () => {
     const h = host({ ...config, enabled: false }, false);
     await h.start(); // Boot one; no config-save callback in either worker.
     const restarted = await h.start();
-    await expect(restarted.initialize()).resolves.toEqual({ initialized: true });
+    await expect(restarted.initialize()).resolves.toEqual({ accepted: true });
+    expect(h.states.has(keyOf(seenKey(company, config.mailbox)))).toBe(false);
+    await (await h.start()).tick(); // The request survives a restart; the job completes it.
     expect(h.states.get(keyOf(seenKey(company, config.mailbox)))).toMatchObject({
       seen: [{ id: "aa", internalDate: now - 1 }], failures: [],
     });
@@ -109,7 +112,9 @@ describe("durable worker startup and board initialization", () => {
   it("accepts the documented company-scoped BOARD/user actor without requiring an agent or run", async () => {
     const h = host({ ...config, enabled: false }, false);
     const worker = await h.start();
-    await expect(worker.initialize(worker.board)).resolves.toEqual({ initialized: true });
+    await expect(worker.initialize(worker.board)).resolves.toEqual({ accepted: true });
+    expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
+    await worker.tick();
     expect(h.ctx.secrets.resolve).toHaveBeenCalled();
   });
   it("accepts the host-forwarded renderEnvironment (null or object) but still refuses unknown params", async () => {
@@ -119,7 +124,7 @@ describe("durable worker startup and board initialization", () => {
     await expect(worker.initialize(worker.board, company, { renderEnvironment: "x" })).rejects.toThrow("params invalid");
     expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
     await expect(worker.initialize(worker.board, company, { renderEnvironment: { surface: "page" } }))
-      .resolves.toEqual({ initialized: true });
+      .resolves.toEqual({ accepted: true });
   });
   it("names missing seen state on an enabled tick instead of reporting a mailbox read failure", async () => {
     const h = host(config, false);
@@ -167,8 +172,8 @@ describe("durable worker startup and board initialization", () => {
   it("surfaces company discovery errors without leaking host/provider text", async () => {
     const h = host(); h.ctx.companies.list.mockRejectedValue(new Error("PRIVATE_PROVIDER_SENTINEL"));
     const worker = await h.start();
-    await expect(worker.tick()).rejects.toThrow("mailbox read failed");
-    expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: "config invalid" });
+    await expect(worker.tick()).rejects.toThrow("host read failed");
+    expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: "host read failed" });
     expect(h.ctx.http.fetch).not.toHaveBeenCalled();
   });
 });
