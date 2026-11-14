@@ -503,6 +503,37 @@ export async function ensureFreshContinuation(db: Db, input: Input): Promise<Fre
   return db.transaction(tx => continueFreshInTransaction(tx as unknown as Db, input));
 }
 
+/** Durable physical settlement, not expiry or a failed status, identifies an
+ * older owner whose system hold may belong to a later refused follow-up. */
+function stoppedRemoteOwnerCondition() {
+  return and(eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "failed"),
+    eq(nativeRunFinalizations.phase, "terminal_failure"), isNull(nativeRunFinalizations.leaseOwner),
+    isNull(nativeRunFinalizations.resultId),
+    sql`${nativeRunFinalizations.failureDetail}#>>'{releasedOwner,reason}' = 'stopped_remote_owner'`)!;
+}
+
+/** Caller holds the task lock. A settlement wake names the retired owner, but
+ * the unanswered message belongs to the latest refusal in that SAME thread.
+ * Do not skip newer work, a reset, reassignment, or a genuinely live owner. */
+async function waitingSourceAfterStoppedOwner(tx: Db, companyId: string, issueId: string, runId: string) {
+  const [stopped] = await tx.select({ run: heartbeatRuns }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
+    eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId), eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId), stoppedRemoteOwnerCondition()));
+  if (!stopped?.run.nativeSessionId) return runId;
+  const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+    or(eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.issueId, issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+    sql`not coalesce(${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.startedAt} is null
+      and ${heartbeatRuns.errorCode} = 'execution_reconciliation_required', false)`))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  return latest && latest.runtimeMode === "native" && latest.agentId === stopped.run.agentId
+    && latest.nativeSessionId === stopped.run.nativeSessionId
+    && (object(latest.contextSnapshot).conversationSessionGeneration ?? 0)
+      === (object(stopped.run.contextSnapshot).conversationSessionGeneration ?? 0)
+    && UNFINISHED_STATUSES.includes(latest.status) && latest.finishedAt && isFreshThreadRefusal(latest)
+    ? latest.id : runId;
+}
+
 /**
  * The fallback inside the caller's transaction. Locks in the shared order
  * (task, coordinator, run, recovery actions, workspace); rows the caller
@@ -519,19 +550,36 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   const issueId = peek.nativeIssueId ?? peek.issueId ?? (typeof contextIssueId === "string" ? contextIssueId : null);
   if (!issueId) return { kind: "not_applicable", reason: "run_has_no_task" };
   const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("update");
+  const sourceRunId = await waitingSourceAfterStoppedOwner(tx, companyId, issueId, input.runId);
   const [coordinator] = await tx.select().from(nativeRunFinalizations).where(and(
-    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, input.runId))).for("update");
+    eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, sourceRunId))).for("update");
   const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
-    eq(heartbeatRuns.id, input.runId))).for("update");
+    eq(heartbeatRuns.id, sourceRunId))).for("update");
   if (!issue || !run) return { kind: "not_applicable", reason: "run_missing" };
   if (!UNFINISHED_STATUSES.includes(run.status) || !run.finishedAt) return { kind: "not_applicable", reason: "run_not_unfinished" };
   if (!issue.assigneeAgentId || issue.assigneeAgentId !== run.agentId || issue.assigneeUserId
     || ["done", "cancelled"].includes(issue.status)) return { kind: "not_applicable", reason: "task_changed" };
 
+  // A later refusal can have NO hold of its own. Include only physically
+  // settled predecessors in this conversation, so their stale system actions
+  // cannot veto the follow-up. The strict gate below still re-proves every
+  // allocation; human gates and unrelated Blocked decisions remain intact.
+  const stoppedPredecessors = isFreshThreadRefusal(run) && run.nativeSessionId
+    ? await tx.select({ run: heartbeatRuns }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
+      eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId), eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
+      .where(and(stoppedRemoteOwnerCondition(), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, run.agentId),
+        eq(heartbeatRuns.nativeSessionId, run.nativeSessionId), eq(nativeRunFinalizations.issueId, issue.id),
+        sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) < (${run.createdAt.toISOString()}::timestamptz, ${run.id}::uuid)`,
+        sql`coalesce(${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration', '0'::jsonb)
+          = ${JSON.stringify(object(run.contextSnapshot).conversationSessionGeneration ?? 0)}::jsonb`)) : [];
+  const holdSources = [run, ...stoppedPredecessors.map(row => row.run)];
   const holds = await tx.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issue.id),
-    or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`, sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`)))
+    or(inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, holdSources.map(source => source.id)),
+      inArray(sql`${issueRecoveryActions.evidence}->>'sourceRunId'`, holdSources.map(source => source.id)))))
     .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
+  const ownsBlockedStatus = (hold: typeof issueRecoveryActions.$inferSelect) => holdOwnsBlockedStatus(hold, issue,
+    holdSources.find(source => source.id === holdRunId(hold.evidence)) ?? run);
   // A physical-stop gate must not promise an automatic restart after a
   // person's Stop, pause, approval, or reassignment decision. Keep these
   // task-level gates ahead of both the waiting note and stop requests.
@@ -583,7 +631,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
           noticeAuthorizationReason: gate.noticeAuthorizationReason } } }).where(eq(issueRecoveryActions.id, prior.id));
       await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
     }
-    await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
+    await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now,
+      ownsBlock: holds.filter(isOwnedReconciliationHold).some(ownsBlockedStatus) });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
   // A refusal cannot be made continuable by repeatedly creating new run IDs.
@@ -726,7 +775,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   if (issue.status === "blocked") {
     const receipts = holds.filter(hold => hold.evidence.nativeFailureBlock !== undefined || hold.evidence.legacyCancellationBlock !== undefined
       || hold.evidence.nativeBootstrapFailureBlock !== undefined);
-    ownsBlock = (receipts.length ? receipts : holds).some(hold => holdOwnsBlockedStatus(hold, issue, run))
+    ownsBlock = (receipts.length ? receipts : holds).some(ownsBlockedStatus)
       || receipts.some(hold => [hold.evidence.legacyCancellationBlock, hold.evidence.nativeBootstrapFailureBlock]
         .some(block => object(block).runId === run.id && object(block).statusVersion === Number(issue.statusVersion)))
       // A run that left no hold: its terminal failure set the block and nothing changed it since.
@@ -822,7 +871,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
         eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.requestedByActorType, "user"), isNull(agentWakeupRequests.runId),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`));
   }
-  const ownerHold =owned.find(hold => issue.status === "blocked" && holdOwnsBlockedStatus(hold, issue, run)) ?? owned.at(-1);
+  const ownerHold = owned.find(ownsBlockedStatus) ?? owned.at(-1);
 
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionReplacement);
@@ -898,13 +947,13 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
 }
 
 async function settleLateHolds(tx: Db, input: { companyId: string; issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect;
-  prior: typeof issueRecoveryActions.$inferSelect; holds: Array<typeof issueRecoveryActions.$inferSelect>; now: Date }) {
+  prior: typeof issueRecoveryActions.$inferSelect; holds: Array<typeof issueRecoveryActions.$inferSelect>; now: Date; ownsBlock: boolean }) {
   const { companyId, issue, run, prior, holds, now } = input;
   if (!holds.length) return;
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
   await notifyStatusCardIssueChange(tx, companyId);
   await notifyRoutineExecutionStatus(tx, issue.id, companyId);
-  const ownsBlock = issue.status === "blocked" && holds.some(hold => holdOwnsBlockedStatus(hold, issue, run));
+  const ownsBlock = input.ownsBlock;
   const delivery = String(prior.evidence.continuationDelivery);
   const followed = ["delivered", "invalidated"].includes(delivery) ? delivery : "coalesced";
   for (const hold of holds) {
@@ -1060,7 +1109,8 @@ export function resetBacklogContinuationPacingForTests(db?: Db) {
 let lastLeftAloneLogAt = 0;
 const LEFT_ALONE_LOG_INTERVAL_MS = 10 * 60_000;
 
-/** Held reconciliation records of a task's latest unfinished run (joined to its task). */
+/** Held reconciliation records of the latest unfinished obligation, including
+ * a stopped predecessor whose hold must route to that obligation. */
 function heldExecutionWhere(options: { includeActive?: boolean } = {}) {
   return and(
       inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
@@ -1080,7 +1130,8 @@ function heldExecutionWhere(options: { includeActive?: boolean } = {}) {
       isNull(issueRecoveryActions.ownerUserId),
       sql`${issues.status} not in ('done', 'cancelled')`,
       sql`${issues.assigneeAgentId} is not null`,
-      // Only the task's latest run, unfinished and still its assignee's: other
+      // Latest unfinished work, or a physically settled predecessor whose only
+      // later work is a refused follow-up in the same conversation.
       sql`exists (select 1 from ${heartbeatRuns} source where source.company_id = ${issueRecoveryActions.companyId}
         and source.id::text = coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')
         and source.status in ('failed', 'timed_out', 'interrupted', 'cancelled') and source.finished_at is not null
@@ -1088,7 +1139,19 @@ function heldExecutionWhere(options: { includeActive?: boolean } = {}) {
         and not exists (select 1 from ${heartbeatRuns} newer where newer.company_id = source.company_id and newer.id <> source.id
           and (newer.native_issue_id = ${issues.id} or newer.issue_id = ${issues.id} or newer.context_snapshot->>'issueId' = ${issues.id}::text)
           and not ${cancelledAtDispatch("newer")}
-          and (newer.created_at, newer.id) > (source.created_at, source.id)))`,
+          and (newer.created_at, newer.id) > (source.created_at, source.id)
+          and not coalesce((newer.runtime_mode = 'native' and newer.agent_id = source.agent_id
+            and newer.native_session_id = source.native_session_id
+            and coalesce(newer.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
+              = coalesce(source.context_snapshot->'conversationSessionGeneration', '0'::jsonb)
+            and newer.status in ('failed', 'timed_out', 'interrupted', 'cancelled') and newer.finished_at is not null
+            and (newer.error_code in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)})
+              or newer.error in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)})
+              or newer.result_json#>>'{nativeFreshContinuationRefusal,code}' in (${sql.join(FRESH_THREAD_REFUSAL_CODES.map(code => sql`${code}`), sql`, `)}))
+            and exists (select 1 from ${nativeRunFinalizations} stopped where stopped.company_id = source.company_id
+              and stopped.run_id = source.id and stopped.issue_id = ${issues.id} and stopped.phase = 'terminal_failure'
+              and stopped.lease_owner is null and stopped.result_id is null
+              and stopped.failure_detail#>>'{releasedOwner,reason}' = 'stopped_remote_owner')), false)))`,
       // An earlier live turn is not a successor. Inspect its strict stop gate
       // so the saved message gets one waiting note; admission still refuses it.
   )!;
