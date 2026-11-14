@@ -278,8 +278,11 @@ export async function proveControllerInstance(db: Db, bootId: string, touchedAt:
         + ${`${CONTROLLER_LEASE_TTL_MS} milliseconds`}::interval)
         < now() - ${`${CONTROLLER_LEASE_FENCE_GRACE_MS} milliseconds`}::interval`,
       sql`${controllerInstances.epoch} < ${epoch}`))
-    .returning({ bootId: controllerInstances.bootId });
-  if (fenced) return "fenced";
+    .returning({ bootId: controllerInstances.bootId, epoch: controllerInstances.epoch, lastRenewedAt: controllerInstances.renewedAt });
+  if (fenced) {
+    logger.info({ ...fenced, fencingEpoch: epoch }, "controller instance fenced");
+    return "fenced";
+  }
   const [after] = await db.select({ fenced: sql<boolean>`${controllerInstances.fencedAt} is not null` })
     .from(controllerInstances).where(eq(controllerInstances.bootId, bootId));
   return after?.fenced ? "fenced" : "expired";

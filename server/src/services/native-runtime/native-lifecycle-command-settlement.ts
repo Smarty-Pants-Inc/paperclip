@@ -44,7 +44,7 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
   const hasLegacyCommands = commands.some(command => command.issuer === undefined);
   const current = await currentNativeControllerIdentity();
   const binding = { companyId: input.companyId, issueId: input.issueId, runId: input.identity.runId! };
-  const prove = async (db: Pick<Db, "select" | "execute">): Promise<boolean> => {
+  const prove = async (db: Pick<Db, "select" | "execute">, fenceOwnerless = false): Promise<boolean> => {
     const boots = hasLegacyCommands ? await db.select().from(controllerInstances) : [];
     const boot = boots.find(row => row.bootId === current.bootId);
     const [prior] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, binding.runId),
@@ -73,6 +73,24 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
     const savedState = record(header.state), savedIdentity = record(savedState.identity);
     if (Object.entries(input.identity).some(([key, value]) => savedIdentity[key] !== value) || savedState.commandDeliveryCounts == null) return false;
     const savedCounts = record(savedState.commandDeliveryCounts);
+    if (hasLegacyCommands) {
+      if (!boot || boot.fencedAt || boot.stoppedAt) return false;
+      let allGone = true;
+      for (const row of boots) {
+        if (row.bootId === current.bootId || row.stoppedAt || row.fencedAt) continue;
+        // B1 also visits ownerless boots that record-driven reconciliation
+        // cannot reach. renewedAt is this row's persisted last lease write;
+        // never substitute command age or lease expiry for it. The documented
+        // prover retains max(lease expiry, renewedAt + TTL) + fence grace.
+        // Fence only in the preflight, before any settlement SHARE lock. A
+        // transaction recheck refuses a newly arrived unclosed boot instead of
+        // upgrading SHARE locks in two competing settlements.
+        if (!fenceOwnerless || row.epoch >= boot.epoch) { allGone = false; continue; }
+        const proof = await proveControllerInstance(db as Db, row.bootId, row.renewedAt);
+        if (proof !== "stopped" && proof !== "fenced") allGone = false;
+      }
+      if (!allGone) return false;
+    }
     for (const command of commands) {
       if (Number(savedCounts[String(command.commandId)] ?? 0) !== 0
         || JSON.stringify(command) !== checkpoint.records.get(`command:${command.controllerSeq}`)) return false;
@@ -90,13 +108,12 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
       } else {
         // Temporary M1 compatibility only. Delete this branch at M2.
         const issuedAt = typeof command.issuedAt === "string" ? Date.parse(command.issuedAt) : NaN;
-        if (!boot || boot.fencedAt || boot.stoppedAt || boots.some(row => row.bootId !== current.bootId && !row.stoppedAt && !row.fencedAt)
-          || !Number.isFinite(issuedAt) || issuedAt >= boot.startedAt.getTime() - NATIVE_LEGACY_LIFECYCLE_SKEW_MS) return false;
+        if (!boot || !Number.isFinite(issuedAt) || issuedAt >= boot.startedAt.getTime() - NATIVE_LEGACY_LIFECYCLE_SKEW_MS) return false;
       }
     }
     return true;
   };
-  if (!await prove(input.db)) return null;
+  if (!await prove(input.db, true)) return null;
   return { commands, commit: async () => {
     const path = join(input.root, "control-plane", "control-plane-state.json");
     const abandonedAt = new Date().toISOString();
