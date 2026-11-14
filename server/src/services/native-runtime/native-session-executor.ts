@@ -19460,7 +19460,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const diagnostics = new NativeSessionDiagnostics(diagnosticOwner, diagnosticOwner,
     (owner, diagnosticKind) => logger.info({ companyId: owner.companyId, runId: owner.runId, diagnosticKind }, "Native session diagnostic without an active run recorder"),
     owner => logger.warn({ companyId: owner.companyId, runId: owner.runId }, "Native session diagnostic recording failed"));
-  const diagnosticLease = diagnostics.activate(diagnosticOwner, input.onLog);
+  const diagnosticLease = diagnostics.activate(diagnosticOwner, input.onLog, input.trace);
   input.onDiagnosticLease?.(diagnosticLease);
   const credentialProvider = input.execution.provider.kind === "codex" ? "codex"
     : input.execution.provider.kind === "acpx" && (input.execution.provider.agent === "codex" || input.execution.provider.agent === "grok")
@@ -19507,7 +19507,11 @@ async function createRunnerdBackendWithinSessionClaim(
     binding: input.remoteWarmRecovery ? { ...input.execution.binding, runId: input.remoteWarmRecovery.identity.runId } : input.execution.binding,
     runnerIngressAuthorized: input.runnerIngressAuthorized, runnerPublicUrl: input.runnerPublicUrl, runnerCaBundlePath: input.runnerCaBundlePath,
     prepareRemote: prepareRetainedRemoteRunner, processStarted: remoteRunnerProcessSpawned, checkpoint: checkpointRemoteRunner,
-    trace: input.trace, onLog: input.onLog,
+    // Ordinary warm sessions retain this driver and its ingress callback. Use
+    // the existing session diagnostic epoch, rebound before run.attach, for
+    // both state lines and transport spans; retirement clears both sinks.
+    get trace() { return diagnostics.trace; },
+    onLog: async (_stream, chunk) => { diagnostics.record(chunk); },
     mapCaBundle: sourcePath => {
       if (!remoteBinary) return sourcePath;
       const targetPath = posix.join(posix.dirname(remoteBinary), "runner-ca-bundle.pem");
@@ -19982,7 +19986,7 @@ async function createRunnerdBackendWithinSessionClaim(
       if (replacementBackend) return replacementBackend.bindDiagnosticSession?.(session);
       const retained = nativeSessionDiagnostics(session);
       if (retained && retained !== diagnostics) {
-        const lease = retained.activate(diagnosticOwner, input.onLog);
+        const lease = retained.activate(diagnosticOwner, input.onLog, input.trace);
         input.onDiagnosticLease?.(lease);
       } else diagnostics.bind(session);
     },

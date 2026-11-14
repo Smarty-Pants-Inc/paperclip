@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { NativeSessionDiagnostics, nativeSessionDiagnostics } from "./native-session-diagnostics.js";
+import { createNativeRunTrace } from "./native-run-trace.js";
 
 const owner = { companyId: "company", sessionScope: "session", runId: "run-a" };
 function fixture() {
@@ -20,6 +21,38 @@ describe("native session diagnostic ownership", () => {
     expect(a.mock.calls).toEqual([["stderr", "first"]]);
     expect(b.mock.calls).toEqual([["stderr", "second"]]);
     expect(f.idle).not.toHaveBeenCalled();
+  });
+
+  it("rebinds the transport trace with its log epoch and clears it on retirement", async () => {
+    const f = fixture(), a = vi.fn(async () => undefined), b = vi.fn(async () => undefined);
+    const firstTrace = createNativeRunTrace({ runId: "run-a", onEvent: a });
+    const nextTrace = createNativeRunTrace({ runId: "run-b", onEvent: b });
+    const sink = vi.fn(async () => undefined);
+    const first = f.channel.activate(owner, sink, firstTrace);
+    expect(f.channel.trace).toBe(firstTrace);
+    first.retire();
+    expect(f.channel.trace).toBeUndefined();
+    const second = f.channel.activate({ ...owner, runId: "run-b" }, sink, nextTrace);
+    first.retire();
+    expect(f.channel.trace).toBe(nextTrace);
+    await expect(f.channel.trace!.measure("runner.prp.authenticate", async () => { throw new Error("transport failed"); }))
+      .rejects.toThrow("transport failed");
+    expect(a).not.toHaveBeenCalled();
+    expect(b).toHaveBeenCalledWith(expect.objectContaining({ eventType: "run.performance.span", payload: expect.objectContaining({
+      span: "runner.prp.authenticate", outcome: "failed" }) }));
+    second.retire();
+    expect(f.channel.trace).toBeUndefined();
+    await firstTrace.finish("ok"); await nextTrace.finish("failed");
+  });
+
+  it("refuses a competing trace even when the log sink and run ID match", async () => {
+    const f = fixture(), sink = vi.fn(async () => undefined);
+    const first = createNativeRunTrace({ runId: owner.runId }), next = createNativeRunTrace({ runId: owner.runId });
+    const lease = f.channel.activate(owner, sink, first);
+    expect(() => f.channel.activate(owner, sink, next)).toThrow("native_diagnostic_owner_busy");
+    expect(f.channel.trace).toBe(first);
+    lease.retire();
+    await first.finish("ok"); await next.finish("ok");
   });
 
   it("detaches immediately while the recorder owns accepted write settlement", async () => {
