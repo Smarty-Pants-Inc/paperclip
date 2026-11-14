@@ -1192,6 +1192,25 @@ File preservation already takes task, run, workspace and lease locks in that
 order. Confirmed lease destruction locks matching workspaces before the lease;
 its workspace-location update takes no task or run lock afterward.
 
+Lease acquisition follows the same parent-first order: company `KEY SHARE`,
+task `UPDATE`, run `UPDATE`, workspace `UPDATE`, environment binding, then source
+lease `UPDATE`. A reusable handoff locks the union of the predecessor's and
+successor's parent IDs, sorted within each table; a shared workspace's previous
+task need not be the new task. Parent discovery does not lock the lease. The
+source lease's parent bindings are rechecked under its final lock, and a changed
+or missing binding aborts acquisition instead of locking another parent out of
+order. Sandbox creation attachment takes these parent locks before its outer run
+fence, not only inside the lease-acquisition savepoint. The environment binding
+keeps its existing lock strength and precedes the source lease lock.
+
+Two updates of a lease in one transaction can make PostgreSQL recheck its
+unchanged foreign keys on the second update, including a metadata-only handoff
+receipt write. Those checks can lock the run before the task, depending on the
+foreign-key trigger order. Explicit parent locks make acquisition independent of
+that order and compatible with native response recovery's task-then-run locks.
+The acquisition locks use bounded primary-key lookups, retain the existing
+ownership and active-lease checks, and contain no provider I/O or deadlock retry.
+
 Provisioning settlement and save-invocation settlement lock the workspace and
 update existing receipt metadata. They neither add a parent foreign-key
 reference nor lock a task or run afterward. Snapshot upload and retention own
