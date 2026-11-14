@@ -42,6 +42,7 @@ import {
   NATIVE_ADDRESSED_INTERACTION_PENDING_FAILURE_MESSAGE,
 } from "./native-addressed-interaction-failure.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { NativeAddressedInteractionAdmissionError, requireNativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
 
 const companyId = randomUUID();
 const ownerAgentId = randomUUID();
@@ -287,7 +288,7 @@ async function executeFailure(input: Fixture, options: {
 
 async function executeWithoutProvider(input: Fixture) {
   provider.execute.mockReset();
-  await executePaperclipNativeSession({
+  await expect(executePaperclipNativeSession({
     db,
     execution: input.execution,
     runContextSnapshot: input.runContextSnapshot,
@@ -295,7 +296,7 @@ async function executeWithoutProvider(input: Fixture) {
     runnerEnvironment: {},
     useRunnerd: true,
     prepareAttachmentPrompt: async () => "",
-  });
+  })).rejects.toBeInstanceOf(NativeAddressedInteractionAdmissionError);
   expect(provider.execute).not.toHaveBeenCalled();
 }
 
@@ -422,14 +423,20 @@ describe("native addressed failure lifecycle through the executor and PostgreSQL
       issueId: input.issueId,
       invocationSource: "assignment",
       triggerDetail: "system",
-      status: "failed",
+      status: "running",
       runtimeMode: "native",
-      nativePhase: "terminal_failure",
       nativeIssueId: input.issueId,
-      errorCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
       contextSnapshot: input.runContextSnapshot,
-      finishedAt: new Date(),
     });
+    const secondBinding = { companyId, issueId: input.issueId, agentId: responderAgentId, runId: secondRunId };
+    const secondError = await requireNativeAddressedInteractionGrant(db, secondBinding).then(
+      () => { throw new Error("expected_second_admission_refusal"); }, error => error as unknown,
+    );
+    expect(secondError).toBeInstanceOf(NativeAddressedInteractionAdmissionError);
+    expect(secondError).toMatchObject({ binding: secondBinding, refusal: { reason: "target", interactionId: input.interactionId } });
+    await db.update(heartbeatRuns).set({ status: "failed", nativePhase: "terminal_failure",
+      errorCode: NATIVE_ADDRESSED_INTERACTION_FAILED, finishedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, secondRunId));
     await db.insert(nativeRunFinalizations).values({
       runId: secondRunId,
       companyId,
@@ -438,9 +445,8 @@ describe("native addressed failure lifecycle through the executor and PostgreSQL
       failureCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
       nextAttemptAt: null,
     });
-    await expect(appendNativeAddressedInteractionFailureNotice(db, {
-      companyId, issueId: input.issueId, agentId: responderAgentId, runId: secondRunId,
-    }, input.interactionId!)).resolves.toBeNull();
+    await expect(appendNativeAddressedInteractionFailureNotice(db, secondBinding, input.interactionId!, secondError))
+      .resolves.toBeNull();
     expect(await readFailureNotice()).toHaveLength(1);
   }, 120_000);
 
