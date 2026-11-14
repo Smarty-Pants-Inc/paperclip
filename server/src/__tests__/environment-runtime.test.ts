@@ -1018,6 +1018,49 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect((await environmentService(db).getLeaseById(first.lease.id))?.status).toBe("failed");
   });
 
+  it("resumes a retained old-boot lease only when the current native conversation's latest finished run owns it", async () => {
+    const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
+    const sessionId = randomUUID();
+    const previousFinishedAt = new Date(Date.now() - 60_000);
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, seeded.runId));
+    const oldConfig = { ...seeded.environment.config, from: "snapshot-S1" };
+    const newConfig = { ...seeded.environment.config, from: "snapshot-S2" };
+    const oldEnvironment = { ...seeded.environment, config: oldConfig };
+    await environmentService(db).update(oldEnvironment.id, { config: oldConfig });
+    const call = vi.fn(async (_pluginId: string, method: string, input: any) => {
+      if (method === "environmentResumeLease") return { providerLeaseId: input.providerLeaseId, metadata: { remoteCwd: "/workspace" } };
+      if (method === "environmentAcquireLease") return { providerLeaseId: "old-snapshot-lease", metadata: { remoteCwd: "/workspace" } };
+      throw new Error(`Unexpected provider operation: ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease"] }),
+    } as unknown as PluginWorkerManager });
+    const original = await runtime.acquireRunLease({ companyId: seeded.companyId, environment: oldEnvironment,
+      agentId: seeded.agentId, issueId: null, adapterType: "paperclip_runner", heartbeatRunId: seeded.runId,
+      persistedExecutionWorkspace: { id: seeded.executionWorkspaceId, mode: "shared_workspace" } });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: previousFinishedAt, nativeSessionId: sessionId })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, original.lease.id));
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+      status: "running", nativeSessionId: sessionId, createdAt: new Date(), updatedAt: new Date() });
+    await environmentService(db).update(oldEnvironment.id, { config: newConfig });
+    call.mockClear();
+
+    const resumed = await runtime.acquireRunLease({ companyId: seeded.companyId, environment: { ...oldEnvironment, config: newConfig },
+      agentId: seeded.agentId, issueId: null, adapterType: "paperclip_runner", heartbeatRunId: nextRunId,
+      runnerTaskResumeSessionId: sessionId,
+      persistedExecutionWorkspace: { id: seeded.executionWorkspaceId, mode: "shared_workspace" } });
+
+    expect(resumed.lease.providerLeaseId).toBe("old-snapshot-lease");
+    expect(call).toHaveBeenCalledWith(seeded.pluginId, "environmentResumeLease", expect.objectContaining({
+      providerLeaseId: "old-snapshot-lease", config: expect.objectContaining({ from: "snapshot-S1" }),
+    }), expect.any(Number));
+    expect(call.mock.calls.some(([, method]) => method === "environmentAcquireLease")).toBe(false);
+    expect(resumed.lease).toMatchObject({ status: "active", heartbeatRunId: nextRunId, providerLeaseId: "old-snapshot-lease" });
+  }, 60_000);
+
   it("acquires and resumes a reusable lease after a task changes from per-turn to warm", async () => {
     const seeded = await seedReusablePluginSandboxLease("paperclip_runner");
     await environmentService(db).releaseLease(seeded.reusableLease.id, "expired");

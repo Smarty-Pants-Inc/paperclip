@@ -1671,6 +1671,34 @@ function createSandboxEnvironmentDriver(
     };
   }
 
+  async function mostRecentFinishedNativeSessionRunId(input: {
+    companyId: string;
+    heartbeatRunId: string | null;
+    resumeSessionId?: string | null;
+  }): Promise<string | null> {
+    if (!input.heartbeatRunId) return null;
+    const [incoming] = await db.select({ nativeSessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.heartbeatRunId),
+    ));
+    const nativeSessionId = incoming?.nativeSessionId ?? input.resumeSessionId ?? null;
+    if (!nativeSessionId) return null;
+    const [finished] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.nativeSessionId, nativeSessionId),
+      sql`${heartbeatRuns.finishedAt} is not null`,
+    )).orderBy(sql`${heartbeatRuns.finishedAt} desc`, sql`${heartbeatRuns.createdAt} desc`).limit(1);
+    return finished?.status === "succeeded" ? finished.id : null;
+  }
+
+  const BOOT_SOURCE_KEYS = ["from", "snapshot", "image", "rootfs"] as const;
+  function configWithAdmittedBootSource(current: Record<string, unknown>, admitted: Record<string, unknown>) {
+    const config = { ...current };
+    for (const key of BOOT_SOURCE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(admitted, key)) config[key] = admitted[key];
+      else delete config[key];
+    }
+    return config;
+  }
+
   async function compatibleReusableSandboxLeases(input: {
     candidates: EnvironmentLease[];
     exactMatches: EnvironmentLease[];
@@ -1682,6 +1710,7 @@ function createSandboxEnvironmentDriver(
     agentId: string | null;
     adapterType: string | null;
     heartbeatRunId: string | null;
+    resumeSessionId?: string | null;
     provider: string;
     config: Record<string, unknown>;
   }) {
@@ -1690,15 +1719,20 @@ function createSandboxEnvironmentDriver(
     let rolloverLease: EnvironmentLease | null = null;
     if (!input.fingerprints) return { pinnedConfigs, compatibleLeases, rolloverLease };
     const exactIds = new Set(input.exactMatches.map(lease => lease.id));
+    const lastFinishedSessionRunId = await mostRecentFinishedNativeSessionRunId(input);
     for (const lease of input.candidates) {
       if (exactIds.has(lease.id)) continue;
-      if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) continue;
-      const admittedConfig = admittedSandboxLeaseConfig(input.config, lease.metadata ?? {});
+      const sourceMatches = sandboxLeaseSourceMatches(input.config, lease.metadata ?? {});
+      const conversationBound = lastFinishedSessionRunId !== null && lease.heartbeatRunId === lastFinishedSessionRunId;
+      if (!sourceMatches && !conversationBound) continue;
+      const compatibilityConfig = sourceMatches ? input.config : configWithAdmittedBootSource(input.config, lease.metadata ?? {});
+      const admittedConfig = admittedSandboxLeaseConfig(compatibilityConfig, lease.metadata ?? {});
       const scope = { ...input, lease };
       const hasIdentityFingerprint = isRecord(lease.metadata?.reusableSandboxLease)
         && readLeaseFingerprint(lease.metadata.reusableSandboxLease.leaseIdentityFingerprint) !== null;
       const compatible = (hasIdentityFingerprint
-        && reusableSandboxLeaseScopeMatches({ ...scope, leaseFingerprint: input.fingerprints.leaseIdentityFingerprint,
+        && reusableSandboxLeaseScopeMatches({ ...scope, config: compatibilityConfig,
+            leaseFingerprint: input.fingerprints.fingerprintForConfig(sandboxLeaseIdentityConfig(compatibilityConfig)),
             fingerprintKey: "leaseIdentityFingerprint" }))
         // Pre-upgrade leases may omit identity or exclude boot sources from it.
         // Reproduce their full digest with admitted sizing/timing settings and
@@ -1709,7 +1743,7 @@ function createSandboxEnvironmentDriver(
             allowLegacyRuntimeFingerprint: lease.status === "active" && lease.heartbeatRunId === input.heartbeatRunId });
       if (!compatible) continue;
       compatibleLeases.push(lease);
-      if (input.exactMatches.length === 0 && !rolloverLease && await reusableSandboxConfigurationChangeIsSafe({
+      if (sourceMatches && input.exactMatches.length === 0 && !rolloverLease && await reusableSandboxConfigurationChangeIsSafe({
         db, lease, config: input.config, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
         executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType,
       })) rolloverLease = lease;
@@ -1977,7 +2011,7 @@ function createSandboxEnvironmentDriver(
           candidates: reusableCandidateLeases, exactMatches: reusableExistingLeases, fingerprints: leaseFingerprints,
           companyId: input.companyId, environmentId: input.environment.id, executionWorkspaceId: input.executionWorkspaceId,
           issueId: input.issueId, agentId: input.agentId, adapterType: input.adapterType, heartbeatRunId: input.heartbeatRunId,
-          provider: parsed.config.provider, config: providerConfigForLease,
+          resumeSessionId: input.runnerTaskResumeSessionId, provider: parsed.config.provider, config: providerConfigForLease,
         });
         reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
         if (reusableCandidateLeases.length > reusableExistingLeases.length) {
@@ -2004,7 +2038,9 @@ function createSandboxEnvironmentDriver(
 
         const pinnedConfig = reusableLease ? compatible.pinnedConfigs.get(reusableLease.id) : undefined;
         const rolloverLease = reusableLease ? null : compatible.rolloverLease;
-        const resumeConfig = pinnedConfig ? admittedSandboxLeaseConfig(workerConfig, pinnedConfig) : workerConfig;
+        const resumeConfig = pinnedConfig
+          ? configWithAdmittedBootSource(admittedSandboxLeaseConfig(workerConfig, pinnedConfig), pinnedConfig)
+          : workerConfig;
         let providerLease: PluginEnvironmentLease | null = null;
         let replacingUnretiredOwner = false;
         let replacementPlan: ReusableSandboxReplacementPlan | null = null;
@@ -2407,7 +2443,7 @@ function createSandboxEnvironmentDriver(
         candidates: reusableCandidateLeases, exactMatches: reusableExistingLeases, fingerprints: leaseFingerprints,
         companyId: input.companyId, environmentId: input.environment.id, executionWorkspaceId: input.executionWorkspaceId,
         issueId: input.issueId, agentId: input.agentId, adapterType: input.adapterType, heartbeatRunId: input.heartbeatRunId,
-        provider: parsed.config.provider, config: providerConfigForLease,
+        resumeSessionId: input.runnerTaskResumeSessionId, provider: parsed.config.provider, config: providerConfigForLease,
       });
       reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
       if (reusableCandidateLeases.length > reusableExistingLeases.length) {
