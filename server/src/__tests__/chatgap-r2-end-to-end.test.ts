@@ -92,7 +92,7 @@ suite("chat-gap round-2 production path", () => {
     if (status === "blocked") await db.update(issues).set({ statusVersion: 4, blockedTransitionAt: f.at(4) }).where(eq(issues.id, f.issueId));
     await createRecoveryHold(f);
     expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.runId, trigger: "recovery_refused" }))
-      .toMatchObject({ kind: "continued" });
+      .toMatchObject({ kind: "person_owned" });
     await occupySlot(f);
     await assertOneDeliveredContinuation(f);
   }, 60_000);
@@ -102,7 +102,7 @@ suite("chat-gap round-2 production path", () => {
     await finalize(f);
     await occupySlot(f);
     expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.runId, trigger: "recovery_refused" }))
-      .toMatchObject({ kind: "continued" });
+      .toMatchObject({ kind: "person_owned" });
     await assertOneDeliveredContinuation(f);
   }, 60_000);
 
