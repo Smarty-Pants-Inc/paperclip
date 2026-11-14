@@ -359,7 +359,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         issue: {
           status: issue.status, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
           hidden: Boolean(issue.hiddenAt), blockedTransitionAt: issue.blockedTransitionAt, updatedAt: issue.updatedAt,
-          createdAt: issue.createdAt,
+          createdAt: issue.createdAt, originKind: issue.originKind,
           unblockOwner: (issue.unblockDescriptor?.owner ?? null) as AssignedWorkFacts["issue"]["unblockOwner"],
           monitorNextCheckAt: issue.monitorNextCheckAt,
           isConversation: Boolean(issue.conversationAgentId) || issue.originKind === "chat_channel",

@@ -3889,6 +3889,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
+          // Resume may replay an ordinary assignment captured before import
+          // or before the source status changed. Imported waits are not fresh
+          // work: judge the current row under the same initial-admission lock,
+          // including callers that did not supply an initialImport guard.
+          if (issue.originKind === "company_import" && reason === "issue_assigned" &&
+            !["todo", "in_progress"].includes(issue.status)) return { kind: "skipped" as const };
+
           if (issueStateGuard?.initialImport) {
             // The sweep's no-run/no-monitor snapshot is only a candidate.
             // Revalidate after the existing issue lock, in separate statements
