@@ -385,6 +385,10 @@ async function hasAnswerSinceSettlement(db: Pick<Db, "select">, source: typeof h
     eq(heartbeatRuns.companyId, source.companyId), eq(heartbeatRuns.agentId, source.agentId),
     eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.nativeSessionId, source.nativeSessionId),
     sql`${heartbeatRuns.id} not in (${source.id}, ${currentRunId})`,
+    // Completing the step that preceded a refused follow-up is not an answer
+    // to that follow-up. A turn admitted AFTER this obligation may supersede
+    // its settlement, even if admitted before recordedAt and answered later.
+    sql`${heartbeatRuns.createdAt} >= ${source.createdAt.toISOString()}::timestamptz`,
     sql`greatest(${heartbeatRuns.createdAt}, ${heartbeatRuns.finishedAt}) >= ${recordedAt}::timestamptz`,
     sql`(${heartbeatRuns.status} = 'succeeded' or ${heartbeatRuns.sessionIdAfter} is not null
       or jsonb_typeof(${heartbeatRuns.resultJson}->'nativeResult') = 'object')`,
