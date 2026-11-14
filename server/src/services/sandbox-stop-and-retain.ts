@@ -12,6 +12,8 @@ import type { SandboxAbsenceProof } from "./sandbox-absence-proof.js";
 type Lease = Pick<typeof environmentLeases.$inferSelect,
   "id" | "companyId" | "heartbeatRunId" | "provider" | "providerLeaseId" | "metadata">;
 export const SANDBOX_STOP_AND_RETAIN_KEY = "sandboxStopAndRetain";
+/** Durable native warm-session close receipt required before warm-window expiry stops a box. */
+export const WARM_NATIVE_SESSION_CLOSE_KEY = "warmNativeSessionClose";
 /** Top-level marker an ownership settle leaves on a lease whose sandbox it
  * stopped and kept. It outlives the stop intent, so the retained orphan can
  * be destroyed once nothing references it. */
@@ -257,6 +259,7 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
           provider: lease.provider, providerLeaseId: lease.providerLeaseId,
           ...(intent.pluginId ? { pluginId: intent.pluginId, method: "environmentStopLease" }
             : { builtinProvider: lease.provider, method: "builtin.stopLease" }),
+          ...((intent as Record<string, unknown>).warmWindowExpired === true ? { warmWindowExpired: true } : {}),
           confirmedAt: receipt.confirmedAt,
         } } : {}),
         ...legacyOrphan,

@@ -13,6 +13,7 @@ import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-ba
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
+import { hasConfirmedSandboxStopAndRetain } from "./sandbox-stop-and-retain.js";
 
 export {
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
@@ -138,6 +139,42 @@ export async function reusableSandboxReplacementPlan(input: {
 /** A compatible configuration change drains only after its owner is terminal
  * and the state needed by the next allocation is verifiable. Projectless chats
  * have no project workspace to checkpoint, but still require their F7 backup. */
+export async function verifiedNativeSandboxHandoffProof(input: {
+  db: Db;
+  lease: EnvironmentLease;
+  companyId: string;
+  heartbeatRunId: string | null;
+}): Promise<Record<string, unknown> | null> {
+  const { lease } = input;
+  if (!hasConfirmedSandboxStopAndRetain(lease) || !await reusableSandboxConfigurationChangeIsSafe({
+    ...input,
+    config: {},
+    executionWorkspaceId: lease.executionWorkspaceId,
+    adapterType: "paperclip_runner",
+    allowSourceChange: true,
+  })) return null;
+  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
+  if (!stamp) return null;
+  return {
+    schema: "paperclip.native-sandbox-handoff-proof.v1",
+    companyId: input.companyId,
+    sourceLeaseId: lease.id,
+    sourceProviderLeaseId: lease.providerLeaseId,
+    sourceRunId: lease.heartbeatRunId,
+    successorRunId: input.heartbeatRunId,
+    checkpoint: {
+      normalizedSessionId: stamp.normalizedSessionId,
+      runnerInstanceId: stamp.runnerInstanceId,
+      manifestSha256: stamp.manifestSha256,
+      completedAt: stamp.completedAt,
+    },
+    custodyReceipt: stamp,
+    stopReceipt: lease.metadata!.sandboxStopAndRetainReceipt,
+    stopConfirmation: lease.metadata!.remoteExecutionTermination,
+    verifiedAt: new Date().toISOString(),
+  };
+}
+
 export async function reusableSandboxConfigurationChangeIsSafe(input: {
   config: Record<string, unknown>;
   db: Db;
@@ -146,9 +183,11 @@ export async function reusableSandboxConfigurationChangeIsSafe(input: {
   heartbeatRunId: string | null;
   executionWorkspaceId: string | null;
   adapterType: string | null | undefined;
+  /** Only a proof check may deliberately ignore current source-config drift. */
+  allowSourceChange?: boolean;
 }): Promise<boolean> {
   const { db, lease } = input;
-  if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) return false;
+  if (!input.allowSourceChange && !sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) return false;
   if (!input.heartbeatRunId || !lease.heartbeatRunId || !lease.providerLeaseId || lease.companyId !== input.companyId
     || !["released", "retained"].includes(lease.status)) return false;
   const [owner] = await db.select({ status: heartbeatRuns.status, nativeSessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns)

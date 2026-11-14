@@ -1,8 +1,9 @@
 import { PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS } from "@paperclipai/adapter-utils";
-import { and, asc, eq, sql } from "drizzle-orm";
-import { environmentLeases, type Db } from "@paperclipai/db";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
+import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
-import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
+import { WARM_NATIVE_SESSION_CLOSE_KEY, prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
+import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 
 /**
  * Warm sandbox expiry.
@@ -47,6 +48,55 @@ function positiveWindowSql(value: ReturnType<typeof sql>) {
     then (${value})::numeric end`;
 }
 
+function nativeWarmCheckpointEligibilitySql() {
+  const backupCompletedAt = sql`case
+    when ${environmentLeases.metadata}->'nativeHarnessBackup'->>'completedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
+    then (${environmentLeases.metadata}->'nativeHarnessBackup'->>'completedAt')::timestamptz end`;
+  const closeAt = sql`case
+    when ${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'closedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$'
+    then (${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'closedAt')::timestamptz end`;
+  const latestLeaseRun = sql`(select max(run.finished_at) from ${environmentLeases} source
+    inner join ${heartbeatRuns} run on run.id = source.heartbeat_run_id
+    where source.company_id = ${environmentLeases.companyId}
+      and source.provider = ${environmentLeases.provider}
+      and source.provider_lease_id = ${environmentLeases.providerLeaseId}
+      and run.finished_at is not null)`;
+  return sql`(
+    coalesce(${environmentLeases.metadata}#>>'{reusableSandboxLease,adapterType}', '') <> 'paperclip_runner'
+    or (
+      ${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'state' = 'closed'
+      and ${environmentLeases.metadata}->'nativeHarnessBackup'->>'authorizedProviderLeaseId' = ${environmentLeases.providerLeaseId}
+      and ${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'schema' = 'paperclip.native-warm-session-close.v1'
+      and ${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'providerLeaseId' = ${environmentLeases.providerLeaseId}
+      and ${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'runId' = ${environmentLeases.heartbeatRunId}::text
+      and ${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'normalizedSessionId' = ${environmentLeases.metadata}->'nativeHarnessBackup'->>'normalizedSessionId'
+      and ${environmentLeases.metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}->>'manifestSha256' = ${environmentLeases.metadata}->'nativeHarnessBackup'->>'manifestSha256'
+      and ${closeAt} >= ${backupCompletedAt}
+      and ${backupCompletedAt} >= ${latestLeaseRun}
+    )
+  )`;
+}
+
+async function nativeWarmSessionCheckpointReady(db: Db, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  const isNative = (lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined)?.adapterType === "paperclip_runner";
+  if (!isNative) return true;
+  if (!lease.providerLeaseId) return false;
+  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId);
+  const close = lease.metadata?.[WARM_NATIVE_SESSION_CLOSE_KEY] as Record<string, unknown> | undefined;
+  if (!stamp || close?.schema !== "paperclip.native-warm-session-close.v1" || close.state !== "closed"
+    || close.providerLeaseId !== lease.providerLeaseId || close.runId !== lease.heartbeatRunId
+    || close.manifestSha256 !== stamp.manifestSha256 || close.normalizedSessionId !== stamp.normalizedSessionId
+    || typeof close.closedAt !== "string") return false;
+  const closedAt = Date.parse(close.closedAt), checkpointAt = Date.parse(stamp.completedAt);
+  if (!Number.isFinite(closedAt) || !Number.isFinite(checkpointAt) || closedAt < checkpointAt) return false;
+  const [latest] = await db.select({ finishedAt: heartbeatRuns.finishedAt }).from(environmentLeases)
+    .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
+    .where(and(eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.provider, lease.provider!),
+      eq(environmentLeases.providerLeaseId, lease.providerLeaseId), sql`${heartbeatRuns.finishedAt} is not null`))
+    .orderBy(desc(heartbeatRuns.finishedAt)).limit(1);
+  return Boolean(latest?.finishedAt && checkpointAt >= latest.finishedAt.getTime() && closedAt >= latest.finishedAt.getTime());
+}
+
 /** Epoch ms when the lease's warm window ends. */
 export function warmWindowEndsAtSql() {
   const window = sql`least(coalesce(
@@ -79,6 +129,7 @@ export function warmSandboxExpiryCandidateCondition() {
       'portableTaskSuccessor', 'reusableLeaseSuccessor', 'reusableSandboxLeaseSuperseded',
       ${REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY}])`,
     sql`coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'true'`,
+    nativeWarmCheckpointEligibilitySql(),
     sql`coalesce(${environmentLeases.metadata}#>>'{legacyShutdownWorkspaceSettlement,state}', '') <> 'pending'`,
     sql`not exists (select 1 from heartbeat_runs run where run.id = ${environmentLeases.heartbeatRunId}
       and run.status not in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`,
@@ -111,6 +162,9 @@ export async function stopWarmSandboxesPastWindow(db: Db, now = new Date()): Pro
     .orderBy(asc(environmentLeases.lastUsedAt)).limit(STOP_PAGE_SIZE);
   let stopping = 0;
   for (const { lease, endsAt } of due) {
+    // Native timer expiry is only eligibility. The box remains running unless
+    // its exact lease has a current durable checkpoint and a successful close.
+    if (!await nativeWarmSessionCheckpointReady(db, lease)) continue;
     // The stop intent is a compare-and-swap on the exact retained row, so a run
     // that reacquired the sandbox since this read keeps it.
     const prepared = await prepareSupersededWarmSandboxStop(db, lease, {

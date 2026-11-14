@@ -20,6 +20,7 @@ import {
   reusableSandboxReplacementPlan,
   type ReusableSandboxReplacementPlan,
   sandboxStateTransitionFailure,
+  verifiedNativeSandboxHandoffProof,
 } from "./reusable-sandbox-resume-replacement.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
@@ -36,7 +37,7 @@ import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
 import { ownedWorkspaceRecoveryLease, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
-import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
+import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, WARM_NATIVE_SESSION_CLOSE_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -2001,6 +2002,16 @@ function createSandboxEnvironmentDriver(
         const reusableLease = reusableProviderLeaseId
           ? reusableExistingLeases.find((lease) => lease.providerLeaseId === reusableProviderLeaseId)
           : null;
+        const nativeStoppedSource = Boolean(reusableLease && input.adapterType === "paperclip_runner"
+          && (reusableLease.metadata?.sandboxStopAndRetainReceipt as { warmWindowExpired?: unknown } | undefined)?.warmWindowExpired === true);
+        const nativeSandboxHandoffProof = nativeStoppedSource && reusableLease
+          ? await verifiedNativeSandboxHandoffProof({ db, lease: reusableLease, companyId: input.companyId,
+              heartbeatRunId: input.heartbeatRunId })
+          : null;
+        const nativeClose = reusableLease?.metadata?.[WARM_NATIVE_SESSION_CLOSE_KEY] as { state?: unknown } | undefined;
+        const forceFreshNativeThread = input.adapterType === "paperclip_runner"
+          && ((nativeStoppedSource && !nativeSandboxHandoffProof)
+            || nativeClose?.state === "retrying" || nativeClose?.state === "failed");
 
         const pinnedConfig = reusableLease ? compatible.pinnedConfigs.get(reusableLease.id) : undefined;
         const rolloverLease = reusableLease ? null : compatible.rolloverLease;
@@ -2043,7 +2054,12 @@ function createSandboxEnvironmentDriver(
               cause: new Error(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE),
             }) === "retire";
           let idleStartWaitSpent = false;
-          if (replacingUnretiredOwner) {
+          if (forceFreshNativeThread) {
+            // A stopped source needs the shared checkpoint/stop/custody proof;
+            // an unclosed or unproven source starts fresh and stays kept.
+            replacementReason = "resume_failed";
+            replacementPlan = "keep";
+          } else if (replacingUnretiredOwner) {
             replacementReason = "resume_failed";
             replacementPlan = "retire";
           } else try {
@@ -2267,9 +2283,12 @@ function createSandboxEnvironmentDriver(
               : {
                   outcome: "created",
                 },
-          ...((rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
+          ...(!forceFreshNativeThread && (rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
             ? { nativeHarnessBackup: (rolloverLease ?? reusableLease)!.metadata!.nativeHarnessBackup }
             : {}),
+          ...(nativeSandboxHandoffProof ? { nativeSandboxHandoffProof: {
+            ...nativeSandboxHandoffProof, successorProviderLeaseId: acquiredLease.providerLeaseId,
+          } } : {}),
           ...(providerLease && reusableLease?.metadata?.nativeWorkspaceSync
             ? {
                 nativeWorkspaceSync: reusableLease.metadata.nativeWorkspaceSync,
@@ -2431,6 +2450,16 @@ function createSandboxEnvironmentDriver(
       const reusableLease = reusableProviderLeaseId
         ? reusableExistingLeases.find((lease) => lease.providerLeaseId === reusableProviderLeaseId)
         : null;
+      const nativeStoppedSource = Boolean(reusableLease && input.adapterType === "paperclip_runner"
+        && (reusableLease.metadata?.sandboxStopAndRetainReceipt as { warmWindowExpired?: unknown } | undefined)?.warmWindowExpired === true);
+      const nativeSandboxHandoffProof = nativeStoppedSource && reusableLease
+        ? await verifiedNativeSandboxHandoffProof({ db, lease: reusableLease, companyId: input.companyId,
+            heartbeatRunId: input.heartbeatRunId })
+        : null;
+      const nativeClose = reusableLease?.metadata?.[WARM_NATIVE_SESSION_CLOSE_KEY] as { state?: unknown } | undefined;
+      const forceFreshNativeThread = input.adapterType === "paperclip_runner"
+        && ((nativeStoppedSource && !nativeSandboxHandoffProof)
+          || nativeClose?.state === "retrying" || nativeClose?.state === "failed");
 
       const pinnedConfig = reusableLease ? compatible.pinnedConfigs.get(reusableLease.id) : undefined;
       const rolloverLease = reusableLease ? null : compatible.rolloverLease;
@@ -2450,13 +2479,13 @@ function createSandboxEnvironmentDriver(
           issueId: input.issueId,
           agentId: input.agentId,
           executionWorkspaceId: input.executionWorkspaceId,
-          reusableProviderLeaseId,
+          reusableProviderLeaseId: forceFreshNativeThread ? undefined : reusableProviderLeaseId,
           // Forward a caller deadline so the provider configures a provider-side
           // expiry at or before it and returns the real provider expiry.
           requestedExpiresAt: requestedExpiresAtParam(input.requestedExpiresAt),
         }));
       } catch (error) {
-        if (reusableLease) {
+        if (reusableLease && !forceFreshNativeThread) {
           throw new ReusableSandboxResumeError({
             provider: parsed.config.provider,
             providerLeaseId: reusableLease.providerLeaseId!,
@@ -2465,7 +2494,7 @@ function createSandboxEnvironmentDriver(
         }
         throw error;
       }
-      if (reusableLease && providerLease.providerLeaseId !== reusableLease.providerLeaseId) {
+      if (reusableLease && !forceFreshNativeThread && providerLease.providerLeaseId !== reusableLease.providerLeaseId) {
         await destroyReusableSandboxLease({
           environment: input.environment,
           lease: reusableLease,
@@ -2514,9 +2543,12 @@ function createSandboxEnvironmentDriver(
               : {
                   outcome: "created",
                 },
-        ...((rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
+        ...(!forceFreshNativeThread && (rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
           ? { nativeHarnessBackup: (rolloverLease ?? reusableLease)!.metadata!.nativeHarnessBackup }
           : {}),
+        ...(nativeSandboxHandoffProof ? { nativeSandboxHandoffProof: {
+          ...nativeSandboxHandoffProof, successorProviderLeaseId: providerLease.providerLeaseId,
+        } } : {}),
         ...(reusableLease &&
         providerLease.providerLeaseId === reusableLease.providerLeaseId &&
         reusableLease.metadata?.nativeWorkspaceSync
@@ -2558,6 +2590,10 @@ function createSandboxEnvironmentDriver(
       });
       if (rolloverLease && input.heartbeatRunId) {
         await retireCompatibleConfigurationSource(rolloverLease, recordedLease, input.heartbeatRunId);
+      }
+      if (forceFreshNativeThread && reusableLease && input.heartbeatRunId) {
+        await keepReplacedReusableSandboxLease({ db, lease: reusableLease, companyId: input.companyId,
+          heartbeatRunId: input.heartbeatRunId, replacementLeaseId: recordedLease.id });
       }
       return recordedLease;
     },

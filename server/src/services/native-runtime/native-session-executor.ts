@@ -54,6 +54,7 @@ import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
 import { verifySnapshotProviderPack } from "./remote-provider-pack-snapshot.js";
 
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
+import { WARM_NATIVE_SESSION_CLOSE_KEY } from "../sandbox-stop-and-retain.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -346,7 +347,7 @@ import {
   type NativeRunSpanScope,
   type NativeRunTrace,
 } from "./native-run-trace.js";
-import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { createNativeHarnessBackupStamp, readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
@@ -737,6 +738,7 @@ export type NativeInstructionWorkingCopy = {
 };
 
 type WarmNativeSession = {
+  db: Db;
   ingressOwner?: NativeWarmIngressOwner;
   onReleased: () => void;
   sessionCheckpointPersisted?: (snapshot: PersistedNativeSession) => void;
@@ -804,6 +806,97 @@ export type WarmNativeSessionCloseResult = {
   failed: number;
   failures: WarmNativeSessionCloseFailure[];
 };
+
+const WARM_NATIVE_CLOSE_ATTEMPT_LIMIT = 3;
+const WARM_NATIVE_CLOSE_RETRY_BACKOFF_MS = [1_000, 5_000] as const;
+
+async function persistWarmNativeSessionClose(entry: WarmNativeSession, state: "closing" | "retrying" | "closed" | "failed",
+  options: { attempts?: number; warningCount?: number; failure?: string; retryAt?: string } = {}): Promise<boolean> {
+  if (!entry.providerLeaseId) return false;
+  const [lease] = await entry.db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, entry.companyId), eq(environmentLeases.heartbeatRunId, entry.runId),
+    eq(environmentLeases.providerLeaseId, entry.providerLeaseId), eq(environmentLeases.status, "retained"),
+  )).orderBy(desc(environmentLeases.updatedAt)).limit(1);
+  if (!lease?.providerLeaseId) return false;
+  const providerLeaseId = lease.providerLeaseId;
+  const old = lease.metadata?.[WARM_NATIVE_SESSION_CLOSE_KEY] as Record<string, unknown> | undefined;
+  const attempts = options.attempts ?? (typeof old?.attempts === "number" ? old.attempts : 0);
+  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, providerLeaseId);
+  const now = new Date();
+  const marker = {
+    schema: "paperclip.native-warm-session-close.v1", state, attempts,
+    warningCount: options.warningCount ?? (typeof old?.warningCount === "number" ? old.warningCount : 0),
+    providerLeaseId, runId: entry.runId,
+    ...(stamp ? { normalizedSessionId: stamp.normalizedSessionId, manifestSha256: stamp.manifestSha256,
+      checkpointCompletedAt: stamp.completedAt } : {}),
+    ...(state === "closed" ? { closedAt: now.toISOString() } : {}),
+    ...(options.failure ? { failure: options.failure } : {}),
+    ...(options.retryAt ? { retryAt: options.retryAt } : {}),
+  };
+  const [updated] = await writeEnvironmentCleanup(entry.db, tx => tx.update(environmentLeases).set({
+    metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+      [WARM_NATIVE_SESSION_CLOSE_KEY]: marker,
+    })}::jsonb`, updatedAt: now,
+  }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
+    eq(environmentLeases.heartbeatRunId, entry.runId), eq(environmentLeases.providerLeaseId, providerLeaseId),
+    eq(environmentLeases.status, "retained"),
+    sql`${environmentLeases.metadata} is not distinct from ${lease.metadata === null ? null : JSON.stringify(lease.metadata)}::jsonb`))
+    .returning({ id: environmentLeases.id }), { companyId: lease.companyId, runId: entry.runId, leaseId: lease.id });
+  return Boolean(updated);
+}
+
+async function closeIdleWarmNativeSessionWithRetries(entry: WarmNativeSession, reason: string): Promise<boolean> {
+  if (!entry.providerLeaseId) return false;
+  const [lease] = await entry.db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, entry.companyId), eq(environmentLeases.heartbeatRunId, entry.runId),
+    eq(environmentLeases.providerLeaseId, entry.providerLeaseId), eq(environmentLeases.status, "retained"),
+  )).limit(1);
+  const prior = lease?.metadata?.[WARM_NATIVE_SESSION_CLOSE_KEY] as Record<string, unknown> | undefined;
+  if (prior?.state === "closed") return true;
+  const completedAttempts = typeof prior?.attempts === "number" ? prior.attempts : 0;
+  if (completedAttempts >= WARM_NATIVE_CLOSE_ATTEMPT_LIMIT) {
+    entry.retirementUnproven = true;
+    if (prior?.state !== "failed" || prior.warningCount !== 1) {
+      const failure = typeof prior?.failure === "string" ? prior.failure : "warm close retry budget exhausted";
+      const recorded = await persistWarmNativeSessionClose(entry, "failed", {
+        attempts: WARM_NATIVE_CLOSE_ATTEMPT_LIMIT, warningCount: 1, failure,
+      });
+      logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+        providerLeaseId: entry.providerLeaseId, attempts: WARM_NATIVE_CLOSE_ATTEMPT_LIMIT, warningCount: 1,
+        failure, durableMarker: recorded }, "warm close failed");
+    }
+    return false;
+  }
+  if (typeof prior?.retryAt === "string") {
+    const retryAt = Date.parse(prior.retryAt);
+    if (Number.isFinite(retryAt) && retryAt > Date.now()) await new Promise(resolve => setTimeout(resolve, retryAt - Date.now()));
+  }
+  for (let attempt = completedAttempts + 1; attempt <= WARM_NATIVE_CLOSE_ATTEMPT_LIMIT; attempt++) {
+    if (!await persistWarmNativeSessionClose(entry, "closing", { attempts: attempt })) return false;
+    try {
+      await closeWarmNativeSession(entry, reason);
+      // closeWarmNativeSession closed the provider session; refresh the durable
+      // receipt after it returns so the stop gate sees the final checkpoint.
+      return await persistWarmNativeSessionClose(entry, "closed", { attempts: attempt });
+    } catch (error) {
+      const failure = describeWarmCloseFailure(error);
+      if (attempt === WARM_NATIVE_CLOSE_ATTEMPT_LIMIT) {
+        entry.retirementUnproven = true;
+        const recorded = await persistWarmNativeSessionClose(entry, "failed", {
+          attempts: attempt, warningCount: 1, failure,
+        });
+        logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+          providerLeaseId: entry.providerLeaseId ?? null, attempts: attempt, warningCount: 1,
+          failure, durableMarker: recorded }, "warm close failed");
+        return false;
+      }
+      const retryAt = new Date(Date.now() + WARM_NATIVE_CLOSE_RETRY_BACKOFF_MS[attempt - 1]!).toISOString();
+      if (!await persistWarmNativeSessionClose(entry, "retrying", { attempts: attempt, failure, retryAt })) return false;
+      await new Promise(resolve => setTimeout(resolve, WARM_NATIVE_CLOSE_RETRY_BACKOFF_MS[attempt - 1]!));
+    }
+  }
+  return false;
+}
 
 async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, options?: {
   preserveInstructionsForRunId?: string;
@@ -9075,6 +9168,21 @@ async function releaseWarmNativeSession(
   armWarmNativeSessionIdleTimer(sessionId, entry, idleTimeoutMs);
 }
 
+async function retainedNativeWarmLease(entry: WarmNativeSession): Promise<boolean> {
+  if (!entry.providerLeaseId) return false;
+  try {
+    const [lease] = await entry.db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, entry.companyId), eq(environmentLeases.heartbeatRunId, entry.runId),
+      eq(environmentLeases.providerLeaseId, entry.providerLeaseId), eq(environmentLeases.status, "retained"),
+    )).limit(1);
+    return (lease?.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined)?.adapterType === "paperclip_runner";
+  } catch {
+    // A lookup failure cannot authorize stopping a box. Leave the existing
+    // released-owner behavior in place; expiry still requires durable proof.
+    return false;
+  }
+}
+
 function armWarmNativeSessionIdleTimer(
   sessionId: string,
   entry: WarmNativeSession,
@@ -9093,19 +9201,38 @@ function armWarmNativeSessionIdleTimer(
     current.busy = true;
     const released = current.released === true;
     if (!released) current.closeOnReleaseReason = "warm native session idle timeout";
-    const closing = (released ? detachReleasedWarmNativeSession(current) : closeWarmNativeSession(current, current.closeOnReleaseReason!))
-      .then(() => { forgetWarmNativeSession(sessionId, current); })
-      .catch(error => {
-        if (released) current.closeOnReleaseReason = "released Runner local detach is unconfirmed";
-        if (!released && error instanceof AgentDirectoryOperationBusyError) {
-          armWarmNativeSessionIdleTimer(sessionId, current, agentDirectoryBusyRetryDelayMs());
-          return;
+    let detach = released;
+    const closing = Promise.resolve().then(async () => {
+      // A released Runner can remain as a native warm session. Its idle close
+      // must publish and retire that exact lease, not merely detach this server.
+      const retainedWarmLease = typeof current.db.transaction === "function" && await retainedNativeWarmLease(current);
+      if (released && retainedWarmLease) {
+        detach = false;
+        current.closeOnReleaseReason = "warm native session idle timeout";
+      }
+      if (detach) {
+        await detachReleasedWarmNativeSession(current);
+        forgetWarmNativeSession(sessionId, current);
+        return;
+      }
+      if (retainedWarmLease) {
+        if (await closeIdleWarmNativeSessionWithRetries(current, current.closeOnReleaseReason!)) {
+          forgetWarmNativeSession(sessionId, current);
         }
-        logger.warn({ runId: current.runId, issueId: current.issueId, environmentId: current.environmentId,
-          providerLeaseId: current.providerLeaseId ?? null, closeFailure: describeWarmCloseFailure(error) },
-        released ? "idle warm native session detach failed" : "idle warm native session close failed");
-      })
-      .finally(() => {
+      } else {
+        await closeWarmNativeSession(current, current.closeOnReleaseReason!);
+        forgetWarmNativeSession(sessionId, current);
+      }
+    }).catch(error => {
+      if (!detach && error instanceof AgentDirectoryOperationBusyError) {
+        armWarmNativeSessionIdleTimer(sessionId, current, agentDirectoryBusyRetryDelayMs());
+        return;
+      }
+      if (detach) current.closeOnReleaseReason = "released Runner local detach is unconfirmed";
+      logger.warn({ runId: current.runId, issueId: current.issueId, environmentId: current.environmentId,
+        providerLeaseId: current.providerLeaseId ?? null, closeFailure: describeWarmCloseFailure(error) },
+      detach ? "idle warm native session detach failed" : "idle warm native session close retry could not be recorded");
+    }).finally(() => {
         current.busy = false;
         if (closingWarmNativeSessions.get(sessionId) === closing) closingWarmNativeSessions.delete(sessionId);
         releaseIdleSessionToolAuthority(sessionId);
@@ -13198,6 +13325,7 @@ async function executePaperclipNativeSessionAttempt(
                   existing.issueId = input.execution.binding.issueId;
                 } else
                   warmNativeSessions.set(warmSessionId, {
+                    db: input.db,
                     ingressOwner: (() => {
                       const ingress = input.useRunnerd ? nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget) : undefined;
                       return ingress ? { ...input.execution.binding, ingress, controllerBootId: controller.bootId, controllerGeneration } : undefined;
@@ -18523,12 +18651,23 @@ async function createRunnerdBackendWithinSessionClaim(
       completedAt: backup.manifest.completedAt,
     });
     const leaseId = remoteTarget.leaseId;
+    const previousClose = leaseRow.metadata?.[WARM_NATIVE_SESSION_CLOSE_KEY] as Record<string, unknown> | undefined;
+    const closeInProgress = previousClose?.state === "closing" || previousClose?.state === "retrying";
+    const closeMarker = {
+      schema: "paperclip.native-warm-session-close.v1", state: "checkpointed",
+      attempts: closeInProgress && typeof previousClose?.attempts === "number" ? previousClose.attempts : 0,
+      warningCount: closeInProgress && typeof previousClose?.warningCount === "number" ? previousClose.warningCount : 0,
+      providerLeaseId: leaseRow.providerLeaseId, runId: leaseRow.heartbeatRunId,
+      normalizedSessionId: stamp.normalizedSessionId, manifestSha256: stamp.manifestSha256,
+      checkpointCompletedAt: stamp.completedAt,
+    };
     const updated = await writeEnvironmentCleanup(input.db, tx => tx
       .update(environmentLeases)
       .set({
         metadata: {
           ...(leaseRow.metadata ?? {}),
           nativeHarnessBackup: stamp,
+          ...(closeInProgress ? { [WARM_NATIVE_SESSION_CLOSE_KEY]: closeMarker } : {}),
         },
         updatedAt: new Date(),
       })

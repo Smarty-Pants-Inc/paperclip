@@ -112,11 +112,34 @@ suite("warm sandbox expiry", () => {
         runnerInstanceId: "runner", sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: lease.providerLeaseId!,
         authorizedProviderLeaseId: lease.providerLeaseId!, manifestSha256: `sha256:${"b".repeat(64)}`,
         completedAt: new Date(finishedAt.getTime() - 1).toISOString() },
-      warmNativeSessionClose: { state: "closed", closedAt: finishedAt.toISOString() },
+      warmNativeSessionClose: { schema: "paperclip.native-warm-session-close.v1", state: "closed",
+        closedAt: finishedAt.toISOString(), providerLeaseId: lease.providerLeaseId, runId: lease.heartbeatRunId,
+        normalizedSessionId: "native-session", manifestSha256: `sha256:${"b".repeat(64)}` },
     } }).where(eq(environmentLeases.id, leaseId));
 
     expect(await stopWarmSandboxesPastWindow(db)).toEqual({ stopping: 0 });
     expect((await row(leaseId)).status).toBe("retained");
+  });
+
+  it("stops an expired native warm lease only after the current checkpoint and close receipt", async () => {
+    const leaseId = await warmRetained({ releasedAgoMs: 6 * MINUTE, windowMs: 5 * MINUTE });
+    const lease = await row(leaseId);
+    const finishedAt = new Date(Date.now() - 2_000);
+    const completedAt = new Date(Date.now() - 1_000).toISOString();
+    const closedAt = new Date().toISOString();
+    await db.update(heartbeatRuns).set({ finishedAt }).where(eq(heartbeatRuns.id, lease.heartbeatRunId!));
+    await db.update(environmentLeases).set({ metadata: { ...lease.metadata,
+      reusableSandboxLease: { adapterType: "paperclip_runner" },
+      nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: "native-session",
+        runnerInstanceId: "runner", sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: lease.providerLeaseId!,
+        authorizedProviderLeaseId: lease.providerLeaseId!, manifestSha256: `sha256:${"b".repeat(64)}`, completedAt },
+      warmNativeSessionClose: { schema: "paperclip.native-warm-session-close.v1", state: "closed", closedAt,
+        providerLeaseId: lease.providerLeaseId, runId: lease.heartbeatRunId,
+        normalizedSessionId: "native-session", manifestSha256: `sha256:${"b".repeat(64)}` },
+    } }).where(eq(environmentLeases.id, leaseId));
+
+    expect(await stopWarmSandboxesPastWindow(db)).toEqual({ stopping: 1 });
+    expect((await row(leaseId)).status).toBe("pending_cleanup");
   });
 
   it("close failure -> no stop, one counted warning", async () => {
