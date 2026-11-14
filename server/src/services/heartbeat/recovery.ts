@@ -1898,7 +1898,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             ? await environmentRuntime.inspectLeaseResource?.(lease.id).catch(() => undefined)
             : undefined;
           const observedStop = acceptedStopOnlyReceipt(lease, observation);
-          const receipt = observedStop ? observation
+          const endedStopAlreadyAttempted = attempts > 0
+            && (lease.metadata?.sandboxStopAndRetain as Record<string, unknown> | undefined)?.endedLeaseEvidence !== undefined;
+          // RFL 22:57Z (2): this receipt-less ended row authorizes ONE stop,
+          // not a new stop per read. Later bounded sweeps only look for proof.
+          // The durable attempt counter also preserves this bound on restart.
+          const receipt = observedStop ? observation : endedStopAlreadyAttempted ? undefined
             : await environmentRuntime.retryPendingSandboxTeardown({ environment, lease });
           const released = hasStopOnlyCleanup(lease)
             ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt,

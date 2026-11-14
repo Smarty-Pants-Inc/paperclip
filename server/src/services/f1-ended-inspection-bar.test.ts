@@ -14,7 +14,7 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
   let db: Db;
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("f1-ended-inspection-bar"); db = createDb(database.connectionString); }, 60_000);
-  afterEach(async () => { await db.execute(sql`truncate table companies cascade`); });
+  afterEach(async () => { vi.useRealTimers(); await db.execute(sql`truncate table companies cascade`); });
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
   async function fixture() {
@@ -121,6 +121,45 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     expect(readStopOnlyCleanup(settled)).toBeNull();
     expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
+  }, 60_000);
+
+  it.each([false, true])("an unconfirmed single stop uses bounded read-only sweeps (later proof: %s)", async laterProof => {
+    const f = await fixture(), t0 = Date.now();
+    await inspectFreshThreadStopResources(db, f.run, f.issue.id,
+      f.inspector({ providerLeaseId: f.lease.providerLeaseId!, state: "running" }));
+    await f.gate();
+    expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
+    expect(await f.notes()).toHaveLength(1);
+    const stop = vi.fn(async () => undefined);
+    let reads = 0;
+    const inspect = vi.fn(async () => ++reads >= 3 && laterProof
+      ? { providerLeaseId: f.lease.providerLeaseId!, state: "stopped" } : undefined);
+    const hb = heartbeatService(db, { environmentRuntime: { retryPendingSandboxTeardown: stop,
+      inspectLeaseResource: inspect } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    for (let n = 0; n < 10; n++) {
+      vi.setSystemTime(t0 + n * 1800_000);
+      await hb.sweepPendingCleanupLeases();
+      await f.gate();
+      expect(stop).toHaveBeenCalledOnce();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
+    }
+    expect(inspect).toHaveBeenCalledTimes(laterProof ? 3 : 5);
+    if (laterProof) {
+      expectRestored(f.lease, await f.readLease());
+      await expectStorageRestored(f);
+      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
+      expect(await f.notes()).toHaveLength(1);
+    } else {
+      const pending = await f.readLease();
+      expect(pending.status).toBe("pending_cleanup");
+      expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
+      const notes = await f.notes(), current = notes.filter(note => !note.metadata?.supersededByCommentId);
+      expect(current).toMatchObject([{ body: FRESH_THREAD_STOP_UNAVAILABLE_NOTE }]);
+      expect(current).toHaveLength(1);
+      expect(notes).toHaveLength(2); // one waiting history, one final cannot-confirm
+    }
   }, 60_000);
 
   it("restart after the persisted rewrite recovers the exact original from its intent and restores it once", async () => {
