@@ -142,7 +142,9 @@ it("uses the selected duplex transport across credential rotation without file p
   expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["a", "b"]);
   expect(recorder.recordSpan).toHaveBeenCalledWith(expect.objectContaining({ name: "sandbox.duplex.request" }));
   expect(recorder.emitEvent).not.toHaveBeenCalledWith(expect.objectContaining({ dimensions: expect.objectContaining({ transport: "file" }) }));
-  expect(b.execute.mock.calls).toHaveLength(commandsAfterStartup);
+  // HTTP/2 attaches and detaches are fenced by the gateway's run-state marker;
+  // each transition performs one bounded control write, with no queue polling.
+  expect(b.execute.mock.calls).toHaveLength(commandsAfterStartup + 3);
   await releaseB();
   await b.stop();
   await expect(b.activate(run("c"))).rejects.toThrow("closed");
@@ -194,7 +196,9 @@ it.each([false, true])("keeps one live parent and its original launcher environm
   const operation = () => new Promise<{ pid: number; value: string; stderr: string }>(resolve => {
     lines.once("line", line => resolve(JSON.parse(line))); parent.stdin.write("run\n");
   });
-  expect((await request(b)).status).toBe(remote ? 503 : 403);
+  // Startup with no run satisfies upstream's startup probe: 403, not the
+  // detached-queue 503 reserved for a run transition after detach.
+  expect((await request(b)).status).toBe(403);
   const releaseA = await b.activate(run("run-a"));
   const a = await operation();
   expect(a.value).toBe("fixture-run-a");

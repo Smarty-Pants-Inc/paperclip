@@ -745,6 +745,8 @@ export interface Http2BridgeForwardRequest {
    * must never release it.
    */
   reservation: BridgeBodyReservation;
+  /** Run generation captured when this stream's HEADERS were accepted. */
+  generation?: string;
 }
 
 export type Http2BridgeForwardHandler = (
@@ -771,6 +773,8 @@ export interface CreateHttp2BridgeServerOptions {
   bridgeToken: string;
   /** The forward handler the server calls for each authorized request. */
   forwardRequest: Http2BridgeForwardHandler;
+  /** Capture the active run generation at stream HEADERS acceptance. */
+  captureGeneration?: () => string | undefined;
   /** The route allowlist. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST}. */
   routes?: readonly SandboxCallbackBridgeRouteRule[];
   /** The header allowlist. The default is {@link DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST}. */
@@ -1161,6 +1165,7 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
   async function handleStream(
     stream: http2.ServerHttp2Stream,
     headers: http2.IncomingHttpHeaders,
+    generation: string | undefined,
   ): Promise<void> {
     // One `AbortController` for this one stream. `forwardRequest` below
     // receives its signal, so a stream that closes, aborts, or errors ends
@@ -1251,6 +1256,7 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
           body,
           signal: controller.signal,
           reservation,
+          generation,
         });
       } catch (error) {
         if (error instanceof BridgeProcessCapacityError) {
@@ -1341,7 +1347,10 @@ export function createHttp2BridgeServer(options: CreateHttp2BridgeServerOptions)
   });
 
   server.on("stream", (stream, headers) => {
-    void handleStream(stream, headers).catch((error) => {
+    // Bind the request to the generation at HEADERS acceptance, before any
+    // body buffering can straddle a detach/reattach boundary.
+    const generation = options.captureGeneration?.();
+    void handleStream(stream, headers, generation).catch((error) => {
       // A fault inside `handleStream` itself (not a forward-handler or
       // stream-body rejection, both already caught above) is a defensive
       // last resort. Destroy only this stream; the session stays open.

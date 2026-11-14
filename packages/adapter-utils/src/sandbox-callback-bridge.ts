@@ -251,6 +251,8 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "if-match",
   "if-none-match",
   "x-paperclip-github-capability",
+  // Internal generation is overwritten by the gateway at request acceptance.
+  "x-paperclip-bridge-generation",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest extends SandboxCallbackBridgeBody {
@@ -900,7 +902,27 @@ export async function startSandboxCallbackBridgeWorker(input: {
     }
   }
   const runStatePath = path.posix.join(directories.rootDir, "run-state.json");
+  const everAttachedPath = `${runStatePath}.ever-attached`;
   let runStateManaged = Boolean(input.startPaused);
+  let runStateWriteFailureLogged = false;
+  const writeRunStateBestEffort = async (remotePath: string, value: string): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        input.client.writeTextFile(remotePath, value),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("run-state write timed out")), 5_000);
+        }),
+      ]);
+    } catch (error) {
+      if (!runStateWriteFailureLogged) {
+        runStateWriteFailureLogged = true;
+        console.warn(`[paperclip] sandbox callback bridge could not update run state: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
   if (input.startPaused) {
     await input.client.writeTextFile(runStatePath, "paused");
   }
@@ -1705,7 +1727,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
       if (stopping || paused) return;
       paused = true;
       runStateManaged = true;
-      await input.client.writeTextFile(runStatePath, "paused");
+      await writeRunStateBestEffort(runStatePath, "paused");
       pausedPromise ??= new Promise<void>((resolve) => { resumePolling = resolve; });
       if (sleepTimer) clearTimeout(sleepTimer);
       sleepTimer = null;
@@ -1730,7 +1752,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
     resume: async (generation?: string) => {
       if (stopping || !paused) return;
       await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
-      await input.client.writeTextFile(runStatePath, generation ? `attached:${generation}` : "attached");
+      await writeRunStateBestEffort(everAttachedPath, "attached");
+      await writeRunStateBestEffort(runStatePath, generation ? `attached:${generation}` : "attached");
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
       const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });
@@ -2501,9 +2524,18 @@ async function runFileGateway() {
       // The host writes this shared queue marker at run detach. Reject here,
       // before queue publication, so leftover sandbox processes fail immediately
       // instead of waiting for the host's next attached-run poll.
+      const url = new URL(req.url || "/", "http://127.0.0.1");
       const runState = await fs.readFile(path.posix.join(queueDir, "run-state.json"), "utf8").catch(() => "");
       const runStateValue = runState.trim();
-      if (runStateValue === "paused" || (runStateValue !== "" && runStateValue !== "attached" && !runStateValue.startsWith("attached:"))) {
+      if (runStateValue === "paused" && req.method === "POST" && url.pathname === "/runtime-tools/github/credentials") {
+        const everAttached = await fs.readFile(path.posix.join(queueDir, "run-state.json") + ".ever-attached", "utf8").then(() => true, () => false);
+        if (!everAttached) {
+          writeJsonResponse(res, 403, { error: "No active GitHub run" });
+          return;
+        }
+      }
+      if (runStateValue === "paused" ||
+          (runStateValue !== "" && runStateValue !== "attached" && !runStateValue.startsWith("attached:"))) {
         writeJsonResponse(res, 503, { error: "The Paperclip run is detached; bridge requests are unavailable." });
         return;
       }
@@ -2523,7 +2555,6 @@ async function runFileGateway() {
         }
       }
 
-      const url = new URL(req.url || "/", "http://127.0.0.1");
       const contentType = typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "";
       const multipartAttachment = req.method === "POST"
         && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(url.pathname)
@@ -2800,6 +2831,14 @@ function runHttp2Gateway() {
         writeJsonResponse(res, 503, { error: "bridge_unavailable" });
         return;
       }
+      // Bind before reading the body: body delivery may straddle detach and
+      // reattach, but this request keeps the generation present at acceptance.
+      const acceptedRunState = queueDir
+        ? await fs.readFile(path.posix.join(queueDir, "run-state.json"), "utf8").catch(() => "")
+        : "";
+      const acceptedGeneration = acceptedRunState.startsWith("attached:")
+        ? acceptedRunState.slice("attached:".length).trim()
+        : "";
       const url = new URL(req.url || "/", "http://127.0.0.1");
       const { body: requestBodyBuffer, release } = await readBodyBytes(req);
       releaseBodyReservation = release;
@@ -2809,7 +2848,10 @@ function runHttp2Gateway() {
           method: req.method || "GET",
           path: url.pathname,
           query: url.search,
-          headers: normalizeHeaders(req.headers),
+          headers: {
+            ...Object.fromEntries(Object.entries(normalizeHeaders(req.headers)).filter(([key]) => key.toLowerCase() !== "x-paperclip-bridge-generation")),
+            ...(acceptedGeneration ? { "x-paperclip-bridge-generation": acceptedGeneration } : {}),
+          },
           body: requestBodyBuffer,
         });
       } catch (error) {
