@@ -2650,6 +2650,7 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    attemptCount?: number;
   }, database: DbOrTransaction = db) {
     const recoveryCause = resolveStrandedRecoveryCause(
       input.latestRun,
@@ -2698,6 +2699,7 @@ export function recoveryService(
       evidenceOnCreate: isProviderQuotaWait || isEnvironmentProviderWait
         ? {}
         : { routingPolicy: STRANDED_BOARD_ESCALATION_POLICY },
+      attemptCount: input.attemptCount,
       nextAction:
         recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "The agent finished without saying whether the task is done. Mark the task done if it is, or press Retry to let the agent continue from the saved work."
@@ -3674,6 +3676,17 @@ export function recoveryService(
         continue;
       }
 
+      const actionEvidence = parseObject(action.evidence);
+      const retryRefusal = parseObject(actionEvidence.taskRetryRefusal);
+      if (retryRefusal.schema === "paperclip.task-retry-source-refusal.v1" &&
+          retryRefusal.currentRunId === actionEvidence.latestRunId &&
+          retryRefusal.sourceRunId !== retryRefusal.currentRunId) {
+        // An older queued wake is not the current run's recovery path. Keep the
+        // source-refreshed board card visible instead of sweeping it away.
+        result.skipped += 1;
+        continue;
+      }
+
       const [sourceState, healthyChildren, hasNewSourcePath] =
         await Promise.all([
           readDispositionRepairDurableWaitingState(db, { issue }),
@@ -4149,6 +4162,7 @@ export function recoveryService(
     issue: RecoveryIssue;
     previousStatus: StrandedPreviousStatus;
     latestRun: LatestIssueRun;
+    attemptCount?: number;
     comment?: string;
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
@@ -4225,6 +4239,7 @@ export function recoveryService(
       latestRun: input.latestRun,
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      attemptCount: input.attemptCount,
     }, tx);
     const isProviderQuotaWait =
       recoveryCause === "provider_quota" &&

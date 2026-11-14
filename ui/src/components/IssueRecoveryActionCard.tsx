@@ -285,12 +285,15 @@ function asNonEmptyString(value: unknown): string | null {
 function readTaskRetrySourceRefusal(action: IssueRecoveryAction) {
   const refusal = asRecord(action.evidence?.taskRetryRefusal);
   const sourceRunId = readEvidenceRunId(action, "latestRunId");
+  const refusalSourceRunId = asNonEmptyString(refusal?.sourceRunId);
+  const currentRunId = asNonEmptyString(refusal?.currentRunId);
+  const originalCard = refusalSourceRunId === sourceRunId && currentRunId !== sourceRunId;
+  const refreshedCard = currentRunId === sourceRunId && refusalSourceRunId !== currentRunId;
   if (refusal?.schema !== "paperclip.task-retry-source-refusal.v1" ||
-      refusal.recoveryActionId !== action.id || refusal.sourceRunId !== sourceRunId ||
-      typeof refusal.currentRunId !== "string" || refusal.currentRunId === sourceRunId) return null;
+      refusal.recoveryActionId !== action.id || !currentRunId || (!originalCard && !refreshedCard)) return null;
   const reason = asNonEmptyString(refusal.reason);
   const nextAction = asNonEmptyString(refusal.nextAction);
-  return reason && nextAction ? { reason, nextAction, currentRunId: refusal.currentRunId } : null;
+  return reason && nextAction ? { reason, nextAction, currentRunId } : null;
 }
 
 function asAncestryVerdict(value: unknown): GitWorktreeBranchAncestryVerdict | null {
