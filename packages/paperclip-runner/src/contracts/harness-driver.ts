@@ -608,6 +608,7 @@ export interface HarnessSessionRecoveryResult {
   /** Server-authored restoration refusal; diagnostics are not authority. */
   recoveryRefusalCode?: "runner_remote_state_unavailable"
     | "runner_harness_state_mismatch: backup_without_reusable_lease"
+    | "runner_harness_state_mismatch: resumed_unavailable"
     | "native_controller_recovery_missing_evidence:retained_sandbox_binding";
 }
 
@@ -619,6 +620,7 @@ export function runnerRecoveryRefusalCode(error: unknown, depth = 0): HarnessSes
   for (const code of [failure.code, runnerPrepareRefusalCode(error)]) {
     if (code === "runner_remote_state_unavailable"
       || code === "runner_harness_state_mismatch: backup_without_reusable_lease"
+      || code === "runner_harness_state_mismatch: resumed_unavailable"
       || code === "native_controller_recovery_missing_evidence:retained_sandbox_binding") return code;
   }
   return runnerRecoveryRefusalCode(failure.cause, depth + 1);
@@ -634,6 +636,7 @@ export const RUNNER_PREPARE_REFUSAL_CODES = [
   "provider_reconciliation_required", "provider_pending_tool_calls",
   "provider_prepare_refused",
   "runner_harness_state_mismatch: backup_without_reusable_lease",
+  "runner_harness_state_mismatch: resumed_unavailable",
   "native_controller_recovery_missing_evidence:retained_sandbox_binding",
 ] as const;
 export type RunnerPrepareRefusalCode = typeof RUNNER_PREPARE_REFUSAL_CODES[number];
@@ -644,6 +647,7 @@ export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepa
   // Runtime recovery preserves C1's specific code beside the closed
   // controller refusal. Accept only a matching pair, never an arbitrary field.
   if ((value.code === "runner_harness_state_mismatch: backup_without_reusable_lease"
+    || value.code === "runner_harness_state_mismatch: resumed_unavailable"
     || value.code === "native_controller_recovery_missing_evidence:retained_sandbox_binding")
     && value.prepareRefusalCode === value.code) return value.code;
   const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)

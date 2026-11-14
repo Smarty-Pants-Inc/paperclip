@@ -465,7 +465,7 @@ type NativeSessionStartup = {
   executionLeaseRenewal?: NativeExecutionLeaseRenewal;
   providerPackSourceAbort: AbortController;
   /** A fresh claim whose preparation failed before any provider turn. */
-  unstartedClaim?: { leaseOwner: string; attempt: number };
+  unstartedClaim?: { leaseOwner: string; attempt: number; failureCode?: typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE };
   /** A provider session handle was published; a turn may have followed it. */
   sessionPublished?: boolean;
   /** One fresh identity exchange per attempt, shared by nested admission checks. */
@@ -11022,7 +11022,7 @@ async function executePaperclipNativeSessionUnnoticed(input: {
       // Join preparation cleanup before release; keep cancellation reachable
       // until the exact retained owner has finished the handover.
       await startup.executionLeaseRenewal?.stop().catch(() => undefined);
-      if (startup.unstartedClaim && !nativeRunsDetachingForRestart.has(runId)) {
+      if (startup.unstartedClaim && !startupUnsettled && !nativeRunsDetachingForRestart.has(runId)) {
         await releaseUnstartedNativeExecutionClaim({ db: input.db, runId, companyId: input.execution.binding.companyId,
           issueId: input.execution.binding.issueId, ...startup.unstartedClaim }).catch(error => {
           logger.warn({ err: error, runId }, "Native preparation claim release failed; the control deadline will settle it");
@@ -11862,10 +11862,12 @@ async function executePaperclipNativeSessionAttempt(
     // exact claim after renewal stops; a restart claim, startup cleanup, Stop or
     // restart detach keeps its owner.
     const startup = nativeSessionStartups.get(input.execution.binding.runId);
-    if (startup && freshClaimAttempt !== undefined && !claimedStartupContext
+    const retirement = findNativePredecessorRetirementUnproven(error);
+    if (startup && freshClaimAttempt !== undefined && (!claimedStartupContext || retirement)
       && !(error instanceof NativeCancellationPendingRecoveryError)
       && !(error instanceof NativeControllerDetachedForRestartError)) {
-      startup.unstartedClaim = { leaseOwner, attempt: freshClaimAttempt };
+      startup.unstartedClaim = { leaseOwner, attempt: freshClaimAttempt,
+        ...(retirement ? { failureCode: retirement.code } : {}) };
     }
     throw error;
   }
@@ -12553,6 +12555,15 @@ async function executePaperclipNativeSessionAttempt(
         try {
           await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
           forgetWarmNativeSession(warmSessionId, entry);
+        } catch (error) {
+          // This late preparation step is outside the earlier task-prepare
+          // catch. No session/turn of this run was opened: join the SAME exact
+          // unstarted-claim release after renewal stops, not the 80s watchdog.
+          const retirement = findNativePredecessorRetirementUnproven(error);
+          if (startupForAdmission && freshClaimAttempt !== undefined && retirement) {
+            startupForAdmission.unstartedClaim = { leaseOwner, attempt: freshClaimAttempt, failureCode: retirement.code };
+          }
+          throw error;
         } finally { entry.busy = false; }
         if (preparedCopy) throw new Error("native_instruction_preparation_configuration_changed");
         if (input.useRunnerd && input.runnerExecutionTarget?.kind === "remote") {
@@ -18768,7 +18779,8 @@ async function createRunnerdBackendWithinSessionClaim(
                         });
                       } else if ((state.incompleteReason !== "unavailable" && !provenRestart) || backupAvailable ||
                           !(await claimUntouchedRemoteSession())) {
-                        throw new Error(`runner_harness_state_mismatch: resumed_${state.incompleteReason}`);
+                        const code = `runner_harness_state_mismatch: resumed_${state.incompleteReason}`;
+                        throw state.incompleteReason === "unavailable" ? nativeReconciliationError(code) : new Error(code);
                       }
                     } else {
                       await recordInPlaceHarnessReuse(

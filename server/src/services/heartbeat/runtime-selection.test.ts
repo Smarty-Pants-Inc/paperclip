@@ -45,6 +45,7 @@ import { createNativeSessionHandoffLoader } from "../native-runtime/native-sessi
 import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer.js";
 import { resolveNativeControllerRecovery, assertNativeRetainedSandboxBinding } from "../native-runtime/native-controller-recovery.js";
 import { createSystemRecovery } from "../system-recovery-state.js";
+import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -588,10 +589,11 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     "codex-confirmed-stop", "codex-unconfirmed-stop", "codex-metadata-format", "codex-already-stranded", "codex-idle-descendants", "codex-active-turn", "codex-held-notice", "codex-already-stranded-unconfirmed",
     "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare",
     "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed", "codex-seed-a-adopted",
-    "codex-tl08", "codex-tl08-unconfirmed"] as const)(
+    "codex-tl08", "codex-tl08-unconfirmed", "codex-tl08-retained", "codex-tl08-retained-unconfirmed"] as const)(
     "designed end answers from history with one note and no Retry (%s)", async shape => {
     const scenario = shape.replace(/^codex-/, "");
     const tl08 = scenario.startsWith("tl08");
+    const tl08Retained = scenario.startsWith("tl08-retained");
     const seedSequence = tl08 || scenario.startsWith("seed-a");
     const f = shape.startsWith("codex-") ? await fixture() : await piFixture();
     f.input.workspace.executionWorkspace.cwd = instructionRoot;
@@ -632,7 +634,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       authorType: "user", authorUserId: "local-board", body: `Answer the saved ${shape} request, using the earlier history.` }).returning();
     await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
       seq: 64, stream: "system", eventType: "native.process_start_requested", createdAt: new Date("2026-11-14T08:16:07.439508Z") });
-    const error = tl08 ? "runner_harness_state_mismatch: resumed_unavailable"
+    const error = tl08Retained ? "native_controller_recovery_missing_evidence:retained_sandbox_binding"
+      : tl08 ? "runner_harness_state_mismatch: resumed_unavailable"
       : scenario === "backup-without-lease" ? "runner_harness_state_mismatch: backup_without_reusable_lease"
       : scenario === "retained-binding" || scenario.startsWith("seed-a") ? "native_controller_recovery_missing_evidence:retained_sandbox_binding"
       : scenario === "launch-profile" ? "native_runner_launch_profile_mismatch"
@@ -642,7 +645,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       : scenario === "idle-descendants" || scenario === "active-turn" ? "native_runner_refresh_required"
       : "native_controller_recovery_missing_evidence:snapshot_binding";
     await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
-      errorCode: tl08 ? "native_session_interrupted" : scenario.startsWith("seed-a") ? "native_continuation_requires_reconciliation" : error, error,
+      errorCode: tl08 && !tl08Retained ? "native_session_interrupted" : seedSequence ? "native_continuation_requires_reconciliation" : error, error,
       resultJson: { failureCause: "provider_http_429" } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", attempt: 1, controllerBootId: randomUUID(),
       leaseOwner: null, leaseExpiresAt: null, recoveryState: "blocked", failureCode: error }).where(eq(nativeRunFinalizations.runId, f.run.id));
@@ -658,29 +661,53 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       // only the original stranded attempt can supply physical-stop proof.
       leaseRunId = stranded.id;
     }
+    const tl08Environment = tl08 ? (await db.insert(environments).values({ name: `TL08 warm box ${randomUUID()}`, driver: "sandbox" }).returning())[0] : undefined;
     const [lease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId, heartbeatRunId: leaseRunId,
-      issueId: f.issue.id, provider: "boat", providerLeaseId: "bx_33zmdkqu", status: "expired", cleanupStatus: "success",
-      acquiredAt: new Date("2026-11-14T08:15:56.610Z"), releasedAt: new Date(), metadata: { pluginId: "fixture-boat" } }).returning();
-    // Seed A: the first follow-up loses its reusable lease; automatic recovery
-    // and the person's resend both refuse the resumed retained binding. These
-    // are real persisted failure rows, not an invented successful continuation.
+      environmentId: tl08Environment?.id, leasePolicy: tl08 ? "reuse_by_environment" : undefined,
+      issueId: f.issue.id, provider: "boat", providerLeaseId: tl08 ? "bx_8v7gcucz" : "bx_33zmdkqu",
+      status: tl08 ? "pending_cleanup" : "expired", cleanupStatus: tl08 ? "failed" : "success",
+      acquiredAt: new Date("2026-11-14T08:15:56.610Z"), releasedAt: tl08 ? null : new Date(),
+      metadata: { pluginId: "fixture-boat", ...(tl08 ? { agentId: f.agent.id, cleanupError: "sandbox_stop_pending" } : {}) } }).returning();
+    // Seed A: backup loss -> retained binding -> retained binding.
+    // TL08: failed retirement -> resumed unavailable -> retained binding,
+    // all on the same box. Check the designed end both at step 2 and step 3.
+    // These are persisted failure rows, not an invented successful continuation.
     const seedLeases: (typeof lease)[] = [];
     if (seedSequence) {
-      for (const [index, code] of [tl08 ? "native_predecessor_retirement_unproven" : "runner_harness_state_mismatch: backup_without_reusable_lease",
-        "native_controller_recovery_missing_evidence:retained_sandbox_binding"].entries()) {
+      const earlierCodes = tl08 ? ["native_predecessor_retirement_unproven",
+        ...(tl08Retained ? ["runner_harness_state_mismatch: resumed_unavailable"] : [])]
+        : ["runner_harness_state_mismatch: backup_without_reusable_lease",
+          "native_controller_recovery_missing_evidence:retained_sandbox_binding"];
+      for (const [index, code] of earlierCodes.entries()) {
         const [failed] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
           nativeIssueId: f.issue.id, nativeSessionId: oldId, runtimeMode: "native", status: "failed",
-          errorCode: index === 0 ? "native_session_interrupted" : "native_continuation_requires_reconciliation",
+          errorCode: code === "native_predecessor_retirement_unproven" ? code
+            : code.startsWith("runner_harness_state_mismatch:") ? "native_session_interrupted" : "native_continuation_requires_reconciliation",
           error: code, finishedAt: new Date(), createdAt: new Date(f.run.createdAt.getTime() - 2000 + index * 500) }).returning();
         const [oldLease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId,
-          heartbeatRunId: failed.id, issueId: f.issue.id, provider: "boat", providerLeaseId: `seed-a-box-${index}`,
-          status: "pending_cleanup", cleanupStatus: "failed", acquiredAt: new Date("2026-11-14T08:15:56.610Z"),
-          metadata: { pluginId: "fixture-boat", cleanupError: "sandbox_stop_pending" } }).returning();
+          heartbeatRunId: failed.id, issueId: f.issue.id, provider: "boat", providerLeaseId: tl08 ? "bx_8v7gcucz" : `seed-a-box-${index}`,
+          environmentId: tl08Environment?.id, leasePolicy: tl08 ? "reuse_by_environment" : undefined,
+          status: tl08 ? "expired" : "pending_cleanup", cleanupStatus: tl08 ? "success" : "failed",
+          acquiredAt: tl08 ? new Date(lease.acquiredAt.getTime() - (earlierCodes.length - index) * 1000) : new Date("2026-11-14T08:15:56.610Z"),
+          releasedAt: tl08 ? new Date(lease.acquiredAt.getTime() - (earlierCodes.length - index - 1) * 1000) : null,
+          metadata: { pluginId: "fixture-boat", ...(tl08 ? { agentId: f.agent.id } : { cleanupError: "sandbox_stop_pending" }) } }).returning();
         seedLeases.push(oldLease);
       }
     }
+    if (tl08) {
+      // Expired reuse is not stop proof: only the ended chain tip may be
+      // stopped. Record the existing allocator's exact two-sided handoff.
+      const chain = [...seedLeases, lease];
+      for (let index = 1; index < chain.length; index++) {
+        const previous = chain[index - 1], current = chain[index];
+        const handoff = createReusableLeaseHandoff(previous, current);
+        previous.metadata = { ...previous.metadata, reusableLeaseSuccessor: handoff };
+        current.metadata = { ...current.metadata, reusableLeasePredecessor: handoff };
+      }
+      for (const row of chain) await db.update(environmentLeases).set({ metadata: row.metadata }).where(eq(environmentLeases.id, row.id));
+    }
     const confirmStop = async () => {
-      for (const oldLease of seedLeases) {
+      for (const oldLease of tl08 ? [] : seedLeases) {
         const confirmedAt = new Date();
         await db.update(environmentLeases).set({ status: "released", releasedAt: confirmedAt,
           cleanupStatus: "success", metadata: { pluginId: "fixture-boat", remoteExecutionTermination: {
@@ -690,12 +717,12 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       }
       const confirmedAt = new Date().toISOString();
       await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success",
-        metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
+        metadata: { ...lease.metadata, pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
           companyId: lease.companyId, runId: leaseRunId, leaseId: lease.id, provider: lease.provider,
           providerLeaseId: lease.providerLeaseId, state: "stopped", confirmedAt } } }).where(eq(environmentLeases.id, lease.id));
     };
     const waiting = scenario === "unconfirmed-stop" || scenario === "active-turn" || scenario === "already-stranded-unconfirmed"
-      || scenario === "seed-a-unconfirmed" || scenario === "tl08-unconfirmed";
+      || scenario === "seed-a-unconfirmed" || (tl08 && scenario.endsWith("-unconfirmed"));
     if (!waiting) await confirmStop();
     const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.agent.companyId, sourceIssueId: f.issue.id,
       kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "board",
@@ -784,6 +811,12 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect(allNotes.find(c => c.id === heldCommentId)).toMatchObject({ body: "The earlier attempt is still being checked.",
         metadata: { supersededByCommentId: notes[0].id } });
       expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
+    }
+    if (tl08) for (const oldLease of seedLeases) {
+      const [unchanged] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLease.id));
+      expect(unchanged).toMatchObject({ status: "expired", cleanupStatus: "success", releasedAt: oldLease.releasedAt,
+        metadata: { reusableLeaseSuccessor: oldLease.metadata!.reusableLeaseSuccessor } });
+      expect(unchanged.metadata).not.toHaveProperty("remoteExecutionTermination");
     }
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
   }, 60_000);

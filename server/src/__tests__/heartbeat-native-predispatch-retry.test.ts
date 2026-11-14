@@ -44,7 +44,7 @@ type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environme
   sessionRoots: string[] };
 
 function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescriptorOnce?: { failed: boolean };
-  unretiredPredecessorOnce?: { failed: boolean; environmentId: string }; turnMessages?: Map<string, string>;
+  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; leasePolicy?: AdmissionFailure["leasePolicy"] }; turnMessages?: Map<string, string>;
   admissionFailure?: AdmissionFailure } = {}):
   NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
   return execution => {
@@ -95,7 +95,7 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
           await db.insert(environmentLeases).values({ companyId: run!.companyId, environmentId: unretired.environmentId,
             issueId: execution.binding.issueId, heartbeatRunId: run!.id, provider: "daytona", providerLeaseId: "sandbox-reused",
-            leasePolicy: "reuse_by_environment", status: "active", metadata: { remoteCwd: "/workspace" } });
+            leasePolicy: unretired.leasePolicy ?? "reuse_by_environment", status: "active", metadata: { remoteCwd: "/workspace" } });
           throw new NativePredecessorRetirementUnprovenError("previous-run", "sandbox-reused",
             new Error("Controller journal drain timed out; preserve the session before replacing its writer."));
         }
@@ -195,12 +195,13 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     }
   }, 90_000);
 
-  it("re-queues a run whose predecessor could not be retired onto a fresh sandbox without a Retry", async () => {
+  it.each(["reuse_by_environment", "reuse_by_execution_workspace"] as const)(
+    "re-queues a run whose predecessor could not be retired onto a fresh sandbox without a Retry (%s)", async leasePolicy => {
     const { companyId } = fixture.current;
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
     const [environment] = await db.insert(environments).values({ name: `reused-${randomUUID()}`, driver: "sandbox" }).returning();
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db,
-      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id } }) });
+      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, leasePolicy } }) });
     try {
       const { issueId, runId } = await startTask(db, heartbeat);
       const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
