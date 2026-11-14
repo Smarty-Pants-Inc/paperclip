@@ -4,7 +4,9 @@ import request from "supertest";
 import { issueRoutes } from "../routes/issues.js";
 import { errorHandler } from "../middleware/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { companyService } from "../services/companies.js";
+import { parseIssueExecutionState } from "../services/issue-execution-policy.js";
 import { and, eq, isNull } from "drizzle-orm";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companyPortabilityService } from "../services/company-portability.js";
@@ -207,6 +209,120 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       expect(runs[0]).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "issue_monitor_due" } });
       expect(await notes(f.issue.id)).toHaveLength(0);
     } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); }
+  });
+
+  // Keep reason: recorded M14 due-time regression; real import/PATCH/lifecycle
+  // boundaries must preserve intent without bypassing ordinary pause admission.
+  function monitorApp() {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", source: "local_implicit", userId: "m12-board", isInstanceAdmin: true };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1]));
+    app.use(errorHandler);
+    return app;
+  }
+
+  it.each(["in_progress", "in_review"])("overdue import-only monitor retains its schedule and runs exactly once after lifecycle resume (%s)", async status => {
+    const f = await imported(true, status);
+    const app = monitorApp();
+    const due = new Date(Date.now() + 60_000);
+    const response = await request(app).patch(`/api/issues/${f.issue.id}`).send({
+      executionPolicy: { monitor: { nextCheckAt: due.toISOString(), notes: "Overdue imported check" } },
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const heartbeat = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    const peer = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+      runPlugin: async () => "complete", runHost: async () => "complete" });
+    try {
+      for (let pass = 0; pass < 2; pass++) {
+        await heartbeat.tickIssueMonitors(new Date(due.getTime() + 1 + pass));
+        const [waiting] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        console.log(JSON.stringify({ check: "import-overdue", status, pass, schedule: waiting!.monitorNextCheckAt,
+          claim: waiting!.monitorWakeRequestedAt, attempts: waiting!.monitorAttemptCount }));
+        expect(waiting).toMatchObject({ status, monitorNextCheckAt: due, monitorWakeRequestedAt: null,
+          monitorAttemptCount: 0, monitorLastTriggeredAt: null, monitorNotes: "Overdue imported check" });
+        expect(parseIssueExecutionState(waiting!.executionState)?.monitor?.status).toBe("scheduled");
+      }
+      expect(await heartbeat.nextIssueMonitorAt()).toBeNull();
+      expect(await notes(f.issue.id)).toHaveLength(0);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      await worker.process(f.agentId);
+      await createAgentLifecycle(db).resumeAgent(f.agentId);
+      await worker.process(f.agentId);
+      expect(await heartbeat.nextIssueMonitorAt()).toBe(due.getTime());
+      await Promise.all([heartbeat.tickIssueMonitors(new Date(due.getTime() + 3)), peer.tickIssueMonitors(new Date(due.getTime() + 3))]);
+      await heartbeat.tickIssueMonitors(new Date(due.getTime() + 4));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId));
+      const [settled] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+      console.log(JSON.stringify({ check: "import-overdue-resumed", status,
+        runs: runs.map(r => ({ id: r.id, status: r.status, reason: r.contextSnapshot?.wakeReason })), wakes: wakes.length }));
+      expect(runs).toHaveLength(1);
+      expect(wakes).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "issue_monitor_due", issueId: f.issue.id } });
+      expect(settled).toMatchObject({ monitorNextCheckAt: null, monitorWakeRequestedAt: null, monitorAttemptCount: 1 });
+      expect(await notes(f.issue.id)).toHaveLength(0);
+    } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); await peer.drainActiveRunExecutions(); }
+  });
+
+  it.each(["manual", "company", "import+manual", "import+company"] as const)("a due monitor cleared by %s pause posts one visible note per clear, not a resume run", async pause => {
+    const f = await imported(true);
+    const app = monitorApp();
+    const due = new Date(Date.now() + 60_000);
+    const arm = async (at: Date) => {
+      const response = await request(app).patch(`/api/issues/${f.issue.id}`).send({
+        executionPolicy: { monitor: { nextCheckAt: at.toISOString(), notes: "Paused scheduled check" } },
+      });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+    };
+    await arm(due);
+    const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+      runPlugin: async () => "complete", runHost: async () => "complete" });
+    const heartbeat = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    const peer = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    try {
+      await worker.process(f.agentId);
+      if (!pause.startsWith("import+")) {
+        await createAgentLifecycle(db).resumeAgent(f.agentId);
+        await worker.process(f.agentId);
+      }
+      if (pause.endsWith("company")) await companyService(db).update(f.companyId, { status: "paused" });
+      else await createAgentLifecycle(db).pauseAgent(f.agentId, "manual");
+      await worker.process(f.agentId);
+      const [paused] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      // Company pause gates admission at commit, before the asynchronous agent
+      // projection; cover that window as well as import+company's paused agent.
+      if (!pause.endsWith("company")) expect(paused!.status).toBe("paused");
+      else expect((await db.select().from(companies).where(eq(companies.id, f.companyId)))[0]!.status).toBe("paused");
+      const expectedNote = (at: Date) => `The scheduled check due at ${at.toISOString()} was skipped because Import Coder was paused; it won't run again unless re-armed.`;
+      for (const at of pause === "manual" ? [due, new Date(due.getTime() + 60_000)] : [due]) {
+        if (at !== due) await arm(at);
+        await Promise.all([heartbeat.tickIssueMonitors(new Date(at.getTime() + 1)), peer.tickIssueMonitors(new Date(at.getTime() + 1))]);
+        await heartbeat.tickIssueMonitors(new Date(at.getTime() + 2));
+        const [cleared] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        expect(cleared).toMatchObject({ monitorNextCheckAt: null, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+        expect(parseIssueExecutionState(cleared!.executionState)?.monitor).toMatchObject({ status: "cleared", clearReason: "dispatch_skipped" });
+        expect((await notes(f.issue.id)).filter(n => n.body === expectedNote(at))).toHaveLength(1);
+      }
+      const expectedCount = pause === "manual" ? 2 : 1;
+      const visible = await notes(f.issue.id);
+      const skips = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issue.id), eq(activityLog.action, "issue.monitor_skipped")));
+      console.log(JSON.stringify({ check: "paused-monitor-clear", pause, notes: visible.map(n => n.body), skips: skips.length }));
+      expect(visible).toHaveLength(expectedCount);
+      expect(skips).toHaveLength(expectedCount);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      if (pause.endsWith("company")) await companyService(db).update(f.companyId, { status: "active" });
+      await createAgentLifecycle(db).resumeAgent(f.agentId);
+      await worker.process(f.agentId);
+      await heartbeat.tickIssueMonitors(new Date(due.getTime() + 120_000));
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      expect(await notes(f.issue.id)).toHaveLength(expectedCount);
+    } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); await peer.drainActiveRunExecutions(); }
   });
 
   it("an imported todo task also starts through normal assignment admission after resume", async () => {

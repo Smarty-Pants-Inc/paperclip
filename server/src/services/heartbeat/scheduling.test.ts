@@ -12,6 +12,8 @@ import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external
 import { heartbeatService } from "../heartbeat.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { companyService } from "../companies.js";
+import { configureAgentLifecycle, createAgentLifecycle } from "../agent-lifecycle.js";
+import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { issueService } from "../issues.js";
 import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
@@ -813,15 +815,53 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
       await quiet();
     });
 
-    it("disarms while the company is paused and reactivates on its committed resume", async () => {
+    // M1.5 explicitly distinguishes company/manual pause from the import
+    // safety hold: a due check is skipped visibly, not replayed on Resume.
+    it("clears a check due while the company is paused and does not replay it on committed resume", async () => {
       const f = await fixture();
       await companyService(db).update(f.company.id, { status: "paused" });
       await start(f); await quiet();
+      expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 0 });
+      expect(parseIssueExecutionState((await readIssue(f.issue.id)).executionState)?.monitor)
+        .toMatchObject({ status: "cleared", clearReason: "dispatch_skipped" });
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+      expect(comments.map(c => c.body)).toEqual([
+        `The scheduled check due at ${dueAt.toISOString()} was skipped because Scheduled agent was paused; it won't run again unless re-armed.`,
+      ]);
       expect(coordinator!.nextWakeAt()).toBeNull();
       await companyService(db).update(f.company.id, { status: "active" });
-      await vi.waitFor(async () => expect((await readIssue(f.issue.id)).monitorNextCheckAt).toBeNull());
-      expect(f.deps.enqueueWakeup).toHaveBeenCalledOnce();
       await quiet();
+      expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(1);
+    });
+
+    it.each(["resume", "manual"] as const)("stays SQL-quiet on an overdue import hold until lifecycle %s changes eligibility", async action => {
+      const f = await fixture();
+      await db.update(agents).set({ status: "paused", lifecycleState: "paused", pauseReason: "import",
+        lifecycleHolds: ["import"] }).where(eq(agents.id, f.agent.id));
+      const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+        runPlugin: async () => "complete", runHost: async () => "complete" });
+      try {
+        await start(f); await quiet();
+        expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: dueAt, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+        expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
+        expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
+        if (action === "resume") await createAgentLifecycle(db).resumeAgent(f.agent.id);
+        else await createAgentLifecycle(db).pauseAgent(f.agent.id, "manual");
+        await worker.process(f.agent.id);
+        await advance(31_000);
+        await vi.waitFor(async () => expect((await readIssue(f.issue.id)).monitorNextCheckAt).toBeNull());
+        const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+        expect(comments).toHaveLength(action === "resume" ? 0 : 1);
+        if (action === "resume") {
+          expect(f.deps.enqueueWakeup).toHaveBeenCalledOnce();
+          expect((await readIssue(f.issue.id)).monitorAttemptCount).toBe(1);
+        } else {
+          expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
+          expect(comments[0]!.body).toContain("won't run again unless re-armed");
+        }
+        await quiet();
+      } finally { await worker.stop(); }
     });
 
     it("bounds global scans during repeated ordinary checkout and release writes", async () => {
