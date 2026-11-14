@@ -8478,6 +8478,7 @@ done
     include!("provider_backend_tests/cross_run_judge.rs");
     include!("provider_backend_tests/cross_run_round2.rs");
     include!("provider_backend_tests/reopen_done.rs");
+    include!("provider_backend_tests/reopen_suspended.rs");
 
     fn prepared_skill_checkpoint(
         provider: &str,
