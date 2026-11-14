@@ -719,7 +719,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       : "native_controller_recovery_missing_evidence:snapshot_binding";
     await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
       errorCode: tl08 && !tl08Retained ? "native_session_interrupted" : seedSequence ? "native_continuation_requires_reconciliation" : error, error,
-      resultJson: { failureCause: "provider_http_429" } }).where(eq(heartbeatRuns.id, f.run.id));
+      resultJson: { failureCause: "provider_http_429", ...(scenario === "active-turn" ? { nativeFreshContinuationRefusal: {
+        code: "native_runner_refresh_required", prepareRefusalCode: "provider_active_turn", waitForTurn: true } } : {}) } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", attempt: 1, controllerBootId: randomUUID(),
       leaseOwner: null, leaseExpiresAt: null, recoveryState: "blocked", failureCode: error }).where(eq(nativeRunFinalizations.runId, f.run.id));
     expect((await read(f.run.id)).resultJson?.nativePreDispatchFailure).toBeUndefined();
