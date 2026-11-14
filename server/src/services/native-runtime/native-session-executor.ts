@@ -20196,6 +20196,29 @@ export function createRemoteNativeArtifactPreparation(input: {
     }
   };
 
+  // Setup cleanup archives the whole runtime under strict no-link rules.
+  // Copy in-box (not an upload), preserving executability and replacing any
+  // previous destination atomically without ever writing through its symlink.
+  const copyPreinstalledRunnerExecutable = async (sourcePath: string) => {
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const result = await remoteCommandRunner.execute({
+      command: "sh",
+      args: ["-c",
+        `umask 077; mkdir -p ${quote(posix.dirname(remoteBinary))} && ` +
+        `[ ! -d ${quote(remoteBinary)} ] && ` +
+        `paperclip_runner_copy_tmp=$(mktemp ${quote(remoteBinary + ".tmp.XXXXXX")}) && ` +
+        `trap 'rm -f "$paperclip_runner_copy_tmp"' 0 && ` +
+        `cp --preserve=mode -- ${quote(sourcePath)} "$paperclip_runner_copy_tmp" && ` +
+        `mv -f -- "$paperclip_runner_copy_tmp" ${quote(remoteBinary)}`],
+      cwd: remoteTarget.remoteCwd,
+      bypassSession: true,
+      timeoutMs: 10_000,
+    });
+    if (result.exitCode !== 0 || result.timedOut) {
+      throw new Error("runner_remote_preinstalled_copy_failed");
+    }
+  };
+
   const prepare = async (requiredMode: "dial_wss" | "listen_ws") => {
     const matchesControllerRunnerArtifact = async (executable: string): Promise<boolean> => {
       // Streamed once per boot and reused while the binary is unchanged; a
@@ -20253,9 +20276,15 @@ export function createRemoteNativeArtifactPreparation(input: {
             }
             await measureNativeRunnerSpan(
               input.trace,
-              "runner.artifact.link",
-              () => linkPreinstalledExecutable(preinstalledRunner, remoteBinary),
+              "runner.artifact.copy",
+              () => copyPreinstalledRunnerExecutable(preinstalledRunner),
             );
+            // The source check cannot attest the copied bytes (or a source
+            // changed during cp). Treat a failed post-copy check as a miss.
+            if (existsSync(controllerRunnerBinary) &&
+                !await matchesControllerRunnerArtifact(remoteBinary)) {
+              throw new Error("runner_remote_preinstalled_artifact_mismatch");
+            }
             runnerArtifactPrepared = true;
             await input.onLog?.(
               "stderr",

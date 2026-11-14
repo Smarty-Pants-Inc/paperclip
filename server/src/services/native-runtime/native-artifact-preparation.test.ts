@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { createRemoteNativeArtifactPreparation } from "./native-session-executor.js";
+import { createRemoteNativeArtifactPreparation, syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
 
 type Request = Parameters<CommandManagedRuntimeRunner["execute"]>[0];
 const roots: string[] = [];
@@ -93,11 +93,39 @@ describe("remote native artifact preparation", () => {
     await createRemoteNativeArtifactPreparation(f.options).prepare("listen_ws");
     expect(f.maxActive()).toBe(2);
     expect(f.active()).toBe(0);
+    expect((await lstat(f.runnerTarget)).isFile()).toBe(true);
     expect(await readFile(f.runnerTarget, "utf8")).toBe(f.runnerScript);
+    expect(f.requests.filter(request => request.args?.[1]?.includes('sha256sum "$1"')).map(request => request.args?.[3]))
+      .toEqual([f.runnerSource, f.runnerTarget]);
     expect(await readFile(f.runnerSource, "utf8")).toBe(f.runnerScript);
     expect(f.requests.filter(request => request.command === f.runnerTarget && request.args?.[0] === "--build-metadata")).toHaveLength(1);
     expect(f.requests.filter(request => request.command === f.codexTarget && request.args?.[0] === "--version")).toHaveLength(1);
     expect(f.requests.some(request => request.command === "npm")).toBe(false);
+  });
+
+  it("atomically replaces an old link with a mode-preserving copy without changing the image", async () => {
+    const f = await fixture();
+    await chmod(f.runnerSource, 0o751);
+    await mkdir(join(f.options.remoteRuntimeRoot, "bin"), { recursive: true });
+    await symlink(f.runnerSource, f.runnerTarget);
+    await createRemoteNativeArtifactPreparation(f.options).prepare("listen_ws");
+    const staged = await lstat(f.runnerTarget);
+    expect(staged.isFile()).toBe(true);
+    expect(staged.mode & 0o777).toBe(0o751);
+    expect(await readFile(f.runnerSource, "utf8")).toBe(f.runnerScript);
+    expect((await readdir(join(f.options.remoteRuntimeRoot, "bin"))).sort()).toEqual(["codex", "paperclip-runnerd"]);
+    const copy = f.requests.find(request => request.args?.[1]?.includes("cp --preserve=mode"));
+    expect(copy).toMatchObject({ command: "sh", bypassSession: true, timeoutMs: 10_000 });
+    expect(copy?.args?.[1]).toContain("mktemp");
+    expect(copy?.args?.[1]).toContain("mv -f");
+    // Both remaining "link" callers write a regular Codex launcher, which
+    // also survives the unchanged strict archive when the whole root is seen.
+    expect((await lstat(f.codexTarget)).isFile()).toBe(true);
+    const checkpoint = f.options.remoteRuntimeRoot + "-checkpoint";
+    await syncRemoteRunnerDirectoryOut({ runner: f.options.runner,
+      sourcePath: f.options.remoteRuntimeRoot, targetPath: checkpoint, mode: 0o700 });
+    expect(await readFile(join(checkpoint, "bin", "paperclip-runnerd"), "utf8")).toBe(f.runnerScript);
+    expect(await readFile(join(checkpoint, "bin", "codex"), "utf8")).toBe(await readFile(f.codexTarget, "utf8"));
   });
 
   it("reads installed pack metadata in the existing final runner probe", async () => {

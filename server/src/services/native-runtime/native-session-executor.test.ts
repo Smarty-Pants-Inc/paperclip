@@ -23804,7 +23804,7 @@ describe("runnerd provider runtime wiring", () => {
   });
 
   it.each([
-    ...["current", "preinstalled-exact", "preinstalled-mismatch", "preinstalled-error", "preinstalled-timeout", "stale", "missing", "retained", "retained-mismatch", "retained-error", "retained-timeout", "retained-explicit"]
+    ...["current", "preinstalled-exact", "preinstalled-mismatch", "preinstalled-error", "preinstalled-timeout", "preinstalled-copy-error", "preinstalled-copy-timeout", "preinstalled-copied-mismatch", "preinstalled-copied-error", "preinstalled-copied-timeout", "stale", "missing", "retained", "retained-mismatch", "retained-error", "retained-timeout", "retained-explicit"]
       .map((image) => ({ image, version: "0.160.0" })),
     ...["0.149.0", "0.149.1", "0.153.4", "0.156.0", "0.160.1"]
       .map((version) => ({ image: "current", version })),
@@ -23826,11 +23826,15 @@ describe("runnerd provider runtime wiring", () => {
         let stdout = "";
         const script = command.args?.[1] ?? "";
         if (script.includes('sha256sum "$1"')) {
-          if (image.endsWith("-error")) throw new Error("checksum unavailable");
+          const copied = image.startsWith("preinstalled-copied-");
+          const fault = !image.startsWith("preinstalled-copy-") && (!copied || command.args?.[3]?.includes("/.paperclip-runtime/"));
+          if (fault && image.endsWith("-error")) throw new Error("checksum unavailable");
           return {
-            exitCode: 0, signal: null, timedOut: image.endsWith("-timeout"), stderr: "",
-            stdout: `${createHash("sha256").update(image.endsWith("-mismatch") ? "stale artifact" : "fixture runner artifact").digest("hex")}  ${command.args?.[3]}\n`,
+            exitCode: 0, signal: null, timedOut: fault && image.endsWith("-timeout"), stderr: "",
+            stdout: `${createHash("sha256").update(fault && image.endsWith("-mismatch") ? "stale artifact" : "fixture runner artifact").digest("hex")}  ${command.args?.[3]}\n`,
           };
+        } else if (script.includes("cp --preserve=mode") && image.startsWith("preinstalled-copy-")) {
+          return { exitCode: 1, signal: null, timedOut: image.endsWith("-timeout"), stdout: "", stderr: "copy failed" };
         } else if (command.args?.[0] === "--build-metadata") {
           stdout = JSON.stringify({
             schema: "paperclip-runner/runnerd-build-metadata/v1",
@@ -23860,7 +23864,7 @@ describe("runnerd provider runtime wiring", () => {
             ? "/opt/paperclip-runner/bin/codex\n"
             : "/usr/local/bin/codex\n";
         } else if (
-          !script.includes("ln -sfn") &&
+          !script.includes("cp --preserve=mode") &&
           !script.includes("paperclip_codex_launcher_tmp")
         ) {
           throw new Error(`unexpected command: ${command.command}`);
@@ -23916,6 +23920,16 @@ describe("runnerd provider runtime wiring", () => {
       })]);
     } else {
       expect(syncIn).not.toHaveBeenCalled();
+    }
+    if (!needsReplacement && !exactRetained) {
+      expect(remoteExecute).toHaveBeenCalledWith(expect.objectContaining({
+        command: "sh", args: ["-c", expect.stringContaining("cp --preserve=mode")],
+        bypassSession: true, timeoutMs: 10_000,
+      }));
+      expect(remoteExecute.mock.calls.filter(([call]) => call.args?.[1]?.includes('sha256sum "$1"'))
+        .map(([call]) => call.args?.[3])).toEqual([
+          "/usr/local/bin/paperclip-runnerd", "/workspace/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd",
+        ]);
     }
     if (exactRetained) {
       expect(remoteExecute.mock.calls.some(([call]) => call.args?.[1]?.includes("command -v paperclip-runnerd"))).toBe(false);
@@ -23984,7 +23998,7 @@ describe("runnerd provider runtime wiring", () => {
           stdout = "/usr/local/bin/paperclip-runnerd\n";
         } else if (script.includes("command -v codex")) {
           stdout = "/opt/paperclip-runner/bin/codex\n";
-        } else if (!script.includes("ln -sfn") && !script.includes("paperclip_codex_launcher_tmp")) {
+        } else if (!script.includes("cp --preserve=mode") && !script.includes("paperclip_codex_launcher_tmp")) {
           throw new Error(`unexpected command: ${command.command}`);
         }
         return { exitCode: 0, signal: null, timedOut: false, stderr: "", stdout };
