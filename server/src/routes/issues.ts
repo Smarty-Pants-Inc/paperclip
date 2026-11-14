@@ -10591,6 +10591,7 @@ export function issueRoutes(
       }
       const actor = getActorInfo(req);
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
+      let staleSourceRefusal: { companyId: string; sourceIssueId: string; recoveryActionId: string; sourceRunId: string; currentRunId: string } | null = null;
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const requestNativeHoldTaskRetry = async (
@@ -10632,6 +10633,10 @@ export function issueRoutes(
           idempotencyKey: recoveryAction.id, observedRunId: blocker.runId,
           prepareChatRetry: opts.chatRunRetries?.prepareFailedChatRunRetry });
         if (!receipt.accepted || !receipt.requestId) {
+          if (receipt.stale && receipt.observedRunId) staleSourceRefusal = {
+            companyId: issue.companyId, sourceIssueId: issue.id, recoveryActionId: recoveryAction.id,
+            sourceRunId: blocker.runId, currentRunId: receipt.observedRunId,
+          };
           logger.warn({ issueId: issue.id, recoveryActionId: recoveryAction.id, observedRunId: blocker.runId },
             "recovery Retry source changed before durable admission");
           // This route's conflict contract is surfaced by IssueDetail's existing
@@ -10645,7 +10650,7 @@ export function issueRoutes(
         return receipt;
       };
       const nativeHoldTaskRetry = { receipt: null as Awaited<ReturnType<typeof requestNativeHoldTaskRetry>> };
-      const result = await db.transaction(async (tx) => {
+      const runResolution = () => db.transaction(async (tx) => {
         const lockedIssue = await tx
           .select()
           .from(issueRows)
@@ -11171,6 +11176,13 @@ export function issueRoutes(
 
         return { issue, recoveryAction, chatRetry };
       });
+      let result: Awaited<ReturnType<typeof runResolution>>;
+      try {
+        result = await runResolution();
+      } catch (error) {
+        if (staleSourceRefusal) await recoveryActionsSvc.recordTaskRetrySourceRefusal(staleSourceRefusal);
+        throw error;
+      }
       const nativeHoldTaskRetryReceipt = nativeHoldTaskRetry.receipt;
       if (nativeHoldTaskRetryReceipt?.accepted && nativeHoldTaskRetryReceipt.requestId) {
         const finalizeRunId = "finalizeRunId" in nativeHoldTaskRetryReceipt ? nativeHoldTaskRetryReceipt.finalizeRunId : undefined;

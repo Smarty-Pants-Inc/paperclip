@@ -651,9 +651,54 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     return updated ? toReadModel(updated) : null;
   }
 
+  async function recordTaskRetrySourceRefusal(input: {
+    companyId: string;
+    sourceIssueId: string;
+    recoveryActionId: string;
+    sourceRunId: string;
+    currentRunId: string;
+  }) {
+    return (db as Db).transaction(async (tx) => {
+      const [row] = await tx.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+        eq(issueRecoveryActions.id, input.recoveryActionId),
+        eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+        eq(issueRecoveryActions.ownerType, "board"),
+        inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      )).for("update");
+      if (!row || row.evidence?.latestRunId !== input.sourceRunId || input.currentRunId === input.sourceRunId) return null;
+
+      const prior = row.evidence?.taskRetryRefusal;
+      if (prior && typeof prior === "object" && !Array.isArray(prior)) {
+        const existing = prior as Record<string, unknown>;
+        if (existing.recoveryActionId === input.recoveryActionId &&
+            existing.sourceRunId === input.sourceRunId && existing.currentRunId === input.currentRunId &&
+            typeof existing.reason === "string" && typeof existing.nextAction === "string") return existing;
+      }
+
+      const refusal = {
+        schema: "paperclip.task-retry-source-refusal.v1",
+        recoveryActionId: input.recoveryActionId,
+        sourceRunId: input.sourceRunId,
+        currentRunId: input.currentRunId,
+        reason: "This recovery card was made for an older run. The task changed before Try again was accepted, so this card cannot retry the current task.",
+        nextAction: "Open the latest run, refresh the task, and use Try again from its current recovery card.",
+        recordedAt: new Date().toISOString(),
+      };
+      await tx.update(issueRecoveryActions).set({
+        evidence: { ...(row.evidence ?? {}), taskRetryRefusal: refusal },
+        nextAction: refusal.nextAction,
+        updatedAt: new Date(),
+      }).where(eq(issueRecoveryActions.id, row.id));
+      return refusal;
+    });
+  }
+
   return {
     getActiveForIssue,
     listActiveForIssues,
+    recordTaskRetrySourceRefusal,
     resolveActiveForIssue,
     upsertSourceScoped,
   };

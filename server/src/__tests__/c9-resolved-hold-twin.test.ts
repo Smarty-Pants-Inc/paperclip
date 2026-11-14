@@ -253,5 +253,18 @@ describe("SMA-43/SMA-63 resolved native hold restore twin", () => {
       .toMatchObject([{ status: "active", outcome: null }]);
     expect(await runRows(f.issueId)).toHaveLength(before.length);
     expect((await wakeRows(f.agentId)).filter(wake => wake.idempotencyKey === `task-retry:${f.board.id}`)).toHaveLength(0);
+
+    const issueAfterRefusal = await request(f.app).get(`/api/issues/${f.issueId}`).expect(200);
+    const refusal = issueAfterRefusal.body.activeRecoveryAction.evidence.taskRetryRefusal;
+    expect(refusal).toMatchObject({ schema: "paperclip.task-retry-source-refusal.v1",
+      recoveryActionId: f.board.id, sourceRunId: f.failed.id, currentRunId: expect.any(String),
+      reason: expect.stringContaining("older run"), nextAction: expect.stringContaining("latest run") });
+    expect(issueAfterRefusal.body.activeRecoveryAction.nextAction).toBe(refusal.nextAction);
+
+    await request(f.app).post(`/api/issues/${f.issueId}/recovery-actions/resolve`)
+      .send({ actionId: f.board.id, outcome: "restored", sourceIssueStatus: "todo" }).expect(409);
+    const issueAfterRepeat = await request(f.app).get(`/api/issues/${f.issueId}`).expect(200);
+    expect(issueAfterRepeat.body.activeRecoveryAction.evidence.taskRetryRefusal).toEqual(refusal);
+    expect(await runRows(f.issueId)).toHaveLength(before.length);
   });
 });

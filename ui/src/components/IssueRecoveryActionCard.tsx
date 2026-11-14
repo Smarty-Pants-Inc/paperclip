@@ -282,6 +282,17 @@ function asNonEmptyString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function readTaskRetrySourceRefusal(action: IssueRecoveryAction) {
+  const refusal = asRecord(action.evidence?.taskRetryRefusal);
+  const sourceRunId = readEvidenceRunId(action, "latestRunId");
+  if (refusal?.schema !== "paperclip.task-retry-source-refusal.v1" ||
+      refusal.recoveryActionId !== action.id || refusal.sourceRunId !== sourceRunId ||
+      typeof refusal.currentRunId !== "string" || refusal.currentRunId === sourceRunId) return null;
+  const reason = asNonEmptyString(refusal.reason);
+  const nextAction = asNonEmptyString(refusal.nextAction);
+  return reason && nextAction ? { reason, nextAction, currentRunId: refusal.currentRunId } : null;
+}
+
 function asAncestryVerdict(value: unknown): GitWorktreeBranchAncestryVerdict | null {
   return value === "ancestor" || value === "diverged" || value === "unknown" ? value : null;
 }
@@ -1038,6 +1049,7 @@ export function IssueRecoveryActionCard({
     ? "Automatic retries are finished — a decision is needed"
     : readWakePolicySummary(action);
   const evidenceSummary = pickEvidenceSummary(action);
+  const taskRetryRefusal = readTaskRetrySourceRefusal(action);
   const sourceRunId = readEvidenceRunId(action, "sourceRunId") ?? readEvidenceRunId(action, "latestRunId");
   const correctiveRunId = readEvidenceRunId(action, "correctiveRunId");
   // The lineage rows below already carry the attempt budget, so the generic chip only
@@ -1316,8 +1328,16 @@ export function IssueRecoveryActionCard({
             <MissingValue />
           )}
         </MetadataRow>
+        {taskRetryRefusal ? (
+          <MetadataRow label="Try again refused">
+            <span data-testid="task-retry-source-refusal">{taskRetryRefusal.reason}</span>
+            <span className="ml-2 inline-flex items-center gap-1.5 text-muted-foreground">Latest run:
+              <RunChip runId={taskRetryRefusal.currentRunId} agentId={action.previousOwnerAgentId} />
+            </span>
+          </MetadataRow>
+        ) : null}
         <MetadataRow label="Next action">
-          {action.nextAction ? <span>{action.nextAction}</span> : <MissingValue />}
+          {taskRetryRefusal ? <span>{taskRetryRefusal.nextAction}</span> : action.nextAction ? <span>{action.nextAction}</span> : <MissingValue />}
         </MetadataRow>
         <MetadataRow label="Follow-up">
           <span className="inline-flex flex-wrap items-center gap-1.5">
