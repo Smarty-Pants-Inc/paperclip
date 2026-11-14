@@ -47,6 +47,11 @@ function invalidPiSessionRecovery(event: Pick<PrpEvent, "eventType" | "payload" 
   return { previousId: recovery.previousSessionId, preservedFile: recovery.preservedFile };
 }
 
+// Track only notices this writer inserted in the SAME database transaction.
+// A transaction object alone is insufficient: callers can pass a root client,
+// whose autocommit queries must never rewrite a previously visible notice.
+const uncommittedNoticeWrites = new WeakMap<object, Map<string, string>>();
+
 /** Shared typed projection for lasting history-loss boundaries, including legacy
  * selection. Caller must hold the company-scoped issue → run → task locks and
  * verify admission authority in this same transaction. Detail links preserve
@@ -63,12 +68,27 @@ export async function writePiSessionHistoryLossNotice(db: Db,
     sql`${issueComments.metadata}->>'supersededByCommentId' is null`,
     sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`)).limit(1);
   if (existing && (!input.replaceExisting || existing.body === body)) return false;
-  // Changing state appends history; never rewrite what a person already read.
+  const [transaction] = await tx.execute<{ id: string }>(sql`select pg_current_xact_id()::text as id`);
+  const writes = uncommittedNoticeWrites.get(tx) ?? new Map<string, string>();
+  uncommittedNoticeWrites.set(tx, writes);
+  if (existing && writes.get(existing.id) === transaction!.id) {
+    // Coalesce intermediate states before commit: no reader could have seen
+    // this inserted row yet. Committed history still appends/supersedes below.
+    const changed = await tx.update(issueComments).set({ body, updatedAt: new Date() }).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+      eq(issueComments.id, existing.id), eq(issueComments.authorType, "system"),
+      eq(issueComments.body, existing.body), isNull(issueComments.deletedAt),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`,
+      sql`${issueComments.metadata}->>'supersededByCommentId' is null`)).returning({ id: issueComments.id });
+    return changed.length === 1;
+  }
+  // Changing committed state appends history; never rewrite what a person read.
   // The issue lock makes replay idempotent and the supersession atomic.
   const next = await issueService(db).addComment(issueId, body, {}, { authorType: "system", presentation: {
     kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
   }, metadata: { version: 1, authorizationReason,
     sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
+  writes.set(next.id, transaction!.id);
   if (existing) await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
     '{supersededByCommentId}', to_jsonb(${next.id}::text))` }).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.id, existing.id)));
