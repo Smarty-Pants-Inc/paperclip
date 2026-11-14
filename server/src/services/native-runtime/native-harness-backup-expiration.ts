@@ -28,6 +28,7 @@ import type { StorageService } from "../../storage/types.js";
 import { releaseExpiredNativeProviderArtifactRun } from "./native-provider-artifacts.js";
 import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
 import { nativeSetupScopeDigest } from "./native-setup-evidence.js";
+import { reportNativeHarnessBackupStalePending } from "./native-harness-backup-observability.js";
 
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS = 60 * 60 * 1000;
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS = 2 * 60 * 1000;
@@ -43,6 +44,7 @@ const QUARANTINE_PATTERN =
 const QUARANTINE_CLEANUP_PATTERN = /^[0-9a-f]{64}\.identity_indeterminate\.cleanup\./;
 const EXPIRED_PREFIX = ".expired-";
 const RETIRING_PREFIX = ".retiring-";
+const PENDING_STALE_AFTER_MS = 2 * 60 * 60 * 1000;
 const LIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"];
 const SETTLED_FINALIZATION_PHASES = ["committed", "terminal_failure"];
 const LIVE_LEASE_STATUSES = ["active", "released", "retained", "pending_cleanup"];
@@ -466,6 +468,22 @@ export function nativeHarnessBackupExpirationService(
     checkpointCursor = null;
   }
 
+  async function reportStalePending(backupRoot: string, scopeDigest: string, now: number) {
+    if (!(await isRealDirectory(backupRoot))) return;
+    const hasCurrent = await isRealDirectory(path.join(backupRoot, "current"));
+    for (const name of (await fs.readdir(backupRoot).catch(missingPath)) ?? []) {
+      if (!name.startsWith(".pending-")) continue;
+      const pendingRoot = path.join(backupRoot, name);
+      const stat = await fs.lstat(pendingRoot).catch(missingPath);
+      // Never follow links or recover/delete an incomplete capture. A concurrent
+      // publication can remove this name; only inspect entries still present.
+      if (!stat?.isDirectory() || stat.isSymbolicLink()) continue;
+      const ageMs = now - stat.mtimeMs;
+      if (ageMs <= PENDING_STALE_AFTER_MS) continue;
+      reportNativeHarnessBackupStalePending({ scopeDigest, pendingRoot, ageMs, hasCurrent });
+    }
+  }
+
   async function settleLeftovers(backupRoot: string) {
     const current = path.join(backupRoot, "current");
     for (const name of (await fs.readdir(backupRoot).catch(missingPath)) ?? []) {
@@ -484,6 +502,7 @@ export function nativeHarnessBackupExpirationService(
     scopeDigest: string,
     options: Required<Pick<NativeHarnessBackupExpirationOptions, "dryRun" | "isSessionBusy">> & {
       closedBefore: Date;
+      now: number;
     },
     result: NativeHarnessBackupExpirationResult,
   ) {
@@ -492,6 +511,7 @@ export function nativeHarnessBackupExpirationService(
     };
     const backupRoot = path.join(root, "failover-backups");
     const current = path.join(backupRoot, "current");
+    await reportStalePending(backupRoot, scopeDigest, options.now);
     if (!options.dryRun) await settleLeftovers(backupRoot);
     if (!(await isRealDirectory(current))) return skip("no_backup");
     if (await fs.lstat(path.join(root, "cleanup-activation.json")).then(() => true, () => false)) {
@@ -770,7 +790,7 @@ export function nativeHarnessBackupExpirationService(
         }
         if (resumeAfter === null && includeBackups) {
           try {
-            await expireSession(root, name, { dryRun, isSessionBusy, closedBefore }, result);
+            await expireSession(root, name, { dryRun, isSessionBusy, closedBefore, now }, result);
           } catch (err) {
             result.failed++;
             logger.warn({ err, scope: name }, "native harness backup expiration skipped a session");
@@ -925,6 +945,9 @@ export function nativeHarnessBackupExpirationService(
     if (!SCOPE_PATTERN.test(scopeDigest) || !(await isRealDirectory(root))) return null;
     const backupRoot = path.join(root, "failover-backups");
     if (!(await isRealDirectory(backupRoot))) return null;
+    // Startup discovery visits scopes even when no current backup or identity
+    // survived. Report before those early exits and without scheduling a poll.
+    await reportStalePending(backupRoot, scopeDigest, (defaults.now ?? new Date()).getTime());
     if (!defaults.dryRun) await settleLeftovers(backupRoot);
     const current = path.join(backupRoot, "current");
     const stat = await fs.lstat(current).catch(missingPath);
@@ -963,6 +986,7 @@ export function nativeHarnessBackupExpirationService(
       dryRun,
       isSessionBusy: defaults.isSessionBusy ?? nativeSessionScopeDigestIsBusy,
       closedBefore: new Date(Date.now() - Math.max(1, defaults.closedForDays ?? NATIVE_HARNESS_BACKUP_EXPIRATION_DEFAULT_DAYS) * DAY_MS),
+      now: Date.now(),
     }, result);
     return result;
   }

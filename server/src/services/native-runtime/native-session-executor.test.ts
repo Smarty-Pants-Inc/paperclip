@@ -825,6 +825,31 @@ describe("remote controller restart adoption", () => {
       await rm(stateBase, { recursive: true, force: true });
     }
   });
+  it("reports and counts a checkpoint skipped without a remote filesystem", async () => {
+    const { logger } = await import("../../middleware/logger.js");
+    const { nativeRestartRecoverySummary } = await import("./native-restart-recovery.js");
+    const summaryDb = { select: () => ({ from: () => ({ where: () => ({ groupBy: async () => [] }) }) }) } as unknown as Db;
+    const before = await nativeRestartRecoverySummary(summaryDb);
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const driver = vi.spyOn(nativeExecutionDriver, "createNativeRunnerExecutionDriver");
+    onTestFinished(() => { warn.mockRestore(); driver.mockRestore(); });
+    const current = { ...execution, session: { ...execution.session, normalizedSessionId: randomUUID() } };
+    await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: "runner" });
+    state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+    const root = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+    onTestFinished(() => rm(root, { recursive: true, force: true }));
+    await expect(driver.mock.calls.at(-1)![0].checkpoint!("settled")).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      scopeDigest: root.split("/").at(-1), runId: current.binding.runId,
+      nativeSessionId: current.session.normalizedSessionId,
+      reason: "remote_filesystem_unavailable",
+    }), "Native harness backup capture skipped");
+    const after = await nativeRestartRecoverySummary(summaryDb);
+    expect(after.harnessBackupCaptureSkipped).toBe((before.harnessBackupCaptureSkipped ?? 0) + 1);
+    expect(after.harnessBackupCaptureFailed ?? 0).toBe(before.harnessBackupCaptureFailed ?? 0);
+    expect(existsSync(join(root, "failover-backups"))).toBe(false);
+  });
+
   it("answers a local run's held Paperclip tool calls after a restart (restart chaos t101)", async () => {
     state.createBackend.mockClear();
     state.createTransport.mockClear();
@@ -3474,7 +3499,19 @@ describe("remote provider pack manifest", () => {
         providerStateUnsaved.mark.mockClear();
         providerStateUnsaved.clear.mockClear();
         if (provider === "opencode-new-durable-store-failed" || provider === "opencode-new-durable-publish-failed") {
+          const { logger } = await import("../../middleware/logger.js");
+          const { nativeRestartRecoverySummary } = await import("./native-restart-recovery.js");
+          const summaryDb = { select: () => ({ from: () => ({ where: () => ({ groupBy: async () => [] }) }) }) } as unknown as Db;
+          const before = await nativeRestartRecoverySummary(summaryDb);
+          const warn = vi.spyOn(logger, "warn");
+          onTestFinished(() => warn.mockRestore());
           await expect(driver.mock.calls.at(-1)![0].checkpoint!("settled")).rejects.toThrow();
+          expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+            scopeDigest: transport.stateDirectory!.split("/").at(-1), runId: remoteExecution.binding.runId,
+            nativeSessionId: remoteExecution.session.normalizedSessionId, reason: "capture_failed",
+          }), "Native harness backup capture failed");
+          expect((await nativeRestartRecoverySummary(summaryDb)).harnessBackupCaptureFailed)
+            .toBe((before.harnessBackupCaptureFailed ?? 0) + 1);
           // Only a backup that was never stored makes the next run start fresh.
           if (provider === "opencode-new-durable-store-failed") {
             expect(providerStateUnsaved.mark).toHaveBeenCalledWith(preparedDb, remoteExecution.binding);
@@ -20828,7 +20865,23 @@ describe("runnerd provider runtime wiring", () => {
     let registration: Awaited<ReturnType<typeof options.controlPlaneRegistration>> | undefined;
     onTestFinished(async () => { await registration?.release(); await controller.stop(); });
     registration = await options.controlPlaneRegistration(controller);
+    const { logger } = await import("../../middleware/logger.js");
+    const { nativeRestartRecoverySummary } = await import("./native-restart-recovery.js");
+    const summaryDb = { select: () => ({ from: () => ({ where: () => ({ groupBy: async () => [] }) }) }) } as unknown as Db;
+    const before = await nativeRestartRecoverySummary(summaryDb);
+    const warn = vi.spyOn(logger, "warn");
+    onTestFinished(() => warn.mockRestore());
+    const fields = { scopeDigest: options.stateDirectory!.split("/").at(-1),
+      runId: current.binding.runId, nativeSessionId: current.session.normalizedSessionId };
+    await registration.checkpoint!("unsettled");
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ ...fields, reason: "checkpoint_incomplete" }),
+      "Native harness backup capture skipped");
     await expect(registration.checkpoint!("settled")).rejects.toThrow("runner_remote_checkpoint_incomplete");
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ ...fields, reason: "capture_failed" }),
+      "Native harness backup capture failed");
+    const after = await nativeRestartRecoverySummary(summaryDb);
+    expect(after.harnessBackupCaptureSkipped).toBe((before.harnessBackupCaptureSkipped ?? 0) + 1);
+    expect(after.harnessBackupCaptureFailed).toBe((before.harnessBackupCaptureFailed ?? 0) + 1);
     if (marked) {
       expect(providerStateUnsaved.mark).toHaveBeenCalledTimes(1);
       expect(providerStateUnsaved.mark.mock.calls[0]![1]).toEqual(current.binding);

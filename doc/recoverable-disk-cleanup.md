@@ -62,8 +62,9 @@ this worker never scans or removes them.
 
 ## Native session failover backups
 
-After each remote turn, the server copies the sandbox's harness state (runner
-state plus the provider's session home, such as `codex-home`) to
+At the remote runner's settled checkpoint after release/quiescing, the server
+copies its harness state (runner state plus the provider's session home, such as
+`codex-home`) to
 `<instance>/runtime/paperclip-runner/durable-sessions/<scope>/failover-backups/current`.
 A replacement sandbox restores the session from this copy, and an ephemeral sandbox
 restores it at the start of every turn. Each session keeps one active failover copy, and a single
@@ -85,6 +86,38 @@ controller already accepted.
 When a controller is registered, the comparison uses its current live cursor.
 The local marker written for external checkpoint storage does not replace that
 authority.
+
+Capture timing is unchanged: there is no per-turn or periodic capture of a warm
+runner. Every skipped or failed capture emits a server warning, even without an
+active run-log recorder. The structured fields are `scopeDigest`, `runId`,
+`nativeSessionId`, `outcome`, and `reason`. Skip reasons are
+`remote_filesystem_unavailable` or `checkpoint_incomplete`; failures use
+`capture_failed` with a bounded, redacted `detail`. Incomplete skips also include
+`incompleteReason`.
+
+Startup backup discovery and backup maintenance report each real
+`failover-backups/.pending-*` directory whose modification time is more than two
+hours old, including scopes without `current` or readable session identity.
+They do not promote, delete, or modify pending captures and do not follow
+symlinks. The warning includes `scopeDigest`, `pendingRoot`, `ageMs`,
+`hasCurrent`, and reason `stale_pending_backup`. When no current backup exists,
+`operatorAction` is `no_current_backup_operator_recovery_required`; the partial
+capture is left in place for operator inspection, not assumed safe to restore.
+This reporting adds no timer or capture attempt.
+
+The existing protected `/api/health` response exposes these counters inside
+`nativeRecovery`, alongside the existing native recovery-state counts:
+
+- `harnessBackupCaptureSkipped`
+- `harnessBackupCaptureFailed`
+- `harnessBackupStalePendingObserved`
+
+These three are process-lifetime observation totals and reset on server restart;
+existing recovery-state counts remain database-backed. Each reported pending
+entry increments the last counter, including repeat sightings on later discovery
+or maintenance passes. It is not a unique-directory inventory or a transcript
+loss count. The counters do not contain session identifiers and are absent from
+public/redacted health responses, like the existing native recovery summary.
 
 An hourly background sweep expires the copy once the session can only resume by
 reopening closed work. It checks at most 200 sessions and expires at most 50 per

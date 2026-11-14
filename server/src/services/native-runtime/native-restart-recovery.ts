@@ -1,4 +1,5 @@
 import { carriesInheritedRunnerIdentity } from "./native-inherited-runner-retry.js";
+import { nativeHarnessBackupCounters } from "./native-harness-backup-observability.js";
 import { readPendingNativeRunStop } from "./native-cancellation-request.js";
 import { nativeRunHandedOffTask } from "./native-human-self-handoff.js";
 import { CONTROLLER_LEASE_RENEW_MS } from "../controller-instance-lease.js";
@@ -2276,7 +2277,7 @@ async function boundAwaitingEvidence(db: Db, candidate: { runId: string; company
   }
 }
 
-export async function nativeRestartRecoverySummary(db: Db) {
+export async function nativeRestartRecoverySummary(db: Db): Promise<Record<string, number>> {
   const rows = await db
     .select({
       state: nativeRunFinalizations.recoveryState,
@@ -2293,7 +2294,8 @@ export async function nativeRestartRecoverySummary(db: Db) {
       ]),
     )
     .groupBy(nativeRunFinalizations.recoveryState);
-  return Object.fromEntries(
-    rows.map((row) => [row.state ?? "unknown", row.count]),
-  );
+  return {
+    ...Object.fromEntries(rows.map((row) => [row.state ?? "unknown", row.count])),
+    ...nativeHarnessBackupCounters(),
+  };
 }

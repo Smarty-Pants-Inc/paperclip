@@ -192,6 +192,21 @@ describe("GET /health", () => {
     });
   });
 
+  it("exposes harness backup observation counters alongside native recovery state counts", async () => {
+    const db = {
+      execute: vi.fn().mockResolvedValue([{ "?column?": 1 }]),
+      select: () => ({ from: () => ({ where: () => ({ groupBy: async () => [{ state: "blocked", count: 2 }] }) }) }),
+    } as unknown as Db;
+    const res = await request(createApp(db)).get("/health");
+    expect(res.status).toBe(200);
+    expect(res.body.nativeRecovery).toMatchObject({
+      blocked: 2,
+      harnessBackupCaptureSkipped: 0,
+      harnessBackupCaptureFailed: 0,
+      harnessBackupStalePendingObserved: 0,
+    });
+  });
+
   it("returns 503 when the database probe fails", async () => {
     const db = {
       execute: vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")),

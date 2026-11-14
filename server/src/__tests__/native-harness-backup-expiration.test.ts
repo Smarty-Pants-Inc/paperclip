@@ -724,6 +724,53 @@ describeEmbeddedPostgres("native harness backup expiration", () => {
     await backupWorker.ready;
   }
 
+  it.each([false, true])("startup reports stale pending backups without removing them (current: %s)", async hasCurrent => {
+    const { nativeRestartRecoverySummary } = await import("../services/native-runtime/native-restart-recovery.js");
+    const session = await seedSession({ issueStatus: "todo" });
+    if (!hasCurrent) {
+      await fs.rm(session.current, { recursive: true });
+      // Interrupted capture may not even have a readable control-plane identity.
+      await fs.rm(path.join(session.root, "control-plane"), { recursive: true });
+    }
+    const backupRoot = path.join(session.root, "failover-backups");
+    const stale = [path.join(backupRoot, `.pending-${randomUUID()}`), path.join(backupRoot, `.pending-${randomUUID()}`)];
+    for (const pending of stale) {
+      await fs.mkdir(path.join(pending, "pi"), { recursive: true });
+      await fs.writeFile(path.join(pending, "pi", "session.jsonl"), "preserve partial transcript\n");
+      const at = new Date(now.getTime() - 2 * 60 * 60_000 - 1000);
+      await fs.utimes(pending, at, at);
+    }
+    const recent = path.join(backupRoot, `.pending-${randomUUID()}`);
+    await fs.mkdir(recent);
+    const boundary = path.join(backupRoot, `.pending-${randomUUID()}`);
+    await fs.mkdir(boundary);
+    const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60_000);
+    await fs.utimes(boundary, twoHoursAgo, twoHoursAgo);
+    const link = path.join(backupRoot, `.pending-${randomUUID()}`);
+    await fs.symlink(stale[0]!, link);
+    const before = await nativeRestartRecoverySummary(db);
+    const warn = vi.spyOn(logger, "warn");
+    await startBackups({ isSessionBusy: () => true, now });
+    await settled();
+    expect(backupErrors).toEqual([]);
+    for (const pending of stale) {
+      expect(await fs.readFile(path.join(pending, "pi", "session.jsonl"), "utf8")).toBe("preserve partial transcript\n");
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+        scopeDigest: session.scope, pendingRoot: pending, reason: "stale_pending_backup", hasCurrent,
+        operatorAction: hasCurrent ? "inspect_pending_backup" : "no_current_backup_operator_recovery_required",
+      }), "Native harness backup pending capture is stale; left in place for operator inspection");
+    }
+    const after = await nativeRestartRecoverySummary(db);
+    expect(after.harnessBackupStalePendingObserved).toBe((before.harnessBackupStalePendingObserved ?? 0) + 2);
+    expect(await exists(recent)).toBe(true);
+    expect(await exists(boundary)).toBe(true);
+    expect(await fs.readlink(link)).toBe(stale[0]);
+    expect(warn.mock.calls.filter(([fields]) => (fields as { reason?: string }).reason === "stale_pending_backup")).toHaveLength(2);
+    expect(await exists(session.current)).toBe(hasCurrent);
+    // Reporting does not arm a new poller or change retention deadlines.
+    await quiet();
+  });
+
   it.each([false, true])("backup deadline worker leaves empty and retained terminal history quiet (%s)", async history => {
     await emptyStateBase();
     if (history) {

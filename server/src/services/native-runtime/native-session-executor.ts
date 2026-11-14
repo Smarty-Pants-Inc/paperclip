@@ -6,6 +6,7 @@ import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
 import { captureRemoteNativeProviderArtifacts, shareNativeProviderArtifactCapture } from "./native-provider-artifact-capture.js";
 import { NativeSessionDiagnostics, nativeSessionDiagnostics, type NativeDiagnosticLease } from "./native-session-diagnostics.js";
+import { reportNativeHarnessBackupCapture } from "./native-harness-backup-observability.js";
 import { recordAgentProviderRateLimits } from "../agent-provider-rate-limits.js";
 import { nativePostResultFailureCategory, type NativePostResultFailureCategory } from "./native-post-result-failure.js";
 import { logger } from "../../middleware/logger.js";
@@ -18926,6 +18927,11 @@ async function createRunnerdBackendWithinSessionClaim(
   // Set once the durable backup is stored. A later local publication, stamp,
   // or cleanup failure leaves that backup restorable, so it is not marked.
   let checkpointBackupStored = false;
+  const checkpointCaptureIdentity = {
+    scopeDigest: createHash("sha256").update(sessionScopeId).digest("hex"),
+    runId: input.execution.binding.runId,
+    nativeSessionId: input.execution.session.normalizedSessionId,
+  };
   const checkpointRemoteRunner = async (
     settlement: "settled" | "unsettled",
   ) => {
@@ -18934,6 +18940,12 @@ async function createRunnerdBackendWithinSessionClaim(
     try {
       saved = await persistRemoteRunnerCheckpoint(settlement);
     } catch (error) {
+      // Include prerequisite/inspection failures as well as copy/publication
+      // failures. The run log below is optional; this server warning is not.
+      reportNativeHarnessBackupCapture({ ...checkpointCaptureIdentity, outcome: "failed", reason: "capture_failed",
+        detail: redactSensitiveText(error instanceof Error ? error.message : String(error))
+          .replace(/[\r\n]+/g, " ").slice(0, 512),
+      });
       if (!checkpointBackupStored && remoteTarget?.transport === "sandbox" && remoteTarget.reusableLeaseConfigured !== true) {
         providerStateUnsavedMarked = await markAcceptedRunProviderStateUnsaved(input.db, input.execution.binding)
           .catch(() => false) || providerStateUnsavedMarked;
@@ -18959,8 +18971,11 @@ async function createRunnerdBackendWithinSessionClaim(
       !remoteCommandRunner ||
       !remoteStateDirectory ||
       !remoteRunnerFilesystemRoot
-    )
+    ) {
+      reportNativeHarnessBackupCapture({ ...checkpointCaptureIdentity,
+        outcome: "skipped", reason: "remote_filesystem_unavailable" });
       return false;
+    }
     const durableStorage = durableNativeHarnessStorage();
     const currentAuthority = sessionToolAuthorityEpochs.get(sessionScopeId);
     const backupOwner = durableStorage && currentAuthority ? sessionHarnessBackupOwners.get(currentAuthority) : null;
@@ -19001,6 +19016,8 @@ async function createRunnerdBackendWithinSessionClaim(
         `[paperclip-runner] remote checkpoint ${incompleteFailure ? "failed" : "skipped"}: exact suspended harness state unavailable (process=${settlement} reason=${checkpointable.incompleteReason})\n`,
       );
       if (incompleteFailure) throw incompleteFailure;
+      reportNativeHarnessBackupCapture({ ...checkpointCaptureIdentity,
+        outcome: "skipped", reason: "checkpoint_incomplete", incompleteReason: checkpointable.incompleteReason });
       return false;
     }
     const backupSpanAttributes = {
