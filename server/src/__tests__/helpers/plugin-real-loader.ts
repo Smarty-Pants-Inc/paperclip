@@ -51,9 +51,10 @@ export async function startRealPluginLoader(db: Db) {
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const installed = new Set<string>();
 
-  async function api<T>(route: string, body?: unknown, method = body === undefined ? "GET" : "POST"): Promise<T> {
+  async function api<T>(route: string, body?: unknown, method = body === undefined ? "GET" : "POST",
+    headers: Record<string, string> = {}): Promise<T> {
     const response = await fetch(`${baseUrl}/api${route}`, {
-      method, headers: { "content-type": "application/json", origin: baseUrl },
+      method, headers: { "content-type": "application/json", origin: baseUrl, ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(60_000),
     });
@@ -64,8 +65,8 @@ export async function startRealPluginLoader(db: Db) {
 
   // Dispatch is asynchronous. Observe the durable scheduler run through the UI's
   // read API, bounded to 30s; never treat the trigger's HTTP 200 as completion.
-  async function waitFor<T>(label: string, read: () => Promise<T>, done: (value: T) => boolean): Promise<T> {
-    const deadline = Date.now() + 30_000;
+  async function waitFor<T>(label: string, read: () => Promise<T>, done: (value: T) => boolean, timeoutMs = 30_000): Promise<T> {
+    const deadline = Date.now() + timeoutMs;
     let last: T;
     do {
       last = await read();
@@ -101,15 +102,28 @@ export async function startRealPluginLoader(db: Db) {
     return api(`/plugins/${pluginId}/config`, { companyId, configJson });
   }
 
-  async function runJob(pluginId: string, jobKey = "sweep") {
+  async function jobRuns(pluginId: string, jobKey = "sweep") {
     const jobs = await api<PluginJobRecord[]>(`/plugins/${pluginId}/jobs`);
     const job = jobs.find(candidate => candidate.jobKey === jobKey);
     if (!job) throw new Error(`No registered job ${jobKey} for ${pluginId}`);
-    const receipt = await api<{ runId: string }>(`/plugins/${pluginId}/jobs/${job.id}/trigger`, {});
-    const run = await waitFor("real job completion", async () => {
-      const runs = await api<PluginJobRunRecord[]>(`/plugins/${pluginId}/jobs/${job.id}/runs?limit=500`);
-      return runs.find(candidate => candidate.id === receipt.runId);
-    }, value => !!value && !["pending", "queued", "running"].includes(value.status));
+    return api<PluginJobRunRecord[]>(`/plugins/${pluginId}/jobs/${job.id}/runs?limit=500`);
+  }
+
+  async function triggerJob(pluginId: string, jobKey = "sweep") {
+    const jobs = await api<PluginJobRecord[]>(`/plugins/${pluginId}/jobs`);
+    const job = jobs.find(candidate => candidate.jobKey === jobKey);
+    if (!job) throw new Error(`No registered job ${jobKey} for ${pluginId}`);
+    return api<{ runId: string }>(`/plugins/${pluginId}/jobs/${job.id}/trigger`, {});
+  }
+
+  async function waitForJob(pluginId: string, runId: string, jobKey = "sweep") {
+    return waitFor("real job completion", async () => (await jobRuns(pluginId, jobKey)).find(run => run.id === runId),
+      value => !!value && !["pending", "queued", "running"].includes(value.status));
+  }
+
+  async function runJob(pluginId: string, jobKey = "sweep") {
+    const receipt = await triggerJob(pluginId, jobKey);
+    const run = await waitForJob(pluginId, receipt.runId, jobKey);
     if (run?.status !== "succeeded") throw new Error(`Guardian job did not succeed: ${JSON.stringify(run)}`);
     console.log("REAL_PLUGIN_JOB", JSON.stringify({ pluginId, jobKey, runId: run.id, status: run.status, trigger: run.trigger }));
     return run;
@@ -128,7 +142,7 @@ export async function startRealPluginLoader(db: Db) {
   }
 
   return {
-    api, install, setCompanyConfig, runJob, restartWorker, baseUrl,
+    api, install, setCompanyConfig, runJob, triggerJob, waitForJob, jobRuns, waitFor, restartWorker, baseUrl,
     comments: (issueId: string) => api<IssueComment[]>(`/issues/${issueId}/comments`),
     dashboard: (pluginId: string) => api<Dashboard>(`/plugins/${pluginId}/dashboard`),
     async close() {
