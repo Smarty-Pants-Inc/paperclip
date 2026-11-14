@@ -138,6 +138,48 @@ describe("Pi in-memory provider binding", () => {
     expect(received).toHaveLength(1);
   });
 
+  // Recorded real catch: RFL's later before_provider_request handler bypassed
+  // the extension guard. This is the actual authenticated HTTP trust boundary.
+  it.each(routes)("enforces only Chat's final tool cap at the $protocol HTTP boundary", async route => {
+    const { environment, received } = await fixture(route);
+    const binding = await createPiProviderBinding({ model: "paperclip/vendor/model", environment });
+    cleanups.push(binding.close);
+    const body = (count: number) => JSON.stringify({ model: "vendor/model", messages: [],
+      tools: Array.from({ length: count }, (_, i) => ({ type: "function", function: { name: `tool_${i}` } })),
+      privateAddonData: "do-not-project-this-canary",
+    });
+    expect((await post(binding.provider, route, body(128))).status).toBe(200);
+    expect(binding.rejectedToolCount()).toBeUndefined();
+    expect((await post(binding.provider, route, body(129), "invalid-capability")).status).toBe(401);
+    expect(binding.rejectedToolCount()).toBeUndefined();
+    const rejected = await post(binding.provider, route, body(129));
+    if (route.protocol !== "chat") {
+      expect(rejected.status).toBe(200);
+      expect(binding.rejectedToolCount()).toBeUndefined();
+      expect(received).toHaveLength(2);
+      return;
+    }
+    expect(rejected.status).toBe(400); // non-retryable, not a transient upstream 5xx
+    expect(JSON.parse(rejected.body)).toEqual({ error: { type: "invalid_request_error", code: "pi_tool_limit_exceeded",
+      message: "Pi provider request refused by the tool limit guard." } });
+    // Counts and actionable guidance are emitted only by the driver's terminal
+    // event, not echoed in Pi's additional low-level provider-error item.
+    expect(rejected.body).not.toContain("ask the board");
+    expect(rejected.body).not.toContain("do-not-project-this-canary");
+    expect(binding.rejectedToolCount()).toBe(129);
+    // A turn cannot repair itself by silently shrinking its rejected catalog.
+    expect((await post(binding.provider, route, body(1))).status).toBe(400);
+    expect((await post(binding.provider, route, body(130))).status).toBe(400);
+    expect(binding.rejectedToolCount()).toBe(129);
+    expect(received).toHaveLength(1);
+    // A new revocable generation has no stale failure cause.
+    const next = await createPiProviderBinding({ model: "paperclip/vendor/model", environment });
+    cleanups.push(next.close);
+    expect(next.rejectedToolCount()).toBeUndefined();
+    expect((await post(next.provider, route, body(128))).status).toBe(200);
+    expect(received).toHaveLength(2);
+  });
+
   it.each(routes)("allows explicit no-auth $protocol without sending any upstream credential", async route => {
     const { environment, received } = await fixture(route);
     environment.PAPERCLIP_AI_PROVIDER_AUTH = "none";

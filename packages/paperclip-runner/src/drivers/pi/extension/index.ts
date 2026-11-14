@@ -402,8 +402,9 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     running = admitted; admitted = null;
     return { systemPrompt: replacePiHostInstructions(event.systemPrompt, config.instructions, process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY) };
   });
-  // Recheck the actual serialized request too: another extension may have added
-  // tools after startup inventory. Never trim here or silently lose authority.
+  // Early check for tools added after inventory. Pi 1.5.2 permits later hooks
+  // to replace this payload; the owned provider broker enforces the final count.
+  // Never trim here or silently lose authority.
   pi.on("before_provider_request", (event, context) => {
     const api = context.model?.api ?? providerApi;
     const cap = api === undefined ? undefined : PI_DYNAMIC_TOOL_LIMIT_BY_API[api];

@@ -61,17 +61,31 @@ export async function createPiProviderBinding(input: {
   thinkingLevel?: PiNativeThinkingLevel;
   modelConfiguration?: PiManagedModel;
   onSensitiveValues?(values: readonly string[]): void;
-}): Promise<{ provider: { name: "paperclip"; api: PiBindProvider["api"]; baseUrl: string; apiKey: string; models: [PiManagedModel] }; close(): Promise<void> }> {
+}): Promise<{ provider: { name: "paperclip"; api: PiBindProvider["api"]; baseUrl: string; apiKey: string; models: [PiManagedModel] }; rejectedToolCount(): number | undefined; close(): Promise<void> }> {
   const protocol = input.environment.PAPERCLIP_AI_PROVIDER_PROTOCOL ?? "";
   const route = Object.hasOwn(PI_MANAGED_PROVIDER_PROTOCOLS, protocol) ? PI_MANAGED_PROVIDER_PROTOCOLS[protocol] : undefined;
   if (!route) throw new Error("Pi managed provider protocol is unsupported");
   const connection = piProviderConnection(input.model, input.environment);
   const model = managedModel(connection.model, input.thinkingLevel, input.modelConfiguration);
-  const broker = await startProviderLoopbackBroker({ adapter: route.adapter, baseUrl: connection.baseUrl, key: connection.key, auth: connection.auth, environment: input.environment });
+  // Pi 1.5.2 docs/extensions.md, before_provider_request: later handlers may
+  // replace the payload. Only this owned HTTP boundary sees their final result.
+  // Retain one numeric cause per revocable binding, never extension payload data.
+  let rejectedToolCount: number | undefined;
+  const broker = await startProviderLoopbackBroker({ adapter: route.adapter, baseUrl: connection.baseUrl, key: connection.key, auth: connection.auth, environment: input.environment,
+    rejectPayload: route.api !== "openai-completions" ? undefined : payload => {
+      if (Array.isArray(payload.tools) && payload.tools.length > 128) rejectedToolCount ??= payload.tools.length;
+      if (rejectedToolCount === undefined) return;
+      // Latch refusal for this binding: no smaller-catalog retry after a failure.
+      // The driver emits the single actionable note from its own count, not
+      // this response (which Pi may also project as a low-level error item).
+      return { code: "pi_tool_limit_exceeded", message: "Pi provider request refused by the tool limit guard." };
+    },
+  });
   try {
     input.onSensitiveValues?.([broker.token, ...(connection.key ? [connection.key] : [])]);
     return {
       provider: { name: "paperclip", api: route.api, baseUrl: broker.baseURL, apiKey: broker.token, models: [model] },
+      rejectedToolCount: () => rejectedToolCount,
       close: broker.close,
     };
   } catch (error) {

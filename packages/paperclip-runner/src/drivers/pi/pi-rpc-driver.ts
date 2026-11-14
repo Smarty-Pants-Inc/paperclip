@@ -250,7 +250,7 @@ export class PiRpcDriver implements HarnessDriver {
             tools: bootstrapToolsDeferred ? [] : context.tools, toolSocketPath };
           if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
           resident = { directory: privateDirectory, socketPath, environment: { ...environment }, modelConfiguration, epoch: 1, context,
-            binding: { origin, close: provider.close, initial: true }, toolSocketPath };
+            binding: { origin, close: provider.close, rejectedToolCount: provider.rejectedToolCount, initial: true }, toolSocketPath };
           const { name, ...configuration } = provider.provider;
           const json = JSON.stringify({ providers: { [name]: configuration } });
           await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json, warn));
@@ -326,7 +326,7 @@ export class PiRpcDriver implements HarnessDriver {
             ...(resident.toolSocketPath ? { toolSocketPath: resident.toolSocketPath } : {}) };
           await send(request);
           resident.epoch = origin.epoch;
-          resident.binding = { origin, close: resident.binding!.close, initial: true };
+          resident.binding = { ...resident.binding!, origin, initial: true };
           await send({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: input.normalizedSessionId, ...origin });
           identity = await admitPiRpcSession(port, config, input.signal);
           await writePrivateFile(instructionFile, piHostInstructionSegment(context.instructions, instructionBoundary));
@@ -401,7 +401,7 @@ interface PiResidentState {
   epoch: number;
   context: PiRunContext;
   toolSocketPath?: string;
-  binding: { origin: Origin; close(): Promise<void>; initial: boolean } | null;
+  binding: { origin: Origin; close(): Promise<void>; rejectedToolCount(): number | undefined; initial: boolean } | null;
 }
 interface PiSessionState {
   transport: PiRpcTransport;
@@ -831,7 +831,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       signal?.throwIfAborted();
       const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel, modelConfiguration: resident.modelConfiguration });
       const origin = { epoch: resident.epoch + 1, runId, turnId: `pi-turn-${randomUUID()}` };
-      resident.binding = { origin, close: broker.close, initial: false };
+      resident.binding = { origin, close: broker.close, rejectedToolCount: broker.rejectedToolCount, initial: false };
       const request = { schema: 1, type: "bind", nonce: randomUUID(), sessionId: this.#normalizedSessionId,
         expectedPriorEpoch: resident.epoch, epoch: origin.epoch, runId, provider: broker.provider,
         model: this.#config.model, thinkingLevel: this.#config.piRpcThinkingLevel!, instructions: context.instructions, tools: context.tools,
@@ -1622,6 +1622,14 @@ export class PiRpcHarnessSession implements HarnessSession {
       for (const mapped of turn.projector.project(event)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
     } catch (error) { throw new PiProjectionFailure(turn, error); }
     if (event.type === "agent_settled") {
+      const binding = this.#resident?.binding;
+      const rejectedToolCount = binding?.rejectedToolCount();
+      if (binding && rejectedToolCount !== undefined && binding.origin.runId === turn.runId
+        && binding.origin.turnId === turn.turnId && this.#callbacks?.authority.accept(binding.origin)) {
+        // Trusted driver-owned dispatch receipt, not provider error text. It is
+        // read before revocation and cannot bleed into another turn or binding.
+        turn.toolLimitFailure = { code: "pi_tool_limit_exceeded", message: piToolLimitMessage(rejectedToolCount) };
+      }
       // A captured, still-pending dialog is an accepted wait, not an answer.
       // Tool-only semantic finish/block turns likewise need no fabricated text.
       const waiting = [...this.#dialogs.values()].some(dialog => dialog.turn === turn

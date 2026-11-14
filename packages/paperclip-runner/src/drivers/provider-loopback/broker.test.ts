@@ -212,6 +212,21 @@ describe("provider loopback broker", () => {
     await upstreamAborted;
   });
 
+  it("rejects the transformed payload before opening upstream HTTP", async () => {
+    let requests = 0;
+    const baseUrl = await listen(createServer((req, res) => { ++requests; req.resume(); res.end("ok"); }));
+    const broker = await startProviderLoopbackBroker({ adapter: chatLoopbackAdapter, baseUrl: `${baseUrl}/v1`, key: "secret", auth: "bearer", environment: {},
+      transformPayload: payload => { payload.finalMarker = true; return true; },
+      rejectPayload: payload => payload.finalMarker === true ? { code: "fixture_rejected", message: "Controlled refusal" } : undefined,
+    });
+    cleanups.push(broker.close);
+    const response = await fetch(`${broker.baseURL}/chat/completions`, { method: "POST",
+      headers: { authorization: `Bearer ${broker.token}` }, body: JSON.stringify({ model: "pinned", private: "payload-canary" }) });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: { type: "invalid_request_error", code: "fixture_rejected", message: "Controlled refusal" } });
+    expect(requests).toBe(0);
+  });
+
   it("preserves Chat model pinning, rejected fields and payload transformation", async () => {
     let payload: unknown;
     let headers: IncomingHttpHeaders | undefined;

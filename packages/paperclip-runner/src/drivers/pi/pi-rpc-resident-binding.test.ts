@@ -760,6 +760,53 @@ real("real Pi 1.5.2 resident binding", () => {
     await writeFile(join(root, "late-guard-proof.json"), JSON.stringify({ requests: upstream.requests, events, nativeEvents }, null, 2));
     console.log(`LATE_TOOLCAP_PROOF ${join(root, "late-guard-proof.json")}`);
   }, 60_000);
+  it("keeps late-payload dispatch refusal bounded to one turn and permits the next fitting turn in the same Pi session", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-toolcap-dispatch-"));
+    const workspace = join(root, "workspace"); await mkdir(workspace);
+    const agent = join(root, "agent"); await mkdir(join(agent, "extensions"), { recursive: true });
+    await writeFile(join(agent, "extensions", "late-payload.ts"), `export default function(pi) {
+      let first = true;
+      pi.on("before_provider_request", event => {
+        if (!first) return;
+        first = false;
+        return { ...event.payload, privateAddonData: "do-not-project-this-canary", tools: [...event.payload.tools,
+          { type: "function", function: { name: "addon_after_guard", description: "Late tool", parameters: { type: "object", properties: {} } } }] };
+      });
+    }`);
+    const upstream = await faux();
+    const core = d981ToolNames.filter(name => !name.startsWith("app_"));
+    const tools = [...Array.from({ length: 200 }, (_, i) => tool(`app_${String(i).padStart(3, "0")}`)),
+      ...core.map(name => ({ ...tool(name), paperclipToolSource: { kind: "core" } }))];
+    const session = await new PiRpcDriver({ command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off",
+      runtimeDirectory: join(root, "sessions"), dynamicTools: tools,
+      environment: { ...upstream.environment, PI_CODING_AGENT_DIR: agent }, shutdownTimeoutMs: 1000,
+    }).openSession({ runId: "late-dispatch", normalizedSessionId: "late-dispatch-native", workingDirectory: workspace }) as PiRpcHarnessSession;
+    sessions.push(session);
+    const nativeId = session.ids().providerSessionId; const pid = session.processPid();
+    const iterator = session.events()[Symbol.asyncIterator](); const events: PrpEvent[] = [];
+    const turn = async () => {
+      await session.startTurn({ message: { role: "user", text: "Say hello" } });
+      for (;;) {
+        const next = await iterator.next(); if (next.done) throw new Error("stream ended"); events.push(next.value);
+        if (["turn.failed", "turn.completed", "turn.cancelled"].includes(next.value.eventType)) return next.value;
+      }
+    };
+    expect(await turn()).toMatchObject({ eventType: "turn.failed", payload: { error: {
+      code: "pi_tool_limit_exceeded", message: expect.stringContaining("129 tools"),
+    } } });
+    expect(upstream.requests).toHaveLength(0);
+    expect(events.filter(event => /total tool cap 128 exceeded/.test(JSON.stringify(event.payload)))).toHaveLength(1);
+    expect(events.at(-1)!.payload.error).toMatchObject({ message: expect.stringContaining("ask the board") });
+    expect(JSON.stringify(events)).not.toContain("do-not-project-this-canary");
+    await session.attachRun({ runId: "late-dispatch-next" });
+    expect((await turn()).eventType).toBe("turn.completed");
+    expect(session.ids().providerSessionId).toBe(nativeId); expect(session.processPid()).toBe(pid);
+    expect(upstream.requests).toHaveLength(1); expect(upstream.requests[0]!.tools).toHaveLength(128);
+    expect(events.filter(event => event.eventType === "turn.failed")).toHaveLength(1);
+    await writeFile(join(root, "late-dispatch-proof.json"), JSON.stringify({ events, requests: upstream.requests }, null, 2));
+    console.log(`LATE_DISPATCH_PROOF ${join(root, "late-dispatch-proof.json")}`);
+  }, 60_000);
+
   it("runs three turns across two runs in one PID/session with refreshed instructions and tools, idle revoked", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-resident-real-")); const workspace = join(root, "workspace"); await mkdir(workspace);
     const upstream = await faux(); const agent = join(root, "agent"); await mkdir(agent);

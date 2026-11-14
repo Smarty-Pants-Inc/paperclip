@@ -36,6 +36,9 @@ export async function startProviderLoopbackBroker(input: {
   model?: string;
   rejectFields?: string[];
   transformPayload?(payload: Record<string, unknown>): boolean;
+  /** Caller-owned policy, checked after transforms and before opening upstream HTTP.
+   * A rejection is a non-retryable 400; never reflect the incoming payload. */
+  rejectPayload?(payload: Readonly<Record<string, unknown>>): { code: string; message: string } | undefined;
   extraUpstreamHeaders?: Record<string, string>;
   environment: NodeJS.ProcessEnv;
   /** Byte-idle upstream limit; active streams have no total-duration cutoff. */
@@ -108,6 +111,13 @@ export async function startProviderLoopbackBroker(input: {
         return;
       }
       if (input.transformPayload?.(payload)) body = Buffer.from(JSON.stringify(payload), "utf8");
+      const rejection = input.rejectPayload?.(payload);
+      if (rejection) {
+        response.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({
+          error: { type: "invalid_request_error", code: rejection.code, message: rejection.message },
+        }));
+        return;
+      }
       refreshIdleDeadline();
       const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
         const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {

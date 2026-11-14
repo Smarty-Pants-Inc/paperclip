@@ -315,12 +315,36 @@ reference above establishes a 256-tool ceiling, so the local guard is removed,
 not replaced by another invented count. Existing private-frame byte bounds remain.
 
 If an add-on pushes the actual serialized Chat request over 128 after inventory,
-the final-request guard refuses it without trimming or HTTP dispatch. Before
-aborting, it publishes only the owned origin and numeric limit/count via Pi's
-supported `appendEntry` → `entry_appended` seam. The driver validates that
-receipt against the live turn and ends it as `turn.failed` with code
-`pi_tool_limit_exceeded`, the count and actionable guidance, not a neutral
-cancellation. Arbitrary extension-error payloads remain excluded.
+the native Runner's Pi provider binding refuses it at the owned loopback HTTP
+boundary, before opening any upstream request. Pi 1.5.2's shipped
+`docs/extensions.md`, §`before_provider_request` (lines 864–879), explicitly says
+handlers run in extension load order and later handlers can replace the payload
+used for the actual request. The extension hook is therefore an early check,
+not a final-payload guarantee. See the corresponding public
+[hook contract](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#before_provider_request).
+
+The broker checks the delivered `tools` array after transforms, returns a
+non-retryable local HTTP 400, and retains only its measured numeric count on the
+revocable binding. The driver reads that trusted cause against the live binding's
+run/turn authority before settlement and emits one `turn.failed` with code
+`pi_tool_limit_exceeded`, the count and actionable guidance. No tools are trimmed,
+no smaller-catalog retry is allowed on the rejected binding, and no upstream HTTP
+request is opened. A fresh binding for the next turn has no retained failure.
+Messages and Responses do not receive Chat's cap. Direct-key development mode
+and native-provider paths without the owned broker retain only the early hook.
+
+The early extension check still publishes the numeric limit/count and origin via
+Pi's supported `appendEntry` → `entry_appended` seam before aborting, so its failure
+is not reported as neutral cancellation. Arbitrary extension-error payloads remain
+excluded. The new dispatch count does not come from an entry or provider error
+text; co-loaded extensions can forge custom entries, so entry provenance is not
+an authentication guarantee.
+
+The unchanged independent regression `toolcap-round2-judge.test.ts` is opt-in in
+the Runner Vitest configuration: supply both `PI_TEST_BINARY` (the pinned Pi
+1.5.2 executable) and `TASK_OUT` (an existing evidence directory). It exercises
+real Pi with controlled local HTTP peers, not paid inference. The ordinary
+broker/driver tests do not require those inputs.
 
 An overflow emits one `harness.diagnostic` per run, code
 `pi_dynamic_tool_limit`, with `api`, total-request `cap`, `nativeToolCount`,
