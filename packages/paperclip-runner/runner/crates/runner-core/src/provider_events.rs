@@ -1213,17 +1213,31 @@ pub fn normalize_codex_notification_in(
         }
         // Native Pi compaction is session progress, not an assistant message or
         // an actionable warning. Preserve its bounded phase through the facade.
-        "warning" if params.get("category").and_then(Value::as_str) == Some("context_compaction") => {
-            let phase = params.pointer("/details/0/value").and_then(Value::as_str).unwrap_or("started");
-            let phase = if matches!(phase, "started" | "completed" | "failed") { phase } else { "started" };
-            push(&mut events, "provider.notice.recorded", EventPriority::P1, json!({
-                "schema":"paperclip.provider.notice.v1",
-                "noticeId": stable_id(string(params.get("noticeKey")), "context-compaction"),
-                "severity": if phase == "failed" { "warning" } else { "info" },
-                "category":"context_compaction", "scope":"session", "recoverable":true, "userActionable":false,
-                "summary": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
-                "details":[{"name":"Phase", "value":phase}],
-            }));
+        "warning"
+            if params.get("category").and_then(Value::as_str) == Some("context_compaction") =>
+        {
+            let phase = params
+                .pointer("/details/0/value")
+                .and_then(Value::as_str)
+                .unwrap_or("started");
+            let phase = if matches!(phase, "started" | "completed" | "failed") {
+                phase
+            } else {
+                "started"
+            };
+            push(
+                &mut events,
+                "provider.notice.recorded",
+                EventPriority::P1,
+                json!({
+                    "schema":"paperclip.provider.notice.v1",
+                    "noticeId": stable_id(string(params.get("noticeKey")), "context-compaction"),
+                    "severity": if phase == "failed" { "warning" } else { "info" },
+                    "category":"context_compaction", "scope":"session", "recoverable":true, "userActionable":false,
+                    "summary": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
+                    "details":[{"name":"Phase", "value":phase}],
+                }),
+            );
         }
         "warning"
             if params.get("classification").and_then(Value::as_str)
@@ -2670,16 +2684,25 @@ mod tests {
     #[test]
     fn pi_manual_compaction_is_progress_and_retains_its_same_session_counts() {
         for phase in ["started", "completed", "failed"] {
-            let events = normalize_codex_notification("warning", &json!({"category":"context_compaction", "noticeKey":"pi-compact-1",
-                "message":"Compacting context", "details":[{"name":"Phase", "value":phase}]}));
+            let events = normalize_codex_notification(
+                "warning",
+                &json!({"category":"context_compaction", "noticeKey":"pi-compact-1",
+                "message":"Compacting context", "details":[{"name":"Phase", "value":phase}]}),
+            );
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].event_type, "provider.notice.recorded");
             assert_eq!(events[0].payload["details"][0]["value"], phase);
             assert_eq!(events[0].payload["userActionable"], false);
-            assert_eq!(events[0].payload["severity"], if phase == "failed" { "warning" } else { "info" });
+            assert_eq!(
+                events[0].payload["severity"],
+                if phase == "failed" { "warning" } else { "info" }
+            );
         }
-        let events = normalize_codex_notification("thread/compacted", &json!({"threadId":"same-native-session", "turnId":"compact-envelope",
-            "reason":"manual", "preTokens":100, "postTokens":25}));
+        let events = normalize_codex_notification(
+            "thread/compacted",
+            &json!({"threadId":"same-native-session", "turnId":"compact-envelope",
+            "reason":"manual", "preTokens":100, "postTokens":25}),
+        );
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "context.compacted");
         assert_eq!(events[0].payload["preTokens"], 100);
@@ -2742,15 +2765,31 @@ mod tests {
 
     #[test]
     fn pi_warm_rpc_performance_timings_cross_the_existing_diagnostic_boundary() {
-        let names = ["runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn",
-            "runner.pi.interrupt_wait", "runner.pi.prompt_to_started",
-            "runner.pi.admission.get_state", "runner.pi.admission.set_model",
-            "runner.pi.admission.get_available_thinking_levels", "runner.pi.admission.set_thinking_level"];
-        let spans: Vec<Value> = names.iter().map(|name| json!({"name":name,
-            "startedAtMs":1000,"endedAtMs":1010,"prompt":"private"})).collect();
-        let events = normalize_codex_notification("paperclip/providerPerformance", &json!({"spans":spans}));
+        let names = [
+            "runner.pi.attach",
+            "runner.pi.bind",
+            "runner.pi.begin_turn",
+            "runner.pi.interrupt_wait",
+            "runner.pi.prompt_to_started",
+            "runner.pi.admission.get_state",
+            "runner.pi.admission.set_model",
+            "runner.pi.admission.get_available_thinking_levels",
+            "runner.pi.admission.set_thinking_level",
+        ];
+        let spans: Vec<Value> = names
+            .iter()
+            .map(|name| {
+                json!({"name":name,
+            "startedAtMs":1000,"endedAtMs":1010,"prompt":"private"})
+            })
+            .collect();
+        let events =
+            normalize_codex_notification("paperclip/providerPerformance", &json!({"spans":spans}));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].payload["spans"].as_array().unwrap().len(), names.len());
+        assert_eq!(
+            events[0].payload["spans"].as_array().unwrap().len(),
+            names.len()
+        );
         assert!(!events[0].payload.to_string().contains("private"));
     }
 

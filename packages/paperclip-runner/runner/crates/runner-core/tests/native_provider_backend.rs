@@ -302,7 +302,10 @@ fn pi_acpx_config(state_dir: &Path, mode: &str) -> DurableRunnerConfig {
         .unwrap()
         .args
         .last_mut()
-        .unwrap() = pi_acpx_profile()["commandDigest"].as_str().unwrap().to_owned();
+        .unwrap() = pi_acpx_profile()["commandDigest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     config
 }
 
@@ -3348,9 +3351,19 @@ fn pi_rpc_compaction_dispatches_through_the_resident_facade_without_a_prompt() {
     let mut config = opencode_config(&directory);
     config.pi_launch_profile = config.opencode_launch_profile.take();
     let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
-    executor.execute(&command(1, "run.prepare", pi_rpc_prepare_payload(&directory))).unwrap();
-    executor.execute(&command(2, "session.open", json!({}))).unwrap();
-    let started = executor.execute(&command(3, "turn.start", json!({"compact":true}))).unwrap();
+    executor
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(&directory),
+        ))
+        .unwrap();
+    executor
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    let started = executor
+        .execute(&command(3, "turn.start", json!({"compact":true})))
+        .unwrap();
     assert_eq!(started.result["providerTurnId"], "provider-compact-turn-1");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut events = Vec::new();
@@ -3358,11 +3371,26 @@ fn pi_rpc_compaction_dispatches_through_the_resident_facade_without_a_prompt() {
         let batch = executor.poll_events().unwrap();
         executor.acknowledge_events(batch.len()).unwrap();
         events.extend(batch);
-        if events.iter().any(|event| event.event_type == "turn.completed") { break; }
+        if events
+            .iter()
+            .any(|event| event.event_type == "turn.completed")
+        {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(events.iter().any(|event| event.event_type == "context.compacted"), "{events:?}");
-    assert!(events.iter().any(|event| event.event_type == "turn.completed"), "{events:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "context.compacted"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == "turn.completed"),
+        "{events:?}"
+    );
     executor.shutdown().unwrap();
     let calls = fs::read_to_string(directory.join("fake-opencode-calls.log")).unwrap();
     assert!(calls.contains("thread/compact/start"), "{calls}");
