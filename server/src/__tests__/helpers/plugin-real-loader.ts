@@ -102,11 +102,17 @@ export async function startRealPluginLoader(db: Db) {
     return api(`/plugins/${pluginId}/config`, { companyId, configJson });
   }
 
-  async function jobRuns(pluginId: string, jobKey = "sweep") {
+  async function jobRunEvidence(pluginId: string, jobKey = "sweep") {
     const jobs = await api<PluginJobRecord[]>(`/plugins/${pluginId}/jobs`);
     const job = jobs.find(candidate => candidate.jobKey === jobKey);
     if (!job) throw new Error(`No registered job ${jobKey} for ${pluginId}`);
-    return api<PluginJobRunRecord[]>(`/plugins/${pluginId}/jobs/${job.id}/runs?limit=500`);
+    const path = `GET /api/plugins/${pluginId}/jobs/${job.id}/runs?limit=500`;
+    const runs = await api<PluginJobRunRecord[]>(`/plugins/${pluginId}/jobs/${job.id}/runs?limit=500`);
+    return { path, runs };
+  }
+
+  async function jobRuns(pluginId: string, jobKey = "sweep") {
+    return (await jobRunEvidence(pluginId, jobKey)).runs;
   }
 
   async function triggerJob(pluginId: string, jobKey = "sweep") {
@@ -142,7 +148,7 @@ export async function startRealPluginLoader(db: Db) {
   }
 
   return {
-    api, install, setCompanyConfig, runJob, triggerJob, waitForJob, jobRuns, waitFor, restartWorker, baseUrl,
+    api, install, setCompanyConfig, runJob, triggerJob, waitForJob, jobRuns, jobRunEvidence, waitFor, restartWorker, baseUrl,
     comments: (issueId: string) => api<IssueComment[]>(`/issues/${issueId}/comments`),
     dashboard: (pluginId: string) => api<Dashboard>(`/plugins/${pluginId}/dashboard`),
     async close() {
