@@ -889,6 +889,14 @@ storage metadata, and after governance before forwarding or a success receipt.
 An over-budget result fails without trimming, including a late expansion from
 secret redaction.
 
+The board/dependency-absent-agent REST fallback at
+`POST /api/plugins/tools/execute` cannot prepare native content. Explicit
+`mcpContent` there returns **501** with static
+`reasonCode: "native_plugin_content_requires_gateway"`; it never returns raw
+native success without storage. Legacy REST text/envelope bytes are unchanged,
+including MCP-looking `data.content` metadata. Use the governed gateway for
+native content.
+
 [SDK seam decision](./TOOL-IMAGE-SDK-SEAM.md) records the upstream check and why
 this additive SDK field is needed instead of reinterpreting legacy metadata.
 [Tool image boundaries](./TOOL-IMAGE-CONTENT.md) distinguishes native conversation

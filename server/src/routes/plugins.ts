@@ -1140,6 +1140,16 @@ export function pluginRoutes(
         parameters ?? {},
         runContext,
       );
+      // Board/dependency-absent fallback has no governed private-image storage
+      // pipeline. Never acknowledge explicit native content as prepared here.
+      // Arbitrary legacy data.content is not an opt-in and stays unchanged.
+      if (result.result && Object.prototype.hasOwnProperty.call(result.result, "mcpContent")) {
+        res.status(501).json({
+          error: "Native plugin content requires the governed tool gateway.",
+          reasonCode: "native_plugin_content_requires_gateway",
+        });
+        return;
+      }
       res.json(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

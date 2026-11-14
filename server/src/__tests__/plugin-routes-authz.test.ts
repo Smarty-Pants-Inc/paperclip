@@ -1,6 +1,10 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// Warm the route graph during collection, not inside a request's 15s budget.
+// vi.mock factories below are hoisted before these imports by Vitest.
+import "../routes/plugins.js";
+import "../middleware/index.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -628,6 +632,52 @@ describe("plugin tool and bridge authz", () => {
       expect(res.status, label).toBe(403);
       expect(executeTool).not.toHaveBeenCalled();
     }
+  });
+
+  // Keep: existing REST/host trust boundary. Exercise actual HTTP/authz; only
+  // the dispatcher result and scope lookups are controlled. No gateway deps.
+  describe.each([
+    { label: "board", actor: boardActor() },
+    { label: "dependency-absent agent", actor: agentActor() },
+  ])("REST fallback for $label", ({ actor }) => {
+    const makeRequest = async (result: unknown) => {
+      const executeTool = vi.fn().mockResolvedValue(result);
+      const { app } = await createApp(actor, {}, {
+        db: createSelectQueueDb([
+          [{ companyId: companyA }],
+          [{ companyId: companyA, agentId: agentA }],
+          [{ companyId: companyA }],
+        ]),
+        toolDeps: { toolDispatcher: {
+          listToolsForAgent: vi.fn(), getTool: vi.fn(() => ({ name: "paperclip.example:search" })), executeTool,
+        } },
+      });
+      return request(app).post("/api/plugins/tools/execute").send({
+        tool: "paperclip.example:search", parameters: {},
+        runContext: { agentId: agentA, runId: runA, companyId: companyA, projectId: projectA },
+      });
+    };
+
+    it("rejects native image opt-in with a content-free 501 rather than unprepared success", async () => {
+      const body = Buffer.from("private synthetic REST capture").toString("base64");
+      const response = await makeRequest({ pluginId: "paperclip.example", toolName: "search", result: {
+        mcpContent: [{ type: "image", data: body, mimeType: "image/png" }],
+      } });
+      expect(response.status).toBe(501);
+      expect(response.body).toEqual({ error: "Native plugin content requires the governed tool gateway.", reasonCode: "native_plugin_content_requires_gateway" });
+      expect(response.text).not.toContain(body);
+      expect(response.text).not.toContain("data:image/");
+    });
+
+    it.each([
+      { content: "ordinary metadata" },
+      { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png" }] },
+    ])("preserves legacy REST text/envelope bytes without native opt-in: %j", async data => {
+      const legacy = { pluginId: "paperclip.example", toolName: "search", result: { content: " a\n\tΩ ", data } };
+      const response = await makeRequest(legacy);
+      expect(response.status).toBe(200);
+      expect(response.text).toBe(JSON.stringify(legacy));
+    });
   });
 
   it("allows tool execution when agent, run, and project all belong to runContext.companyId", async () => {
