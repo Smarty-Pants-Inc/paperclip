@@ -4,7 +4,6 @@ import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executo
 
 describe("native continuation refusal", () => {
   it.each([
-    "native_controller_recovery_missing_evidence:retained_sandbox_binding",
     "native_controller_recovery_unsupported:metadata_format",
     "native_controller_recovery_unsupported:supervisor_compatibility",
     "native_controller_recovery_unsupported:admitted_input_format",
@@ -62,6 +61,8 @@ describe("native continuation refusal", () => {
 
   it.each([
     "native_controller_recovery_missing_evidence:snapshot_binding",
+    "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+    "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_unsupported:metadata_format",
     "runner_remote_state_unavailable", "native_runner_refresh_required", "native_runner_launch_profile_mismatch",
     "provider_active_turn", "provider_live_descendants", "provider_active_goal", "provider_prepare_refused",

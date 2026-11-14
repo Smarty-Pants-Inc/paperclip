@@ -44,7 +44,8 @@ import { canBypassFailedNativePredecessor } from "../native-runtime/native-provi
 import { heartbeatRunEvents } from "@paperclipai/db";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer.js";
-import { resolveNativeControllerRecovery } from "../native-runtime/native-controller-recovery.js";
+import { resolveNativeControllerRecovery, assertNativeRetainedSandboxBinding } from "../native-runtime/native-controller-recovery.js";
+import { createSystemRecovery } from "../system-recovery-state.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -596,7 +597,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   it.each(["confirmed-stop", "unconfirmed-stop", "metadata-format", "already-stranded", "idle-descendants", "active-turn", "held-notice", "already-stranded-unconfirmed",
     "codex-confirmed-stop", "codex-unconfirmed-stop", "codex-metadata-format", "codex-already-stranded", "codex-idle-descendants", "codex-active-turn", "codex-held-notice", "codex-already-stranded-unconfirmed",
     "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare",
-    "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed"] as const)(
+    "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed", "codex-seed-a-adopted"] as const)(
     "designed end answers from history with one note and no Retry (%s)", async shape => {
     const scenario = shape.replace(/^codex-/, "");
     const f = shape.startsWith("codex-") ? await fixture() : await piFixture();
@@ -604,6 +605,36 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const first = await selectHeartbeatRuntime(db, f.input);
     if (!first.selected || !first.nativeExecution) throw new Error("Expected first selection");
     const oldId = first.nativeExecution.session.normalizedSessionId!;
+    if (scenario.startsWith("seed-a")) {
+      await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+        authorType: "user", authorUserId: "local-board", body: "Remember ALDER as the original conversation word.",
+        createdAt: new Date(f.run.createdAt.getTime() - 10_000) });
+      // The actual retained-binding validator supplies both automatic recovery
+      // and resend failures; the runner must preserve each before any turn.
+      for (const attempt of ["automatic-recovery", "resend"]) {
+        const refusal = await assertNativeRetainedSandboxBinding(db, { companyId: f.agent.companyId,
+          issueId: f.issue.id, runId: f.run.id, target: { kind: "remote", transport: "sandbox",
+            environmentId: randomUUID(), leaseId: randomUUID(), providerKey: "boat", remoteCwd: instructionRoot,
+            sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "seed-a-resumed-box" } } as never,
+        }).catch((error: unknown) => error);
+        const transport = { request: async () => { throw refusal; }, notify() {},
+          async *notifications() {}, setServerRequestHandler() {}, async close() {} };
+        const openRun = vi.fn(), completeRun = vi.fn();
+        const failure = await runner.executeNativeSession({ input: first.nativeExecution,
+          backend: runner.createNativeSessionBackend(first.nativeExecution, { codexTransportFactory: () => transport }),
+          runnerInstanceId: `d10b-${attempt}`, controlPlaneInstanceId: "d10b-server",
+          controlPlane: { openRun, completeRun, appendEvent: vi.fn(),
+            loadSessionCheckpoint: async () => ({ backendKind: "runner", driverKind: "codex_app_server",
+              sessionId: "seed-a-driver", providerSessionId: "seed-a-provider", identity: {
+                ...first.nativeExecution!.binding, sessionId: oldId }, workingDirectory: instructionRoot,
+              cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [], providerRecoveryPolicy: "same_session_only" }),
+            replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }) },
+        }).catch((error: unknown) => error);
+        expect(failure).toMatchObject({ code: "native_controller_recovery_missing_evidence:retained_sandbox_binding" });
+        expect(openRun).not.toHaveBeenCalled();
+        expect(completeRun).not.toHaveBeenCalled();
+      }
+    }
     const [message] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
       authorType: "user", authorUserId: "local-board", body: `Answer the saved ${shape} request, using the earlier history.` }).returning();
     await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
@@ -616,7 +647,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       ? "native_controller_recovery_unsupported:metadata_format"
       : scenario === "idle-descendants" || scenario === "active-turn" ? "native_runner_refresh_required"
       : "native_controller_recovery_missing_evidence:snapshot_binding";
-    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: error, error,
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+      errorCode: scenario.startsWith("seed-a") ? "native_continuation_requires_reconciliation" : error, error,
       resultJson: { failureCause: "provider_http_429" } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", attempt: 1, controllerBootId: randomUUID(),
       leaseOwner: null, leaseExpiresAt: null, recoveryState: "blocked", failureCode: error }).where(eq(nativeRunFinalizations.runId, f.run.id));
@@ -654,11 +686,14 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       }
     }
     const confirmStop = async () => {
-      for (const oldLease of seedLeases) await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(),
-        cleanupStatus: "success", metadata: { pluginId: "fixture-boat", remoteExecutionTermination: {
-          schema: "paperclip.remote-termination.v1", companyId: oldLease.companyId, runId: oldLease.heartbeatRunId,
-          leaseId: oldLease.id, provider: oldLease.provider, providerLeaseId: oldLease.providerLeaseId,
-          state: "stopped", confirmedAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, oldLease.id));
+      for (const oldLease of seedLeases) {
+        const confirmedAt = new Date();
+        await db.update(environmentLeases).set({ status: "released", releasedAt: confirmedAt,
+          cleanupStatus: "success", metadata: { pluginId: "fixture-boat", remoteExecutionTermination: {
+            schema: "paperclip.remote-termination.v1", companyId: oldLease.companyId, runId: oldLease.heartbeatRunId,
+            leaseId: oldLease.id, provider: oldLease.provider, providerLeaseId: oldLease.providerLeaseId,
+            state: "stopped", confirmedAt: confirmedAt.toISOString() } } }).where(eq(environmentLeases.id, oldLease.id));
+      }
       const confirmedAt = new Date().toISOString();
       await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success",
         metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
@@ -671,7 +706,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.agent.companyId, sourceIssueId: f.issue.id,
       kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "board",
       returnOwnerAgentId: f.agent.id, fingerprint: `d10-designed-end:${f.run.id}`, nextAction: "System recovery pending",
-      evidence: { runId: f.run.id } }).returning();
+      evidence: { runId: f.run.id, ...(scenario === "seed-a-adopted"
+        ? { systemRecovery: { ...createSystemRecovery(f.run.id), state: "complete" } } : {}) } }).returning();
     let activeRunId: string | undefined;
     if (scenario === "active-turn") {
       const [active] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
@@ -735,14 +771,26 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
     expect(answered.settled.status).toBe("succeeded");
     expect(JSON.stringify(answered.prompts)).toContain(message.body);
+    if (scenario.startsWith("seed-a")) expect(JSON.stringify(answered.prompts)).toContain("ALDER");
     const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
     expect(allNotes).toHaveLength(beforeNotes.length + 1);
     const notes = currentNotices(allNotes, beforeNotes);
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toContain("fresh thread in this conversation");
+    if (scenario.startsWith("seed-a") || scenario === "backup-without-lease" || scenario === "retained-binding") {
+      expect(notes[0].body).not.toMatch(/skill change|cannot continue|Retry/);
+      await settleUnrecoverableExecutions(db);
+      await settleUnrecoverableExecutions(db);
+      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(1);
+      const unchanged = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+        .filter(c => c.authorType === "system");
+      expect(unchanged).toHaveLength(allNotes.length);
+      if (waiting) expect(allNotes.filter(c => c.metadata?.supersededByCommentId === notes[0].id)).toHaveLength(1);
+    }
     if (heldCommentId) {
       expect(notes[0].id).not.toBe(heldCommentId);
-      expect(allNotes.find(note => note.id === heldCommentId)?.metadata?.supersededByCommentId).toBe(notes[0].id);
+      expect(allNotes.find(c => c.id === heldCommentId)).toMatchObject({ body: "The earlier attempt is still being checked.",
+        metadata: { supersededByCommentId: notes[0].id } });
       expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
     }
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);

@@ -20,6 +20,7 @@ import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
+import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "./unanswered-person-message.js";
 
@@ -135,31 +136,46 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     }
   });
 
-  it("SMAA-143 msg 1: native_session_interrupted (backup_without_reusable_lease) with its retries exhausted -> exactly one notice, code in metadata only", async () => {
+  it("D10b SMAA-143 exhausted backup refusal requests disposition, never tells a person resend is safe", async () => {
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId,
+      heartbeatRunId: id, provider: "boat", providerLeaseId: null, status: "expired" });
     await f.boardHold("native_session_retry_exhausted", id);
     await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleUnrecoverableExecutions(db);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
-    expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without/);
-    expect(notices[0]!.metadata?.recoveryResponsibility).toBe("user");
-    expect(codeOf(notices[0]!)).toBe("runner_harness_state_mismatch");
+    expect(notices[0]!.body).toContain("cannot confirm that the earlier attempt stopped");
+    expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without|Sending it again is safe/);
+    await f.sweep();
+    await settleUnrecoverableExecutions(db);
+    expect(await f.visible()).toHaveLength(1);
   });
 
-  it("SMAA-143 msg 1, other branch: the native same-run retry never starts -> pending first, then exactly one notice once it is overdue", async () => {
+  it("D10b SMAA-143 does not preempt a same-run retry by timer; its terminal refusal reaches disposition", async () => {
     const f = await fixture();
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId,
+      heartbeatRunId: id, provider: "boat", providerLeaseId: null, status: "expired" });
     await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: id, phase: "retryable_failure",
       nextAttemptAt: new Date(Date.now() + 30_000) });
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
     await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(Date.now() - 10 * 60_000) }).where(eq(nativeRunFinalizations.runId, id));
     await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    // A timer is not terminal settlement or stop proof. Only the existing
+    // recovery owner settling its attempt makes this refusal disposable.
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", nextAttemptAt: null })
+      .where(eq(nativeRunFinalizations.runId, id));
+    await f.boardHold("native_session_retry_exhausted", id);
+    await settleUnrecoverableExecutions(db);
     expect(await f.visible()).toHaveLength(1);
+    expect((await f.visible())[0].body).toContain("cannot confirm that the earlier attempt stopped");
   });
 
   it("SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {

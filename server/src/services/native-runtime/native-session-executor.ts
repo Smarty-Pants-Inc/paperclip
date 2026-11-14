@@ -7760,6 +7760,9 @@ const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch
  */
 /** Exported for the notice-writer regression only. */
 export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
+  // D10 disposition owns both waiting and fresh-history notices for typed
+  // refusals; the legacy held writer must not add a competing dead-chat note.
+  if (freshThreadRefusalCode(error)) return;
   const message = error instanceof Error ? error.message : String(error);
   if (!HELD_PREDECESSOR_REFUSAL.test(message)) return;
   const { companyId, issueId, agentId, runId } = input.execution.binding;
@@ -18827,7 +18830,7 @@ async function createRunnerdBackendWithinSessionClaim(
                       // A continuation that has a durable backup but no recorded reusable
                       // lease was not provider-confirmed lost. Never silently create a new
                       // provider session from that ambiguous state.
-                      throw new Error("runner_harness_state_mismatch: backup_without_reusable_lease");
+                      throw nativeReconciliationError("runner_harness_state_mismatch: backup_without_reusable_lease");
                     } else if (restartableBootstrapState(state)) {
                       if (!(await moveInterruptedBootstrapSessionAside()
                         && takeRemoteBootstrapRestartProof(input.execution.binding.runId)

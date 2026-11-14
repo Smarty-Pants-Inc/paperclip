@@ -2,10 +2,20 @@ import { randomUUID } from "node:crypto";
 import { agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
   nativeRunResults } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { HELD_PREDECESSOR_NOTICE, noticeHeldUnfinishedPredecessor } from "./native-session-executor.js";
 import { readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+
+it.each([
+  "runner_harness_state_mismatch: backup_without_reusable_lease",
+  "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+])("D10b leaves typed refusal notices exclusively to proven-stop disposition (%s)", async code => {
+  const select = vi.fn(() => { throw new Error("Legacy notice owner must not read"); });
+  await noticeHeldUnfinishedPredecessor({ db: { select } as never, execution: {} as never },
+    Object.assign(new Error(code), { code }));
+  expect(select).not.toHaveBeenCalled();
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("held predecessor notice writer", () => {
