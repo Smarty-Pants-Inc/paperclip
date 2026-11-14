@@ -548,6 +548,109 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
           companyId: oldLease.companyId, runId: f.run.id, leaseId: oldLease.id, provider: oldLease.provider,
           providerLeaseId: oldLease.providerLeaseId, state: "stopped", confirmedAt } } }).where(eq(environmentLeases.id, oldLease.id));
     }
+    if (settlementState === "unconfirmed-stop") {
+      const { environmentRuntimeService } = await import("../environment-runtime.js");
+      const observation = await environmentRuntimeService(db).inspectLeaseResource(oldLease.id, { freshThreadStop: true });
+      await (await import("node:fs/promises")).appendFile(join(process.env.TASK_OUT!, "start-intent-inspection.jsonl"),
+        JSON.stringify({ pluginId: oldLease.metadata?.pluginId, providerLeaseId: oldLease.providerLeaseId,
+          observation: observation ?? null, returnedUndefined: observation === undefined }) + "\n");
+      expect(observation).toBeUndefined();
+      const notes = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))
+        .then(rows => rows.filter(comment => comment.authorType === "system"));
+      const pending = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
+        trigger: "recovery_refused", delivery: "caller_owns" });
+      expect(pending).toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+      const waiting = await notes();
+      expect(waiting).toHaveLength(1);
+      expect(waiting[0].body).toContain("stopping the earlier attempt before starting fresh");
+      expect(waiting[0].body).not.toMatch(/Starting a fresh thread|\bsafe\b/);
+      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLease.id)))[0]).toEqual(oldLease);
+
+      // The normal disposition pass owns inspection and automatic delivery. A
+      // later positive provider read, not a resend or a test-minted successor,
+      // must wake the saved message through real admission.
+      const userId = randomUUID();
+      await db.insert(authUsers).values({ id: userId, name: "Board", email: `${userId}@example.test`,
+        emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+      await db.update(companies).set({ defaultResponsibleUserId: userId }).where(eq(companies.id, f.agent.companyId));
+      await db.update(heartbeatRuns).set({ responsibleUserId: userId }).where(eq(heartbeatRuns.id, f.run.id));
+      const [blocked] = await db.update(issues).set({ status: "blocked", responsibleUserId: userId,
+        blockedTransitionAt: new Date() }).where(eq(issues.id, f.issue.id)).returning();
+      await db.insert(issueRecoveryActions).values({ companyId: f.agent.companyId, sourceIssueId: f.issue.id,
+        kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active",
+        ownerType: "board", returnOwnerAgentId: f.agent.id, fingerprint: `start-intent:${f.run.id}`,
+        nextAction: "Wait for confirmed stop before continuing the saved message.", evidence: { runId: f.run.id, nativeFailureBlock: { runId: f.run.id, statusVersion: blocked.statusVersion } } });
+      let stopped = false;
+      const inspectLeaseResource = vi.fn(async (leaseId: string) => {
+        expect(leaseId).toBe(oldLease.id);
+        return stopped ? { providerLeaseId: oldLease.providerLeaseId!, state: "stopped" } : undefined;
+      });
+      const beforeChecks = performance.now(), clock = Date.now() - 3 * 61000;
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        for (let n = 0; n < 3; n++) {
+          vi.setSystemTime(clock + n * 61000);
+          await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+        }
+        expect(performance.now() - beforeChecks).toBeLessThan(10000);
+        expect(inspectLeaseResource).toHaveBeenCalledTimes(3);
+        const current = () => notes().then(rows => rows.filter(comment => !comment.metadata?.supersededByCommentId));
+        expect(await current()).toHaveLength(1);
+        expect((await current())[0].body).toContain("cannot confirm that the earlier attempt stopped");
+        expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
+
+        const { heartbeatService } = await import("../heartbeat.js");
+        const { deliverReconciledExecutions } = await import("../execution-recovery-resolution.js");
+        await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+          .where(eq(agents.id, f.agent.id));
+        const hb = heartbeatService(db);
+        const [busy] = await db.insert(issues).values({ companyId: f.agent.companyId, title: "Other work",
+          status: "in_progress", assigneeAgentId: f.agent.id }).returning();
+        await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+          issueId: busy.id, status: "running", contextSnapshot: { issueId: busy.id } });
+        stopped = true;
+        vi.setSystemTime(clock + 3 * 61000);
+        try {
+          await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+          await deliverReconciledExecutions(db, hb.wakeup);
+          await hb.drainActiveRunExecutions();
+          const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id));
+          expect(successors).toHaveLength(1);
+          expect(successors[0]).toMatchObject({ status: "queued", contextSnapshot: { previousRunId: f.run.id, forceFreshSession: true } });
+          const [next] = await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successors[0].id)).returning();
+          await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, f.issue.id));
+          f.input.run = next;
+          f.input.session.persistedNativeExecutionInput = null;
+          f.input.session.persistedRunnerProfile = {};
+          f.input.task.context = next.contextSnapshot!;
+          f.input.session.getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+            agentId: f.agent.id, issueId: f.issue.id, before: next.createdAt });
+          const selected = await selectHeartbeatRuntime(db, f.input);
+          if (!selected.selected || !selected.nativeExecution) throw new Error("Expected automatic fresh selection");
+          expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(oldId);
+          const answer = await answerWithNativePeer({ db, execution: selected.nativeExecution,
+            runnerInstanceId: selected.nativeRunnerInstanceId!, text: "The saved request answered after stop proof.",
+            getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+          expect(answer.settled.status).toBe("succeeded");
+          expect(JSON.stringify(answer.prompts)).toContain(message!.body);
+          for (let n = 0; n < 3; n++) {
+            await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+            await deliverReconciledExecutions(db, hb.wakeup);
+          }
+          expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id))).toHaveLength(1);
+          expect(await current()).toHaveLength(1);
+          expect((await current())[0].body).toContain("fresh thread in this conversation");
+        } finally {
+          await hb.drainActiveRunExecutions();
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+      return;
+    }
     const continued = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
       trigger: "recovery_refused", delivery: "caller_owns" });
     expect(continued.kind).toBe("continued");
@@ -578,16 +681,6 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000),
       contextSnapshot: { issueId: f.issue.id, recoveryActionId: continued.recoveryActionId, previousRunId: f.run.id, forceFreshSession: true,
         ...(continued.isolation === "fresh_isolated_workspace" ? { freshContinuationIsolation: continued.recoveryActionId } : {}) } }).returning();
-    if (settlementState === "unconfirmed-stop") {
-      const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
-      expect(await readFreshContinuationSessionBoundary(db, run!, f.issue.id)).toBeNull();
-      const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
-        .filter(comment => comment.authorType === "system");
-      expect(notes).toHaveLength(1);
-      expect(notes[0].body).toContain("stopping the earlier attempt before starting fresh");
-      expect((await read(run!.id)).nativeSessionId).toBeNull();
-      return;
-    }
     f.input.run = run!;
     f.input.session.persistedNativeExecutionInput = null;
     f.input.session.persistedRunnerProfile = {};
