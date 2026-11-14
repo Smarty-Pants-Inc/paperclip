@@ -39,7 +39,7 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -4591,7 +4591,10 @@ export function environmentRuntimeService(
 
     async inspectLeaseResource(leaseId: string): Promise<PluginEnvironmentLeaseObservation | undefined> {
       const lease = await environmentsSvc.getLeaseById(leaseId);
-      if (!lease || lease.status !== "failed" || lease.leasePolicy !== "ephemeral" || !lease.providerLeaseId) return undefined;
+      if (!lease || !lease.providerLeaseId || hasRemoteTerminationReceipt(lease)) return undefined;
+      const unconfirmedCleanup = ["failed", "pending_cleanup"].includes(lease.status)
+        && ["failed", "pending"].includes(lease.cleanupStatus ?? "");
+      if (!unconfirmedCleanup && !(lease.status === "failed" && lease.leasePolicy === "ephemeral")) return undefined;
       const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
       // Legacy Cloud leases can lack a credential version that permits a
       // provider-local observation. Cloud's manager verifies the historical

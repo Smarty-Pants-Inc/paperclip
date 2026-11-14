@@ -53,11 +53,26 @@ introduced by the server policy.
   identity keeps its running thread; a late boundary belongs to the next turn.
 * **Write seam:** `freshThreadStopGate` uses the same proof predicate inside the
   decision owner's transaction. It requests the existing stop-only cleanup owner
-  and appends/supersedes the current history notice. It never contacts a provider
-  from this transaction and creates no independent scheduler, queue or timer.
+  only when proof is missing and appends/supersedes the current history notice.
+  An expired, result-less `observed` predecessor with recorded provider stop
+  proof is settled through `native-failed-run-owner-release` before the live-turn
+  check. The existing orphan-recovery pass invokes the same owner and releases
+  the stale task pointer through the ordinary queue owner so saved person wakes
+  do not wait forever before admission is even reached. That owner rechecks the
+  exact claim/attempt/generation, accepted-result,
+  process, workspace and exclusive-allocation fences. A live claim or executor
+  remains held. It never contacts a provider from this transaction and creates
+  no independent scheduler, queue or timer.
 * **Evidence:** the exact company/run/lease/provider/allocation-bound stop or
-  destruction receipt, with valid timestamps, exclusive holder and no cleanup in
-  flight; or exact local process-owner proof. A missing local identity needs a
+  destruction receipt on a successfully released lease, with a parseable
+  confirmation timestamp and exclusive holder;
+  or exact local process-owner proof. Cleanup's existing bound release receipt
+  is final physical-stop evidence: a consumer does not re-interpret the order
+  of its recording timestamps, demand a newer stop-only dispatch receipt, or
+  rewrite any field of that lease. Released/expired rows with incomplete older
+  stop evidence are also immutable: they remain held, not freshly authorized.
+  A dedicated stop-and-retain receipt retains
+  its stronger separate retention checks. A missing local identity needs a
   successful current-host process-table read showing no attributed runner. A
   missing allocation ID, foreign-host/remote launch without its allocation proof,
   unreadable process table, void release, `stopping`, expiry or timeout is not proof.
@@ -108,6 +123,17 @@ another conversation's unanswered-message notice. Other harnesses with a typed
 instruction/launch-contract replacement could consume this boundary without
 adding a provider-specific server recovery owner. Expansion beyond the closed
 code family requires an explicit policy decision; this document does not enable it.
+
+The existing pending-cleanup sweep may call `inspectLeaseResource` for a
+failed/pending cleanup without a receipt, outside the admission transaction.
+An exact fresh `stopped`/`destroyed` observation settles the existing stop-only
+intent through `settleStopOnlyCleanup`, under its current attempt fence. It
+records the bound physical-stop receipt, not a fictional stop-RPC dispatch or
+stronger stop-and-retain receipt. Workspace-export resume keeps its own owner.
+An unknown, active, mismatched or failed read grants no proof and leaves ordinary
+bounded cleanup retry in charge. Released receipts are not inspected again.
+Starting a new stop intent clears the previous attempt's controller stamp;
+only the cleanup claimant stamps its actual process identity.
 
 The provider plugin remains the consumer of the existing environment lifecycle
 seam and the source of independently bound physical evidence. The server owns

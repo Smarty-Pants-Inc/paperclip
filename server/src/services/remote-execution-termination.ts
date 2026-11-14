@@ -37,6 +37,7 @@ export function hasBoundRemoteStopReceipt(lease: Pick<ReceiptLease, keyof LeaseI
   return Boolean(receipt && receipt.schema === "paperclip.remote-termination.v1" &&
     receipt.companyId === lease.companyId && receipt.runId === lease.heartbeatRunId &&
     receipt.leaseId === lease.id && receipt.provider === lease.provider &&
+    typeof receipt.confirmedAt === "string" && Number.isFinite(Date.parse(receipt.confirmedAt)) &&
     remoteTerminationReceipt(lease, receipt));
 }
 

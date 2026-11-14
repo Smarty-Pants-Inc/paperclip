@@ -7,6 +7,7 @@ import {
   activityLog,
   agents,
   companies,
+  completionContracts,
   createDb,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   environmentLeases,
@@ -14,6 +15,7 @@ import {
   issues,
   issueRecoveryActions,
   nativeRunFinalizations,
+  nativeRunResults,
   subscribeDatabaseWork,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -31,9 +33,13 @@ import {
   releaseAbandonedNativeOwners,
   resetAbandonedNativeOwnerReleaseForTests,
   settleUnstartedNativeSessionResume,
+  settleStoppedObservedNativeOwner,
 } from "./native-failed-run-owner-release.js";
 
 import * as controllerProcess from "../controller-process-identity.js";
+import { activeNativeExecutionRunIds } from "./native-active-runs.js";
+import { remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { LEGACY_WORKSPACE_RECOVERY_KEY } from "../workspace-restore-recovery-state.js";
 
 const LEASE_FAILURE = 'Failed to acquire lease for environment "Managed computer" (sandbox): Sandbox creation has failed';
 
@@ -152,6 +158,63 @@ describe("failed native run owner release", () => {
     await failRunDuringSetup(runId, "adapter_failed", "provider turn failed");
     await expect(settleUnstartedNativeSessionResume(db, claim!)).resolves.toBe(false);
     expect(await coordinator(runId)).toMatchObject({ phase: "observed", leaseOwner: claim!.leaseOwner, attempt: 2 });
+  });
+
+  it.each(["stopped", "live_claim", "run_lease", "tracked", "wrong_receipt", "other_holder", "workspace_hold", "native_workspace_hold", "controller_recovery_hold", "wrong_issue", "accepted_result", "local_process", "foreign_controller", "remote_process"] as const)(
+    "F1b observed owner settles only on bound stop proof with every owner fence (%s)", async shape => {
+    const { runId, issueId } = await nativeRun({ status: "running", errorCode: "native_runner_ownership_unverified",
+      coordinator: { leaseOwner: "stranded-observed", attempt: 2, controllerGeneration: 4,
+        leaseExpiresAt: shape === "live_claim" ? new Date(Date.now() + 60_000) : new Date(0) } });
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: runId, issueId,
+      provider: "boat", providerLeaseId: `f1b-${runId}`, status: "released", cleanupStatus: "success", releasedAt: new Date() }).returning();
+    const receipt = remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" })!;
+    await db.update(environmentLeases).set({ metadata: { remoteExecutionTermination: {
+      ...receipt, ...(shape === "wrong_receipt" ? { runId: randomUUID() } : {}) } } }).where(eq(environmentLeases.id, lease.id));
+    if (shape === "run_lease") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) })
+      .where(eq(heartbeatRuns.id, runId));
+    if (shape === "workspace_hold") await db.update(heartbeatRuns).set({ resultJson: { [LEGACY_WORKSPACE_RECOVERY_KEY]: { retained: true } } })
+      .where(eq(heartbeatRuns.id, runId));
+    if (shape === "native_workspace_hold" || shape === "controller_recovery_hold") {
+      const key = shape === "native_workspace_hold" ? "nativeWorkspaceSync" : "nativeControllerRecovery";
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { [key]: { state: "pending" } } }).where(eq(heartbeatRuns.id, runId));
+    }
+    if (shape === "accepted_result") {
+      const [contract] = await db.insert(completionContracts).values({ companyId, issueId, revision: 1,
+        schemaVersion: "test", policyVersion: "test", risk: "low", completionAuthority: "agent",
+        incompleteCriteriaPolicy: "block", contractJson: {}, canonicalSha256: "a".repeat(64),
+        createdByActorType: "system", createdByActorId: "fixture" }).returning();
+      await db.update(heartbeatRuns).set({ completionContractId: contract.id }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(nativeRunResults).values({ companyId, issueId, runId, completionContractId: contract.id,
+        serverFingerprint: "fixture", schemaStatus: "accepted", resultJson: {}, canonicalSha256: "b".repeat(64) });
+    }
+    if (shape === "remote_process") await db.update(heartbeatRuns).set({ processPid: process.pid,
+      processHostHash: "remote" }).where(eq(heartbeatRuns.id, runId));
+    if (shape === "local_process") await db.update(heartbeatRuns).set({ processPid: process.pid,
+      processHostHash: currentProcessSpaceHash() }).where(eq(heartbeatRuns.id, runId));
+    if (shape === "foreign_controller") await db.update(nativeRunFinalizations).set({ controllerPid: 2_000_000_001,
+      controllerHostHash: "foreign-process-space", controllerProcessStartedAt: new Date(0) }).where(eq(nativeRunFinalizations.runId, runId));
+    if (shape === "tracked") activeNativeExecutionRunIds.add(runId);
+    if (shape === "other_holder") await db.insert(environmentLeases).values({ companyId, provider: lease.provider,
+      providerLeaseId: lease.providerLeaseId, status: "active" });
+    const beforeOwner = await coordinator(runId);
+    const [beforeRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const [beforeLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    try {
+      const settled = await settleStoppedObservedNativeOwner(db, { companyId, issueId: shape === "wrong_issue" ? randomUUID() : issueId, runId });
+      expect(settled).toBe(shape === "stopped" || shape === "remote_process");
+      if (shape === "stopped" || shape === "remote_process") {
+        expect(await coordinator(runId)).toMatchObject({ phase: "terminal_failure", leaseOwner: null, leaseExpiresAt: null,
+          attempt: 2, controllerGeneration: 4, resultId: null, failureDetail: {
+            releasedOwner: { reason: "stopped_observed_owner", leaseOwner: "stranded-observed", attempt: 2 } } });
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0])
+          .toMatchObject({ status: "failed", nativePhase: "terminal_failure", finishedAt: expect.any(Date) });
+        expect(await settleStoppedObservedNativeOwner(db, { companyId, issueId, runId })).toBe(false);
+      } else {
+        expect(await coordinator(runId)).toEqual(beforeOwner);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(beforeRun);
+      }
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(beforeLease);
+    } finally { activeNativeExecutionRunIds.delete(runId); }
   });
 
   it("reaps an already leaked owner on a failed run so the agent can stop", async () => {

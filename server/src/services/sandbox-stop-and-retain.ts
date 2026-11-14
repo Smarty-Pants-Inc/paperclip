@@ -110,7 +110,7 @@ export async function prepareSandboxStopAndRetain(db: Db, lease: Lease, recovery
  * The preservation owner verifies source eligibility and exclusive allocation
  * ownership before calling. Lease reuse policy does not authorize destruction. */
 export async function prepareHistoricalSandboxStopVerification(db: Db, lease: typeof environmentLeases.$inferSelect) {
-  if (lease.status !== "released" || !lease.heartbeatRunId || !lease.providerLeaseId ||
+  if (lease.status !== "released" || carriesHistoricalStopEvidence(lease) || !lease.heartbeatRunId || !lease.providerLeaseId ||
       lease.metadata?.pendingCleanupInFlight === true)
     return null;
   return prepareStopAndRetain(db, lease, "released");
@@ -180,6 +180,14 @@ export async function prepareSupersededWarmSandboxStop(db: Db, lease: typeof env
   return prepareStopAndRetain(db, lease, "retained", recovery);
 }
 
+function carriesHistoricalStopEvidence(lease: typeof environmentLeases.$inferSelect): boolean {
+  // Even an older/malformed receipt is immutable evidence, not permission to
+  // erase it and dispatch another stop. Only the bound predicate grants a
+  // continuation; incomplete evidence stays held for its existing owner.
+  return hasRemoteTerminationReceipt(lease) || ["released", "expired"].includes(lease.status)
+    && (lease.metadata?.remoteExecutionTermination != null || lease.metadata?.sandboxStopAndRetainReceipt != null);
+}
+
 /** An ended run still owes unsaved files from this sandbox, and no stop-and-retain
  * receipt ever arrived for it. Stop and keep it through the stop-only contract,
  * whatever cleanup it was waiting on: its pending-cleanup sweep then dispatches
@@ -187,7 +195,7 @@ export async function prepareSupersededWarmSandboxStop(db: Db, lease: typeof env
  * stop already in progress and a sandbox another lease holds are left alone;
  * the caller verifies that the run has ended. */
 export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
-  if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
+  if (carriesHistoricalStopEvidence(lease) || !lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
     || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
     || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed") return null;
   return prepareStopAndRetain(db, lease, lease.status);
@@ -197,6 +205,7 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
  * It never changes allocation identity, resumes a provider, or clears proof.
  * In-flight cleanup and workspace-export recovery keep their own budgets. */
 export async function retryUnconfirmedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
+  if (carriesHistoricalStopEvidence(lease)) return null;
   if (!hasStopOnlyCleanup(lease)) return prepareUnconfirmedSourceSandboxStop(db, lease);
   if (hasNativeWorkspaceExportResume(lease) || !readStopOnlyCleanup(lease)
     || lease.status !== "pending_cleanup" || lease.metadata?.pendingCleanupInFlight === true) return null;
@@ -220,7 +229,7 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
   const [updated] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
     status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending", releasedAt: now, updatedAt: now,
     ...(retention ? { leasePolicy: retention.leasePolicy } : {}),
-    metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination' - 'sandboxStopAndRetainReceipt') || ${JSON.stringify({
+    metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination' - 'sandboxStopAndRetainReceipt' - 'pendingCleanupController') || ${JSON.stringify({
       [SANDBOX_STOP_AND_RETAIN_KEY]: intent, pendingCleanupAttemptId: requestId,
       ...(fromStatus === "active" && Object.keys(recovery).length
         ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, runId: lease.heartbeatRunId, recoveredAt: now.toISOString() } } : {}),
@@ -237,7 +246,9 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
   return updated ?? null;
 }
 
-export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { attemptId: string; receipt?: unknown }) {
+export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: {
+  attemptId: string; receipt?: unknown; receiptSource?: "inspection";
+}) {
   if (hasNativeWorkspaceExportResume(lease)) return settleNativeWorkspaceExportResume(db, lease, options);
   const intent = readStopOnlyCleanup(lease);
   if (!intent) return null;
@@ -246,7 +257,9 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
   // receipt, and nothing claims its files were retained.
   const gone = receipt?.state === "destroyed";
   const now = new Date();
-  const removeIntent: SQL = stopped ? sql`- 'sandboxStopAndRetain'`
+  const removeIntent: SQL = stopped && options.receiptSource === "inspection"
+    ? sql`- 'sandboxStopAndRetain' - 'sandboxStopAndRetainReceipt'`
+    : stopped ? sql`- 'sandboxStopAndRetain'`
     : gone ? sql`- 'sandboxStopAndRetain' - 'sandboxStopAndRetainReceipt'` : sql``;
   const recordedIntent = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY] as Record<string, unknown> | undefined;
   const legacyOrphan = stopped && recordedIntent?.recoveredOrphanedRunLease === true && !lease.metadata?.[ORPHANED_SANDBOX_RECOVERY_KEY]
@@ -267,7 +280,10 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
       releasedAt: now, lastUsedAt: now, updatedAt: now,
       metadata: sql`(${environmentLeases.metadata} - 'remoteExecutionTermination' ${removeIntent}) || ${JSON.stringify({
         ...(gone ? { remoteExecutionTermination: receipt } : {}),
-        ...(stopped ? { remoteExecutionTermination: receipt, sandboxStopAndRetainReceipt: {
+        ...(stopped ? { remoteExecutionTermination: receipt } : {}),
+        // Inspection proves physical stop, not that a stop RPC was dispatched.
+        // Never fabricate the stronger dedicated dispatch/retention receipt.
+        ...(stopped && options.receiptSource !== "inspection" ? { sandboxStopAndRetainReceipt: {
           schema: "paperclip.sandbox-stop-and-retain-receipt.v1", requestId: intent.requestId,
           companyId: lease.companyId, runId: lease.heartbeatRunId, leaseId: lease.id,
           provider: lease.provider, providerLeaseId: lease.providerLeaseId,
