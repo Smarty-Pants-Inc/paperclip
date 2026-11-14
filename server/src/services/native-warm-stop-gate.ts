@@ -22,6 +22,11 @@ import { prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop } from ".
  *    provider lease, the lease's own run, and the stamp's session and manifest,
  *    no older than the stamp (`closedAt >= completedAt`).
  *
+ * In place of the `closed` receipt, the explicit backstop of the durable close
+ * opener (`native-warm-close-opener.ts`) also passes: a `failed` receipt whose
+ * `backstop` is `checkpoint` (with 1. above still true) or `ttl` (recorded once
+ * the lease's own `expiresAt` passed). See `nativeWarmSessionStopReadySql`.
+ *
  * A lease with no native warm session passes (another adapter, a per-turn
  * native run, or a lease saved before the warm window was recorded). A missing run finish time, a
  * malformed timestamp, or any identity mismatch fails closed.
@@ -58,43 +63,94 @@ function instantSql(value: SQL) {
   return sql`case when ${value} ~ ${ISO_INSTANT} then (${value})::timestamptz end`;
 }
 
-/** The predicate, as a boolean SQL expression over the `environment_leases` row in scope. */
-export function nativeWarmSessionStopReadySql(): SQL {
-  const metadata = sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)`;
+function leaseMetadataSql() {
+  return sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)`;
+}
+
+/** The lease keeps a native warm session (see the module comment). */
+export function nativeWarmSessionSql(): SQL {
+  const metadata = leaseMetadataSql();
+  return sql`(coalesce(${metadata}#>>'{reusableSandboxLease,adapterType}', '') = 'paperclip_runner'
+    and ${metadata} ? ${WARM_SANDBOX_IDLE_TIMEOUT_KEY})`;
+}
+
+/**
+ * The lease row's checkpoint stamp is a v2 stamp authorised for this exact
+ * provider lease, and it covers the last finished turn on that provider lease
+ * (every row of it); every run that used the provider lease has finished.
+ */
+export function nativeWarmCheckpointCoversLastTurnSql(): SQL {
+  const metadata = leaseMetadataSql();
   const stamp = sql`${metadata}->'nativeHarnessBackup'`;
-  const close = sql`${metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}`;
   const checkpointAt = instantSql(sql`${stamp}->>'completedAt'`);
-  const closedAt = instantSql(sql`${close}->>'closedAt'`);
   // Latest finished turn on the same provider lease, across every row of it.
   const lastFinishedTurn = sql`(select max(run.finished_at) from ${environmentLeases} source
     inner join ${heartbeatRuns} run on run.id = source.heartbeat_run_id
     where source.company_id = ${environmentLeases.companyId}
       and source.provider is not distinct from ${environmentLeases.provider}
       and source.provider_lease_id = ${environmentLeases.providerLeaseId})`;
-  // Every run that used this provider lease has finished (a missing finish fails closed).
-  const unfinishedTurn = sql`exists (select 1 from ${environmentLeases} source
+  return sql`coalesce((
+    ${environmentLeases.providerLeaseId} is not null
+    and ${stamp}->>'schema' = 'paperclip.native-harness-backup-stamp.v2'
+    and ${stamp}->>'authorizedProviderLeaseId' = ${environmentLeases.providerLeaseId}
+    and ${checkpointAt} >= ${lastFinishedTurn}
+    and not ${unfinishedTurnSql()}
+  ), false)`;
+}
+
+/** Some run that used this provider lease has not finished (a missing finish fails closed). */
+function unfinishedTurnSql(): SQL {
+  return sql`exists (select 1 from ${environmentLeases} source
     inner join ${heartbeatRuns} run on run.id = source.heartbeat_run_id
     where source.company_id = ${environmentLeases.companyId}
       and source.provider is not distinct from ${environmentLeases.provider}
       and source.provider_lease_id = ${environmentLeases.providerLeaseId}
       and run.finished_at is null)`;
+}
+
+/**
+ * The predicate, as a boolean SQL expression over the `environment_leases` row in scope.
+ *
+ * Besides a `closed` receipt, it accepts the explicit backstop the cleanup
+ * sweep's close opener records once a close has been given up on
+ * (`native-warm-close-opener.ts`): a `failed` receipt for the same provider
+ * lease and run whose `backstop` is either `checkpoint` (bound to the stamp's
+ * session and manifest, recorded no earlier than the stamp, and the stamp still
+ * covers the last turn) or `ttl` (recorded no earlier than the lease's own
+ * `expiresAt`). A `failed` receipt without a backstop never opens it.
+ */
+export function nativeWarmSessionStopReadySql(): SQL {
+  const metadata = leaseMetadataSql();
+  const stamp = sql`${metadata}->'nativeHarnessBackup'`;
+  const close = sql`${metadata}->${WARM_NATIVE_SESSION_CLOSE_KEY}`;
+  const backstop = sql`${close}->'backstop'`;
+  const checkpointAt = instantSql(sql`${stamp}->>'completedAt'`);
+  const closedAt = instantSql(sql`${close}->>'closedAt'`);
+  const backstopAt = instantSql(sql`${backstop}->>'at'`);
   return sql`(
-    coalesce(${metadata}#>>'{reusableSandboxLease,adapterType}', '') <> 'paperclip_runner'
-    or not (${metadata} ? ${WARM_SANDBOX_IDLE_TIMEOUT_KEY})
+    not ${nativeWarmSessionSql()}
     or coalesce((
       ${environmentLeases.providerLeaseId} is not null
       and ${environmentLeases.heartbeatRunId} is not null
-      and ${stamp}->>'schema' = 'paperclip.native-harness-backup-stamp.v2'
-      and ${stamp}->>'authorizedProviderLeaseId' = ${environmentLeases.providerLeaseId}
       and ${close}->>'schema' = ${WARM_NATIVE_SESSION_CLOSE_SCHEMA}
-      and ${close}->>'state' = 'closed'
       and ${close}->>'providerLeaseId' = ${environmentLeases.providerLeaseId}
       and ${close}->>'runId' = ${environmentLeases.heartbeatRunId}::text
-      and ${close}->>'normalizedSessionId' = ${stamp}->>'normalizedSessionId'
-      and ${close}->>'manifestSha256' = ${stamp}->>'manifestSha256'
-      and ${closedAt} >= ${checkpointAt}
-      and ${checkpointAt} >= ${lastFinishedTurn}
-      and not ${unfinishedTurn}
+      and not ${unfinishedTurnSql()}
+      and (
+        (${close}->>'state' = 'closed'
+          and ${close}->>'normalizedSessionId' = ${stamp}->>'normalizedSessionId'
+          and ${close}->>'manifestSha256' = ${stamp}->>'manifestSha256'
+          and ${closedAt} >= ${checkpointAt}
+          and ${nativeWarmCheckpointCoversLastTurnSql()})
+        or (${close}->>'state' = 'failed' and ${backstop}->>'kind' = 'checkpoint'
+          and ${backstop}->>'normalizedSessionId' = ${stamp}->>'normalizedSessionId'
+          and ${backstop}->>'manifestSha256' = ${stamp}->>'manifestSha256'
+          and ${backstopAt} >= ${checkpointAt}
+          and ${nativeWarmCheckpointCoversLastTurnSql()})
+        or (${close}->>'state' = 'failed' and ${backstop}->>'kind' = 'ttl'
+          and ${environmentLeases.expiresAt} is not null
+          and ${backstopAt} >= ${environmentLeases.expiresAt})
+      )
     ), false)
   )`;
 }

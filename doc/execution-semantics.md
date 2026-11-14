@@ -1643,6 +1643,20 @@ keeps the sandbox under a stop intent in `pending_cleanup` with a retry time; if
 it still waits after 30 minutes, it is warned about once. Sandboxes without a
 native warm session are not affected.
 
+The close receipt does not depend on one process's timer. Every confirmed close
+of a warm owner records it (the idle timer, a restart, sleep or environment
+close), and the environment cleanup sweep picks up any retained native warm
+sandbox whose window ended with no receipt: the process that holds its warm
+session closes it through the same close path; a busy agent directory is
+retried without counting; a released Runner, or one another run adopted, is
+never closed. If no process closes it within 10 minutes of the window ending, or
+the close fails 3 times, the close is recorded as failed with one warning, and
+the sandbox is stopped only if a checkpoint covering its last turn exists;
+otherwise it keeps running until the lease's own expiry, then is stopped. A
+stopped sandbox stays released, stopped and kept: no sweep re-acquires it, and
+only a new run's own acquisition (for example the next message on the task)
+resumes it.
+
 A remote runner also keeps working while its controller is offline, and the host
 reattaches it within the remote runner reconnect grace (7 minutes). Daytona counts
 only SDK and lifecycle calls as activity, so with no controller its idle auto-stop
