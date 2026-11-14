@@ -3,6 +3,8 @@ import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { agentTaskSessions, heartbeatRuns, issueComments, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { logger } from "../../middleware/logger.js";
+import { redactCurrentUserText } from "../../log-redaction.js";
+import { instanceSettingsService } from "../instance-settings.js";
 import { issueService } from "../issues.js";
 import { readPiConversation } from "./pi-conversation-record.js";
 
@@ -74,7 +76,10 @@ export async function writePiSessionHistoryLossNotice(db: Db,
   if (existing && writes.get(existing.id) === transaction!.id) {
     // Coalesce intermediate states before commit: no reader could have seen
     // this inserted row yet. Committed history still appends/supersedes below.
-    const changed = await tx.update(issueComments).set({ body, updatedAt: new Date() }).where(and(
+    const redactedBody = redactCurrentUserText(body, {
+      enabled: (await instanceSettingsService(db).getGeneral({ db: tx })).censorUsernameInLogs,
+    });
+    const changed = await tx.update(issueComments).set({ body: redactedBody, updatedAt: new Date() }).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
       eq(issueComments.id, existing.id), eq(issueComments.authorType, "system"),
       eq(issueComments.body, existing.body), isNull(issueComments.deletedAt),
