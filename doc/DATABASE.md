@@ -1192,16 +1192,25 @@ File preservation already takes task, run, workspace and lease locks in that
 order. Confirmed lease destruction locks matching workspaces before the lease;
 its workspace-location update takes no task or run lock afterward.
 
-Lease acquisition follows the same parent-first order: company `KEY SHARE`,
-task `UPDATE`, run `UPDATE`, workspace `UPDATE`, environment binding, then source
-lease `UPDATE`. A reusable handoff locks the union of the predecessor's and
-successor's parent IDs, sorted within each table; a shared workspace's previous
-task need not be the new task. Parent discovery does not lock the lease. The
-source lease's parent bindings are rechecked under its final lock, and a changed
-or missing binding aborts acquisition instead of locking another parent out of
-order. Sandbox creation attachment takes these parent locks before its outer run
-fence, not only inside the lease-acquisition savepoint. The environment binding
-keeps its existing lock strength and precedes the source lease lock.
+Lease acquisition follows this parent-first order: company `KEY SHARE`,
+environment fence, task `UPDATE`, run `UPDATE`, workspace `UPDATE`, then source
+lease `UPDATE`. The environment fence is `UPDATE` when asserting company binding
+or attaching sandbox creation, otherwise `KEY SHARE`. Take its final strength
+before the task/run/workspace locks, not an upgrade afterward. Orphan cleanup
+already holds environment `UPDATE` before inserting its lease; that insert's
+implicit task/run/workspace `KEY SHARE` checks must not meet an acquisition that
+holds those parents while waiting for the environment. The cleanup fence still
+serializes environment deletion and permits a null environment reference when
+deletion has already won.
+
+A reusable handoff locks the union of the predecessor's and successor's parent
+IDs, sorted within each table; a shared workspace's previous task need not be the
+new task. Parent discovery does not lock the lease. The source lease's parent
+bindings are rechecked under its final lock, and a changed or missing binding
+aborts acquisition instead of locking another parent out of order. Sandbox
+creation attachment takes the same environment-first parent locks before its
+outer run fence, not only inside the lease-acquisition savepoint. Company binding
+validation and the creation-operation fence still precede the source lease lock.
 
 Two updates of a lease in one transaction can make PostgreSQL recheck its
 unchanged foreign keys on the second update, including a metadata-only handoff

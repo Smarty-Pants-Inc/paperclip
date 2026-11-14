@@ -33,6 +33,14 @@ export async function lockEnvironmentLeaseAcquisitionParents(db: Db, scope: Acqu
   }
   const company = await db.select({ id: companies.id }).from(companies).where(eq(companies.id, scope.companyId)).for("key share");
   if (company.length !== 1) throw conflict("Sandbox acquisition company no longer exists.");
+  // Orphan cleanup holds the environment UPDATE fence before its insert's
+  // implicit task/run/workspace KEY SHARE checks. Fence the environment before
+  // those parents too, including the outer creation-attachment transaction.
+  // Binding assertions later need UPDATE: take that strength now, not a
+  // KEY SHARE lock that would have to be upgraded while holding the parents.
+  await db.select({ id: environments.id }).from(environments)
+    .where(inArray(environments.id, ids(scope.environmentId, previous?.environmentId))).orderBy(environments.id)
+    .for(scope.assertCompanyBinding ? "update" : "key share");
   const issueIds = ids(scope.issueId, previous?.issueId);
   if (issueIds.length) {
     const locked = await db.select({ id: issues.id }).from(issues).where(and(
@@ -53,10 +61,6 @@ export async function lockEnvironmentLeaseAcquisitionParents(db: Db, scope: Acqu
       eq(executionWorkspaces.companyId, scope.companyId), inArray(executionWorkspaces.id, workspaceIds),
     )).orderBy(executionWorkspaces.id).for("update");
     if (locked.length !== workspaceIds.length) throw conflict("Sandbox acquisition workspace ownership changed.");
-  }
-  if (!scope.assertCompanyBinding) {
-    await db.select({ id: environments.id }).from(environments)
-      .where(inArray(environments.id, ids(scope.environmentId, previous?.environmentId))).orderBy(environments.id).for("key share");
   }
   return previous;
 }
