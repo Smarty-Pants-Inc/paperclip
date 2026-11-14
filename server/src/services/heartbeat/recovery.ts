@@ -1770,6 +1770,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           opts?.explicitRetry ? eq(environmentLeases.heartbeatRunId, opts.explicitRetry.runId) : undefined,
           opts?.environmentRetry ? eq(environmentLeases.environmentId, opts.environmentRetry.environmentId) : undefined,
           pendingCleanupRetryDueSql(manualRetry),
+          // Receipt-less ended rows enter this SAME owner only after their
+          // resource GET. Their fresh-thread stop budget is finite; ordinary
+          // destructive cleanup keeps its existing slow-retry policy. Retry
+          // can re-arm the validated intent without discarding its evidence.
+          !manualRetry ? sql`not (coalesce(${environmentLeases.metadata}->'sandboxStopAndRetain' ? 'endedLeaseEvidence', false)
+            and ${pendingCleanupAttemptsSql()} >= ${PENDING_CLEANUP_SWEEP_ATTEMPT_CAP})` : undefined,
           backoffMs > 0 ? or(lte(environmentLeases.updatedAt, cutoff), recoveredOrphanFirstAttemptSql()) : undefined,
         ),
       )

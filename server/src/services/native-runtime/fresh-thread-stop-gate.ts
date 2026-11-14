@@ -1,7 +1,7 @@
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
-import { hasRemoteTerminationReceipt, remoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
-import { hasConfirmedSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, settleStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
+import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, remoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { hasConfirmedSandboxStopAndRetain, prepareInspectedSourceSandboxStop, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, settleStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 import { noLocalRunnerProcessesForRuns, proveRunProcessGone } from "../run-process-owner.js";
 import { writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
@@ -97,14 +97,19 @@ export async function inspectFreshThreadStopResources(db: Db, run: typeof heartb
     inArray(environmentLeases.heartbeatRunId, owners.map(owner => owner.id).concat(run.id))));
   for (const lease of leases) {
     if (!lease.provider || lease.provider === "local" || !lease.providerLeaseId
-      || lease.metadata?.remoteExecutionTermination != null || readStopOnlyCleanup(lease)
+      || hasBoundRemoteStopReceipt(lease) || readStopOnlyCleanup(lease)
       || lease.metadata?.pendingCleanupInFlight === true) continue;
     const [peer] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
       eq(environmentLeases.provider, lease.provider), eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
       sql`${environmentLeases.id} <> ${lease.id}`, inArray(environmentLeases.status, [...SANDBOX_ALLOCATION_HOLDER_STATUSES]))).limit(1);
     if (peer) continue;
     const observation = await inspectLeaseResource(lease.id).catch(() => undefined);
-    if (!remoteTerminationReceipt(lease, observation)) continue;
+    if (!remoteTerminationReceipt(lease, observation)) {
+      // The resource read came first. An ended row's status is not stop proof;
+      // the existing bounded stop owner keeps its historical evidence intact.
+      if (["released", "expired"].includes(lease.status)) await prepareInspectedSourceSandboxStop(db, lease);
+      continue;
+    }
     const prepared = ["released", "expired"].includes(lease.status) ? lease : await prepareUnconfirmedSourceSandboxStop(db, lease);
     if (prepared) await settleStopOnlyCleanup(db, prepared, { attemptId: String(prepared.metadata?.pendingCleanupAttemptId),
       receipt: observation, receiptSource: "provider_inspection" });
@@ -189,7 +194,14 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
     gone = false;
     // Even an inadmissible ended receipt is immutable evidence, not permission
     // to erase it and launch a new stop request.
-    if (["released", "expired"].includes(lease.status)) { unavailable = true; continue; }
+    if (["released", "expired"].includes(lease.status)) {
+      // Missing/unbound proof waits for the outside-lock provider read first.
+      // A bound but inadmissible receipt (for example bad-time) stays immutable
+      // and unavailable; never erase it to re-arm a stop.
+      if (hasBoundRemoteStopReceipt(lease)
+        || lease.metadata?.pluginId == null && !isBuiltinSandboxProvider(lease.provider!)) unavailable = true;
+      continue;
+    }
     // Persist the existing stop-only intent; cleanup's plugin release contract
     // supplies the independently bound stopped/destroyed receipt. A void
     // release, 'stopping', expired lease, or successful RPC is NOT evidence.

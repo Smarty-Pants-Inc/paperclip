@@ -10,7 +10,7 @@ import { hasNativeWorkspaceExportResume, readNativeWorkspaceExportResume, settle
 import type { SandboxAbsenceProof } from "./sandbox-absence-proof.js";
 
 type Lease = Pick<typeof environmentLeases.$inferSelect,
-  "id" | "companyId" | "heartbeatRunId" | "provider" | "providerLeaseId" | "metadata">;
+  "id" | "companyId" | "heartbeatRunId" | "provider" | "providerLeaseId" | "metadata" | "status">;
 export const SANDBOX_STOP_AND_RETAIN_KEY = "sandboxStopAndRetain";
 /** Top-level marker an ownership settle leaves on a lease whose sandbox it
  * stopped and kept. It outlives the stop intent, so the retained orphan can
@@ -198,6 +198,21 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
   return prepareStopAndRetain(db, lease, lease.status);
 }
 
+/** The exact provider GET has finished outside locks without positive stop
+ * proof. Cleanup can dispatch only from pending_cleanup: retain the complete
+ * ended-row evidence inside that SAME stop intent before changing its status.
+ * This is never called from the preparation gate or for an active turn. */
+export async function prepareInspectedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
+  if (!["released", "expired"].includes(lease.status)) return prepareUnconfirmedSourceSandboxStop(db, lease);
+  if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
+    || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease) || hasBoundRemoteStopReceipt(lease)) return null;
+  return prepareStopAndRetain(db, lease, lease.status, { endedLeaseEvidence: {
+    status: lease.status, cleanupStatus: lease.cleanupStatus, failureReason: lease.failureReason,
+    releasedAt: lease.releasedAt?.toISOString() ?? null, lastUsedAt: lease.lastUsedAt.toISOString(),
+    metadata: lease.metadata,
+  } });
+}
+
 /** A deliberate user Retry re-arms only the existing, validated stop owner.
  * It never changes allocation identity, resumes a provider, or clears proof.
  * In-flight cleanup and workspace-export recovery keep their own budgets. */
@@ -218,6 +233,9 @@ export async function retryUnconfirmedSourceSandboxStop(db: Db, lease: typeof en
 async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, recovery: Record<string, unknown> = {},
   retention?: { leasePolicy: string; metadata: Record<string, unknown> }) {
   const requestId = randomUUID(), now = new Date();
+  const preserveEndedEvidence = ["released", "expired"].includes(fromStatus) && recovery.endedLeaseEvidence !== undefined;
+  const priorMetadata = preserveEndedEvidence ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)`
+    : sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination' - 'sandboxStopAndRetainReceipt' - 'pendingCleanupController')`;
   const intent = { schema: "paperclip.sandbox-stop-and-retain.v1", requestId,
     companyId: lease.companyId, runId: lease.heartbeatRunId, leaseId: lease.id,
     provider: lease.provider, providerLeaseId: lease.providerLeaseId,
@@ -226,7 +244,7 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
   const [updated] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
     status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending", releasedAt: now, updatedAt: now,
     ...(retention ? { leasePolicy: retention.leasePolicy } : {}),
-    metadata: sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination' - 'sandboxStopAndRetainReceipt' - 'pendingCleanupController') || ${JSON.stringify({
+    metadata: sql`${priorMetadata} || ${JSON.stringify({
       [SANDBOX_STOP_AND_RETAIN_KEY]: intent, pendingCleanupAttemptId: requestId,
       ...(fromStatus === "active" && Object.keys(recovery).length
         ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, runId: lease.heartbeatRunId, recoveredAt: now.toISOString() } } : {}),
@@ -236,6 +254,9 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
     })}::jsonb`,
   }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
     eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!), eq(environmentLeases.status, fromStatus),
+    preserveEndedEvidence ? sql`not exists (select 1 from environment_leases peer where peer.id <> ${lease.id}
+      and peer.provider = ${lease.provider} and peer.provider_lease_id = ${lease.providerLeaseId}
+      and peer.status in ('active', 'retained', 'pending_cleanup'))` : undefined,
     sql`${environmentLeases.provider} is not distinct from ${lease.provider}`,
     sql`${environmentLeases.providerLeaseId} is not distinct from ${lease.providerLeaseId}`,
     sql`${environmentLeases.metadata} is not distinct from ${lease.metadata === null ? null : JSON.stringify(lease.metadata)}::jsonb`,
