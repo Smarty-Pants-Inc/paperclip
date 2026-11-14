@@ -1194,6 +1194,49 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       }
     },
   );
+
+  it.each(["fold", "inline"] as const)("shows %s reasoning in the live phase", async (display) => {
+    if (display === "inline") localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "inline");
+    const liveRun = {
+      id: "live-reasoning-run", runtimeMode, status: "running" as const, invocationSource: "issue" as const,
+      triggerDetail: null, startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null,
+      createdAt: "2026-08-25T18:00:00.000Z", agentId: "agent-1", agentName: "Assistant",
+      adapterType: runtimeMode === "native" ? "paperclip_runner" : "codex_local",
+    };
+    const state = runtimeMode === "native" ? nativeTranscriptState : transcriptState;
+    transcriptState.hydratedRunIds = new Set([liveRun.id]);
+    nativeTranscriptState.hydratedRunIds = new Set([liveRun.id]);
+    state.transcriptByRun.set(liveRun.id, [
+      { kind: "thinking", ts: "2026-08-25T18:00:01.000Z", itemId: "reasoning-1", text: "Finished live thought" },
+      { kind: "tool_call", ts: "2026-08-25T18:00:02.000Z", name: "Read", input: { path: "README.md" }, toolUseId: "read-1" },
+      { kind: "tool_result", ts: "2026-08-25T18:00:03.000Z", toolUseId: "read-1", content: "Private tool output" },
+      { kind: "thinking", ts: "2026-08-25T18:00:04.000Z", itemId: "reasoning-2", text: "Streaming live thought" },
+    ]);
+    render(<TaskChatThread issueId="issue-1" issueStatus="in_progress" comments={createLongThreadComments()}
+      onAdd={async () => {}} linkedRuns={[{ ...retryRun, runId: liveRun.id, status: "running", startedAt: liveRun.startedAt }]}
+      activeRun={liveRun} liveRuns={[liveRun]} />);
+    await settleThreadLayout();
+
+    const inlineBlocks = Array.from(container.querySelectorAll<HTMLElement>('[data-reasoning-display="inline"]'));
+    if (display === "fold") {
+      expect(inlineBlocks).toHaveLength(0);
+      return;
+    }
+    // Live phase, inline mode: each reasoning block is rendered as visible
+    // transcript content (not inside a collapsed fold), the newest one is
+    // still streaming, and the tool step between them stays folded.
+    expect(inlineBlocks.map((block) => [block.textContent, block.dataset.state])).toEqual([
+      ["Finished live thought", "settled-inline"],
+      ["Streaming live thought", "streaming-inline"],
+    ]);
+    for (const block of inlineBlocks) {
+      expect(block.closest('[data-expanded="false"], [hidden], [inert], .tc-turn-fold')).toBeNull();
+    }
+    const text = container.textContent!;
+    expect(text.indexOf("Finished live thought")).toBeLessThan(text.indexOf("Read files"));
+    expect(text.indexOf("Read files")).toBeLessThan(text.indexOf("Streaming live thought"));
+    expect(text).not.toContain("Private tool output");
+  });
 });
 
 it("preserves the typed disposition notice through the task-chat adapter", () => {
