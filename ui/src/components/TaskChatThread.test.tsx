@@ -34,6 +34,7 @@ import { isCurrentNotice } from "@paperclipai/shared";
 import { waitForStoppedRuns } from "@/lib/wait-for-stopped-runs";
 import rflHeldNoteRows from "@/fixtures/bprime-held-notes/rfl-faf2a201-ui-notice-rows.json";
 import lineHeldNoteRows from "@/fixtures/bprime-held-notes/line-cd45a050-ui-notice-rows.json";
+import rflM15HeldNoteRows from "@/fixtures/bprime-held-notes/rfl-29040953-ui-notice-rows.json";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -6323,6 +6324,25 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       expect(container.textContent).toContain("· Superseded");
     });
 
+    // Superseded-note row helpers (RFL M1.5 F1/F3).
+    const heldNoteComments = (rows: unknown) => (rows as Array<Record<string, unknown> & { id: string; metadata: unknown; createdAt: string; updatedAt: string }>)
+      .map(row => ({ ...row, createdAt: new Date(row.createdAt), updatedAt: new Date(row.updatedAt), deletedAt: null }));
+    const noticeToggle = (id: string) => anchor(id)?.querySelector<HTMLButtonElement>("button[aria-expanded]") ?? null;
+    const noticeDetails = (id: string) => anchor(id)?.querySelector('[data-testid="task-chat-system-notice-details"]') ?? null;
+    const labelledSuperseded = (id: string) => (noticeToggle(id)?.textContent ?? "").includes("· Superseded");
+    // RFL M1.5 F1: a chat (conversationMode, no expand control, as IssueDetail mounts it) has no other history,
+    // so there a superseded note stays in place as a collapsed "· Superseded" row instead of being dropped.
+    const expectOffLiveView = (id: string, text: string) => {
+      if (conversationMode) {
+        expect(anchor(id), "a chat keeps the kept note reachable").not.toBeNull();
+        expect(labelledSuperseded(id), "labelled superseded, not current").toBe(true);
+        expect(noticeDetails(id), "collapsed").toBeNull();
+        expect(container.textContent).not.toContain(text);
+      } else {
+        expect(anchor(id)).toBeNull();
+      }
+    };
+
     it("hides a notice marked only by supersededByInteractionId from live chat and retains its history row", () => {
       const notice = {
         ...bPrimeNoRunNotice(5),
@@ -6330,7 +6350,7 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       };
       const comments = [personMessage("person-message", "Please continue.", 0), notice];
       paint({ comments, linkedRuns: [], issueStatus: "in_progress", compactHistory: true });
-      expect(anchor("bprime-no-run-notice")).toBeNull();
+      expectOffLiveView("bprime-no-run-notice", BPRIME_NO_RUN);
       expect(comments).toContain(notice);
       expect(notice.deletedAt).toBeNull();
       expect(notice.metadata.supersededByInteractionId).toBe("new-interaction");
@@ -6343,7 +6363,7 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       };
       const comments = [personMessage("person-message", "Please continue.", 0), notice];
       paint({ comments, linkedRuns: [], issueStatus: "in_progress", compactHistory: true });
-      expect(anchor("bprime-no-run-notice")).toBeNull();
+      expectOffLiveView("bprime-no-run-notice", BPRIME_NO_RUN);
       expect(comments).toContain(notice);
       expect(notice.deletedAt).toBeNull();
       expect(notice.metadata.supersededBy).toBe("answer-comment");
@@ -6364,11 +6384,66 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
         const superseded = comments.find(comment => !isCurrentNotice(comment.metadata))!;
         const rendered = () => comments.filter(comment => anchor(comment.id) !== null).map(comment => comment.id);
         paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true });
-        expect(rendered(), "live view: exactly ONE held note, the current one").toEqual([current[0]!.id]);
+        if (conversationMode) {
+          // RFL M1.5 F1: in a chat the kept note stays as a collapsed "· Superseded" row; ONE note reads as current.
+          expect(rendered().filter(id => !labelledSuperseded(id)), "live view: exactly ONE held note reads as current").toEqual([current[0]!.id]);
+          expect(labelledSuperseded(superseded.id)).toBe(true);
+          expect(noticeDetails(superseded.id), "collapsed").toBeNull();
+        } else {
+          expect(rendered(), "live view: exactly ONE held note, the current one").toEqual([current[0]!.id]);
+        }
         paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: false });
         expect(rendered(), "expanded history: the kept superseded row is reachable").toContain(superseded.id);
         expect(rendered()).toContain(current[0]!.id);
       });
+
+    // RFL M1.5 F1 (13:01Z, score 15) and F3 (score 6), on actual PostgreSQL rows (2 kept notes, 1 current, identical text).
+    const heldNoteRowSets = [["RFL's faf2a201 rows", rflHeldNoteRows], ["this line's cd45a050 rows", lineHeldNoteRows],
+      ["RFL's 29040953 rows", rflM15HeldNoteRows]] as const;
+    for (const [name, rows] of heldNoteRowSets) {
+      // A chat with exactly the props the page passes: IssueDetail.tsx:2657-2660 gives a conversation
+      // compactHistory = !historyExpanded, onExpandHistory undefined and historyControl null, and
+      // useIssueHistoryWindow.ts:25 keeps historyExpanded false for every conversation. Nothing can expand it,
+      // so the kept note must stay in place as a collapsed "· Superseded" row, as Classic shows it.
+      it.skipIf(!conversationMode)(`F1 real page props (${name}): a chat keeps the superseded note reachable as a collapsed '· Superseded' row`, () => {
+        const comments = heldNoteComments(rows);
+        const current = comments.find(comment => isCurrentNotice(comment.metadata))!;
+        const superseded = comments.find(comment => !isCurrentNotice(comment.metadata))!;
+        paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true, onExpandHistory: undefined, historyControl: null });
+        expect(container.textContent, "no expand control in a chat").not.toContain("More messages");
+        expect(anchor(superseded.id), "the kept superseded note is reachable in the chat").not.toBeNull();
+        expect(labelledSuperseded(superseded.id), "it reads as superseded, not current").toBe(true);
+        expect(noticeToggle(superseded.id)!.getAttribute("aria-expanded"), "collapsed").toBe("false");
+        expect(noticeDetails(superseded.id), "details closed until opened").toBeNull();
+        expect(anchor(current.id)).not.toBeNull();
+        expect(labelledSuperseded(current.id), "the current note carries no Superseded label").toBe(false);
+        expect(comments.filter(comment => anchor(comment.id) !== null && !labelledSuperseded(comment.id)).map(comment => comment.id),
+          "exactly ONE note reads as current").toEqual([current.id]);
+        flushSync(() => noticeToggle(superseded.id)!.click());
+        expect(noticeDetails(superseded.id), "its text is one click away").not.toBeNull();
+        expect(comments).toHaveLength(2);
+      });
+
+      // The task view after "More messages": both kept notes show, and the old one must say it is superseded.
+      it.skipIf(conversationMode)(`F3 (${name}): after expanding task history the superseded row is labelled '· Superseded' and the current one is not`, () => {
+        const comments = heldNoteComments(rows);
+        const current = comments.find(comment => isCurrentNotice(comment.metadata))!;
+        const superseded = comments.find(comment => !isCurrentNotice(comment.metadata))!;
+        let expanded = false;
+        const repaint = () => paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: !expanded,
+          onExpandHistory: () => { expanded = true; repaint(); },
+          historyControl: expanded ? null : <button type="button" data-testid="f3-expand" onClick={() => { expanded = true; repaint(); }}>More messages</button> });
+        repaint();
+        expect(anchor(superseded.id), "live: the superseded note is off the task view until expanded").toBeNull();
+        flushSync(() => container.querySelector<HTMLButtonElement>('[data-testid="f3-expand"]')!.click());
+        expect(anchor(superseded.id)).not.toBeNull();
+        expect(anchor(current.id)).not.toBeNull();
+        expect(labelledSuperseded(superseded.id), "the superseded row is labelled").toBe(true);
+        expect(labelledSuperseded(current.id), "the current row is not").toBe(false);
+        expect(noticeToggle(superseded.id)!.textContent, "the two rows can be told apart").not.toBe(noticeToggle(current.id)!.textContent);
+        expect(noticeDetails(superseded.id), "collapsed").toBeNull();
+      });
+    }
 
     it("(b) hides the same comment when recoveryResponsibility is 'system' (upstream's filter kept)", () => {
       paint({ comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5, { recoveryResponsibility: "system" })],

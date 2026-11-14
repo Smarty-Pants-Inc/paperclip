@@ -1,0 +1,115 @@
+[
+  {
+    "id": "19ff89d6-d60d-4b06-8449-119adeb6ea0c",
+    "companyId": "2808d82a-c3e8-4e4f-8c43-4642ea039bd4",
+    "issueId": "5f6d3443-8916-4a0c-a1e4-b3c1d71a0fd2",
+    "authorType": "system",
+    "authorAgentId": null,
+    "authorUserId": null,
+    "body": "Coder can't continue this chat from its saved state. Start a new chat with Coder; this one stays readable.",
+    "presentation": {
+      "kind": "system_notice",
+      "tone": "warning",
+      "title": "This conversation can't continue",
+      "detailsDefaultOpen": false
+    },
+    "metadata": {
+      "version": 1,
+      "sections": [
+        {
+          "rows": [
+            {
+              "type": "key_value",
+              "label": "Recovery action",
+              "value": "fe4c993c-2ac5-403f-8def-65a819f1bdca"
+            },
+            {
+              "type": "key_value",
+              "label": "Recovery owner",
+              "value": "Waiting for you"
+            },
+            {
+              "type": "key_value",
+              "label": "Next action",
+              "value": "Start a new chat with Coder."
+            }
+          ],
+          "title": "Recovery"
+        },
+        {
+          "rows": [
+            {
+              "type": "key_value",
+              "label": "Failure code",
+              "value": "no_run"
+            }
+          ],
+          "title": "Run evidence"
+        }
+      ],
+      "sourceRunId": null,
+      "authorizationReason": "unanswered_message:50152060-8372-4dac-afee-2bf90062e52a",
+      "recoveryResponsibility": "user"
+    },
+    "createdAt": "2026-11-14T12:44:49.747Z",
+    "updatedAt": "2026-11-14T12:44:49.747Z",
+    "deletedAt": null
+  },
+  {
+    "id": "bfa8f51a-b052-4cb8-9535-34f633018b57",
+    "companyId": "2808d82a-c3e8-4e4f-8c43-4642ea039bd4",
+    "issueId": "5f6d3443-8916-4a0c-a1e4-b3c1d71a0fd2",
+    "authorType": "system",
+    "authorAgentId": null,
+    "authorUserId": null,
+    "body": "Coder can't continue this chat from its saved state. Start a new chat with Coder; this one stays readable.",
+    "presentation": {
+      "kind": "system_notice",
+      "tone": "warning",
+      "title": "This conversation can't continue",
+      "detailsDefaultOpen": false
+    },
+    "metadata": {
+      "version": 1,
+      "sections": [
+        {
+          "rows": [
+            {
+              "type": "key_value",
+              "label": "Recovery action",
+              "value": "fe4c993c-2ac5-403f-8def-65a819f1bdca"
+            },
+            {
+              "type": "key_value",
+              "label": "Recovery owner",
+              "value": "Waiting for you"
+            },
+            {
+              "type": "key_value",
+              "label": "Next action",
+              "value": "Start a new chat with Coder."
+            }
+          ],
+          "title": "Recovery"
+        },
+        {
+          "rows": [
+            {
+              "type": "key_value",
+              "label": "Failure code",
+              "value": "no_run"
+            }
+          ],
+          "title": "Run evidence"
+        }
+      ],
+      "sourceRunId": null,
+      "supersededBy": "19ff89d6-d60d-4b06-8449-119adeb6ea0c",
+      "authorizationReason": "unanswered_message:5b88e941-1ec6-404e-a785-529f606d8d4b",
+      "recoveryResponsibility": "user"
+    },
+    "createdAt": "2026-11-14T12:44:49.634Z",
+    "updatedAt": "2026-11-14T12:46:59.421Z",
+    "deletedAt": null
+  }
+]
