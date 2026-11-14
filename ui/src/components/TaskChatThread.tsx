@@ -2538,6 +2538,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ? runs.find((run) => run.id === tailRunId)
     : undefined;
   const paperclipRunnerTail = isNativePaperclipRunnerRun(tailRunSource);
+  // One resolved value for whichever renderer draws the live tail.
+  const tailReasoningDisplay = reasoningDisplayOverride ?? adapterReasoningDisplay(tailRunSource?.adapterType);
   const paperclipRunnerTailAwaitingContinuation = Boolean(
     paperclipRunnerTail &&
     (acceptedSemanticResultDisposition(
@@ -3544,6 +3546,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                   optimisticRunnerStartup ? (
                                     <TaskChatRunnerTurn
                                       showHeader={false}
+                                      reasoningDisplay={tailReasoningDisplay}
                                       runId={tailRunId}
                                       execution={
                                         liveRun?.id === tailRunId
@@ -3585,7 +3588,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       <McpAppTurnViews runId={tailRunId} refreshKey={mcpAppRunRefreshKey(tailItems, tailStatus)} />
                                       <TaskChatLiveTail
                                         items={tailItems}
-                                        reasoningDisplay={reasoningDisplayOverride ?? adapterReasoningDisplay(tailRunSource?.adapterType)}
+                                        reasoningDisplay={tailReasoningDisplay}
                                         emptyMessage={
                                           tailStatus === "queued"
                                             ? "Waiting to start..."

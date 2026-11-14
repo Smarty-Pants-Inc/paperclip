@@ -31,7 +31,7 @@ import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { waitForStoppedRuns } from "@/lib/wait-for-stopped-runs";
-import { findUIAdapter, registerUIAdapter, unregisterUIAdapter } from "@/adapters/registry";
+import { findUIAdapter, registerUIAdapter } from "@/adapters/registry";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -1196,86 +1196,151 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     },
   );
 
-  it.each([
-    { adapterDisplay: "inline", override: null, expected: 2 },
-    { adapterDisplay: "fold", override: null, expected: 0 },
-    { adapterDisplay: "inline", override: "fold", expected: 0 },
-    { adapterDisplay: "fold", override: "inline", expected: 2 },
-    { adapterDisplay: undefined, override: null, expected: 0 },
-  ] as const)("uses adapter default $adapterDisplay with override $override", async ({ adapterDisplay, override, expected }) => {
-    const original = findUIAdapter("codex_local")!;
-    const testAdapterType = `test_reasoning_${adapterDisplay ?? "unset"}`;
+  // Reasoning display precedence: the in-memory choice (even when saving it
+  // fails) > the saved device choice > the run adapter's
+  // transcriptPresentation.liveReasoningView > fold. Each case runs on this
+  // runtime's REAL renderer: native runs are `paperclip_runner` runs read from
+  // the native transcript store, so they render through TaskChatRunnerTurn.
+  const reasoningThoughts = ["First adapter thought", "Second adapter thought"];
+  function reasoningRun(adapterDisplay?: "inline" | "fold") {
+    const adapterType = runtimeMode === "native" ? "paperclip_runner" : "codex_local";
+    const original = findUIAdapter(adapterType)!;
     registerUIAdapter({
       ...original,
-      type: testAdapterType,
-      transcriptPresentation: adapterDisplay
-        ? { liveReasoningView: adapterDisplay }
-        : undefined,
+      transcriptPresentation: adapterDisplay ? { liveReasoningView: adapterDisplay } : undefined,
     });
+    const runId = "adapter-default-run";
+    const startedAt = "2026-08-25T18:00:00.000Z";
+    const liveRun = {
+      id: runId, runtimeMode, adapterType, status: "running" as const,
+      invocationSource: "issue" as const, triggerDetail: null, startedAt, finishedAt: null,
+      createdAt: startedAt, agentId: "agent-1", agentName: "Assistant",
+    };
+    transcriptState.hydratedRunIds = new Set([runId]);
+    nativeTranscriptState.hydratedRunIds = new Set([runId]);
+    (runtimeMode === "native" ? nativeTranscriptState : transcriptState).transcriptByRun.set(runId, [
+      { kind: "thinking", ts: "2026-08-25T18:00:01.000Z", itemId: "reasoning-1", text: reasoningThoughts[0] },
+      { kind: "tool_call", ts: "2026-08-25T18:00:02.000Z", name: "Read", input: { path: "README.md" }, toolUseId: "read-1" },
+      { kind: "tool_result", ts: "2026-08-25T18:00:03.000Z", toolUseId: "read-1", content: "Private tool output" },
+      { kind: "thinking", ts: "2026-08-25T18:00:04.000Z", itemId: "reasoning-2", text: reasoningThoughts[1] },
+    ]);
+    const comments = createLongThreadComments();
+    const answer = {
+      ...comments[3]!, id: "adapter-default-answer", authorType: "agent" as const,
+      authorAgentId: "agent-1", body: "Saved adapter reply", runId,
+      createdAt: new Date("2026-08-25T18:00:05.000Z"),
+    };
+    const linkedRun = { ...retryRun, adapterType, runId, status: "running", startedAt };
+    const live = {
+      issueId: "issue-1", issueStatus: "in_progress", onAdd: async () => {}, comments,
+      linkedRuns: [linkedRun], activeRun: liveRun, liveRuns: [liveRun],
+    };
+    const settled = {
+      ...live, comments: [...comments, answer], activeRun: undefined, liveRuns: [],
+      linkedRuns: [{ ...linkedRun, status: "succeeded", finishedAt: "2026-08-25T18:00:06.000Z" }],
+    };
+    return { live, settled, restore: () => registerUIAdapter(original) };
+  }
+  const inlineReasoning = () =>
+    Array.from(container.querySelectorAll<HTMLElement>('[data-reasoning-display="inline"]'));
+  const reasoningToggle = () =>
+    container.querySelector<HTMLButtonElement>('[data-testid="task-chat-reasoning-display-toggle"]')!;
+  function expectReasoning(display: "inline" | "fold") {
+    expect(reasoningToggle().textContent).toContain(display === "inline" ? "Inline" : "Folded");
+    if (display === "fold") {
+      expect(inlineReasoning()).toHaveLength(0);
+    } else {
+      expect(inlineReasoning().map((block) => block.textContent)).toEqual(reasoningThoughts);
+      for (const block of inlineReasoning()) {
+        expect(block.closest('[data-expanded="false"], [hidden], [inert], .tc-turn-fold')).toBeNull();
+      }
+    }
+    expect(container.textContent).not.toContain("Private tool output");
+  }
+  function chooseReasoningWithFailingSave() {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("storage denied");
+    });
+    flushSync(() => reasoningToggle().click());
+  }
+
+  it.each([
+    { adapterDisplay: "inline", override: null, expected: "inline" },
+    { adapterDisplay: "fold", override: null, expected: "fold" },
+    { adapterDisplay: "inline", override: "fold", expected: "fold" },
+    { adapterDisplay: "fold", override: "inline", expected: "inline" },
+    { adapterDisplay: undefined, override: null, expected: "fold" },
+  ] as const)("live run uses adapter default $adapterDisplay with saved choice $override", async ({ adapterDisplay, override, expected }) => {
+    if (override) localStorage.setItem("paperclip:task-chat:reasoning-display:v1", override);
+    const run = reasoningRun(adapterDisplay);
     try {
-      if (override) localStorage.setItem("paperclip:task-chat:reasoning-display:v1", override);
-      const liveRun = {
-        id: "adapter-default-run", runtimeMode: "legacy" as const, status: "running" as const,
-        invocationSource: "issue" as const, triggerDetail: null,
-        startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null,
-        createdAt: "2026-08-25T18:00:00.000Z", agentId: "agent-1", agentName: "Assistant",
-        adapterType: testAdapterType,
-      };
-      transcriptState.hydratedRunIds = new Set([liveRun.id]);
-      transcriptState.transcriptByRun.set(liveRun.id, [
-        { kind: "thinking", ts: "2026-08-25T18:00:01.000Z", itemId: "reasoning-1", text: "First adapter thought" },
-        { kind: "tool_call", ts: "2026-08-25T18:00:02.000Z", name: "Read", input: { path: "README.md" }, toolUseId: "read-1" },
-        { kind: "tool_result", ts: "2026-08-25T18:00:03.000Z", toolUseId: "read-1", content: "Private tool output" },
-        { kind: "thinking", ts: "2026-08-25T18:00:04.000Z", itemId: "reasoning-2", text: "Second adapter thought" },
-      ]);
-      render(<TaskChatThread issueId="issue-1" issueStatus="in_progress" comments={createLongThreadComments()}
-        onAdd={async () => {}} linkedRuns={[{ ...retryRun, runtimeMode: "legacy", adapterType: testAdapterType,
-          runId: liveRun.id, status: "running", startedAt: liveRun.startedAt }]}
-        activeRun={liveRun} liveRuns={[liveRun]} />);
+      render(<TaskChatThread {...run.live} />);
       await settleThreadLayout();
-      expect(container.querySelectorAll('[data-reasoning-display="inline"]')).toHaveLength(expected);
-      expect(container.textContent).not.toContain("Private tool output");
-      const mode = override ?? (expected > 0 ? "inline" : "fold");
-      expect(container.querySelector('[data-testid="task-chat-reasoning-display-toggle"]')?.textContent).toContain(
-        mode === "inline" ? "Inline" : "Folded",
-      );
+      expect(container.querySelector(
+        runtimeMode === "native" ? '[data-testid="task-chat-runner-turn"]' : '[data-testid="task-chat-live-transcript"]',
+      )).not.toBeNull();
+      expectReasoning(expected);
     } finally {
-      unregisterUIAdapter(testAdapterType);
+      run.restore();
     }
   });
 
-  it("applies the adapter's inline default to settled turns without a device preference", async () => {
-    const original = findUIAdapter("codex_local")!;
-    const adapterType = "custom_plugin";
-    const previous = findUIAdapter(adapterType);
-    registerUIAdapter({ ...original, type: adapterType, transcriptPresentation: { liveReasoningView: "inline" } });
+  it("applies the adapter's inline default live, after settle and after a cold remount", async () => {
+    const run = reasoningRun("inline");
     try {
-      const runId = "settled-adapter-default";
-      transcriptState.hydratedRunIds = new Set([runId]);
-      nativeTranscriptState.hydratedRunIds = new Set([runId]);
-      transcriptState.transcriptByRun.set(runId, [
-        { kind: "thinking", ts: "2026-08-25T18:00:01.000Z", text: "Settled adapter thought one" },
-        { kind: "tool_call", ts: "2026-08-25T18:00:02.000Z", name: "Read", input: { path: "README.md" }, toolUseId: "read-1" },
-        { kind: "tool_result", ts: "2026-08-25T18:00:03.000Z", toolUseId: "read-1", content: "Private tool output" },
-        { kind: "thinking", ts: "2026-08-25T18:00:04.000Z", text: "Settled adapter thought two" },
-      ]);
-      const comments = createLongThreadComments();
-      const answer = {
-        ...comments[3]!, id: "settled-adapter-answer", authorType: "agent" as const,
-        authorAgentId: "agent-1", body: "Saved adapter reply", runId,
-        createdAt: new Date("2026-08-25T18:00:05.000Z"),
-      };
-      render(<TaskChatThread issueId="issue-1" issueStatus="in_progress" comments={[...comments, answer]}
-        onAdd={async () => {}} linkedRuns={[{ ...retryRun, runtimeMode: "legacy", adapterType, runId,
-          status: "succeeded", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:06.000Z" }]} />);
+      render(<TaskChatThread {...run.live} />);
       await settleThreadLayout();
-      expect(container.querySelectorAll('[data-reasoning-display="inline"]')).toHaveLength(2);
+      expectReasoning("inline");
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("inline");
       expect(container.querySelector(".tc-turn-fold")).toBeNull();
       expect(container.textContent).toContain("Saved adapter reply");
-      expect(container.textContent).not.toContain("Private tool output");
+      flushSync(() => root!.unmount());
+      root = createRoot(container);
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("inline");
+      expect(container.textContent).toContain("Saved adapter reply");
     } finally {
-      unregisterUIAdapter(adapterType);
-      if (previous) registerUIAdapter(previous);
+      run.restore();
+    }
+  });
+
+  it("folds reasoning live and after settle when Folded is chosen and saving it fails", async () => {
+    localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "inline");
+    const run = reasoningRun("inline");
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      expectReasoning("inline");
+      chooseReasoningWithFailingSave();
+      expect(localStorage.getItem("paperclip:task-chat:reasoning-display:v1")).toBe("inline");
+      expectReasoning("fold");
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("fold");
+      expect(container.textContent).toContain("Saved adapter reply");
+    } finally {
+      run.restore();
+    }
+  });
+
+  it("shows reasoning live and after settle when Inline is chosen and saving it fails", async () => {
+    const run = reasoningRun();
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      expectReasoning("fold");
+      chooseReasoningWithFailingSave();
+      expect(localStorage.getItem("paperclip:task-chat:reasoning-display:v1")).toBeNull();
+      expectReasoning("inline");
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("inline");
+      expect(container.textContent).toContain("Saved adapter reply");
+    } finally {
+      run.restore();
     }
   });
 
