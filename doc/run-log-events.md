@@ -776,7 +776,10 @@ exception. It has no outcome field and does not by itself prove restore success.
 Its producer is the native workspace sync `onPhase` callback.
 
 `task.run.measured` is emitted only after the controller observes a terminal run
-with no remaining native runner ownership. Its duration starts at `startedAt`,
+with no remaining native runner ownership. For legacy execution, its observed
+controller boot must still match the executor's boot. A living owner that resumes
+after lease revocation cannot append this event to the reaped run.
+Its duration starts at `startedAt`,
 or `createdAt` if the run never started, and includes preparation, execution,
 finalization, and cleanup. It is not model-only time; the creation-time fallback
 also includes time spent queued. `outcome` is the actual terminal status, such as

@@ -2135,7 +2135,7 @@ function createHeartbeatService(
       return;
     }
     activeRunExecutions.add(run.id);
-    const timePreparation = createHeartbeatPreparationTiming(run.id);
+    const measurePreparation = createHeartbeatPreparationTiming(run.id);
     const executionControl = createAdapterExecutionControl();
     endStorageOutageWaitOn(executionControl.controller.signal);
     reportStorageOutageWaitsTo(createStorageWaitNotice({ run, appendRunEvent }));
@@ -2144,6 +2144,13 @@ function createHeartbeatService(
     executionControl.phases.enter("host_execution");
     const executionPhaseContext = { onExecutionPhase: executionControl.phases.enter };
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    const timePreparation: ReturnType<typeof createHeartbeatPreparationTiming> = (phase, work) =>
+      measurePreparation(phase, async () => {
+        await controllerLease.assertOwned();
+        const result = await work();
+        await controllerLease.assertOwned();
+        return result;
+      });
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
@@ -4146,7 +4153,9 @@ function createHeartbeatService(
           await writeExecutionControl(db, DELIVERY_QUEUES.executionFinalization, tx => tx
             .update(heartbeatRuns)
             .set({ executionControlDeadlineAt: null })
-            .where(eq(heartbeatRuns.id, run.id)), { companyId: run.companyId });
+            .where(and(eq(heartbeatRuns.id, run.id),
+              or(eq(heartbeatRuns.runtimeMode, "native"),
+                eq(heartbeatRuns.controllerBootId, legacyControllerBootId)))), { companyId: run.companyId });
         }
         nativeOwnershipHeld =
           nativeOwnershipHeld ||
@@ -4371,7 +4380,8 @@ function createHeartbeatService(
           inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"])));
 
         latestRun = await getRun(run.id).catch(() => null);
-        if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status) && !isNativeRunnerOwnershipHeld(latestRun)) {
+        if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status) && !isNativeRunnerOwnershipHeld(latestRun)
+            && (latestRun.runtimeMode !== "legacy" || latestRun.controllerBootId === run.controllerBootId)) {
           await appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info", message: "task.run.measured",
             payload: { phase: "task.run.measured", durationMs: Date.now() - (latestRun.startedAt ?? latestRun.createdAt).getTime(),
               outcome: latestRun.status, durableSettlement: true } }).catch(error => logger.warn({ runId: run.id, error }, "Could not record terminal run duration"));

@@ -2396,6 +2396,15 @@ renewal/revocation and the committed stage fence prevent concurrent dispatch.
 Dispatched adapters and recorded provider processes retain their existing safety
 checks. A provably gone controller can still be recovered immediately.
 
+Lease expiry is not proof that its process exited. A live controller can block
+its event loop past the lease and resume after the sweep revoked its boot. Each
+preparation phase checks the existing controller boot/lease CAS before and after
+its awaited work, rather than trusting a deadline callback that may not have run
+yet. A refused check stops preparation before the next phase can publish identity,
+claim, progress or provider work. Terminal deadline clearing and duration events
+also require the observed legacy boot, so a resumed executor cannot mutate or
+append to the reaped run during teardown.
+
 When preparation actually fails before dispatch, completion runs on a fresh
 pool rather than the failed request connection. It makes at most three logged
 settlement attempts, with 2-second connection/statement timeouts and a 1-second
