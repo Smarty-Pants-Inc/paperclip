@@ -18,7 +18,6 @@ export function nativeHarnessBackupCounters(): Readonly<typeof counters> {
 // best-effort scrub of arbitrary provider/storage/transcript content.
 export function nativeHarnessBackupErrorFields(error: unknown): {
   errorCode: "permission_denied" | "not_found" | "io_error" | "timeout" | "unknown";
-  errorClass?: string;
 } {
   const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
   switch (code) {
@@ -26,12 +25,7 @@ export function nativeHarnessBackupErrorFields(error: unknown): {
     case "ENOENT": return { errorCode: "not_found" };
     case "EIO": return { errorCode: "io_error" };
     case "ETIMEDOUT": return { errorCode: "timeout" };
-    default: {
-      // Error.name is caller-controlled; only the constructor identifies a class.
-      const name: unknown = error instanceof Error ? Object.getPrototypeOf(error)?.constructor?.name : undefined;
-      return { errorCode: "unknown", ...(typeof name === "string" && /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/.test(name)
-        ? { errorClass: name } : {}) };
-    }
+    default: return { errorCode: "unknown" };
   }
 }
 
@@ -56,13 +50,16 @@ export function reportNativeHarnessBackupCapture(input: {
     : "Native harness backup capture failed");
 }
 
+export function noteNativeHarnessBackupStalePendingObserved(): void {
+  counters.harnessBackupStalePendingObserved++;
+}
+
 export function reportNativeHarnessBackupStalePending(input: {
   scopeDigest: string;
   pendingRoot: string;
   ageMs: number;
   hasCurrent: boolean;
 }) {
-  counters.harnessBackupStalePendingObserved++;
   logger.warn({ scopeDigest: input.scopeDigest, pendingRoot: input.pendingRoot, ageMs: input.ageMs,
     hasCurrent: input.hasCurrent, reason: "stale_pending_backup",
     operatorAction: input.hasCurrent ? "inspect_pending_backup" : "no_current_backup_operator_recovery_required",

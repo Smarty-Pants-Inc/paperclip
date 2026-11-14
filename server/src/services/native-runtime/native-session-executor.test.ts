@@ -3526,7 +3526,8 @@ describe("remote provider pack manifest", () => {
               "transcript-marker-sentinel", "stderr-secret-sentinel", "untrusted-code-sentinel"]) {
               expect(logged).not.toContain(sentinel);
             }
-            expect(captureWarnings.at(-1)?.[0]).toMatchObject({ errorCode: "unknown", errorClass: "Error" });
+            expect(captureWarnings.at(-1)?.[0]).toMatchObject({ errorCode: "unknown" });
+            expect(captureWarnings.at(-1)?.[0]).not.toHaveProperty("errorClass");
             expect(captureWarnings.at(-1)?.[0]).not.toHaveProperty("detail");
             // Creation, not just successful publication, wakes stale discovery.
             expect(pendingChanged).toHaveBeenCalledWith({ companyId: remoteExecution.binding.companyId,

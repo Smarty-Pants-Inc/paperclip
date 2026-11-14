@@ -1,6 +1,6 @@
 import { readNativeCheckpointRetirement, nativeCheckpointRetirement, MAX_NATIVE_CHECKPOINT_RETIREMENT_RUNS } from "./native-runner-checkpoint-retirement.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { and, asc, eq, gt, gte, inArray, isNull, lt, or, sql } from "drizzle-orm";
@@ -28,7 +28,7 @@ import type { StorageService } from "../../storage/types.js";
 import { releaseExpiredNativeProviderArtifactRun } from "./native-provider-artifacts.js";
 import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
 import { nativeSetupScopeDigest } from "./native-setup-evidence.js";
-import { nativeHarnessBackupErrorFields, reportNativeHarnessBackupStalePending } from "./native-harness-backup-observability.js";
+import { nativeHarnessBackupErrorFields, noteNativeHarnessBackupStalePendingObserved, reportNativeHarnessBackupStalePending } from "./native-harness-backup-observability.js";
 
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS = 60 * 60 * 1000;
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS = 2 * 60 * 1000;
@@ -45,6 +45,7 @@ const QUARANTINE_CLEANUP_PATTERN = /^[0-9a-f]{64}\.identity_indeterminate\.clean
 const EXPIRED_PREFIX = ".expired-";
 const RETIRING_PREFIX = ".retiring-";
 const PENDING_STALE_AFTER_MS = 2 * 60 * 60 * 1000;
+const PENDING_WARNING_INTERVAL_MS = NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS;
 const LIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"];
 const SETTLED_FINALIZATION_PHASES = ["committed", "terminal_failure"];
 const LIVE_LEASE_STATUSES = ["active", "released", "retained", "pending_cleanup"];
@@ -470,6 +471,36 @@ export function nativeHarnessBackupExpirationService(
 
   const canReportPending = (signal?: AbortSignal) => !signal?.aborted && (defaults.shouldContinue?.() ?? true);
 
+  const lastWarnedAt = new Map<string, number>();
+  async function warnStalePendingOnce(scopeDigest: string, pendingRoot: string,
+    ageMs: number, hasCurrent: boolean, now: number): Promise<void> {
+    const markerRoot = path.join(path.resolve(defaults.stateBase ?? nativeHarnessStateBase()), ".pending-warning-state");
+    await fs.mkdir(markerRoot, { recursive: true });
+    const key = createHash("sha256").update(pendingRoot).digest("hex");
+    const marker = path.join(markerRoot, key);
+    const lock = `${marker}.lock`;
+    let acquired = false;
+    for (let attempt = 0; attempt < 100 && !acquired; attempt++) {
+      try { const handle = await fs.open(lock, "wx"); await handle.close(); acquired = true; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const lockStat = await fs.stat(lock).catch(missingPath);
+        if (!lockStat || now - lockStat.mtimeMs > 30_000) await fs.unlink(lock).catch(() => undefined);
+        else await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+    if (!acquired) return;
+    try {
+      const markerStat = await fs.stat(marker).catch(missingPath);
+      const last = Math.max(lastWarnedAt.get(pendingRoot) ?? 0, markerStat?.mtimeMs ?? 0);
+      if (now - last < PENDING_WARNING_INTERVAL_MS) return;
+      const handle = await fs.open(marker, "a"); await handle.close();
+      await fs.utimes(marker, new Date(now), new Date(now));
+      lastWarnedAt.set(pendingRoot, now);
+      reportNativeHarnessBackupStalePending({ scopeDigest, pendingRoot, ageMs, hasCurrent });
+    } finally { await fs.unlink(lock).catch(() => undefined); }
+  }
+
   async function reportStalePending(backupRoot: string, scopeDigest: string, now: number, canContinue = () => true): Promise<number | null> {
     // The read-only monitor supplies cancellation. Expiration callers already
     // own their budget/admission checks; do not consume their predicate here.
@@ -491,12 +522,13 @@ export function nativeHarnessBackupExpirationService(
         : Math.ceil(stat.mtimeMs + PENDING_STALE_AFTER_MS + 1);
       next = next === null ? dueAt : Math.min(next, dueAt);
       if (ageMs <= PENDING_STALE_AFTER_MS) continue;
-      reportNativeHarnessBackupStalePending({ scopeDigest, pendingRoot, ageMs, hasCurrent });
+      noteNativeHarnessBackupStalePendingObserved();
+      await warnStalePendingOnce(scopeDigest, pendingRoot, ageMs, hasCurrent, now);
     }
     return next;
   }
 
-  async function reportStalePendingBackups(signal?: AbortSignal): Promise<number | null> {
+  async function reportStalePendingBackups(signal?: AbortSignal): Promise<{ next: number | null; complete: boolean }> {
     const base = path.resolve(defaults.stateBase ?? nativeHarnessStateBase());
     let after: string | undefined;
     let next: number | null = null;
@@ -507,39 +539,42 @@ export function nativeHarnessBackupExpirationService(
     while (canReportPending(signal)) {
       const page = await backupScopes(after, 100);
       for (const scopeDigest of page.names) {
-        if (!canReportPending(signal)) return next;
+        if (!canReportPending(signal)) return { next, complete: false };
         const scopeRoot = path.join(base, scopeDigest);
         if (!(await isRealDirectory(scopeRoot))) continue;
         await report(path.join(scopeRoot, "failover-backups"), scopeDigest);
-        if (!canReportPending(signal)) return next;
+        if (!canReportPending(signal)) return { next, complete: false };
         const continuityRoot = path.join(scopeRoot, "continuity-breaks");
         if (!(await isRealDirectory(continuityRoot))) continue;
-        if (!canReportPending(signal)) return next;
+        if (!canReportPending(signal)) return { next, complete: false };
         for (const archive of (await fs.readdir(continuityRoot).catch(missingPath)) ?? []) {
-          if (!canReportPending(signal)) return next;
+          if (!canReportPending(signal)) return { next, complete: false };
           const archiveRoot = path.join(continuityRoot, archive);
           if (await isRealDirectory(archiveRoot)) {
             await report(path.join(archiveRoot, "failover-backups"), scopeDigest);
           }
         }
       }
-      if (page.complete) return next;
+      if (page.complete) return { next, complete: true };
       after = page.names.at(-1);
     }
-    return next;
+    return { next, complete: false };
   }
 
   function registerStalePendingScan(coordinator: ReturnType<typeof createDeliveryWorkCoordinator>) {
     let next: number | null = null;
+    let unfinishedDiscovery = false;
     const worker = coordinator.register(DELIVERY_QUEUES.nativeHarnessBackupStalePending, {
       retryMs: NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS,
       pausePassiveMaintenance: true,
       run: async signal => {
         if (!canReportPending(signal)) return;
+        unfinishedDiscovery = true;
         try {
-          const dueAt = await reportStalePendingBackups(signal);
-          // Drain or stop does not consume a partially inspected obligation.
-          if (canReportPending(signal)) next = dueAt;
+          const scan = await reportStalePendingBackups(signal);
+          // Only a fully completed pass discharges the startup/discovery obligation.
+          if (scan.complete) unfinishedDiscovery = false;
+          next = scan.complete ? scan.next : Date.now() + NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS;
         } catch (error) {
           if (!canReportPending(signal)) return;
           logger.warn({ reason: "stale_pending_scan_failed", ...nativeHarnessBackupErrorFields(error) },
@@ -547,7 +582,7 @@ export function nativeHarnessBackupExpirationService(
           next = Date.now() + NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS;
         }
       },
-      hasPending: async () => !canReportPending(),
+      hasPending: async () => unfinishedDiscovery || !canReportPending(),
       nextRunAt: () => next,
       onStop: () => unsubscribe(),
     });

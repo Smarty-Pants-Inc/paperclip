@@ -6,7 +6,7 @@ import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
 import { captureRemoteNativeProviderArtifacts, shareNativeProviderArtifactCapture } from "./native-provider-artifact-capture.js";
 import { NativeSessionDiagnostics, nativeSessionDiagnostics, type NativeDiagnosticLease } from "./native-session-diagnostics.js";
-import { reportNativeHarnessBackupCapture } from "./native-harness-backup-observability.js";
+import { nativeHarnessBackupErrorFields, reportNativeHarnessBackupCapture } from "./native-harness-backup-observability.js";
 import { recordAgentProviderRateLimits } from "../agent-provider-rate-limits.js";
 import { nativePostResultFailureCategory, type NativePostResultFailureCategory } from "./native-post-result-failure.js";
 import { logger } from "../../middleware/logger.js";
@@ -19142,15 +19142,8 @@ async function createRunnerdBackendWithinSessionClaim(
         { parentName: "task.settle" },
       );
     } catch (error) {
-      const detail = redactSensitiveText(
-        error instanceof Error ? error.message : String(error),
-      )
-        .replace(/[\r\n]+/g, " ")
-        .slice(0, 512);
-      await input.onLog?.(
-        "stderr",
-        `[paperclip-runner] remote checkpoint failed: ${detail || "unknown failure"}\n`,
-      );
+      const { errorCode } = nativeHarnessBackupErrorFields(error);
+      await input.onLog?.("stderr", `[paperclip-runner] remote checkpoint failed: ${errorCode}\n`);
       throw error;
     }
     return true;

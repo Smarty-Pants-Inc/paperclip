@@ -17,9 +17,18 @@ describe("closed native backup warning fields", () => {
     const error = Object.assign(new StorageFailure(privateText), { code, name: privateText, stderr: privateText });
     reportNativeHarnessBackupCapture({ ...identity, outcome: "failed", reason: "capture_failed", error });
     const fields = vi.mocked(logger.warn).mock.calls.at(-1)?.[0];
-    expect(fields).toEqual({ ...identity, outcome: "failed", reason: "capture_failed", errorCode: expected,
-      ...(expected === "unknown" ? { errorClass: "StorageFailure" } : {}) });
+    expect(fields).toEqual({ ...identity, outcome: "failed", reason: "capture_failed", errorCode: expected });
     expect(JSON.stringify(fields)).not.toContain("sentinel");
+  });
+
+  it("never exposes a secret-derived Error constructor name", () => {
+    const secretName = "ConstructorSentinel9284";
+    const SecretError = ({ [secretName]: class extends Error {} })[secretName];
+    reportNativeHarnessBackupCapture({ ...identity, outcome: "failed", reason: "capture_failed",
+      error: new SecretError("synthetic") });
+    const fields = vi.mocked(logger.warn).mock.calls.at(-1)?.[0];
+    expect(fields).toEqual({ ...identity, outcome: "failed", reason: "capture_failed", errorCode: "unknown" });
+    expect(JSON.stringify(fields)).not.toContain(secretName);
   });
 
   it("uses unknown for non-Error throws without stringifying their contents", () => {
