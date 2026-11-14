@@ -19,9 +19,12 @@ export const FRESH_THREAD_TURN_NOTE = "Your message is saved; the current step m
 /** Only the typed instruction/skill refresh may claim the change took effect.
  * Environment loss and launch mismatch retain the generic truthful notice. */
 export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof heartbeatRuns.$inferSelect): Promise<string> {
-  const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown } | undefined;
+  const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown; prepareRefusalCode?: unknown } | undefined;
   const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
-  if (code !== "native_runner_refresh_required") return FRESH_THREAD_STARTED_NOTE;
+  // A generic/no-code run.prepare envelope is normalized to
+  // provider_prepare_refused. Only the typed refresh path (which has no
+  // generic prepare refusal) may claim that an instruction/skill change landed.
+  if (code !== "native_runner_refresh_required" || refusal?.prepareRefusalCode != null) return FRESH_THREAD_STARTED_NOTE;
   const [agent] = await db.select({ name: agents.name }).from(agents).where(and(
     eq(agents.companyId, run.companyId), eq(agents.id, run.agentId))).limit(1);
   return `your skill change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
@@ -160,13 +163,20 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
     const requested = !waitingTurn ? await effects?.requestStop(lease) : undefined;
     if (exhausted && (!retryStop || !requested)) unavailable = true;
   }
-  // Remote execution has its allocation-bound proof above; process stamps for
-  // owners with no remote allocation cannot be skipped just because a local
-  // lease row exists (or belongs to an earlier stranded attempt).
+  // Classify from durable execution evidence before consulting this host's
+  // process table. A persisted remote target with a missing/mismatched lease is
+  // still unproven; controller-local absence says nothing about that allocation.
   const unidentifiedLocalOwners: string[] = [];
   for (const owner of owners) {
+    const remoteWorkspace = owner.runnerProfileJson?.remoteWorkspace as Record<string, unknown> | undefined;
+    const remoteProviderLeaseId = typeof remoteWorkspace?.providerLeaseId === "string"
+      ? remoteWorkspace.providerLeaseId : null;
+    const hasRemoteProfile = remoteWorkspace?.schema === "paperclip.remote-workspace-run.v1"
+      && remoteProviderLeaseId !== null;
     const hasRemoteAllocation = leases.some(lease => lease.heartbeatRunId === owner.id
-      && lease.provider && lease.provider !== "local" && lease.providerLeaseId);
+      && lease.provider && lease.provider !== "local" && lease.providerLeaseId
+      && (!remoteProviderLeaseId || lease.providerLeaseId === remoteProviderLeaseId));
+    if (hasRemoteProfile && !hasRemoteAllocation) { gone = false; unavailable = true; continue; }
     if (hasRemoteAllocation) continue;
     if (owner.processPid !== null || owner.processGroupId !== null) {
       const proof = await proveRunProcessGone(owner, owner.id);
