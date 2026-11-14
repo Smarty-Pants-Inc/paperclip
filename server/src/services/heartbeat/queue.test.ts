@@ -1193,6 +1193,30 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     return { ...fixtureRows, deps };
   }
 
+  it.each([false, true])("judge F4-coalesce: repeated system recovery wakes remain one execution wait (carried=%s)", async carried => {
+    const { company, agent, issue, deps } = await admissionBudgetBlock({ openIncident: false });
+    deps.instanceSettings.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false } as Awaited<ReturnType<typeof deps.instanceSettings.getExperimental>>);
+    const [message] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id,
+      authorType: "user", authorUserId: "queue-test-user", body: "Pending carried input" }).returning();
+    const before = await db.select().from(agentWakeupRequests);
+    const queue = createHeartbeatQueue(db, deps);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await expect(queue.enqueueWakeup(agent.id, { source: "automation", triggerDetail: "system",
+        reason: "issue_continuation_needed", requestedByActorType: "system", requestedByActorId: "heartbeat",
+        payload: { issueId: issue.id }, contextSnapshot: { issueId: issue.id, taskId: issue.id,
+          ...(carried ? { commentContinuation: true, wakeCommentId: message.id, commentId: message.id,
+            wakeCommentIds: [message.id] } : {}) } })).rejects.toThrow("budget");
+    }
+    const added = (await db.select().from(agentWakeupRequests)).filter(row => !before.some(old => old.id === row.id));
+    const observation = JSON.stringify({ carried, rows: added.map(row => ({ status: row.status,
+      reason: row.reason, coalescedCount: row.coalescedCount, wait: row.payload?.executionWait })) });
+    console.log("JUDGE-F4-COALESCE", observation);
+    (await import("node:fs")).appendFileSync(process.env.JUDGE_OUT ?? "/dev/null", `JUDGE-F4-COALESCE ${observation}\n`);
+    expect(added).toHaveLength(1);
+    expect(added[0].coalescedCount).toBe(2);
+    expect(deps.executeRun).not.toHaveBeenCalled();
+  });
+
   it("leaves a queued run queued when a resume closed its budget incident first", async () => {
     // Raise budget and resume closed the incident between the admission
     // check and the cancel: the re-read finds no block, so the task runs.

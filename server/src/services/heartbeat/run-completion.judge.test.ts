@@ -325,21 +325,6 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(mineOf(replies, run.id)).toEqual(["An answer from a continuation whose context predates the carry."]);
   });
 
-  it("judge J3: the pending comment is answered by ANOTHER run meanwhile -> no duplicate answer; the model output stays in the run record", async () => {
-    const f = await commentContinuationFixture();
-    const run = await f.start();
-    const [other] = await db.insert(heartbeatRuns).values({ companyId: f.run.companyId, agentId: f.agent.id, status: "succeeded",
-      contextSnapshot: { issueId: f.issue.id, wakeCommentId: f.message!.id } }).returning();
-    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: f.issue.id, authorType: "agent",
-      authorAgentId: f.agent.id, createdByRunId: other.id, body: "Your new recall word is COBALT." });
-    const replies = await f.finish("Your new recall word is COBALT (duplicate).");
-    const trace = await traceOf(run.id);
-    const note = await settleUnansweredPersonMessage(db, { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) });
-    judgeLog("JUDGE-J3", JSON.stringify({ published: mineOf(replies, run.id), trace, bPrime: note.kind }));
-    expect(mineOf(replies, run.id)).toEqual([]);
-    expect(trace.finalResponse).toBe("Your new recall word is COBALT (duplicate).");
-  });
-
   it("judge J4: suppressed and the person STILL waits (old-context continuation, message unanswered) -> the B' note is still raised", async () => {
     const f = await commentContinuationFixture();
     const run = await f.start();
@@ -367,7 +352,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(outcome.kind).toBe("answered");
   });
 
-  it("judge J6 (two creators): two continuations of one parent both carry the id; only the first publishes an answer", async () => {
+  it("judge J6' (two creators): twin continuations both publish the accepted duplicate without self-seeding", async () => {
     const f = await commentContinuationFixture();
     const run = await f.start();
     const [twin] = await db.insert(heartbeatRuns).values({ companyId: run.companyId, agentId: run.agentId, status: "queued",
@@ -383,8 +368,15 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       return { ...comment, authorType: "agent" as const };
     });
     const second = await f.finish("Your new recall word is COBALT.");
-    judgeLog("JUDGE-J6", JSON.stringify({ first: mineOf(first, run.id), twin: mineOf(second, twinRunning.id) }));
-    expect(mineOf(second, twinRunning.id)).toEqual([]);
+    const answers = second.filter(reply => reply.createdByRunId === run.id || reply.createdByRunId === twinRunning.id);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, run.companyId));
+    judgeLog("JUDGE-J6'", JSON.stringify({ first: mineOf(first, run.id), twin: mineOf(second, twinRunning.id),
+      answers: answers.length, runIds: runs.map(row => row.id) }));
+    expect(mineOf(second, twinRunning.id)).toEqual(["Your new recall word is COBALT."]);
+    expect(answers).toHaveLength(2);
+    expect(answers.every(reply => reply.authorType === "agent" && reply.authorAgentId === f.agent.id && reply.authorUserId === null)).toBe(true);
+    expect(runs.map(row => row.id).sort()).toEqual([f.run.id, run.id, twinRunning.id].sort());
+    for (const answer of answers) expect(JSON.stringify(runs.map(row => row.contextSnapshot))).not.toContain(answer.id);
   });
   it("judge J7 (person's Retry): a person's manual Retry of a comment-woken failed run on an ordinary task publishes its answer", async () => {
     // Context shape per routes/agents.ts (failedRunId retry copies wake comment ids ONLY for Agent Chat conversations)
@@ -418,6 +410,61 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     judgeLog("JUDGE-J8", JSON.stringify({ ctx: { commentContinuation: run.contextSnapshot?.commentContinuation, wakeCommentIds: run.contextSnapshot?.wakeCommentIds,
       wakeCommentId: run.contextSnapshot?.wakeCommentId }, published: mineOf(replies, run.id), reasonCodes: trace.presentationDecision?.reasonCodes }));
     expect(mineOf(replies, run.id)).toEqual(["Confirmed for the reviewer: COBALT."]);
+  });
+  it("judge J3prime: zero suppression publishes exactly two attributed answers and leaves the release queue quiet", async () => {
+    const { authUsers } = await import("@paperclipai/db");
+    await db.insert(authUsers).values({ id: "local-board", name: "Board", email: "board@example.test",
+      emailVerified: true, createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    const f = await commentContinuationFixture();
+    const run = await f.start();
+    expect(run.contextSnapshot).toMatchObject({ commentContinuation: true,
+      wakeCommentId: f.message!.id, wakeCommentIds: [f.message!.id] });
+    expect(await claimFirstTurnQueuedInput(db, { companyId: run.companyId, issueId: f.issue.id,
+      runId: run.id, agentId: run.agentId })).toContain("COBALT");
+    const [other] = await db.insert(heartbeatRuns).values({ companyId: f.run.companyId, agentId: f.agent.id, status: "succeeded",
+      contextSnapshot: { issueId: f.issue.id, wakeCommentId: f.message!.id } }).returning();
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: f.issue.id, authorType: "agent",
+      authorAgentId: f.agent.id, createdByRunId: other.id, body: "Your new recall word is COBALT." });
+    // Same J3 fixture; make its terminal parent wake consistent with the failed parent,
+    // and wire real publication + release instead of the fixture's boundary mocks.
+    await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() }).where(eq(agentWakeupRequests.id, f.wake.id));
+    const { issueService } = await import("../issues.js");
+    f.input.onLog = async (stream, message) => { console.log("J3PRIME-COMPLETION-LOG", stream, message); };
+    f.deps.issuesSvc.addComment.mockImplementation(issueService(db).addComment);
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => "local-board", getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    }), recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} } });
+    f.deps.releaseIssueExecutionAndPromote.mockImplementation(async finishing => {
+      await release({ companyId: run.companyId, runId: typeof finishing === "string" ? finishing : finishing.id, now: new Date() });
+    });
+    const text = "Your new recall word is COBALT (duplicate).";
+    let replies = await f.finish(text);
+    expect(mineOf(replies, run.id)).toEqual([text]);
+    expect(mineOf(replies, other.id)).toEqual(["Your new recall word is COBALT."]);
+    expect((await traceOf(run.id)).finalResponse).toBe(text);
+    // Redeliver completion and release work: no third answer, run, or active wake.
+    replies = await f.finish(text);
+    for (let pass = 0; pass < 3; pass++) await release({ companyId: run.companyId, runId: run.id, now: new Date() });
+    const answers = replies.filter(reply => reply.createdByRunId === run.id || reply.createdByRunId === other.id);
+    expect(answers).toHaveLength(2);
+    expect(answers.every(reply => reply.authorType === "agent" && reply.authorAgentId === f.agent.id && reply.authorUserId === null)).toBe(true);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, run.companyId));
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, run.companyId));
+    expect(runs.map(row => row.id).sort()).toEqual([f.run.id, run.id, other.id].sort());
+    expect(wakes.filter(wake => ["queued", "claimed", "deferred_issue_execution"].includes(wake.status))).toEqual([]);
+    expect(runs.filter(row => ["queued", "running"].includes(row.status))).toEqual([]);
+    for (const answer of answers) {
+      const authorRun = runs.find(row => row.id === answer.createdByRunId)!;
+      expect(authorRun.contextSnapshot?.wakeCommentId).toBe(f.message!.id);
+      expect(authorRun.contextSnapshot?.explicitUserContinuation).toBeUndefined();
+      expect(JSON.stringify(runs.map(row => row.contextSnapshot))).not.toContain(answer.id);
+      expect(JSON.stringify(wakes.map(row => row.payload))).not.toContain(answer.id);
+    }
+    expect(wakes.find(wake => wake.id === run.wakeupRequestId)?.requestedByActorType).toBe("system");
+    judgeLog("JUDGE-J3PRIME", JSON.stringify({ answerCount: answers.length, runCount: runs.length,
+      activeWakes: wakes.filter(wake => ["queued", "claimed", "deferred_issue_execution"].includes(wake.status)).length,
+      carried: (await read(run.id)).contextSnapshot?.wakeCommentIds, answerIds: answers.map(answer => answer.id) }));
   });
   // ===== END RFL JUDGE TESTS =====
 

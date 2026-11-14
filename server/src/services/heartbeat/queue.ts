@@ -3061,7 +3061,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       opts.allowRunCoalescing !== false &&
       !receiptRequest &&
       (!wakeCommentId || enrichedContextSnapshot.commentContinuation === true) &&
-      queuedCommentIdsFromRunContext(enrichedContextSnapshot).length === 0 &&
+      (enrichedContextSnapshot.commentContinuation === true ||
+        queuedCommentIdsFromRunContext(enrichedContextSnapshot).length === 0) &&
       !isInteractionResolutionWakePayload(payload ?? {}) &&
       !hasInteractionContinuationWakeContext(enrichedContextSnapshot);
     const writeSkippedRequest = async (
