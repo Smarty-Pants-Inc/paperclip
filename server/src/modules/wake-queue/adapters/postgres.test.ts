@@ -184,6 +184,29 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     return id;
   }
 
+  it("carries pending person input through the review-participant recovery seed", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user",
+      authorUserId: "responsible-user", body: "Review the COBALT follow-up." }).returning();
+    const runId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId, wakeCommentId: message.id } });
+    await db.update(heartbeatRuns).set({ responsibleUserId: "responsible-user",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, runId));
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    const result = await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (locked, ports) => {
+      const queued = await ports.transaction.queueReviewParticipantRecoveryRun({ companyId, issue: locked.primaryIssue!, finishingRun: locked.run,
+        recoveryAgent: { id: agentId, companyId, name: "Reviewer", invokable: true }, sessionBefore: null, now: new Date() });
+      return { outcome: { kind: "queued_review_participant_recovery", run: queued }, postCommitEffects: [] };
+    });
+    expect(result.outcome.kind).toBe("queued_review_participant_recovery");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(successor).toMatchObject({ responsibleUserId: "responsible-user", contextSnapshot: {
+      commentContinuation: true, wakeCommentId: message.id, wakeCommentIds: [message.id] } });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, successor.wakeupRequestId!));
+    expect(wake.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: [message.id] });
+  });
+
   function recordReleaseRunReads() {
     const rows: unknown[][] = [];
     function recordSelects<T extends Pick<Db, "select">>(executor: T): T {

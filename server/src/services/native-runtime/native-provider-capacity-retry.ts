@@ -1,3 +1,4 @@
+import { pendingContinuationCommentInput } from "../continuation-comment-input.js";
 import { notifyAttentionRetentionWork } from "../retention-work-notifications.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { randomUUID } from "node:crypto";
@@ -30,9 +31,8 @@ export async function materializeNativeProviderCapacityRetry(input: {
   const dueAt = new Date(now.getTime() + 60_000 * 2 ** (attempt - 1));
   const retryId = randomUUID();
   const predecessorContext = { ...run.contextSnapshot };
-  // Resume receipts and delivered wake input belong to the failed run. The
-  // new turn has ordinary task authority; history comes from retryOfRunId.
-  // Match the consumed-input boundary used by native safe replacements.
+  // Resume authority and rendered prompts belong to the failed run. Rebind
+  // only still-unanswered person input below; delivery alone is not an answer.
   for (const key of [
     "explicitUserContinuation", "wakeCommentId", "wakeCommentIds", "commentId",
     "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
@@ -41,6 +41,7 @@ export async function materializeNativeProviderCapacityRetry(input: {
   ]) delete predecessorContext[key];
   const contextSnapshot = {
     ...predecessorContext,
+    ...await pendingContinuationCommentInput(input.tx, { companyId: input.companyId, issueId: input.issueId, contextSnapshot: run.contextSnapshot }),
     issueId: input.issueId,
     taskId: input.issueId,
     forceFreshSession: true,

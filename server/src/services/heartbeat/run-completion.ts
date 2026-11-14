@@ -38,6 +38,7 @@ import { REVIEWED_CHAT_BINDING_NOT_READY, ReviewedChatBindingNotReadyError, revi
 import { reportRunFailure } from "../run-failure-report.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { isConversation, settleConversationTurn } from "../agent-conversations.js";
+import { commentContinuationHasNoPendingInput } from "../continuation-comment-input.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -841,7 +842,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         await settleAgent();
         return;
       }
-      const skipRunIssueComment =
+      const noPendingCommentInput = Boolean(issueId) && await commentContinuationHasNoPendingInput(db, {
+        companyId: livenessRun.companyId, issueId: issueId!, retryOfRunId: livenessRun.retryOfRunId,
+        contextSnapshot: livenessRun.contextSnapshot,
+      });
+      const skipRunIssueComment = noPendingCommentInput ||
         parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
       let resolvedPresentationDecision: RunPresentationDecision | null =
         null;
@@ -955,8 +960,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           presentationDecision = {
             ...presentationDecision,
             commentAction: "none",
+            ...(noPendingCommentInput ? { chosenSource: "none" as const } : {}),
             reasonCodes: [
               ...presentationDecision.reasonCodes,
+              ...(noPendingCommentInput ? ["comment_continuation_no_pending_input"] : []),
               skipRunIssueComment
                 ? "issue_comment_suppressed"
                 : "run_has_no_issue",

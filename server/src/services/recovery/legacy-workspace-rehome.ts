@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues, statusDecisions, type Db } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
@@ -105,6 +106,7 @@ export async function deliverPendingRecoveryWakes(db: Db, wake: RehomeWakeup, sc
     sql`${wakeField(kind.key, "wake")} = 'pending'`);
   const pending = await db.select({ actionId: issueRecoveryActions.id, companyId: issueRecoveryActions.companyId,
     issueId: issueRecoveryActions.sourceIssueId, agentId: issues.assigneeAgentId,
+    sourceRunId: sql<string | null>`coalesce(${wakeField(kind.key, "runId")}, ${issueRecoveryActions.evidence}->>'latestRunId')`,
     wakeFailures: sql<number>`coalesce(${wakeField(kind.key, "wakeFailures")}::int, 0)`,
   }).from(issueRecoveryActions)
     .innerJoin(issues, and(eq(issues.companyId, issueRecoveryActions.companyId), eq(issues.id, issueRecoveryActions.sourceIssueId)))
@@ -130,7 +132,8 @@ export async function deliverPendingRecoveryWakes(db: Db, wake: RehomeWakeup, sc
         source: "automation", triggerDetail: "system", reason: "issue_recovery_action_restored",
         payload: { issueId: row.issueId, recoveryActionId: row.actionId, mutation: "recovery_action_resolution" },
         requestedByActorType: "system", requestedByActorId: kind.actorId,
-        contextSnapshot: { issueId: row.issueId, taskId: row.issueId, wakeReason: "issue_recovery_action_restored",
+        contextSnapshot: { ...await readContinuationCommentInput(db, { companyId: row.companyId, issueId: row.issueId, runId: row.sourceRunId }),
+          issueId: row.issueId, taskId: row.issueId, wakeReason: "issue_recovery_action_restored",
           source: "issue.recovery_action_resolution", recoveryActionId: row.actionId,
           ...(kind.forceFreshSession ? { forceFreshSession: true } : {}) },
         issueStateGuard: { statuses: ["todo"], assigneeAgentId: row.agentId! },

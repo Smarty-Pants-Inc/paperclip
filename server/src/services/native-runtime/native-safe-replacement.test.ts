@@ -768,7 +768,9 @@ const support = externalDatabaseUrl
       await reconcileSafeNativeReplacements(db);
       const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.runId));
       expect(successor.contextSnapshot?.explicitUserContinuation).toBeUndefined();
-      expect(deriveCommentId(successor.contextSnapshot)).toBeNull();
+      // Carry the unanswered message, but never the source's consumed resume authority.
+      expect(deriveCommentId(successor.contextSnapshot)).toBe(commentId);
+      expect(successor.contextSnapshot?.commentContinuation).toBe(true);
       expect(successor.contextSnapshot?.resumeIntent).toBeUndefined();
       expect(successor.contextSnapshot?.followUpRequested).toBeUndefined();
       const envelope = await buildExecutionContinuation({ db, companyId: source.companyId,

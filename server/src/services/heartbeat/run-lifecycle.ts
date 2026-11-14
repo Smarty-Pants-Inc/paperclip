@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { notifyStrandedAgentStatus } from "../live-run-recovery-notifications.js";
@@ -1693,6 +1694,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       payload: decision.payload,
       contextSnapshot: {
         ...decision.contextSnapshot,
+        ...await readContinuationCommentInput(db, { companyId: run.companyId, issueId, runId: run.id }),
         originIdentityContextId: null,
         parentRunId: run.id,
       },
@@ -2202,7 +2204,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       reason: ISSUE_REVIEW_PATH_LOST_WAKE_REASON,
       idempotencyKey: decision.idempotencyKey,
       payload: decision.payload,
-      contextSnapshot: decision.contextSnapshot,
+      contextSnapshot: { ...decision.contextSnapshot,
+        ...await readContinuationCommentInput(db, { companyId: run.companyId, issueId, runId: run.id }) },
       requestedByActorType: "system",
       requestedByActorId: "heartbeat",
     }).catch((error: unknown) => {
@@ -2541,6 +2544,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     const retryContextSnapshot: Record<string, unknown> = withRecoveryContext(
       {
         ...contextSnapshot,
+        ...await readContinuationCommentInput(db, { companyId: run.companyId, issueId, runId: run.id }),
         retryOfRunId: run.id,
         wakeReason: "missing_issue_comment",
         retryReason: "missing_issue_comment",
@@ -2753,7 +2757,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     // an artificial comment into the issue thread.
     if (
       presentationDecision?.chosenSource === "none" &&
-      (hasAcceptedSemanticResult(parseObject(run.resultJson)) ||
+      (presentationDecision.reasonCodes.includes("comment_continuation_no_pending_input") ||
+        hasAcceptedSemanticResult(parseObject(run.resultJson)) ||
         presentationDecision.reasonCodes.includes(
           "legacy_adapter_summary_ambiguous",
         ))

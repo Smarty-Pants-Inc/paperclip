@@ -1,3 +1,4 @@
+import { carryContinuationCommentInput } from "../domain/continuation-comment-input.js";
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../domain/policy.js";
@@ -767,6 +768,7 @@ async function runReleaseRecoveryTail(
     deriveImmediateRecoveryContextLabels(issue.status);
   // This fresh normal-model seed carries no inherited recovery/model-profile fields.
   const recoveryContextSnapshot: Record<string, unknown> = {
+    ...carryContinuationCommentInput(run.contextSnapshot),
     issueId: issue.id,
     taskId: issue.id,
     wakeReason: recoveryReason,

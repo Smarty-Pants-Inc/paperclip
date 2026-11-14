@@ -748,7 +748,9 @@ export function createPostgresRunDispatchAdapter(
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
-      wakeCommentIdPresent: Boolean(wakeCommentId),
+      // Carried input is data, not a new person's authorization to reopen a
+      // terminal task or bypass a changed review participant.
+      wakeCommentIdPresent: Boolean(wakeCommentId) && context.commentContinuation !== true,
       isCompletedOnboardingHandoffWake: await isCompletedOnboardingHandoffWake(dbOrTx, {
         companyId: input.companyId, issueId, agentId: input.agentId,
         reason: wakeReason, contextSnapshot: context,

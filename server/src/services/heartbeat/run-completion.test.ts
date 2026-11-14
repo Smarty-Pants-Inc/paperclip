@@ -55,6 +55,10 @@ import { hasAcknowledgedNativeReassignmentStopIntent } from "../acknowledged-nat
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { heartbeatService } from "../heartbeat.js";
+import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
+import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
+import { claimFirstTurnQueuedInput } from "../native-runtime/first-turn-queued-input.js";
+import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -195,6 +199,92 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     return { run, agent, wake, deps, controller, input, completion, failure, setup };
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
+
+  // DREA-31: real release/queue, first-turn seal, completion publisher and B' notice.
+  // Only the provider is deterministic: its answer depends on the actual turn text.
+  async function commentContinuationFixture(personMessage = true) {
+    const f = await fixture({ status: "failed", errorCode: "adapter_failed", finishedAt: new Date(), responsibleUserId: "local-board",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Recall the follow-up",
+      assigneeAgentId: f.agent.id, status: "in_progress", executionRunId: f.run.id }).returning();
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id,
+      authorType: "agent", authorAgentId: f.agent.id, body: "Turn one: ORANGE.", createdAt: new Date(Date.now() - 60_000) });
+    const [message] = personMessage ? await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: issue.id,
+      authorType: "user", authorUserId: "local-board", body: "Forget ORANGE. What is my new recall word? COBALT." }).returning() : [];
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: issue.id,
+      ...(message ? { wakeReason: "issue_commented", wakeCommentId: message.id } : { wakeReason: "issue_assigned" }) } })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => "local-board", getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    }), recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} } });
+    async function start() {
+      const result = await release({ companyId: f.run.companyId, runId: f.run.id, now: new Date() });
+      expect(result.outcome.kind).toBe("queued_recovery");
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id));
+      const [running] = await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: issue.id })
+        .where(eq(heartbeatRuns.id, successor.id)).returning();
+      f.input.run = running;
+      f.input.issueId = issue.id;
+      f.input.issueRef = issue;
+      f.deps.issuesSvc.addComment.mockImplementation(async (issueId, body) => {
+        const [comment] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId, body,
+          authorType: "agent", authorAgentId: f.agent.id, createdByRunId: running.id }).returning();
+        return { ...comment, authorType: "agent" as const };
+      });
+      return running;
+    }
+    async function finish(text: string) {
+      f.input.adapterResult.resultJson = { finalResponseDisposition: "final", finalResponse: text };
+      await f.completion.completeRun(f.input);
+      return db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.authorType, "agent")));
+    }
+    return { ...f, issue, message, start, finish };
+  }
+
+  it("carry-comment (a): failed comment wake carries COBALT into the continuation's first turn and answer", async () => {
+    const f = await commentContinuationFixture();
+    const run = await f.start();
+    expect(run.contextSnapshot).toMatchObject({ wakeCommentId: f.message!.id, wakeCommentIds: [f.message!.id] });
+    const input = await claimFirstTurnQueuedInput(db, { companyId: run.companyId, issueId: f.issue.id, runId: run.id, agentId: run.agentId });
+    expect(input).toContain("COBALT");
+    expect((await read(run.id)).contextSnapshot?.firstTurnQueuedInput).toMatchObject({ runId: run.id, commentIds: [f.message!.id] });
+    const replies = await f.finish(input?.includes("COBALT") ? "Your new recall word is COBALT." : "Turn one: ORANGE.");
+    expect(replies.find(reply => reply.createdByRunId === run.id)?.body).toBe("Your new recall word is COBALT.");
+  });
+
+  it("carry-comment (b): comment continuation with no pending person input publishes no answer", async () => {
+    const f = await commentContinuationFixture();
+    // An attributed answer arrived before recovery. The old comment remains in history.
+    await db.insert(issueComments).values({ companyId: f.run.companyId, issueId: f.issue.id, authorType: "agent",
+      authorAgentId: f.agent.id, createdByRunId: f.run.id, body: "COBALT was already answered." });
+    const run = await f.start();
+    await claimFirstTurnQueuedInput(db, { companyId: run.companyId, issueId: f.issue.id, runId: run.id, agentId: run.agentId });
+    const replies = await f.finish("Turn one: ORANGE.");
+    expect(replies.filter(reply => reply.createdByRunId === run.id)).toEqual([]);
+  });
+
+  it("carry-comment (c): ordinary work continuation still publishes its result", async () => {
+    const f = await commentContinuationFixture(false);
+    const run = await f.start();
+    const replies = await f.finish("Finished my own assigned work.");
+    expect(replies.find(reply => reply.createdByRunId === run.id)?.body).toBe("Finished my own assigned work.");
+  });
+
+  it.each([false, true])("carry-comment (d): B' notice remains only while the message is unanswered (answered=%s)", async answered => {
+    const f = await commentContinuationFixture();
+    const scope = { companyId: f.run.companyId, issueId: f.issue.id, now: new Date(Date.now() + 60 * 60_000) };
+    const first = await settleUnansweredPersonMessage(db, scope);
+    expect(first.kind).toBe("noticed");
+    if (answered) {
+      await f.start();
+      await f.finish("Your new recall word is COBALT.");
+    }
+    const outcome = await settleUnansweredPersonMessage(db, scope);
+    expect(outcome.kind).toBe(answered ? "answered" : "noticed_before");
+    const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id), eq(issueComments.authorType, "system")));
+    expect(notes.filter(note => !note.deletedAt && String(note.metadata?.authorizationReason).startsWith("unanswered_message:"))).toHaveLength(answered ? 0 : 1);
+  });
 
   it("replays saved user intent through normal Retry after a first-attempt retained runner failure", async () => {
     for (const mode of ["unattached", "archive_failed", "provider_started", "system_wake", "stopped", "stopped_failed", "promoted"] as const) {

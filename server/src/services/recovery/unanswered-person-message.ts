@@ -23,6 +23,7 @@ import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { answeredPersonMessageSql as answeredSql } from "../person-message-answer.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -181,19 +182,6 @@ const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorization
  * agent comment with no run counts by time. A later reply to ANOTHER message
  * never answers m.
  */
-function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
-  return sql`exists (select 1 from ${issueComments} a
-    left join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
-    where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
-      and a.created_at > ${m.createdAt}
-      and (a.created_by_run_id is null or exists (select 1 from ${issueComments} b
-        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
-          and (r.context_snapshot->>'wakeCommentId' = b.id::text or r.context_snapshot->>'commentId' = b.id::text
-            or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
-            or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
-            or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text))))`;
-}
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 

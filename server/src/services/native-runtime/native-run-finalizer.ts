@@ -1,3 +1,4 @@
+import { commentContinuationHasNoPendingInput } from "../continuation-comment-input.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { REMOTE_WORKSPACE_SANDBOX_DISK_FULL_CODE } from "../remote-workspace-transport.js";
@@ -1071,10 +1072,18 @@ async function recoverCommittedNativeChatResponseInScope(
           errorCode: heartbeatRuns.errorCode,
           nativePhase: heartbeatRuns.nativePhase,
           finishedAt: heartbeatRuns.finishedAt,
+          retryOfRunId: heartbeatRuns.retryOfRunId,
           resultJson: heartbeatRuns.resultJson,
           contextSnapshot: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.contextSnapshot} is null then null
             else jsonb_build_object(
               'skipIssueComment', ${heartbeatRuns.contextSnapshot}->'skipIssueComment',
+              'commentContinuation', ${heartbeatRuns.contextSnapshot}->'commentContinuation',
+              'wakeCommentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentId',
+              'commentId', ${heartbeatRuns.contextSnapshot}->'commentId',
+              'wakeCommentIds', ${heartbeatRuns.contextSnapshot}->'wakeCommentIds',
+              'firstTurnQueuedInput', ${heartbeatRuns.contextSnapshot}->'firstTurnQueuedInput',
+              'retryOfRunId', ${heartbeatRuns.contextSnapshot}->'retryOfRunId',
+              'previousRunId', ${heartbeatRuns.contextSnapshot}->'previousRunId',
               'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
               'conversationSessionGeneration', ${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration',
               'source', ${heartbeatRuns.contextSnapshot}->'source',
@@ -1109,6 +1118,15 @@ async function recoverCommittedNativeChatResponseInScope(
         record(run.contextSnapshot).skipIssueComment === true
       )
         return false;
+      if (await commentContinuationHasNoPendingInput(tx, { ...input, retryOfRunId: run.retryOfRunId, contextSnapshot: run.contextSnapshot })) {
+        await tx.update(heartbeatRuns).set({
+          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+            presentationDecision: { ...resolveHeartbeatRunResponse({ resultJson: null }).decision,
+              reasonCodes: ["comment_continuation_no_pending_input"] },
+          })}::jsonb || ${settledResponsePublicationSql()}`, updatedAt: new Date(),
+        }).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, run.id)));
+        return false;
+      }
       if (input.onlyWhenDue) {
         if (coordinator.nextAttemptAt && coordinator.nextAttemptAt.getTime() > Date.now()) return false;
         const [pendingEffect] = await tx.select({ id: statusDecisionEffects.id }).from(statusDecisionEffects).where(and(

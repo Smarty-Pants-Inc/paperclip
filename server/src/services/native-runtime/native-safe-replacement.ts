@@ -1,3 +1,4 @@
+import { pendingContinuationCommentInput } from "../continuation-comment-input.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { notifyNativeStatusReassessment } from "../native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../unsafe-workspace-export-notifications.js";
@@ -741,8 +742,8 @@ export async function reconcileSafeNativeReplacements(
         const successorRunId = randomUUID();
         const dueAt = new Date(now.getTime() + 30_000);
         const predecessorContext = { ...record(run.contextSnapshot) };
-        // History comes from the failed source run. Consumed wake fields must
-        // not grant this automatic retry fresh comment/resume authority.
+        // Resume authority and rendered prompts belong to the failed source.
+        // Unanswered person input is rebound separately, not treated as consumed.
         for (const key of [
           "explicitUserContinuation", "wakeCommentId", "wakeCommentIds", "commentId",
           "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
@@ -751,6 +752,7 @@ export async function reconcileSafeNativeReplacements(
         ]) delete predecessorContext[key];
         const context = {
           ...predecessorContext,
+          ...await pendingContinuationCommentInput(tx as unknown as Db, { companyId: run.companyId, issueId: task.id, contextSnapshot: run.contextSnapshot }),
           issueId: task.id,
           retryOfRunId: run.id,
           wakeReason: NATIVE_SAFE_REPLACEMENT_REASON,

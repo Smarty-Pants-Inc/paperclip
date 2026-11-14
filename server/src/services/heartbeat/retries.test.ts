@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, projects, projectWorkspaces } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issueComments, issues, projects, projectWorkspaces } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
@@ -261,6 +261,7 @@ describePostgres("heartbeat retry module database wiring", () => {
 
   afterEach(async () => {
     await db.delete(activityLog);
+    await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
@@ -353,12 +354,14 @@ describePostgres("heartbeat retry module database wiring", () => {
   });
 
   it("bounds answered chat attestation retries across restarts and escalates their exhaustion", async () => {
-    const { run, agent, companyId } = await fixture();
+    const { run, agent, issue, companyId } = await fixture();
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user",
+      authorUserId: "retry-user", body: "Continue with my answered interaction." }).returning();
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId: agent.id,
       runId: run.id, source: "automation", status: "failed" }).returning();
     const contextSnapshot = { ...run.contextSnapshot, source: "issue.interaction.respond", externalChatContinuation: true,
       interactionId: randomUUID(), interactionStatus: "answered", interactionKind: "ask_user_questions",
-      mutation: "interaction", wakeReason: "issue_commented", wakeCommentIds: [randomUUID()] };
+      mutation: "interaction", wakeReason: "issue_commented", wakeCommentIds: [message.id] };
     const [failed] = await db.update(heartbeatRuns).set({ wakeupRequestId: wake!.id,
       errorCode: "reviewed_chat_execution_binding_not_ready", contextSnapshot,
     }).where(eq(heartbeatRuns.id, run.id)).returning();
