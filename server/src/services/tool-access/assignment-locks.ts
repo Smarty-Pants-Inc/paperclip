@@ -11,14 +11,17 @@ export async function lockManagedAppPolicies(client: ToolAccessMutationDb, compa
   )).orderBy(toolPolicies.id).for("no key update");
 }
 
-export async function lockToolAssignmentAgents(client: ToolAccessMutationDb, companyId: string, targets: ReadonlyArray<{ targetType: string; targetId: string }>, actorAgentId?: string | null) {
+export async function lockToolAssignmentAgents(client: ToolAccessMutationDb, companyId: string, targets: ReadonlyArray<{ targetType: string; targetId: string }>, actorAgentId?: string | null, options: { includeAllStatuses?: boolean } = {}) {
   const allAgents = targets.some(target => target.targetType === "company" && target.targetId === companyId);
   const ids = targets.filter(target => target.targetType === "agent").map(target => target.targetId);
   const sourceAgentId = currentPluginInteractionOrigin()?.agentId ?? actorAgentId;
   if (sourceAgentId) ids.push(sourceAgentId);
   if (!allAgents && !ids.length) return;
   await client.select({ id: agents.id }).from(agents)
-    .where(and(eq(agents.companyId, companyId), or(sql`${agents.status} NOT IN ('pending_approval', 'terminated')`, ids.length ? inArray(agents.id, ids) : undefined),
+    // Gateway updates discover their current target only after this lock set.
+    // Include inactive rows up front so later configure checks cannot acquire
+    // a lower-ID pending/terminated target after an active actor.
+    .where(and(eq(agents.companyId, companyId), options.includeAllStatuses ? undefined : or(sql`${agents.status} NOT IN ('pending_approval', 'terminated')`, ids.length ? inArray(agents.id, ids) : undefined),
       allAgents ? undefined : inArray(agents.id, ids)))
     .orderBy(agents.id).for("no key update");
 }

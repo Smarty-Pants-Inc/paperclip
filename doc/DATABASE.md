@@ -2354,9 +2354,12 @@ uses ordered `FOR NO KEY UPDATE` locks, which remain compatible with foreign-key
 references while excluding runtime readers' `FOR SHARE` locks. Connector feature
 switches use the same journal; process-start overlays receive a delivery baseline.
 
-Named MCP gateway creation and updates take the complete company runtime-agent
-lock set in ascending agent ID order before locking a scoped configure-permission
-actor or target. Updates take that set before the gateway row as well. Gateway
+Named MCP gateway creation and updates take the complete company agent lock set,
+including `pending_approval` and `terminated` rows, in ascending agent ID order
+before locking a scoped configure-permission actor or target. Configure checks
+lock these excluded runtime targets too; locking only active agents first can
+still invert the order. Updates take the all-status set before the gateway row
+as well, covering both the current target read under that lock and any new target. Gateway
 writes invalidate the whole company, even when the gateway belongs to one agent;
 locking that agent first would invert a concurrent multi-agent permission read
 when the invalidation trigger visits a lower-ID peer. The service reuses
@@ -2364,7 +2367,9 @@ when the invalidation trigger visits a lower-ID peer. The service reuses
 in the same transaction. Native warm-up creation and legacy unbound-gateway
 binding repair follow the same order; the repair retains its null-agent CAS.
 Run `pnpm --filter @paperclipai/server exec vitest run src/__tests__/gateway-runtime-lock-order.test.ts --maxWorkers=2`
-for the real-PostgreSQL create/update concurrency regression.
+for the real-PostgreSQL create/update concurrency regression. Also run
+`pnpm --filter @paperclipai/server exec vitest run src/__tests__/judge-gateway-excluded-target.test.ts --maxWorkers=2`
+for the lower-ID pending-approval target regression.
 
 Migration 0355 extends connector invalidation to tool definitions and
 configuration. Statement triggers cover applications, connections, catalogs,

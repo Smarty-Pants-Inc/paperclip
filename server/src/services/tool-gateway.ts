@@ -10635,12 +10635,12 @@ export function createToolGatewayService(
         input.body.slug ??
         slugSegment(input.body.name, "gateway");
       const gateway = await db.transaction(async tx => {
-        // Gateway mutations invalidate every active agent's connector runtime.
-        // Lock that complete set in ID order before configure-permission checks
-        // lock a scoped (possibly higher-ID) actor/target. Otherwise the trigger
-        // waits on a lower agent while its permission reader waits on our actor.
+        // Lock company agents of every status in ID order before configure
+        // checks: pending/terminated targets are absent from the runtime set,
+        // but the checks still lock them. The trigger also needs active peers.
         await lockToolAssignmentAgents(tx, input.companyId, [{ targetType: "company", targetId: input.companyId }],
-          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : input.actor?.agentId);
+          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : input.actor?.agentId,
+          { includeAllStatuses: true });
         await assertAgentToolAssignmentInteractions(tx as unknown as Db,
           input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : input.actor?.agentId,
           input.companyId, input.body.agentId ? [input.body.agentId] : []);
@@ -10747,11 +10747,12 @@ export function createToolGatewayService(
     }): Promise<ToolMcpGatewayWithTokens> {
       await input.managementContext?.reauthorize();
       const updated = await db.transaction(async tx => {
-        // Match create and the connector trigger: company agents before scoped
-        // permission checks or gateway locks, so gateway owners cannot invert
-        // the same lock set.
+        // Match create before gateway locks. Include every status so the
+        // current target read under the gateway lock and any proposed target
+        // are already covered, even if pending approval or terminated.
         await lockToolAssignmentAgents(tx, input.companyId, [{ targetType: "company", targetId: input.companyId }],
-          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : null);
+          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : null,
+          { includeAllStatuses: true });
         const [existing] = await tx
           .select()
           .from(toolMcpGateways)

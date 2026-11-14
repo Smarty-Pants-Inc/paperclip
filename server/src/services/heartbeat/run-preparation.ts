@@ -1168,9 +1168,9 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     const gatewayId = gateway.id;
     await input.db.transaction(async tx => {
       // This repair fires the same company-wide invalidation as named gateway
-      // edits. Match their agent-before-gateway order, retaining the null CAS.
+      // edits. Match their all-status agent-before-gateway order, retaining the null CAS.
       await lockToolAssignmentAgents(tx, input.agent.companyId,
-        [{ targetType: "company", targetId: input.agent.companyId }], input.agent.id);
+        [{ targetType: "company", targetId: input.agent.companyId }], input.agent.id, { includeAllStatuses: true });
       await tx.update(toolMcpGateways)
         .set({ agentId: input.agent.id, contextScopeType: "agent", contextScopeId: input.agent.id, updatedAt: new Date() })
         .where(and(
