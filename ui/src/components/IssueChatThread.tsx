@@ -6,6 +6,7 @@ import { WorkspaceBaseRefRecoveryNotice } from "./WorkspaceBaseRefRecoveryNotice
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "./DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { TaskChatRunnerTurn } from "./task-chat/TaskChatRunnerTurn";
+import { isSupersededNotice } from "./task-chat/status-relevance";
 import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
 import type { ComposerRunSettings } from "./task-chat/composer-run-settings";
 import { ComposerRunSettingsPicker } from "./task-chat/ComposerRunSettingsPicker";
@@ -3481,6 +3482,7 @@ function CompactSystemNoticeRow({
   source,
   noticeProps,
   defaultOpen = false,
+  superseded = false,
 }: {
   anchorId?: string;
   message: ThreadMessage;
@@ -3489,6 +3491,8 @@ function CompactSystemNoticeRow({
   source?: SystemNoticeProps["source"];
   noticeProps: SystemNoticeProps;
   defaultOpen?: boolean;
+  /** Kept as history, not current: details render only when opened. */
+  superseded?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const detailsId = useId();
@@ -3520,6 +3524,11 @@ function CompactSystemNoticeRow({
                 · {source.label}
               </span>
             ) : null}
+            {superseded ? (
+              <span className="shrink-0 text-(length:--text-micro) text-muted-foreground">
+                · Superseded
+              </span>
+            ) : null}
             {/* Trailing meta never shrinks — keeps the timestamp on one line so the
                 collapsed row stays a single quiet line on narrow / mobile widths. */}
             <span className="ml-auto flex shrink-0 items-center gap-1.5">
@@ -3540,7 +3549,7 @@ function CompactSystemNoticeRow({
             </span>
           </button>
           <div id={detailsId} hidden={!open} className="py-1">
-            <SystemNotice {...noticeProps} />
+            {open || !superseded ? <SystemNotice {...noticeProps} /> : null}
           </div>
         </div>
       </div>
@@ -3683,6 +3692,23 @@ function SystemNoticeCommentContent({
         message={message}
         metadata={commentMetadata}
         runAgentId={runAgentId}
+      />
+    );
+  }
+
+  // A superseded notice is history, not current status (status-relevance.ts):
+  // keep the row, collapsed, with its details one click away.
+  if (isSupersededNotice({ authorType, presentation, metadata: commentMetadata })) {
+    const tone = presentation?.tone ?? "neutral";
+    return (
+      <CompactSystemNoticeRow
+        anchorId={anchorId}
+        message={message}
+        tone={tone}
+        title={systemNoticeLabelForTone(tone, presentation?.title)}
+        source={source}
+        noticeProps={props}
+        superseded
       />
     );
   }
