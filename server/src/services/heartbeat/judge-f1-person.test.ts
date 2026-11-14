@@ -69,8 +69,8 @@ type Run = typeof heartbeatRuns.$inferSelect;
 const native = vi.hoisted(() => ({
   closeIdle: vi.fn(async () => ({ closed: 0, failed: 0 })),
   detach: vi.fn(async () => 0),
-  finalizations: vi.fn(async (_db: Db, _ids?: string[], _options?: unknown) => undefined),
-  cleanups: vi.fn<() => Promise<void>>(async () => undefined),
+  finalizations: vi.fn<(...args: Parameters<typeof import("../native-runtime/index.js").reconcileNativeFinalizations>) => Promise<void>>(async (_db, _ids, _options) => undefined),
+  cleanups: vi.fn<(...args: Parameters<typeof import("../native-runtime/retained-native-session-cleanup.js").reconcileRetainedNativeSessionCleanups>) => ReturnType<typeof import("../native-runtime/retained-native-session-cleanup.js").reconcileRetainedNativeSessionCleanups> | Promise<void>>(async () => undefined),
   drainMaintenance: vi.fn<() => Promise<void>>(async () => undefined),
   claims: vi.fn<typeof claimNativeRestartRecoveries>(async () => []),
 }));

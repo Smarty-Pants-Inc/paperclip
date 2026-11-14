@@ -233,7 +233,10 @@ export function layerConfig(layer, { emptyLayers = new Set() } = {}) {
         };
   return {
     extends: fromOutput("tsconfig.json"),
-    compilerOptions: { ...output, rootDir: fromOutput("src") },
+    // No-emit service tests, like src/__tests__, may import actual UI
+    // projections. Widen their root only; production declaration paths stay
+    // unchanged and every imported file is still fully typechecked.
+    compilerOptions: { ...output, rootDir: fromOutput(layer.name === "tests" ? ".." : "src") },
     files: layer.files.map(fromOutput),
     include: [],
     references,

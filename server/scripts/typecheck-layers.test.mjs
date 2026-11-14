@@ -163,6 +163,7 @@ describe("layerConfig", () => {
     const config = layerConfig(layer);
 
     expect(config.compilerOptions).toMatchObject({ composite: true, emitDeclarationOnly: true, outDir: "./dts" });
+    expect(config.compilerOptions.rootDir).toBe("../../../src");
     expect(config.extends).toBe("../../../tsconfig.json");
     expect(config.files).toEqual(["../../../src/a.ts"]);
     expect(config.references).toEqual([{ path: "./tsconfig.below.json" }]);
@@ -175,6 +176,7 @@ describe("layerConfig", () => {
     );
 
     expect(config.compilerOptions).toMatchObject({ composite: false, noEmit: true });
+    expect(config.compilerOptions.rootDir).toBe("../../../..");
     expect(config.references).toEqual([{ path: "./tsconfig.below.json" }]);
   });
 });
