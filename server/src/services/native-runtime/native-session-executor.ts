@@ -7797,7 +7797,9 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
       // live one stands until an answer supersedes it. One notice, both orders.
       const [unanswered] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
-        isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
+        isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`,
+        // never-delete (org 09:18Z): a superseded B' note is history, not a live notice.
+        sql`not coalesce(${issueComments.metadata} ? 'supersededBy', false)`)).limit(1);
       if (unanswered) return;
       await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,

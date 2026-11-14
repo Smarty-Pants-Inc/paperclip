@@ -234,6 +234,24 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
             or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
             or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text))))`;
 }
+/** The earliest agent comment that answers message m (answeredSql's exact
+ * predicate): the id a superseded note is marked with (never-delete part 1). */
+function answeringCommentIdSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
+  return sql`(select a.id::text from ${issueComments} a
+    left join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
+    where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
+      and a.created_at > ${m.createdAt}
+      and (a.created_by_run_id is null or exists (select 1 from ${issueComments} b
+        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
+          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
+          and (r.context_snapshot->>'wakeCommentId' = b.id::text or r.context_snapshot->>'commentId' = b.id::text
+            or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
+            or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
+            or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text)))
+    order by a.created_at, a.id limit 1)`;
+}
+/** A note marked superseded (metadata.supersededBy) is history, never a live note. */
+const notSupersededSql = (metadata: SQL | AnyPgColumn) => sql`not coalesce(${metadata} ? 'supersededBy', false)`;
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
@@ -396,6 +414,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
+      and ${notSupersededSql(sql.raw("n.metadata"))}
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and not ${heldReplyMetadataSql(sql.raw("n.metadata"))}
       and ${answeredSql(rawMessage("m"))}))`;
@@ -422,6 +441,7 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and ${heldReplyOutstandingSql(issueComments.metadata)})
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
+      and ${notSupersededSql(issueComments.metadata)}
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and not ${heldReplyMetadataSql(issueComments.metadata)}
       and exists (select 1 from ${issueComments} m
@@ -640,14 +660,21 @@ export async function settleUnansweredPersonMessage(
   const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
-    sql`not ${heldReplyMetadataSql(issueComments.metadata)}`,
+    sql`not ${heldReplyMetadataSql(issueComments.metadata)}`, notSupersededSql(issueComments.metadata),
     or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
       sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
   if (liveNotice) await db.transaction(async tx => {
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+    // never-delete part 1 (org 09:18Z, RFL 10:14Z): the answered note is KEPT
+    // (deleted_at NULL, body unchanged) and marked supersededBy = the answer.
+    await tx.execute(sql`update ${issueComments} n set metadata = coalesce(n.metadata, '{}'::jsonb)
+        || jsonb_build_object('supersededBy', (select ${answeringCommentIdSql(rawMessage("m"))} from ${issueComments} m
+          where m.company_id = n.company_id and m.issue_id = n.issue_id
+            and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1))),
+      updated_at = ${now.toISOString()}::timestamptz
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
+      and ${notSupersededSql(sql.raw("n.metadata"))}
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
       and not ${heldReplyMetadataSql(sql.raw("n.metadata"))}
