@@ -1,7 +1,7 @@
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, subscribeDatabaseWork } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issueComments, issues, subscribeDatabaseWork } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -153,6 +153,71 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, wakeupRequestId: wake.id, status: "running", runtimeMode: "native", ...patch }).returning();
     return { company, agent, wake, run };
   }
+
+  async function reviewDispositionFixture(input: {
+    originKind?: string;
+    conversationAgent?: boolean;
+    reply?: "published" | "none" | "held";
+    heldReason?: string;
+  } = {}) {
+    const issueId = randomUUID();
+    const f = await fixture({ issueId, contextSnapshot: { issueId } });
+    await db.insert(issues).values({ id: issueId, companyId: f.company.id, title: "Review path disposition",
+      status: "in_review", assigneeAgentId: f.agent.id, originKind: input.originKind ?? "chat_channel",
+      ...(input.conversationAgent ? { conversationAgentId: f.agent.id, conversationUserId: "review-person", conversationState: "active" as const } : {}) });
+    await db.insert(issueComments).values({ companyId: f.company.id, issueId, authorType: "user", authorUserId: "review-person",
+      body: "Please answer this.", createdAt: new Date(Date.now() - 1_000) });
+    if (input.reply !== "none") {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.company.id, issueId, authorType: "agent",
+        authorAgentId: f.agent.id, createdByRunId: f.run.id, origin: "comment", body: "Here is the answer." }).returning();
+      await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: input.reply === "held"
+        ? { commentAction: "none", reasonCodes: [input.heldReason ?? "yielded_control_plane_wait"] }
+        : { commentAction: "create", commentId: comment!.id } } }).where(eq(heartbeatRuns.id, f.run.id));
+    }
+    return { ...f, issueId };
+  }
+
+  async function runReviewDisposition(f: Awaited<ReturnType<typeof reviewDispositionFixture>>) {
+    const deps = callbacks(db);
+    deps.issuesSvc.listReviewAttention.mockResolvedValue(new Map([[f.issueId, { state: "stalled", paths: [], reason: null }]]));
+    deps.enqueueWakeup.mockResolvedValue({ id: randomUUID() } as never);
+    await createHeartbeatLifecycle(db, deps).handleIssueReviewPathDisposition(f.run);
+    return deps;
+  }
+
+  it("skips disposition for a NULL-channel chat answered by its assigned agent", async () => {
+    const f = await reviewDispositionFixture({ reply: "published" });
+    const deps = await runReviewDisposition(f);
+    expect(deps.enqueueWakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(2);
+    expect(await db.select({ status: issues.status }).from(issues).where(eq(issues.id, f.issueId))).toMatchObject([{ status: "in_review" }]);
+  }, 60_000);
+
+  it("keeps disposition for an unanswered NULL-channel chat", async () => {
+    const f = await reviewDispositionFixture({ reply: "none" });
+    const deps = await runReviewDisposition(f);
+    expect(deps.enqueueWakeup).toHaveBeenCalledTimes(1);
+  }, 60_000);
+
+  it("keeps disposition for an answered non-chat task", async () => {
+    const f = await reviewDispositionFixture({ originKind: "manual", reply: "published" });
+    const deps = await runReviewDisposition(f);
+    expect(deps.enqueueWakeup).toHaveBeenCalledTimes(1);
+  }, 60_000);
+
+  it("keeps disposition for an answered chat with a conversation agent", async () => {
+    const f = await reviewDispositionFixture({ conversationAgent: true, reply: "published" });
+    const deps = await runReviewDisposition(f);
+    expect(deps.enqueueWakeup).toHaveBeenCalledTimes(1);
+  }, 60_000);
+
+  it.each(["yielded_control_plane_wait", "board_response_wait_superseded"] as const)(
+    "keeps disposition when the reply was held (%s)", async heldReason => {
+      const f = await reviewDispositionFixture({ reply: "held", heldReason });
+      const deps = await runReviewDisposition(f);
+      expect(deps.enqueueWakeup).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each(["succeeded", "failed", "cancelled", "timed_out", "interrupted", "deleted"])(
     "rechecks progress after a run becomes %s without reading its large payloads",
