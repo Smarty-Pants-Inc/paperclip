@@ -204,6 +204,16 @@ export const authApi = {
     return currentUserProfileSchema.parse(payload);
   },
 
+  /**
+   * Better Auth's documented change-password endpoint
+   * (https://better-auth.com/docs/authentication/email-password#update-password).
+   * With `revokeOtherSessions` Better Auth signs out every other session and
+   * sets a fresh session cookie on this browser, so the caller stays signed in.
+   */
+  changePassword: async (input: { currentPassword: string; newPassword: string; revokeOtherSessions: boolean }) => {
+    await authPost("/change-password", input);
+  },
+
   updateProfile: async (input: UpdateCurrentUserProfile): Promise<CurrentUserProfile> =>
     authPatch("/profile", input, (payload) => currentUserProfileSchema.parse(payload)),
 
