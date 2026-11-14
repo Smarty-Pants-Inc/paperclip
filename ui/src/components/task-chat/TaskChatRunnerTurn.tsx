@@ -29,6 +29,7 @@ import {
   omitProgressRepeatedByResponse,
   paperclipRunnerFinalResponse,
   paperclipRunnerTimelineItems,
+  type ReasoningDisplay,
 } from "./transcript-adapter";
 
 function currentActivityStatusItems(
@@ -172,6 +173,7 @@ export function TaskChatRunnerTurn({
   waitSummary = null,
   continuedAfterSteering = false,
   showHeader = true,
+  reasoningDisplay,
   onRuntimeRequestDecision,
 }: {
   /** Stable identity used to clear replay-latched final text for the next turn. */
@@ -200,6 +202,13 @@ export function TaskChatRunnerTurn({
   continuedAfterSteering?: boolean;
   /** The task thread keeps a shared header across native and legacy discovery. */
   showHeader?: boolean;
+  /**
+   * The thread's resolved reasoning display for this run: the person's
+   * choice (kept in memory even when saving it fails), else the run adapter's
+   * `transcriptPresentation.liveReasoningView`. Omitted only by hosts without
+   * that resolution, which keep the saved device choice.
+   */
+  reasoningDisplay?: ReasoningDisplay;
   onRuntimeRequestDecision?: (
     item: TaskChatRuntimeRequestItem,
     decision: TaskChatRuntimeRequestDecision,
@@ -256,6 +265,7 @@ export function TaskChatRunnerTurn({
   const timelineRows = groupImageResources(buildTurnTimelineRows(
     omitProgressRepeatedByResponse(timelineItems, final?.text),
     !terminal,
+    reasoningDisplay,
   ));
 
   return (
