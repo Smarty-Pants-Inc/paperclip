@@ -330,13 +330,13 @@ export function CoordinatorNeedsYou() {
       className="coordinator-decision-card space-y-3"
       data-attention-card={item.id} data-card-type={type} data-card-kind={needsYouSection(item) === "problems" ? "problem" : "decision"} data-reviewing={reviewing || undefined}>
       {/* What to do (with whose card it is) on the left; who asked, when, and ⋯ on the right (Paper "A · Compact cards"). */}
-      <div className="flex items-center justify-between gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <div className="flex min-w-0 items-center gap-2">
           <NeedsYouTypeLabel item={item} currentUserId={userId} userLabelMap={userLabelMap} />
           <AttentionHiddenChip item={item} />
           <AttentionStaleChip item={item} />
         </div>
-        <div className="flex shrink-0 items-center gap-3" data-attention-context>
+        <div className="flex max-w-full shrink-0 flex-wrap items-center justify-end gap-2 sm:flex-nowrap sm:gap-3" data-attention-context>
           <NeedsYouAudience item={item} currentUserId={userId} userLabelMap={userLabelMap} onClaim={entry => claim.mutate(entry)} claiming={claim.isPending && claim.variables?.id === item.id} />
           <NeedsYouRequester item={item} agentMap={agentMap} userLabelMap={userLabelMap} currentUserId={userId} />
           <time dateTime={item.activityAt} title={new Date(item.activityAt).toLocaleString()} className="shrink-0 text-xs leading-4.5 text-muted-foreground">{timeAgo(item.activityAt)}</time>
@@ -391,7 +391,7 @@ export function CoordinatorNeedsYou() {
         Decision history sit in View. */}
     <div role="toolbar" aria-label="Decisions controls" className="flex flex-wrap items-center gap-2">
       <div className="min-w-44 flex-1"><ToolbarSearch query={query} onQueryChange={setQuery} label="Search decisions" placeholder="Search…" /></div>
-      <NativeSelect aria-label="Filter decisions by agent" value={agentFilter} onChange={(event) => setAgentFilter(event.target.value)} className="w-auto"><option value="">All agents</option>{(agentQuery.data ?? []).map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</NativeSelect>
+      <NativeSelect aria-label="Filter decisions by agent" value={agentFilter} onChange={(event) => setAgentFilter(event.target.value)} className="w-full max-w-full min-w-0 sm:w-auto"><option value="">All agents</option>{(agentQuery.data ?? []).map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</NativeSelect>
       <NativeSelect aria-label="Filter decisions by project" value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)} className="w-auto"><option value="">All projects</option>{projects.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</NativeSelect>
       {assignee ? <NativeSelect aria-label="Filter decisions by assignee" data-attention-assignee={assignee} value={assignee} onChange={(event) => chooseAssignee(event.target.value as CoordinatorAssignee)} className="w-auto">
         {assigneeOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}

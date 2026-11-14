@@ -99,6 +99,21 @@ async function renderPage(url = fixture.url) {
   return client;
 }
 describe("Coordinator Needs You — Archived view and history filters (PAP-749 task 2e)", () => {
+  it("lets the mobile card header and its context wrap instead of overflowing", async () => {
+    await renderPage();
+    const card = container.querySelector<HTMLElement>("[data-attention-card]");
+    const header = card?.firstElementChild as HTMLElement | null;
+    expect(header?.className).toContain("flex-wrap");
+    expect(header?.querySelector("[data-attention-context]")?.className).toContain("flex-wrap");
+  });
+
+  it("constrains the mobile agent filter to the available width", async () => {
+    await renderPage();
+    const agentFilter = container.querySelector<HTMLSelectElement>('select[aria-label="Filter decisions by agent"]');
+    expect(agentFilter?.className).toContain("max-w-full");
+    expect(agentFilter?.className).toContain("min-w-0");
+  });
+
   const hidden = (id: string, kind: "dismiss" | "snooze", snoozedUntil: string | null = null) => ({
     id, sourceKind: "issue_thread_interaction", inlineResolvable: false, dismissalKey: `attention:${id}`, changeFingerprint: `${id}.me`,
     closeModes: ["withdraw", "archive", "snooze"], obligationKey: null, obligationLeadId: null, audience: { kind: "user", userId: "reviewer", reason: "addressee" },
