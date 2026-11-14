@@ -1682,11 +1682,36 @@ function createSandboxEnvironmentDriver(
     ));
     const nativeSessionId = incoming?.nativeSessionId ?? input.resumeSessionId ?? null;
     if (!nativeSessionId) return null;
-    const [finished] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+    const finished = await db.select({
+      id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+      nativePhase: heartbeatRuns.nativePhase, lastOutputSeq: heartbeatRuns.lastOutputSeq,
+      stdoutExcerpt: heartbeatRuns.stdoutExcerpt, stderrExcerpt: heartbeatRuns.stderrExcerpt,
+    }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.nativeSessionId, nativeSessionId),
       sql`${heartbeatRuns.finishedAt} is not null`,
-    )).orderBy(sql`${heartbeatRuns.finishedAt} desc`, sql`${heartbeatRuns.createdAt} desc`).limit(1);
-    return finished?.status === "succeeded" ? finished.id : null;
+    )).orderBy(sql`${heartbeatRuns.finishedAt} asc`, sql`${heartbeatRuns.createdAt} asc`);
+    const latestSucceeded = [...finished].reverse().find(run => run.status === "succeeded");
+    if (!latestSucceeded) return null;
+    const laterRuns = finished.slice(finished.indexOf(latestSucceeded) + 1);
+    const preTurnRecoveryErrors = new Set([
+      "native_session_interrupted", "runner_remote_state_unavailable",
+      "native_continuation_requires_reconciliation",
+    ]);
+    const everyLaterRunFailedBeforeTurn = laterRuns.every(run => {
+      if (run.status !== "failed") return false;
+      const recoveryError = run.errorCode !== null && (
+        preTurnRecoveryErrors.has(run.errorCode) || run.errorCode.startsWith("native_controller_recovery_")
+      );
+      const hasTurnOutput = run.lastOutputSeq > 0 || run.stdoutExcerpt !== null || run.stderrExcerpt !== null;
+      // The listed errors are emitted while recovering/attaching to a session,
+      // before dispatching a new turn. Output/result evidence always wins.
+      const turnStarted = new Set([
+        "turn", "turn_running", "running", "provider_running", "awaiting_input", "result_accepted",
+        "arbitrating", "finalizing", "workspace_finalizing", "committed",
+      ]).has(run.nativePhase ?? "");
+      return recoveryError && !hasTurnOutput && !turnStarted;
+    });
+    return everyLaterRunFailedBeforeTurn ? latestSucceeded.id : null;
   }
 
   const BOOT_SOURCE_KEYS = ["from", "snapshot", "image", "rootfs"] as const;
