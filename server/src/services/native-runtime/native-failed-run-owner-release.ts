@@ -17,6 +17,11 @@ import { LEGACY_WORKSPACE_RECOVERY_KEY } from "../workspace-restore-recovery-sta
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { currentNativeControllerIdentity, isCurrentNativeControllerProcess, surfaceNativeControllerNamespaceAttention, recordLegacyHostFallbackProof } from "./native-restart-recovery.js";
 import { nativeControllerOwnerStamp, runProcessOwnerStamp } from "./native-owner-stamps.js";
+import { readFreshThreadStopProof } from "./fresh-thread-stop-gate.js";
+import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { hasStopOnlyCleanup, prepareUnconfirmedSourceSandboxStop, settleStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
+import { readRunCancellation } from "../run-cancellation.js";
+import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../acknowledged-native-stop.js";
 
 /**
  * A native run can fail outside the native session executor: environment lease
@@ -44,6 +49,9 @@ type Release =
   | { kind: "unstarted_resume"; runId: string; leaseOwner: string; attempt: number }
   /** A background pass found an expired owner and must prove it stopped. */
   | { kind: "expired_owner"; runId: string; leaseOwner: string; attempt: number; controllerGeneration: number }
+  /** Exact bound remote stop proof retires a stranded observed claim, not a result. */
+  | { kind: "stopped_remote_owner"; runId: string; leaseOwner: string; attempt: number; controllerGeneration: number;
+      observations: Array<{ lease: typeof environmentLeases.$inferSelect; receipt: unknown }> }
   | { kind: "operator_containment"; runId: string; leaseOwner: string; attempt: number;
       companyId: string; issueId: string; actionId: string; authorityDigest: string; actorId: string; controllerGeneration: number;
       actionOutcome: ExecutionReconciliation["actionOutcome"]; outcomeEvidence: string };
@@ -175,7 +183,7 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
     const [run] = await tx.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, binding.companyId), eq(heartbeatRuns.id, release.runId))).for("update");
     if (!coordinator || !run || run.runtimeMode !== "native"
-      || !(RELEASABLE_RUN_STATUSES.includes(run.status) || (release.kind === "operator_containment" && run.status === "running"))
+      || !(RELEASABLE_RUN_STATUSES.includes(run.status) || (["operator_containment", "stopped_remote_owner"].includes(release.kind) && run.status === "running"))
       || !(coordinator.phase === "observed" || (release.kind === "operator_containment" && coordinator.phase === "retryable_failure"))
       || coordinator.resultId !== null
       || coordinator.leaseOwner !== release.leaseOwner || coordinator.attempt !== release.attempt) return false;
@@ -235,6 +243,46 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
       containedExpiryEpoch = expiry.epoch;
       // The explicit original-host controller+provider attestation replaces a
       // meaningless local PID observation only in this exact authority branch.
+    } else if (release.kind === "stopped_remote_owner") {
+      if (run.status !== "running" || run.errorCode !== "native_execution_ownership_unverified"
+        || !task || task.assigneeAgentId !== run.agentId || ["done", "cancelled"].includes(task.status)
+        || !coordinator.leaseExpiresAt || coordinator.leaseExpiresAt > now
+        || coordinator.controllerGeneration !== release.controllerGeneration
+        || coordinator.leaseOwner?.startsWith("native-finalizer:") || coordinator.leaseOwner?.startsWith("native-cleanup:")
+        || coordinator.failureDetail?.successorRunId || run.resultJson?.[LEGACY_WORKSPACE_RECOVERY_KEY] != null
+        || readRunCancellation(run.resultJson) || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)
+        || adapterExecutionControls.has(run.id) || activeNativeExecutionRunIds.has(run.id)
+        || (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > now)) return false;
+      for (const observation of release.observations) {
+        const lease = observation.lease;
+        if (lease.companyId !== run.companyId || lease.heartbeatRunId !== run.id
+          || !remoteTerminationReceipt(lease, observation.receipt)) return false;
+        const [peer] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+          ne(environmentLeases.id, lease.id), eq(environmentLeases.provider, lease.provider!),
+          eq(environmentLeases.providerLeaseId, lease.providerLeaseId!),
+          inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"]))).limit(1);
+        if (peer) return false;
+        // The provider read already completed outside these locks. Preserve its
+        // exact lease snapshot through the existing CAS/stop-receipt owner;
+        // never dispatch a stop against a merely uncertain running turn.
+        const prepared = await prepareUnconfirmedSourceSandboxStop(tx, lease);
+        if (!prepared || !await settleStopOnlyCleanup(tx, prepared, {
+          attemptId: String(prepared.metadata?.pendingCleanupAttemptId), receipt: observation.receipt,
+          receiptSource: "provider_inspection" })) return false;
+      }
+      const leases = await tx.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+      // Local process absence cannot retire this uncertain owner. Every recorded
+      // allocation must be remote and the shared proof must validate receipts,
+      // allocation peers and the saved remote profile before settlement.
+      if (!leases.length || leases.some(lease => !lease.provider || lease.provider === "local")
+        || !(await readFreshThreadStopProof(tx, run, coordinator.issueId)).gone) return false;
+      const [pending] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, run.id), pendingNativeStop)).limit(1);
+      const [work] = await tx.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
+        eq(workspaceOperations.companyId, run.companyId), eq(workspaceOperations.heartbeatRunId, run.id),
+        inArray(workspaceOperations.status, ["queued", "running"]))).limit(1);
+      if (pending || work) return false;
     } else if (release.kind === "expired_owner") {
       if (!coordinator.leaseExpiresAt || coordinator.controllerGeneration !== release.controllerGeneration
         || run.resultJson?.[LEGACY_WORKSPACE_RECOVERY_KEY] != null
@@ -267,7 +315,8 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
       eq(nativeRunResults.schemaStatus, "accepted"))).limit(1);
     if (accepted) return false;
 
-    const failureCode = release.kind === "operator_containment" ? "native_restart_recovery_blocked"
+    const failureCode = release.kind === "stopped_remote_owner" ? "native_controller_recovery_missing_evidence:retained_sandbox_binding"
+      : release.kind === "operator_containment" ? "native_restart_recovery_blocked"
       : coordinator.failureCode ?? run.errorCode ?? FALLBACK_FAILURE_CODE;
     const scope = { companyId: run.companyId, agentId: run.agentId, runId: run.id, issueId: coordinator.issueId };
     await notifyExecutionRunWork(tx, scope);
@@ -276,6 +325,7 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, run.companyId);
     const [updated] = await tx.update(nativeRunFinalizations).set({
       phase: "terminal_failure",
+      ...(release.kind === "stopped_remote_owner" ? { controllerGeneration: coordinator.controllerGeneration + 1 } : {}),
       leaseOwner: null,
       leaseExpiresAt: null,
       controlDeadlineAt: null,
@@ -313,10 +363,20 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
     )).returning({ runId: nativeRunFinalizations.runId });
     if (!updated) return false;
     const [settledRun] = await tx.update(heartbeatRuns).set({ nativePhase: "terminal_failure", nativePhaseUpdatedAt: now, updatedAt: now,
+      ...(release.kind === "stopped_remote_owner" ? { status: "failed", finishedAt: now,
+        errorCode: failureCode, error: "The earlier remote allocation is confirmed stopped; its result was not recovered.",
+        processPid: null, processGroupId: null, processStartedAt: null, executionControlDeadlineAt: null } : {}),
       ...(release.kind === "operator_containment" ? { status: "failed", finishedAt: now,
         errorCode: failureCode, error: "The original controller and provider were contained by a board operator. Review the recorded action outcomes before explicitly retrying.",
         processPid: null, processGroupId: null, processStartedAt: null, executionControlDeadlineAt: null } : {}),
     }).where(eq(heartbeatRuns.id, run.id)).returning();
+    if (release.kind === "stopped_remote_owner" && settledRun) {
+      await preserveNativeFailedWorkspace(tx, settledRun);
+      await settleNativeTerminalWake(tx, settledRun);
+      await notifyNativeStatusReassessment(tx, scope);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionReplacement);
+    }
     if (release.kind === "operator_containment" && settledRun) {
       await preserveNativeFailedWorkspace(tx, settledRun);
       await settleNativeTerminalWake(tx, settledRun);
@@ -360,6 +420,36 @@ export async function settleUnstartedNativeSessionResume(db: Db, claim: {
       "Native session resume owner release failed; the abandoned owner pass will release it after lease expiry");
     return false;
   });
+}
+
+/** The existing orphan inventory calls this before preserving an unverified
+ * observed owner. Provider reads finish BEFORE its transaction; there is no new
+ * scan. Proof is re-read under task/coordinator/run locks and the generation is
+ * fenced on settle. Unknown/live observations never request a provider stop. */
+export async function settleStoppedRemoteNativeOwner(db: Db, runId: string, now = new Date(),
+  inspectLeaseResource?: (leaseId: string) => Promise<unknown>): Promise<boolean> {
+  const [owner] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+  if (!owner?.leaseOwner || owner.phase !== "observed" || owner.resultId
+    || !owner.leaseExpiresAt || owner.leaseExpiresAt > now) return false;
+  const observations: Array<{ lease: typeof environmentLeases.$inferSelect; receipt: unknown }> = [];
+  if (inspectLeaseResource) {
+    const leases = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, owner.companyId), eq(environmentLeases.heartbeatRunId, runId)));
+    for (const lease of leases) {
+      if (!lease.provider || lease.provider === "local" || !lease.providerLeaseId
+        || hasBoundRemoteStopReceipt(lease) || hasStopOnlyCleanup(lease)
+        || lease.metadata?.pendingCleanupInFlight === true) continue;
+      const [peer] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        ne(environmentLeases.id, lease.id), eq(environmentLeases.provider, lease.provider),
+        eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
+        inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"]))).limit(1);
+      if (peer) continue;
+      const receipt = await inspectLeaseResource(lease.id).catch(() => undefined);
+      if (remoteTerminationReceipt(lease, receipt)) observations.push({ lease, receipt });
+    }
+  }
+  return settleFailedRunOwner(db, { kind: "stopped_remote_owner", runId, observations,
+    leaseOwner: owner.leaseOwner, attempt: owner.attempt, controllerGeneration: owner.controllerGeneration }, now);
 }
 
 let abandonedOwnerReleaseCursor: string | null = null;
