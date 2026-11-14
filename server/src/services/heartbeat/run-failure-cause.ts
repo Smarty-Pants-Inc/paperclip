@@ -81,7 +81,9 @@ const TRANSIENT_PRE_DISPATCH_FAILURE_CAUSES: ReadonlySet<string> = new Set([
 /**
  * A failed native run that may re-queue itself without a person: it carries the
  * pre-dispatch record, a generic failure code and a transient database cause.
- * Anything else keeps the native hold and its manual Retry.
+ * This predicate controls automatic re-queueing, not the resume barrier.
+ * Other positively pre-dispatch failures can use normal Retry or resend
+ * admission when the shared no-execution proof finds no contradictions.
  */
 export function isNativePreDispatchTransientFailure(run: {
   runtimeMode: string | null; status: string; errorCode: string | null; resultJson: unknown;
