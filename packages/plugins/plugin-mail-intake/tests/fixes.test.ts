@@ -142,19 +142,19 @@ describe("review fixes", () => {
   });
   it.each([-1, "1700000000000", null, Infinity, 1.5])("rejects an invalid persisted floor %s", async notBefore => {
     const f = fixture({ ...empty(), notBefore });
-    await expect(runTick(f.ctx, "company", config)).rejects.toThrow(SAFE_ERROR);
+    await expect(runTick(f.ctx, "company", config)).rejects.toThrow("state invalid");
     expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.state.set).not.toHaveBeenCalled();
   });
   it("does not fire if the new floor cannot be durably checkpointed", async () => {
     const f = fixture();
     f.ctx.state.set.mockRejectedValue(new Error("provider secret"));
-    await expect(runTick(f.ctx, "company", config)).rejects.toThrow(SAFE_ERROR);
+    await expect(runTick(f.ctx, "company", config)).rejects.toThrow("state write failed");
     expect(f.attempts).toEqual([]); expect(f.saved()).toEqual(empty());
   });
   it.each([-1, "1700000000000", null])("rejects invalid last-failure time %s without leaking state", async lastFailureAt => {
     const f = fixture({ ...empty(), failures: [{ id: "aa", internalDate: now,
       attempts: 10, nextRetryAt: now, lastFailureAt }] });
-    await expect(runTick(f.ctx, "company", config)).rejects.toThrow(SAFE_ERROR);
+    await expect(runTick(f.ctx, "company", config)).rejects.toThrow("state invalid");
     expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.logger.warn).not.toHaveBeenCalled();
   });
   it("uses a default seven-day window on every list page; rejects config beyond 30 days", async () => {
@@ -184,7 +184,7 @@ describe("review fixes", () => {
     { version: 2, seen: [{ id: "aa", internalDate: now }], failures: [{ id: "aa", internalDate: now, attempts: 1, nextRetryAt: now }] },
   ])("rejects corrupt or content-bearing timestamp/failure state %#", async initial => {
     const f = fixture(initial);
-    await expect(runTick(f.ctx, "company", config)).rejects.toThrow(SAFE_ERROR);
+    await expect(runTick(f.ctx, "company", config)).rejects.toThrow("state invalid");
     expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.state.set).not.toHaveBeenCalled();
   });
   it("does not deliver metadata outside the window or prune on an incomplete scan", async () => {

@@ -207,7 +207,9 @@ describe("F3: initialize-seen returns at once; the job reads the mailbox", () =>
     const worker = await h.start();
     await expect(worker.tick()).resolves.toBeUndefined();
     expect(h.ctx.http.fetch).not.toHaveBeenCalled();
-    expect(h.ctx.state.set).not.toHaveBeenCalled();
+    // 0.1.6: only the instance-scoped configured-company set may be written.
+    expect(h.ctx.state.set.mock.calls.map(([key]) => (key as { stateKey: string }).stateKey))
+      .toEqual(["configured-companies"]);
   });
   it("enabling before the tick runs does not complete a pending request; the enabled tick names missing state", async () => {
     const h = host();

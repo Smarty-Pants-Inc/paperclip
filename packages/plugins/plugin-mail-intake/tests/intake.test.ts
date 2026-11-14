@@ -13,6 +13,10 @@ const config: MailConfig = {
   routineOrigin: "https://hq.smartypants.ai", routinePublicId: "test-mail", scanWindowDays: 7,
 };
 const access = "ACCESS_SECRET_SENTINEL", refresh = "REFRESH_SECRET_SENTINEL", bearer = "FIRE_SECRET_SENTINEL";
+// Calls on the plugin's company-scoped mail rows, excluding the 0.1.6 instance-scoped
+// configured-company set (which a configChanged delivery writes once).
+const mailCalls = (fn: { mock: { calls: unknown[][] } }) =>
+  fn.mock.calls.filter(([key]) => (key as { stateKey?: string } | null)?.stateKey !== "configured-companies");
 const message = (id: string) => ({ id, threadId: "ff" });
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status });
 const state = (ids: string[] = []) => ({ version: 2, notBefore: Date.now() - 7 * 86_400_000,
@@ -26,11 +30,15 @@ function fixture(initial: unknown = []) {
   // under its own init:* key, as on the host (plugin_state is keyed by stateKey).
   let pending: unknown = null;
   const isInit = (key: unknown) => String((key as { stateKey?: string } | null)?.stateKey ?? "").startsWith("init:");
+  // 0.1.6: the instance-scoped configured-company set has its own row too.
+  let known: unknown = null;
+  const isKnown = (key: unknown) => (key as { stateKey?: string } | null)?.stateKey === "configured-companies";
   const ctx = {
     logger: { warn: vi.fn() },
     state: {
-      get: vi.fn(async (key?: unknown) => structuredClone(isInit(key) ? pending : saved)),
+      get: vi.fn(async (key?: unknown) => structuredClone(isKnown(key) ? known : isInit(key) ? pending : saved)),
       set: vi.fn(async (key: unknown, value: unknown) => {
+        if (isKnown(key)) { known = structuredClone(value); return; }
         if (isInit(key)) { pending = structuredClone(value); return; }
         saved = structuredClone(value); writes.push(saved); order.push("save");
       }),
@@ -132,7 +140,7 @@ describe("mail-intake job", () => {
   it.each([null, {}, ["aa", "aa"], ["body content"], [{ id: "aa", subject: "private" }]])(
     "fails closed on absent/corrupt state %j", async stored => {
       const f = fixture(stored);
-      await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
+      await expect(runTick(f.ctx, company, config)).rejects.toThrow("state invalid");
       expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.writes).toEqual([]);
     });
   it.each([
@@ -217,7 +225,7 @@ describe("mail-intake job", () => {
     });
     if (mode === "lost-kv") f.ctx.state.set.mockRejectedValueOnce(new Error(access));
     if (mode === "lost-kv") {
-      await expect(runTick(f.ctx, company, config)).rejects.toThrow(SAFE_ERROR);
+      await expect(runTick(f.ctx, company, config)).rejects.toThrow("state write failed");
       expect(f.saved()).toEqual(state());
     } else {
       await runTick(f.ctx, company, config);
@@ -326,7 +334,7 @@ describe("registered job and explicit company binding", () => {
       details: { parked: [{ id: "aa", attempts: 10, lastFailureAt }] } });
     expect(f.ctx.state.get).toHaveBeenCalledWith(seenKey(company, config.mailbox));
     expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.secrets.resolve).not.toHaveBeenCalled();
-    expect(f.ctx.state.set).not.toHaveBeenCalled();
+    expect(mailCalls(f.ctx.state.set)).toEqual([]);
     const restarted = await worker(f.saved());
     expect(await restarted.plugin.onHealth?.()).toEqual(await f.plugin.onHealth?.());
   });
@@ -359,11 +367,11 @@ describe("registered job and explicit company binding", () => {
       { id: "aa", internalDate: Date.now(), attempts: 10, nextRetryAt: Date.now(), subject: access },
     ] }, false);
     expect(await f.plugin.onHealth?.()).toEqual({ status: "error", message: "mail intake is not configured" });
-    expect(f.ctx.state.get).not.toHaveBeenCalled();
+    expect(mailCalls(f.ctx.state.get)).toEqual([]);
     f.ctx.config.get.mockResolvedValue({ ...config });
     await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
     expect(await f.plugin.onHealth?.()).toEqual({ status: "error", message: "state invalid" });
-    expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.state.set).not.toHaveBeenCalled();
+    expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(mailCalls(f.ctx.state.set)).toEqual([]);
   });
   it("initialization uses the configured window and rejects IDs outside it", async () => {
     const f = await worker(null);
