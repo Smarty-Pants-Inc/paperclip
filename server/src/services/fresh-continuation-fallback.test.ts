@@ -367,13 +367,14 @@ suite("fresh-continuation fallback", () => {
     expect(await successors(next.id)).toHaveLength(0);
     const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NATIVE_CONTINUATION_REFUSED_ACTION);
+    // org 09:11Z: unansweredChat() is a chat; B''s held note names a new chat, not a new task.
+    expect(notices[0]!.body).toBe("Coder can't continue this chat from its saved state. Start a new chat with Coder; this one stays readable.");
     expect(notices[0]!.body).not.toMatch(/sending it again is safe/i);
     expect(notices[0]!.metadata).toMatchObject({ sourceRunId: next.id, authorizationReason: `unanswered_message:${f.messageId}`,
       recoveryResponsibility: "user" });
     const rows = notices[0]!.metadata!.sections!.flatMap(section => section.rows);
     expect(rows).toContainEqual({ type: "key_value", label: "Failure code", value: code });
-    expect(rows).toContainEqual({ type: "key_value", label: "Next action", value: "Assign this agent a new task to continue." });
+    expect(rows).toContainEqual({ type: "key_value", label: "Next action", value: "Start a new chat with Coder." });
   }, 60_000);
 
   it("invalidates an older pending terminal fallback before it can occupy an agent slot", async () => {

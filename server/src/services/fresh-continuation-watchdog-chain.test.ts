@@ -145,7 +145,8 @@ suite("fresh-continuation watchdog snapshot-binding chain", () => {
     expect.soft(forbidden).toHaveLength(0);
     expect.soft(records).toHaveLength(2);
     expect.soft(notes).toHaveLength(1);
-    expect.soft(notes[0]?.body).toBe(NATIVE_CONTINUATION_REFUSED_ACTION);
+    // org 09:11Z: this fixture is a chat; B''s held note names a new chat, not a new task.
+    expect.soft(notes[0]?.body).toBe("Coder can't continue this chat from its saved state. Start a new chat with Coder; this one stays readable.");
     expect.soft(notes[0]?.metadata).toMatchObject({ authorizationReason: `unanswered_message:${messageId}`,
       recoveryResponsibility: "user" });
   }, 60_000);

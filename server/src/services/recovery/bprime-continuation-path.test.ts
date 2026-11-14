@@ -10,7 +10,6 @@ import { truncateTablesWithDeadlockRetry } from "../../__tests__/helpers/truncat
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { continueHeldExecutions, resetBacklogContinuationPacingForTests } from "../fresh-continuation-fallback.js";
 import { heartbeatService } from "../heartbeat.js";
-import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { settleUnansweredPersonMessagesForTask } from "./unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -173,9 +172,8 @@ suite("B' waits for the continuation path (Smarty fork, TEMPORARY)", () => {
     const notices = await systemComments(f.issueId);
     expect(notices.map(n => n.body).filter(body => SAFE.test(body)), "never 'sending again is safe'").toEqual([]);
     expect(notices, "one note: the resend's note replaces the first").toHaveLength(1);
-    // The one wording for a refused conversation (HELD_PREDECESSOR_NOTICE), as the existing G3 row
-    // and fork-lead's SMAA-1431 replay (fresh-continuation-watchdog-chain) assert for this refusal.
-    expect(notices[0]!.body).toBe(HELD_PREDECESSOR_NOTICE);
+    // org 09:11Z: this fixture is a chat, so the held note names a new chat, not a new task.
+    expect(notices[0]!.body).toBe("Coder can't continue this chat from its saved state. Start a new chat with Coder; this one stays readable.");
     expect(notices[0]!.presentation).toMatchObject({ title: "This conversation can't continue" });
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${resend}`);
   }, 90_000);

@@ -32,6 +32,11 @@ const HELD = "Your saved work is kept, but this conversation cannot continue. As
 const NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
 const NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 const NO_REPLY = "This run finished without a reply to your message. Sending it again is safe.";
+// org 09:11Z: the default fixture is a CHAT (isConversation), where B''s action names a new chat, not
+// a new task. Rows whose fixture is a chat assert these; task rows keep the task constants above.
+const CHAT_NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat with Managed Pi; this one stays readable.";
+const CHAT_NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, start a new chat with Managed Pi; this one stays readable.";
+const CHAT_HELD = "Managed Pi can't continue this chat from its saved state. Start a new chat with Managed Pi; this one stays readable.";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("unanswered person message notice (C9, the stranded sweep)", () => {
@@ -103,6 +108,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   };
 
   it("SMAA-143 msg 1: native_session_interrupted (backup_without_reusable_lease) with its retries exhausted -> exactly one notice, code in metadata only", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
@@ -110,7 +116,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(notices[0]!.body).toBe(CHAT_NOT_ANSWERED);
     expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without/);
     expect(notices[0]!.metadata?.recoveryResponsibility).toBe("user");
     expect(codeOf(notices[0]!)).toBe("runner_harness_state_mismatch");
@@ -130,19 +136,21 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   it("SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed", error: "Native session failed" });
     await f.boardHold("native_continuation_requires_reconciliation", id);
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(notices[0]!.body).toBe(CHAT_NOT_ANSWERED);
     expect(codeOf(notices[0]!)).toBe("adapter_failed");
     const rows = (notices[0]!.metadata?.sections ?? []).flatMap(section => section.rows) as Array<{ label?: string }>;
     expect(rows.some(row => row.label === "Recovery action")).toBe(true);
   });
 
   it("SMAA-1370 (REG-03 on Boat): 'runnerd transport closed during provider startup', blocked by the board -> exactly one notice", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_retry_exhausted",
       error: "runnerd transport closed during provider startup" });
@@ -150,12 +158,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(notices[0]!.body).toBe(CHAT_NOT_ANSWERED);
     expect(notices[0]!.body).not.toContain("runnerd");
     expect(codeOf(notices[0]!)).toBe("native_session_retry_exhausted");
   });
 
   it("SMAA-501: a person comment with no run bound in 180 s on a task held by native_continuation_requires_reconciliation -> exactly one notice", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture({ status: "blocked" });
     const earlier = await f.run({ commentId: await f.message("first"), status: "failed", errorCode: "native_continuation_requires_reconciliation" });
     await f.boardHold("native_continuation_requires_reconciliation", earlier, "stranded_assigned_issue");
@@ -167,10 +176,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(2);
-    expect(notices.map(notice => notice.body)).toContain(NO_RUN);
+    expect(notices.map(notice => notice.body)).toContain(CHAT_NO_RUN);
   });
 
   it("SMAA-501 (RFL 20:37Z): a comment coalesced into a remote_cleanup execution wait whose wake FAILED -> exactly one notice, at the failure (no timer)", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     const earlier = await f.run({ commentId: await f.message("first"), status: "succeeded" });
     await f.reply(earlier);
@@ -189,12 +199,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(notices[0]!.body).toBe(CHAT_NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${comment!.id}`);
     expect(JSON.stringify(notices[0])).not.toContain("receipt missing");
   });
 
   it("REG-21: after a gateway key rotation the person's wake FAILED 'provider or completion contract changed', no run, blocked -> exactly one notice", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture({ status: "blocked" });
     const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, body: "Are you there?",
       authorType: "user", authorUserId: f.userId, createdAt: new Date(Date.now() - 10_000) }).returning();
@@ -204,17 +215,18 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(notices[0]!.body).toBe(CHAT_NO_RUN);
     expect(JSON.stringify(notices[0])).not.toContain("completion contract");
   });
 
   it("issues.ts:20740 save-to-wake: a saved person comment whose wake threw (no run, no wake) -> exactly one notice keyed on the comment", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     const commentId = await f.message();
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(notices[0]!.body).toBe(CHAT_NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     expect(codeOf(notices[0]!)).toBe("no_run");
   });
@@ -242,13 +254,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   it("G4: a pre-turn refusal recorded as adapter_failed (legacy_owner_unverified) -> one held notice", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
       error: "runner_state_identity_mismatch: legacy_owner_unverified" });
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(HELD);
+    expect(notices[0]!.body).toBe(CHAT_HELD);
     expect(codeOf(notices[0]!)).toBe("runner_state_identity_mismatch");
   });
 
@@ -262,13 +275,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   it("G3: bare runner_process_termination_unconfirmed, and missing_evidence:checkpoint_binding -> one notice each", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     for (const error of ["runner_process_termination_unconfirmed", "native_controller_recovery_missing_evidence:checkpoint_binding"]) {
       const f = await fixture();
       await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed", error });
       await f.sweep();
       const notices = await f.visible();
       expect(notices).toHaveLength(1);
-      expect(notices[0]!.body).toBe(HELD);
+      expect(notices[0]!.body).toBe(CHAT_HELD);
     }
   });
 
@@ -280,12 +294,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   it("raw error text never shows: a prose error keeps only the run's allowlisted code in metadata, plain words in the body", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed",
       error: "Something exploded at /srv/secret/path with token abc123" });
     await f.sweep();
     const [notice] = await f.visible();
-    expect(notice!.body).toBe(NOT_ANSWERED);
+    expect(notice!.body).toBe(CHAT_NOT_ANSWERED);
     expect(JSON.stringify(notice)).not.toMatch(/exploded|secret|abc123/);
     expect(codeOf(notice!)).toBe("adapter_failed");
     const unknown = await fixture();
@@ -332,16 +347,18 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   it("RFL F4: an unrelated timer run's success is not evidence; the message's own path gives exactly one notice", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     await f.message();
     await f.run({ commentId: null, status: "succeeded", wakeReason: "heartbeat_timer" });
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(notices[0]!.body).toBe(CHAT_NO_RUN);
   });
 
   it("fabric-v2 (21:40Z): a comment delivered as a run's FIRST-TURN input is carried by that run: no notice while it runs or after it answers; one if it fails", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     for (const outcome of ["answers", "fails"] as const) {
       const f = await fixture();
       await f.reply(await f.run({ commentId: await f.message("first"), status: "succeeded" }));
@@ -368,7 +385,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         const notices = await f.visible();
         expect(notices).toHaveLength(1);
         expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
-        expect(notices[0]!.body).toBe(NOT_ANSWERED);
+        expect(notices[0]!.body).toBe(CHAT_NOT_ANSWERED);
       }
     }
   });
@@ -646,6 +663,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   const rowsOf = (notice: { metadata: unknown }) =>
     ((notice.metadata as { sections?: Array<{ rows: Array<{ label?: string; value?: string }> }> })?.sections ?? []).flatMap(section => section.rows);
   it("E3.04 (2nd bound): a carrying queued run that never starts -> waiting note at ~2 min, the SAME note becomes the failure text at ~10 min", async () => {
+    // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     const commentId = await f.message();
     await f.run({ commentId, status: "queued" });
@@ -665,7 +683,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     notices = await f.visible();
     expect(notices).toHaveLength(1);
     expect(notices[0]!.id).toBe(noteId);
-    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(notices[0]!.body).toBe(CHAT_NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
     await settleAt(f, 12 * 60_000);
@@ -765,6 +783,48 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices[0]!.id).toBe(waitingNote!.id);
     expect(notices[0]!.body).toBe(PAUSED_TEXT);
   });
+
+  // org 09:11Z (app-lead's SMAAA-1907 screenshots): in a CHAT (Paperclip's isConversation,
+  // agent-conversations.ts:39-43) every B' action names the chat's way on; in a task it stays
+  // "assign this agent a new task". One row per kind, chat and task, for each note that names an action.
+  const nextActionOf = (notice: { metadata: unknown }) =>
+    ((notice.metadata as { sections?: Array<{ rows: Array<{ label?: string; value?: string }> }> })?.sections ?? [])
+      .flatMap(section => section.rows).find(row => row.label === "Next action")?.value;
+  const CHAT_ACTION = {
+    failed: { body: "Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat with Managed Pi; this one stays readable.",
+      next: "Send the message again; if it fails again, start a new chat with Managed Pi." },
+    noRun: { body: "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, start a new chat with Managed Pi; this one stays readable.",
+      next: "Send the message again; if it fails again, start a new chat with Managed Pi." },
+    noReply: { body: NO_REPLY, next: "Send the message again; if it fails again, start a new chat with Managed Pi." },
+    held: { body: "Managed Pi can't continue this chat from its saved state. Start a new chat with Managed Pi; this one stays readable.",
+      next: "Start a new chat with Managed Pi." },
+  };
+  const TASK_ACTION = {
+    failed: { body: NOT_ANSWERED, next: "Send the message again; if it fails again, assign this agent a new task." },
+    noRun: { body: NO_RUN, next: "Send the message again; if it fails again, assign this agent a new task." },
+    noReply: { body: NO_REPLY, next: "Send the message again; if it fails again, assign this agent a new task." },
+    held: { body: HELD, next: "Assign this agent a new task to continue." },
+  };
+  for (const chat of [true, false]) {
+    for (const kind of ["failed", "noRun", "noReply", "held"] as const) {
+      it(`action wording, ${chat ? "chat" : "task"}: ${kind}`, async () => {
+        const f = await fixture({ chat, status: "in_progress" });
+        const commentId = await f.message();
+        if (kind === "failed") await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+        if (kind === "noReply") await f.run({ commentId, status: "succeeded" });
+        if (kind === "held") await f.run({ commentId, status: "failed", errorCode: "native_continuation_requires_reconciliation",
+          error: "native_controller_recovery_missing_evidence:snapshot_binding" });
+        await f.sweep();
+        await settleAt(f, 3 * 60_000);
+        const notices = await f.visible();
+        expect(notices).toHaveLength(1);
+        const expected = (chat ? CHAT_ACTION : TASK_ACTION)[kind];
+        expect(notices[0]!.body).toBe(expected.body);
+        expect(nextActionOf(notices[0]!)).toBe(expected.next);
+        if (chat) expect(`${notices[0]!.body} ${nextActionOf(notices[0]!)}`).not.toMatch(/new task/i);
+      });
+    }
+  }
 
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
     for (let round = 0; round < 4; round++) {
