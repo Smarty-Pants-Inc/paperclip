@@ -1180,7 +1180,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(1);
   });
 
-  it("D8: a card answered before the continuation fails leaves one updated true note with no standing continuation promise", async () => {
+  it("D8: a card answered before the continuation fails gets ONE NEW true note; the earlier held note is kept unchanged and marked superseded (RFL 10:12Z R2)", async () => {
     const f = await fixture({ status: "in_review", chat: false });
     const first = await f.message("Write me a summary.");
     const seed = await f.run({ commentId: first, status: "succeeded" });
@@ -1201,11 +1201,65 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         interactionStatus: "answered", mutation: "interaction", sourceCommentId: first, wakeCommentId: first, wakeCommentIds: [first],
         wakeReason: "issue_commented", source: "issue.interaction.respond" }, createdAt: f.at(), finishedAt: f.at() }).returning();
     await f.sweep();
+    // RFL 10:12Z (R2 of D8): no edit in place (a person may already have read it; notes are history,
+    // org 09:18Z). ONE NEW true note says the card was answered but the follow-up run failed, with the next
+    // action (chat-aware); the earlier held note is kept unchanged and marked superseded by it.
     const notes = await f.visible();
-    expect(notes).toHaveLength(1);
-    expect(notes[0]!.id).toBe(initialNote!.id);
-    expect(notes[0]!.body).toMatch(/card has been answered/i);
-    expect(notes[0]!.body).not.toMatch(/will continue from there|answer the card/i);
+    expect(notes, "the earlier held note is kept, and one new note").toHaveLength(2);
+    const kept = notes.find(note => note.id === initialNote!.id)!;
+    expect(kept.body, "the earlier note's body is unchanged").toBe(initialNote!.body);
+    expect(kept.deletedAt).toBeNull();
+    const current = notes.filter(note => !(note.metadata as Record<string, unknown> | null)?.supersededBy);
+    expect(current).toHaveLength(1);
+    expect(current[0]!.id).not.toBe(initialNote!.id);
+    expect((kept.metadata as Record<string, unknown> | null)?.supersededBy).toBe(current[0]!.id);
+    expect(current[0]!.body).toMatch(/was answered/i);
+    expect(current[0]!.body).toMatch(/follow-up run failed/i);
+    expect(current[0]!.body).not.toMatch(/will continue from there|answer the card|sending it again is safe/i);
+    expect(nextActionOf(current[0]!)).toBe("Send your message again; if it fails again, assign this agent a new task.");
     expect(failedContinuation).toBeDefined();
+    await f.sweep();
+    expect(await f.visible(), "no further note").toHaveLength(2);
+  });
+  it("D8 (chat): a card answered before the continuation fails gets ONE NEW true note with the chat-aware action (RFL 10:12Z R2)", async () => {
+    const f = await fixture({ status: "in_review", chat: true });
+    const first = await f.message("Write me a summary.");
+    const seed = await f.run({ commentId: first, status: "succeeded" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId: seed, createdByAgentId: f.agentId, addresseeUserId: f.userId,
+      payload: questionPayload("Bullets or a paragraph?") as never, createdAt: f.at() }).returning();
+    const message = await f.message("What was the word?");
+    const held = await f.run({ commentId: message, status: "succeeded" });
+    await db.update(heartbeatRuns).set({ resultJson: heldResult }).where(eq(heartbeatRuns.id, held));
+    await f.sweep();
+    const [initialNote] = await f.visible();
+    await issueThreadInteractionService(db).answerQuestions(
+      { id: f.issueId, companyId: f.companyId, status: "in_review" }, card!.id,
+      { answers: [{ questionId: "format", optionIds: ["a"] }] }, { userId: f.userId });
+    const [failedContinuation] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "failed", errorCode: "adapter_failed", error: "provider_process_exited: boom", runtimeMode: "native", nativeIssueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, interactionId: card!.id, interactionKind: "ask_user_questions",
+        interactionStatus: "answered", mutation: "interaction", sourceCommentId: first, wakeCommentId: first, wakeCommentIds: [first],
+        wakeReason: "issue_commented", source: "issue.interaction.respond" }, createdAt: f.at(), finishedAt: f.at() }).returning();
+    await f.sweep();
+    // RFL 10:12Z (R2 of D8): no edit in place (a person may already have read it; notes are history,
+    // org 09:18Z). ONE NEW true note says the card was answered but the follow-up run failed, with the next
+    // action (chat-aware); the earlier held note is kept unchanged and marked superseded by it.
+    const notes = await f.visible();
+    expect(notes, "the earlier held note is kept, and one new note").toHaveLength(2);
+    const kept = notes.find(note => note.id === initialNote!.id)!;
+    expect(kept.body, "the earlier note's body is unchanged").toBe(initialNote!.body);
+    expect(kept.deletedAt).toBeNull();
+    const current = notes.filter(note => !(note.metadata as Record<string, unknown> | null)?.supersededBy);
+    expect(current).toHaveLength(1);
+    expect(current[0]!.id).not.toBe(initialNote!.id);
+    expect((kept.metadata as Record<string, unknown> | null)?.supersededBy).toBe(current[0]!.id);
+    expect(current[0]!.body).toMatch(/was answered/i);
+    expect(current[0]!.body).toMatch(/follow-up run failed/i);
+    expect(current[0]!.body).not.toMatch(/will continue from there|answer the card|sending it again is safe/i);
+    expect(nextActionOf(current[0]!)).toBe("Send your message again; if it fails again, start a new chat with Managed Pi.");
+    expect(failedContinuation).toBeDefined();
+    await f.sweep();
+    expect(await f.visible(), "no further note").toHaveLength(2);
   });
 });
