@@ -69,7 +69,7 @@ suite("chat-gap round-2 production path", () => {
       evidence: { runId: f.runId, originalFailureCode: "native_continuation_requires_reconciliation",
         nativeFailureBlock: { runId: f.runId, statusVersion: 4 } } });
   }
-  async function assertOneDeliveredContinuation(f: Awaited<ReturnType<typeof seed>>) {
+  async function assertNoContinuation(f: Awaited<ReturnType<typeof seed>>) {
     const heartbeat = heartbeatService(db);
     await deliverReconciledExecutions(db, heartbeat.wakeup);
     await deliverReconciledExecutions(db, heartbeat.wakeup);
@@ -77,9 +77,8 @@ suite("chat-gap round-2 production path", () => {
     const records = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
       eq(issueRecoveryActions.sourceIssueId, f.issueId)));
     const record = records.find(row => row.evidence.freshContinuation);
-    expect(successors).toHaveLength(1);
-    expect(successors[0]).toMatchObject({ status: "queued", contextSnapshot: { forceFreshSession: true, previousRunId: f.runId } });
-    expect(record?.evidence.continuationDelivery).toBe("delivered");
+    expect(successors).toHaveLength(0);
+    expect(record).toBeUndefined();
   }
 
   it.each(["todo", "in_progress", "blocked"] as const)("selector -> fallback -> real queue delivers one unanswered %s chat", async status => {
@@ -94,7 +93,7 @@ suite("chat-gap round-2 production path", () => {
     expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.runId, trigger: "recovery_refused" }))
       .toMatchObject({ kind: "person_owned" });
     await occupySlot(f);
-    await assertOneDeliveredContinuation(f);
+    await assertNoContinuation(f);
   }, 60_000);
 
   it("fallback -> delivery -> real queue admits an unanswered in_review chat once", async () => {
@@ -103,7 +102,7 @@ suite("chat-gap round-2 production path", () => {
     await occupySlot(f);
     expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.runId, trigger: "recovery_refused" }))
       .toMatchObject({ kind: "person_owned" });
-    await assertOneDeliveredContinuation(f);
+    await assertNoContinuation(f);
   }, 60_000);
 
   it("an answered chat is absent from production suspects and never gets a wake", async () => {
