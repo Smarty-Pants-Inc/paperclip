@@ -72,6 +72,16 @@ export function warmWindowEndsAtSql() {
  * it cannot promise to keep the task's files.
  */
 export function warmSandboxExpiryCandidateCondition() {
+  return and(warmSandboxIdleRetainedCondition(), nativeWarmSessionStopReadySql());
+}
+
+/**
+ * Every expiry condition except the native warm stop gate: a retained warm
+ * sandbox that only its own ended run references and nothing is using. The
+ * native warm close opener (`native-warm-close-opener.ts`) works on the rows
+ * that match this but not yet the gate.
+ */
+export function warmSandboxIdleRetainedCondition() {
   return and(
     eq(environmentLeases.status, "retained"),
     eq(environmentLeases.leasePolicy, "reuse_by_environment"),
@@ -84,7 +94,6 @@ export function warmSandboxExpiryCandidateCondition() {
       'portableTaskSuccessor', 'reusableLeaseSuccessor', 'reusableSandboxLeaseSuperseded',
       ${REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY}])`,
     sql`coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'true'`,
-    nativeWarmSessionStopReadySql(),
     sql`coalesce(${environmentLeases.metadata}#>>'{legacyShutdownWorkspaceSettlement,state}', '') <> 'pending'`,
     sql`not exists (select 1 from heartbeat_runs run where run.id = ${environmentLeases.heartbeatRunId}
       and run.status not in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`,

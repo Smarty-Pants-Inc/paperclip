@@ -3,6 +3,7 @@ import { environmentLeases, sandboxCreationOperations, type Db } from "@papercli
 import { hasDeferredEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { nextAbandonedWorkspaceFileHoldExpiryAt } from "./remote-workspace-abandoned-files-hold.js";
 import { nextWarmSandboxStopAt } from "./warm-sandbox-expiry.js";
+import { nextNativeWarmCloseOpenerAt } from "./native-warm-close-opener.js";
 
 export const ENVIRONMENT_CLEANUP_RETRY_MS = 5 * 60_000;
 
@@ -92,7 +93,8 @@ export async function nextEnvironmentCleanupAt(db: Db, backoffMs = ENVIRONMENT_C
     .from(sandboxCreationOperations).where(recoverableSandboxCreationCondition());
   const expiry = await nextAbandonedWorkspaceFileHoldExpiryAt(db);
   const warmStop = await nextWarmSandboxStopAt(db);
-  const deadlines = [row?.next, creation?.next, expiry, warmStop].filter((value): value is string | number => value != null).map(Number);
+  const nativeWarmClose = await nextNativeWarmCloseOpenerAt(db);
+  const deadlines = [row?.next, creation?.next, expiry, warmStop, nativeWarmClose].filter((value): value is string | number => value != null).map(Number);
   const saved = deadlines.length ? Math.min(...deadlines) : null;
   const buffered = hasDeferredEnvironmentCleanup(db) ? Date.now() + backoffMs : null;
   return saved === null ? buffered : buffered === null ? saved : Math.min(saved, buffered);

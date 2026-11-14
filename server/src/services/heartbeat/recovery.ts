@@ -33,6 +33,7 @@ import { preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } fr
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { expireAbandonedWorkspaceFileHoldsWhenDue, parkAbandonedWorkspaceFilesLease, recordAbandonedWorkspaceFilesRemoved } from "../remote-workspace-abandoned-files-hold.js";
 import { stopWarmSandboxesPastWindowWhenDue } from "../warm-sandbox-expiry.js";
+import { sweepNativeWarmCloseOpeners } from "../native-warm-close-opener.js";
 import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
 import {
   hasStopOnlyCleanup,
@@ -1752,6 +1753,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
     if (!manualRetry) await expireAbandonedWorkspaceFileHoldsWhenDue(db).catch(() => {
       logger.warn({ errorKind: "abandoned_workspace_files_expiry_failed" }, "abandoned workspace file expiry failed; a later sweep retries");
+    });
+    // A native warm session whose window ended but whose close nothing
+    // recorded (restart, dead process, another close path, a lost write) is
+    // closed here, or given up on with its explicit backstop, so the native
+    // warm stop gate has a durable opener (native-warm-close-opener.ts).
+    if (!manualRetry) await sweepNativeWarmCloseOpeners(db).catch(() => {
+      logger.warn({ errorKind: "native_warm_close_opener_failed" }, "native warm close opener failed; a later sweep retries");
     });
     // A warm sandbox whose warm window ended is handed to the stop-only cleanup
     // here, so the rows read below already include its first stop.
