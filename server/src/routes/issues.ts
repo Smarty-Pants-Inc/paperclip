@@ -52,6 +52,7 @@ import { resumeNativeWorkspaceAfterOwnerStop } from "../services/native-runtime/
 import { enqueueOwnQuestionDismissalWake } from "../services/native-runtime/own-question-wait.js";
 import { confirmNativeControllerStopped, NATIVE_CONTROLLER_HOST_UNVERIFIED } from "../services/native-runtime/native-controller-host-recovery.js";
 import { confirmOwnerGone, OWNER_UNPROVABLE_CAUSE } from "../services/recovery/owner-gone-attestation.js";
+import { recoveryService } from "../services/recovery/service.js";
 import { OWNABLE_KINDS } from "../services/recovery/ownership-registry.js";
 import { retryNativeWorkspaceExport } from "../services/native-runtime/native-workspace-export-retry.js";
 import { deferredWakeJoinsFirstTurn, firstTurnClaimedCommentIds, firstTurnQueuedCommentIds, firstTurnTakesAllQueuedComments, firstTurnWakeColumns, firstTurnWakeContextFields, firstTurnWakePayloadFields, runAcceptsFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
@@ -10762,6 +10763,17 @@ export function issueRoutes(
         ) {
           throw notFound("Active recovery action not found");
         }
+        const currentRecoveryEvidence = parseObject(activeRecoveryAction.evidence);
+        const currentRetryRefusal = parseObject(currentRecoveryEvidence.taskRetryRefusal);
+        if (outcome === "restored" && sourceIssueStatus === "todo" &&
+            currentRetryRefusal.schema === "paperclip.task-retry-source-refusal.v1" &&
+            currentRetryRefusal.currentRunId === currentRecoveryEvidence.latestRunId &&
+            currentRetryRefusal.sourceRunId !== currentRetryRefusal.currentRunId) {
+          throw conflict(
+            "The current run's recovery card is shown on this task. Use its current recovery outcome; the older run cannot be retried.",
+            { code: "task_retry_source_changed" },
+          );
+        }
         await requireRecoveryActionAuthority(
           req,
           lockedIssue,
@@ -11180,7 +11192,66 @@ export function issueRoutes(
       try {
         result = await runResolution();
       } catch (error) {
-        if (staleSourceRefusal) await recoveryActionsSvc.recordTaskRetrySourceRefusal(staleSourceRefusal);
+        const sourceRefusal = staleSourceRefusal as {
+          companyId: string;
+          sourceIssueId: string;
+          recoveryActionId: string;
+          sourceRunId: string;
+          currentRunId: string;
+        } | null;
+        if (sourceRefusal) {
+          const refusal = await recoveryActionsSvc.recordTaskRetrySourceRefusal(sourceRefusal);
+          if (refusal) {
+            const [currentRun] = await db.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, sourceRefusal.companyId),
+              eq(heartbeatRuns.id, sourceRefusal.currentRunId),
+            )).limit(1);
+            const [currentIssue] = await db.select().from(issueRows).where(and(
+              eq(issueRows.companyId, sourceRefusal.companyId),
+              eq(issueRows.id, sourceRefusal.sourceIssueId),
+            )).limit(1);
+            if (currentRun && currentIssue) {
+              let currentCard = await recoveryActionsSvc.getActiveForIssue(
+                sourceRefusal.companyId,
+                sourceRefusal.sourceIssueId,
+              );
+              let activeEvidence = parseObject(currentCard?.evidence);
+              if (activeEvidence.latestRunId !== sourceRefusal.currentRunId) {
+                const previousStatus = activeEvidence.previousStatus === "todo" ||
+                  activeEvidence.previousStatus === "in_review"
+                  ? activeEvidence.previousStatus
+                  : "in_progress";
+                // The existing recovery owner evaluates the receipt's current
+                // run now, refreshing this task's card to a usable current-source
+                // recovery card instead of leaving its stale Retry instruction.
+                await recoveryService(db, { enqueueWakeup: heartbeat.wakeup })
+                  .escalateStrandedAssignedIssue({
+                    issue: currentIssue,
+                    previousStatus,
+                    latestRun: currentRun,
+                    ...(currentCard ? { attemptCount: currentCard.attemptCount } : {}),
+                  });
+                currentCard = await recoveryActionsSvc.getActiveForIssue(
+                  sourceRefusal.companyId,
+                  sourceRefusal.sourceIssueId,
+                );
+                activeEvidence = parseObject(currentCard?.evidence);
+              }
+              if (currentCard && activeEvidence.latestRunId === sourceRefusal.currentRunId) {
+                await recoveryActionsSvc.attachTaskRetrySourceRefusal({
+                  companyId: sourceRefusal.companyId,
+                  sourceIssueId: sourceRefusal.sourceIssueId,
+                  recoveryActionId: currentCard.id,
+                  currentRunId: sourceRefusal.currentRunId,
+                  refusal: {
+                    ...(refusal as Record<string, unknown>),
+                    nextAction: "The latest run's recovery card is shown on this task. Use its current recovery outcome; the older run cannot be retried.",
+                  },
+                });
+              }
+            }
+          }
+        }
         throw error;
       }
       const nativeHoldTaskRetryReceipt = nativeHoldTaskRetry.receipt;

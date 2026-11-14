@@ -239,9 +239,9 @@ describe("SMA-43/SMA-63 resolved native hold restore twin", () => {
   it("a stale Try again reports the refusal and keeps the board card unresolved", async () => {
     const f = await fixture();
     const newerAt = new Date(Date.now() + 1_000);
-    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+    const [newer] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
       issueId: f.issueId, nativeIssueId: f.issueId, runtimeMode: "native", status: "failed", nativePhase: "terminal_failure",
-      contextSnapshot: { issueId: f.issueId }, createdAt: newerAt, finishedAt: newerAt, errorCode: "adapter_failed" });
+      contextSnapshot: { issueId: f.issueId }, createdAt: newerAt, finishedAt: newerAt, errorCode: "adapter_failed" }).returning();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ runId: f.failed.id });
     const before = await runRows(f.issueId);
     const response = await request(f.app).post(`/api/issues/${f.issueId}/recovery-actions/resolve`)
@@ -257,8 +257,9 @@ describe("SMA-43/SMA-63 resolved native hold restore twin", () => {
     const issueAfterRefusal = await request(f.app).get(`/api/issues/${f.issueId}`).expect(200);
     const refusal = issueAfterRefusal.body.activeRecoveryAction.evidence.taskRetryRefusal;
     expect(refusal).toMatchObject({ schema: "paperclip.task-retry-source-refusal.v1",
-      recoveryActionId: f.board.id, sourceRunId: f.failed.id, currentRunId: expect.any(String),
+      recoveryActionId: f.board.id, sourceRunId: f.failed.id, currentRunId: newer!.id,
       reason: expect.stringContaining("older run"), nextAction: expect.stringContaining("latest run") });
+    expect(issueAfterRefusal.body.activeRecoveryAction.evidence.latestRunId).toBe(newer!.id);
     expect(issueAfterRefusal.body.activeRecoveryAction.nextAction).toBe(refusal.nextAction);
 
     await request(f.app).post(`/api/issues/${f.issueId}/recovery-actions/resolve`)

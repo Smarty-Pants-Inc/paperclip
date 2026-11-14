@@ -351,6 +351,25 @@ describe("IssueRecoveryActionCard", () => {
     expect(node.querySelector(`a[href$="/runs/${currentRunId}"]`)).not.toBeNull();
   });
 
+  it("shows the refused source link when the existing card has been refreshed to the current run", () => {
+    const sourceRunId = "7accd7a4-c9ca-4db2-9233-3228a037cc09";
+    const currentRunId = "f6229ec3-a80f-4f91-a908-7b5a217495b8";
+    const reason = "This recovery card was made for an older run. The task changed before Try again was accepted, so this card cannot retry the current task.";
+    const nextAction = "The latest run's recovery card is shown on this task. Use its current recovery outcome; the older run cannot be retried.";
+    const action = buildAction({
+      id: "00000000-0000-0000-0000-0000000000aa",
+      kind: "stranded_assigned_issue", ownerType: "board",
+      evidence: { latestRunId: currentRunId, taskRetryRefusal: {
+        schema: "paperclip.task-retry-source-refusal.v1", recoveryActionId: "00000000-0000-0000-0000-0000000000aa",
+        sourceRunId, currentRunId, reason, nextAction,
+      } }, nextAction,
+    });
+    const node = render(<IssueRecoveryActionCard action={action} />);
+    expect(node.querySelector('[data-testid="task-retry-source-refusal"]')?.textContent).toBe(reason);
+    expect(node.textContent).toContain(nextAction);
+    expect(node.querySelector(`a[href$="/runs/${currentRunId}"]`)).not.toBeNull();
+  });
+
   it("keeps code-shaped evidence (error code, no summary) in the mono treatment", () => {
     const node = render(
       <IssueRecoveryActionCard
