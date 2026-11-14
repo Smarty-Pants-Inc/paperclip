@@ -476,7 +476,9 @@ function captureCheckpoint(state: StoredCoreState, runnerVersion: string, runner
   records.set("header", JSON.stringify(header));
   records.set("cursor", JSON.stringify({ ackedSourceSeq: state.ackedSourceSeq, replayDeliveries: state.replayDeliveries,
     commandCount: commands.length, eventCount: recoveryEvents.length }));
-  const maintenance = new Set(["runner.identity", "turn.stop", "runner.drain", "runner.suspend", "session.snapshot", "session.close"]);
+  // Recovery reads the goal before closing a completed source. Like snapshots,
+  // that read grants no provider work and must not poison a maintenance writer.
+  const maintenance = new Set(["runner.identity", "turn.stop", "runner.drain", "runner.suspend", "session.snapshot", "session.goal.get", "session.close"]);
   return {
     // The controller replaces this full write set with a delta before it persists.
     runnerVersion, runnerDigest, runId, records,

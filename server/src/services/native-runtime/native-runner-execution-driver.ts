@@ -34,7 +34,8 @@ export interface NativeRunnerExecutionDriverInput {
   processStarted?: Promise<void>;
   processIdentityReady?: Promise<void>;
   beforeConnect?: (identity: RunnerIdentity, authority: Parameters<ConnectionRegistration>[0]) => Promise<void>;
-  controllerPersistence?: { db: Db; bootId: string; authorityRunId?: string | (() => string); onFailure?: (runId: string, leaseOwner: string) => Promise<void> };
+  controllerPersistence?: { db: Db; bootId: string; authorityRunId?: string | (() => string); onFailure?: (runId: string, leaseOwner: string) => Promise<void>;
+    checkpointMaintenanceOnly?: { generation: number } };
   checkpoint?: Awaited<ReturnType<ConnectionRegistration>>["checkpoint"];
   process?: Omit<RunnerExecutionDriver, "controlPlaneRegistration">;
   trace?: NativeRunTrace;

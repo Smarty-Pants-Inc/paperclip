@@ -13,6 +13,7 @@ import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-ba
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
+import { hasConfirmedSandboxStopAndRetain } from "./sandbox-stop-and-retain.js";
 
 export {
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
@@ -146,9 +147,11 @@ export async function reusableSandboxConfigurationChangeIsSafe(input: {
   heartbeatRunId: string | null;
   executionWorkspaceId: string | null;
   adapterType: string | null | undefined;
+  /** Only the replacement owner may drain a different recorded source. */
+  allowSourceChange?: boolean;
 }): Promise<boolean> {
   const { db, lease } = input;
-  if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) return false;
+  if (!input.allowSourceChange && !sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) return false;
   if (!input.heartbeatRunId || !lease.heartbeatRunId || !lease.providerLeaseId || lease.companyId !== input.companyId
     || !["released", "retained"].includes(lease.status)) return false;
   const [owner] = await db.select({ status: heartbeatRuns.status, nativeSessionId: heartbeatRuns.nativeSessionId }).from(heartbeatRuns)
@@ -170,10 +173,10 @@ export async function reusableSandboxConfigurationChangeIsSafe(input: {
 
 /**
  * Retire a preserved lease after its replacement lease is recorded. The old
- * sandbox is not destroyed here: a provider that cannot start it may also be
- * slow to delete it, and that must not delay this run's first turn. The
- * `pending_cleanup` row hands the destroy to the existing cleanup sweep. The
- * write is guarded, so a lease that another run resumed meanwhile is untouched.
+ * native checkpoint source stays released with its verified stop receipt and
+ * kept-after-replacement marker; it never enters the destruction queue. Other
+ * callers retain the existing pending-cleanup policy. The write is guarded, so
+ * a lease that another run resumed meanwhile is untouched.
  */
 export async function retireReplacedReusableSandboxLease(input: {
   db: Db;
@@ -181,21 +184,28 @@ export async function retireReplacedReusableSandboxLease(input: {
   companyId: string;
   heartbeatRunId: string;
   reason?: "compatible_environment_change" | "lease_fingerprint_mismatch";
+  /** Native checkpoint replacements retain their stopped source, never delete. */
+  preserveSource?: { replacementLeaseId: string };
 }): Promise<boolean> {
   const { db, lease } = input;
-  if (!lease.providerLeaseId) return false;
+  if (!lease.providerLeaseId || input.preserveSource && !hasConfirmedSandboxStopAndRetain(lease)) return false;
   const now = new Date();
   const held = abandonedWorkspaceFilesHeldOnLeaseRowSql();
   const [claimed] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
-    status: sql`case when ${held} then 'retained' else 'pending_cleanup' end`,
-    cleanupStatus: "failed",
+    status: input.preserveSource ? "released" : sql`case when ${held} then 'retained' else 'pending_cleanup' end`,
+    cleanupStatus: input.preserveSource ? "success" : "failed",
     failureReason: sql`case when ${held} then ${ABANDONED_WORKSPACE_FILES_PARKED_REASON} else ${input.reason ?? REUSABLE_SANDBOX_RESUME_REPLACED_REASON} end`,
     releasedAt: now,
     lastUsedAt: now,
     updatedAt: now,
-    metadata: sql`case when ${held} then coalesce(${environmentLeases.metadata}, '{}'::jsonb)
-      || ${JSON.stringify({ [ABANDONED_WORKSPACE_FILES_PARKED_KEY]: { parkedAt: now.toISOString() } })}::jsonb
-      else ${environmentLeases.metadata} end`,
+    metadata: input.preserveSource
+      ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+          [REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]: { runId: input.heartbeatRunId,
+            replacementLeaseId: input.preserveSource.replacementLeaseId, recordedAt: now.toISOString() },
+        })}::jsonb`
+      : sql`case when ${held} then coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+        || ${JSON.stringify({ [ABANDONED_WORKSPACE_FILES_PARKED_KEY]: { parkedAt: now.toISOString() } })}::jsonb
+        else ${environmentLeases.metadata} end`,
   }).where(and(
     eq(environmentLeases.id, lease.id),
     eq(environmentLeases.companyId, input.companyId),

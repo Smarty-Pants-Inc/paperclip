@@ -4969,14 +4969,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const config = { ...providerConfig, [key]: change === "same" ? "snap-A" : change === "unset" ? null : "snap-B" };
     await environmentService(db).update(environment.id, { config });
     vi.mocked(workerManager.call).mockClear();
-    const next = await acquire({ ...environment, config }, nextRunId);
-    expect(next.lease.metadata?.[key]).toBe(config[key]);
-    if (change === "same") {
-      expect(next.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
+    if (change !== "same") {
+      // This fixture has no native checkpoint owner or suspended backup. A boot
+      // change is no longer permission to cold-open and abandon its history.
+      await expect(acquire({ ...environment, config }, nextRunId)).rejects.toThrow("runner_pack_reuse_blocked");
       expect(acquisitions).toBe(1);
-    } else {
-      expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
-      expect(acquisitions).toBe(2);
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
       await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
         status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
@@ -4985,9 +4982,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         } },
       });
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+    } else {
+      const next = await acquire({ ...environment, config }, nextRunId);
+      expect(next.lease.metadata?.[key]).toBe(config[key]);
+      expect(next.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
+      expect(acquisitions).toBe(1);
+      await expect(service.execute({ environment: { ...environment, config }, lease: next.lease, command: "verify source" }))
+        .resolves.toMatchObject({ stdout: `served:${config[key]}` });
     }
-    await expect(service.execute({ environment: { ...environment, config }, lease: next.lease, command: "verify source" }))
-      .resolves.toMatchObject({ stdout: `served:${config[key]}` });
   });
 
   // Compatible sizing changes still preserve a warm conversation until its
@@ -5009,9 +5011,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const calls: string[] = [];
     const workerManager = {
       isRunning: () => true,
-      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentStopLease", "environmentDestroyLease", "environmentExecute"] }),
       call: vi.fn(async (_pluginId: string, method: string, params: any) => {
         calls.push(method);
+        if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" };
         if (method === "environmentAcquireLease") {
           if (rejectReplacement) throw new Error("injected create refusal");
           if (raceSourceLeaseId) {
@@ -5141,7 +5144,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         await expect(acquire(changed, retryRunId)).rejects.toThrow("Reusable sandbox changed during compatible configuration drain");
         await expect(environmentService(db).getLeaseById(sourceLease.id)).resolves.toMatchObject({ status: "released" });
         const unused = (await environmentService(db).listLeases(environment.id)).find(lease => lease.heartbeatRunId === retryRunId);
-        expect(unused).toMatchObject({ status: "pending_cleanup", failureReason: "compatible_environment_change_source_changed" });
+        expect(unused).toMatchObject({ status: "released", metadata: { sandboxStopAndRetainReceipt: { method: "environmentStopLease" } } });
         expect(calls).not.toContain("environmentDestroyLease");
         await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, retryRunId));
         retryRunId = randomUUID();
@@ -5155,7 +5158,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         sandboxLeaseAcquisition: { outcome: "replacement", reason: "compatible_environment_change", previousProviderLeaseId: first.lease.providerLeaseId } });
       // Recording the replacement (with the backup) precedes retirement.
       const old = await environmentService(db).getLeaseById(sourceLease.id);
-      expect(old).toMatchObject({ status: "pending_cleanup", failureReason: "compatible_environment_change" });
+      expect(old).toMatchObject({ status: "released", failureReason: "compatible_environment_change",
+        metadata: { sandboxStopAndRetainReceipt: { method: "environmentStopLease" },
+          reusableSandboxKeptAfterReplacement: { replacementLeaseId: replacement.lease.id } } });
       expect(calls).not.toContain("environmentDestroyLease");
       await expect(runtimeWithPlugin.execute({ environment: changed, lease: replacement.lease, command: "after settle" }))
         .resolves.toMatchObject({ exitCode: 0, stdout: "served:2:after settle" });
@@ -5191,8 +5196,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         displayName: "Pack cutover", supportsReusableLeases: true, configSchema: { type: "object" } }] });
       let acquisitions = 0;
       const worker = { isRunning: () => true,
-        getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+        getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentStopLease", "environmentDestroyLease", "environmentExecute"] }),
         call: vi.fn(async (_id: string, method: string, params: any) => {
+          if (method === "environmentStopLease") return { providerLeaseId: params.providerLeaseId, state: "stopped" };
           if (method === "environmentAcquireLease") {
             acquisitions++;
             if (acquisitions === 2 && scenario === "creation failed") throw new Error("pack-cutover-create-failed");
@@ -5265,7 +5271,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released" });
         expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
         if (scenario === "source changed") expect(await environmentService(db).listLeases(environment.id)).toEqual(expect.arrayContaining([
-          expect.objectContaining({ providerLeaseId: "pack-box-2", status: "pending_cleanup", failureReason: "lease_fingerprint_mismatch_source_changed" }),
+          expect.objectContaining({ providerLeaseId: "pack-box-2", status: "released", metadata: expect.objectContaining({
+            sandboxStopAndRetainReceipt: expect.objectContaining({ method: "environmentStopLease" }) }) }),
         ]));
       } else if (scenario === "missing backup") {
         await expect(acquire(nextRunId)).rejects.toThrow("runner_pack_reuse_blocked");
@@ -5273,8 +5280,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
         expect(notices).toHaveLength(1);
         expect(notices[0]!.body).toContain("preserved");
-        expect(worker.call).not.toHaveBeenCalled();
-        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released" });
+        expect(vi.mocked(worker.call).mock.calls.every(call => call[1] === "environmentStopLease")).toBe(true);
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released",
+          metadata: { sandboxStopAndRetainReceipt: { method: "environmentStopLease" } } });
       } else {
         const next = await acquire(nextRunId);
         if (["same pack", "in flight", "legacy in flight"].includes(scenario)) {
@@ -5289,13 +5297,15 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           expect(next.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "replacement", reason: "lease_fingerprint_mismatch",
             previousProviderLeaseId: first.lease.providerLeaseId });
           expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
-          // The same server replacement owner durably retires the old box;
-          // its existing claimed teardown can then destroy it, never before
-          // the replacement and verified conversation backup are recorded.
-          await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "pending_cleanup", failureReason: "lease_fingerprint_mismatch" });
+          // Native replacement stops and keeps the source. Even the ordinary
+          // cleanup owner cannot turn that retirement into sandbox deletion.
+          await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released", failureReason: "lease_fingerprint_mismatch",
+            metadata: { sandboxStopAndRetainReceipt: { method: "environmentStopLease" },
+              reusableSandboxKeptAfterReplacement: { replacementLeaseId: next.lease.id } } });
           expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
           await service.destroyReusableSandboxLeases({ companyId, issueId, failureReason: "lease_fingerprint_mismatch" });
-          await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "expired", failureReason: "lease_fingerprint_mismatch" });
+          await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released", failureReason: "lease_fingerprint_mismatch" });
+          expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
         }
       }
     } finally {
@@ -5665,12 +5675,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(f.call.mock.calls.filter(call => call[1] === "environmentAcquireLease")).toHaveLength(1);
   });
 
-  it("does not wait for a warm lease that a predecessor finished long ago and never released", async () => {
+  it("fails closed rather than abandoning an unreleased warm predecessor, without waiting", async () => {
     const f = await seedSettlingWarmLease(new Date(Date.now() - 10 * 60_000));
     const startedAt = Date.now();
-    const next = await f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: f.nextRunId });
+    await expect(f.runtime.acquireRunLease({ ...f.input, heartbeatRunId: f.nextRunId })).rejects.toThrow("runner_pack_reuse_blocked");
     expect(Date.now() - startedAt).toBeLessThan(5_000);
-    expect(next.lease.providerLeaseId).not.toBe(f.predecessor.lease.providerLeaseId);
+    expect(f.call.mock.calls.filter(call => call[1] === "environmentAcquireLease")).toHaveLength(1);
+    expect(f.call.mock.calls.some(call => call[1] === "environmentDestroyLease" || call[1] === "environmentStopLease")).toBe(false);
     await expect(environmentService(db).getLeaseById(f.predecessor.lease.id)).resolves.toMatchObject({ status: "active" });
   });
 

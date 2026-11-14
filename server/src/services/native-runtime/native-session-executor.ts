@@ -10,6 +10,7 @@ import { recordAgentProviderRateLimits } from "../agent-provider-rate-limits.js"
 import { nativePostResultFailureCategory, type NativePostResultFailureCategory } from "./native-post-result-failure.js";
 import { logger } from "../../middleware/logger.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
+import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
@@ -278,7 +279,8 @@ import {
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
-import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
+import type { EnvironmentDriverExecuteInput, EnvironmentRuntimeService } from "../environment-runtime.js";
+import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeCredentialUpdateOwner, appendNativeCredentialUpdate } from "./native-credential-updates.js";
@@ -1120,6 +1122,74 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   return closeIdleWarmNativeSessions(input);
 }
 
+/** Checkpoint the exact completed warm source BEFORE environment admission
+ * allocates its successor. Reuse the normal recovered-session close owner:
+ * runner.suspend -> verified suspension -> harness publication/stamp. This
+ * grants no turn/result authority and has no new-session fallback. */
+export async function checkpointWarmNativeSandboxSource(input: {
+  db: Db; lease: typeof environmentLeases.$inferSelect; heartbeatRunId: string;
+  environmentRuntime: EnvironmentRuntimeService;
+}): Promise<void> {
+  const { db, lease } = input;
+  const [prior] = await db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
+    .innerJoin(nativeRunFinalizations, eq(nativeRunFinalizations.runId, heartbeatRuns.id))
+    .where(and(eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId!)));
+  if (!prior || prior.run.status !== "succeeded" || prior.owner.phase !== "committed" || !prior.owner.resultId
+    || prior.owner.leaseOwner || !prior.owner.controllerBootId || !lease.environmentId || !lease.providerLeaseId
+    || !["released", "retained"].includes(lease.status)) throw new Error("native_warm_source_not_settled");
+  const previous = parseNativeExecutionInput(prior.run.runnerProfileJson?.nativeExecutionInput);
+  if (previous.session.lifecyclePolicy.mode !== "warm" || previous.binding.companyId !== lease.companyId
+    || previous.binding.issueId !== lease.issueId || previous.binding.agentId !== lease.metadata?.agentId
+    || previous.binding.runId !== lease.heartbeatRunId || prior.run.nativeSessionId !== nativeSessionKey(previous)) {
+    throw new Error("native_warm_source_binding_mismatch");
+  }
+  const scope = nativeSessionScopeKey(previous), cached = warmNativeSessions.get(scope);
+  if (cached) {
+    if (cached.runId !== prior.run.id || cached.providerLeaseId !== lease.providerLeaseId || cached.companyId !== lease.companyId) {
+      throw new Error("native_warm_source_binding_mismatch");
+    }
+    const closed = await closeIdleWarmNativeSessions({ reason: "checkpoint before sandbox replacement", sessionScopeId: scope });
+    if (closed.closed !== 1 || closed.failed || closed.busy) throw new Error("native_warm_source_close_unproven");
+    return;
+  }
+  const [environment] = await db.select().from(environments).where(eq(environments.id, lease.environmentId));
+  if (!environment || environment.driver !== "sandbox") throw new Error("native_warm_source_environment_missing");
+  const resolved = await resolveEnvironmentExecutionTarget({ db, companyId: lease.companyId, adapterType: "paperclip_runner",
+    environment: environment as never, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never,
+    environmentRuntime: input.environmentRuntime, retainedRunnerMaintenance: true });
+  if (resolved?.kind !== "remote" || resolved.transport !== "sandbox" || resolved.runnerTask) throw new Error("native_warm_source_transport_unavailable");
+  const target = { ...resolved, sandboxLeaseAcquisition: { outcome: "resumed" as const, providerLeaseId: lease.providerLeaseId } };
+  const next = { ...previous, binding: { ...previous.binding, runId: input.heartbeatRunId } };
+  await restoreWarmRunnerdController({ db, execution: next, runnerExecutionTarget: target });
+  const root = scopedRunnerdStateRoot(previous);
+  // Refresh even a same-run local projection: the database is canonical after
+  // the old controller left, not whichever cached files survived the restart.
+  if (!await restoreNativeRunnerCheckpoint(db, previous.binding, root, nativeSessionKey(previous))) throw new Error("native_runner_checkpoint_missing");
+  const identity = readRunnerdDurableIdentity(root);
+  if (!identity || typeof identity.runnerInstanceId !== "string" || identity.runId !== prior.run.id || identity.runnerInstanceId !== prior.run.runnerInstanceId) throw new Error("native_warm_source_binding_mismatch");
+  const recovery = await inspectRemoteWarmSessionRecovery({ db, execution: next, target, identity, completedSourceMaintenance: true,
+    readControlState: () => readRunnerdControlPlaneState(root), matchesExecution: candidate => canonicalJson(candidate) === canonicalJson(previous),
+    loadCheckpoint: candidate => loadWarmNativeCheckpoint(candidate, nativeSessionConfigDigest(candidate, "remote"), "remote"), canReuseProcess: () => false });
+  if (!recovery?.revalidateSource) throw new Error("native_warm_source_recovery_unproven");
+  const released = releasedWarmRunner(readWarmNativeEnvelope(previous));
+  if (released) recovery.releasedSource = released.source;
+  await recovery.revalidateSource();
+  const header = await loadNativeRunnerCheckpointHeader(db, previous.binding);
+  const artifact = header ? record(JSON.parse(header)) : {};
+  if (typeof artifact.runnerVersion !== "string" || typeof artifact.runnerDigest !== "string") throw new Error("native_warm_source_artifact_missing");
+  try {
+    const backend = await createRunnerdBackend({ db, execution: previous, runnerInstanceId: identity.runnerInstanceId,
+      controllerPersistence: { bootId: prior.owner.controllerBootId, runnerArtifact: { version: artifact.runnerVersion, digest: artifact.runnerDigest },
+        checkpointMaintenanceOnly: { generation: prior.owner.controllerGeneration } },
+      runnerExecutionTarget: target, runnerIngressAuthorized: true,
+      remoteWarmRecovery: { ...recovery, revalidate: recovery.revalidateSource } });
+    const recovered = await backend.recoverSession?.(recovery.checkpoint, { signal: new AbortController().signal });
+    if (!recovered?.recovered || !recovered.session) throw new Error("native_warm_source_recovery_unproven");
+    await recovered.session.close({ reason: "checkpoint before sandbox replacement" });
+    persistWarmNativeCheckpoint(previous, nativeSessionConfigDigest(previous, "remote"), await recovered.session.snapshot());
+  } finally { releaseIdleSessionToolAuthority(scope); }
+}
+
 async function warmSandboxDestroyed(db: Db, entry: WarmNativeSession): Promise<boolean> {
   if (!entry.providerLeaseId || !entry.environmentId) return false;
   const leases = await db.select().from(environmentLeases).where(and(
@@ -1149,6 +1219,7 @@ export async function prepareIdleWarmNativeSessionsForSleep(input: {
 }
 
 async function closeIdleWarmNativeSessions(input: {
+  sessionScopeId?: string;
   environmentId?: string;
   reason: string;
   closeBusyOnRelease?: boolean;
@@ -1163,6 +1234,7 @@ async function closeIdleWarmNativeSessions(input: {
   const failures: WarmNativeSessionCloseFailure[] = [];
   for (const [sessionId, entry] of [...warmNativeSessions]) {
     if (input.canRetire && !input.canRetire()) break;
+    if (input.sessionScopeId !== undefined && sessionId !== input.sessionScopeId) continue;
     if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) {
       continue;
     }
@@ -16982,7 +17054,7 @@ export async function createRunnerdBackend(input: {
   toolRefreshOnResume?: boolean;
   db: Db;
   providerPackAdmissionSource?: NativeProviderPackAdmissionSource;
-  controllerPersistence?: { bootId: string; runnerArtifact?: { version: string; digest: string } };
+  controllerPersistence?: { bootId: string; runnerArtifact?: { version: string; digest: string }; checkpointMaintenanceOnly?: { generation: number } };
   onAccountingEvent?: (event: PrpEvent) => Promise<void>;
   execution: NativeExecutionInput;
   runContextSnapshot?: Record<string, unknown> | null;
@@ -17069,7 +17141,17 @@ export async function createRunnerdBackend(input: {
     // lease. Avoid reclassifying the same root after that path has marked its
     // retained warm owner busy for this run. Direct backend construction still
     // performs the complete fail-closed verification here.
-    if (
+    if (input.controllerPersistence?.checkpointMaintenanceOnly) {
+      // Completed remote owners have no live business lease. The existing
+      // remote-recovery proof (settled journal, canonical checkpoint, stopped
+      // controller and exact recorded allocation) replaces only the local
+      // process-liveness classification, not any transport/checkpoint fence.
+      if (!input.remoteWarmRecovery || input.remoteWarmRecovery.identity.runId !== input.execution.binding.runId
+        || input.remoteWarmRecovery.identity.runnerInstanceId !== input.runnerInstanceId) {
+        throw new Error("native_warm_source_recovery_unproven");
+      }
+      await input.remoteWarmRecovery.revalidate();
+    } else if (
       executingRunnerdSessionScopes.get(sessionScopeId) !==
         input.execution.binding.runId ||
       hasRetainedWarmTransitionEvidence(scopedRunnerdStateRoot(input.execution))
@@ -17783,6 +17865,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const restoredArtifactDirectory = artifactBackup ? join(artifactBackup.root, "provider-artifacts") : join(root, "provider-artifacts");
   let openCodeLaunchArtifacts: OpenCodeLaunchArtifacts | undefined;
   const adoptingPersistedRemoteRunner = remoteTarget !== null && (
+    input.controllerPersistence?.checkpointMaintenanceOnly !== undefined ||
     input.restartRecovery?.kind === "reattach_remote_runner" && input.controllerPersistence?.runnerArtifact !== undefined ||
     input.retainedSandboxOwner !== undefined || input.remoteWarmRecovery?.releasedSource !== undefined && remoteTarget.transport === "sandbox" && remoteTarget.runnerGuardian !== undefined);
   const remoteClaude = remoteTarget !== null && input.execution.provider.kind === "acpx" && input.execution.provider.agent === "claude";
@@ -18518,20 +18601,31 @@ async function createRunnerdBackendWithinSessionClaim(
     if (remoteTarget?.transport !== "sandbox" || !remoteTarget.leaseId) {
       return;
     }
-    const leaseRow = await input.db
-      .select({
-        metadata: environmentLeases.metadata,
-        providerLeaseId: environmentLeases.providerLeaseId,
-        companyId: environmentLeases.companyId,
-        heartbeatRunId: environmentLeases.heartbeatRunId,
-      })
-      .from(environmentLeases)
-      .where(eq(environmentLeases.id, remoteTarget.leaseId))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    if (!leaseRow?.providerLeaseId) {
-      throw new Error("runner_harness_backup_lease_missing");
+    let leaseId = remoteTarget.leaseId;
+    let leaseRow = await input.db.select({ metadata: environmentLeases.metadata, providerLeaseId: environmentLeases.providerLeaseId,
+      companyId: environmentLeases.companyId, heartbeatRunId: environmentLeases.heartbeatRunId })
+      .from(environmentLeases).where(and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, input.execution.binding.companyId)))
+      .limit(1).then(rows => rows[0] ?? null);
+    if (!leaseRow?.providerLeaseId) throw new Error("runner_harness_backup_lease_missing");
+    if (Object.hasOwn(leaseRow.metadata ?? {}, "reusableLeaseSuccessor")) {
+      const [original] = await input.db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, input.execution.binding.companyId)));
+      if (!original?.provider || original.providerLeaseId !== leaseRow.providerLeaseId) throw new Error("runner_harness_backup_lease_mismatch");
+      const history = await input.db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, original.companyId), eq(environmentLeases.provider, original.provider),
+        eq(environmentLeases.providerLeaseId, original.providerLeaseId)));
+      const tips = history.filter(lease => !Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor"));
+      const tip = tips.length === 1 ? tips[0]! : null;
+      // A warm backend survives multiple answered turns/lease handoffs. Stamp
+      // the verified current tip, never its captured first-turn lease. Provider
+      // allocation equality by itself cannot authorize a different lease.
+      const predecessors = tip ? retiredReusableLeasePredecessors(tip, history.filter(lease => lease.id !== tip.id)) : null;
+      if (!tip?.providerLeaseId || !predecessors || ![tip, ...predecessors].some(lease => lease.id === original.id)
+        || !["active", "released", "retained"].includes(tip.status)) throw new Error("runner_harness_backup_lease_mismatch");
+      leaseId = tip.id;
+      leaseRow = tip;
     }
+    if (!leaseRow.providerLeaseId) throw new Error("runner_harness_backup_lease_mismatch");
     if (
       sandboxLeaseAcquisition?.providerLeaseId &&
       sandboxLeaseAcquisition.providerLeaseId !== leaseRow.providerLeaseId
@@ -18546,7 +18640,6 @@ async function createRunnerdBackendWithinSessionClaim(
       runnerInstanceId: backup.manifest.runnerInstanceId,
       completedAt: backup.manifest.completedAt,
     });
-    const leaseId = remoteTarget.leaseId;
     const updated = await writeEnvironmentCleanup(input.db, tx => tx
       .update(environmentLeases)
       .set({
@@ -18556,7 +18649,9 @@ async function createRunnerdBackendWithinSessionClaim(
         },
         updatedAt: new Date(),
       })
-      .where(eq(environmentLeases.id, leaseId))
+      .where(and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, leaseRow.companyId),
+        sql`${environmentLeases.heartbeatRunId} is not distinct from ${leaseRow.heartbeatRunId}`,
+        sql`${environmentLeases.metadata} is not distinct from ${leaseRow.metadata === null ? null : JSON.stringify(leaseRow.metadata)}::jsonb`))
       .returning({ id: environmentLeases.id })
       .then((rows) => rows[0] ?? null), { companyId: leaseRow.companyId, runId: leaseRow.heartbeatRunId ?? undefined, leaseId });
     if (!updated) throw new Error("runner_harness_backup_lease_missing");
@@ -19526,12 +19621,12 @@ async function createRunnerdBackendWithinSessionClaim(
       prepareExternalRunnerState, archiveExternalRunnerState, runnerProcessLauncher: remoteProcessLauncher, adoptExistingRunner: adoptedProcess,
       ...(lostRunnerSource ? { lostRunnerSource } : {}) },
     target, sandboxRetention,
-    controllerPersistence: input.controllerPersistence ? nativeRunnerCheckpointPersistence(
+    controllerPersistence: input.controllerPersistence ? { ...nativeRunnerCheckpointPersistence(
       input.db, input.controllerPersistence.bootId, () => {
         const current = sessionToolAuthorityEpochs.get(sessionScopeId);
         if (!current) throw new Error("native_session_tool_authority_unavailable");
         return current.runId;
-      }, detachNativeSessionsForRestart) : undefined,
+      }, detachNativeSessionsForRestart), checkpointMaintenanceOnly: input.controllerPersistence.checkpointMaintenanceOnly } : undefined,
     binding: input.remoteWarmRecovery ? { ...input.execution.binding, runId: input.remoteWarmRecovery.identity.runId } : input.execution.binding,
     runnerIngressAuthorized: input.runnerIngressAuthorized, runnerPublicUrl: input.runnerPublicUrl, runnerCaBundlePath: input.runnerCaBundlePath,
     prepareRemote: prepareRetainedRemoteRunner, processStarted: remoteRunnerProcessSpawned, checkpoint: checkpointRemoteRunner,

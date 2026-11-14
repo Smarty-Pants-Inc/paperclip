@@ -308,6 +308,9 @@ export async function resolveEnvironmentExecutionTarget(input: {
   leaseMetadata: Record<string, unknown> | null;
   lease?: EnvironmentLease | null;
   environmentRuntime?: EnvironmentRuntimeService | null;
+  /** The native source owner proved a completed, exact old lease. Allows its
+   * existing release/resume lifecycle to close a retained Runner, never work. */
+  retainedRunnerMaintenance?: boolean;
   signal?: AbortSignal;
   // The startup tracer for the provider-exec span. Defaults to the endpoint-
   // gated server tracer, which is a no-op when tracing is off. Tests inject a
@@ -508,7 +511,8 @@ export async function resolveEnvironmentExecutionTarget(input: {
           effectiveCapabilities.duplexCommandStream === true && input.lease && input.environmentRuntime &&
           input.lease.companyId === input.companyId && input.lease.environmentId === input.environment.id &&
           input.lease.id === input.leaseId && input.lease.providerLeaseId && input.lease.leasePolicy === "reuse_by_environment" &&
-          input.lease.status === "active" && input.lease.heartbeatRunId && (input.lease.executionWorkspaceId || input.lease.issueId) &&
+          (input.lease.status === "active" || input.retainedRunnerMaintenance === true && ["released", "retained"].includes(input.lease.status)) &&
+          input.lease.heartbeatRunId && (input.lease.executionWorkspaceId || input.lease.issueId) &&
           typeof input.lease.metadata?.agentId === "string" && input.lease.metadata.agentId.trim()
         ? { runnerLeaseLifecycle: bindSandboxRunnerLeaseLifecycle(input as Parameters<typeof bindSandboxRunnerLeaseLifecycle>[0]) } : {}),
       ...(effectiveCapabilities ? { effectiveCapabilities: Object.freeze({ ...effectiveCapabilities }) } : {}),

@@ -1,4 +1,5 @@
-import { and, eq } from "drizzle-orm";
+import { isDeepStrictEqual } from "node:util";
+import { and, eq, ne } from "drizzle-orm";
 import { agents, companies, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { parseNativeExecutionInput, type NativeExecutionInput, type PersistedNativeSession, type DurableRecoveryIdentity } from "../../vendor/paperclip-runner/index.js";
@@ -16,6 +17,8 @@ export type RemoteWarmSessionRecovery = {
   portableSourceTaskId?: string;
   remote: { providerLeaseId: string; remoteCwd: string };
   revalidate: (leaseOwner: string) => Promise<void>;
+  /** Completed-source maintenance only; never successor turn authority. */
+  revalidateSource?: () => Promise<void>;
 };
 
 /** Protocol events that mean work started and may still be live or waiting. */
@@ -131,6 +134,7 @@ export async function inspectRemoteWarmSessionRecovery(input: {
   loadCheckpoint: (previous: NativeExecutionInput) => PersistedNativeSession | null;
   canReuseProcess: (previous: NativeExecutionInput) => boolean;
   portableSourceTaskId?: string;
+  completedSourceMaintenance?: boolean;
 }): Promise<RemoteWarmSessionRecovery | null> {
   const { binding } = input.execution;
   const { target } = input;
@@ -202,13 +206,32 @@ export async function inspectRemoteWarmSessionRecovery(input: {
     eq(environmentLeases.provider, target.providerKey), eq(environmentLeases.providerLeaseId, sourceProviderLeaseId),
   ));
   if (priorLeases.length !== 1 || priorLeases[0].metadata?.remoteCwd !== target.remoteCwd ||
-      !["released", "expired", "active", ...(input.portableSourceTaskId ? ["retained"] : [])].includes(priorLeases[0].status)) {
+      !["released", "expired", "active", ...(input.portableSourceTaskId || input.completedSourceMaintenance ? ["retained"] : [])].includes(priorLeases[0].status)) {
     return deny("prior_lease_mismatch");
   }
   return {
     identity, checkpoint, previousExecution: previous, reuseProcess: input.canReuseProcess(previous),
     portableSourceTaskId: input.portableSourceTaskId,
     remote: { providerLeaseId, remoteCwd: target.remoteCwd },
+    revalidateSource: async () => {
+      await assertPriorStopped();
+      const [current] = await input.db.select({ run: heartbeatRuns, owner: nativeRunFinalizations })
+        .from(heartbeatRuns).innerJoin(nativeRunFinalizations, eq(nativeRunFinalizations.runId, heartbeatRuns.id))
+        .where(and(eq(heartbeatRuns.id, identity.runId), eq(heartbeatRuns.companyId, binding.companyId)));
+      const [lease] = await input.db.select().from(environmentLeases).where(eq(environmentLeases.id, priorLeases[0]!.id));
+      const [active] = await input.db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, binding.companyId), eq(environmentLeases.provider, target.providerKey!),
+        eq(environmentLeases.providerLeaseId, sourceProviderLeaseId), eq(environmentLeases.status, "active"),
+        ne(environmentLeases.id, priorLeases[0]!.id))).limit(1);
+      if (!current || current.run.status !== "succeeded" || current.owner.leaseOwner || current.owner.phase !== "committed"
+        || current.owner.resultId !== prior.owner.resultId || current.owner.controllerBootId !== prior.owner.controllerBootId
+        || current.owner.controllerGeneration !== prior.owner.controllerGeneration) return deny("owner_changed");
+      if (!lease || active || !["released", "retained"].includes(lease.status)
+        || lease.heartbeatRunId !== identity.runId || lease.companyId !== binding.companyId
+        || lease.providerLeaseId !== sourceProviderLeaseId || !isDeepStrictEqual(lease.metadata, priorLeases[0]!.metadata)) {
+        return deny("prior_lease_mismatch");
+      }
+    },
     revalidate: async leaseOwner => {
       await assertPriorStopped();
       if (input.portableSourceTaskId &&

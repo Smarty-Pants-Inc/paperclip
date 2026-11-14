@@ -37,7 +37,7 @@ import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
 import { ownedWorkspaceRecoveryLease, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
-import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
+import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -45,7 +45,7 @@ import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { currentControllerProcess } from "./controller-process-identity.js";
-import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companySecrets, companySecretVersions, environments, environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import type {
@@ -1709,6 +1709,7 @@ function createSandboxEnvironmentDriver(
     const exactIds = new Set(input.exactMatches.map(lease => lease.id));
     for (const lease of input.candidates) {
       if (exactIds.has(lease.id)) continue;
+      if (hasStopOnlyCleanup(lease) || lease.status === "active" && lease.heartbeatRunId !== input.heartbeatRunId) continue;
       if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) continue;
       const admittedConfig = admittedSandboxLeaseConfig(input.config, lease.metadata ?? {});
       const scope = { ...input, lease };
@@ -1733,8 +1734,18 @@ function createSandboxEnvironmentDriver(
       if (input.exactMatches.length === 0 && !rolloverLease && await reusableSandboxConfigurationChangeIsSafe({
         db, lease, config: input.config, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
         executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType,
-      })) rolloverLease = lease;
-      else pinnedConfigs.set(lease.id, admittedConfig);
+      })) {
+        if ((lease.metadata?.reusableSandboxLease as { adapterType?: string } | undefined)?.adapterType === "paperclip_runner") {
+          try { rolloverLease = await stopReplacementSource(lease); }
+          catch (cause) {
+            if (input.heartbeatRunId && input.issueId && input.agentId) await noticeRunnerReuseRefusal(db, {
+              companyId: input.companyId, issueId: input.issueId, agentId: input.agentId, runId: input.heartbeatRunId,
+              reason: "runner_pack_reuse_blocked",
+            });
+            throw new Error("runner_pack_reuse_blocked: the old Runner's computer was preserved; its stop is not confirmed", { cause });
+          }
+        } else rolloverLease = lease;
+      } else pinnedConfigs.set(lease.id, admittedConfig);
     }
     return { pinnedConfigs, compatibleLeases, rolloverLease };
   }
@@ -1742,14 +1753,52 @@ function createSandboxEnvironmentDriver(
   async function retireCompatibleConfigurationSource(source: EnvironmentLease, replacement: EnvironmentLease, heartbeatRunId: string,
     reason: "compatible_environment_change" | "lease_fingerprint_mismatch" = "compatible_environment_change") {
     if (await retireReplacedReusableSandboxLease({ db, lease: source, companyId: source.companyId,
-      heartbeatRunId, reason })) return;
+      heartbeatRunId, reason,
+      ...(source.metadata?.reusableSandboxLease
+        && (source.metadata.reusableSandboxLease as { adapterType?: string }).adapterType === "paperclip_runner"
+        ? { preserveSource: { replacementLeaseId: replacement.id } } : {}),
+    })) return;
     // Another admission/checkpoint changed the source while creation was in
     // flight. Never serve an older backup or delete that source. The existing
     // cleanup worker owns only our unused new allocation; a retry rereads truth.
-    await environmentsSvc.releaseLease(replacement.id, "pending_cleanup", {
+    if ((source.metadata?.reusableSandboxLease as { adapterType?: string } | undefined)?.adapterType === "paperclip_runner") {
+      // Even an unused successor is stop-only. Never turn a source CAS race
+      // into permission for the cleanup sweep to delete either allocation.
+      await stopReplacementSource(replacement).then(stopped => keepReplacedReusableSandboxLease({
+        db, lease: stopped, companyId: stopped.companyId, heartbeatRunId, replacementLeaseId: source.id,
+      })).catch(() => undefined); // Keep the unused allocation out of reuse AND destruction.
+    } else await environmentsSvc.releaseLease(replacement.id, "pending_cleanup", {
       failureReason: `${reason}_source_changed`, cleanupStatus: "failed",
     });
     throw new Error("Reusable sandbox changed during compatible configuration drain; retry acquisition.");
+  }
+
+  async function reusableCandidates(input: { companyId: string; environment: Environment; adapterType: string | null | undefined;
+    executionWorkspaceId: string | null; issueId: string | null; agentId: string | null }): Promise<EnvironmentLease[]> {
+    // An environment move must find the old native source rather than silently
+    // create a cold computer. Non-native selection retains its existing scope.
+    return input.adapterType === "paperclip_runner"
+      ? await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
+          eq(environmentLeases.leasePolicy, "reuse_by_environment"),
+          or(eq(environmentLeases.environmentId, input.environment.id),
+            sql`${environmentLeases.metadata}#>>'{reusableSandboxLease,adapterType}' = 'paperclip_runner'`),
+          input.executionWorkspaceId ? eq(environmentLeases.executionWorkspaceId, input.executionWorkspaceId)
+            : and(sql`${environmentLeases.executionWorkspaceId} is null`, eq(environmentLeases.issueId, input.issueId!)),
+          sql`${environmentLeases.metadata}->>'agentId' = ${input.agentId}`))
+        .orderBy(desc(environmentLeases.acquiredAt), desc(environmentLeases.id)) as EnvironmentLease[]
+      : await environmentsSvc.listLeases(input.environment.id);
+  }
+
+  async function stopReplacementSource(lease: EnvironmentLease): Promise<EnvironmentLease> {
+    const runtime = environmentRuntimeService(db, options);
+    const pending = hasStopOnlyCleanup(lease) ? lease : await prepareUnconfirmedSourceSandboxStop(db, lease);
+    if (!pending) throw new Error("native_warm_source_stop_unproven");
+    const receipt = await runtime.retryPendingSandboxTeardown({ environment: null, lease: pending as EnvironmentLease });
+    const stopped = await settleStopOnlyCleanup(db, pending, { attemptId: readStopOnlyCleanup(pending)!.requestId, receipt });
+    if (!stopped || stopped.status !== "released" || !stopped.metadata?.sandboxStopAndRetainReceipt) {
+      throw new Error("native_warm_source_stop_unproven");
+    }
+    return stopped as EnvironmentLease;
   }
 
   async function cleanupObsoleteReusableSandboxLeases(input: {
@@ -1765,8 +1814,56 @@ function createSandboxEnvironmentDriver(
     let runnerPackReplacement: EnvironmentLease | null = null;
     const currentPack = runnerPackReuseIdentity(input.adapterType);
     const reusableIds = new Set(input.reusableLeases.map((lease) => lease.id));
-    for (const lease of input.leases) {
+    for (let lease of input.leases) {
       if (reusableIds.has(lease.id)) continue;
+      const nativeSource = input.adapterType === "paperclip_runner"
+        && (lease.metadata?.reusableSandboxLease as { adapterType?: string } | undefined)?.adapterType === "paperclip_runner";
+      // Every non-reusable native fingerprint (not just the pack digest)
+      // drains under this same checkpoint owner; none may reach destruction.
+      const changedNativeSource = nativeSource;
+      if (changedNativeSource) {
+        // Handoff predecessors are historical proof, not replacement candidates.
+        // Only the current live/retained source (or its stop-only retry) drains.
+        if (!["released", "retained", "active", "pending_cleanup"].includes(lease.status)
+          || Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor")) continue;
+        if (input.reusableLeases.length > 0 || runnerPackReplacement) continue;
+        const refuse = async (cause?: unknown): Promise<never> => {
+          if (input.heartbeatRunId && input.issueId && input.agentId) await noticeRunnerReuseRefusal(db, {
+            companyId: lease.companyId, issueId: input.issueId, agentId: input.agentId, runId: input.heartbeatRunId,
+            reason: "runner_pack_reuse_blocked",
+          });
+          throw new Error("runner_pack_reuse_blocked: the old Runner's conversation is not safely saved; its computer was preserved", { cause });
+        };
+        if (!await reusableSandboxLeaseIsIdle({ db, lease, companyId: lease.companyId, heartbeatRunId: input.heartbeatRunId })
+          && !hasStopOnlyCleanup(lease)) await refuse(); // Never suspend an in-flight turn.
+        try {
+          if (hasStopOnlyCleanup(lease)) lease = await stopReplacementSource(lease);
+          let safe = await reusableSandboxConfigurationChangeIsSafe({ db, lease, config: input.config,
+            companyId: lease.companyId, heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: lease.executionWorkspaceId,
+            adapterType: input.adapterType, allowSourceChange: true });
+          if (!safe && input.heartbeatRunId) {
+            const { checkpointWarmNativeSandboxSource } = await import("./native-runtime/native-session-executor.js");
+            await checkpointWarmNativeSandboxSource({ db, lease: lease as never, heartbeatRunId: input.heartbeatRunId,
+              environmentRuntime: environmentRuntimeService(db, options) });
+            lease = (await environmentsSvc.getLeaseById(lease.id))!;
+            safe = Boolean(lease) && await reusableSandboxConfigurationChangeIsSafe({ db, lease, config: input.config,
+              companyId: lease.companyId, heartbeatRunId: input.heartbeatRunId, executionWorkspaceId: lease.executionWorkspaceId,
+              adapterType: input.adapterType, allowSourceChange: true });
+          }
+          if (!safe) throw new Error("native_warm_source_checkpoint_unproven");
+          lease = await stopReplacementSource(lease);
+          runnerPackReplacement = lease;
+        } catch (cause) {
+          // Retain the durable stop-only intent on failure. A later admission
+          // still sees this source; it cannot skip a pending source and cold-open.
+          const current = await environmentsSvc.getLeaseById(lease.id);
+          if (current && ["released", "retained", "pending_cleanup"].includes(current.status)) {
+            await stopReplacementSource(current).catch(() => undefined);
+          }
+          await refuse(cause);
+        }
+        continue;
+      }
       if (!reusableLeaseCanBeCleanedUp(lease)) continue;
       // A stale boot source must not serve the next run, but may hold its only
       // workspace/session copy. Use the existing durable stop-only intent, not
@@ -1987,11 +2084,12 @@ function createSandboxEnvironmentDriver(
           input.heartbeatRunId !== null &&
           (input.executionWorkspaceId !== null || input.issueId !== null) &&
           input.agentId !== null
-          ? (await environmentsSvc.listLeases(input.environment.id))
+          ? (await reusableCandidates(input))
               .filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
+                (reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId })
+                  || input.adapterType === "paperclip_runner" && (hasStopOnlyCleanup(lease) || lease.status === "active")) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
                 lease.metadata?.agentId === input.agentId,
@@ -2004,6 +2102,7 @@ function createSandboxEnvironmentDriver(
             reusableCandidateLeases.splice(index, 1);
         }
         const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
+          !hasStopOnlyCleanup(lease) && (lease.status !== "active" || lease.heartbeatRunId === input.heartbeatRunId) &&
           reusableSandboxLeaseScopeMatches({
             lease,
             companyId: input.companyId,
@@ -2423,11 +2522,12 @@ function createSandboxEnvironmentDriver(
         input.heartbeatRunId !== null &&
         (input.executionWorkspaceId !== null || input.issueId !== null) &&
         input.agentId !== null
-          ? (await environmentsSvc.listLeases(input.environment.id))
+          ? (await reusableCandidates(input))
               .filter((lease) =>
                 lease.leasePolicy === "reuse_by_environment" &&
                 !reusableSandboxKeptAfterReplacement(lease) &&
-                reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId }) &&
+                (reusableLeaseCanBeResumed({ lease, heartbeatRunId: input.heartbeatRunId })
+                  || input.adapterType === "paperclip_runner" && (hasStopOnlyCleanup(lease) || lease.status === "active")) &&
                 lease.executionWorkspaceId === input.executionWorkspaceId &&
                 (input.executionWorkspaceId !== null || lease.issueId === input.issueId) &&
                 lease.metadata?.agentId === input.agentId,
@@ -2440,6 +2540,7 @@ function createSandboxEnvironmentDriver(
           reusableCandidateLeases.splice(index, 1);
       }
       const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
+        !hasStopOnlyCleanup(lease) && (lease.status !== "active" || lease.heartbeatRunId === input.heartbeatRunId) &&
         reusableSandboxLeaseScopeMatches({
           lease,
           companyId: input.companyId,

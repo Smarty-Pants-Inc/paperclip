@@ -161,25 +161,39 @@ export async function validateNativeRunnerCheckpointOwner(
   }
 }
 
-export async function assertNativeRunnerCheckpointOwner(tx: CheckpointTransaction, owner: NativeRunnerCheckpointOwner, newWork: boolean,
+export async function assertNativeRunnerCheckpointOwner(tx: CheckpointTransaction, owner: NativeRunnerCheckpointFenceOwner, newWork: boolean,
   authorization: { checkpointMaintenanceOnly: boolean }) {
   const locked = await lockNativeRunnerCheckpointOwner(tx, owner);
   await validateNativeRunnerCheckpointOwner(tx, owner, locked, newWork, authorization);
 }
 
-export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpointOwner) {
+export function nativeRunnerCheckpointWriter(db: Db, owner: NativeRunnerCheckpointFenceOwner,
+  maintenance?: { checkpoint: DurablePrpCheckpoint }) {
   const persistenceDb = checkpointDb(db);
-  let previousWork = new Set<string>();
+  // Only a canonical source checkpoint can supply the pre-existing inventory.
+  // A recreated idle writer must neither call historical work "new" nor gain
+  // permission to enqueue any work after registration.
+  const admittedWork = new Set(maintenance?.checkpoint.workCommandIds ?? []);
+  let previousWork = new Set(admittedWork);
   return async (checkpoint: DurablePrpCheckpoint): Promise<void> => {
     if (checkpoint.runId !== owner.runId) throw new Error("native_runner_checkpoint_binding_mismatch");
+    if (maintenance && checkpoint.workCommandIds.some(id => !admittedWork.has(id))) {
+      throw new Error("native_runner_checkpoint_owner_lost");
+    }
     const changed = encryptParts(owner, checkpoint.changedRecords);
     await measureNativeControllerStep("runner_checkpoint_transaction", () => persistenceDb.transaction(async tx => {
       if (owner.runId !== owner.authorityRunId) {
         await measureNativeControllerStep("source_coordinator_locks", () => lockSourceRecoveryCoordinators(tx, owner.companyId, [owner.runId, owner.authorityRunId]));
         await assertNativeSourceCheckpointConsumer(tx, owner, checkpoint);
       }
-      await measureNativeControllerStep("runner_checkpoint_owner", () => assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id)),
-        { checkpointMaintenanceOnly: true }));
+      await measureNativeControllerStep("runner_checkpoint_owner", async () => {
+        if (maintenance) {
+          const locked = await lockNativeRunnerCheckpointOwner(tx, owner);
+          if (locked.phase !== "committed" || !locked.resultId || locked.leaseOwner !== null) throw new Error("native_runner_checkpoint_owner_lost");
+          await validateNativeRunnerCheckpointOwner(tx, owner, locked, false, { checkpointMaintenanceOnly: true });
+        } else await assertNativeRunnerCheckpointOwner(tx, owner, checkpoint.workCommandIds.some(id => !previousWork.has(id)),
+          { checkpointMaintenanceOnly: true });
+      });
       if (checkpoint.reset || checkpoint.changedRecords.has("header") || checkpoint.removedRecords.includes("header")) {
         const [header] = await measureNativeControllerStep("runner_checkpoint_header_read", () => tx.select({ material: nativeRunnerCheckpoints.material }).from(nativeRunnerCheckpoints).where(and(
           eq(nativeRunnerCheckpoints.companyId, owner.companyId), eq(nativeRunnerCheckpoints.runId, owner.runId),
@@ -233,6 +247,8 @@ export async function registerNativeRunnerCheckpoint(input: {
   db: Db; binding: Binding; bootId: string; authority: DurablePrpControlPlane;
   authorityRunId?: string | (() => string);
   onFailure?: (runId: string, leaseOwner: string) => Promise<void>;
+  /** Reconnect the completed source epoch for close/checkpoint only. */
+  checkpointMaintenanceOnly?: { generation: number };
 }): Promise<void> {
   const authorityRunId = typeof input.authorityRunId === "function"
     ? input.authorityRunId() : input.authorityRunId ?? input.binding.runId;
@@ -241,8 +257,14 @@ export async function registerNativeRunnerCheckpoint(input: {
     eq(nativeRunFinalizations.issueId, input.binding.issueId),
     eq(nativeRunFinalizations.runId, authorityRunId),
     eq(nativeRunFinalizations.controllerBootId, input.bootId),
-    gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`))));
-  if (!owner?.leaseOwner) throw new Error("native_runner_checkpoint_owner_lost");
+    input.checkpointMaintenanceOnly ? eq(nativeRunFinalizations.controllerGeneration, input.checkpointMaintenanceOnly.generation)
+      : gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`))));
+  const maintenance = input.checkpointMaintenanceOnly;
+  if (!owner || (maintenance
+    ? authorityRunId !== input.binding.runId || owner.phase !== "committed" || !owner.resultId || owner.leaseOwner !== null
+    : !owner.leaseOwner)) throw new Error("native_runner_checkpoint_owner_lost");
+  const checkpoint = maintenance ? await loadNativeRunnerCheckpoint(input.db, input.binding) : null;
+  if (maintenance && !checkpoint) throw new Error("native_runner_checkpoint_owner_lost");
   let writers = authorities.get(input.authority);
   if (!writers) {
     writers = new Map();
@@ -254,15 +276,15 @@ export async function registerNativeRunnerCheckpoint(input: {
     });
     authorities.set(input.authority, writers);
   }
-  const fence = JSON.stringify([authorityRunId, input.bootId, owner.controllerGeneration, owner.leaseOwner]);
+  const fence = JSON.stringify([authorityRunId, input.bootId, owner.controllerGeneration, owner.leaseOwner, maintenance ?? null]);
   if (writers.get(input.binding.runId)?.fence !== fence) {
     const write = nativeRunnerCheckpointWriter(input.db, {
       ...input.binding, authorityRunId, bootId: input.bootId, generation: owner.controllerGeneration, leaseOwner: owner.leaseOwner,
-    });
+    }, checkpoint ? { checkpoint } : undefined);
     writers.set(input.binding.runId, { fence, write: async checkpoint => {
       try { await write(checkpoint); }
       catch (error) {
-        void input.onFailure?.(authorityRunId, owner.leaseOwner!).catch(() => undefined);
+        if (owner.leaseOwner) void input.onFailure?.(authorityRunId, owner.leaseOwner).catch(() => undefined);
         throw error;
       }
     } });

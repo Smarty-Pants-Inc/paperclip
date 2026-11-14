@@ -112,6 +112,18 @@ it("serialises only the new command when one command is added to a full journal"
   }
 });
 
+it("does not turn read-only goal recovery into new work at the checkpoint fence", async () => {
+  const core = new DurablePrpControlPlane({ stateDirectory: temporaryRoot(), identity,
+    expectedRunnerVersion: runnerVersion, expectedRunnerDigest: runnerDigest });
+  try {
+    core.queueCommand("session.goal.get", {}, "read-goal");
+    core.queueCommand("runner.suspend", {}, "suspend-source");
+    core.queueCommand("turn.start", { prompt: "new work still needs an owner" }, "new-turn");
+    const checkpoint = durableRecoveryInternals.captureCheckpoint(core.store.state, runnerVersion, runnerDigest);
+    expect(checkpoint.workCommandIds).toEqual(["new-turn"]);
+  } finally { await core.stop(); }
+});
+
 /** Small deterministic generator (mulberry32), so a failure is reproducible. */
 function random(seed: number): () => number {
   let value = seed >>> 0;
