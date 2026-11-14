@@ -70,7 +70,14 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
-const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused"]);
+/** The message's own run is still at work in same-run resume cycles (its
+ * native finalization is a retryable_failure with the next attempt scheduled,
+ * heartbeat.ts:3862-3895): past T0, ONE progress note, never a failure. */
+export const UNANSWERED_MESSAGE_STILL_TRYING_CODE = "still_trying";
+export function stillTryingText(name: string) {
+  return `${name} is still trying to reach its workspace; your message is kept.`;
+}
+const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_STILL_TRYING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -389,7 +396,8 @@ export async function settleUnansweredPersonMessage(
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
-      || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
+      || fenced.upgradeCommentId !== decision.upgradeCommentId
+      || fenced.supersedeCommentId !== decision.supersedeCommentId) return null;
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
@@ -407,6 +415,11 @@ export async function settleUnansweredPersonMessage(
     // the person's latest message replaces B''s live note for an earlier
     // message (soft-deleted, as an answer supersedes one; its key still marks
     // that message noticed). Other notes stay one per message.
+    if (comment?.id && fenced.supersedeCommentId) {
+      await tx.execute(sql`update ${issueComments} set metadata = coalesce(metadata, '{}'::jsonb)
+        || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
+        where id = ${fenced.supersedeCommentId} and company_id = ${issue.companyId} and deleted_at is null`);
+    }
     if (comment?.id && fenced.replacesEarlier) {
       const messageId = fenced.reason.slice(UNANSWERED_MESSAGE_REASON_PREFIX.length);
       await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
@@ -433,7 +446,9 @@ type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" 
       /** Set when this replaces the message's standing waiting note. */
       upgradeCommentId?: string;
       /** A held-conversation note: it replaces B''s live note for an earlier message. */
-      replacesEarlier?: boolean };
+      replacesEarlier?: boolean;
+      /** The message's progress note that this note supersedes (kept, marked supersededBy). */
+      supersedeCommentId?: string };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
@@ -474,7 +489,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+    sql`${reasonOf(issueComments.metadata)} = ${reason}`,
+    // A superseded progress note is history, not this message's standing note.
+    sql`not coalesce(${issueComments.metadata} ? 'supersededBy', false)`)).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
@@ -641,6 +658,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   }
 
   let code: string;
+  let stillTrying = false;
   if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (waitingToStart) {
@@ -680,9 +698,19 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) {
         const wait = await bounded(now.getTime() + 30_000);
         if (wait) return wait;
-      } else if (coordinator.phase === "retryable_failure"
-        && (!coordinator.nextAttemptAt || coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime())) {
-        const wait = await bounded(Math.max(now.getTime() + 30_000, (coordinator.nextAttemptAt?.getTime() ?? 0) + OVERDUE_NATIVE_RETRY_MS));
+      } else if (coordinator.phase === "retryable_failure" && coordinator.nextAttemptAt
+        && coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime()) {
+        // SMA-189 (RFL 09:19Z/09:35Z): a same-run resume is scheduled and not
+        // overdue: the message's run is still at work, and T0 does not end it.
+        // Within T0 nothing; past T0 ONE progress note (waiting-kind, so the
+        // run's terminal failure replaces it in place); no note per cycle.
+        const recheckAt = Math.max(now.getTime() + 30_000, coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS);
+        const wait = await bounded(recheckAt);
+        if (wait) return wait;
+        if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_STILL_TRYING_CODE) return { kind: "pending", recheckAt };
+        stillTrying = true;
+      } else if (coordinator.phase === "retryable_failure" && !coordinator.nextAttemptAt) {
+        const wait = await bounded(now.getTime() + 30_000);
         if (wait) return wait;
       }
     }
@@ -698,7 +726,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // + NATIVE_REPAIR_PUBLISH_BOUND_MS (D4). If a guard of the repair (an
     // edited carried message, a newer status decision, a board-owned hold)
     // keeps it from publishing, this step posts the notice after that bound.
-    if (run.status === "succeeded" && nativeBlockedRepairApplies) {
+    if (!stillTrying && run.status === "succeeded" && nativeBlockedRepairApplies) {
       const [deferral] = await q.select({ at: sql<Date>`min(${heartbeatRunEvents.createdAt})` }).from(heartbeatRunEvents).where(and(
         eq(heartbeatRunEvents.companyId, issue.companyId), eq(heartbeatRunEvents.runId, run.id),
         eq(heartbeatRunEvents.eventType, NATIVE_REPAIR_DEFERRAL_EVENT),
@@ -711,7 +739,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
           ...(t0 === null ? { recordDeferral: { runId: run.id, agentId: run.agentId, messageId: message.id } } : {}) };
       }
     }
-    code = refusedRun && run.status !== "succeeded" ? unansweredMessageCode(refusedRun)
+    code = stillTrying ? UNANSWERED_MESSAGE_STILL_TRYING_CODE
+      : refusedRun && run.status !== "succeeded" ? unansweredMessageCode(refusedRun)
       : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
   }
 
@@ -749,17 +778,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const waiting = WAITING_KIND_CODES.has(code);
   const chat = Boolean(issue.conversationAgentId && issue.conversationUserId);
   const agentName = agentRow?.name?.trim() || "this agent";
-  const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+  const stillTryingNote = code === UNANSWERED_MESSAGE_STILL_TRYING_CODE;
+  const body = paused ? agentPausedText(pausedName) : stillTryingNote ? stillTryingText(pausedName)
+    : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : heldByHold ? (chat ? chatHeldText(agentName) : HELD_PREDECESSOR_NOTICE)
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? (chat ? chatNoRunText(agentName) : UNANSWERED_MESSAGE_NO_RUN_TEXT)
       : held ? (chat ? chatHeldText(agentName) : HELD_PREDECESSOR_NOTICE) : chat ? chatUnansweredText(agentName) : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
+      title: paused ? `${pausedName} is paused` : stillTryingNote ? `${pausedName} is still trying`
+        : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : stillTryingNote ? "No action is needed; your message is kept while it tries."
         : waiting ? "No action is needed; it will start by itself."
         : held ? (chat ? `Start a new chat with ${agentName}.` : "Assign this agent a new task to continue.")
         : chat ? `Send the message again; if it fails again, start a new chat with ${agentName}.`
@@ -775,7 +808,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     failureCode: waiting ? undefined : run || (refused && refusedRun) ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
-  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}),
+  // RFL 09:45Z: the progress note is never rewritten or deleted; the next
+  // state is a new note, and the progress note is marked superseded by it.
+  const supersedes = upgrading && standingWaitingCode === UNANSWERED_MESSAGE_STILL_TRYING_CODE && !stillTryingNote;
+  return { kind: "notice", reason, code, notice,
+    ...(upgrading && !supersedes ? { upgradeCommentId: upgrading } : {}),
+    ...(supersedes ? { supersedeCommentId: upgrading } : {}),
     ...(held && !paused && !waiting ? { replacesEarlier: true } : {}) };
 }
 
