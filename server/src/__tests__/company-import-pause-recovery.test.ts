@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { and, eq, isNull } from "drizzle-orm";
@@ -145,6 +149,60 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       console.log(JSON.stringify({ shape: "S4-armed", tick, runs: runs.map(r => ({ id: r.id, status: r.status,
         reason: r.contextSnapshot?.wakeReason })) }));
       expect(tick.triggered).toBe(1);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "issue_monitor_due" } });
+      expect(await notes(f.issue.id)).toHaveLength(0);
+    } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); }
+  });
+
+  it.each([
+    { sourceStatus: "in_progress", status: "in_progress" },
+    { sourceStatus: "in_progress", status: "in_review" },
+    { sourceStatus: "blocked", status: "in_progress" },
+    { sourceStatus: "blocked", status: "in_review" },
+  ])("documented PATCH re-arms an imported monitor without a recovery note while import-paused ($sourceStatus -> $status)", async ({ sourceStatus, status }) => {
+    const f = await imported(true, sourceStatus);
+    const due = new Date(Date.now() + 60_000);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", source: "local_implicit", userId: "m12-board", isInstanceAdmin: true };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as Parameters<typeof issueRoutes>[1]));
+    app.use(errorHandler);
+    const heartbeat = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+      runPlugin: async () => "complete", runHost: async () => "complete" });
+    try {
+      const response = await request(app).patch(`/api/issues/${f.issue.id}`).send({ status,
+        executionPolicy: { monitor: { nextCheckAt: due.toISOString(), notes: "Re-armed imported monitor" } } });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({ status, monitorNextCheckAt: due.toISOString() });
+      const [paused] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      expect(paused).toMatchObject({ status: "paused", pauseReason: "import" });
+      expect(paused!.lifecycleHolds.every(hold => hold === "import")).toBe(true);
+      console.log(JSON.stringify({ check: "monitor-patch-import-paused", status, phase: "patched",
+        notes: (await notes(f.issue.id)).map(note => note.body), holds: paused!.lifecycleHolds }));
+      expect(await notes(f.issue.id)).toHaveLength(0);
+      for (let pass = 0; pass < 2; pass++) {
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issue.id });
+        await heartbeat.checkAssignedWorkInvariant({ companyId: f.companyId, issueId: f.issue.id });
+        await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issue.id,
+          now: new Date(Date.now() + 30 * 60_000) });
+        await heartbeat.tickIssueMonitors(new Date());
+      }
+      console.log(JSON.stringify({ check: "monitor-patch-import-paused", status, phase: "swept",
+        notes: (await notes(f.issue.id)).map(note => note.body) }));
+      expect(await notes(f.issue.id)).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      const [waiting] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+      expect(waiting).toMatchObject({ status, monitorNextCheckAt: due, monitorNotes: "Re-armed imported monitor" });
+      await worker.process(f.agentId);
+      await createAgentLifecycle(db).resumeAgent(f.agentId);
+      await worker.process(f.agentId);
+      await heartbeat.tickIssueMonitors(new Date(due.getTime() + 1));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
       expect(runs).toHaveLength(1);
       expect(runs[0]).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "issue_monitor_due" } });
       expect(await notes(f.issue.id)).toHaveLength(0);
