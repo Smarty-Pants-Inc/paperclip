@@ -1,6 +1,7 @@
 import { sql, type SQL } from "drizzle-orm";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { ISSUE_COMMENT_SUPERSESSION_KEYS } from "@paperclipai/shared";
+import { CONVERSATION_RESET_COMMAND } from "./agent-conversations.js";
 
 /**
  * SQL form of @paperclipai/shared isCurrentNotice (RFL 11:43Z): the ONE rule for
@@ -15,4 +16,18 @@ export function currentNoticeSql(metadata: SQL | AnyPgColumn): SQL {
     const k = sql.raw(`'${key}'`);
     return sql`(jsonb_typeof(${metadata}->${k}) is distinct from 'string' or ${metadata}->>${k} = '')`;
   }), sql` and `)})`;
+}
+
+/** String.prototype.trim's whitespace (ECMA-262 WhiteSpace and LineTerminator), so SQL trims exactly as JS does. */
+const JS_TRIM_CHARACTERS = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+  + "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
+
+/**
+ * The ONE SQL mirror of agent-conversations.ts isConversationReset: a person's
+ * "/new" session reset, a command and a conversation boundary, not a message
+ * owed a reply (SMAA-1909). Like Paperclip's callers, it also requires a
+ * person author. A parity test pins it to the TS function.
+ */
+export function conversationResetSql(comment: { body: SQL | AnyPgColumn; authorUserId: SQL | AnyPgColumn }): SQL {
+  return sql`(${comment.authorUserId} is not null and btrim(${comment.body}, ${JS_TRIM_CHARACTERS}) = ${CONVERSATION_RESET_COMMAND})`;
 }
