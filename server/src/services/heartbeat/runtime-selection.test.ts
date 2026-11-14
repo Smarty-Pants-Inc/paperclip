@@ -46,6 +46,7 @@ import { createNativeSessionHandoffLoader } from "../native-runtime/native-sessi
 import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer.js";
 import { resolveNativeControllerRecovery, assertNativeRetainedSandboxBinding } from "../native-runtime/native-controller-recovery.js";
 import { createSystemRecovery } from "../system-recovery-state.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -794,6 +795,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
     }
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
+    // RFL 17:1xZ (authorized strengthening): after the designed end answered, no stale blocker remains.
+    expect(await getExecutionBlocker(db, f.agent.companyId, f.issue.id)).toBeNull();
   }, 60_000);
 
   it.each(["pi", "codex"])("RFL round4 F9 preserves the skill-change note through actual %s selection and replay", async provider => {
