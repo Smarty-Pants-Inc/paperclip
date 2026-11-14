@@ -158,6 +158,56 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(notes[0].body).toContain("stopping the earlier attempt before starting fresh");
   });
 
+  // Keep: D1, a read-only authorization cannot write a stop intent or a note;
+  // an admitted running turn must keep its immutable provider identity.
+  it.each([false, true])("RFL round5 D1 session-boundary inspection is pure (admitted: %s)", async admitted => {
+    const f = await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected first selection");
+    const oldId = first.nativeExecution.session.normalizedSessionId!;
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+      errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", recoveryState: "blocked" })
+      .where(eq(nativeRunFinalizations.runId, f.run.id));
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId,
+      heartbeatRunId: f.run.id, issueId: f.issue.id, provider: "boat", providerLeaseId: `d1-${f.run.id}`,
+      status: "expired", acquiredAt: new Date(Date.now() - 1000), releasedAt: new Date(), cleanupStatus: "success" }).returning();
+    const continued = await ensureFreshContinuation(db, { companyId: f.agent.companyId,
+      runId: f.run.id, trigger: "recovery_refused", delivery: "caller_owns" });
+    expect(continued.kind).toBe("continued");
+    if (continued.kind !== "continued") throw new Error(JSON.stringify(continued));
+    const [current] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId,
+      agentId: f.agent.id, issueId: f.issue.id, nativeIssueId: f.issue.id, status: "running", runtimeMode: "native",
+      nativeSessionId: admitted ? oldId : null, createdAt: new Date(Date.now() + 1000),
+      contextSnapshot: { issueId: f.issue.id, recoveryActionId: continued.recoveryActionId,
+        ...(continued.isolation === "fresh_isolated_workspace" ? { freshContinuationIsolation: continued.recoveryActionId } : {}) } }).returning();
+    const beforeLease = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0];
+    const beforeNotes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
+    expect(await readFreshContinuationSessionBoundary(db, current, f.issue.id)).toBeNull();
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(beforeLease);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toEqual(beforeNotes);
+    const confirmedAt = new Date().toISOString();
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
+        companyId: f.agent.companyId, runId: f.run.id, leaseId: lease.id,
+        provider: lease.provider, providerLeaseId: lease.providerLeaseId, state: "stopped", confirmedAt } } })
+      .where(eq(environmentLeases.id, lease.id));
+    const confirmedLease = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0];
+    const boundary = await readFreshContinuationSessionBoundary(db, current, f.issue.id);
+    if (admitted) expect(boundary).toBeNull();
+    else expect(boundary).toMatchObject({ sourceRunId: f.run.id, sourceSessionId: oldId });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toEqual(beforeNotes);
+    if (admitted) {
+      f.input.run = current; f.input.task.context = current.contextSnapshot!;
+      const selected = await selectHeartbeatRuntime(db, f.input);
+      expect(selected).toMatchObject({ nativeExecution: { session: { normalizedSessionId: oldId } } });
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(confirmedLease);
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toEqual(beforeNotes);
+    }
+  });
+
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
   const coordinators = (id: string) => db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id));
   const sandbox = { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: "/workspace", reusableLeaseConfigured: false };
