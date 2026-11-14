@@ -127,6 +127,25 @@ test.describe("Announcement placement on a new company's first task", () => {
     }
   });
 
+  test("on a phone, defer announcements on chat routes and keep Send hit-testable", async ({ page, request }, testInfo) => {
+    const { company, issue } = await firstTask(request, "Announcement Phone Composer");
+    await serveConnectorsAnnouncement(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`/${company.issuePrefix}/issues/${issue.identifier}`);
+
+    const announcement = page.getByRole("complementary", { name: "Paperclip announcements" });
+    const send = page.getByTestId("task-chat-composer-send");
+    await expect(send).toBeVisible({ timeout: 30_000 });
+    await expect(announcement).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath("announcement-390x844.png") });
+    const result = await send.evaluate(button => {
+      const rect = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      return { hit: hit?.outerHTML ?? null, sendHit: Boolean(hit && (hit === button || button.contains(hit))) };
+    });
+    expect(result.sendHit, `Send center was covered by ${result.hit}`).toBe(true);
+  });
+
   test("a long announcement docked in a narrow sidebar keeps navigation and the account menu usable", async ({ page, request }) => {
     const { company, issue } = await firstTask(request, "Announcement Long");
     const long = {

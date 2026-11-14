@@ -774,7 +774,7 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
       <BoardDialogs />
       <KeyboardShortcutsCheatsheet open={shortcutsOpen} onOpenChange={setShortcutsOpen} />
       <ToastViewport />
-      {isMobile ? <AnnouncementWell health={health} placement="floating" /> : null}
+      {isMobile && !isTaskDetailRoute && !isAgentChatRoute ? <AnnouncementWell health={health} placement="floating" /> : null}
       <PluginAppShellOverlays localTrusted={health?.deploymentMode === "local_trusted"} />
       </div>
     </ChatSetupSidebarProvider>
