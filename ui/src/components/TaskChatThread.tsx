@@ -445,6 +445,14 @@ function resolvedWithoutUserFacingResponse(value: unknown): boolean {
   );
 }
 
+// A superseded system notice is history, never current. It leaves compact
+// history only where an expand control can show it (see historyControl).
+function isSupersededHistoryNotice(comment: TaskChatThreadProps["comments"][number]) {
+  return comment.conversationSessionGeneration == null
+    && (comment.authorType === "system" || comment.presentation?.kind === "system_notice")
+    && isSupersededNotice(comment.metadata);
+}
+
 export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
   conversationMode?: boolean;
   creationActivity?: ActivityEvent[];
@@ -932,14 +940,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (imageReceipts.has(comment.id)) return [];
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment)) return [];
-        // Superseded: off the live view, kept collapsed in expanded history.
-        // A chat with no expand control is its own history (IssueDetail never
-        // expands a conversation), so there it stays in place, collapsed and
-        // labelled "Superseded" as in Classic.
-        if (comment.conversationSessionGeneration == null
-          && (comment.authorType === "system" || comment.presentation?.kind === "system_notice")
-          && isSupersededNotice(comment.metadata)) {
-          if (props.compactHistory && (!conversationMode || props.onExpandHistory || props.historyControl)) return [];
+        // Superseded: kept in place, collapsed and labelled "Superseded" as in
+        // Classic; compact history drops it only where an expand control can
+        // show it (items, below).
+        if (isSupersededHistoryNotice(comment)) {
           return [comment.presentation ? { ...comment, presentation: { ...comment.presentation, detailsDefaultOpen: false } } : comment];
         }
         if (isRedundantAiRecoveryNotice(comment, interactions)) return [];
@@ -955,28 +959,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const summary = acceptedSemanticResultSummary(resultJson);
         return [summary ? { ...comment, body: summary } : comment];
       }),
-    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts, props.compactHistory, conversationMode, props.onExpandHistory, props.historyControl],
-  );
-
-  const commentItems = useMemo(
-    () =>
-      commentsToTaskChatItems(projectedComments, {
-        agentMap,
-        userLabelMap,
-        userProfileMap,
-        currentUserId,
-        issueAssigneeAgentId,
-        verificationCaveatsByRunId,
-      }),
-    [
-      projectedComments,
-      agentMap,
-      userLabelMap,
-      userProfileMap,
-      currentUserId,
-      issueAssigneeAgentId,
-      verificationCaveatsByRunId,
-    ],
+    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
   );
 
   // Every run we might need a transcript for (history + live), deduped by id.
@@ -1049,7 +1032,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       const presentationCommentId = presentationDecisionCommentId(meta?.resultJson);
       const progressCommentIds = semanticProgressCommentIds(meta?.resultJson);
       if (projectedComments.some(comment =>
-        comment.authorType === "agent" && !comment.deletedAt && comment.body.trim() &&
+        comment.authorType === "agent" && !isSupersededHistoryNotice(comment) && !comment.deletedAt && comment.body.trim() &&
         comment.body !== LEGACY_WITHHELD_RUN_COMMENT && !progressCommentIds.has(comment.id) &&
         (comment.runId ?? comment.createdByRunId ?? comment.derivedCreatedByRunId) === run.id &&
         (presentationCommentId === undefined || presentationCommentId === comment.id),
@@ -1102,6 +1085,34 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     errorsByRun: logErrorsByRun,
     retry: retryLogs,
   } = useLiveRunTranscripts({ runs: logRuns, companyId, ...(props.compactHistory ? { logReadLimitBytes: COMPACT_RUN_LOG_READ_LIMIT_BYTES } : {}) });
+  // The expand control this thread renders: the page's ("More messages") or,
+  // without one, its own "More run output".
+  const historyControl = props.historyControl ?? (
+    props.compactHistory && props.onExpandHistory
+    && (deferredTranscriptRunIds.size > 0 || logRuns.some((run) => truncatedRunIds?.has(run.id)))
+      ? <Button type="button" variant="ghost" size="sm" onClick={props.onExpandHistory}>More run output</Button>
+      : null
+  );
+  const commentItems = useMemo(
+    () =>
+      commentsToTaskChatItems(projectedComments, {
+        agentMap,
+        userLabelMap,
+        userProfileMap,
+        currentUserId,
+        issueAssigneeAgentId,
+        verificationCaveatsByRunId,
+      }),
+    [
+      projectedComments,
+      agentMap,
+      userLabelMap,
+      userProfileMap,
+      currentUserId,
+      issueAssigneeAgentId,
+      verificationCaveatsByRunId,
+    ],
+  );
   const fallbackByRunRef = useRef(
     new Map<string, NonNullable<ReturnType<typeof logTranscriptByRun.get>>>(),
   );
@@ -1643,7 +1654,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   // heavy assembly memo doesn't recompute on every parent render.
   const hasBrief = Boolean(issueBrief);
 
-  const { items, settledRunIds, settledReplyRunIds } = useMemo<{
+  const { items: historyItems, settledRunIds, settledReplyRunIds } = useMemo<{
     items: TaskChatItem[];
     settledRunIds: Set<string>;
     settledReplyRunIds: Set<string>;
@@ -2512,6 +2523,27 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : showSettlingTail
       ? settlingRun!.id
       : null;
+  // A superseded notice leaves compact history ONLY where the expand control
+  // renders and can show it. The control renders with the thread, never on the
+  // empty-thread screen, so the drop also needs something else to show: with
+  // no control (a chat, a short task) or nothing else (a thread whose only
+  // items are these notices) they stay in place, collapsed and labelled
+  // "Superseded".
+  const supersededNoticeIds = useMemo(
+    () => new Set(projectedComments.filter(isSupersededHistoryNotice).map((comment) => comment.id)),
+    [projectedComments],
+  );
+  const itemsWithoutSupersededNotices = useMemo(
+    () => supersededNoticeIds.size > 0
+      ? historyItems.filter((item) => !supersededNoticeIds.has(item.id))
+      : historyItems,
+    [historyItems, supersededNoticeIds],
+  );
+  const dropSupersededHistoryNotices = Boolean(
+    props.compactHistory && historyControl
+    && (itemsWithoutSupersededNotices.length > 0 || tailRunId || scrollingHistory?.hasMore),
+  );
+  const items = dropSupersededHistoryNotices ? itemsWithoutSupersededNotices : historyItems;
   // A running (or still settling) turn lives outside the chronological body.
   // Its task cards follow that same tail until the complete turn takes over.
   const [threadItems, tailTaskCreationItems] = useMemo<[TaskChatItem[], TaskChatItem[]]>(() => {
@@ -3084,12 +3116,6 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ],
   );
 
-  const historyControl = props.historyControl ?? (
-    props.compactHistory && props.onExpandHistory
-    && (deferredTranscriptRunIds.size > 0 || logRuns.some((run) => truncatedRunIds?.has(run.id)))
-      ? <Button type="button" variant="ghost" size="sm" onClick={props.onExpandHistory}>More run output</Button>
-      : null
-  );
   const renderBrief = useCallback(
     () => issueBrief ? <><TaskChatDescriptionBubble brief={issueBrief} />{historyControl}</> : null,
     [issueBrief, historyControl],
