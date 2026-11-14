@@ -26,6 +26,8 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, nativeIssueId: issue.id, nativeSessionId: randomUUID(), runtimeMode: "native", nativePhase: "terminal_failure", status: "failed", errorCode: "runner_remote_state_unavailable", createdAt: new Date(now - 600_000), finishedAt: new Date(now - 60_000), responsibleUserId: userId }).returning();
     const [lease] = await db.insert(environmentLeases).values({ companyId: company.id, issueId: issue.id, heartbeatRunId: run.id, provider: "boat", providerLeaseId: `ended-${randomUUID()}`, status: "released", cleanupStatus: "success", failureReason: "historical-idle-close", acquiredAt: new Date(now - 590_000), releasedAt: new Date(now - 300_000), metadata: { pluginId: "fixture-boat", leaseController: { bootId: "historical-boot" }, historicalEvidence: "must survive" } }).returning();
     const readLease = async () => (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]!;
+    const readStorage = async () => (await db.execute<{ row: Record<string, unknown> }>(sql`select to_jsonb(${environmentLeases}) as row from ${environmentLeases} where ${environmentLeases.id} = ${lease.id}`))[0]!.row;
+    const storage = await readStorage();
     const notes = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.authorType, "system")));
     const gate = () => db.transaction(tx => freshThreadStopGate(tx as unknown as Db, run, issue.id));
     const inspector = (result: unknown) => vi.fn(async () => {
@@ -35,7 +37,7 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
       return result;
     });
     const cleanup = (stop: ReturnType<typeof vi.fn>) => heartbeatService(db, { environmentRuntime: { retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
-    return { run, issue, lease, readLease, notes, gate, inspector, cleanup };
+    return { run, issue, lease, readLease, readStorage, storage, notes, gate, inspector, cleanup };
   }
 
   it.each(["error", "absent"] as const)("released no receipt + GET %s: unchanged row, one cannot-confirm note, bounded, no stop or run", async observation => {
@@ -56,18 +58,44 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
-  it("released no receipt + GET running: unchanged row, one waiting note, single stop, no proofless run", async () => {
-    const f = await fixture(), inspect = f.inspector({ providerLeaseId: "unused", state: "active" });
-    inspect.mockImplementation(async () => ({ providerLeaseId: f.lease.providerLeaseId!, state: "active" }));
-    const stop = vi.fn(async () => undefined), hb = f.cleanup(stop);
+  function expectRestored(original: typeof environmentLeases.$inferSelect, restored: typeof environmentLeases.$inferSelect) {
+    const receipt = restored.metadata?.remoteExecutionTermination;
+    expect(receipt).toMatchObject({ schema: "paperclip.remote-termination.v1", companyId: original.companyId,
+      runId: original.heartbeatRunId, leaseId: original.id, provider: original.provider,
+      providerLeaseId: original.providerLeaseId, state: "stopped", endedLeaseEvidence: JSON.parse(JSON.stringify(original)) });
+    expect(Date.parse((receipt as { confirmedAt: string }).confirmedAt)).toBeGreaterThanOrEqual(original.releasedAt!.getTime());
+    // RFL 22:57Z (2): EVERY field, including all original timestamps and every
+    // metadata key, is restored. The new stop receipt is the sole addition.
+    for (const key of Object.keys(original) as (keyof typeof original)[]) {
+      expect(restored[key], key).toEqual(key === "metadata" ? { ...original.metadata, remoteExecutionTermination: receipt } : original[key]);
+    }
+    expect(restored).toEqual({ ...original, metadata: { ...original.metadata, remoteExecutionTermination: receipt } });
+  }
+
+  async function expectStorageRestored(f: Awaited<ReturnType<typeof fixture>>) {
+    const restored = await f.readStorage(), metadata = f.storage.metadata as Record<string, unknown>;
+    // to_jsonb retains PostgreSQL microseconds that a JS Date read discards.
+    expect(restored).toEqual({ ...f.storage, metadata: { ...metadata,
+      remoteExecutionTermination: (restored.metadata as Record<string, unknown>).remoteExecutionTermination } });
+  }
+
+  it("released no receipt + GET running: one waiting note, single stop, restored original plus new receipt, no proofless run", async () => {
+    const f = await fixture(), inspect = f.inspector({ providerLeaseId: f.lease.providerLeaseId!, state: "running" });
+    const stop = vi.fn(async () => ({ providerLeaseId: f.lease.providerLeaseId!, state: "stopped" })), hb = f.cleanup(stop);
     await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
+    const pending = await f.readLease();
+    expect(readStopOnlyCleanup(pending)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+    expect(pending.status).toBe("pending_cleanup");
     await f.gate();
-    await hb.sweepPendingCleanupLeases();
-    expect(await f.readLease()).toEqual(f.lease); // strict bar: preserve the original ended row, not a copy
     expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
     expect(await f.notes()).toHaveLength(1);
-    expect(stop).toHaveBeenCalledOnce();
     expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
+    for (let n = 0; n < 3; n++) await hb.sweepPendingCleanupLeases();
+    expect(stop).toHaveBeenCalledOnce();
+    expectRestored(f.lease, await f.readLease());
+    await expectStorageRestored(f);
+    expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
@@ -88,9 +116,46 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     await hb.sweepPendingCleanupLeases();
     expect(stop).toHaveBeenCalledOnce();
     const settled = await f.readLease();
-    expect(settled.metadata?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+    expectRestored(f.lease, settled);
+    await expectStorageRestored(f);
     expect(readStopOnlyCleanup(settled)).toBeNull();
     expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
+  }, 60_000);
+
+  it("restart after the persisted rewrite recovers the exact original from its intent and restores it once", async () => {
+    const f = await fixture(), inspect = f.inspector({ providerLeaseId: f.lease.providerLeaseId!, state: "running" });
+    await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
+    const pending = await f.readLease(), requestId = readStopOnlyCleanup(pending)!.requestId;
+    expect(pending.status).toBe("pending_cleanup");
+    expect(readStopOnlyCleanup(pending)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+    await f.gate();
+    expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
+    // Nothing in memory is passed to the successor service. This is the crash
+    // boundary after committed intent/rewrite and before dispatch/restoration.
+    const restartedDb = createDb(database.connectionString);
+    const stop = vi.fn(async () => {
+      const [claimed] = await restartedDb.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      expect(readStopOnlyCleanup(claimed)!.requestId).toBe(requestId);
+      expect(readStopOnlyCleanup(claimed)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+      return { providerLeaseId: f.lease.providerLeaseId!, state: "stopped" };
+    });
+    const restarted = heartbeatService(restartedDb, { environmentRuntime: { retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
+    try {
+      for (let n = 0; n < 3; n++) await restarted.sweepPendingCleanupLeases();
+      expect(stop).toHaveBeenCalledOnce();
+      const restored = await f.readLease();
+      expectRestored(f.lease, restored);
+      await expectStorageRestored(f);
+      expect(readStopOnlyCleanup(restored)).toBeNull();
+      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
+      expect(await f.notes()).toHaveLength(1);
+      // Snapshot and time checks must not become a broad bad-time exception.
+      await db.update(environmentLeases).set({ failureReason: "tampered" }).where(eq(environmentLeases.id, f.lease.id));
+      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
+      await db.update(environmentLeases).set({ failureReason: restored.failureReason, metadata: { ...restored.metadata,
+        remoteExecutionTermination: { ...(restored.metadata?.remoteExecutionTermination as object), confirmedAt: new Date(Date.now() + 60000).toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+      expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
+    } finally { await restarted.drainActiveRunExecutions(); await restartedDb.$client.end(); }
   }, 60_000);
 });

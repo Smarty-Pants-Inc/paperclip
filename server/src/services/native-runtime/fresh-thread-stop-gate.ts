@@ -1,7 +1,7 @@
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, remoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
-import { hasConfirmedSandboxStopAndRetain, prepareInspectedSourceSandboxStop, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, settleStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
+import { hasConfirmedSandboxStopAndRetain, hasRestoredEndedLeaseStopReceipt, prepareInspectedSourceSandboxStop, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, settleStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 import { noLocalRunnerProcessesForRuns, proveRunProcessGone } from "../run-process-owner.js";
 import { writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
@@ -196,7 +196,7 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
       && (termination?.confirmedAt === undefined || (Number.isFinite(confirmedAt)
         && confirmedAt >= lease.acquiredAt.getTime() && lease.releasedAt !== null && confirmedAt <= lease.releasedAt.getTime()))
       && lease.metadata?.pendingCleanupInFlight !== true;
-    if (hasConfirmedSandboxStopAndRetain(lease) || confirmedRelease) continue;
+    if (hasConfirmedSandboxStopAndRetain(lease) || confirmedRelease || hasRestoredEndedLeaseStopReceipt(lease)) continue;
     gone = false;
     // Even an inadmissible ended receipt is immutable evidence, not permission
     // to erase it and launch a new stop request.

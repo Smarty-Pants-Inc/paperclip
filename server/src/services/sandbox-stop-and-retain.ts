@@ -2,7 +2,8 @@ import { notifyRetainedNativeSessionCleanup } from "./retained-native-session-cl
 import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
-import { and, eq, sql, type SQL } from "drizzle-orm";
+import { isDeepStrictEqual } from "node:util";
+import { and, eq, getTableColumns, isNull, sql, type SQL } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import { isBuiltinSandboxProvider } from "./sandbox-provider-runtime.js";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -202,7 +203,7 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
  * Error, absent, unknown and foreign observations leave ended rows unchanged.
  * The existing cleanup owner dispatches only from pending_cleanup; preserve
  * the COMPLETE ended row durably as well as in its intent before re-arming.
- * This alternative still changes status and needs RFL's row-immutability ruling.
+ * Settlement restores that exact row plus its fresh physical stop receipt.
  * Never called from the preparation gate or for an active turn. */
 export async function prepareInspectedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect, observation: unknown) {
   if (!observation || typeof observation !== "object" || Array.isArray(observation)) return null;
@@ -255,9 +256,17 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
       pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,
       pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0, pendingCleanupRetryCapWarned: false,
       ...retention?.metadata,
-    })}::jsonb`,
+    })}::jsonb ${preserveEndedEvidence ? sql`|| jsonb_build_object('sandboxStopAndRetain',
+      ${JSON.stringify(intent)}::jsonb || jsonb_build_object('endedLeaseStorageEvidence', to_jsonb(${environmentLeases})))` : sql``}`,
   }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
     eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!), eq(environmentLeases.status, fromStatus),
+    preserveEndedEvidence ? and(...Object.entries(getTableColumns(environmentLeases)).map(([key, column]) => {
+      const value = (recovery.endedLeaseEvidence as Record<string, unknown>)[key];
+      // JS Date reads have millisecond precision; preserve the database's
+      // complete timestamp precision in the intent's storage snapshot above.
+      return value === null ? isNull(column) : value instanceof Date
+        ? sql`date_trunc('milliseconds', ${column}) = ${value.toISOString()}::timestamptz` : eq(column, value as never);
+    })) : undefined,
     preserveEndedEvidence ? sql`not exists (select 1 from environment_leases peer where peer.id <> ${lease.id}
       and peer.provider = ${lease.provider} and peer.provider_lease_id = ${lease.providerLeaseId}
       and peer.status in ('active', 'retained', 'pending_cleanup'))` : undefined,
@@ -266,6 +275,43 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
     sql`${environmentLeases.metadata} is not distinct from ${lease.metadata === null ? null : JSON.stringify(lease.metadata)}::jsonb`,
   )).returning(), { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
   return updated ?? null;
+}
+
+/** The existing stop intent carries the complete pre-rewrite row. Dates cross
+ * JSON storage as strings; reject damaged/foreign evidence rather than restore
+ * a partial row or overwrite allocation identity. */
+function endedLeaseFromEvidence(value: unknown, lease: Lease): typeof environmentLeases.$inferSelect | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const evidence = value as Record<string, unknown>;
+  if (evidence.id !== lease.id || evidence.companyId !== lease.companyId
+    || evidence.heartbeatRunId !== lease.heartbeatRunId || evidence.provider !== lease.provider
+    || evidence.providerLeaseId !== lease.providerLeaseId || !["released", "expired"].includes(String(evidence.status))) return null;
+  const original = { ...evidence };
+  for (const key of ["acquiredAt", "lastUsedAt", "expiresAt", "releasedAt", "createdAt", "updatedAt"]) {
+    const date = original[key];
+    if (date === null && ["expiresAt", "releasedAt"].includes(key)) continue;
+    if (typeof date !== "string" || !Number.isFinite(Date.parse(date))) return null;
+    original[key] = new Date(date);
+  }
+  if (Object.keys(getTableColumns(environmentLeases)).some(key => !Object.hasOwn(original, key))) return null;
+  const row = original as typeof environmentLeases.$inferSelect;
+  if (hasBoundRemoteStopReceipt(row) || hasStopOnlyCleanup(row) || row.metadata?.pendingCleanupInFlight === true) return null;
+  return row;
+}
+
+/** An ended row restored by the stop owner retains its historical timestamps.
+ * Its NEW receipt is not backdated to that old release. Admit only the exact
+ * restored snapshot carried by that receipt, with a real, non-future stop time;
+ * ordinary receipts keep the original bad-time window checks. */
+export function hasRestoredEndedLeaseStopReceipt(lease: typeof environmentLeases.$inferSelect): boolean {
+  const receipt = lease.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined;
+  if (!receipt || !hasBoundRemoteStopReceipt(lease) || typeof receipt.confirmedAt !== "string") return false;
+  const original = endedLeaseFromEvidence(receipt.endedLeaseEvidence, lease);
+  const confirmedAt = Date.parse(receipt.confirmedAt);
+  if (!original || !Number.isFinite(confirmedAt) || confirmedAt < original.acquiredAt.getTime()
+    || confirmedAt < (original.releasedAt?.getTime() ?? 0) || confirmedAt > Date.now()) return false;
+  return isDeepStrictEqual(JSON.parse(JSON.stringify(lease)), JSON.parse(JSON.stringify({ ...original,
+    metadata: { ...original.metadata, remoteExecutionTermination: receipt } })));
 }
 
 export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { attemptId: string; receipt?: unknown; receiptSource?: "provider_inspection" }) {
@@ -306,6 +352,17 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
   const removeIntent: SQL = stopped ? inspected ? sql`- 'sandboxStopAndRetain' - 'sandboxStopAndRetainReceipt'` : sql`- 'sandboxStopAndRetain'`
     : gone ? sql`- 'sandboxStopAndRetain' - 'sandboxStopAndRetainReceipt'` : sql``;
   const recordedIntent = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY] as Record<string, unknown> | undefined;
+  const endedEvidence = recordedIntent?.endedLeaseEvidence;
+  const original = endedLeaseFromEvidence(endedEvidence, lease);
+  // A malformed snapshot cannot fall through to ordinary release and erase it.
+  if (endedEvidence !== undefined && !original) return null;
+  const storageEvidence = recordedIntent?.endedLeaseStorageEvidence;
+  const originalTime = (key: string) => sql`(${environmentLeases.metadata}->'sandboxStopAndRetain'->'endedLeaseStorageEvidence'->>${key})::timestamptz`;
+  const restoration = original && (stopped || gone) ? { ...original,
+    ...(storageEvidence ? { acquiredAt: originalTime("acquired_at"), lastUsedAt: originalTime("last_used_at"),
+      expiresAt: originalTime("expires_at"), releasedAt: originalTime("released_at"),
+      createdAt: originalTime("created_at"), updatedAt: originalTime("updated_at") } : {}),
+    metadata: { ...original.metadata, remoteExecutionTermination: { ...receipt, endedLeaseEvidence: endedEvidence } } } : null;
   const legacyOrphan = stopped && recordedIntent?.recoveredOrphanedRunLease === true && !lease.metadata?.[ORPHANED_SANDBOX_RECOVERY_KEY]
     ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { recoveredOrphanedRunLease: true, ownerProof: recordedIntent.ownerProof ?? null,
       runId: lease.heartbeatRunId, recoveredAt: now.toISOString(), fromStopIntent: true } } : {};
@@ -317,8 +374,9 @@ export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { att
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.workspaceRecovery);
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.nativeRunProjection,
         JSON.stringify({ companyId: lease.companyId, runId: lease.heartbeatRunId }));
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
     }
-    return tx.update(environmentLeases).set({
+    return tx.update(environmentLeases).set(restoration ?? {
       status: stopped || gone ? "released" : "pending_cleanup", cleanupStatus: stopped || gone ? "success" : "failed",
       failureReason: stopped ? null : gone ? "workspace_source_unavailable" : "sandbox_stop_pending",
       releasedAt: now, lastUsedAt: now, updatedAt: now,
