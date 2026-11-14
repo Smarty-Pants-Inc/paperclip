@@ -19,6 +19,7 @@ import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-noti
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
+import { keyValueRow } from "./notice-format.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -57,6 +58,12 @@ export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
 /** The run that carries the message is queued or scheduled and has not started. */
 export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
+/** A waiting note stays true only this long: if the carrying run still has not
+ * started by T0 + this bound, the SAME note becomes the failure text. */
+export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
+/** The non-failure marker row of a waiting note (no "Failure code" row). */
+const WAITING_ROW_LABEL = "Waiting code";
+const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL, value: "waiting_to_start" }] }]);
 
 export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
@@ -208,7 +215,8 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and m.deleted_at is null and ${inScopeSql(rawMessage("m"), since)}
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
-          and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text))
+          and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
+          and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
@@ -233,7 +241,8 @@ export function unansweredPersonMessageCommentCondition(): SQL {
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` })}
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
-        and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text))
+        and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+        and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and exists (select 1 from ${issueComments} m
@@ -338,7 +347,16 @@ export async function settleUnansweredPersonMessage(
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
-    if (fenced.kind !== "notice" || fenced.reason !== decision.reason) return null;
+    if (fenced.kind !== "notice" || fenced.reason !== decision.reason
+      || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
+    if (fenced.upgradeCommentId) {
+      // The SAME note (same key) becomes the failure text: still one note.
+      const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
+        .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
+          isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
+      return updated?.id ?? null;
+    }
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
       authorType: "system",
       presentation: fenced.notice.presentation,
@@ -354,7 +372,9 @@ type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: 
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
-  | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice> };
+  | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
+      /** Set when this replaces the message's standing waiting note. */
+      upgradeCommentId?: string };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
@@ -389,10 +409,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
-  const [noticed] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+  const [noticed] = await q.select({ id: issueComments.id,
+    waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)` })
+    .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
-  if (noticed) return { kind: "noticed_before" };
+  // A standing WAITING note is still an open obligation: it must stay true.
+  if (noticed && !noticed.waiting) return { kind: "noticed_before" };
+  const upgrading = noticed?.waiting ? noticed.id : null;
 
   // The run this message started (the latest run that carries it), if any.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
@@ -485,7 +509,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 
   let code: string;
   if (waitingToStart) {
-    code = UNANSWERED_MESSAGE_WAITING_CODE;
+    // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
+    // carrying run has not started (a dead claim, a stuck queue): failure text.
+    const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
+    if (startDeadline > now.getTime()) {
+      if (upgrading) return { kind: "pending", recheckAt: startDeadline };
+      code = UNANSWERED_MESSAGE_WAITING_CODE;
+    } else {
+      code = UNANSWERED_MESSAGE_NO_RUN_CODE;
+    }
   } else if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
@@ -576,9 +608,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     recoveryOwner: null,
     recoveryResponsibility: "user",
     sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
-    failureCode: run && !waiting ? undefined : code,
+    // A waiting note is not a failure: no "Failure code" row, a marker row instead.
+    failureCode: waiting ? undefined : run ? undefined : code,
   });
-  return { kind: "notice", reason, code, notice };
+  if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, UNANSWERED_MESSAGE_WAITING_CODE)] });
+  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
 

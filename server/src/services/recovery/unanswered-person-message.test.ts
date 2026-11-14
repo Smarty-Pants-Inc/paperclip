@@ -20,7 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
 import { noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
-import { settleUnansweredPersonMessage } from "./unanswered-person-message.js";
+import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -638,6 +638,58 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.reply(queued);
     await settleAt(f, AFTER_WAKE_BOUND_MS + 120_000);
     expect(await f.visible()).toHaveLength(0);
+  });
+
+  // RFL 03:26Z: "it will start by itself" must stay TRUE. A carrying run that
+  // still has not started by T0 + 10 min turns the SAME note into the failure
+  // text; the waiting note carries no failure code.
+  const rowsOf = (notice: { metadata: unknown }) =>
+    ((notice.metadata as { sections?: Array<{ rows: Array<{ label?: string; value?: string }> }> })?.sections ?? []).flatMap(section => section.rows);
+  it("E3.04 (2nd bound): a carrying queued run that never starts -> waiting note at ~2 min, the SAME note becomes the failure text at ~10 min", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    let notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    const noteId = notices[0]!.id;
+    expect(notices[0]!.body).toBe(WAITING);
+    expect(rowsOf(notices[0]!).some(row => row.label === "Failure code")).toBe(false);
+    expect(rowsOf(notices[0]!).find(row => row.label === "Waiting code")?.value).toBe("waiting_to_start");
+    expect((await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      unansweredPersonMessageCommentCondition()))).length, "the waiting note keeps the obligation open").toBeGreaterThan(0);
+    await settleAt(f, 6 * 60_000);
+    expect((await f.visible())[0]!.body).toBe(WAITING);
+    await settleAt(f, 11 * 60_000);
+    notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.id).toBe(noteId);
+    expect(notices[0]!.body).toBe(NO_RUN);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
+    await settleAt(f, 12 * 60_000);
+    expect(await f.visible()).toHaveLength(1);
+  });
+
+  it("E3.04 (2nd bound) control: the carrying run starts at 5 min -> the note stays 'waiting', then the answer supersedes it", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const queued = await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    expect((await f.visible())[0]!.body).toBe(WAITING);
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
+    await settleAt(f, 5 * 60_000);
+    await settleAt(f, 11 * 60_000);
+    let notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(WAITING);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
+    await f.reply(queued);
+    await settleAt(f, 12 * 60_000);
+    notices = await f.visible();
+    expect(notices).toHaveLength(0);
   });
 
   it("E3.04 control: a RUNNING run carrying the message is never bounded (a quiet healthy turn) -> no note at +30 min", async () => {
