@@ -1,3 +1,4 @@
+import { resetGuardianLogCapture, readGuardianLogCapture } from "../../__tests__/helpers/guardian-log-capture.js";
 import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -679,6 +680,56 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     await sweep(f, 3);
     console.log("GUARDIAN_CARD", JSON.stringify(saved));
     expect(await notes(f, "I3 / answered with card")).toHaveLength(0);
+  });
+
+  it("malformed interaction logs a bounded warning and does not starve a healthy issue in the same company", async () => {
+    const f = await seed(false, true);
+    const [healthyIssue] = await db.insert(issues).values({ companyId: f.company.id,
+      title: "Healthy request beside malformed interaction", status: "todo", assigneeAgentId: f.agent.id,
+      responsibleUserId: "local-board", createdAt: f.old, updatedAt: f.old }).returning();
+    const source = await seedRun(f, "running");
+    const badPosted = await runtime.api<{ id: string; authorType: string }>(`/issues/${f.issue.id}/comments`, {
+      body: "Please review the issue with the malformed interaction.",
+    });
+    const healthyPosted = await runtime.api<{ id: string; authorType: string }>(`/issues/${healthyIssue.id}/comments`, {
+      body: "Please review this healthy issue and report the result.",
+    });
+    expect(badPosted.authorType).toBe("user");
+    expect(healthyPosted.authorType).toBe("user");
+    [f.request] = await db.update(issueComments).set({ createdAt: f.old, updatedAt: f.old })
+      .where(eq(issueComments.id, badPosted.id)).returning();
+    const [healthyRequest] = await db.update(issueComments).set({ createdAt: f.old, updatedAt: f.old })
+      .where(eq(issueComments.id, healthyPosted.id)).returning();
+    await db.insert(issueThreadInteractions).values({ companyId: f.company.id, issueId: f.issue.id,
+      kind: "request_confirmation", status: "pending", sourceRunId: source.id,
+      sourceCommentId: f.request!.id, originCommentIds: [f.request!.id], createdByAgentId: f.agent.id,
+      title: "Malformed confirmation card", payload: { body: "Approve this action?", confirmLabel: "Approve" } as any,
+      createdAt: new Date(f.old.getTime() + 2_000) });
+
+    resetGuardianLogCapture();
+    const completed = await runtime.runJob(pluginId);
+    expect(completed.status).toBe("succeeded");
+    const warnings = readGuardianLogCapture();
+    console.log("GUARDIAN_MALFORMED_INTERACTION_LOG", JSON.stringify(warnings));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ level: 40,
+      msg: "[plugin] Conversation guardian reconciliation failed.", source: "sweep",
+      companyId: f.company.id, step: "issues.listInteractions" });
+    for (const key of ["errorClass", "errorCode"] as const) {
+      expect(typeof warnings[0][key]).toBe("string");
+      expect((warnings[0][key] as string).length).toBeGreaterThan(0);
+      expect((warnings[0][key] as string).length).toBeLessThanOrEqual(64);
+    }
+    for (const key of ["err", "error", "stack"]) expect(warnings[0]).not.toHaveProperty(key);
+
+    const badNotes = (await runtime.comments(f.issue.id)).filter(comment =>
+      comment.authorType === "system" && comment.body.includes("conversation-guardian:note:"));
+    const healthyNotes = (await runtime.comments(healthyIssue.id)).filter(comment =>
+      comment.authorType === "system" && comment.body.includes("conversation-guardian:note:"));
+    expect(badNotes).toHaveLength(0);
+    expect(healthyNotes).toHaveLength(1);
+    expect(healthyNotes[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null });
+    expect(healthyNotes[0].body).toContain(`<!-- conversation-guardian:note:${healthyRequest.id} -->`);
   });
 
   it.each(["agent", "board-key agent", "system"] as const)("person-only / %s comment gets no note", async kind => {
