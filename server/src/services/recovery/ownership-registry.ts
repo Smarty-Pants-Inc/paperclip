@@ -707,9 +707,7 @@ const agentLifecycleLeaseKind: OwnableKind = {
 };
 
 const acceptedNativeResultLease = nrfKind("native_accepted_result_lease", "Accepted-result executor lease", "accepted_result",
-  and(isNotNull(nativeRunFinalizations.resultId), notInArray(nativeRunFinalizations.phase, TERMINAL_PHASES),
-    isNotNull(nativeRunFinalizations.leaseOwner), notFinalizerOrCleanup,
-    sql`${nativeRunFinalizations.leaseExpiresAt} > now()`));
+  acceptedNativeResultLeasePredicate());
 
 export const OWNABLE_KINDS: readonly OwnableKind[] = [
   // Native runtime and Runner
@@ -1205,4 +1203,124 @@ export async function resolveFenceHolders(db: Db, records: InProgressRecord[]): 
       currentGeneration: holder?.generation ?? null, leaseExpiresAt: holder?.leaseExpiresAt ?? null };
   }
   await applyObservedFenceProviderProof(db, pending);
+}
+
+/** SQL counterpart of readControllerProcess; guard the cast even for malformed JSON. */
+function controllerStampValidSql(stamp: SQL): SQL {
+  return sql`(jsonb_typeof(${stamp}->'bootId') = 'string'
+    and jsonb_typeof(${stamp}->'hostHash') = 'string' and ${positivePidSql(stamp)})`;
+}
+function positivePidSql(stamp: SQL): SQL {
+  return sql`(case when jsonb_typeof(${stamp}->'pid') = 'number'
+    then (${stamp}->>'pid')::numeric > 0 and trunc((${stamp}->>'pid')::numeric) = (${stamp}->>'pid')::numeric
+    else false end)`;
+}
+
+/** B1 only: the inventory's boot-owning process/fence kinds, rechecked in the
+ * guarded UPDATE's snapshot. Run/issue/queue/operator/none owners do not name a
+ * boot. Keep these predicates beside OWNABLE_KINDS and resolveFenceHolders:
+ * unlike a second inventory read, NOT EXISTS in the UPDATE cannot miss a first
+ * owned record committed between inventory and that statement. This deliberately
+ * does not serialize writes committed after the statement snapshot. */
+export function noControllerOwnedRecordsSql(bootId: string): SQL {
+  const stamped = (stamp: SQL) => sql`(${controllerStampValidSql(stamp)} and ${stamp}->>'bootId' = ${bootId})`;
+  const leaseStamp = sql`${environmentLeases.metadata}->'leaseController'`;
+  const cleanupStamp = sql`${environmentLeases.metadata}->'pendingCleanupController'`;
+  const shutdown = sql`${environmentLeases.metadata}->'legacyShutdownWorkspaceSettlement'`;
+  const tokenHolder = sql`${nativeRunFinalizations.leaseHolder}`;
+  const validTokenHolder = sql`(${controllerStampValidSql(tokenHolder)} and ${tokenHolder}->>'token' = ${nativeRunFinalizations.leaseOwner})`;
+  const nrfControllerKinds = or(
+    and(eq(nativeRunFinalizations.phase, "observed"), isNull(nativeRunFinalizations.resultId),
+      isNotNull(nativeRunFinalizations.leaseOwner), notFinalizerOrCleanup, isNull(nativeRunFinalizations.recoveryState)),
+    inArray(nativeRunFinalizations.recoveryState, ["awaiting_runner_reattach", "resuming_session", "bootstrap_incomplete", "awaiting_evidence"]),
+    completedTurnCleanupHoldWhere());
+  const remoteResult = sql`(coalesce(jsonb_typeof(h.runner_profile_json->'nativeWorkspaceSync') <> 'null', false)
+    or coalesce(jsonb_typeof(h.runner_profile_json->'remoteWorkspace') <> 'null', false)
+    or exists (select 1 from environment_leases l where l.company_id = h.company_id
+      and l.issue_id = ${nativeRunFinalizations.issueId} and l.heartbeat_run_id = h.id
+      and l.metadata->>'runnerTaskLease' = 'true'))`;
+  const runtimeOwner = sql`${workspaceOperations.metadata}->'runtimeControlOwner'`;
+  const work = sql`${workspaceOperations.metadata}->'saveWork'`;
+  const active = sql`jsonb_array_elements(case when jsonb_typeof(${work}->'activeIds') = 'array'
+    then ${work}->'activeIds' else '[]'::jsonb end)`;
+  const saveStamp = sql`${work}->'owners'->(a.id #>> '{}')`;
+  const copyback = sql`${issueRecoveryActions.evidence}->'workspaceOwnerRecovery'->'owner'`;
+  const observed = sql`${issueRecoveryActions.evidence}->'observedWorkspacePreservation'`;
+  return sql`(
+    not exists (select 1 from ${nativeRunFinalizations} where
+      (${nrfControllerKinds} and ${nativeRunFinalizations.controllerBootId} = ${bootId})
+      or (${acceptedNativeResultLeasePredicate()} and exists (select 1 from heartbeat_runs h
+        where h.id = ${nativeRunFinalizations.runId} and h.company_id = ${nativeRunFinalizations.companyId}
+          and h.native_issue_id = ${nativeRunFinalizations.issueId} and
+          (case when ${remoteResult} then ${nativeRunFinalizations.leaseOwner} = ${bootId}
+            else ${nativeRunFinalizations.controllerBootId} = ${bootId} end)))
+      or ((${nativeRunFinalizations.leaseOwner} like 'native-finalizer:%'
+          and ${nativeRunFinalizations.phase} not in ('committed', 'terminal_failure', 'applied')
+        or ${nativeRunFinalizations.leaseOwner} like 'native-cleanup:%')
+        and ${nativeRunFinalizations.leaseExpiresAt} > now()
+        and (case when ${validTokenHolder} then ${tokenHolder}->>'bootId' = ${bootId}
+          else ${nativeRunFinalizations.leaseOwner} = ${bootId} end)))
+    and not exists (select 1 from ${environmentLeases} where
+      (${environmentLeases.status} = 'active' and ${stamped(leaseStamp)}
+        and (${environmentLeases.heartbeatRunId} is null or not exists (select 1 from heartbeat_runs h
+          where h.id = ${environmentLeases.heartbeatRunId}
+          and h.status not in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))))
+      or (${environmentLeases.status} = 'pending_cleanup'
+        and ${environmentLeases.metadata}->>'pendingCleanupInFlight' = 'true'
+        and (case when coalesce(${controllerStampValidSql(cleanupStamp)}
+            and jsonb_typeof(${environmentLeases.metadata}->'pendingCleanupAttemptId') = 'string'
+            and ${environmentLeases.metadata}->>'pendingCleanupAttemptId' <> ''
+            and ${cleanupStamp}->'attemptId' = ${environmentLeases.metadata}->'pendingCleanupAttemptId', false)
+          then ${cleanupStamp}->>'bootId' = ${bootId}
+          else ${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${bootId} end))
+      or (${shutdown}->>'state' = 'pending' and
+        (case when ${controllerStampValidSql(sql`${shutdown}->'controller'`)}
+          then ${shutdown}->'controller'->>'bootId' = ${bootId} else ${shutdown}->>'controllerBootId' = ${bootId} end)))
+    and not exists (select 1 from ${sandboxCreationOperations} where ${sandboxCreationOperations.state} = 'pending'
+      and coalesce(${sandboxCreationOperations.metadata}->>'creationControllerLost', '') <> 'true'
+      and ${stamped(sql`${sandboxCreationOperations.metadata}->'creationController'`)})
+    and not exists (select 1 from ${agents} where ${agentLifecycleLeaseHeld}
+      and ${stamped(sql`${agents.lifecycleOperation}->'leaseHolder'`)})
+    and not exists (select 1 from ${workspaceOperations} where
+      (${workspaceOperations.status} = 'running' and jsonb_typeof(${runtimeOwner}->'ownerId') = 'string'
+        and ${positivePidSql(runtimeOwner)} and ${runtimeOwner}->>'bootId' = ${bootId})
+      or (${workspaceOperations.status} in ('running', 'pending') and ${workspaceOperations.phase} = 'workspace_finalize'
+        and ${stamped(sql`${workspaceOperations.metadata}->'finalizeOwner'`)})
+      or (${workspaceOperations.status} = 'running' and ${inArray(workspaceOperations.phase, [...LOCAL_WORKSPACE_COMMAND_PHASES])}
+        and not (${workspaceOperations.metadata} ? 'runtimeControlOwner')
+        and ${stamped(sql`${workspaceOperations.metadata}->'commandOwner'`)})
+      or (${workspaceOperations.status} in ('running', 'pending') and ${workspaceOperations.phase} = 'remote_workspace_snapshot'
+        and exists (select 1 from ${active} a(id) where jsonb_typeof(a.id) = 'string')
+        and not exists (select 1 from ${active} a(id) where jsonb_typeof(a.id) = 'string'
+          and not coalesce(${stamped(saveStamp)}, false))
+        and (select count(distinct case when jsonb_typeof(${saveStamp}->'pid') = 'number'
+          then (${saveStamp}->>'pid')::numeric end) from ${active} a(id)
+          where jsonb_typeof(a.id) = 'string') = 1))
+    and not exists (select 1 from ${heartbeatRuns} where
+      (${legacyControllerLeaseWhere} and ${heartbeatRuns.controllerBootId}::text = ${bootId})
+      or (${heldInterruptedPreparationWhere()} and ${stamped(sql`${heartbeatRuns.controllerProcess}`)})
+      or (${heartbeatRuns.status} = 'running' and ${heartbeatRuns.runnerProfileJson} ? 'nativeStartupContext'
+        and jsonb_typeof(${heartbeatRuns.runnerProfileJson}->'nativeStartupContext'->'leaseOwner') = 'string'
+        and ${heartbeatRuns.runnerProfileJson}->'nativeStartupContext'->>'leaseOwner' <> ''
+        and (${heartbeatRuns.runnerProfileJson}->'nativeStartupContext'->>'leaseOwner' = ${bootId}
+          or exists (select 1 from native_run_finalizations n where n.run_id = ${heartbeatRuns.id}
+            and n.company_id = ${heartbeatRuns.companyId} and n.lease_owner = ${bootId}))))
+    and not exists (select 1 from ${executionWorkspaceRuntimeLeases} where ${executionWorkspaceRuntimeLeases.ownerKey} = ${bootId})
+    and not exists (select 1 from ${issueRecoveryActions} where
+      (${issueRecoveryActions.resolvedAt} is null
+        and ${issueRecoveryActions.evidence}->'workspaceOwnerRecovery'->>'state' = 'operator_required'
+        and ${positivePidSql(copyback)} and jsonb_typeof(${copyback}->'hostname') = 'string' and ${copyback}->>'hostname' <> ''
+        and jsonb_typeof(${copyback}->'processStartedAt') = 'string' and ${copyback}->>'processStartedAt' <> ''
+        and ${copyback}->>'controllerBootId' = ${bootId})
+      or (${observed}->>'state' = 'stop_pending' and jsonb_typeof(${observed}->'leaseOwner') = 'string'
+        and ${observed}->>'leaseOwner' <> '' and (${observed}->>'leaseOwner' = ${bootId}
+          or exists (select 1 from native_run_finalizations n where n.run_id::text = ${observed}->>'runId'
+            and n.lease_owner = ${bootId}))))
+  )`;
+}
+
+/** Shared by the accepted-result inventory and its atomic ownerless recheck. */
+function acceptedNativeResultLeasePredicate(): SQL {
+  return and(isNotNull(nativeRunFinalizations.resultId), notInArray(nativeRunFinalizations.phase, TERMINAL_PHASES),
+    isNotNull(nativeRunFinalizations.leaseOwner), notFinalizerOrCleanup, sql`${nativeRunFinalizations.leaseExpiresAt} > now()`)!;
 }

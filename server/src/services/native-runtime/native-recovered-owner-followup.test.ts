@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  agents, companies, completionContracts, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
+  agents, companies, completionContracts, controllerInstances, createDb, environmentLeases, environments, executionWorkspaces, executionWorkspaceRuntimeLeases,
+  sandboxCreationOperations, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
   nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations, issueThreadInteractions, issueQuestionResponseDeliveries, issueComments,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type NativeSession, type NativeSessionBackend, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
@@ -28,6 +29,7 @@ import { proveControllerInstance, registerControllerInstanceLeaseWork, resetCont
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { planNativeLifecycleSettlement } from "./native-lifecycle-command-settlement.js";
+import { noControllerOwnedRecordsSql, OWNABLE_KINDS, resolveFenceHolders } from "../recovery/ownership-registry.js";
 import { waitForCondition } from "../../__tests__/helpers/native-restart.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -1548,76 +1550,209 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     }
   }, 60_000);
 
-  // Keep: data-safety boundary. Actual PG writers, not mocked ownership reads,
-  // prove both UPDATE and INSERT are included before the fallback can fence.
-  it.each(["insert", "update"])("B1 ownership %s committed during preflight cannot be missed", async shape => {
+  // Keep: data-safety boundary. The spy schedules a REAL independent PG
+  // transaction after the inventory proved empty, before the real prover's
+  // UPDATE. No ownership query, proof, or write result is mocked.
+  it.each(["insert", "update"])("B1 concurrent ownership %s committed before the fence UPDATE prevents fencing", async shape => {
     const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
-    const leaseId = randomUUID();
+    const leaseId = randomUUID(), real = controllerLease.proveControllerInstance;
     const lease = { id: leaseId, companyId, heartbeatRunId: null, status: "active", leasePolicy: "ephemeral",
       provider: "fake", providerLeaseId: `b1-race://${leaseId}` };
     const metadata = { leaseController: { bootId: f.stale, pid: 7, hostHash: "judge-foreign-process-space", processStartedAt: null } };
     if (shape === "update") await db.insert(environmentLeases).values(lease);
-    let release!: () => void, ready!: () => void;
-    const gate = new Promise<void>(resolve => { release = resolve; });
-    const written = new Promise<void>(resolve => { ready = resolve; });
-    const writer = db.transaction(async tx => {
-      if (shape === "insert") await tx.insert(environmentLeases).values({ ...lease, metadata, updatedAt: sql`now()` });
-      else await tx.update(environmentLeases).set({ metadata, updatedAt: sql`now()` }).where(eq(environmentLeases.id, leaseId));
-      ready(); await gate;
+    let committed = false, entered = 0;
+    const prover = vi.spyOn(controllerLease, "proveControllerInstance").mockImplementation(async (...args) => {
+      if (args[1] !== f.stale) return real(...args);
+      entered++;
+      await db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '500ms'`);
+        if (shape === "insert") await tx.insert(environmentLeases).values({ ...lease, metadata, updatedAt: sql`now()` });
+        else await tx.update(environmentLeases).set({ metadata, updatedAt: sql`now()` }).where(eq(environmentLeases.id, leaseId));
+      });
+      committed = true;
+      expect(args[3]?.ownedRecordRecheck).toBeDefined();
+      const proof = await real(...args);
+      expect(proof).toBe("expired");
+      return proof;
     });
-    await written;
-    let finished = false;
-    const planning = f.plan().then(plan => { finished = true; return plan; });
     try {
-      await waitForCondition("B1 waits for the actual ownership writer", async () => {
-        const rows = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
-          and wait_event_type = 'Lock' and query like 'lock table agents, environment_leases,%'`);
-        return rows.length === 1;
-      }, 800);
-      expect(finished).toBe(false);
-      release(); await writer;
-      expect(await planning).toBeNull();
+      expect(await f.plan()).toBeNull();
+      expect(entered).toBe(1); expect(committed).toBe(true);
       const [after] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale));
       expect(after).toMatchObject({ fencedAt: null, fencedByEpoch: null });
-      const [owned] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
-      expect(await proveControllerInstance(db, f.stale, owned!.updatedAt)).toBe("grace");
+      console.log("B1 UPDATE snapshot evidence", JSON.stringify({ shape, committed, inventoryPassed: entered === 1, fencedAt: after!.fencedAt }));
       expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
       expect([...(await loadNativeRunnerCheckpoint(db, fixture.binding))!.records]).toEqual([...fixture.checkpoint.records]);
     } finally {
-      release(); await writer; await planning;
+      prover.mockRestore();
       await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId)); await f.cleanup();
     }
   }, 60_000);
 
-  it("B1 ownership INSERT cannot land between the inventory read and guarded fence", async () => {
-    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
-    const leaseId = randomUUID(), real = controllerLease.proveControllerInstance;
-    let inserting: Promise<unknown> | undefined, written = false;
-    const prover = vi.spyOn(controllerLease, "proveControllerInstance").mockImplementation(async (...args) => {
-      if (args[1] !== f.stale) return real(...args);
-      inserting = db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: null,
-        status: "active", leasePolicy: "ephemeral", provider: "fake", providerLeaseId: `b1-between://${leaseId}`,
-        metadata: { leaseController: { bootId: f.stale, pid: 7, hostHash: "judge-foreign-process-space", processStartedAt: null } },
-        updatedAt: sql`now()` }).then(() => { written = true; });
-      await waitForCondition("new ownership INSERT is excluded until the fence transaction commits", async () => {
-        const rows = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
-          and wait_event_type = 'Lock' and query like 'insert into "environment_leases"%'`);
-        return rows.length === 1;
-      }, 2_000);
-      expect(written).toBe(false);
-      const proof = await real(...args);
-      expect(proof).toBe("fenced"); expect(written).toBe(false);
-      return proof;
-    });
-    try {
-      expect(await f.plan()).not.toBeNull();
-      await inserting; expect(written).toBe(true);
-      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeInstanceOf(Date);
-    } finally {
-      prover.mockRestore(); await inserting;
-      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId)); await f.cleanup();
-    }
-  }, 60_000);
+  it.each(["teardown-process", "teardown-token", "shutdown-process", "shutdown-legacy", "sandbox", "agent",
+    "workspace-runtime", "workspace-finalize", "workspace-command", "workspace-save", "legacy-run", "startup-token", "startup-holder",
+    "executor", "restart", "awaiting-evidence", "finalizer", "cleanup", "accepted-local", "accepted-remote",
+    "copyback", "observed-token", "observed-holder", "runtime-lease"])(
+    "B1 atomic recheck matches the inventory for a concurrent %s owner", async shape => {
+      const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
+      const id = randomUUID(), runId = randomUUID(), workspaceId = randomUUID(), resultId = randomUUID();
+      const stamp = { bootId: f.stale, pid: 7, hostHash: "judge-foreign-process-space", processStartedAt: null };
+      const real = controllerLease.proveControllerInstance;
+      let entered = 0;
+      const [prior] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.prior.runId));
+      const cleanup = async () => {
+        await db.update(agents).set({ lifecycleOperation: null }).where(eq(agents.id, agentId));
+        await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, id));
+        await db.delete(environmentLeases).where(eq(environmentLeases.id, id));
+        await db.delete(workspaceOperations).where(eq(workspaceOperations.id, id));
+        await db.delete(sandboxCreationOperations).where(eq(sandboxCreationOperations.id, id));
+        await db.delete(executionWorkspaceRuntimeLeases).where(eq(executionWorkspaceRuntimeLeases.id, id));
+        await db.delete(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
+        await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+        await db.delete(nativeRunResults).where(eq(nativeRunResults.id, resultId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      };
+      const prover = vi.spyOn(controllerLease, "proveControllerInstance").mockImplementation(async (...args) => {
+        if (args[1] !== f.stale) return real(...args);
+        entered++;
+        // This transaction commits after the fallback's empty inventory, not
+        // before preflight. Every source below is real PostgreSQL storage.
+        await db.transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '500ms'`);
+          await tx.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: fixture.prior.issueId,
+            status: "succeeded", completionContractId: prior!.completionContractId });
+          const nrf = { companyId, issueId: fixture.prior.issueId, runId, phase: "committed" };
+          if (["executor", "restart", "awaiting-evidence", "finalizer", "cleanup", "accepted-local", "accepted-remote"].includes(shape)) {
+            const accepted = shape.startsWith("accepted-");
+            if (accepted) await tx.insert(nativeRunResults).values({ id: resultId, companyId, issueId: fixture.prior.issueId,
+              runId, completionContractId: prior!.completionContractId!, serverFingerprint: "b1-parity",
+              schemaStatus: "accepted", resultJson: {}, canonicalSha256: "b1-parity" });
+            if (shape === "accepted-remote") await tx.update(heartbeatRuns).set({ runnerProfileJson: { remoteWorkspace: {} } })
+              .where(eq(heartbeatRuns.id, runId));
+            const token = shape === "finalizer" ? `native-finalizer:${id}` : shape === "cleanup" ? `native-cleanup:${id}`
+              : shape === "accepted-remote" ? f.stale : `executor:${id}`;
+            await tx.insert(nativeRunFinalizations).values({ ...nrf, phase: shape === "cleanup" ? "committed" : "observed",
+              controllerBootId: shape === "accepted-remote" ? "other-controller" : f.stale,
+              leaseOwner: token, leaseExpiresAt: sql`now() + interval '1 minute'`,
+              resultId: accepted ? resultId : null,
+              recoveryState: shape === "restart" ? "resuming_session" : shape === "awaiting-evidence" ? "awaiting_evidence" : null,
+              leaseHolder: ["finalizer", "cleanup"].includes(shape) ? { token, ...stamp } : null });
+          } else if (shape.startsWith("teardown-") || shape.startsWith("shutdown-")) {
+            await tx.insert(environmentLeases).values({ id, companyId, status: "pending_cleanup", leasePolicy: "ephemeral",
+              metadata: shape.startsWith("teardown-") ? { pendingCleanupInFlight: true, pendingCleanupAttemptId: shape === "teardown-token" ? f.stale : id,
+                ...(shape === "teardown-process" ? { pendingCleanupController: { ...stamp, attemptId: id } } : {}) }
+                : { legacyShutdownWorkspaceSettlement: { state: "pending", ...(shape === "shutdown-process" ? { controller: stamp } : { controllerBootId: f.stale }) } } });
+          } else if (shape === "sandbox") {
+            await tx.insert(sandboxCreationOperations).values({ id, companyId, originalEnvironmentId: workspaceId, runId,
+              provider: "fake", driverKey: "fake", config: {}, metadata: { creationController: stamp }, nextAttemptAt: new Date() });
+          } else if (shape === "agent") {
+            await tx.update(agents).set({ lifecycleOperation: { id, hostComplete: false, completedPluginIds: [], attempts: 1,
+              leaseOwner: id, leaseHolder: stamp, leaseUntil: new Date(Date.now() + 60_000).toISOString() } }).where(eq(agents.id, agentId));
+          } else if (shape.startsWith("workspace-")) {
+            const phase = shape === "workspace-finalize" ? "workspace_finalize" : shape === "workspace-command" ? "worktree_prepare"
+              : shape === "workspace-save" ? "remote_workspace_snapshot" : "runtime_control";
+            const metadata = shape === "workspace-finalize" ? { finalizeOwner: stamp } : shape === "workspace-command" ? { commandOwner: stamp }
+              : shape === "workspace-save" ? { saveWork: { activeIds: [id], owners: { [id]: stamp } } }
+                : { runtimeControlOwner: { ownerId: id, ...stamp } };
+            await tx.insert(workspaceOperations).values({ id, companyId, phase, status: "running", metadata });
+          } else if (shape === "legacy-run") {
+            await tx.update(heartbeatRuns).set({ status: "running", runtimeMode: "legacy", controllerBootId: f.stale,
+              controllerLeaseExpiresAt: sql`now() + interval '1 minute'` }).where(eq(heartbeatRuns.id, runId));
+          } else if (shape.startsWith("startup-")) {
+            await tx.update(heartbeatRuns).set({ status: "running", runnerProfileJson: { nativeStartupContext: {
+              leaseOwner: shape === "startup-token" ? f.stale : "old-holder" } } }).where(eq(heartbeatRuns.id, runId));
+            if (shape === "startup-holder") await tx.insert(nativeRunFinalizations).values({ ...nrf, leaseOwner: f.stale });
+          } else if (shape === "runtime-lease") {
+            await tx.insert(executionWorkspaces).values({ id: workspaceId, companyId, mode: "isolated", strategyType: "test", name: "B1 parity" });
+            await tx.insert(executionWorkspaceRuntimeLeases).values({ id, companyId, executionWorkspaceId: workspaceId,
+              ownerKey: f.stale, lastAction: "test", expiresAt: new Date() });
+          } else {
+            if (shape === "observed-holder") await tx.insert(nativeRunFinalizations).values({ ...nrf, leaseOwner: f.stale });
+            await tx.insert(issueRecoveryActions).values({ id, companyId, sourceIssueId: fixture.prior.issueId,
+              kind: "b1-parity", cause: "b1-parity", fingerprint: id, nextAction: "wait",
+              // Resolved observed fences are STILL in the inventory.
+              resolvedAt: shape.startsWith("observed-") ? new Date() : null,
+              evidence: shape === "copyback" ? { workspaceOwnerRecovery: { state: "operator_required",
+                owner: { hostname: "old-host", pid: 7, processStartedAt: "old-start", controllerBootId: f.stale } } }
+                : { observedWorkspacePreservation: { runId, state: "stop_pending", leaseOwner: shape === "observed-token" ? f.stale : "old-holder" } } });
+          }
+        });
+        const owners: string[] = [];
+        for (const kind of OWNABLE_KINDS) {
+          if (!kind.listInProgress) continue;
+          const listed = await kind.listInProgress(db, 2_000, 0);
+          expect(listed.truncated).toBe(false);
+          await resolveFenceHolders(db, listed.records);
+          if (listed.records.some(({ owner }) => owner.kind === "process" ? owner.stamp.bootId === f.stale
+            : owner.kind === "fence" && (owner.stamp.fenceToken === f.stale || owner.fence.currentFenceToken === f.stale))) owners.push(kind.id);
+        }
+        expect(owners.length, shape).toBeGreaterThan(0);
+        const [check] = await db.execute(sql`select ${noControllerOwnedRecordsSql(f.stale)} as ownerless`);
+        expect(check!.ownerless, owners.join(",")).toBe(false);
+        const proof = await real(...args);
+        expect(proof).toBe("expired");
+        console.log("B1 registry parity evidence", JSON.stringify({ shape, owners, ownerless: check!.ownerless, proof }));
+        return proof;
+      });
+      try {
+        expect(await f.plan()).toBeNull(); expect(entered).toBe(1);
+        expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeNull();
+      } finally {
+        prover.mockRestore(); await cleanup(); await f.cleanup();
+      }
+    }, 60_000);
+
+  it.each(["active-run-lease", "superseded-teardown", "lost-sandbox", "finished-operation", "inactive-save-stamp", "mixed-save-stamps",
+    "expired-agent-lease", "terminal-coordinator", "superseded-token-holder", "malformed-stamp"])(
+    "B1 atomic predicate does not mistake %s for a boot owner", async shape => {
+      const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
+      const id = randomUUID(), runId = randomUUID();
+      const stamp = { bootId: f.stale, pid: 7, hostHash: "judge-foreign-process-space", processStartedAt: null };
+      try {
+        await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: fixture.prior.issueId, status: "running" });
+        if (shape === "active-run-lease" || shape === "superseded-teardown" || shape === "malformed-stamp") {
+          await db.insert(environmentLeases).values({ id, companyId, status: shape === "superseded-teardown" ? "pending_cleanup" : "active",
+            heartbeatRunId: shape === "active-run-lease" ? runId : null, leasePolicy: "ephemeral",
+            metadata: shape === "superseded-teardown" ? { pendingCleanupInFlight: true, pendingCleanupAttemptId: "new-attempt",
+              pendingCleanupController: { ...stamp, attemptId: "old-attempt" } }
+              : { leaseController: { ...stamp, ...(shape === "malformed-stamp" ? { pid: "7" } : {}) } } });
+        } else if (shape === "lost-sandbox") {
+          await db.insert(sandboxCreationOperations).values({ id, companyId, originalEnvironmentId: randomUUID(), runId,
+            provider: "fake", driverKey: "fake", config: {}, metadata: { creationController: stamp, creationControllerLost: true }, nextAttemptAt: new Date() });
+        } else if (shape === "expired-agent-lease") {
+          await db.update(agents).set({ lifecycleOperation: { id, hostComplete: false, completedPluginIds: [], attempts: 1,
+            leaseOwner: id, leaseHolder: stamp, leaseUntil: new Date(Date.now() - 60_000).toISOString() } }).where(eq(agents.id, agentId));
+        } else if (shape === "terminal-coordinator" || shape === "superseded-token-holder") {
+          await db.insert(nativeRunFinalizations).values({ companyId, issueId: fixture.prior.issueId, runId,
+            phase: shape === "terminal-coordinator" ? "committed" : "observed", controllerBootId: f.stale,
+            leaseOwner: shape === "terminal-coordinator" ? null : `native-finalizer:${id}`,
+            leaseExpiresAt: sql`now() + interval '1 minute'`, leaseHolder: { ...stamp, token: "superseded-token" } });
+        } else {
+          await db.insert(workspaceOperations).values({ id, companyId, phase: shape === "finished-operation" ? "workspace_finalize" : "remote_workspace_snapshot",
+            status: shape === "finished-operation" ? "succeeded" : "running", metadata: shape === "finished-operation" ? { finalizeOwner: stamp }
+              : { saveWork: { activeIds: shape === "inactive-save-stamp" ? [] : ["one", "two"],
+                owners: { one: stamp, two: { ...stamp, pid: 8 } } } } });
+        }
+        for (const kind of OWNABLE_KINDS) {
+          if (!kind.listInProgress) continue;
+          const listed = await kind.listInProgress(db, 2_000, 0); expect(listed.truncated).toBe(false);
+          await resolveFenceHolders(db, listed.records);
+          expect(listed.records.some(({ owner }) => owner.kind === "process" ? owner.stamp.bootId === f.stale
+            : owner.kind === "fence" && (owner.stamp.fenceToken === f.stale || owner.fence.currentFenceToken === f.stale)), kind.id).toBe(false);
+        }
+        const [check] = await db.execute(sql`select ${noControllerOwnedRecordsSql(f.stale)} as ownerless`);
+        expect(check!.ownerless).toBe(true);
+        expect(await f.plan()).not.toBeNull();
+        expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeInstanceOf(Date);
+      } finally {
+        await db.update(agents).set({ lifecycleOperation: null }).where(eq(agents.id, agentId));
+        await db.delete(environmentLeases).where(eq(environmentLeases.id, id));
+        await db.delete(workspaceOperations).where(eq(workspaceOperations.id, id));
+        await db.delete(sandboxCreationOperations).where(eq(sandboxCreationOperations.id, id));
+        await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId)); await f.cleanup();
+      }
+    }, 60_000);
 
   it.each([201, 2_001])("B1 fails closed on a later owned page or capped inventory (%s records)", async count => {
     const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
@@ -1687,21 +1822,22 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   }, 60_000);
 
   it.each(["agents", "environment_leases", "execution_workspace_runtime_leases", "heartbeat_runs", "issue_recovery_actions",
-    "native_run_finalizations", "sandbox_creation_operations", "workspace_operations"])("B1 busy ownership source %s times out without a fence", async table => {
+    "native_run_finalizations", "sandbox_creation_operations", "workspace_operations"])("B1 unrelated writer on ownership source %s does not block fencing", async table => {
     const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
     let release!: () => void, ready!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const locked = new Promise<void>(resolve => { ready = resolve; });
     const writer = db.transaction(async tx => {
-      // This is the table lock every real INSERT/UPDATE/DELETE takes, even
-      // before it has an in-progress row for the inventory to enumerate.
-      await tx.execute(sql`lock table ${sql.identifier(table)} in row exclusive mode`);
+      // A real UPDATE takes ROW EXCLUSIVE even when no rows match. A B1
+      // table SHARE lock would block here; the statement recheck must not.
+      const key = table === "native_run_finalizations" ? "run_id" : "id";
+      await tx.execute(sql`update ${sql.identifier(table)} set ${sql.identifier(key)} = ${sql.identifier(key)} where false`);
       ready(); await gate;
     });
     await locked;
     try {
-      expect(await f.plan()).toBeNull();
-      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeNull();
+      expect(await f.plan()).not.toBeNull();
+      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeInstanceOf(Date);
       expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
       expect([...(await loadNativeRunnerCheckpoint(db, fixture.binding))!.records]).toEqual([...fixture.checkpoint.records]);
     } finally { release(); await writer; await f.cleanup(); }
