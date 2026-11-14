@@ -69,9 +69,11 @@ export function taskChatStatusRelevance(
   };
 
   const isHistoricalNotice = (comment: IssueChatComment): boolean => {
+    if (comment.authorType !== "system" && comment.presentation?.kind !== "system_notice") return false;
+    const supersededBy = comment.metadata && "supersededBy" in comment.metadata ? comment.metadata.supersededBy : null;
+    if (typeof supersededBy === "string" && supersededBy.trim()) return true;
     // Session resets are durable conversation boundaries, not execution status.
     if (comment.conversationSessionGeneration != null) return false;
-    if (comment.authorType !== "system" && comment.presentation?.kind !== "system_notice") return false;
     const sourceRunId = comment.metadata?.sourceRunId ?? comment.createdByRunId
       ?? comment.runId ?? comment.derivedCreatedByRunId;
     const recoveryActionId = comment.metadata?.recovery?.actionId;
