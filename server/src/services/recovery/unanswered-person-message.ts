@@ -96,6 +96,21 @@ export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
+/** In a chat (Paperclip's own predicate: agent-conversations.ts:39-43
+ * isConversation, conversationAgentId and conversationUserId set), "assign this
+ * agent a new task" is task language and a dead end. B''s chat notes name the
+ * chat's own way on: a new chat with the agent; this one stays readable.
+ * TODO(D10, code-lead): when the designed end lands (a fresh thread that
+ * answers), it replaces the held-chat note. */
+export function chatUnansweredText(name: string) {
+  return `Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat with ${name}; this one stays readable.`;
+}
+export function chatNoRunText(name: string) {
+  return `Your message is saved, but no run started for it. Sending it again is safe; if it fails again, start a new chat with ${name}; this one stays readable.`;
+}
+export function chatHeldText(name: string) {
+  return `${name} can't continue this chat from its saved state. Start a new chat with ${name}; this one stays readable.`;
+}
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
 
@@ -322,6 +337,7 @@ export async function settleUnansweredPersonMessage(
   const [issue] = await db.select({
     id: issues.id, companyId: issues.companyId, status: issues.status, hiddenAt: issues.hiddenAt,
     assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, createdAt: issues.createdAt,
+    conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId,
   }).from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
   if (!issue) return { kind: "none" };
   if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
@@ -408,6 +424,7 @@ export async function settleUnansweredPersonMessage(
 }
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
+  conversationAgentId?: string | null; conversationUserId?: string | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
@@ -720,10 +737,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
+  const chat = Boolean(issue.conversationAgentId && issue.conversationUserId);
+  const agentName = agentRow?.name?.trim() || "this agent";
   const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
-    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
-      : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
+    : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? (chat ? chatNoRunText(agentName) : UNANSWERED_MESSAGE_NO_RUN_TEXT)
+      : held ? (chat ? chatHeldText(agentName) : HELD_PREDECESSOR_NOTICE) : chat ? chatUnansweredText(agentName) : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
@@ -731,7 +750,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
-        : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
+        : held ? (chat ? `Start a new chat with ${agentName}.` : "Assign this agent a new task to continue.")
+        : chat ? `Send the message again; if it fails again, start a new chat with ${agentName}.`
+        : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
