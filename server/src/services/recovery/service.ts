@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
@@ -2154,6 +2155,9 @@ export function recoveryService(
       )
         return null;
     }
+    const [commentTask] = input.retryOfRunId ? await db.select({ companyId: issues.companyId }).from(issues)
+      .where(eq(issues.id, input.issueId)).limit(1) : [];
+    const commentInput = commentTask ? await readContinuationCommentInput(db, { companyId: commentTask.companyId, issueId: input.issueId, runId: input.retryOfRunId }) : {};
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -2172,6 +2176,7 @@ export function recoveryService(
       payload: withRecoveryContext(
         {
           issueId: input.issueId,
+          _paperclipWakeContext: commentInput,
           ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
           ...(input.extraContext ?? {}),
         },
@@ -2186,6 +2191,7 @@ export function recoveryService(
           wakeReason: input.reason,
           retryReason: input.retryReason,
           source: input.source,
+          ...commentInput,
           ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
           ...(input.extraContext ?? {}),
         },
@@ -2807,6 +2813,7 @@ export function recoveryService(
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
     return database.transaction(async (tx) => {
+      const commentInput = await readContinuationCommentInput(tx as unknown as Db, { companyId: input.issue.companyId, issueId: input.issue.id, runId: input.latestRun?.id });
       await notifyScheduledRetryDispatch(tx, { companyId: input.issue.companyId });
       const wakeup = await tx
         .insert(agentWakeupRequests)
@@ -2820,6 +2827,7 @@ export function recoveryService(
             {
               issueId: input.issue.id,
               retryOfRunId: input.latestRun?.id ?? null,
+              _paperclipWakeContext: commentInput,
               retryReason: "provider_quota_recovery",
               providerQuotaRetryNotBefore: retryAt.toISOString(),
             },
@@ -2853,6 +2861,7 @@ export function recoveryService(
               issueId: input.issue.id,
               taskId: input.issue.id,
               wakeReason: "provider_quota_recovery",
+              ...commentInput,
               retryReason: "provider_quota_recovery",
               providerQuotaRetryNotBefore: retryAt.toISOString(),
             },
@@ -3339,6 +3348,7 @@ export function recoveryService(
         wakeReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
         retryReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
         source: "issue.deliberate_wait_disposition_repair",
+        ...await readContinuationCommentInput(db, { companyId: input.issue.companyId, issueId: input.issue.id, runId: input.latestRun?.id }),
         executionRetryAccounting: executionRetryAccounting(sourceRun ?? {}),
         retryOfRunId: input.latestRun?.id ?? null,
         recoveryActionId: input.action.id,

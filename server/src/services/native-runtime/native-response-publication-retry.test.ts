@@ -67,6 +67,19 @@ describe.skipIf(!support.supported)("native final reply publication retry", () =
   const makeDue = (runId: string) => db.execute(sql`update heartbeat_runs set result_json = jsonb_set(result_json,
     '{responsePublication,nextAttemptAt}', to_jsonb('2000-01-01T00:00:00.000Z'::text)) where id = ${runId}`);
 
+  it.each([false, true])("carry-comment: background publication publishes the result (commentOrigin=%s)", async commentOrigin => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId,
+      ...(commentOrigin ? { commentContinuation: true, wakeCommentIds: [] } : {}) } }).where(eq(heartbeatRuns.id, f.runId));
+    await f.saveFinalReply();
+    const work = nativeResponsePresentationWork(db);
+    const [entry] = await work.load({ companyId: f.companyId, issueId: f.issueId });
+    await expect(work.check(entry)).resolves.toBeNull();
+    expect(await comments(f.runId)).toHaveLength(1);
+    expect(await work.load({ companyId: f.companyId, issueId: f.issueId })).toEqual([]);
+    expect((await run(f.runId)).resultJson?.presentationDecision).toMatchObject({ commentAction: "create" });
+  });
+
   it("publishes a later-page reply while older publication groups remain contended", async () => {
     const first = await fixture({ runId: "00000000-0000-4000-8000-000000000001" });
     const group = { companyId: first.companyId, agentId: first.agentId };

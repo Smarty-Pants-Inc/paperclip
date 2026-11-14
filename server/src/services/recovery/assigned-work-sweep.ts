@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { and, desc, eq, gte, inArray, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import {
   activityLog,
@@ -548,7 +549,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       reason: facts.latestRun ? "issue_continuation_needed" : "issue_assigned",
       payload: { issueId: issue.id, mutation: "assigned_work_invariant" },
       requestedByActorType: "system", requestedByActorId: null,
-      contextSnapshot: { issueId: issue.id, taskId: issue.id, wakeReason: facts.latestRun ? "issue_continuation_needed" : "issue_assigned",
+      contextSnapshot: { ...await readContinuationCommentInput(db, { companyId: issue.companyId, issueId: issue.id, runId: facts.latestRun?.id }),
+        issueId: issue.id, taskId: issue.id, wakeReason: facts.latestRun ? "issue_continuation_needed" : "issue_assigned",
         source: ASSIGNED_WORK_CONTINUATION_SOURCE, assignedWorkViolation: claimed.reason,
         ...(facts.latestRun ? { previousRunId: facts.latestRun.id } : {}) },
     }).catch(error => {

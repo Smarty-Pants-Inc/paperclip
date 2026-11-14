@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "./continuation-comment-input.js";
 import { settleOperatorContainedNativeOwner } from "./native-runtime/native-failed-run-owner-release.js";
 import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
@@ -574,6 +575,7 @@ export async function deliverReconciledExecutions(
             issueId: task.id,
             taskId: task.id,
             recoveryActionId: action.id,
+            ...await readContinuationCommentInput(db, { companyId: action.companyId, issueId: task.id, runId: decision.runId }),
             previousRunId: decision.runId,
             retryOfRunId: decision.runId,
             forceFreshSession: true,
