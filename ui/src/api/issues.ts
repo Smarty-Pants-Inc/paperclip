@@ -467,6 +467,7 @@ export const issuesApi = {
       executionReconciliation?: ExecutionReconciliation;
       workspaceBaseRef?: { requestedRef: string; branch: string };
       actionId?: string;
+      sourceRunId?: string;
       outcome: "restored" | "false_positive" | "blocked" | "cancelled";
       sourceIssueStatus: Issue["status"];
       resolutionNote?: string | null;
