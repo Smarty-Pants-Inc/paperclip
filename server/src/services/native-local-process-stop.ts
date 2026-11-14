@@ -1,4 +1,5 @@
 import { notifyLiveRunRecovery } from "./live-run-recovery-notifications.js";
+import { notifyInstructionCopyStopEvidence } from "./instruction-collection-notifications.js";
 import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { notifyRetainedNativeSessionCleanup } from "./retained-native-session-cleanup-notifications.js";
@@ -82,6 +83,7 @@ export async function recordNativeLocalProcessStop(db: Db, run: Pick<typeof hear
     payload: { processPid: run.processPid, processGroupId: run.processGroupId,
       processStartedAt: run.processStartedAt?.toISOString() ?? null },
   });
+  await notifyInstructionCopyStopEvidence(db, { companyId: run.companyId, runId: run.id });
   return true;
 }
 
@@ -147,6 +149,7 @@ export async function recordUnidentifiedLocalRunnerStop(db: Db, run: Pick<typeof
     message: "Verified that no runner for this run exists on this host and none saved runner state after the launch request.",
     payload: { processPid: null, processGroupId: null, processStartedAt: null, basis: "unidentified_runner_absent" },
   });
+  await notifyInstructionCopyStopEvidence(db, { companyId: run.companyId, runId: run.id });
   return true;
 }
 
@@ -234,6 +237,7 @@ export async function confirmUnidentifiedLocalRunnerStopped(db: Db, input: {
       payload: { processPid: null, processGroupId: null, processStartedAt: null, basis: "operator_attested",
         attestedByUserId: input.actorId },
     });
+    await notifyInstructionCopyStopEvidence(tx, { companyId: run.companyId, runId: run.id });
     await notifyDeliveryWork(tx as unknown as Db, DELIVERY_QUEUES.accounting, run.companyId);
   });
   return { runId: run.id, alreadyStopped: false };
