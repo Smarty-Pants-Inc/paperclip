@@ -279,14 +279,14 @@ describe("registered job and explicit company binding", () => {
     await f.plugin.onConfigChanged!({ ...config, enabled: false }, { companyId: company });
     f.ctx.config.get.mockResolvedValue({ ...config, enabled: false });
     const params = { companyId: company, mailbox: config.mailbox, seenIds: ["aa"] };
-    await expect(f.seed(params, "other-company")).rejects.toThrow(SAFE_ERROR);
-    await expect(f.seed({ ...params, seenIds: ["private subject"] })).rejects.toThrow(SAFE_ERROR);
-    await expect(f.seed({ ...params, mailbox: "other@example.com" })).rejects.toThrow(SAFE_ERROR);
+    await expect(f.seed(params, "other-company")).rejects.toThrow("actor/company mismatch");
+    await expect(f.seed({ ...params, seenIds: ["private subject"] })).rejects.toThrow("config invalid");
+    await expect(f.seed({ ...params, mailbox: "other@example.com" })).rejects.toThrow("config invalid");
     expect(f.saved()).toBeNull();
     await expect(f.seed(params)).resolves.toEqual({ initialized: true });
     expect(f.saved()).toEqual(state(["aa"]));
     expect(f.ctx.http.fetch.mock.calls.some(([url]) => new URL(url).searchParams.get("q") === `${INCOMING_QUERY} newer_than:7d`)).toBe(true);
-    await expect(f.seed({ ...params, seenIds: [] })).rejects.toThrow(SAFE_ERROR);
+    await expect(f.seed({ ...params, seenIds: [] })).rejects.toThrow("state exists");
     f.ctx.config.get.mockResolvedValue({ ...config });
     f.pages.push({ messages: [message("aa"), message("bb")] });
     await f.tick(); expect(f.fires).toHaveLength(1); expect(f.saved()).toEqual(state(["aa", "bb"]));
@@ -346,7 +346,7 @@ describe("registered job and explicit company binding", () => {
     expect(f.ctx.state.get).not.toHaveBeenCalled();
     f.ctx.config.get.mockResolvedValue({ ...config });
     await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
-    expect(await f.plugin.onHealth?.()).toEqual({ status: "error", message: SAFE_ERROR });
+    expect(await f.plugin.onHealth?.()).toEqual({ status: "error", message: "state invalid" });
     expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.state.set).not.toHaveBeenCalled();
   });
   it("initialization uses the configured window and rejects IDs outside it", async () => {
@@ -357,7 +357,7 @@ describe("registered job and explicit company binding", () => {
     const original = f.ctx.http.fetch.getMockImplementation()!;
     f.ctx.http.fetch.mockImplementation(async (url, init) => url.includes("/aa?")
       ? json({ id: "aa", threadId: "ff", internalDate: String(1700000000001 - 4 * 86_400_000) }) : original(url, init));
-    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: ["aa"] })).rejects.toThrow(SAFE_ERROR);
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: ["aa"] })).rejects.toThrow("mailbox read failed");
     expect(f.saved()).toBeNull(); expect(f.fires).toEqual([]);
     expect(f.ctx.http.fetch.mock.calls.some(([url]) => new URL(url).searchParams.get("q") === `${INCOMING_QUERY} newer_than:3d`)).toBe(true);
   });
@@ -367,18 +367,18 @@ describe("registered job and explicit company binding", () => {
     await f.plugin.onConfigChanged!(disabled, { companyId: company });
     f.ctx.config.get.mockResolvedValue(disabled);
     f.pages.splice(0, 1, { nextPageToken: "repeat" }, { nextPageToken: "repeat" });
-    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow(SAFE_ERROR);
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow("mailbox read failed");
     expect(f.saved()).toBeNull(); expect(f.ctx.state.set).not.toHaveBeenCalled();
   });
   it("cannot initialize while enabled", async () => {
     const f = await worker(null);
     await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
-    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow(SAFE_ERROR);
+    await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow("config invalid");
     expect(f.saved()).toBeNull();
   });
   it("no config fails visibly; saved config re-reads only the explicit company and fires", async () => {
     const f = await worker([], false);
-    await expect(f.tick()).rejects.toThrow(SAFE_ERROR); expect(f.ctx.http.fetch).not.toHaveBeenCalled();
+    await expect(f.tick()).rejects.toThrow("not configured"); expect(f.ctx.http.fetch).not.toHaveBeenCalled();
     f.ctx.config.get.mockResolvedValue({ ...config });
     await f.plugin.onConfigChanged!(config as unknown as Record<string, unknown>, { companyId: company });
     await f.tick(); expect(f.ctx.config.get).toHaveBeenCalledWith(company); expect(f.fires).toHaveLength(2);
@@ -388,16 +388,18 @@ describe("registered job and explicit company binding", () => {
   it.each([null, "44444444-4444-4444-4444-444444444444"])("rejects wrong/global company %s and fails closed", async wrong => {
     const f = await worker();
     await f.plugin.onConfigChanged!(config as unknown as Record<string, unknown>, { companyId: company });
-    await expect(f.plugin.onConfigChanged!(config as unknown as Record<string, unknown>, { companyId: wrong })).rejects.toThrow(SAFE_ERROR);
-    await expect(f.tick()).rejects.toThrow(SAFE_ERROR); expect(f.ctx.http.fetch).not.toHaveBeenCalled();
+    await expect(f.plugin.onConfigChanged!(config as unknown as Record<string, unknown>, { companyId: wrong })).rejects.toThrow("actor/company mismatch");
+    await f.tick(); // A rejected callback does not set an in-memory invalidation flag.
+    expect(f.ctx.http.fetch).toHaveBeenCalled();
   });
   it("config errors do not leak values and invalidate old enabled config", async () => {
     const f = await worker();
     await f.plugin.onConfigChanged!(config as unknown as Record<string, unknown>, { companyId: company });
     const raw = { ...config, routineOrigin: access };
     expect(await f.plugin.onValidateConfig!(raw)).toEqual({ ok: false, errors: [SAFE_ERROR] });
-    await expect(f.plugin.onConfigChanged!(raw, { companyId: company })).rejects.toThrow(SAFE_ERROR);
-    await expect(f.tick()).rejects.toThrow(SAFE_ERROR); expect(f.ctx.http.fetch).not.toHaveBeenCalled();
+    await expect(f.plugin.onConfigChanged!(raw, { companyId: company })).rejects.toThrow("config invalid");
+    f.ctx.config.get.mockResolvedValue(raw);
+    await expect(f.tick()).rejects.toThrow("config invalid"); expect(f.ctx.http.fetch).not.toHaveBeenCalled();
   });
   it("does not overlap jobs", async () => {
     const f = await worker();
@@ -406,7 +408,7 @@ describe("registered job and explicit company binding", () => {
     const gate = new Promise<void>(resolve => { release = resolve; });
     f.ctx.config.get.mockImplementationOnce(async () => { await gate; return { ...config, enabled: false }; });
     const first = f.tick();
-    await expect(f.tick()).rejects.toThrow(SAFE_ERROR);
+    await expect(f.tick()).rejects.toThrow("state exists");
     release(); await first;
   });
 });

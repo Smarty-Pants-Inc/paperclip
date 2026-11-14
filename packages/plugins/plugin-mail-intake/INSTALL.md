@@ -17,7 +17,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack --pack-destination /approved/artifacts
-sha256sum /approved/artifacts/smarty-plugin-mail-intake-0.1.2.tgz
+sha256sum /approved/artifacts/smarty-plugin-mail-intake-0.1.4.tgz
 ```
 
 Only GitHub automation commits the root lockfile; do not commit install churn.
@@ -36,7 +36,7 @@ local-path installer, for example on a non-managed authorized TEST instance:
 ```sh
 mkdir -p /approved/plugins/mail-intake
 # Verify the supplied SHA-256 before extracting.
-tar -xzf /approved/artifacts/smarty-plugin-mail-intake-0.1.2.tgz \
+tar -xzf /approved/artifacts/smarty-plugin-mail-intake-0.1.4.tgz \
   -C /approved/plugins/mail-intake --strip-components=1
 paperclipai plugin install /approved/plugins/mail-intake --api-base https://TEST-ORIGIN
 ```
@@ -46,7 +46,7 @@ Cloud-managed hosts reject arbitrary local/npm paths; the image owner must
 confirm its approved day-one staging/admission route. A tgz alone does not
 bypass that guard. Catalog/image integration is deferred, not silently added.
 
-## Upgrading to 0.1.2
+## Upgrading to 0.1.4 (from 0.1.2 or earlier)
 
 Approve the added `companies.read` capability through the host's normal upgrade
 flow if requested. Discovery uses only documented SDK calls; no core change or

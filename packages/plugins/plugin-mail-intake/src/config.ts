@@ -21,7 +21,7 @@ export function assertRoutineOrigin(origin: string): void {
   if (!ROUTINE_ORIGINS.includes(origin)) fail();
 }
 export const SAFE_ERROR = "could not read mail";
-export function fail(): never { throw new Error(SAFE_ERROR); }
+export function fail(code: string = SAFE_ERROR): never { throw new Error(code); }
 export function record(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object" && !Array.isArray(v);
 }
