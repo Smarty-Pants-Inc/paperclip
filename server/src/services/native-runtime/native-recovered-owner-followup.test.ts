@@ -19,6 +19,10 @@ import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
+import { currentControllerProcessStamp } from "../controller-process-identity.js";
+import { proveControllerInstance, registerControllerInstanceLeaseWork, resetControllerInstanceLeaseForTests,
+  tickControllerInstanceLease } from "../controller-instance-lease.js";
+import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { planNativeLifecycleSettlement } from "./native-lifecycle-command-settlement.js";
 import { waitForCondition } from "../../__tests__/helpers/native-restart.js";
@@ -1361,6 +1365,71 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
     } finally { await db.delete(controllerInstances).where(eq(controllerInstances.bootId, other)); }
   }, 60_000);
+
+  // Keep: recorded production catch, stale boot 4f539509 (settlepred4).
+  // Use the documented controller-instance fence rather than weakening B1:
+  // an expired lease, even on this process space, is not a recorded close.
+  it.each(["settlement-test-current", "another-host-space", "unknown"])(
+    "B1 stale boot in %s stays refused until the existing mutating prover fences it", async processSpace => {
+      const current = await currentNativeControllerIdentity();
+      const [boot] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+      const stale = randomUUID(), recent = randomUUID(), leaseId = randomUUID();
+      const renewedAt = new Date(current.processStartedAt.getTime() - 2 * 86_400_000);
+      await db.insert(controllerInstances).values([
+        { bootId: stale, epoch: boot!.epoch - 1, processSpace, pid: 7,
+          startedAt: new Date(renewedAt.getTime() - 3_000_000), renewedAt,
+          leaseExpiresAt: new Date(renewedAt.getTime() + 90_000) },
+        { bootId: recent, processSpace: "recent-stopped-boot", pid: 7,
+          startedAt: new Date(current.processStartedAt.getTime() - 60_000),
+          leaseExpiresAt: new Date(current.processStartedAt.getTime() - 1_000), stoppedAt: current.processStartedAt },
+      ]);
+      const [owned] = await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: null,
+        status: "active", leasePolicy: "ephemeral", provider: "fake", providerLeaseId: `sandbox://fake/${leaseId}`,
+        updatedAt: renewedAt, metadata: { leaseController: { bootId: stale, pid: 7, hostHash: processSpace,
+          processStartedAt: new Date(renewedAt.getTime() - 3_000_000).toISOString() } } }).returning();
+      // The real lease renewal installs this boot's epoch. No background worker
+      // is needed: the test drives the production renewal explicitly.
+      const coordinator = { register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }) } as unknown as
+        ReturnType<typeof createDeliveryWorkCoordinator>;
+      const work = registerControllerInstanceLeaseWork(db, coordinator);
+      try {
+        currentControllerProcessStamp();
+        await tickControllerInstanceLease();
+        const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true });
+        const followUp = await admitFollowUp(prior);
+        const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
+        const binding = { companyId, issueId: prior.issueId, runId: prior.runId };
+        const checkpoint = (await loadNativeRunnerCheckpoint(db, binding))!;
+        checkpoint.restoreSessionDirectory(root);
+        const path = join(root, "control-plane", "control-plane-state.json"), bytes = await readFile(path, "utf8");
+        const plan = () => planNativeLifecycleSettlement({ db, root, bytes, identity: prior.identity, companyId, agentId,
+          issueId: prior.issueId, currentRunId: followUp.runId });
+        expect(await plan()).toBeNull();
+        expect(await proveControllerInstance(db, stale, owned!.updatedAt, { readOnly: true })).toBe("expired");
+        // An unbound proof cannot fence, even in a mutating pass.
+        expect(await proveControllerInstance(db, stale, null)).toBe("expired");
+        const [unfenced] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+        expect(unfenced).toMatchObject({ stoppedAt: null, fencedAt: null, fencedByEpoch: null });
+        expect(await plan()).toBeNull();
+        expect(await readFile(path, "utf8")).toBe(bytes);
+        expect([...(await loadNativeRunnerCheckpoint(db, binding))!.records]).toEqual([...checkpoint.records]);
+        // The owned fixture's last-write time is recorded, not inferred from
+        // command age. Any older epoch can be fenced, not just the predecessor.
+        expect(await proveControllerInstance(db, stale, owned!.updatedAt)).toBe("fenced");
+        const [fenced] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+        expect(fenced).toMatchObject({ stoppedAt: null, fencedByEpoch: boot!.epoch });
+        expect(fenced!.fencedAt).toBeInstanceOf(Date);
+        expect(await plan()).not.toBeNull();
+        expect(await followUp.start()).toBe(ADMITTED);
+        expect(followUp.logs.join("")).toContain("native_legacy_lifecycle_abandoned count=2");
+      } finally {
+        await work.stop();
+        resetControllerInstanceLeaseForTests();
+        await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId));
+        await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale));
+        await db.delete(controllerInstances).where(eq(controllerInstances.bootId, recent));
+      }
+    }, 60_000);
 
   it.each([{ offset: -1, admitted: true }, { offset: 0, admitted: false }, { offset: 1, admitted: false }])(
     "SMA-122 B2 strict skew boundary offset=$offset", async ({ offset, admitted }) => {
