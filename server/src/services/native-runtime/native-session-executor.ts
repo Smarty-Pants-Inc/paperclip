@@ -21,6 +21,7 @@ import { readProviderFailure } from "@paperclipai/shared";
 import { nativeCancellationHasUnsettledOwner, notifyNativeCancellation, waitForNativeCancellation } from "./native-cancellation-delivery.js";
 import { readClaimedNativeStopRecovery } from "./native-cancellation-request.js";
 import { publishNativeHarnessBackup } from "./native-harness-backup-publication.js";
+import { noteNativeHarnessBackupChange } from "../native-harness-backup-expiration-notifications.js";
 import { restartRecoveryMeasurementFor, speedBudgetAdapter } from "./native-speed-budgets.js";
 import { getStartupRecoveryState } from "../../startup-recovery-state.js";
 import { assertNativeHarnessBackupOwner, durableNativeHarnessStorage, NATIVE_HARNESS_DOWNLOAD_IDLE_TIMEOUT_MS, nativeHarnessBackupOwner, persistNativeHarnessBackup,
@@ -18943,8 +18944,7 @@ async function createRunnerdBackendWithinSessionClaim(
       // Include prerequisite/inspection failures as well as copy/publication
       // failures. The run log below is optional; this server warning is not.
       reportNativeHarnessBackupCapture({ ...checkpointCaptureIdentity, outcome: "failed", reason: "capture_failed",
-        detail: redactSensitiveText(error instanceof Error ? error.message : String(error))
-          .replace(/[\r\n]+/g, " ").slice(0, 512),
+        error,
       });
       if (!checkpointBackupStored && remoteTarget?.transport === "sandbox" && remoteTarget.reusableLeaseConfigured !== true) {
         providerStateUnsavedMarked = await markAcceptedRunProviderStateUnsaved(input.db, input.execution.binding)
@@ -19057,6 +19057,8 @@ async function createRunnerdBackendWithinSessionClaim(
                   throw new Error("runner_harness_state_mismatch: checkpoint_identity_incomplete");
                 }
                 mkdirSync(pendingRoot, { recursive: true, mode: 0o700 });
+                noteNativeHarnessBackupChange(input.db, { companyId: input.execution.binding.companyId,
+                  scopeDigest: checkpointCaptureIdentity.scopeDigest });
                 for (const directory of persistenceProfile.directories) {
                   const sourcePath = remotePersistencePath(directory);
                   if (!sourcePath)

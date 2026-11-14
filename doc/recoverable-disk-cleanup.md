@@ -92,8 +92,11 @@ runner. Every skipped or failed capture emits a server warning, even without an
 active run-log recorder. The structured fields are `scopeDigest`, `runId`,
 `nativeSessionId`, `outcome`, and `reason`. Skip reasons are
 `remote_filesystem_unavailable` or `checkpoint_incomplete`; failures use
-`capture_failed` with a bounded, redacted `detail`. Incomplete skips also include
-`incompleteReason`.
+`capture_failed` with a closed `errorCode` (`permission_denied`, `not_found`,
+`io_error`, `timeout`, or `unknown`). Unknown errors may also include their
+constructor's `errorClass`, never their message, stack, stderr, or arbitrary
+provider code. Incomplete skips include a closed `incompleteReason`
+(`unavailable`, `not_suspended`, `provider_unopened`, or `unknown`).
 
 Startup backup discovery and backup maintenance report each real
 `failover-backups/.pending-*` directory whose modification time is more than two
@@ -103,7 +106,19 @@ symlinks. The warning includes `scopeDigest`, `pendingRoot`, `ageMs`,
 `hasCurrent`, and reason `stale_pending_backup`. When no current backup exists,
 `operatorAction` is `no_current_backup_operator_recovery_required`; the partial
 capture is left in place for operator inspection, not assumed safe to restore.
-This reporting adds no timer or capture attempt.
+Reporting uses the existing delivery coordinator and shared maintenance scheduler,
+not an independent timer, and never starts a capture. It is registered even when
+`PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED=false`. Startup reconstructs
+pending deadlines from the local filesystem; capture creation and publication
+wake discovery through the existing native-backup change notification. A young
+pending directory is checked just after its two-hour boundary; a stale directory
+is reported hourly while it remains present. With no pending directories and no
+failed discovery to retry, the worker has no deadline and performs no idle scans.
+Drain/warm standby pause discovery; shutdown aborts and awaits the active scan
+and removes its notification subscription. Out-of-process filesystem additions
+are discovered on restart or the next backup-change notification, not by an
+unconditional empty-root poll. Scan failures log only the same closed error
+projection and retry through the shared coordinator.
 
 The existing protected `/api/health` response exposes these counters inside
 `nativeRecovery`, alongside the existing native recovery-state counts:

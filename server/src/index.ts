@@ -1364,11 +1364,14 @@ async function startServerWithDatabaseTeardown(
     evidenceRetentionDays: config.nativeRunnerEvidenceRetentionDays,
     shouldContinue: () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby(),
   });
-  // Report stranded transcript captures regardless of the optional expiration
-  // feature. This is read-only and shares the native backup maintenance startup
-  // delay/cadence, so disabled expiration cannot silence the warning.
-  const stopNativeHarnessBackupStalePendingScan = nativeHarnessBackupExpiration.registerStalePendingScan();
-  server.on("close", stopNativeHarnessBackupStalePendingScan);
+  // What: report pending captures through the existing delivery maintenance scheduler.
+  // Why: backup diagnostics must run even when destructive expiration is disabled.
+  // Owner: native harness backups; pending directories supply reconstructible deadlines.
+  // Stop: deliveryWork.stop aborts and awaits scans, cancelling deadlines/subscriptions.
+  // Upstream shape: reuse coordinator registration and backup-change notifications, no private timer.
+  const nativeHarnessBackupStalePendingWork = nativeHarnessBackupExpiration.registerStalePendingScan(deliveryWork);
+  trackHeartbeatSchedulerWork(nativeHarnessBackupStalePendingWork.ready);
+  server.on("close", () => { void nativeHarnessBackupStalePendingWork.stop(); });
   const externalObjects = externalObjectService(db as any, {
     pluginWorkerManager,
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,

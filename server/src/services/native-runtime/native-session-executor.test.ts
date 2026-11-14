@@ -3357,7 +3357,13 @@ describe("remote provider pack manifest", () => {
       const backup = vi.spyOn(harnessStorage, "persistNativeHarnessBackup").mockImplementation(async input => {
         expect(JSON.parse(await readFile(join(input.root, "manifest.json"), "utf8")).providerArtifacts).toEqual(newReceipt);
         // Only the first save fails; a later checkpoint of the same run saves.
-        if (provider === "opencode-new-durable-store-failed" && backup.mock.calls.length === 1) throw new Error("SlowDown: Please reduce your request rate.");
+        if (provider === "opencode-new-durable-store-failed" && backup.mock.calls.length === 1) {
+          // Privacy regression: exercise the real checkpoint's unconditional WARN,
+          // not just the projection helper. These are synthetic sentinels.
+          throw Object.assign(new Error("DB_PASSWORD db-password-sentinel proxyPassword proxy-password-sentinel transcript-marker-sentinel"), {
+            stderr: "stderr-secret-sentinel", code: "untrusted-code-sentinel",
+          });
+        }
         // The durable backup is stored; only the later local publication fails.
         if (provider === "opencode-new-durable-publish-failed") await rm(input.root, { recursive: true, force: true });
         return undefined as never;
@@ -3504,12 +3510,28 @@ describe("remote provider pack manifest", () => {
           const summaryDb = { select: () => ({ from: () => ({ where: () => ({ groupBy: async () => [] }) }) }) } as unknown as Db;
           const before = await nativeRestartRecoverySummary(summaryDb);
           const warn = vi.spyOn(logger, "warn");
-          onTestFinished(() => warn.mockRestore());
+          const { onNativeHarnessBackupChange } = await import("../native-harness-backup-expiration-notifications.js");
+          const pendingChanged = vi.fn();
+          const unsubscribePending = onNativeHarnessBackupChange(preparedDb, pendingChanged);
+          onTestFinished(() => { warn.mockRestore(); unsubscribePending(); });
           await expect(driver.mock.calls.at(-1)![0].checkpoint!("settled")).rejects.toThrow();
           expect(warn).toHaveBeenCalledWith(expect.objectContaining({
             scopeDigest: transport.stateDirectory!.split("/").at(-1), runId: remoteExecution.binding.runId,
             nativeSessionId: remoteExecution.session.normalizedSessionId, reason: "capture_failed",
           }), "Native harness backup capture failed");
+          if (provider === "opencode-new-durable-store-failed") {
+            const captureWarnings = warn.mock.calls.filter(([, message]) => message === "Native harness backup capture failed");
+            const logged = JSON.stringify(captureWarnings);
+            for (const sentinel of ["DB_PASSWORD", "db-password-sentinel", "proxyPassword", "proxy-password-sentinel",
+              "transcript-marker-sentinel", "stderr-secret-sentinel", "untrusted-code-sentinel"]) {
+              expect(logged).not.toContain(sentinel);
+            }
+            expect(captureWarnings.at(-1)?.[0]).toMatchObject({ errorCode: "unknown", errorClass: "Error" });
+            expect(captureWarnings.at(-1)?.[0]).not.toHaveProperty("detail");
+            // Creation, not just successful publication, wakes stale discovery.
+            expect(pendingChanged).toHaveBeenCalledWith({ companyId: remoteExecution.binding.companyId,
+              scopeDigest: transport.stateDirectory!.split("/").at(-1) });
+          }
           expect((await nativeRestartRecoverySummary(summaryDb)).harnessBackupCaptureFailed)
             .toBe((before.harnessBackupCaptureFailed ?? 0) + 1);
           // Only a backup that was never stored makes the next run start fresh.
