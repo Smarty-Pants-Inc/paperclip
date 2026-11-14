@@ -104,7 +104,10 @@ function AllStatesGallery() {
       <Frame caption="3. Finished run, expanded: the Thought row keeps the last headline; its detail lists every part.">
         <TaskChatRunnerActivityGroup item={{ ...livePhase(3), id: "phase-settled", active: false, items: [readTool, thinking("reasoning-settled", CODEX_PARTS, false)] }} defaultExpanded />
       </Frame>
-      <Frame caption="4. Claude summarized thinking (no headlines): plain prose, unchanged.">
+      <Frame caption="4. Inline display: provider reasoning stays readable between response and tool activity, including while streaming.">
+        <TaskChatThinking item={thinking("reasoning-inline", [CLAUDE_PROSE], true)} inline />
+      </Frame>
+      <Frame caption="5. Claude summarized thinking (no headlines): plain prose, unchanged.">
         <TaskChatThinking item={thinking("reasoning-claude", [CLAUDE_PROSE], false, { summaryLabel: "Thought for 6s" })} defaultOpen active={false} />
       </Frame>
     </div>

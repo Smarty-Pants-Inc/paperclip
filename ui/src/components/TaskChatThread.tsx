@@ -74,6 +74,8 @@ import {
   prependIssueBrief,
   settledCompactionMarkers,
   settledRunChildren,
+  readReasoningDisplay,
+  REASONING_DISPLAY_STORAGE_KEY,
   splitTranscriptAtAnchors,
   transcriptToTaskChatItems,
   runtimeRequestSegmentContext,
@@ -526,6 +528,7 @@ function durableInputLabel(
  */
 export function TaskChatThread(props: TaskChatThreadProps) {
   const coordinatorEnabled = useCoordinatorPresentation();
+  const [reasoningDisplay, setReasoningDisplay] = useState(readReasoningDisplay);
   const { status: connectionStatus } = useConnectivity();
   const { enabled: streamlinedPreference } = useStreamlinedUiEnabled();
   const streamlinedUiEnabled = coordinatorEnabled || streamlinedPreference;
@@ -875,8 +878,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ],
   );
 
-  const threadHeaderWithBlockers =
-    threadHeader || blockerLinks || liveWorkLinks ? (
+  const threadHeaderWithBlockers = (
       <>
         {threadHeader}
         {liveWorkLinks ? (
@@ -889,7 +891,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           />
         ) : null}
       </>
-    ) : undefined;
+  );
 
   const linkedRunMetaById = useMemo(() => {
     const map = new Map<
@@ -2436,6 +2438,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     agentMap,
     currentUserId,
     userLabelMap,
+    reasoningDisplay,
   ]);
 
   // Hand off once the settled turn or its reply comment is in the thread; a
@@ -3455,6 +3458,21 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 )}
                 inert={!historyRevealed}
               >
+                <div className="flex justify-end px-4 py-1">
+                  <button
+                    type="button"
+                    aria-pressed={reasoningDisplay === "inline"}
+                    onClick={() => {
+                      const next = reasoningDisplay === "inline" ? "fold" : "inline";
+                      try { window.localStorage.setItem(REASONING_DISPLAY_STORAGE_KEY, next); } catch { /* per-device preference is optional */ }
+                      setReasoningDisplay(next);
+                    }}
+                    className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    data-testid="task-chat-reasoning-display-toggle"
+                  >
+                    Reasoning: {reasoningDisplay === "inline" ? "Inline" : "Folded"}
+                  </button>
+                </div>
                 {prepareInitialContent ? (
                   <>
                     {items.length === 0 && !tailRunId && !optimisticRunnerStartup && !scrollingHistory?.hasMore ? (

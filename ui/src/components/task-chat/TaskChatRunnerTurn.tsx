@@ -21,6 +21,7 @@ import { TaskChatRunHealthBanner, partitionRunHealthItems } from "./TaskChatRunH
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 import { TaskChatMarker } from "./TaskChatMarker";
+import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskChatShimmerScope, useTaskChatShimmer } from "./TaskChatShimmer";
 import {
   buildTurnTimelineRows,
@@ -309,6 +310,8 @@ export function TaskChatRunnerTurn({
                   item={row}
                   onRuntimeRequestDecision={onRuntimeRequestDecision}
                 />
+              ) : row.kind === "thinking" ? (
+                <TaskChatThinking item={row} inline />
               ) : null}
             </div>
           ))}

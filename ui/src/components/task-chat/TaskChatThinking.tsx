@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Brain, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TaskChatThinkingItem } from "./task-chat-model";
-import { flattenSelfTalk } from "./transcript-adapter";
+import { flattenSelfTalk, readReasoningDisplay } from "./transcript-adapter";
 import { TaskChatReasoningSummary } from "./TaskChatReasoningSummary";
 import { latestReasoningHeadline } from "./reasoning-summary";
 import { useTaskChatShimmer } from "./TaskChatShimmer";
@@ -12,6 +12,7 @@ export function TaskChatThinking({
   item,
   defaultOpen,
   rowClassName,
+  inline = readReasoningDisplay() === "inline",
   active = Boolean(item.streaming),
 }: {
   item: TaskChatThinkingItem;
@@ -19,6 +20,8 @@ export function TaskChatThinking({
   defaultOpen?: boolean;
   /** Optional alignment override for a containing activity rail. */
   rowClassName?: string;
+  /** Render as readable transcript content rather than an activity disclosure. */
+  inline?: boolean;
   /** Whether this reasoning block is the runner's current activity. */
   active?: boolean;
 }) {
@@ -30,6 +33,19 @@ export function TaskChatThinking({
   const label = active
     ? body ? `${baseLabel}…` : "Thinking…"
     : item.summaryLabel ?? (body ? baseLabel : "Thought");
+
+  if (inline) {
+    return (
+      <div
+        className={cn("min-w-0 max-w-full rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground", rowClassName)}
+        data-testid="task-chat-thinking"
+        data-state={active ? "streaming-inline" : "settled-inline"}
+        data-reasoning-display="inline"
+      >
+        <TaskChatReasoningSummary text={body || "Thinking…"} streaming={active} />
+      </div>
+    );
+  }
 
   if (body && !active) {
     return (
