@@ -1,3 +1,4 @@
+import { runtimeModeReasonForTerminalSql } from "../runtime-selection-state.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
@@ -1050,7 +1051,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await notifyCancelledWorkspacePreservation(tx, { companyId: run.companyId, runId: run.id });
           await notifyExecutionRunWork(tx, { companyId: run.companyId, agentId: run.agentId, runId: run.id });
           await notifyUnsafeWorkspaceExportRunChange(tx, run);
-          const [row] = await tx.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(),
+          const [row] = await tx.update(heartbeatRuns).set({ status: "cancelled", runtimeModeReason: runtimeModeReasonForTerminalSql(), finishedAt: new Date(),
             errorCode: "case_handoff_superseded", error: "This case handoff was cancelled or superseded.", updatedAt: new Date() })
             .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "queued"))).returning();
           return row;
@@ -1528,6 +1529,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     .update(heartbeatRuns)
                     .set({
                       status: "cancelled",
+                      runtimeModeReason: runtimeModeReasonForTerminalSql(),
                       errorCode: CHAT_CONTROL_RECOVERY_STOP_CODE,
                       error,
                       finishedAt: claimedAt,
@@ -1658,6 +1660,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .update(heartbeatRuns)
                   .set({
                     status: "cancelled",
+                    runtimeModeReason: runtimeModeReasonForTerminalSql(),
                     finishedAt: claimedAt,
                     error: reason,
                     errorCode: "queued_comment_discarded",
@@ -4228,6 +4231,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .update(heartbeatRuns)
               .set({
                 status: "cancelled",
+                runtimeModeReason: runtimeModeReasonForTerminalSql(),
                 finishedAt: now,
                 error: reason,
                 errorCode: issueCancelled
@@ -4373,6 +4377,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .update(heartbeatRuns)
               .set({
                 status: "cancelled",
+                runtimeModeReason: runtimeModeReasonForTerminalSql(),
                 finishedAt: new Date(),
                 error:
                   "Execution lock released after issue reassigned to a different agent",

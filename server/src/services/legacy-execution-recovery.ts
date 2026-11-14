@@ -1,3 +1,4 @@
+import { runtimeModeReasonForTerminalSql } from "./runtime-selection-state.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
@@ -164,6 +165,8 @@ export async function terminalizeLegacyExecution(input: {
       .set({
         status: input.recordRestoreFailureOnly ? current.status : status,
         ...patch,
+        ...(!input.recordRestoreFailureOnly && ["failed", "cancelled", "succeeded", "interrupted", "timed_out"].includes(status)
+          ? { runtimeModeReason: runtimeModeReasonForTerminalSql() } : {}),
         executionStatusDeliveryId: input.recordRestoreFailureOnly || current.status !== status || Object.keys(patch ?? {}).length > 0
           ? randomUUID() : current.executionStatusDeliveryId,
         updatedAt: new Date(),

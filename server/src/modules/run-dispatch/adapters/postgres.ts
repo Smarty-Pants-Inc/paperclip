@@ -1,3 +1,4 @@
+import { runtimeModeReasonForTerminalSql } from "../../../services/runtime-selection-state.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
@@ -849,6 +850,7 @@ export function createPostgresRunDispatchAdapter(
       .update(heartbeatRuns)
       .set({
         status: "cancelled",
+        runtimeModeReason: runtimeModeReasonForTerminalSql(),
         finishedAt: input.now,
         error: input.reason,
         errorCode: input.errorCode,
@@ -1197,6 +1199,7 @@ export function createPostgresRunDispatchAdapter(
         .update(heartbeatRuns)
         .set({
           status: "cancelled",
+          runtimeModeReason: runtimeModeReasonForTerminalSql(),
           finishedAt: now,
           error: decision.reason,
           errorCode: decision.errorCode,

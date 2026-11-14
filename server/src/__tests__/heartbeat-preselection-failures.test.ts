@@ -63,7 +63,7 @@ vi.mock("../services/fresh-workspace-continuation.js", async original => {
 
 describe("pre-selection failure settlement and unresolved runtime reasons", () => {
   const fixture = nativeRestartFixture({});
-  async function restoredTask(db: ReturnType<typeof createDb>, heartbeat: ReturnType<typeof heartbeatService>) {
+  async function restoredTask(db: ReturnType<typeof createDb>, heartbeat: ReturnType<typeof heartbeatService>, body = "Please continue my daily task.", delivery: "restored" | "person" = "restored") {
     const { companyId, agentId } = fixture.current;
     const userId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Task owner", email: `${userId}@example.invalid`,
@@ -75,7 +75,15 @@ describe("pre-selection failure settlement and unresolved runtime reasons", () =
       assigneeAgentId: agentId, responsibleUserId: userId, conversationAgentId: agentId, conversationUserId: userId,
       conversationState: "active" }).returning();
     const [message] = await db.insert(issueComments).values({ companyId, issueId: issue!.id,
-      authorType: "user", authorUserId: userId, body: "Please continue my daily task." }).returning();
+      authorType: "user", authorUserId: userId, body }).returning();
+    if (delivery === "person") {
+      const run = await heartbeat.wakeup(agentId, { source: "automation", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: userId,
+        payload: { issueId: issue!.id, commentId: message!.id },
+        contextSnapshot: { issueId: issue!.id, commentId: message!.id, wakeReason: "issue_commented" } });
+      expect(run).toBeDefined();
+      return { issueId: issue!.id, runId: run!.id };
+    }
     const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: issue!.id,
       invocationSource: "on_demand", status: "failed", errorCode: "process_lost", finishedAt: new Date(),
       contextSnapshot: { issueId: issue!.id, wakeCommentId: message!.id } }).returning();
@@ -145,6 +153,37 @@ describe("pre-selection failure settlement and unresolved runtime reasons", () =
       expect(run).toMatchObject({ status: "failed", runtimeMode: "legacy", runtimeModeResolvedAt: null,
         runtimeModeReason: "not_selected_run_ended_before_selection:workspace_prep" });
     } finally { fault.phase = "none"; await heartbeat.drainActiveRunExecutions(); await db.$client.end(); }
+  });
+
+  it("keeps the selection phase when real cancellation wins the native-selection fence", async () => {
+    const db = createDb(fixture.current.temporary.connectionString);
+    const provider = vi.fn(() => { throw new Error("provider must not start"); });
+    let reachedSelection = false;
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: provider,
+      beforeNativeRuntimeSelection: async runId => { reachedSelection = true; await heartbeat.cancelRun(runId); } });
+    try {
+      const { runId } = await restoredTask(db, heartbeat);
+      await heartbeat.drainActiveRunExecutions();
+      expect(reachedSelection).toBe(true);
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", runtimeMode: "legacy",
+        runtimeModeResolvedAt: null, runtimeModeReason: "not_selected_run_ended_before_selection:selection_txn" });
+      expect(provider).not.toHaveBeenCalled();
+      expect(await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId))).toHaveLength(0);
+    } finally { await heartbeat.drainActiveRunExecutions(); await db.$client.end(); }
+  });
+
+  it("explains a real successful conversation-reset no-op before workspace preparation", async () => {
+    const db = createDb(fixture.current.temporary.connectionString);
+    const provider = vi.fn(() => { throw new Error("provider must not start"); });
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: provider });
+    try {
+      const { runId } = await restoredTask(db, heartbeat, "/new", "person");
+      await heartbeat.drainActiveRunExecutions();
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "succeeded", runtimeMode: "legacy",
+        runtimeModeResolvedAt: null, runtimeModeReason: "not_selected_run_ended_before_selection:workspace_prep",
+        resultJson: { conversationReset: true } });
+      expect(provider).not.toHaveBeenCalled();
+    } finally { await heartbeat.drainActiveRunExecutions(); await db.$client.end(); }
   });
 
   it.each(["workspace_prep", "instruction_prep", "selection_txn"])("preserves %s on cancellation and a successful no-op without selecting legacy", async phase => {

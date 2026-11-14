@@ -156,6 +156,8 @@ export interface HeartbeatRuntimeSelectionInput {
   issuesSvc: Pick<ReturnType<typeof issueService>, "addComment">;
   runtimeEnv: Record<string, string | undefined>;
   beforeNativeRuntimeSelection?: (runId: string) => Promise<void>;
+  /** Invoked immediately after the durable selection commits, before further setup. */
+  onRuntimeSelected?: () => void;
   predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   onAdapterEvent: (event: AdapterRuntimeEvent) => Promise<void>;
   // Teardown must observe these updates even when a later preparation step throws.
@@ -1058,7 +1060,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             lockedRun.runtimeModeResolverVersion ??
             nativeRuntimeResolution.resolverVersion,
           runtimeModeReason:
-            lockedRun.runtimeModeReason ?? nativeRuntimeResolution.reason,
+            lockedRun.runtimeModeResolvedAt ? lockedRun.runtimeModeReason ?? nativeRuntimeResolution.reason : nativeRuntimeResolution.reason,
           runtimeModeResolvedAt:
             lockedRun.runtimeModeResolvedAt ?? new Date(),
           runnerProfileJson: {
@@ -1163,6 +1165,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       return true;
     });
     if (!nativeSelected) return { selected: false };
+    input.onRuntimeSelected?.();
     stopControllerLease();
     if (nativeExecution?.provider.kind !== "cursor_cloud" && !activeEnvironmentLease) throw new Error("native_environment_lease_unavailable");
     nativeWorkspaceSync = nativeExecution?.provider.kind === "cursor_cloud" || readRemoteWorkspaceAuthority(persistedExecutionWorkspace?.metadata) ? null
@@ -1215,6 +1218,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id)));
+    input.onRuntimeSelected?.();
   }
   return { selected: true, nativeExecution, nativeRunnerInstanceId, pluginTaskDescription, toolRefreshOnResume, getNativeFreshSessionHandoff, nativeWorkspaceSync };
 }

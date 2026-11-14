@@ -67,6 +67,7 @@ import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorks
 import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
 import { nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { prepareAndSelectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
+import { recordRuntimePreparationPhase, type RuntimePreparationPhase } from "./runtime-selection-state.js";
 import { createHeartbeatRunCompletion, settlePreparationFailureWithFreshConnection, type FailHeartbeatRunSetupInput } from "./heartbeat/run-completion.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 export {
@@ -2020,6 +2021,9 @@ function createHeartbeatService(
       return;
     }
 
+    const runtimePreparation: { phase: RuntimePreparationPhase } = { phase: "workspace_prep" };
+    let nativeEligibilityConfirmed = false;
+    let runtimeSelected = false;
     let legacyAdapterEntered = false;
     let legacyLocalAdapterEntered = false;
     let legacyPreparationFailedBeforeDispatch = false;
@@ -2027,6 +2031,7 @@ function createHeartbeatService(
     let run = await getRun(runId);
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
+    runtimeSelected = run.runtimeMode === "native" || run.runtimeModeResolvedAt !== null;
 
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
@@ -2235,6 +2240,7 @@ function createHeartbeatService(
     let identityRedactor = createAgentIdentityRedactor();
 
     try {
+      await recordRuntimePreparationPhase(db, run.id, runtimePreparation.phase);
       const loadedAgent = await timePreparation("agent_read", () => getAgent(run.agentId));
       if (!loadedAgent) {
         await setRunStatus(runId, "failed", {
@@ -3545,6 +3551,9 @@ function createHeartbeatService(
           agent: { id: agent.id, companyId: agent.companyId, status: runningAgent.status, adapterType: agent.adapterType },
           issue: issueRef, target: executionTarget, workspaceId: persistedExecutionWorkspace?.id ?? null,
         });
+        nativeEligibilityConfirmed = nativeRuntimeResolution.kind === "native";
+        runtimePreparation.phase = "instruction_prep";
+        await recordRuntimePreparationPhase(db, run.id, runtimePreparation.phase);
         const githubEnvironment = await timePreparation("github_environment", () => prepareHeartbeatGitHubEnvironment({
           defer: !useAgentGitHubEnv && nativeRuntimeResolution.kind === "native" && nativeRuntimeResolution.profile.backend === "pi_rpc",
           target: executionTarget, cwd: executionWorkspace.cwd,
@@ -3678,6 +3687,7 @@ function createHeartbeatService(
           issuesSvc,
           runtimeEnv,
           beforeNativeRuntimeSelection: options.beforeNativeRuntimeSelection,
+          onRuntimeSelected: () => { runtimeSelected = true; },
           onAdapterEvent,
           onNativeLifecycleSelected: (telemetry) => {
             nativeLifecycleTelemetryForRun = telemetry;
@@ -3690,7 +3700,13 @@ function createHeartbeatService(
           },
           stopControllerLease: () => controllerLease.stop(),
         }, {
-          measure: timePreparation,
+          measure: async (phase, work) => {
+            if (phase === "runtime_selection") {
+              runtimePreparation.phase = "selection_txn";
+              await recordRuntimePreparationPhase(db, run.id, runtimePreparation.phase);
+            }
+            return timePreparation(phase, work);
+          },
           prepareInstructions: async nativeLifecyclePolicy => {
             runtimeConfig = await prepareWithAgentDirectoryDeferral(() => preparedInstructions.prepare({ runtimeConfig, nativeRuntimeResolution, hasInstructionFilesystem, nativeLifecyclePolicy }));
             return { runtimeConfig, instructionCopy: preparedInstructions.instructionCopy };
@@ -4024,6 +4040,11 @@ function createHeartbeatService(
           return;
         }
         if (await leaveToNextController(err)) return;
+        // Eligibility is not selection. Instructions and the selection
+        // transaction can fail before a native stamp commits; use the same
+        // fresh preparation owners as earlier workspace failures, not the
+        // adapter-failure owner (which can launch an immediate successor).
+        if (nativeEligibilityConfirmed && !runtimeSelected && !legacyAdapterEntered && !nativeDispatchMayHaveStarted()) throw err;
         // An unretired predecessor on a reused sandbox: no provider work ran,
         // so the next attempt starts on a fresh sandbox restored from the save.
         const predecessorRetirementFallback = await preparePredecessorRetirementFallback(db, run, err).catch(error => {
@@ -4122,6 +4143,9 @@ function createHeartbeatService(
           await (!legacyAdapterEntered && !nativeDispatchStarted && !nativeDispatchMayHaveStarted()
             ? settleFailedPreparation : runCompletion.failRunSetup)({
             run, runId, outerErr, signal: executionControl.controller.signal,
+            preselectionFailureCode: nativeEligibilityConfirmed && !runtimeSelected
+              ? runtimePreparation.phase === "instruction_prep" ? "instruction_preparation_failed" : "runtime_selection_failed"
+              : undefined,
             providerDispatchStarted: legacyAdapterEntered || nativeDispatchStarted,
             nativeDispatchMayHaveStarted: nativeDispatchMayHaveStarted(),
             identityRedactor, readFailureReportSecrets,
