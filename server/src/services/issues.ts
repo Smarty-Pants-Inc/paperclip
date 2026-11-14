@@ -11433,7 +11433,9 @@ export function issueService(db: Db) {
             goalId,
             responsibleUserId: null,
             requestDepth: clampIssueRequestDepth(undefined),
-            originKind: "manual",
+            // Imported timestamps describe source history, not a local run.
+            // Preserve that provenance so resume can admit carried-over work.
+            originKind: "company_import",
             // The caller resolves parentId against ids in this same batch, so a
             // parent always lands in the same insert (rows arrive parents-first).
             parentId: row.parentId ?? null,

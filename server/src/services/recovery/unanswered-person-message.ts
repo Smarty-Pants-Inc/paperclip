@@ -509,9 +509,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // paused and who can resume it; it stays a waiting-kind note, so after the
   // resume the saved message's own run decides (its answer supersedes it).
   const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
-    lifecycleHolds: agents.lifecycleHolds }).from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+    lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason }).from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
   const agentPaused = Boolean(agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
     || (agentRow.lifecycleHolds ?? []).length > 0));
+  // Import intentionally parks automations until activation. It lost neither
+  // the message nor an attempt: do not annotate every carried-over open task.
+  // Resume's existing eligibility notification rechecks the saved work.
+  if (agentPaused && agentRow?.pauseReason === "import" && (agentRow.lifecycleHolds ?? []).every(hold => hold === "import")) {
+    return { kind: "none" };
+  }
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };

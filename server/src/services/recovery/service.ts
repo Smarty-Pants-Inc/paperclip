@@ -2208,18 +2208,21 @@ export function recoveryService(
     return queued;
   }
 
-  async function enqueueInitialAssignedTodoDispatch(
+  async function enqueueInitialAssignedIssueDispatch(
     issue: RecoveryIssue,
     agentId: string,
   ) {
+    const initialDispatch = issue.status === "in_progress"
+      ? "assigned_in_progress_liveness_dispatch" : "assigned_todo_liveness_dispatch";
     return deps.enqueueWakeup(agentId, {
+      ...(issue.status === "in_progress" ? { issueStateGuard: { statuses: ["in_progress"], assigneeAgentId: agentId } } : {}),
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
       payload: withRecoveryContext(
         {
           issueId: issue.id,
-          mutation: "assigned_todo_liveness_dispatch",
+          mutation: initialDispatch,
         },
         "normal_model",
       ),
@@ -2230,7 +2233,7 @@ export function recoveryService(
           issueId: issue.id,
           taskId: issue.id,
           wakeReason: "issue_assigned",
-          source: "issue.assigned_todo_liveness_dispatch",
+          source: `issue.${initialDispatch}`,
         },
         "normal_model",
       ),
@@ -4841,6 +4844,15 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
+      const agent = await getAgent(agentId);
+      // Import's safety pause is an admission wait, not a failed assignee.
+      // Preserve the task and its monitor until normal agent resume notifies
+      // recovery; blocking it here would require a separate per-task repair.
+      if (agent?.companyId === issue.companyId && agent.status === "paused" && agent.pauseReason === "import" &&
+        agent.lifecycleHolds.every(hold => hold === "import")) {
+        result.skipped += 1;
+        continue;
+      }
 
       // An unfinished durable session goal owns its continuation lifecycle.
       // A paused goal waits for explicit resume; an active goal is handled by
@@ -4915,7 +4927,6 @@ export function recoveryService(
         }
       }
 
-      const agent = await getAgent(agentId);
       // Resume can remove the last hold before an in-flight Pause finishes.
       // Its compatibility status stays paused until Stop settles and startup
       // completes. Like setup/resuming, this is an admission wait, not a lost
@@ -5631,7 +5642,7 @@ export function recoveryService(
             continue;
           }
 
-          const queued = await enqueueInitialAssignedTodoDispatch(
+          const queued = await enqueueInitialAssignedIssueDispatch(
             issue,
             agentId,
           );
@@ -5714,7 +5725,22 @@ export function recoveryService(
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
-        result.skipped += 1;
+        // Imported in-progress work has no local run, even when its source
+        // startedAt is preserved. Once its assignee is ready, use normal initial
+        // assignment admission. Local started episodes still belong to their
+        // execution owner; armed monitors retain their own timer admission.
+        if (issue.status === "in_progress" && issue.originKind === "company_import" && !issue.monitorNextCheckAt &&
+          !issue.conversationAgentId) {
+          if (await hasQueuedIssueWake(issue.companyId, issue.id) || await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+          const queued = await enqueueInitialAssignedIssueDispatch(issue, agentId);
+          if (queued) {
+            result.assignmentDispatched += 1;
+            result.issueIds.push(issue.id);
+          } else result.skipped += 1;
+        } else result.skipped += 1;
         continue;
       }
       if (readDispositionRepairAttempt(latestRun)) {
