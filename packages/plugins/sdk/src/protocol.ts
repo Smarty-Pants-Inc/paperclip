@@ -383,6 +383,8 @@ export interface InitializeResult {
  * @see PLUGIN_SPEC.md §13.4 — `configChanged`
  */
 export interface ConfigChangedParams {
+  /** Monotonic company-row revision; absent for legacy unversioned deliveries. */
+  revision?: number;
   /** The newly resolved company-scoped configuration. */
   config: Record<string, unknown>;
   /** Company whose plugin config changed. */

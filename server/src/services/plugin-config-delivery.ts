@@ -62,9 +62,12 @@ function createConfigDelivery(db: Db, manager: PluginWorkerManager) {
     if (last?.rowId === row.id && revision <= last.updatedAt) return;
     await manager.call(pluginId, "configChanged", {
       companyId,
+      revision,
       config: (row.configJson ?? {}) as Record<string, unknown>,
     });
-    generation.delivered.set(companyId, { rowId: row.id, updatedAt: revision });
+    if (isCurrent(pluginId, generation)) {
+      generation.delivered.set(companyId, { rowId: row.id, updatedAt: revision });
+    }
   }
 
   function deliver(pluginId: string, companyId: string, generation = current(pluginId)): Promise<void> {

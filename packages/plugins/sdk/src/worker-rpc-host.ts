@@ -359,6 +359,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
   // closed when a single-tenant plugin would be collapsed onto a second,
   // distinct company's config. `null` until the first company-scoped delivery.
   let configCompanyId: string | null = null;
+  // Settlement, not RPC arrival or caller timeout, advances a company's queue.
+  const configQueues = new Map<string | null, Promise<void>>();
+  const appliedConfigRevisions = new Map<string | null, number>();
+  const startedConfigRevisions = new Map<string | null, number>();
   let databaseNamespace: string | null = null;
   const invocationContextStorage = new AsyncLocalStorage<PluginInvocationContext>();
   const canRecordSpans = () => Boolean(invocationContextStorage.getStore()?.traceparent)
@@ -1958,7 +1962,32 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     return plugin.definition.onValidateConfig(params.config);
   }
 
-  async function handleConfigChanged(params: ConfigChangedParams): Promise<void> {
+  function handleConfigChanged(params: ConfigChangedParams): Promise<void> {
+    const companyId = params.companyId ?? null;
+    const previous = configQueues.get(companyId) ?? Promise.resolve();
+    const work = previous.catch(() => {}).then(async () => {
+      if (!running) return;
+      const revision = params.revision;
+      if (revision !== undefined) {
+        const applied = appliedConfigRevisions.get(companyId);
+        const started = startedConfigRevisions.get(companyId);
+        // Check at execution time: queued deliveries may have become obsolete.
+        if ((applied !== undefined && revision <= applied) ||
+            (started !== undefined && revision < started)) return;
+        startedConfigRevisions.set(companyId, revision);
+      }
+      await applyConfigChanged(params);
+      if (revision !== undefined) appliedConfigRevisions.set(companyId, revision);
+    });
+    configQueues.set(companyId, work);
+    const cleanup = () => {
+      if (configQueues.get(companyId) === work) configQueues.delete(companyId);
+    };
+    void work.then(cleanup, cleanup);
+    return work;
+  }
+
+  async function applyConfigChanged(params: ConfigChangedParams): Promise<void> {
     const incomingCompanyId = params.companyId ?? null;
 
     // Fail-closed cross-tenant guard.

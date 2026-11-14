@@ -3733,6 +3733,10 @@ export function createPluginWorkerHandle(
       };
 
       const timer = setTimeout(() => {
+        // A timed-out config callback can still mutate private plugin state.
+        // Retire that process before allowing current config into a fresh one;
+        // the existing ready listener replays authoritative company rows.
+        if (method === "configChanged") retireWorkerProcess();
         settle(
           reject,
           new JsonRpcCallError({
