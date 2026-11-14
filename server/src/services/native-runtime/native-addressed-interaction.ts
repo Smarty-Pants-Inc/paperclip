@@ -4,6 +4,7 @@ import { isLowTrustQuarantined } from "../source-trust.js";
 import { authorizationService, type AuthorizationActor } from "../authorization.js";
 import { budgetServiceInTransaction } from "../budgets.js";
 import { evaluateIssueThreadInteractionResolverAudience } from "../issue-thread-interaction-resolution.js";
+import { getSameIssueDocumentConfirmationTargetRefusal, type SameIssueDocumentConfirmationTargetRefusal } from "../issue-thread-interactions.js";
 import { isIssueReviewVerdictInteraction, resolveIssueReviewRequester } from "../issue-review-policy.js";
 import { nativeRunKeyScope } from "./native-skill-test-scope.js";
 import { readNativeReviewAssignmentContext } from "./native-review-participant.js";
@@ -33,6 +34,7 @@ export type NativeAddressedInteractionRefusal = {
   audienceCode?: Extract<ReturnType<typeof evaluateIssueThreadInteractionResolverAudience>, { allowed: false }>["code"];
   status?: string;
   reviewRequesterKnown?: boolean;
+  targetReason?: SameIssueDocumentConfirmationTargetRefusal;
 };
 export type NativeAddressedInteractionGrantDecision =
   | { allowed: true; grant: NativeAddressedInteractionGrant }
@@ -64,7 +66,7 @@ async function getAddressedInteractionAuthority(db: Db, binding: NativeAddressed
   options: NativeAddressedInteractionGrantOptions = {}, requireNativeBinding = true): Promise<NativeAddressedInteractionGrantDecision> {
   let interactionId: string | null = null;
   const refuse = (reason: NativeAddressedInteractionRefusalReason,
-    details: Pick<NativeAddressedInteractionRefusal, "audienceCode" | "status" | "reviewRequesterKnown"> = {}): NativeAddressedInteractionGrantDecision =>
+    details: Pick<NativeAddressedInteractionRefusal, "audienceCode" | "status" | "reviewRequesterKnown" | "targetReason"> = {}): NativeAddressedInteractionGrantDecision =>
     ({ allowed: false, refusal: { reason, interactionId, ...details } });
   const [row] = await db.select({ run: {
     runtimeMode: heartbeatRuns.runtimeMode, nativeIssueId: heartbeatRuns.nativeIssueId, status: heartbeatRuns.status,
@@ -112,7 +114,14 @@ async function getAddressedInteractionAuthority(db: Db, binding: NativeAddressed
   }
   const payload = interaction.payload as unknown as Record<string, unknown> | null;
   if (!payload) return refuse("payload_missing");
-  if (payload.target != null) return refuse("target");
+  if (payload.target != null) {
+    const targetReason = await getSameIssueDocumentConfirmationTargetRefusal(db, {
+      companyId: binding.companyId, issueId: binding.issueId, target: payload.target,
+    });
+    if (targetReason && !(targetReason === "revision_changed"
+      && (interaction.status === "accepted" || interaction.status === "rejected")
+      && (options.phase === "settlement" || options.phase === "resolved"))) return refuse("target", { targetReason });
+  }
   if (payload.toolAction !== undefined) return refuse("tool_action");
   if (payload.secretProposal !== undefined) return refuse("secret_proposal");
   const phase = options.phase ?? "pending";

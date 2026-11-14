@@ -2772,6 +2772,20 @@ provider-failure note, not a later admission refusal. The note is neither approv
 nor an access grant, including for private or governed cards, and exposes no
 protected card payload.
 
+An addressed confirmation may reference an existing document on the same task
+and in the same company, but pending-card admission and decision require its exact
+current revision; explicit `settlement`/`resolved` phases ignore only
+`revision_changed` for an already-recorded accepted/rejected decision by the same
+agent and run, while identity, company, issue linkage, access, and governance
+remain checked.
+Missing, foreign-task, malformed, unsupported, and stale pending-card targets
+remain refused;
+the captured target reason guides inspection or replacement, not approval of
+unverified work. Target validity does not bypass resolver policy, addressee,
+privacy, run attribution, governed-action, or other permission checks, and does
+not grant task ownership or mutation tools beyond the card response. Generic
+provider-failure reporting retains its existing review-verdict exclusion.
+
 An open audience is not an uncapped one: when an agent run resolves an interaction
 on an issue other than its own source issue, the resolution is a cross-issue
 mutation and consumes the per-run cross-issue influence budget in

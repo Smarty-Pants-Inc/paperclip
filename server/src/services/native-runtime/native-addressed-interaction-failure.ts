@@ -5,6 +5,7 @@ import { persistActivity } from "../activity-log.js";
 import { canActorReadIssuePrivacy } from "../authorization.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { isIssueReviewVerdictInteraction } from "../issue-review-policy.js";
+import { getSameIssueDocumentConfirmationTargetRefusal } from "../issue-thread-interactions.js";
 import { agentLinkRow, keyValueRow, type NoticeMetadataRow } from "../recovery/notice-format.js";
 import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
 import { NativeAddressedInteractionAdmissionError, readNativeAddressedInteractionId,
@@ -52,10 +53,13 @@ async function readOrdinaryAddressedFailureIdentity(db: Db, binding: NativeAddre
     if (!await canActorReadIssuePrivacy(db, { type: "agent", companyId: binding.companyId, agentId: binding.agentId,
       runId: binding.runId, source: "agent_jwt", onBehalfOfUserId: row.run.responsibleUserId }, row.issue)) return null;
     if (payload?.toolAction !== undefined || payload?.secretProposal !== undefined) return null;
-    // Provider errors retain the original ordinary response-only classifier.
-    // Only a captured authority refusal may identify a denied kind/target/audience.
+    // Provider errors retain the ordinary response-only classifier, including
+    // only verified current same-issue document targets. This is identity, not authority.
     if (interaction.kind !== "request_confirmation" || interaction.addresseeAgentId !== binding.agentId
-      || interaction.addresseeUserId || !payload || payload.target != null) return null;
+      || interaction.addresseeUserId || !payload) return null;
+    if (payload.target != null && await getSameIssueDocumentConfirmationTargetRefusal(db, {
+      companyId: binding.companyId, issueId: binding.issueId, target: payload.target,
+    })) return null;
     if (row.issue.status === "in_review" && await isIssueReviewVerdictInteraction(db, { issue: row.issue, interaction })) return null;
   }
   return { interactionId, state: interaction.status };
@@ -89,7 +93,7 @@ const REFUSAL_COPY: Record<NativeAddressedInteractionRefusalReason, RefusalCopy>
   source_run_issue: { cause: "The card's creating run does not belong to this task.", action: "Have a person inspect the card's task and origin before replacing the request." },
   source_run_creator: { cause: "The card's creator does not match its creating run.", action: "Have a person inspect who created the card before deciding it or replacing the request." },
   payload_missing: { cause: "The card is missing the confirmation details needed for an agent response.", action: "Have a person inspect the card and replace the incomplete request if needed." },
-  target: { cause: "This card is linked to a document or another target that this agent response path does not support.", action: "Ask a person with access to inspect the linked item and answer through the card's normal controls, or replace the request. Do not treat a read receipt as approval of the linked work." },
+  target: { cause: "Paperclip could not verify this card's linked target for the response run.", action: "Ask a person with access to inspect the linked item and the card before deciding it or replacing the request. Do not treat a read receipt as approval of the linked work." },
   tool_action: { cause: "The card is bound to a governed tool action that needs independent authorization.", action: "Use the governed action's approval flow; this notice does not authorize the action." },
   secret_proposal: { cause: "The card is bound to a protected secret change that needs independent authorization.", action: "Use the secret change's approval flow; this notice does not authorize the change." },
   pending_in_resolved_phase: { cause: "The run expected a recorded decision, but the card has not been answered.", action: "Have an eligible person answer the card through its normal controls." },
@@ -116,6 +120,17 @@ const AUDIENCE_COPY: Partial<Record<NonNullable<NativeAddressedInteractionRefusa
 
 function refusalCopy(refusal: NativeAddressedInteractionRefusal): RefusalCopy {
   const copy = REFUSAL_COPY[refusal.reason] ?? UNKNOWN_REFUSAL;
+  if (refusal.reason === "target") {
+    const targetCopy: Record<NonNullable<NativeAddressedInteractionRefusal["targetReason"]>, RefusalCopy> = {
+      invalid: { cause: "The card's linked target is malformed and could not be verified.", action: "Have a person inspect the card and replace it with a correctly linked request if a response is still needed." },
+      unsupported: { cause: "This card uses a linked-target type that this agent response path does not support.", action: "Have a person with access inspect the linked item and use the card's normal controls, or replace the request." },
+      wrong_issue: { cause: "The card's linked document target names a different task.", action: "Have a person replace the request with a document target on this task; this response run cannot approve another task's document." },
+      unavailable: { cause: "The exact linked document or its current revision is unavailable on this task.", action: "Have a person inspect the document's current link and replace the request if the intended document is available; do not answer until the linked revision can be verified." },
+      revision_changed: { cause: "The card's linked document revision does not match the current revision.", action: "Have a person inspect the current document and replace the stale request before requesting a new response." },
+    };
+    return refusal.targetReason && Object.hasOwn(targetCopy, refusal.targetReason)
+      ? targetCopy[refusal.targetReason] : copy;
+  }
   if (refusal.reason === "agent_status") {
     const causes: Record<string, string> = {
       paused: "The responding agent is paused, so it cannot answer this card.",
