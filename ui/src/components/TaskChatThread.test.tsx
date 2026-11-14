@@ -31,6 +31,7 @@ import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import type { HeartbeatRun } from "@paperclipai/shared";
 import { waitForStoppedRuns } from "@/lib/wait-for-stopped-runs";
+import { findUIAdapter, registerUIAdapter, unregisterUIAdapter } from "@/adapters/registry";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -1194,6 +1195,89 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       }
     },
   );
+
+  it.each([
+    { adapterDisplay: "inline", override: null, expected: 2 },
+    { adapterDisplay: "fold", override: null, expected: 0 },
+    { adapterDisplay: "inline", override: "fold", expected: 0 },
+    { adapterDisplay: "fold", override: "inline", expected: 2 },
+    { adapterDisplay: undefined, override: null, expected: 0 },
+  ] as const)("uses adapter default $adapterDisplay with override $override", async ({ adapterDisplay, override, expected }) => {
+    const original = findUIAdapter("codex_local")!;
+    const testAdapterType = `test_reasoning_${adapterDisplay ?? "unset"}`;
+    registerUIAdapter({
+      ...original,
+      type: testAdapterType,
+      transcriptPresentation: adapterDisplay
+        ? { liveReasoningView: adapterDisplay }
+        : undefined,
+    });
+    try {
+      if (override) localStorage.setItem("paperclip:task-chat:reasoning-display:v1", override);
+      const liveRun = {
+        id: "adapter-default-run", runtimeMode: "legacy" as const, status: "running" as const,
+        invocationSource: "issue" as const, triggerDetail: null,
+        startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null,
+        createdAt: "2026-08-25T18:00:00.000Z", agentId: "agent-1", agentName: "Assistant",
+        adapterType: testAdapterType,
+      };
+      transcriptState.hydratedRunIds = new Set([liveRun.id]);
+      transcriptState.transcriptByRun.set(liveRun.id, [
+        { kind: "thinking", ts: "2026-08-25T18:00:01.000Z", itemId: "reasoning-1", text: "First adapter thought" },
+        { kind: "tool_call", ts: "2026-08-25T18:00:02.000Z", name: "Read", input: { path: "README.md" }, toolUseId: "read-1" },
+        { kind: "tool_result", ts: "2026-08-25T18:00:03.000Z", toolUseId: "read-1", content: "Private tool output" },
+        { kind: "thinking", ts: "2026-08-25T18:00:04.000Z", itemId: "reasoning-2", text: "Second adapter thought" },
+      ]);
+      render(<TaskChatThread issueId="issue-1" issueStatus="in_progress" comments={createLongThreadComments()}
+        onAdd={async () => {}} linkedRuns={[{ ...retryRun, runtimeMode: "legacy", adapterType: testAdapterType,
+          runId: liveRun.id, status: "running", startedAt: liveRun.startedAt }]}
+        activeRun={liveRun} liveRuns={[liveRun]} />);
+      await settleThreadLayout();
+      expect(container.querySelectorAll('[data-reasoning-display="inline"]')).toHaveLength(expected);
+      expect(container.textContent).not.toContain("Private tool output");
+      const mode = override ?? (expected > 0 ? "inline" : "fold");
+      expect(container.querySelector('[data-testid="task-chat-reasoning-display-toggle"]')?.textContent).toContain(
+        mode === "inline" ? "Inline" : "Folded",
+      );
+    } finally {
+      unregisterUIAdapter(testAdapterType);
+    }
+  });
+
+  it("applies the adapter's inline default to settled turns without a device preference", async () => {
+    const original = findUIAdapter("codex_local")!;
+    const adapterType = "custom_plugin";
+    const previous = findUIAdapter(adapterType);
+    registerUIAdapter({ ...original, type: adapterType, transcriptPresentation: { liveReasoningView: "inline" } });
+    try {
+      const runId = "settled-adapter-default";
+      transcriptState.hydratedRunIds = new Set([runId]);
+      nativeTranscriptState.hydratedRunIds = new Set([runId]);
+      transcriptState.transcriptByRun.set(runId, [
+        { kind: "thinking", ts: "2026-08-25T18:00:01.000Z", text: "Settled adapter thought one" },
+        { kind: "tool_call", ts: "2026-08-25T18:00:02.000Z", name: "Read", input: { path: "README.md" }, toolUseId: "read-1" },
+        { kind: "tool_result", ts: "2026-08-25T18:00:03.000Z", toolUseId: "read-1", content: "Private tool output" },
+        { kind: "thinking", ts: "2026-08-25T18:00:04.000Z", text: "Settled adapter thought two" },
+      ]);
+      const comments = createLongThreadComments();
+      const answer = {
+        ...comments[3]!, id: "settled-adapter-answer", authorType: "agent" as const,
+        authorAgentId: "agent-1", body: "Saved adapter reply", runId,
+        createdAt: new Date("2026-08-25T18:00:05.000Z"),
+      };
+      render(<TaskChatThread issueId="issue-1" issueStatus="in_progress" comments={[...comments, answer]}
+        onAdd={async () => {}} linkedRuns={[{ ...retryRun, runtimeMode: "legacy", adapterType, runId,
+          status: "succeeded", startedAt: "2026-08-25T18:00:00.000Z", finishedAt: "2026-08-25T18:00:06.000Z" }]} />);
+      await settleThreadLayout();
+      expect(container.querySelectorAll('[data-reasoning-display="inline"]')).toHaveLength(2);
+      expect(container.querySelector(".tc-turn-fold")).toBeNull();
+      expect(container.textContent).toContain("Saved adapter reply");
+      expect(container.textContent).not.toContain("Private tool output");
+    } finally {
+      unregisterUIAdapter(adapterType);
+      if (previous) registerUIAdapter(previous);
+    }
+  });
 
   it.each(["fold", "inline"] as const)("shows %s reasoning in the live phase", async (display) => {
     if (display === "inline") localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "inline");
