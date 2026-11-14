@@ -168,6 +168,10 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
     const hasRemoteAllocation = leases.some(lease => lease.heartbeatRunId === owner.id
       && lease.provider && lease.provider !== "local" && lease.providerLeaseId);
     if (hasRemoteAllocation) continue;
+    // Location comes from durable target evidence before any local read: a
+    // profile bound to a remote workspace ran on that allocation, so with its
+    // lease row missing only allocation-bound evidence could prove it gone.
+    if (owner.runnerProfileJson?.remoteWorkspace != null) { gone = false; unavailable = true; continue; }
     if (owner.processPid !== null || owner.processGroupId !== null) {
       const proof = await proveRunProcessGone(owner, owner.id);
       if (proof?.verdict !== "gone") gone = false;
