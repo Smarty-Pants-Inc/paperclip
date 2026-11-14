@@ -847,8 +847,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
  * read AS OF then from durable timestamps (RFL m15b B1): a run or wake created
  * later did not exist; one that ended later was still live (running if it had
  * started, queued if not); a wake that failed later had not failed; a wait T0,
- * a native-repair deferral or a hold recorded later had not been recorded;
- * and a native finalization updated later is read as still pending.
+ * a native-repair deferral or a hold recorded later had not been recorded. A
+ * run that had ended keeps its finalization phase: its terminal moment is the
+ * run's finished_at, never a row's updated_at (RFL B1 F1). The agent's pause
+ * is read as it is now: Paperclip keeps no durable pause/resume history (RFL
+ * B1 F2, filed as a follow-up).
  */
 async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: string; createdAt: Date }, now: Date,
   nativeBlockedRepairApplies?: NativeBlockedRepairApplies, asOf = false): Promise<Decision> {
@@ -1106,11 +1109,14 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
     }
-    const [recorded] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
-      updatedAt: nativeRunFinalizations.updatedAt })
+    // As of a past instant this run had already ENDED (asOfRun): its terminal
+    // moment is the run's own finished_at, which the finalizer sets with the
+    // terminal verdict (native-run-finalizer.ts terminalFinalizationRunPatch).
+    // The finalization row's updated_at is NOT a phase-transition time (lease
+    // and history maintenance touch it, RFL B1 F1), so the phase is read as it
+    // is; a scheduled resume keeps its durable nextAttemptAt.
+    const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id)));
-    // As of a past instant, a finalization that changed later is read as still pending then.
-    const coordinator = recorded && asOf && recorded.updatedAt > now ? { ...recorded, phase: NATIVE_PENDING_PHASES[0]! } : recorded;
     if (coordinator && !boardHold) {
       if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) {
         const wait = await bounded(now.getTime() + 30_000);
