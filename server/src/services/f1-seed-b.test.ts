@@ -60,7 +60,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); if (root) await rm(root, { recursive: true, force: true }); });
 
   it.each(["idle-release", "receipt-window-end", "released-no-receipt", "expired-no-receipt", "retained-age-stop", "observed-owner", "observed-proof-arrives", "proof-arrives", "running", "stopping", "unknown", "other-lease", "tl07-idle", "tl07-running"] as const)(
-    "%s: immutable receipt, one current note, no impossible run; proof wakes the saved message", async shape => {
+    "%s: stop-safe recovery; TL07 idle answers without a waiting note", async shape => {
     const t0 = Date.now();
     const tl07 = shape.startsWith("tl07-");
     const liveTurn = shape === "tl07-running";
@@ -191,6 +191,13 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       expect(stoppedLease.metadata).not.toHaveProperty("sandboxStopAndRetainReceipt");
       expect((stoppedLease.metadata?.pendingCleanupController as { bootId?: string } | undefined)?.bootId).not.toBe("stale-boot");
     }
+    if (shape === "tl07-idle") {
+      // RFL ruling 20:21Z: an idle instruction refresh must close successfully
+      // and answer from history, without first posting a stop-waiting note.
+      expect(await notes()).toHaveLength(0);
+      const [closedIdleLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      expect(hasBoundRemoteStopReceipt(closedIdleLease)).toBe(true);
+    }
     // Occupy the agent slot so real delivery/admission leaves its automatically
     // admitted run observable as queued. No test mints a successor run or resends
     // input. Then exercise that run's real selection/executor with a native peer.
@@ -221,9 +228,14 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     expect(JSON.stringify(answer.prompts)).toContain("What word did I ask you to remember?");
     for (let n = 4; n < 7; n++) { await settleUnrecoverableExecutions(db); await deliverReconciledExecutions(db, hb.wakeup); }
     expect(await runCount()).toBe(3);
-    expect(await current()).toHaveLength(1);
-    expect((await current())[0].body).toContain("fresh thread");
-    expect(await notes()).toHaveLength(proofLands || endedWithoutReceipt ? 2 : 1);
+    if (shape === "tl07-idle") {
+      expect(await current()).toHaveLength(0);
+      expect(await notes()).toHaveLength(0);
+    } else {
+      expect(await current()).toHaveLength(1);
+      expect((await current())[0].body).toContain("fresh thread");
+      expect(await notes()).toHaveLength(proofLands || endedWithoutReceipt ? 2 : 1);
+    }
     if (inspectedStop) expect(Date.now() - t0).toBeLessThanOrEqual(60_000);
     if (observedOwner) expect(await readRun(old.id)).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
   }, 60_000);
