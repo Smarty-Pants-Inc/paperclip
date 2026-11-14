@@ -11213,54 +11213,17 @@ export function issueRoutes(
         if (sourceRefusal) {
           const refusal = await recoveryActionsSvc.recordTaskRetrySourceRefusal(sourceRefusal);
           if (refusal) {
-            const [currentRun] = await db.select().from(heartbeatRuns).where(and(
-              eq(heartbeatRuns.companyId, sourceRefusal.companyId),
-              eq(heartbeatRuns.id, sourceRefusal.currentRunId),
-            )).limit(1);
-            const [currentIssue] = await db.select().from(issueRows).where(and(
-              eq(issueRows.companyId, sourceRefusal.companyId),
-              eq(issueRows.id, sourceRefusal.sourceIssueId),
-            )).limit(1);
-            if (currentRun && currentIssue) {
-              let currentCard = await recoveryActionsSvc.getActiveForIssue(
-                sourceRefusal.companyId,
-                sourceRefusal.sourceIssueId,
-              );
-              let activeEvidence = parseObject(currentCard?.evidence);
-              if (activeEvidence.latestRunId !== sourceRefusal.currentRunId) {
-                const previousStatus = activeEvidence.previousStatus === "todo" ||
-                  activeEvidence.previousStatus === "in_review"
-                  ? activeEvidence.previousStatus
-                  : "in_progress";
-                // The existing recovery owner evaluates the receipt's current
-                // run now, refreshing this task's card to a usable current-source
-                // recovery card instead of leaving its stale Retry instruction.
-                await recoveryService(db, { enqueueWakeup: heartbeat.wakeup })
-                  .escalateStrandedAssignedIssue({
-                    issue: currentIssue,
-                    previousStatus,
-                    latestRun: currentRun,
-                    ...(currentCard ? { attemptCount: currentCard.attemptCount } : {}),
-                  });
-                currentCard = await recoveryActionsSvc.getActiveForIssue(
-                  sourceRefusal.companyId,
-                  sourceRefusal.sourceIssueId,
-                );
-                activeEvidence = parseObject(currentCard?.evidence);
-              }
-              if (currentCard && activeEvidence.latestRunId === sourceRefusal.currentRunId) {
-                await recoveryActionsSvc.attachTaskRetrySourceRefusal({
-                  companyId: sourceRefusal.companyId,
-                  sourceIssueId: sourceRefusal.sourceIssueId,
-                  recoveryActionId: currentCard.id,
-                  currentRunId: sourceRefusal.currentRunId,
-                  refusal: {
-                    ...(refusal as Record<string, unknown>),
-                    nextAction: "The latest run's recovery card is shown on this task. Use its current recovery outcome; the older run cannot be retried.",
-                  },
-                });
-              }
-            }
+            // A stale-card refusal may refresh only the existing action's
+            // current-run evidence. Full escalation also changes task status,
+            // publishes a notice, and may schedule provider-quota recovery.
+            await recoveryService(db, { enqueueWakeup: heartbeat.wakeup })
+              .refreshStrandedAssignedIssueRecoveryProjection({
+              companyId: sourceRefusal.companyId,
+              issueId: sourceRefusal.sourceIssueId,
+              recoveryActionId: sourceRefusal.recoveryActionId,
+              sourceRunId: sourceRefusal.sourceRunId,
+              currentRunId: sourceRefusal.currentRunId,
+            });
           }
         }
         throw error;
