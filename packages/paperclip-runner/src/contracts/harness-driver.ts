@@ -516,6 +516,9 @@ export const PROVIDER_STATE_INCOMPATIBLE = "provider_state_incompatible";
  * protected launch argument or the durable provider profile would change).
  * The refusal leaves the saved state unchanged and repeats on every retry. */
 export const PROVIDER_ATTACH_REFUSED = "provider_attach_refused";
+/** Runner-owned launch-profile drift diagnostic. The refusal channel carries
+ * this code independently of the existing recovery/replacement policy. */
+export const PROVIDER_LAUNCH_PROFILE_MISMATCH = "provider_launch_profile_mismatch";
 /** The saved session still owns a side-effecting call without a recorded
  * result. Replacing the session could repeat or lose that external action. */
 export const PROVIDER_SIDE_EFFECT_PENDING = "provider_side_effect_pending";
@@ -574,8 +577,34 @@ export interface HarnessSessionRecoveryResult {
   runnerExitConfirmed?: true;
 }
 
-/** Reads the closed class of an authenticated runner command failure, or of a
- * typed source-reconciliation refusal. Never derived from message text. */
+/** The additive prepare/attach channel. Unknown and old no-code receipts map
+ * to one generic code; diagnostics and serialized English are never authority.
+ * This reader does not change the existing recovery-class policy. */
+export const RUNNER_PREPARE_REFUSAL_CODES = [
+  "provider_active_turn", "provider_live_descendants", "provider_active_goal",
+  "provider_config_changed", "provider_contract_changed_same_run",
+  "provider_launch_profile_mismatch", "provider_session_closed",
+  "provider_reconciliation_required", "provider_pending_tool_calls",
+  "provider_prepare_refused",
+] as const;
+export type RunnerPrepareRefusalCode = typeof RUNNER_PREPARE_REFUSAL_CODES[number];
+export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepareRefusalCode | undefined {
+  if (!error || typeof error !== "object" || depth > 5) return undefined;
+  const value = error as Record<string, unknown>;
+  const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
+    ? v as Record<string, unknown> : {};
+  const receipt = record(value.runnerCommandResult);
+  const detail = record(receipt.result);
+  if (["run.attach", "run.prepare"].includes(String(receipt.commandType)) && receipt.status === "failed"
+    && detail.code === "command_execution_failed") {
+    return (RUNNER_PREPARE_REFUSAL_CODES as readonly unknown[]).includes(detail.refusalCode)
+      ? detail.refusalCode as RunnerPrepareRefusalCode : "provider_prepare_refused";
+  }
+  return runnerPrepareRefusalCode(value.cause, depth + 1);
+}
+
+/** Existing recovery classification is deliberately unchanged by the additive
+ * refusal channel. In particular old receipts still reach replacement policy. */
 export function runnerRecoveryFailureClass(
   error: unknown,
   depth = 0,

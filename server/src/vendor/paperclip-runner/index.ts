@@ -156,6 +156,11 @@ export const createRunnerdCodexTransport: (
   options?: import("@paperclipai/paperclip-runner").RunnerdCodexTransportOptions,
 ) => import("@paperclipai/paperclip-runner").RunnerdCodexTransport =
   runner.createRunnerdCodexTransport;
+// Runner-owned normalized refusal boundary; core must not parse provider prose.
+export const runnerRecoveryFailureClass = runner.runnerRecoveryFailureClass;
+export const runnerPrepareRefusalCode = runner.runnerPrepareRefusalCode;
+export const PROVIDER_LAUNCH_PROFILE_MISMATCH = runner.PROVIDER_LAUNCH_PROFILE_MISMATCH;
+
 export const defaultCapabilityRunnerdBinary =
   runner.defaultCapabilityRunnerdBinary;
 export const defaultCapabilityRunnerdBinaryAsync =
