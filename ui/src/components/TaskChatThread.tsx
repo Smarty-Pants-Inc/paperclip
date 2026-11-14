@@ -2205,7 +2205,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
           rest: partitionRunHealthItems(timelineItemsBySegment[segmentIndex] ?? []).rest,
         };
-        const children = settledRunChildren(runHealth.rest);
+        const children = settledRunChildren(runHealth.rest, reasoningDisplay);
         // A compaction-only run is fully shown by its divider.
         if (children.length === 0 && !finalResponse && (!sourceIsPaperclipRunner || compactionMarkers.length > 0)) {
           if (compactionMarkers.length > 0) settledRunIds.add(source.id);
@@ -2245,7 +2245,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               agentIcon: meta?.agentId
               ? agentMap?.get(meta.agentId)?.icon
               : undefined,
-            standaloneHeader: sourceIsPaperclipRunner,
+            // Inline reasoning must not be hidden inside the legacy turn's
+            // outer Activity disclosure after it settles or is reloaded.
+            standaloneHeader: sourceIsPaperclipRunner || reasoningDisplay === "inline",
             continuedAfterSteering: sourceIsPaperclipRunner && segmentIndex > 0,
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
@@ -2309,7 +2311,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               ? paperclipRunnerTimelineItems(parsed)
               : parsed,
           );
-          const children = settledRunChildren(runHealth.rest);
+          const children = settledRunChildren(runHealth.rest, reasoningDisplay);
           if (children.length === 0 && runHealth.failures.length === 0) continue;
           const turnId = `${liveRun.id}:turn:${segmentIndex}`;
           const segmentDurationMs =
@@ -2342,7 +2344,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               agentIcon: liveRun.agentId
                 ? agentMap?.get(liveRun.agentId)?.icon
                 : undefined,
-              standaloneHeader: isNativePaperclipRunnerRun(liveRun),
+              standaloneHeader:
+                isNativePaperclipRunnerRun(liveRun) || reasoningDisplay === "inline",
               continuedAfterSteering:
                 isNativePaperclipRunnerRun(liveRun) && segmentIndex > 0,
               items: children,

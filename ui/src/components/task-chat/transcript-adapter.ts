@@ -2060,10 +2060,12 @@ function subagentsFromDelegation(
 export type ReasoningDisplay = "fold" | "inline";
 export const REASONING_DISPLAY_STORAGE_KEY = "paperclip:task-chat:reasoning-display:v1";
 
-export function readReasoningDisplay(): ReasoningDisplay {
-  if (typeof window === "undefined") return "fold";
+export function readReasoningDisplay(defaultDisplay: ReasoningDisplay = "fold"): ReasoningDisplay {
+  if (typeof window === "undefined") return defaultDisplay;
   try {
-    return window.localStorage.getItem(REASONING_DISPLAY_STORAGE_KEY) === "inline" ? "inline" : "fold";
+    const stored = window.localStorage.getItem(REASONING_DISPLAY_STORAGE_KEY);
+    if (stored === "inline" || stored === "fold") return stored;
+    return defaultDisplay;
   } catch {
     return "fold";
   }

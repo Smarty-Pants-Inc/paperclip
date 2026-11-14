@@ -1126,6 +1126,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   it.each(["running", "succeeded"])(
     "reveals durable comments together with a %s run's initial history",
     async (status) => {
+      localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "inline");
       const props = {
         issueId: "issue-1",
         comments: [...createLongThreadComments(), {
@@ -1148,7 +1149,10 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
           },
         ],
       };
-      render(<TaskChatThread {...props} />);
+      const initialProps = status === "succeeded"
+        ? { ...props, linkedRuns: props.linkedRuns.map((run) => run.runId === "started-run" ? { ...run, status: "running" } : run) }
+        : props;
+      render(<TaskChatThread {...initialProps} />);
       expect(container.querySelector('[aria-busy="true"]')).not.toBeNull();
       expect(
         container.querySelector('[data-testid="task-chat-history-loading"]'),
@@ -1165,7 +1169,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
         kind: "assistant", text: "Reasoning before the reply", channel: "progress",
         ts: "2026-08-25T18:00:01.000Z",
       }]);
-      render(<TaskChatThread {...props} />);
+      render(<TaskChatThread {...initialProps} />);
       await settleThreadLayout();
 
       expect(container.querySelector('[aria-busy="false"]')).not.toBeNull();
@@ -1174,8 +1178,15 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       ).toBeNull();
       expect(container.querySelector('[data-thread-anchor="comment-1"]')?.closest('[inert]')).toBeNull();
       expect(container.textContent).toContain("Thread message 1");
-      if (status === "succeeded" && runtimeMode === "native") {
+      if (status === "succeeded") {
+        const settledProps = props;
+        render(<TaskChatThread {...settledProps} />);
         expect(container.textContent).toContain("Reasoning before the reply");
+        flushSync(() => root!.unmount());
+        root = createRoot(container);
+        render(<TaskChatThread {...settledProps} />);
+        expect(container.textContent).toContain("Reasoning before the reply");
+        expect(container.querySelector(".tc-turn-fold")).toBeNull();
         expect(container.textContent).toContain("Final saved reply");
         expect(container.textContent!.indexOf("Reasoning before the reply")).toBeLessThan(
           container.textContent!.indexOf("Final saved reply"),
