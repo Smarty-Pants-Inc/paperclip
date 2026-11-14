@@ -2776,7 +2776,13 @@ concurrent handling, and restarts do not repeat the same reason; a different
 reason gets its own note. Legacy per-run provider-failure notes suppress only
 another generic provider-failure note, not a later admission refusal. The note is neither approval
 nor an access grant, including for private or governed cards, and exposes no
-protected card payload.
+protected card payload. A later authorized acceptance of that same confirmation
+marks its still-current failure notes with `metadata.supersededByInteractionId`
+pointing to the accepted card, in the locked acceptance transaction. Their bodies,
+presentation, and prior metadata remain readable as history; no new comment is
+posted. This depends on the shared metadata schema and current-note helper
+recognizing both `supersededBy` and `supersededByInteractionId`; it does not by
+itself change notice rendering.
 
 An addressed confirmation may reference an existing document on the same task
 and in the same company, but pending-card admission and decision require its exact

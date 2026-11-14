@@ -132,6 +132,7 @@ import {
 } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
+import { supersedeNativeAddressedInteractionFailureNotices } from "./native-runtime/native-addressed-interaction-supersession.js";
 import {
   assertIssueReviewVerdictActorAllowed,
   isIssueReviewVerdictInteraction,
@@ -2648,6 +2649,9 @@ export function issueThreadInteractionService(
         );
       }
 
+      if (updated.kind === "request_confirmation") {
+        await supersedeNativeAddressedInteractionFailureNotices(tx, updated);
+      }
       const acceptedInteraction = hydrateInteraction(updated);
       await args.mutationOptions?.afterResolveInTransaction?.(
         tx,
