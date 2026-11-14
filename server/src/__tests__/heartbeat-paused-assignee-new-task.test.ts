@@ -13,6 +13,7 @@ import { createLifecycleWorker } from "../modules/agent-lifecycle/application/wo
 import { issueService } from "../services/issues.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { noticeParkedAssignment } from "../services/recovery/unanswered-person-message.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
 const describePostgres = recoveryPostgresSupport.supported ? describe : describe.skip;
@@ -119,6 +120,21 @@ describePostgres("new task for a manually paused assignee", () => {
     console.log("PARKED_ASSIGNMENT_ONCE", JSON.stringify({ issueId: f.issueId, agentId: f.agentId,
       issueStatus: waiting.status, lifecycleState: agent.lifecycleState, comments, runCount: 0 }));
   }, 180_000);
+
+  it.each(["ready", "reassigned", "done", "other-company"] as const)(
+    "does not publish a stale parked-assignment note after %s", async change => {
+      const f = await seed([]);
+      await db.update(agents).set({ lifecycleState: "pausing",
+        lifecycleOperation: { id: randomUUID(), attempts: 5, stopFailures: 5, retryRequired: true,
+          hostComplete: false, completedPluginIds: [] } })
+        .where(eq(agents.id, f.agentId));
+      if (change === "ready") await db.update(agents).set({ status: "idle", lifecycleState: "ready" })
+        .where(eq(agents.id, f.agentId));
+      if (change === "reassigned") await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, f.issueId));
+      if (change === "done") await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      await noticeParkedAssignment(db, { ...f, companyId: change === "other-company" ? randomUUID() : f.companyId });
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+    }, 180_000);
 
   // Keep reason: SMAA-1873. The real pause/resume command removes the hold
   // before Stop settles; the recovery sweep must not escalate that admission wait.

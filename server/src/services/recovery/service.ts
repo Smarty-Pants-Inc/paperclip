@@ -1,4 +1,5 @@
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
+import { noticeParkedAssignment } from "./unanswered-person-message.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { OWNER_UNPROVABLE_CAUSE } from "./owner-gone-attestation.js";
@@ -4992,6 +4993,12 @@ export function recoveryService(
       }
 
       const agent = await getAgent(agentId);
+      if (agent?.companyId === issue.companyId && agent.lifecycleState === "pausing"
+        && agent.lifecycleOperation?.retryRequired === true) {
+        await noticeParkedAssignment(db, { companyId: issue.companyId, issueId: issue.id, agentId });
+        result.skipped += 1;
+        continue;
+      }
       // Resume can remove the last hold before an in-flight Pause finishes.
       // Its compatibility status stays paused until Stop settles and startup
       // completes. Like setup/resuming, this is an admission wait, not a lost

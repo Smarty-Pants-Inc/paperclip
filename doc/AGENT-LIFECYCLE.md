@@ -383,6 +383,18 @@ Stop budget. A successful stop then completes through the ordinary state path.
 A Retry racing an active attempt is retained; that old result cannot park over it.
 Claims deferred before external work do not consume a Stop attempt.
 
+Assigning a task does not clear a parked Stop. Stranded-task recovery leaves the
+assignment in place and posts one system notice per task and saved Stop operation,
+even when the task has no person comment. The notice explains that stopping is
+paused, asks the operator to check the outstanding stop or cleanup and use Retry,
+and says the task will be reconsidered when the agent is ready. The writer
+rechecks the same-company assignee and parked operation under the lifecycle and
+task fences, so racing recovery owners do not duplicate the notice. The existing
+deferred-eligibility event also wakes assignment recovery: task creation and a
+later lifecycle readiness change reconsider assignments even when wake admission
+refused before it could save a wake receipt. Normal admission still enforces
+pause holds, budgets, and ownership; the notice does not start or resume an agent.
+
 Each result must match the current revision and lease owner.
 Shutdown waits for active work.
 

@@ -61,6 +61,10 @@ export async function notifyDeferredExecutionEligibility(tx: object, scope?: { c
   if (pending[0]?.pendingPreparationContinuation === true)
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.workspaceRecovery, scope ? JSON.stringify({ companyId: scope.companyId }) : "*");
   await notifyDeliveryWork(tx, DELIVERY_QUEUES.nativeProcessSessions, scope ? JSON.stringify({ companyId: scope.companyId }) : "*");
+  // A never-run assignment can have no wake receipt: admission refused while
+  // its assignee was stopping. The same eligibility event must reconsider it
+  // through the existing issue recovery owner, not wait for a periodic sweep.
+  await notifyDeliveryWork(tx, DELIVERY_QUEUES.strandedAssignments, scope ? JSON.stringify({ companyId: scope.companyId }) : "*");
   if (scope) {
     await notifyDeferredExecutionWork(tx, scope);
     await notifyNativeStatusWakeWork(tx, scope);

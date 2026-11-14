@@ -298,6 +298,48 @@ function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
   return value.issueId === issueId || nested.issueId === issueId || value.taskId === issueId;
 }
 
+/** An assignment is itself a person's request, even without a comment. Keep
+ * this explanation in the existing recovery notice owner; neither assignment
+ * nor a notice is permission to clear Stop proof. One note per saved operation,
+ * serialized across recovery owners and rechecked against reassignment/resume. */
+export async function noticeParkedAssignment(
+  db: Db, input: { companyId: string; issueId: string; agentId: string },
+): Promise<void> {
+  await db.transaction(async tx => {
+    // Lifecycle owns the agent writer. Read-lock it before the issue fence so a
+    // concurrent Retry/resume cannot commit between the state check and note.
+    const [agent] = await tx.select({ name: agents.name, lifecycleState: agents.lifecycleState,
+      lifecycleOperation: agents.lifecycleOperation, lifecycleVersion: agents.lifecycleVersion })
+      .from(agents).where(and(eq(agents.companyId, input.companyId), eq(agents.id, input.agentId))).for("share");
+    if (agent?.lifecycleState !== "pausing" || agent.lifecycleOperation?.retryRequired !== true) return;
+    const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
+      eq(issues.companyId, input.companyId), eq(issues.id, input.issueId),
+      eq(issues.assigneeAgentId, input.agentId), isNull(issues.assigneeUserId), isNull(issues.hiddenAt),
+      inArray(issues.status, ["todo", "in_progress"]))).for("no key update");
+    if (!issue) return;
+    const reason = `parked_assignment:${input.agentId}:${agent.lifecycleOperation.id ?? agent.lifecycleVersion}`;
+    const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${reason}`)).limit(1);
+    if (existing) return;
+    const name = agent.name.trim() || "The assigned agent";
+    const notice = buildStrandedRecoveryEscalationNotice({
+      seed: { title: `${name} is stopping`, tone: "warning",
+        body: `${name} is stopping and can't take this task yet. Automatic stop work is paused. `
+          + `A board user or ${name}'s manager must check the outstanding stop or cleanup, then use Retry on the agent. `
+          + "Paperclip will reconsider this task when the agent is ready.",
+        nextAction: "Check the outstanding stop or cleanup, then use Retry on the agent. Resume it if a pause hold remains." },
+      recoveryActionId: null, recoveryOwner: null, recoveryResponsibility: "user", sourceRun: null,
+      failureCode: "agent_stop_parked",
+    });
+    await issueService(tx as unknown as Db).addComment(issue.id, notice.body, {}, {
+      authorType: "system", presentation: notice.presentation,
+      metadata: { ...notice.metadata, authorizationReason: reason },
+    }, tx);
+  });
+}
+
 /** One task: answer, supersede or notice its person's last message. Idempotent. */
 /** The recovery service's own native blocked-request repair check (it publishes
  * the run's unblock request itself when it applies). */

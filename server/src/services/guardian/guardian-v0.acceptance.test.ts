@@ -839,6 +839,7 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
   }, 120_000);
 
   it("case 8b / parked Stop: one true host note, no silent assignment; Retry and resume start it once", async () => {
+    await runtime.startAssignmentRecovery();
     const suffix = randomUUID().slice(0, 8);
     const [company] = await db.insert(companies).values({ name: `Guardian default judge ${suffix}`,
       issuePrefix: `D${suffix}`, defaultResponsibleUserId: "local-board",
@@ -936,8 +937,9 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     await runtime.api(`/agents/${agent.id}/lifecycle/retry`, {});
     await runtime.api(`/agents/${agent.id}/resume`, {});
     const resumed = await runtime.waitFor("saved assignment starts after Retry/resume", async () => snapshot(f, "case8b-resumed", Date.now() - started),
-      value => value.runs.some(run => run.startedAt !== null), 30_000);
+      value => value.runs.some(run => run.startedAt !== null && run.status === "succeeded"), 30_000);
     expect(resumed.agent.lifecycleState).toBe("ready");
+    expect(resumed.runs[0]).toMatchObject({ status: "succeeded", exitCode: 0 });
     expect(resumed.runs.filter(run => run.nativeIssueId === issue.id || run.contextSnapshot?.issueId === issue.id)).toHaveLength(1);
     expect((await notes(f, "case 8b / after resume")).map(note => note.id)).toEqual([rows[0].id]);
   }, 210_000 + EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);

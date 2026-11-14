@@ -10,6 +10,7 @@ import { promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
 import type { IssueComment, PluginJobRecord, PluginJobRunRecord, PluginRecord } from "@paperclipai/shared";
 import { createApp } from "../../app.js";
+import { heartbeatService } from "../../services/heartbeat.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
 import { createStorageService } from "../../storage/service.js";
 
@@ -50,6 +51,7 @@ export async function startRealPluginLoader(db: Db) {
   if (!address || typeof address === "string") throw new Error("No guardian test listener");
   const baseUrl = `http://127.0.0.1:${address.port}`;
   const installed = new Set<string>();
+  let assignmentRecovery: ReturnType<ReturnType<typeof heartbeatService>["registerIssueStateRecoveryWork"]> | undefined;
 
   async function api<T>(route: string, body?: unknown, method = body === undefined ? "GET" : "POST",
     headers: Record<string, string> = {}): Promise<T> {
@@ -149,6 +151,13 @@ export async function startRealPluginLoader(db: Db) {
 
   return {
     api, install, setCompanyConfig, runJob, triggerJob, waitForJob, jobRuns, jobRunEvidence, waitFor, restartWorker, baseUrl,
+    async startAssignmentRecovery() {
+      // createApp starts lifecycle/plugin workers, but index.ts:1877–1882 owns
+      // registration of issue recovery. Use that SAME production owner here;
+      // no test sweep, fake scheduler, or direct readiness mutation.
+      assignmentRecovery ??= heartbeatService(db).registerIssueStateRecoveryWork(app.locals.deliveryWork, () => true);
+      await assignmentRecovery.ready;
+    },
     comments: (issueId: string) => api<IssueComment[]>(`/issues/${issueId}/comments`),
     dashboard: (pluginId: string) => api<Dashboard>(`/plugins/${pluginId}/dashboard`),
     async close() {
@@ -160,7 +169,11 @@ export async function startRealPluginLoader(db: Db) {
           if (plugin.status === "ready") await api(`/plugins/${pluginId}/disable`, {});
         }
       } finally {
-        try { await app.locals.paperclipShutdown(); }
+        try {
+          await assignmentRecovery?.stop();
+          await heartbeatService(db).drainActiveRunExecutions();
+          await app.locals.paperclipShutdown();
+        }
         finally {
           server.closeAllConnections();
           await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
