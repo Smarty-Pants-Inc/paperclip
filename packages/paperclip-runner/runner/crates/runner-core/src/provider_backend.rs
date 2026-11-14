@@ -1,12 +1,12 @@
 use std::collections::{HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2339,7 +2339,10 @@ impl CodexCommandExecutor {
         // not a provider refusal. Use the existing close path and commit its
         // session.closed receipt with run.prepare before session.open can start.
         // If close cannot be confirmed, retain the strict D10 refresh refusal.
-        let close = match self.close_session() {
+        let close = match self
+            .retain_superseded_checkpoint()
+            .and_then(|()| self.close_session())
+        {
             Ok(close) => close,
             Err(_) => {
                 let prepare_refusal_code = if goal {
@@ -2489,6 +2492,52 @@ impl CodexCommandExecutor {
 
     fn state_path(&self) -> PathBuf {
         self.state_dir.join(CODEX_PROVIDER_STATE_FILE)
+    }
+
+    /// Retain the exact persisted predecessor checkpoint before close_session
+    /// rewrites the canonical state path with its closed receipt. The archived
+    /// file stays beside the active checkpoint in the same private owned tree.
+    fn retain_superseded_checkpoint(&self) -> Result<(), DurableRunnerError> {
+        verify_private_directory(&self.state_dir)?;
+        let mut source = open_private_regular_file(&self.state_path()).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to read superseded Codex provider checkpoint: {error}"
+            ))
+        })?;
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to read superseded Codex provider checkpoint: {error}"
+            ))
+        })?;
+        let retained_path = self.state_dir.join(format!(
+            "{CODEX_PROVIDER_STATE_FILE}.retained-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut retained = options.open(&retained_path).map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to create retained Codex provider checkpoint: {error}"
+            ))
+        })?;
+        let saved = (|| -> std::io::Result<()> {
+            retained.write_all(&bytes)?;
+            retained.sync_all()?;
+            drop(retained);
+            #[cfg(unix)]
+            File::open(&self.state_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = saved {
+            let _ = fs::remove_file(&retained_path);
+            return Err(DurableRunnerError::invalid(format!(
+                "failed to retain superseded Codex provider checkpoint: {error}"
+            )));
+        }
+        Ok(())
     }
 
     fn assert_startup_admitted(&self) -> Result<(), DurableRunnerError> {
