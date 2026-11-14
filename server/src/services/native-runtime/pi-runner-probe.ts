@@ -41,7 +41,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     if (target?.kind !== "remote" || target.transport === "sandbox" && target.runnerTask) throw new Error("Native Pi setup requires a remote command factory");
     const runner = target.transport === "ssh" ? createNativeSshCommandRunner({ spec: target.spec, defaultCwd: target.remoteCwd }) : target.runner;
     if (!runner) throw new Error("The selected factory has no process runner");
-    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
+    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget, createRemoteNativeArtifactPreparation, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
     const source = resolveRemoteProviderPackSource(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH);
     // Validate native entries before staging or acquiring an inference authority.
     nativePiRemoteLaunchOptions("/unused", source.manifest, "/unused");
@@ -61,12 +61,15 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       const remoteBinary = posix.join(remoteRoot, "bin", "paperclip-runnerd");
       let cleanupTransferred = false, remoteCreated = false, prepared = false;
       let pack: Awaited<ReturnType<typeof prepareRemoteProviderPackOnTarget>> | undefined;
-      const prepareRemote = async () => {
+      const prepareRemote = async (requiredMode: "listen_ws" | "dial_wss") => {
         if (prepared) return;
         requireSuccess(await runner!.execute({ command: "mkdir", args: ["-p", "-m", "700", "--", remoteRoot, remoteFilesystemRoot], bypassSession: true, timeoutMs: 10_000 }));
         remoteCreated = true;
         pack = await prepareRemoteProviderPackOnTarget({ target: target!, runner: runner!, configuredProviderPackRoot: source.configuredRoot, manifest: source.manifest });
-        await stageRemoteRunnerFile({ target: target!, runner: runner!, sourcePath: runnerBinary, targetPath: remoteBinary, mode: 0o700 });
+        await createRemoteNativeArtifactPreparation({ target: target!, runner: runner!, remoteBinary,
+          controllerRunnerBinary: runnerBinary, remoteRuntimeRoot: remoteRoot,
+          runnerRemoteBinaryPath: process.env.PAPERCLIP_RUNNER_REMOTE_BINARY_PATH,
+          targetPlatformArtifactVerified: true }).prepare(requiredMode);
         prepared = true;
       };
       const cleanup = async () => {
