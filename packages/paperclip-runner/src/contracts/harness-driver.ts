@@ -516,6 +516,9 @@ export const PROVIDER_STATE_INCOMPATIBLE = "provider_state_incompatible";
  * protected launch argument or the durable provider profile would change).
  * The refusal leaves the saved state unchanged and repeats on every retry. */
 export const PROVIDER_ATTACH_REFUSED = "provider_attach_refused";
+/** Qualified launch-profile drift preserves the saved session. Unlike generic
+ * state incompatibility, it must not offer a Retry that discards that session. */
+export const PROVIDER_LAUNCH_PROFILE_MISMATCH = "provider_launch_profile_mismatch";
 /** The saved session still owns a side-effecting call without a recorded
  * result. Replacing the session could repeat or lose that external action. */
 export const PROVIDER_SIDE_EFFECT_PENDING = "provider_side_effect_pending";
@@ -523,6 +526,7 @@ export const PROVIDER_SIDE_EFFECT_PENDING = "provider_side_effect_pending";
 export type RunnerRecoveryFailureClass =
   | typeof PROVIDER_STATE_INCOMPATIBLE
   | typeof PROVIDER_ATTACH_REFUSED
+  | typeof PROVIDER_LAUNCH_PROFILE_MISMATCH
   | typeof PROVIDER_SIDE_EFFECT_PENDING;
 
 const RUNNER_RECOVERY_FAILURE_CLASSES: ReadonlySet<string> = new Set([
@@ -530,6 +534,16 @@ const RUNNER_RECOVERY_FAILURE_CLASSES: ReadonlySet<string> = new Set([
   PROVIDER_ATTACH_REFUSED,
   PROVIDER_SIDE_EFFECT_PENDING,
 ]);
+
+/** Terminal launch refusal, deliberately distinct from state incompatibility:
+ * no automatic replacement or Retry may discard the saved conversation. */
+export class NativeRunnerLaunchProfileMismatchError extends Error {
+  readonly code = "native_runner_launch_profile_mismatch";
+  constructor(reason: string) {
+    super(`native_session_recovery_failed: ${reason}`);
+    this.name = "NativeRunnerLaunchProfileMismatchError";
+  }
+}
 
 /** A predecessor's semantic tool call or bridged runtime input has no settled
  * result, so the source runner cannot hand its session to a new run. */
@@ -574,18 +588,42 @@ export interface HarnessSessionRecoveryResult {
   runnerExitConfirmed?: true;
 }
 
-/** Reads the closed class of an authenticated runner command failure, or of a
- * typed source-reconciliation refusal. Never derived from message text. */
+/** Reads the Runner-owned closed refusal class. New receipts carry a structured
+ * refusal code; the narrowly framed legacy command-receipt compatibility
+ * parser stays here, never in the control plane's provider-agnostic policy. */
 export function runnerRecoveryFailureClass(
   error: unknown,
   depth = 0,
 ): RunnerRecoveryFailureClass | undefined {
   if (!error || typeof error !== "object" || depth > 5) return undefined;
   if (error instanceof NativeRunnerSourceReconciliationRequiredError) return PROVIDER_SIDE_EFFECT_PENDING;
+  if (error instanceof NativeRunnerLaunchProfileMismatchError) return PROVIDER_LAUNCH_PROFILE_MISMATCH;
   const value = error as Record<string, unknown>;
-  const result = value.runnerCommandResult as Record<string, unknown> | undefined;
-  const detail = result?.result as Record<string, unknown> | undefined;
-  if (typeof detail?.classification === "string" && RUNNER_RECOVERY_FAILURE_CLASSES.has(detail.classification)) {
+  const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
+    ? v as Record<string, unknown> : {};
+  let receipt = record(value.runnerCommandResult);
+  // Old recovery wrappers serialized the authenticated command receipt. Do
+  // not accept a quoted receipt in arbitrary provider/model prose.
+  if (error instanceof Error && Object.keys(receipt).length === 0) {
+    const match = /^(?:native_session_recovery_failed: )?(?:Error: )?PRP command (run\.(?:attach|prepare)) failed: (\{[^\n]*\})$/.exec(error.message);
+    if (match) {
+      try {
+        const parsed = record(JSON.parse(match[2]!));
+        if (parsed.commandType === match[1]) receipt = parsed;
+      } catch { /* Malformed legacy receipts confer no refusal authority. */ }
+    }
+  }
+  const detail = record(receipt.result);
+  if (["run.attach", "run.prepare"].includes(String(receipt.commandType)) && receipt.status === "failed"
+    && detail.code === "command_execution_failed"
+    && (detail.refusalCode === PROVIDER_LAUNCH_PROFILE_MISMATCH
+      || detail.classification === PROVIDER_LAUNCH_PROFILE_MISMATCH
+      || typeof detail.message === "string" && (
+        /^(?:Pi|OpenCode|Cursor Cloud|ACPX descriptor sidecar)(?: run\.prepare)? launch does not match the runner-owned qualified profile$/.test(detail.message)
+        || /^(?:Pi|OpenCode|Cursor Cloud) runner launch profile changed across (?:durable recovery|the durable run)$/.test(detail.message)))) {
+    return PROVIDER_LAUNCH_PROFILE_MISMATCH;
+  }
+  if (typeof detail.classification === "string" && RUNNER_RECOVERY_FAILURE_CLASSES.has(detail.classification)) {
     return detail.classification as RunnerRecoveryFailureClass;
   }
   return runnerRecoveryFailureClass(value.cause, depth + 1);
