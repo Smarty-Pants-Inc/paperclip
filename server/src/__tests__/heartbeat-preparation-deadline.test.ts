@@ -43,6 +43,32 @@ vi.mock("../services/budget-reservations.js", async importOriginal => {
   } };
 });
 
+// Real database faults before the executor's inner setup catch. Keep queue,
+// claim, heartbeat and terminalization owners intact (incident 9459ea28).
+const initialReadFault = vi.hoisted(() => ({ mode: "", entered: false, used: false,
+  queryError: null as unknown, bootId: "" }));
+vi.mock("../services/heartbeat/run-state.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/heartbeat/run-state.js")>();
+  return { ...actual, createHeartbeatRunState: (...args: Parameters<typeof actual.createHeartbeatRunState>) => {
+    const state = actual.createHeartbeatRunState(...args);
+    return { ...state, getRun: async (...readArgs: Parameters<typeof state.getRun>) => {
+      const run = await state.getRun(...readArgs);
+      if (run?.status === "running" && initialReadFault.mode && !initialReadFault.used) {
+        initialReadFault.used = true;
+        if (initialReadFault.mode === "foreign") {
+          run.controllerBootId = initialReadFault.bootId;
+          await args[0].update(heartbeatRuns).set({ controllerBootId: run.controllerBootId }).where(eq(heartbeatRuns.id, run.id));
+        } else {
+          initialReadFault.entered = true;
+          try { await args[0].$client`select pg_sleep(30) /* d11b-preparation */`; }
+          catch (error) { initialReadFault.queryError = error; throw error; }
+        }
+      }
+      return run;
+    } };
+  } };
+});
+
 const support = await getRecoveryPostgresSupport({});
 async function until(description: string, check: () => boolean | Promise<boolean>, timeoutMs = 10_000) {
   const end = performance.now() + timeoutMs;
@@ -207,6 +233,49 @@ describe.skipIf(!support.supported)("claimed recovery run preparation deadline",
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();
       await db.$client.end();
+    }
+  }, 60_000);
+
+  it.each(["connection", "foreign"])("terminalizes a queue-claimed %s preparation failure without the reaper", async mode => {
+    const applicationName = `d11b-${randomUUID()}`;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4, applicationName });
+    const admin = createDb(fixture.current.temporary.connectionString, { applicationName: "d11b-admin" });
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: completingBackend(db) });
+    initialReadFault.mode = mode; initialReadFault.used = false; initialReadFault.entered = false;
+    initialReadFault.queryError = null; initialReadFault.bootId = randomUUID();
+    try {
+      const { runId, issueId } = await restoredTask(db, heartbeat);
+      if (mode === "connection") {
+        await until("real in-flight preparation query", async () => initialReadFault.entered &&
+          (await admin.$client`select pid from pg_stat_activity where application_name = ${applicationName}
+            and query like '%d11b-preparation%' and state = 'active'`).length > 0);
+        const killed = await admin.$client`select pid, pg_terminate_backend(pid) as terminated from pg_stat_activity
+          where application_name = ${applicationName} and pid <> pg_backend_pid()`;
+        expect(killed.length).toBeGreaterThan(0);
+        expect(killed.every(row => row.terminated)).toBe(true);
+        console.info("d11b-killed-app-backends", JSON.stringify(killed));
+      }
+      await heartbeat.drainActiveRunExecutions();
+      const [run] = await admin.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      console.info("d11b-preparation-trigger-proof", JSON.stringify({ mode, runId, issueId,
+        driverCode: (initialReadFault.queryError as { code?: string } | null)?.code,
+        status: run?.status, errorCode: run?.errorCode, controllerBootId: run?.controllerBootId }));
+      if (mode === "connection") expect(["57P01", "CONNECTION_CLOSED", "ECONNRESET"]).toContain((initialReadFault.queryError as { code?: string }).code);
+      expect(run?.status).toBe("failed");
+      expect(run?.errorCode).toBe(mode === "foreign" ? "setup_controller_ownership_mismatch" : "setup_database_connection_lost");
+      const [issue] = await admin.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue).toMatchObject({ executionRunId: null, checkoutRunId: null, executionLockedAt: null });
+      await until("one failure note", async () => (await admin.select().from(issueComments)
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")))).length === 1);
+      await settleUnansweredPersonMessage(admin, { companyId: fixture.current.companyId, issueId });
+      const notes = await admin.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
+      expect(notes).toHaveLength(1);
+      console.info("d11b-terminal-proof", JSON.stringify({ mode, runId, errorCode: run?.errorCode,
+        issueClaim: issue?.executionRunId, noteCount: notes.length, note: notes[0]?.body }));
+    } finally {
+      initialReadFault.mode = "";
+      await heartbeat.drainActiveRunExecutions();
+      await db.$client.end(); await admin.$client.end();
     }
   }, 60_000);
 
