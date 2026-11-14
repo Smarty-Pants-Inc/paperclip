@@ -32,6 +32,17 @@ invalid config or multiple configured companies fails closed. No ID, config or
 credential is copied into instance state. This also recovers pre-0.1.2 installs
 with saved config but **zero plugin_state rows**, without a config re-save.
 
+### 0.1.3 / 0.1.4 fixes found on a real c1dea0db host
+
+- 0.1.3: setup and ticks skip companies the host scope-denies (`company context
+  is required`) instead of aborting discovery.
+- 0.1.4: the board `initialize-seen` action accepts the `renderEnvironment` key
+  the host always forwards (`server/src/routes/plugins.ts:1772` sends
+  `body?.renderEnvironment ?? null`; SDK `worker-rpc-host.ts:2115-2120` merges it
+  into params). 0.1.3 refused it and reported the wrong code, `config invalid`.
+  Bad action input now reports `params invalid`. An enabled tick with missing or
+  malformed seen state now reports `state invalid`, not `mailbox read failed`.
+
 Discovery requires the documented `companies.read` capability (SDK README:413).
 It is the only added capability; an upgrade may require the host's normal
 capability approval before activation (PLUGIN_SPEC.md:1595). Do not bypass it.

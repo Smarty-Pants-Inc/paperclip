@@ -26,6 +26,12 @@ function host(savedConfig: Record<string, unknown> | null = config, baseline = t
   const ctx = {
     config: { get: vi.fn(async (id?: string) => {
       if (!id) throw new Error("global config forbidden");
+      // Host-faithful proactive scope: setup/job calls may read only companies
+      // represented by saved company config rows (server/src/services/
+      // plugin-worker-manager.ts:2856-2865). The SDK gate requires invocation
+      // scope or a matching proactive scope (host-client-factory.ts:610-643).
+      // A board action gets its company from the host invocation context.
+      if (id === foreign && !configs.has(foreign)) throw new Error('Plugin "test" is not allowed to perform "config.get": company context is required');
       return structuredClone(configs.get(id) ?? {});
     }) },
     companies: { list: vi.fn(async () => [{ id: foreign }, { id: company }]) },
@@ -56,8 +62,11 @@ function host(savedConfig: Record<string, unknown> | null = config, baseline = t
     const board: PluginPerformActionContext = { companyId: company,
       actor: { type: "user", companyId: company, userId: "operator", agentId: null, runId: null } };
     return { plugin, tick: () => tick(), board,
-      initialize: (context = board, paramsCompany = company) => action({
-        companyId: paramsCompany, mailbox: config.mailbox, seenIds: ["aa"],
+      // Host-faithful params: the action route forwards `renderEnvironment ?? null`
+      // (server routes/plugins.ts:1772) and the SDK merges it into params
+      // (sdk worker-rpc-host.ts:2115-2120), so a REST board call always carries it.
+      initialize: (context = board, paramsCompany = company, extra: Record<string, unknown> = {}) => action({
+        companyId: paramsCompany, mailbox: config.mailbox, seenIds: ["aa"], renderEnvironment: null, ...extra,
       }, context) };
   }
   return { ctx, configs, states, fires, start };
@@ -70,6 +79,13 @@ beforeEach(() => {
 afterEach(() => { expect(globalThis.fetch).not.toHaveBeenCalled(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe("durable worker startup and board initialization", () => {
+  it("continues discovery after host scope-denies an unconfigured company", async () => {
+    const h = host();
+    const worker = await h.start();
+    await worker.tick();
+    expect(h.ctx.config.get.mock.calls.map(([id]) => id)).toEqual([foreign, company, foreign, company]);
+    expect(h.fires).toHaveLength(1);
+  });
   it("runs a fresh worker's tick from saved config without onConfigChanged, then survives another restart", async () => {
     const h = host();
     await (await h.start()).tick();
@@ -96,6 +112,22 @@ describe("durable worker startup and board initialization", () => {
     await expect(worker.initialize(worker.board)).resolves.toEqual({ initialized: true });
     expect(h.ctx.secrets.resolve).toHaveBeenCalled();
   });
+  it("accepts the host-forwarded renderEnvironment (null or object) but still refuses unknown params", async () => {
+    const h = host({ ...config, enabled: false }, false);
+    const worker = await h.start();
+    await expect(worker.initialize(worker.board, company, { unexpected: true })).rejects.toThrow("params invalid");
+    await expect(worker.initialize(worker.board, company, { renderEnvironment: "x" })).rejects.toThrow("params invalid");
+    expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
+    await expect(worker.initialize(worker.board, company, { renderEnvironment: { surface: "page" } }))
+      .resolves.toEqual({ initialized: true });
+  });
+  it("names missing seen state on an enabled tick instead of reporting a mailbox read failure", async () => {
+    const h = host(config, false);
+    const worker = await h.start();
+    await expect(worker.tick()).rejects.toThrow("state invalid");
+    expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
+    expect(h.ctx.http.fetch).not.toHaveBeenCalled();
+  });
   it.each(["scope", "actor", "params", "global"])("refuses foreign/missing %s company before secret, mail or KV writes", async mismatch => {
     const h = host({ ...config, enabled: false }, false);
     const worker = await h.start();
@@ -103,7 +135,7 @@ describe("durable worker startup and board initialization", () => {
     if (mismatch === "scope") context.companyId = foreign;
     if (mismatch === "actor") context.actor.companyId = foreign;
     if (mismatch === "global") { context.companyId = null; context.actor.companyId = null; }
-    await expect(worker.initialize(context, mismatch === "params" ? foreign : company)).rejects.toThrow(SAFE_ERROR);
+    await expect(worker.initialize(context, mismatch === "params" ? foreign : company)).rejects.toThrow("actor/company mismatch");
     expect(h.ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(h.ctx.http.fetch).not.toHaveBeenCalled();
     expect(h.ctx.state.set).not.toHaveBeenCalled();
@@ -112,7 +144,7 @@ describe("durable worker startup and board initialization", () => {
     const h = host(null, false);
     const worker = await h.start();
     expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: "mail intake is not configured" });
-    await expect(worker.tick()).rejects.toThrow(SAFE_ERROR);
+    await expect(worker.tick()).rejects.toThrow("not configured");
     expect(h.ctx.http.fetch).not.toHaveBeenCalled();
   });
   it("re-resolves host config on each tick, including removal and later creation without a callback", async () => {
@@ -122,21 +154,21 @@ describe("durable worker startup and board initialization", () => {
     await worker.tick();
     expect(h.fires).toHaveLength(1);
     h.configs.delete(company);
-    await expect(worker.tick()).rejects.toThrow(SAFE_ERROR);
+    await expect(worker.tick()).rejects.toThrow("not configured");
     expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: "mail intake is not configured" });
   });
   it("does not choose an arbitrary company when two have saved config", async () => {
     const h = host(); h.configs.set(foreign, config);
     const worker = await h.start();
-    await expect(worker.tick()).rejects.toThrow(SAFE_ERROR);
-    expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: SAFE_ERROR });
+    await expect(worker.tick()).rejects.toThrow("multiple companies configured");
+    expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: "multiple companies configured" });
     expect(h.ctx.http.fetch).not.toHaveBeenCalled();
   });
   it("surfaces company discovery errors without leaking host/provider text", async () => {
     const h = host(); h.ctx.companies.list.mockRejectedValue(new Error("PRIVATE_PROVIDER_SENTINEL"));
     const worker = await h.start();
-    await expect(worker.tick()).rejects.toThrow(SAFE_ERROR);
-    expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: SAFE_ERROR });
+    await expect(worker.tick()).rejects.toThrow("mailbox read failed");
+    expect(await worker.plugin.onHealth!()).toEqual({ status: "error", message: "config invalid" });
     expect(h.ctx.http.fetch).not.toHaveBeenCalled();
   });
 });
