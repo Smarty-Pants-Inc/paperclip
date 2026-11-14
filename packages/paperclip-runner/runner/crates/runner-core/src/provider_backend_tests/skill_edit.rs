@@ -129,7 +129,35 @@ mod skill_edit {
             result.is_ok(),
             "{blocker}: prepare must select {expected}, not fail: {result:?}"
         );
+        if blocker == "close_failure" {
+            if let Ok(artifacts) = std::env::var("TL07_JUDGE_ARTIFACTS") {
+                fs::write(std::path::Path::new(&artifacts).join("close-failure-receipt.json"),
+                    serde_json::to_vec_pretty(&result.as_ref().unwrap().result).unwrap()).unwrap();
+            }
+        }
         assert_eq!(result.unwrap().result["status"], expected, "{blocker}");
+        if expected == "prepared" {
+            // Independent RFL probe: preserve the OLD checkpoint bytes somewhere
+            // in its owned tree, and use a distinct file for the fresh session.
+            let artifacts = std::path::PathBuf::from(std::env::var("TL07_JUDGE_ARTIFACTS").unwrap());
+            fs::write(artifacts.join(format!("trace-{blocker}-before.json")), &bytes).unwrap();
+            let after = fs::read(next.state_path()).unwrap();
+            fs::write(artifacts.join(format!("trace-{blocker}-after.json")), &after).unwrap();
+            fn checkpoint_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                for entry in fs::read_dir(root).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() { checkpoint_files(&path, out); }
+                    else if path.is_file() { out.push(path); }
+                }
+            }
+            let mut paths = Vec::new();
+            checkpoint_files(&directory, &mut paths);
+            let retained: Vec<_> = paths.iter().filter(|path| fs::read(path).is_ok_and(|data| data == bytes)).collect();
+            fs::write(artifacts.join(format!("trace-{blocker}-inventory.txt")),
+                format!("old={}\nfresh={}\nall={paths:?}\nretained={retained:?}\n", old.state_path().display(), next.state_path().display())).unwrap();
+            assert!(!retained.is_empty(), "RFL trace loss: {blocker}: old checkpoint bytes are absent from {directory:?}; fresh state overwrote {}", old.state_path().display());
+            assert!(retained.iter().all(|path| **path != next.state_path()), "fresh session must write a NEW file, never the retained old trace");
+        }
         if expected != "prepared" {
             assert_eq!(
                 fs::read(old.state_path()).unwrap(),
