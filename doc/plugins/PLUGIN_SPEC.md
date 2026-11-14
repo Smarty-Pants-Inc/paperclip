@@ -642,6 +642,18 @@ Input includes:
 
 If the worker implements this method, it applies the new config without restarting. If the worker does not implement this method, the host restarts the worker process with the new config (graceful shutdown then restart).
 
+The host also uses this method to restore stored company configuration after
+activation or automatic crash respawn. Replay lists companies in deterministic
+order, but reads each current config row immediately before delivery; deleted
+rows are omitted. Replay and settings saves share per-company ordering and the
+last successfully delivered row's `updatedAt` revision, so an unchanged or older
+revision is not reapplied to the same worker process. Config writes advance this
+existing timestamp monotonically at millisecond precision; no config-payload
+revision field or schema migration is required. Each worker-ready event starts a
+new process generation, even when the host reuses its worker handle. Outstanding
+reads and queued deliveries from retired generations are discarded; a slow
+company's callback does not block settings delivery to another company.
+
 ### 13.5 `onEvent`
 
 Receives one typed Paperclip domain event.
