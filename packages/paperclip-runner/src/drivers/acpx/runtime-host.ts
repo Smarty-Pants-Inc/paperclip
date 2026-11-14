@@ -963,6 +963,9 @@ export class AcpxRuntimeHost {
     const text = claudeNativeSkillPrompt(
       boundedTurnText(input.text), this.#claudeSkillNames,
     );
+    // Legacy Pi keeps its provider broker for the session. Reset turn-local
+    // refusal only after admission/input checks, never for a same-turn retry.
+    this.#sandbox.beginOwnedConfigurationTurn?.();
     const turn = this.#runtime.startTurn({
       text,
       requestId,

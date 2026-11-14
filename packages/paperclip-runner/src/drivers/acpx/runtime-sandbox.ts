@@ -58,6 +58,8 @@ export interface AcpxRuntimeSandbox {
   agentHomeDirectory: string;
   workspaceRecordPath: string;
   initializeOwnedConfiguration?: () => Promise<void>;
+  /** Begin an admitted turn without replacing session-scoped configuration. */
+  beginOwnedConfigurationTurn?: () => void;
   /** Release session capabilities after the provider lifetime has ended. */
   closeOwnedConfiguration?: () => Promise<void>;
   launchEnvironment: Readonly<NodeJS.ProcessEnv>;
@@ -637,7 +639,10 @@ export async function prepareAcpxRuntimeSandbox(input: {
     agentHomeDirectory,
     workspaceRecordPath,
     ...(initializeOwnedConfiguration ? { initializeOwnedConfiguration } : {}),
-    ...(managedPiProvider ? { closeOwnedConfiguration: async () => { await piProviderLoopback?.close(); piProviderLoopback = undefined; } } : {}),
+    ...(managedPiProvider ? {
+      beginOwnedConfigurationTurn: () => { piProviderLoopback?.beginTurn(); },
+      closeOwnedConfiguration: async () => { await piProviderLoopback?.close(); piProviderLoopback = undefined; },
+    } : {}),
     protectedPaths,
     launchEnvironment: Object.freeze({ ...launchEnvironment }),
     persistedEnvironment: Object.freeze(persistedEnvironment),

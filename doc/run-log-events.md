@@ -328,9 +328,11 @@ non-retryable local HTTP 400, and retains only its measured numeric count on the
 revocable binding. The driver reads that trusted cause against the live binding's
 run/turn authority before settlement and emits one `turn.failed` with code
 `pi_tool_limit_exceeded`, the count and actionable guidance. No tools are trimmed,
-no smaller-catalog retry is allowed on the rejected binding, and no upstream HTTP
-request is opened. A fresh binding for the next turn has no retained failure.
-Messages and Responses do not receive Chat's cap. Direct-key development mode
+no smaller-catalog retry is allowed within the rejected turn, and no upstream HTTP
+request is opened. Native RPC replaces its binding for the next turn. Legacy ACPX
+Pi keeps one broker/capability for the session, so its host clears the turn-local
+refusal only when admitting the next turn, after active-turn and input checks.
+An HTTP request cannot clear that refusal. Messages and Responses do not receive Chat's cap. Direct-key development mode
 and native-provider paths without the owned broker do not have this final-dispatch
 guarantee; inventory-time selection still applies.
 

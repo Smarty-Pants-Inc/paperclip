@@ -111,6 +111,60 @@ describe("Pi loopback provider lifetime", () => {
     expect(upstreamKeys).toEqual([authorization(routeEnvironment.PAPERCLIP_AI_PROVIDER_KEY), authorization(routeEnvironment.PAPERCLIP_AI_PROVIDER_KEY), authorization(replacementKey)]);
   });
 
+  it("keeps smaller retries refused until a new legacy turn is admitted, not merely attempted", async () => {
+    // F1 trust-boundary regression: real host + authenticated broker, with one
+    // refused turn held open while a caller tries to start a concurrent turn.
+    const test = await fixture();
+    const upstreamCounts: number[] = [];
+    const upstream = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      upstreamCounts.push(JSON.parse(Buffer.concat(chunks).toString()).tools.length);
+      response.end("{}");
+    });
+    upstream.listen(0, "127.0.0.1"); await once(upstream, "listening");
+    cleanups.push(() => new Promise<void>(resolve => { upstream.close(() => resolve()); upstream.closeAllConnections(); }));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("Missing upstream listener");
+    let provider!: { baseUrl: string; apiKey: string };
+    let settle!: () => void;
+    const pending = new Promise<void>(resolve => { settle = resolve; });
+    test.dependencies.openRuntime = async launch => {
+      provider = JSON.parse(await readFile(join(launch.launchEnvironment.PI_CODING_AGENT_DIR!, "models.json"), "utf8")).providers.paperclip;
+      return { ...test.runtime, startTurn: input => ({
+        requestId: input.requestId, promptStarted: Promise.resolve(),
+        events: (async function* () {})(),
+        result: pending.then(() => ({ status: "failed" as const, error: { message: "Controlled refusal", retryable: false } })),
+        cancel: async () => { settle(); }, closeStream: async () => {},
+      }) };
+    };
+    const host = await AcpxRuntimeHost.open({ ...test.options, environment: { ...test.options.environment,
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`,
+    } }, test.dependencies);
+    cleanups.push(() => host.close({ reason: "test cleanup" }));
+    const request = async (count: number) => {
+      const response = await fetch(`${provider.baseUrl}/chat/completions`, { method: "POST",
+        headers: { Authorization: `Bearer ${provider.apiKey}` },
+        body: JSON.stringify({ model: "vendor/model", messages: [], tools: Array.from({ length: count }, (_, i) => ({ type: "function", function: { name: `t${i}` } })) }),
+      });
+      await response.text(); return response.status;
+    };
+    const first = host.startTurn({ requestId: "rejected", text: "first" });
+    expect(await request(129)).toBe(400);
+    expect(await request(4)).toBe(400);
+    expect(() => host.startTurn({ requestId: "concurrent", text: "not admitted" })).toThrow("already has an active turn");
+    expect(await request(4)).toBe(400);
+    expect(upstreamCounts).toEqual([]);
+    settle(); await first.result;
+    // Invalid next-turn input must not clear the settled turn's refusal either.
+    expect(() => host.startTurn({ requestId: "", text: "invalid" })).toThrow();
+    expect(await request(4)).toBe(400);
+    const second = host.startTurn({ requestId: "next", text: "new turn" });
+    expect(await request(4)).toBe(200);
+    await second.result;
+    expect(upstreamCounts).toEqual([4]);
+  });
+
   it.each([false, true])("revokes the broker when admission ends (startup failure: %s)", async startupFailure => {
     const test = await fixture();
     let provider: { baseUrl: string; apiKey: string } | undefined;
