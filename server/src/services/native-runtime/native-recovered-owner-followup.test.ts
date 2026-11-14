@@ -73,6 +73,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   let stateDirectory: string;
   const previousHome = process.env.PAPERCLIP_HOME;
   const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+  const previousTaskOut = process.env.TASK_OUT;
   const companyId = randomUUID(), agentId = randomUUID();
 
   beforeAll(async () => {
@@ -96,11 +97,16 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   beforeEach(async () => {
     stateDirectory = await mkdtemp(join(tmpdir(), "native-recovered-owner-state-"));
     process.env.PAPERCLIP_RUNNER_STATE_DIR = stateDirectory;
+    // The retained independent safety tests write evidence; ordinary CI keeps it
+    // in this test's disposable directory unless the caller requests retention.
+    process.env.TASK_OUT ??= stateDirectory;
     toolDefinitions.mockReset().mockRejectedValue(new Error(ADMITTED));
   });
   afterEach(async () => {
     if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
     else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+    if (previousTaskOut === undefined) delete process.env.TASK_OUT;
+    else process.env.TASK_OUT = previousTaskOut;
     await rm(stateDirectory, { recursive: true, force: true });
   });
 
@@ -2728,4 +2734,88 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toHaveLength(scenario === "live controller lease" ? 0 : expectedQuarantine);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
+
+  // Keep reason: RFL F1 data safety; retain the judge's two safety cases unchanged.
+  it('R7 JUDGE ownership committed while fence UPDATE waits retains owned-write grace', async () => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, 'expired'), leaseId = randomUUID();
+    let held!:()=>void, finish!:()=>void;
+    const ready = new Promise<void>(r=>{held=r}), gate=new Promise<void>(r=>{finish=r});
+    let writerPid=0, ownedAt:Date|undefined;
+    const writer=db.transaction(async tx=>{
+      await tx.execute(sql`set local statement_timeout='5s'`);
+      await tx.select().from(controllerInstances).where(eq(controllerInstances.bootId,f.stale)).for('share');
+      const [session]=await tx.execute(sql`select pg_backend_pid() as pid`); writerPid=Number(session!.pid);
+      held(); await gate;
+      const [owned]=await tx.insert(environmentLeases).values({id:leaseId,companyId,heartbeatRunId:null,status:'active',leasePolicy:'ephemeral',
+        updatedAt:sql`now()`, metadata:{leaseController:{bootId:f.stale,pid:7,hostHash:'judge-foreign-process-space',processStartedAt:null}}}).returning();
+      ownedAt=owned!.updatedAt;
+    });
+    await ready;
+    const planning=f.plan();
+    try {
+      let waiterPid=0;
+      await waitForCondition('fence UPDATE has taken its statement snapshot and waits for controller row',async()=>{
+        const rows=await db.execute(sql`select pid from pg_stat_activity where datname=current_database() and wait_event_type='Lock'
+          and query like 'update "controller_instances"%'`);
+        waiterPid=Number(rows[0]?.pid??0); return rows.length===1;
+      },800);
+      finish(); await writer;
+      const plan=await planning;
+      const [boot]=await db.select().from(controllerInstances).where(eq(controllerInstances.bootId,f.stale));
+      const ownerVerdict=await proveControllerInstance(db,f.stale,ownedAt!);
+      await writeFile(join(process.env.TASK_OUT!,'post-snapshot.json'),JSON.stringify({writerPid,waiterPid,ownedAt,
+        fencedAt:boot!.fencedAt,planReturned:plan!==null,ownerVerdict},null,2));
+      expect.soft(plan).toBeNull(); expect.soft(boot!.fencedAt).toBeNull(); expect(ownerVerdict).toBe('grace');
+    } finally {finish();await writer;await planning;await db.delete(environmentLeases).where(eq(environmentLeases.id,leaseId));await f.cleanup();}
+  },20_000);
+
+  it('R7 JUDGE real second controller resumes during waiting fence UPDATE',async()=>{
+    const fixture=await lifecyclePlan(false),leaseId=randomUUID();
+    const child=spawn(process.execPath,['--import',new URL('../../../../cli/node_modules/tsx/dist/loader.mjs',import.meta.url).pathname,
+      new URL('./r7-lease-child.ts',import.meta.url).pathname],{stdio:['ignore','pipe','pipe','ipc'],env:{...process.env,RFL_TEST_DB:database.connectionString}});
+    const exited=new Promise<number|null>(r=>child.once('exit',r));
+    const message=()=>new Promise<Record<string,any>>((resolve,reject)=>{
+      const timer=setTimeout(()=>reject(new Error('child message deadline')),15000);
+      child.once('message',v=>{clearTimeout(timer);resolve(v as Record<string,any>)});
+    });
+    const request=(p:Record<string,unknown>)=>{const next=message();child.send(p);return next};
+    let stderr='';child.stderr!.on('data',c=>{stderr+=String(c)});child.stdout!.resume();
+    let bootId:string|undefined,work:ReturnType<typeof registerControllerInstanceLeaseWork>|undefined;
+    let planning:ReturnType<typeof planNativeLifecycleSettlement>|undefined;
+    try{
+      const ready=await message();expect(ready.kind).toBe('ready');bootId=ready.bootId;
+      const current=await currentNativeControllerIdentity();
+      const [serving]=await db.select().from(controllerInstances).where(eq(controllerInstances.bootId,current.bootId));
+      await db.insert(controllerInstances).values({bootId:bootId!,epoch:serving!.epoch-1,pid:ready.pid,processSpace:ready.processSpace,
+        startedAt:sql`now()-interval '3 days'`,renewedAt:sql`now()-interval '2 days'`,leaseExpiresAt:sql`now()-interval '2 days'`});
+      const coordinator={register:()=>({ready:Promise.resolve(),wake:()=>{},stop:async()=>{}})} as unknown as ReturnType<typeof createDeliveryWorkCoordinator>;
+      work=registerControllerInstanceLeaseWork(db,coordinator);currentControllerProcessStamp();await tickControllerInstanceLease();
+      const held=await request({action:'hold'});expect(held.kind).toBe('held');expect(held.isolation).toBe('read committed');
+      planning=planNativeLifecycleSettlement({db,root:fixture.root,bytes:fixture.bytes,identity:fixture.prior.identity,companyId,agentId,
+        issueId:fixture.prior.issueId,currentRunId:fixture.followUp.runId});
+      let waiterPid=0;
+      await waitForCondition('real fence UPDATE waits after statement snapshot',async()=>{
+        const rows=await db.execute(sql`select pid from pg_stat_activity where datname=current_database() and wait_event_type='Lock'
+          and query like 'update "controller_instances"%'`);
+        waiterPid=Number(rows[0]?.pid??0);return rows.length===1;
+      },800);
+      const owned=await request({action:'own',companyId,leaseId});expect(owned.kind).toBe('owned');expect(owned.wakes).toBe(1);
+      const plan=await planning;
+      const [beforeRenew]=await db.select().from(controllerInstances).where(eq(controllerInstances.bootId,bootId!));
+      const verdictBeforeRenew=await proveControllerInstance(db,bootId!,new Date(owned.updatedAt),{readOnly:true});
+      const renewed=await request({action:'renew'});expect(renewed.kind).toBe('renewed');
+      const [afterRenew]=await db.select().from(controllerInstances).where(eq(controllerInstances.bootId,bootId!));
+      const evidence={processPid:ready.pid,writerBackendPid:held.backendPid,waiterPid,isolation:held.isolation,ownedAt:owned.updatedAt,
+        fencedAt:beforeRenew!.fencedAt,planReturned:plan!==null,verdictBeforeRenew,laterRenewalLost:renewed.lost,
+        rowUnchangedAfterRenewal:JSON.stringify(beforeRenew)===JSON.stringify(afterRenew)};
+      await writeFile(join(process.env.TASK_OUT!,`child-race-${process.env.R7_LABEL??'head'}.json`),JSON.stringify(evidence,null,2));
+      expect.soft(plan).toBeNull();expect.soft(beforeRenew!.fencedAt).toBeNull();expect.soft(verdictBeforeRenew).toBe('grace');
+      expect(renewed.lost).toEqual([]);
+    }finally{
+      if(child.connected)child.send({action:'quit'});const kill=setTimeout(()=>child.kill('SIGKILL'),5000);
+      const code=await exited;clearTimeout(kill);await planning;await work?.stop();resetControllerInstanceLeaseForTests();
+      await db.delete(environmentLeases).where(eq(environmentLeases.id,leaseId));
+      if(bootId)await db.delete(controllerInstances).where(eq(controllerInstances.bootId,bootId));expect(code,stderr).toBe(0);
+    }
+  },30000);
 });
