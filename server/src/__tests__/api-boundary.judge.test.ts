@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, expect, it } from 'vitest';
 import { sql } from 'drizzle-orm';
 import { companies, issues, issueComments, createDb, startEmbeddedPostgresTestDatabase } from '@paperclipai/db';
@@ -30,7 +32,8 @@ it('judge: comments read service must preserve supersededBy from Postgres for th
  const exact=await service.getComment(oldId);
  const old=listed.find(c=>c.id===oldId)!;
  const current=listed.find(c=>c.id===newId)!;
- await writeFile(process.env.TASK_OUT+'/api-comment-payload.json',JSON.stringify({oldId,newId,stored,listed,exact},null,2));
+ const outDir=process.env.RFL_JUDGE_LOG_DIR ?? process.env.TASK_OUT ?? tmpdir(); await mkdir(outDir,{recursive:true});
+ await writeFile(join(outDir,'api-comment-payload.json'),JSON.stringify({oldId,newId,stored,listed,exact},null,2));
  expect(stored.find(c=>c.id===oldId)?.metadata).toMatchObject({supersededBy:newId});
  expect(old.deletedAt).toBeNull();
  expect(current.metadata).not.toBeNull();

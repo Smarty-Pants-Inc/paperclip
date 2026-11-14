@@ -1,7 +1,9 @@
 // Independent M1.4 attacks: actual PostgreSQL and production settlement, not mocked decisions.
 // Keep reasons: immutable conversation history, durable links, multi-client idempotency.
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, authUsers, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
@@ -32,8 +34,8 @@ describe.skipIf(!support.supported)("independent M14 never-delete and current-li
  it("exports actual persisted held-note rows for the production UI projection check",async()=>{
   const f=await seed();await f.settle();await f.message(1000);await f.settle(130000);
   const rows=await f.all();expect(rows).toHaveLength(2);expect(await f.notices()).toHaveLength(1);
-  if(!process.env.JUDGE_NOTICE_RECEIPT) throw new Error("JUDGE_NOTICE_RECEIPT must name the retained evidence file");
-  writeFileSync(process.env.JUDGE_NOTICE_RECEIPT,JSON.stringify(rows.map(n=>({id:n.id,companyId:n.companyId,issueId:n.issueId,authorType:n.authorType,authorAgentId:n.authorAgentId,authorUserId:n.authorUserId,body:n.body,presentation:n.presentation,metadata:n.metadata,createdAt:n.createdAt,updatedAt:n.updatedAt,deletedAt:n.deletedAt})),null,2)+"\n");
+  const receiptPath=process.env.JUDGE_NOTICE_RECEIPT ?? join(process.env.RFL_JUDGE_LOG_DIR ?? tmpdir(),"ui-notice-rows.json");mkdirSync(dirname(receiptPath),{recursive:true});
+  writeFileSync(receiptPath,JSON.stringify(rows.map(n=>({id:n.id,companyId:n.companyId,issueId:n.issueId,authorType:n.authorType,authorAgentId:n.authorAgentId,authorUserId:n.authorUserId,body:n.body,presentation:n.presentation,metadata:n.metadata,createdAt:n.createdAt,updatedAt:n.updatedAt,deletedAt:n.deletedAt})),null,2)+"\n");
  });
  it("every supersededBy directly targets an existing CURRENT note after three held messages",async()=>{
   const f=await seed();await f.settle();
