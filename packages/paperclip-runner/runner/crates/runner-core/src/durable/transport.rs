@@ -1747,6 +1747,7 @@ mod tests {
     include!("tests/listener_admission.rs");
     include!("tests/listener_deadline_edge.rs");
     include!("tests/listener_waiter.rs");
+    include!("tests/listener_abandoned_flood.rs");
     include!("tests/indeterminate_terminal_ack.rs");
 
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
