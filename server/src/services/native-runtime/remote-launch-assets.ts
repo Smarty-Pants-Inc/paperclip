@@ -105,6 +105,7 @@ if (process.argv[3] === "remove-auth") fs.rmSync(path.join(current, "auth.json")
 export async function stageRemoteLaunchAssets(input: LaunchAssetsInput): Promise<void> {
   const measure = async (name: string, operation: () => Promise<void>) =>
     input.trace ? input.trace.measure(name, operation) : operation();
+  const allowConcurrentSyncOperations = input.transport === "sandbox" && input.runner.allowConcurrentSyncOperations === true;
   const materializeLaunchState = () => measure("harness_state.launch_material", async () => {
     for (const directory of input.persistenceDirectories) {
       if (directory.location !== "filesystem") continue;
@@ -165,9 +166,21 @@ export async function stageRemoteLaunchAssets(input: LaunchAssetsInput): Promise
         mode: 0o600,
       }];
       const changed = await changedRemoteRuntimeAssets(input.runner.execute.bind(input.runner), assets);
-      for (const { kind, ...asset } of changed) {
-        if (kind === "directory") await input.stageDirectory(asset);
-        else await input.stageFile(asset);
+      const stage = ({ kind, ...asset }: RuntimeStageAsset) =>
+        kind === "directory" ? input.stageDirectory(asset) : input.stageFile(asset);
+      if (allowConcurrentSyncOperations) {
+        const concurrency = 4;
+        for (let offset = 0; offset < changed.length; offset += concurrency) {
+          let failed = false;
+          let firstFailure: unknown;
+          await Promise.allSettled(changed.slice(offset, offset + concurrency).map(asset => stage(asset).catch(error => {
+            if (!failed) { failed = true; firstFailure = error; }
+            throw error;
+          })));
+          if (failed) throw firstFailure;
+        }
+      } else {
+        for (const asset of changed) await stage(asset);
       }
     });
   };
@@ -194,7 +207,7 @@ export async function stageRemoteLaunchAssets(input: LaunchAssetsInput): Promise
   // Resolve the owned home and remove obsolete assignments before any launch
   // file can be written through a retained, redirected path.
   await stageCodexSkills();
-  if (input.transport === "sandbox" && input.runner.allowConcurrentSyncOperations === true) {
+  if (allowConcurrentSyncOperations) {
     const outcomes = await Promise.allSettled([materializeLaunchState(), stageRuntimeContext()]);
     for (const outcome of outcomes) {
       if (outcome.status === "rejected") throw outcome.reason;
