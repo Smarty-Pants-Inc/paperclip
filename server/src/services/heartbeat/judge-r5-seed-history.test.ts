@@ -1,3 +1,4 @@
+import { mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { currentNotices } from "../rfl-current-notice-assertions.js";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -45,6 +46,7 @@ import { heartbeatRunEvents } from "@paperclipai/db";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer.js";
 import { resolveNativeControllerRecovery } from "../native-runtime/native-controller-recovery.js";
+const rflJudgeLogDir = () => { const dir = join(process.env.RFL_JUDGE_LOG_DIR ?? process.env.TASK_OUT ?? tmpdir(), "logs"); mkdirSync(dir, { recursive: true }); return dir; };
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -681,7 +683,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const action = records[0];
     const projected = projectTaskInterruption(f.issue, { run: await read(f.run.id), action, paused: false, approval: false });
     const { appendFileSync } = await import("node:fs");
-    appendFileSync(process.env.TASK_OUT + "/logs/seed-history-observations.jsonl", JSON.stringify({ shape, stage: "projection", projected }) + "\n");
+    appendFileSync(join(rflJudgeLogDir(), "seed-history-observations.jsonl"), JSON.stringify({ shape, stage: "projection", projected }) + "\n");
     expect.soft(projected).toMatchObject({ state: "working", canRetry: false, nextRetryAt: null });
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
       status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000), contextSnapshot: { issueId: f.issue.id,
@@ -707,7 +709,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const answered = await answerWithNativePeer({ db, execution: selected.nativeExecution,
       runnerInstanceId: selected.nativeRunnerInstanceId!, text: `Answered ${shape} from saved history.`,
       getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
-    appendFileSync(process.env.TASK_OUT + "/logs/seed-history-observations.jsonl", JSON.stringify({ shape, stage: "answer", status: answered.settled.status,
+    appendFileSync(join(rflJudgeLogDir(), "seed-history-observations.jsonl"), JSON.stringify({ shape, stage: "answer", status: answered.settled.status,
       newSession: selected.nativeExecution.session.normalizedSessionId !== oldId, hasFollowUp: JSON.stringify(answered.prompts).includes(message.body) }) + "\n");
     expect(answered.settled.status).toBe("succeeded");
     expect(JSON.stringify(answered.prompts)).toContain(message.body);

@@ -1,5 +1,7 @@
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -30,6 +32,7 @@ import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapte
 import { createSystemRecovery } from "./system-recovery-state.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
+const rflJudgeLogDir = () => { const dir = join(process.env.RFL_JUDGE_LOG_DIR ?? process.env.TASK_OUT ?? tmpdir(), "logs"); mkdirSync(dir, { recursive: true }); return dir; };
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -197,7 +200,7 @@ suite("fresh-continuation fallback", () => {
       } }).returning();
     const { readFreshContinuationSessionBoundary } = await import("./fresh-continuation-fallback.js");
     const boundary = await readFreshContinuationSessionBoundary(db, next, f.issueId);
-    appendFileSync(process.env.TASK_OUT + "/logs/remote-absence-authority.jsonl", JSON.stringify({ result,
+    appendFileSync(join(rflJudgeLogDir(), "remote-absence-authority.jsonl"), JSON.stringify({ result,
       fresh: record.evidence.freshContinuation, boundary }) + "\n");
     expect(boundary).toBeNull();
   });
