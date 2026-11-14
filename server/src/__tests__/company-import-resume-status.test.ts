@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
@@ -130,6 +133,38 @@ describe.skipIf(!support.supported)("import resume preserves source waiting stat
       expect(await db.select().from(issues).where(eq(issues.id, task.id))).toMatchObject([{ status }]);
     } finally { await heartbeat.drainActiveRunExecutions(); }
   });
+
+  it.each(["todo", "in_progress"])("a separate controller's real Stop fences stale imported %s recovery", async status => {
+    const f = await imported(); await ready(f);
+    const task = f.tasks.find(task => task.status === status)!;
+    const heartbeat = heartbeatService(db, options);
+    let peerPid: number | undefined;
+    const recovery = recoveryService(db, {
+      enqueueWakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts),
+      afterStrandedLatestRunRead: async ({ issueId, runId }) => {
+        expect(issueId).toBe(task.id); expect(runId).toBeNull();
+        const { stdout } = await promisify(execFile)(process.execPath, ["--import",
+          fileURLToPath(new URL("../../node_modules/tsx/dist/loader.mjs", import.meta.url)),
+          fileURLToPath(new URL("./rfl-importpause-peer.ts", import.meta.url))], {
+          timeout: 60_000,
+          env: { ...process.env, RFL_LOCAL_DATABASE_URL: database.connectionString, RFL_COMPANY_ID: f.companyId,
+            RFL_ISSUE_ID: task.id, RFL_ACTOR_ID: f.actor, RFL_STOP_FIRST: "1", RFL_CRASH_BEFORE_QUEUE: "0" },
+        });
+        console.log(stdout.trim());
+        const receipt = JSON.parse(stdout.trim().split("\n").at(-1)!);
+        peerPid = receipt.pid;
+        expect(peerPid).not.toBe(process.pid);
+      },
+    });
+    try {
+      await recovery.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: task.id });
+      const runs = await runRows(f.companyId);
+      console.log(JSON.stringify({ check: "separate-controller-import-stop", status, localPid: process.pid, peerPid,
+        runs: runs.map(run => ({ id: run.id, status: run.status })) }));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ status: "cancelled", contextSnapshot: { issueId: task.id } });
+    } finally { await heartbeat.drainActiveRunExecutions(); }
+  }, 90_000);
 
   it("stale imported todo recovery cannot undo a peer's completed initial admission and Stop", async () => {
     const f = await imported(); await ready(f);
