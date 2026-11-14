@@ -231,7 +231,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     await db.update(nativeRunFinalizations).set({phase:"terminal_failure",leaseOwner:null,leaseExpiresAt:null,recoveryState:"blocked",failureCode:code}).where(eq(nativeRunFinalizations.runId,f.run.id));
     const [prior]=await db.insert(heartbeatRuns).values({companyId:f.agent.companyId,agentId:f.agent.id,issueId:f.issue.id,
       nativeIssueId:f.issue.id,nativeSessionId:oldId,runtimeMode:"native",status:shape==="observed"?"running":"failed",
-      errorCode:shape==="observed"?"native_runner_ownership_unverified":"native_predecessor_retirement_unproven",
+      errorCode:shape==="observed"?"native_execution_ownership_unverified":"native_predecessor_retirement_unproven",
       createdAt:new Date(f.run.createdAt.getTime()-1000),finishedAt:shape==="observed"?null:new Date()}).returning();
     if(shape==="observed") await db.insert(nativeRunFinalizations).values({runId:prior.id,companyId:f.agent.companyId,issueId:f.issue.id,
       phase:"observed",attempt:2,leaseOwner:"prior-owner",leaseExpiresAt:new Date(0)});
