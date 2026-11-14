@@ -84,7 +84,7 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     const stop = vi.fn(async () => ({ providerLeaseId: f.lease.providerLeaseId!, state: "stopped" })), hb = f.cleanup(stop);
     await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
     const pending = await f.readLease();
-    expect(readStopOnlyCleanup(pending)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+    expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
     expect(pending.status).toBe("pending_cleanup");
     await f.gate();
     expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
@@ -128,7 +128,7 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
     const pending = await f.readLease(), requestId = readStopOnlyCleanup(pending)!.requestId;
     expect(pending.status).toBe("pending_cleanup");
-    expect(readStopOnlyCleanup(pending)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+    expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
     await f.gate();
     expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
     // Nothing in memory is passed to the successor service. This is the crash
@@ -137,7 +137,7 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     const stop = vi.fn(async () => {
       const [claimed] = await restartedDb.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
       expect(readStopOnlyCleanup(claimed)!.requestId).toBe(requestId);
-      expect(readStopOnlyCleanup(claimed)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+      expect((claimed.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
       return { providerLeaseId: f.lease.providerLeaseId!, state: "stopped" };
     });
     const restarted = heartbeatService(restartedDb, { environmentRuntime: { retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
