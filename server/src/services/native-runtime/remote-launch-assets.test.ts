@@ -351,6 +351,45 @@ describe("remote launch asset staging", () => {
     expect(existsSync(join(f.remote, "skills"))).toBe(false);
   });
 
+  it("stages ten skill bundles with bounded sandbox concurrency and preserves mappings", async () => {
+    const f = fixture({ concurrent: true });
+    const context = f.input.runtimeContext!;
+    for (let index = 1; index < 10; index++) {
+      const sourcePath = join(f.root, `skill-${index}`);
+      mkdirSync(sourcePath);
+      writeFileSync(join(sourcePath, "SKILL.md"), `skill ${index}`);
+      context.source.skills.push({ ...context.source.skills[0]!, key: `skill-${index}`, runtimeName: `skill-${index}`,
+        bundle: { ...context.source.skills[0]!.bundle, rootPath: sourcePath } });
+      context.target.skills.push({ ...context.target.skills[0]!, key: `skill-${index}`, runtimeName: `skill-${index}`,
+        bundle: { ...context.target.skills[0]!.bundle, rootPath: `/session/filesystem/context/skills/${index}-digest` } });
+    }
+    const active = { count: 0, max: 0 };
+    f.input.stageDirectory = vi.fn(async () => {
+      active.count++;
+      active.max = Math.max(active.max, active.count);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      active.count--;
+    });
+    const started = Date.now();
+    await stageRemoteLaunchAssets(f.input);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(1_400);
+    expect(active.max).toBeGreaterThan(1);
+    expect(active.max).toBeLessThanOrEqual(4);
+    expect(f.input.stageDirectory).toHaveBeenCalledTimes(11);
+    expect(f.input.stageDirectory.mock.calls.map(([asset]) => [asset.targetPath, asset.mode])).toEqual([
+      [context.target.instructions.bundle.rootPath, 0o555],
+      ...context.target.skills.map(skill => [skill.bundle.rootPath, 0o555]),
+    ]);
+  });
+
+  it("fails staging when one concurrently uploaded runtime asset fails", async () => {
+    const f = fixture({ concurrent: true });
+    const failure = new Error("directory upload failed");
+    f.input.stageDirectory = vi.fn().mockRejectedValueOnce(failure).mockResolvedValue(undefined);
+    await expect(stageRemoteLaunchAssets(f.input)).rejects.toBe(failure);
+  });
+
   it("retains serial paths, private launch modes and immutable context modes without an opt-in", async () => {
     const f = fixture();
     await stageRemoteLaunchAssets(f.input);
@@ -481,6 +520,7 @@ describe("remote launch asset staging", () => {
     f.stageFile.mockRejectedValueOnce(failure);
     f.stageDirectory.mockRejectedValueOnce(new Error("context failure"));
     await expect(stageRemoteLaunchAssets(f.input)).rejects.toBe(failure);
-    expect(f.stageDirectory).toHaveBeenCalledOnce();
+    // The other directory in the active four-item batch is allowed to settle.
+    expect(f.stageDirectory).toHaveBeenCalledTimes(2);
   });
 });
