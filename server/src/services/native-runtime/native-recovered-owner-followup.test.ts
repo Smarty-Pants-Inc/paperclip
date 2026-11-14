@@ -1435,6 +1435,278 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       }
     }, 60_000);
 
+  // Keep: settlepred5 RFL's real recent-owned-write regression. This helper
+  // and the two JUDGE regressions below are retained verbatim from the judge.
+  async function judgeBoot(fixture: Awaited<ReturnType<typeof lifecyclePlan>>, shape: string) {
+    const current = await currentNativeControllerIdentity();
+    const [serving] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+    const stale = randomUUID();
+    if (shape === "equal") await db.execute(sql`drop index controller_instances_epoch_idx`);
+    const epoch = shape === "newer" ? Math.max(...(await db.select().from(controllerInstances)).map(row => row.epoch)) + 1
+      : shape === "equal" ? serving!.epoch : serving!.epoch - 1;
+    await db.insert(controllerInstances).values({ bootId: stale, epoch, pid: 7, processSpace: "judge-foreign-process-space",
+      startedAt: sql`now() - interval '3 days'`,
+      renewedAt: shape === "write-grace" ? sql`now() - interval '95 seconds'` : sql`now() - interval '2 days'`,
+      leaseExpiresAt: shape === "live" ? sql`now() + interval '1 minute'`
+        : shape === "lease-grace" ? sql`now() - interval '5 seconds'` : sql`now() - interval '2 days'` });
+    const coordinator = { register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }) } as unknown as
+      ReturnType<typeof createDeliveryWorkCoordinator>;
+    const work = shape === "unregistered" ? null : registerControllerInstanceLeaseWork(db, coordinator);
+    if (work) { currentControllerProcessStamp(); await tickControllerInstanceLease(); }
+    const plan = () => planNativeLifecycleSettlement({ db, root: fixture.root, bytes: fixture.bytes,
+      identity: fixture.prior.identity, companyId, agentId, issueId: fixture.prior.issueId, currentRunId: fixture.followUp.runId });
+    return { stale, serving: serving!, coordinator, plan, cleanup: async () => {
+      await work?.stop(); resetControllerInstanceLeaseForTests();
+      await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale));
+      if (shape === "equal") await db.execute(sql`create unique index controller_instances_epoch_idx on controller_instances (epoch)`);
+    } };
+  }
+
+  it("JUDGE recent owned write after idle lapse must retain its documented grace", async () => {
+    const fixture = await lifecyclePlan(false);
+    const f = await judgeBoot(fixture, "expired");
+    const leaseId = randomUUID();
+    const [owned] = await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: null,
+      status: "active", leasePolicy: "ephemeral", provider: "fake", providerLeaseId: `judge://${leaseId}`,
+      updatedAt: sql`now()`, metadata: { leaseController: { bootId: f.stale, pid: 7,
+        hostHash: "judge-foreign-process-space", processStartedAt: null } } }).returning();
+    try {
+      expect(await proveControllerInstance(db, f.stale, owned!.updatedAt)).toBe("grace");
+      const plan = await f.plan();
+      const [after] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale));
+      console.log("JUDGE recent-owned-write evidence", JSON.stringify({
+        ownedUpdatedAt: owned!.updatedAt, leaseRenewedAt: after!.renewedAt,
+        leaseExpiresAt: after!.leaseExpiresAt, fencedAt: after!.fencedAt,
+        settlementAdmitted: plan !== null,
+      }));
+      expect.soft(plan).toBeNull();
+      expect.soft(after!.fencedAt).toBeNull();
+      expect(await proveControllerInstance(db, f.stale, owned!.updatedAt)).toBe("grace");
+    } finally { await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId)); await f.cleanup(); }
+  }, 60_000);
+
+  it.each([false, true])("JUDGE real second controller fence behavior (recent ownership=%s)", async recent => {
+    const fixture = await lifecyclePlan(false);
+    const child = spawn(process.execPath, ["--import", new URL("../../../../cli/node_modules/tsx/dist/loader.mjs", import.meta.url).pathname,
+      new URL("./rfl-lease-child.ts", import.meta.url).pathname], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"], env: { ...process.env, RFL_TEST_DB: database.connectionString },
+    });
+    const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+    const message = () => new Promise<Record<string, any>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("judge child message deadline")), 15_000);
+      child.once("message", value => { clearTimeout(timer); resolve(value as Record<string, any>); });
+    });
+    const request = (payload: Record<string, unknown>) => { const next = message(); child.send(payload); return next; };
+    let stderr = ""; child.stderr!.on("data", chunk => { stderr += String(chunk); });
+    child.stdout!.resume();
+    let stale: string | undefined;
+    let work: ReturnType<typeof registerControllerInstanceLeaseWork> | undefined;
+    const leaseId = randomUUID();
+    try {
+      const ready = await message(); expect(ready.kind).toBe("ready"); stale = ready.bootId as string;
+      const current = await currentNativeControllerIdentity();
+      const [serving] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+      await db.insert(controllerInstances).values({ bootId: stale, epoch: serving!.epoch - 1, pid: ready.pid,
+        processSpace: ready.processSpace, startedAt: sql`now() - interval '3 days'`,
+        renewedAt: sql`now() - interval '2 days'`, leaseExpiresAt: sql`now() - interval '2 days'` });
+      const coordinator = { register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }) } as unknown as
+        ReturnType<typeof createDeliveryWorkCoordinator>;
+      work = registerControllerInstanceLeaseWork(db, coordinator); currentControllerProcessStamp(); await tickControllerInstanceLease();
+      let ownedWrite: Date | null = null;
+      if (recent) {
+        const owned = await request({ action: "own", companyId, leaseId });
+        expect(owned.kind).toBe("owned"); expect(owned.wakes).toBe(1); expect(owned.lost).toEqual([]);
+        ownedWrite = new Date(owned.updatedAt);
+        expect(await proveControllerInstance(db, stale, ownedWrite)).toBe("grace");
+      }
+      expect(child.exitCode).toBeNull();
+      const plan = await planNativeLifecycleSettlement({ db, root: fixture.root, bytes: fixture.bytes,
+        identity: fixture.prior.identity, companyId, agentId, issueId: fixture.prior.issueId, currentRunId: fixture.followUp.runId });
+      const [after] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+      const renewed = await request({ action: "renew" }); expect(renewed.kind).toBe("renewed");
+      const [afterRenew] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+      console.log("JUDGE second process evidence", JSON.stringify({ recent, pid: ready.pid, ownedWrite,
+        fencedAt: after!.fencedAt, planReturned: plan !== null, laterRenewalLost: renewed.lost,
+        rowUnchangedAfterRenewal: JSON.stringify(after) === JSON.stringify(afterRenew) }));
+      if (recent) {
+        expect.soft(plan).toBeNull(); expect.soft(after!.fencedAt).toBeNull();
+        expect.soft(renewed.lost).toEqual([]);
+        expect(await proveControllerInstance(db, stale, ownedWrite)).toBe("live");
+      } else {
+        expect(plan).not.toBeNull(); expect(after!.fencedAt).toBeInstanceOf(Date);
+        expect(renewed.lost).toEqual(["fenced"]); expect(afterRenew).toEqual(after);
+        await expect(plan!.commit()).resolves.toContain("ABANDONED");
+      }
+    } finally {
+      if (child.connected) child.send({ action: "quit" });
+      const kill = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      const code = await exited; clearTimeout(kill);
+      await work?.stop(); resetControllerInstanceLeaseForTests();
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      if (stale) await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale));
+      expect(code, stderr).toBe(0);
+    }
+  }, 60_000);
+
+  // Keep: data-safety boundary. Actual PG writers, not mocked ownership reads,
+  // prove both UPDATE and INSERT are included before the fallback can fence.
+  it.each(["insert", "update"])("B1 ownership %s committed during preflight cannot be missed", async shape => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
+    const leaseId = randomUUID();
+    const lease = { id: leaseId, companyId, heartbeatRunId: null, status: "active", leasePolicy: "ephemeral",
+      provider: "fake", providerLeaseId: `b1-race://${leaseId}` };
+    const metadata = { leaseController: { bootId: f.stale, pid: 7, hostHash: "judge-foreign-process-space", processStartedAt: null } };
+    if (shape === "update") await db.insert(environmentLeases).values(lease);
+    let release!: () => void, ready!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const written = new Promise<void>(resolve => { ready = resolve; });
+    const writer = db.transaction(async tx => {
+      if (shape === "insert") await tx.insert(environmentLeases).values({ ...lease, metadata, updatedAt: sql`now()` });
+      else await tx.update(environmentLeases).set({ metadata, updatedAt: sql`now()` }).where(eq(environmentLeases.id, leaseId));
+      ready(); await gate;
+    });
+    await written;
+    let finished = false;
+    const planning = f.plan().then(plan => { finished = true; return plan; });
+    try {
+      await waitForCondition("B1 waits for the actual ownership writer", async () => {
+        const rows = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
+          and wait_event_type = 'Lock' and query like 'lock table agents, environment_leases,%'`);
+        return rows.length === 1;
+      }, 800);
+      expect(finished).toBe(false);
+      release(); await writer;
+      expect(await planning).toBeNull();
+      const [after] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale));
+      expect(after).toMatchObject({ fencedAt: null, fencedByEpoch: null });
+      const [owned] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+      expect(await proveControllerInstance(db, f.stale, owned!.updatedAt)).toBe("grace");
+      expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
+      expect([...(await loadNativeRunnerCheckpoint(db, fixture.binding))!.records]).toEqual([...fixture.checkpoint.records]);
+    } finally {
+      release(); await writer; await planning;
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId)); await f.cleanup();
+    }
+  }, 60_000);
+
+  it("B1 ownership INSERT cannot land between the inventory read and guarded fence", async () => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
+    const leaseId = randomUUID(), real = controllerLease.proveControllerInstance;
+    let inserting: Promise<unknown> | undefined, written = false;
+    const prover = vi.spyOn(controllerLease, "proveControllerInstance").mockImplementation(async (...args) => {
+      if (args[1] !== f.stale) return real(...args);
+      inserting = db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: null,
+        status: "active", leasePolicy: "ephemeral", provider: "fake", providerLeaseId: `b1-between://${leaseId}`,
+        metadata: { leaseController: { bootId: f.stale, pid: 7, hostHash: "judge-foreign-process-space", processStartedAt: null } },
+        updatedAt: sql`now()` }).then(() => { written = true; });
+      await waitForCondition("new ownership INSERT is excluded until the fence transaction commits", async () => {
+        const rows = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
+          and wait_event_type = 'Lock' and query like 'insert into "environment_leases"%'`);
+        return rows.length === 1;
+      }, 2_000);
+      expect(written).toBe(false);
+      const proof = await real(...args);
+      expect(proof).toBe("fenced"); expect(written).toBe(false);
+      return proof;
+    });
+    try {
+      expect(await f.plan()).not.toBeNull();
+      await inserting; expect(written).toBe(true);
+      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeInstanceOf(Date);
+    } finally {
+      prover.mockRestore(); await inserting;
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId)); await f.cleanup();
+    }
+  }, 60_000);
+
+  it.each([201, 2_001])("B1 fails closed on a later owned page or capped inventory (%s records)", async count => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
+    const prefix = `b1-inventory://${randomUUID()}/`;
+    const rows = Array.from({ length: count }, (_, index) => ({ companyId, heartbeatRunId: null, status: "active",
+      leasePolicy: "ephemeral", provider: "fake", providerLeaseId: `${prefix}${index}`,
+      id: index === count - 1 ? "ffffffff-ffff-4fff-afff-ffffffffffff" : `00000000-0000-4000-a000-${String(index).padStart(12, "0")}`,
+      metadata: index === count - 1 && count === 201 ? { leaseController: { bootId: f.stale, pid: 7,
+        hostHash: "judge-foreign-process-space", processStartedAt: null } } : {} }));
+    try {
+      for (let index = 0; index < rows.length; index += 200) await db.insert(environmentLeases).values(rows.slice(index, index + 200));
+      expect(await f.plan()).toBeNull();
+      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeNull();
+      await db.delete(environmentLeases).where(sql`${environmentLeases.providerLeaseId} like ${prefix + "%"}`);
+      expect(await f.plan()).not.toBeNull();
+    } finally {
+      await db.delete(environmentLeases).where(sql`${environmentLeases.providerLeaseId} like ${prefix + "%"}`); await f.cleanup();
+    }
+  }, 60_000);
+
+  it("B1 leaves even old owned boots to the documented record-driven path", async () => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
+    const leaseId = randomUUID();
+    const [owned] = await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: null,
+      status: "active", leasePolicy: "ephemeral", provider: "fake", providerLeaseId: `b1-old-owned://${leaseId}`,
+      updatedAt: sql`now() - interval '2 days'`, metadata: { leaseController: { bootId: f.stale, pid: 7,
+        hostHash: "judge-foreign-process-space", processStartedAt: null } } }).returning();
+    try {
+      expect(await f.plan()).toBeNull();
+      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeNull();
+      expect(await proveControllerInstance(db, f.stale, owned!.updatedAt)).toBe("fenced");
+      const plan = await f.plan(); expect(plan).not.toBeNull();
+      await expect(plan!.commit()).resolves.toContain("ABANDONED");
+    } finally { await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId)); await f.cleanup(); }
+  }, 60_000);
+
+  it("B1 also refuses an inventory fence that names the boot without a process stamp", async () => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired"), runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "legacy",
+      controllerBootId: f.stale, controllerLeaseExpiresAt: sql`now() + interval '1 minute'`, controllerProcess: null });
+    try {
+      expect(await f.plan()).toBeNull();
+      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeNull();
+    } finally { await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId)); await f.cleanup(); }
+  }, 60_000);
+
+  it("B1 uses reconciliation's resolved coordinator holder as well as the stored fence token", async () => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired"), runId = randomUUID(), actionId = randomUUID();
+    try {
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: fixture.prior.issueId, status: "completed" });
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId: fixture.prior.issueId, runId, phase: "committed",
+        leaseOwner: f.stale, controllerGeneration: 7, leaseExpiresAt: sql`now() + interval '1 minute'` });
+      await db.insert(issueRecoveryActions).values({ id: actionId, companyId, sourceIssueId: fixture.prior.issueId,
+        kind: "b1-resolved-fence-test", cause: "b1-resolved-fence-test", fingerprint: actionId, nextAction: "wait",
+        evidence: { observedWorkspacePreservation: { runId, state: "stop_pending", leaseOwner: "previous-holder", controllerGeneration: 6 } } });
+      expect(await f.plan()).toBeNull();
+      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeNull();
+      // Neither the original token nor a process stamp names this boot. Only
+      // resolveFenceHolders joins the current coordinator's holder into it.
+      await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      expect(await f.plan()).not.toBeNull();
+    } finally {
+      await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId));
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, runId)); await f.cleanup();
+    }
+  }, 60_000);
+
+  it.each(["agents", "environment_leases", "execution_workspace_runtime_leases", "heartbeat_runs", "issue_recovery_actions",
+    "native_run_finalizations", "sandbox_creation_operations", "workspace_operations"])("B1 busy ownership source %s times out without a fence", async table => {
+    const fixture = await lifecyclePlan(false), f = await judgeBoot(fixture, "expired");
+    let release!: () => void, ready!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const locked = new Promise<void>(resolve => { ready = resolve; });
+    const writer = db.transaction(async tx => {
+      // This is the table lock every real INSERT/UPDATE/DELETE takes, even
+      // before it has an in-progress row for the inventory to enumerate.
+      await tx.execute(sql`lock table ${sql.identifier(table)} in row exclusive mode`);
+      ready(); await gate;
+    });
+    await locked;
+    try {
+      expect(await f.plan()).toBeNull();
+      expect((await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, f.stale)))[0]!.fencedAt).toBeNull();
+      expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
+      expect([...(await loadNativeRunnerCheckpoint(db, fixture.binding))!.records]).toEqual([...fixture.checkpoint.records]);
+    } finally { release(); await writer; await f.cleanup(); }
+  }, 60_000);
+
   // Keep: ownerless production boot 4f539509; real PG/checkpoint safety boundary.
   it.each(["expired", "lease-grace", "write-grace", "live", "equal", "newer"] as const)(
     "B1 ownerless boot: %s uses only an older epoch past both grace windows", async shape => {
