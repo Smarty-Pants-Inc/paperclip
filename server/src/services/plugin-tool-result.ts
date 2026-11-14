@@ -16,18 +16,17 @@ function fail(reason: string): never {
   throw new Error(`Invalid plugin tool content: ${reason}`);
 }
 
-/** Legacy data is untouched; opting into data.content opts into strict MCP limits. */
+/** Only the new top-level field opts in; all historical data remains opaque. */
 export function validatePluginToolResult(result: ToolResult): Content[] | null {
-  const data = record(result.data);
-  if (!data || !("content" in data)) return null;
-  if (!Array.isArray(data.content) || data.content.length === 0 || data.content.length > MAX_PLUGIN_TOOL_CONTENT_ITEMS) {
+  if (!Object.prototype.hasOwnProperty.call(result, "mcpContent")) return null;
+  if (!Array.isArray(result.mcpContent) || result.mcpContent.length === 0 || result.mcpContent.length > MAX_PLUGIN_TOOL_CONTENT_ITEMS) {
     fail("content must contain 1–64 text/image blocks");
   }
   // Preserve legacy text beside native images, without duplicating a matching
   // explicit text block. Do not mutate the plugin's worker result.
   const content = typeof result.content === "string" && result.content.length > 0
-    && !data.content.some(value => record(value)?.type === "text" && record(value)?.text === result.content)
-    ? [{ type: "text", text: result.content }, ...data.content] : data.content;
+    && !result.mcpContent.some(value => record(value)?.type === "text" && record(value)?.text === result.content)
+    ? [{ type: "text", text: result.content }, ...result.mcpContent] : result.mcpContent;
   if (content.length > MAX_PLUGIN_TOOL_CONTENT_ITEMS) fail("content must contain 1–64 text/image blocks including legacy text");
   let decodedSize = 0;
   for (const value of content) {
@@ -46,8 +45,8 @@ export function validatePluginToolResult(result: ToolResult): Content[] | null {
     if (decodedSize > MAX_PLUGIN_TOOL_RESULT_BYTES) fail("result exceeds 10 MiB decoded");
   }
   // Bound metadata, duplicate legacy text, keys, and base64 wire expansion too.
-  const { content: _content, ...metadata } = data;
-  const metadataBytes = Buffer.byteLength(JSON.stringify({ ...result, data: metadata }), "utf8");
+  const { mcpContent: _content, ...metadata } = result;
+  const metadataBytes = Buffer.byteLength(JSON.stringify(metadata), "utf8");
   if (decodedSize + metadataBytes > MAX_PLUGIN_TOOL_RESULT_BYTES) fail("result exceeds 10 MiB decoded including metadata");
   return content as Content[];
 }
@@ -85,12 +84,15 @@ export async function preparePluginToolResult(
   }
   return {
     ...execution,
-    result: { ...execution.result, data: { ...record(execution.result.data), transport: "paperclip_plugin", content, imageReferences } },
+    result: { ...execution.result, mcpContent: content, data: { ...record(execution.result.data), transport: "paperclip_plugin", imageReferences } },
   };
 }
 
 /** Only opted-in native content unwraps; historical text-only envelopes stay byte-identical. */
 export function pluginGatewayToolResult(execution: ToolExecutionResult): unknown {
-  const data = record(execution.result.data);
-  return data?.transport === "paperclip_plugin" && Array.isArray(data.content) ? execution.result : execution;
+  if (!Object.prototype.hasOwnProperty.call(execution.result, "mcpContent")) return execution;
+  const { mcpContent, ...result } = execution.result;
+  // Adapt only explicit native results into #16517's existing governed shape.
+  // No second wire projection, and no duplicate body in structured metadata.
+  return { ...result, data: { ...record(result.data), transport: "paperclip_plugin", content: mcpContent } };
 }

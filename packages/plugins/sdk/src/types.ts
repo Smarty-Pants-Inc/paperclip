@@ -287,20 +287,17 @@ export type PluginToolResultContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: "image/png" | "image/jpeg" | "image/webp" };
 
-/** Opt-in native MCP content. Images use canonical base64, not URLs. */
-export interface PluginToolResultData {
-  content: PluginToolResultContent[];
-  [key: string]: unknown;
-}
-
 export interface ToolResult<TData = unknown> {
-  /** Legacy text content. Native tools can put text blocks in data.content. */
+  /** Legacy string content. Remains text alongside explicitly opted-in blocks. */
   content?: string;
-  /** Structured data; use ToolResult<PluginToolResultData> for native MCP blocks.
-   * Limits: 5 MiB decoded/image, 10 MiB decoded/result including text/metadata,
-   * and 64 blocks. Invalid or oversized native results fail, never truncate.
-   */
+  /** Arbitrary legacy structured data. Never interpreted as native content. */
   data?: TData;
+  /** Explicit opt-in to the existing governed MCP content projection.
+   * Images use canonical base64, not URLs. Limits: 5 MiB decoded/image,
+   * 10 MiB decoded/result including host metadata, 64 blocks including text.
+   * Invalid/oversized opt-ins fail loudly; they never downgrade or truncate.
+   */
+  mcpContent?: PluginToolResultContent[];
   /** If present, indicates the tool call failed. */
   error?: string;
 }

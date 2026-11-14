@@ -56,6 +56,7 @@ import { createPluginToolDispatcher, type PluginToolDispatcher } from "../servic
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { createStorageService } from "../storage/service.js";
+import type { StorageService } from "../storage/types.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
@@ -6508,6 +6509,45 @@ rl.on("line", (line) => {
     });
   });
 
+  // R2: legacy data was arbitrary before native images. Assert complete HTTP
+  // bytes through real registry/dispatcher/gateway/DB, not a helper-only shape.
+  it.each([
+    { label: "scalar", data: { content: "ordinary metadata" } },
+    { label: "null", data: { content: null } },
+    { label: "empty", data: { content: [] } },
+    { label: "ordinary array", data: { content: ["ordinary", { value: 1 }] } },
+    { label: "MCP text", data: { content: [{ type: "text", text: "plain text" }] } },
+    { label: "MCP image", data: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png" }] } },
+    { label: "transport collision", data: { transport: "paperclip_plugin", content: [{ type: "text", text: "plain text" }] } },
+  ])("preserves pre-image HTTP bytes for legacy $label data.content", async ({ data }) => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const legacy = { content: " a\n\tΩ ", data };
+    const worker = { isRunning: () => true, call: vi.fn(async () => legacy) } as unknown as PluginWorkerManager;
+    const dispatcher = createPluginToolDispatcher({ workerManager: worker });
+    dispatcher.registerPluginTools("demo.legacy", {
+      id: "demo.legacy", apiVersion: 1, version: "1.0.0", displayName: "Legacy", description: "Legacy text",
+      author: "Paperclip", categories: ["automation"], capabilities: [], entrypoints: { worker: "unused" },
+      tools: [{ name: "read", displayName: "Read", description: "Read", parametersSchema: { type: "object", properties: {} } }],
+    } as unknown as PaperclipPluginManifestV1, randomUUID());
+    const putFile = vi.fn(async () => { throw new Error("Legacy metadata must not enter native storage"); });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher, toolResultStorage: { provider: "local_disk", putFile } as unknown as StorageService });
+    const [profile] = await db.insert(toolProfiles).values({ companyId: company.id, profileKey: `legacy-${randomUUID()}`, name: "Legacy", defaultAction: "deny" }).returning();
+    await db.insert(toolProfileEntries).values({ companyId: company.id, profileId: profile.id, selectorType: "tool_name", effect: "include", toolName: "demo.legacy:read" });
+    const named = await gateway.createNamedGateway({ companyId: company.id, body: { name: "Legacy", profileId: profile.id, agentId: agent.id } });
+    const token = await gateway.createNamedGatewayToken({ companyId: company.id, gatewayId: named.id, body: { name: "Test", clientLabel: "Test", ownerNote: "", subjectType: "heartbeat_run", subjectId: run.id } });
+    const response = await request(createGatewayRouteApp(db, gateway)).post(named.endpointPath)
+      .set("authorization", `Bearer ${token.token}`)
+      .send({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "demo.legacy:read", arguments: {} } });
+    expect(response.status, response.body.error?.message).toBe(200);
+    const oldEnvelope = { pluginId: "demo.legacy", toolName: "read", result: legacy };
+    expect(response.text).toBe(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { content: [{ type: "text", text: JSON.stringify(oldEnvelope) }], isError: false } }));
+    expect(response.body.result.content.every((block: { type: string }) => block.type === "text")).toBe(true);
+    expect(putFile).not.toHaveBeenCalled();
+  });
+
   // Keep: plugin/MCP trust boundary and persistence safety. Real dispatcher,
   // registry, storage, DB, policy and HTTP; only the plugin worker is controlled.
   it("returns a plugin frame through MCP while audit retains references only", async () => {
@@ -6518,7 +6558,7 @@ rl.on("line", (line) => {
     const bytes = Buffer.from("private synthetic frame bytes: MCP bridge acceptance");
     const image = { type: "image", data: bytes.toString("base64"), mimeType: "image/png" };
     const content = [{ type: "text", text: "one frame" }, image];
-    const worker = { isRunning: () => true, call: vi.fn(async () => ({ data: { content } })) } as unknown as PluginWorkerManager;
+    const worker = { isRunning: () => true, call: vi.fn(async () => ({ mcpContent: content })) } as unknown as PluginWorkerManager;
     const dispatcher = createPluginToolDispatcher({ workerManager: worker });
     dispatcher.registerPluginTools("demo.capture", {
       id: "demo.capture", apiVersion: 1, version: "1.0.0", displayName: "Frame capture", description: "One frame",

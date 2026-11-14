@@ -33,7 +33,12 @@ export function restoreToolImages(governed: unknown, original: unknown): unknown
   const before = original as Record<string, unknown>;
   if (before.type === "image" && typeof before.data === "string") {
     const { reference: _reference, sha256: _sha256, sizeBytes: _sizeBytes, ...block } = governed as Record<string, unknown>;
-    return { ...block, data: before.data };
+    // Preserve legacy JSON field order too: data.content may be arbitrary
+    // metadata whose old text envelope must remain byte-identical. Restore
+    // only the opaque body; every other surviving field remains governed.
+    const keys = [...new Set([...Object.keys(before), ...Object.keys(block)])];
+    return Object.fromEntries(keys.filter(key => key === "data" || Object.prototype.hasOwnProperty.call(block, key))
+      .map(key => [key, key === "data" ? before.data : block[key]]));
   }
   return Object.fromEntries(Object.entries(governed).map(([key, item]) => [key, restoreToolImages(item, before[key])]));
 }

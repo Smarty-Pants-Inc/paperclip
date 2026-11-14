@@ -31,7 +31,8 @@ second provider result. Invalid native blocks fall back to the governed text.
 Stored replay receipts remain receipts; the gateway does not repeat a tool call
 to recover an image. The selected agent harness and model must also support the
 content type. Plugin tools can opt into the same projection using
-[`data.content`](./plugins/PLUGIN_SPEC.md#143-native-tool-result-images).
+[top-level `mcpContent`](./plugins/PLUGIN_SPEC.md#143-native-tool-result-images),
+never by reinterpreting legacy `data.content` metadata.
 [Tool image boundaries](./plugins/TOOL-IMAGE-CONTENT.md) records private storage,
 log/reference handling, native conversation history and the open Langfuse export
 tracker. Native Pi history is **not** image-free.

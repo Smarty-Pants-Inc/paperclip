@@ -7,7 +7,7 @@ import { validateToolContent, summarizeToolValue } from "./tool-content-guards.j
 import { MAX_PLUGIN_TOOL_IMAGE_BYTES, MAX_PLUGIN_TOOL_RESULT_BYTES, preparePluginToolResult, pluginGatewayToolResult, validatePluginToolResult } from "./plugin-tool-result.js";
 
 const image = (bytes = Buffer.from("synthetic pixels"), mimeType = "image/png") => ({ type: "image", data: bytes.toString("base64"), mimeType });
-const result = (content: unknown) => ({ content: "one frame", data: { content } });
+const result = (mcpContent: unknown): any => ({ content: "one frame", mcpContent });
 const execution = (content: unknown) => ({ pluginId: "capture", toolName: "frame", result: result(content) });
 const store = () => ({ provider: "local_disk", deleteObject: vi.fn(async () => {}), putFile: vi.fn(async (input: any) => ({ objectKey: input.objectKey, provider: "local_disk", byteSize: input.body.length })) }) as unknown as StorageService;
 
@@ -49,6 +49,19 @@ describe("plugin native MCP tool result", () => {
       .toBe(JSON.stringify({ content: [{ type: "text", text: " a\n\tΩ " }], structuredContent: { ok: true }, isError: false }));
   });
 
+  it("preserves legacy MCP-looking metadata JSON key order through governance", async () => {
+    const legacy = { pluginId: "p", toolName: "t", result: { content: "text", data: { content: [image()] } } };
+    const checked = await validateToolContent({ value: legacy, direction: "result" });
+    expect(JSON.stringify(checked.value)).toBe(JSON.stringify(legacy));
+  });
+
+  it.each([null, [], [{ type: "image", data: "bad!", mimeType: "image/png" }], [image(undefined, "image/gif")]])("rejects explicitly opted-in malformed mcpContent without downgrading it to legacy text", async mcpContent => {
+    const storage = store();
+    const raw = { pluginId: "capture", toolName: "frame", result: { content: "one frame", mcpContent } };
+    await expect(preparePluginToolResult(raw as any, { companyId: "c", invocationId: "i", storage })).rejects.toThrow("Invalid plugin tool content");
+    expect(storage.putFile).not.toHaveBeenCalled();
+  });
+
   it("accepts exactly 5 MiB per image and refuses one byte over before storage", async () => {
     const storage = store();
     expect(validatePluginToolResult(result([image(Buffer.alloc(MAX_PLUGIN_TOOL_IMAGE_BYTES))]))).toHaveLength(2);
@@ -61,7 +74,7 @@ describe("plugin native MCP tool result", () => {
     const block = image(Buffer.alloc(4 * 1024 * 1024));
     await expect(preparePluginToolResult(execution([block, block, block]), { companyId: "c", invocationId: "i", storage })).rejects.toThrow("10 MiB");
     expect(storage.putFile).not.toHaveBeenCalled();
-    expect(() => validatePluginToolResult({ data: { content: [image()], other: "x".repeat(MAX_PLUGIN_TOOL_RESULT_BYTES) } })).toThrow("10 MiB");
+    expect(() => validatePluginToolResult({ mcpContent: [image()] as any, data: { other: "x".repeat(MAX_PLUGIN_TOOL_RESULT_BYTES) } })).toThrow("10 MiB");
   });
 
   it.each([null, [], Array(65).fill({ type: "text", text: "x" }), [{ type: "image", data: "bad!", mimeType: "image/png" }], [image(undefined, "image/gif")], [{ ...image(), data: "cGl4ZWxz\n" }], [{ ...image(), data: "ZE==" }], [{ ...image(), url: "https://invalid" }], [{ type: "audio", data: "AA==", mimeType: "audio/wav" }]])("fails malformed native content loudly: %j", content => {

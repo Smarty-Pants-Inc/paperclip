@@ -3,13 +3,16 @@
 The bridge adopts the existing native MCP projection carried from upstream
 [paperclipai/paperclip#16517](https://github.com/paperclipai/paperclip/pull/16517).
 It adds no second route or MCP protocol. The plugin-owned SDK contract is
-`ToolResult<PluginToolResultData>` with native blocks in `data.content`;
+`ToolResult.mcpContent`, an explicit optional top-level field (not legacy
+`data.content`);
 [the plugin spec](./PLUGIN_SPEC.md#143-native-tool-result-images) has an example.
 
 ## Contract and ownership
 
-- `packages/plugins/sdk/src/types.ts:286` exports the optional native data shape;
-  historical `ToolResult` remains valid without a type argument or native data.
+- `packages/plugins/sdk/src/types.ts:286` exports the optional `mcpContent`
+  field/content union; historical `ToolResult` and arbitrary `data.content`
+  remain unchanged without that explicit field. The [five-line SDK seam
+  decision](./TOOL-IMAGE-SDK-SEAM.md) records the read-only upstream check.
 - `server/src/services/plugin-tool-result.ts:20` validates canonical base64,
   PNG/JPEG/WebP MIME, 5 MiB decoded/image, 10 MiB decoded/result including
   text/metadata, and 64 blocks including legacy text. It rejects unsupported,
@@ -28,7 +31,8 @@ It adds no second route or MCP protocol. The plugin-owned SDK contract is
   to the same governed native-content projection as remote MCP. It removes the
   duplicate content array from structured metadata, so the wire response has
   one image block, not an image plus a JSON-encoded copy. Legacy results that
-  do not opt into `data.content` retain the historical envelope.
+  do not opt into top-level `mcpContent` retain the historical envelope and
+  complete response bytes, even with MCP-looking legacy `data.content`.
 
 The guard changes are shared because both remote MCP and plugin images can
 reach the existing audit/classifier entry points. The runner change belongs in

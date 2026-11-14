@@ -860,29 +860,32 @@ export interface EventFilter {
 
 ## 14.3 Native tool-result images
 
-A plugin can opt into the existing gateway MCP content projection with
-`ToolResult<PluginToolResultData>`. Keep the legacy `content` string for text,
-put native MCP blocks in `data.content`, and do not stringify image blocks:
+A plugin explicitly opts into the existing gateway MCP content projection with
+optional top-level `ToolResult.mcpContent`. Keep the legacy `content` string for
+text; `data` remains arbitrary legacy metadata and never opts into native
+content, even if `data.content` contains MCP-looking blocks. Do not stringify
+image blocks:
 
 ```ts
-import type { PluginToolResultData, ToolResult } from "@paperclipai/plugin-sdk";
+import type { ToolResult } from "@paperclipai/plugin-sdk";
 
-const result: ToolResult<PluginToolResultData> = {
+const result: ToolResult = {
   content: "One captured frame",
-  data: {
-    content: [{ type: "image", mimeType: "image/png", data: pngBytes.toString("base64") }],
-  },
+  mcpContent: [{ type: "image", mimeType: "image/png", data: pngBytes.toString("base64") }],
+  data: { width: 1 },
 };
 ```
 
 The gateway sends that text beside the image, without duplicating an identical
-explicit text block. Existing results without `data.content` keep their legacy
-envelope. Native content accepts text and canonical base64 PNG, JPEG or WebP:
+explicit text block. Existing results without `mcpContent` keep their complete
+legacy envelope and HTTP bytes, including arbitrary `data.content` metadata. Native content accepts text and canonical base64 PNG, JPEG or WebP:
 5 MiB decoded per image, 10 MiB decoded per result including text/metadata, at
 most 64 blocks including legacy text. Bad MIME, malformed base64, unsupported
 blocks and excessive size fail the call; they are never silently trimmed.
 Images are stored through company-scoped storage before the call succeeds.
 
+[SDK seam decision](./TOOL-IMAGE-SDK-SEAM.md) records the upstream check and why
+this additive SDK field is needed instead of reinterpreting legacy metadata.
 [Tool image boundaries](./TOOL-IMAGE-CONTENT.md) distinguishes native conversation
 history from audit/classifier/run-event projections and the separate Langfuse
 cloud-export tracker. Do not manually log image bodies or copy them into text
