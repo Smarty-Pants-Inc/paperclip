@@ -143,7 +143,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.sweep();
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(CHAT_NOT_ANSWERED);
+    // RFL 09:16Z (b): under an ACTIVE board-owned code-only reconciliation hold a resend starts nothing
+    // (run-dispatch postgres.ts:905-994), so the note is the held one, never "sending it again is safe".
+    expect(notices[0]!.body).toBe(CHAT_HELD);
     expect(codeOf(notices[0]!)).toBe("adapter_failed");
     const rows = (notices[0]!.metadata?.sections ?? []).flatMap(section => section.rows) as Array<{ label?: string }>;
     expect(rows.some(row => row.label === "Recovery action")).toBe(true);
@@ -165,18 +167,27 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   it("SMAA-501: a person comment with no run bound in 180 s on a task held by native_continuation_requires_reconciliation -> exactly one notice", async () => {
     // org 09:11Z: chat fixture; the chat-aware action wording.
+    // RFL 09:16Z (b): a code-only reconciliation hold (no missing-evidence failure) also holds the
+    // conversation: the wake-queue release keeps the issue behind the board-owned reconciliation action
+    // and leaves deferred messages unpromoted (code-lead's D10 read, run-dispatch postgres.ts:905-994),
+    // so a resend starts nothing and "sending it again is safe" is false. SUPERSEDES the NO_RUN
+    // expectation: both messages get the held note, and the second replaces the first (one note).
     const f = await fixture({ status: "blocked" });
     const earlier = await f.run({ commentId: await f.message("first"), status: "failed", errorCode: "native_continuation_requires_reconciliation" });
     await f.boardHold("native_continuation_requires_reconciliation", earlier, "stranded_assigned_issue");
     await f.sweep();
-    expect(await f.visible()).toHaveLength(1);
-    await f.message("second, never taken by a run", 200_000);
+    let notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(CHAT_HELD);
+    const second = await f.message("second, never taken by a run", 200_000);
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand", reason: "issue_commented",
       status: "deferred_issue_execution", payload: { issueId: f.issueId } });
     await f.sweep();
-    const notices = await f.visible();
-    expect(notices).toHaveLength(2);
-    expect(notices.map(notice => notice.body)).toContain(CHAT_NO_RUN);
+    notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(CHAT_HELD);
+    expect(notices[0]!.body).not.toMatch(/sending it again is safe/i);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${second}`);
   });
 
   it("SMAA-501 (RFL 20:37Z): a comment coalesced into a remote_cleanup execution wait whose wake FAILED -> exactly one notice, at the failure (no timer)", async () => {
