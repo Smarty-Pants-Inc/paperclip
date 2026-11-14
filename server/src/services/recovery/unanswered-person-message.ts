@@ -7,6 +7,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   type Db,
@@ -23,6 +24,7 @@ import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { activeIssueInteractionCondition } from "../issue-question-context.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -57,6 +59,7 @@ export const UNANSWERED_MESSAGE_NO_RUN_GRACE_MS = 120_000;
 const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
+export const UNANSWERED_MESSAGE_HELD_REPLY_CODE = "held_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
 /** The run that carries the message is queued or scheduled and has not started. */
@@ -197,6 +200,118 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
+type HeldReplyCard = { id: string; title: string | null; summary: string | null; payload: unknown };
+const HELD_REPLY_METADATA_SECTION = "Held reply";
+const HELD_REPLY_METADATA_LABEL = "Held reply record";
+
+type HeldReplyMetadata = {
+  version: 1;
+  sourceRunId: string;
+  cardId: string | null;
+  cardName: string | null;
+  relatedCardName?: string | null;
+  cardRole?: "active_hold" | "continuation_reference" | null;
+  continuationCardIds: string[];
+  state: "waiting_for_card" | "generic" | "card_answered_no_reply" | "superseded";
+  superseded?: boolean;
+  supersededAt?: string;
+  supersededByCommentId?: string;
+  supersededByRunId?: string;
+};
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+}
+
+/** A governed wait is still an answer when Paperclip deliberately kept its
+ * accepted prose in run activity rather than publishing it to the thread. */
+function isHeldReplyRun(run: { status: string; resultJson: unknown }): boolean {
+  if (run.status !== "succeeded") return false;
+  const result = objectRecord(run.resultJson);
+  const presentation = objectRecord(result.presentationDecision);
+  const nativeResult = objectRecord(result.nativeResult);
+  const reasonCodes = Array.isArray(presentation.reasonCodes) ? presentation.reasonCodes : [];
+  const yielded = reasonCodes.includes("yielded_control_plane_wait")
+    || reasonCodes.includes("board_response_wait_superseded")
+    || result.finalizationReasonCode === "board_response_wait_superseded";
+  return presentation.commentAction === "none" && yielded
+    && typeof nativeResult.summary === "string" && nativeResult.summary.trim().length > 0;
+}
+
+function firstQuestionPrompt(payload: unknown): string | null {
+  const questions = objectRecord(payload).questions;
+  const prompt = Array.isArray(questions) ? objectRecord(questions[0]).prompt : null;
+  return typeof prompt === "string" && prompt.trim() ? prompt.trim() : null;
+}
+
+function heldReplyCardName(card: HeldReplyCard): string | null {
+  const title = card.title?.trim();
+  // When an ordinary question has no title, its first prompt is its visible name.
+  const name = title || firstQuestionPrompt(card.payload) || card.summary?.trim() || null;
+  // Keep the structured metadata row (and its JSON card references) bounded.
+  return name?.slice(0, 160) ?? null;
+}
+
+function readHeldReplyMetadata(value: unknown): HeldReplyMetadata | null {
+  const sections = objectRecord(value).sections;
+  if (!Array.isArray(sections)) return null;
+  const row = sections.flatMap(section => Array.isArray(objectRecord(section).rows)
+    ? objectRecord(section).rows as unknown[] : [])
+    .map(objectRecord).find(candidate => candidate.label === HELD_REPLY_METADATA_LABEL);
+  if (typeof row?.value !== "string") return null;
+  let parsed: unknown;
+  try { parsed = JSON.parse(row.value); } catch { return null; }
+  const held = objectRecord(parsed);
+  if (held.version !== 1 || typeof held.sourceRunId !== "string") return null;
+  return {
+    version: 1,
+    sourceRunId: held.sourceRunId,
+    cardId: typeof held.cardId === "string" ? held.cardId : null,
+    cardName: typeof held.cardName === "string" ? held.cardName : null,
+    relatedCardName: typeof held.relatedCardName === "string" ? held.relatedCardName : null,
+    cardRole: held.cardRole === "active_hold" || held.cardRole === "continuation_reference" ? held.cardRole : null,
+    continuationCardIds: Array.isArray(held.continuationCardIds)
+      ? held.continuationCardIds.filter((id): id is string => typeof id === "string") : [],
+    state: held.state === "superseded" || held.state === "card_answered_no_reply" || held.state === "waiting_for_card"
+      ? held.state : "generic",
+    ...(held.superseded === true ? { superseded: true } : {}),
+    ...(typeof held.supersededAt === "string" ? { supersededAt: held.supersededAt } : {}),
+    ...(typeof held.supersededByCommentId === "string" ? { supersededByCommentId: held.supersededByCommentId } : {}),
+    ...(typeof held.supersededByRunId === "string" ? { supersededByRunId: held.supersededByRunId } : {}),
+  };
+}
+
+function withHeldReplyMetadata(metadata: unknown, held: HeldReplyMetadata): Record<string, unknown> {
+  const base = objectRecord(metadata);
+  const sections = Array.isArray(base.sections) ? [...base.sections] : [];
+  const sectionIndex = sections.findIndex(section => objectRecord(section).title === HELD_REPLY_METADATA_SECTION);
+  const row = keyValueRow(HELD_REPLY_METADATA_LABEL, JSON.stringify(held));
+  if (sectionIndex >= 0) {
+    const section = objectRecord(sections[sectionIndex]);
+    const rows = Array.isArray(section.rows) ? section.rows as unknown[] : [];
+    sections[sectionIndex] = { ...section, rows: [...rows.filter(value => objectRecord(value).label !== HELD_REPLY_METADATA_LABEL), row] };
+  } else {
+    sections.push({ title: HELD_REPLY_METADATA_SECTION, rows: [row] });
+  }
+  return { ...base, sections };
+}
+
+function heldReplyMetadataSql(metadata: SQL | AnyPgColumn): SQL {
+  return sql`exists (select 1 from jsonb_array_elements(coalesce(${metadata}->'sections', '[]'::jsonb)) held_section,
+    jsonb_array_elements(coalesce(held_section->'rows', '[]'::jsonb)) held_row
+    where held_section->>'title' = ${HELD_REPLY_METADATA_SECTION}
+      and held_row->>'label' = ${HELD_REPLY_METADATA_LABEL})`;
+}
+
+function heldReplyOutstandingSql(metadata: SQL | AnyPgColumn): SQL {
+  return sql`exists (select 1 from jsonb_array_elements(coalesce(${metadata}->'sections', '[]'::jsonb)) held_section,
+    jsonb_array_elements(coalesce(held_section->'rows', '[]'::jsonb)) held_row
+    where held_section->>'title' = ${HELD_REPLY_METADATA_SECTION}
+      and held_row->>'label' = ${HELD_REPLY_METADATA_LABEL}
+      and coalesce(held_row->>'value', '') not like '%\"superseded\":true%')`;
+}
+
 /**
  * SQL: message m is still in scope. It is within the lookback, or its own
  * obligation saw durable activity within it: a run that carries it finished,
@@ -236,8 +351,16 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
+        and n.author_type = 'system' and n.deleted_at is null
+        and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+        and ${heldReplyOutstandingSql(sql.raw("n.metadata"))})
+    or exists (select 1 from ${issueComments} n
+      join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
+        and m.id::text = substr(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
+      where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+      and not ${heldReplyMetadataSql(sql.raw("n.metadata"))}
       and ${answeredSql(rawMessage("m"))}))`;
 }
 
@@ -260,6 +383,10 @@ export function unansweredPersonMessageCommentCondition(): SQL {
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+      and ${heldReplyOutstandingSql(issueComments.metadata)})
+    or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
+      and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
+      and not ${heldReplyMetadataSql(issueComments.metadata)}
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
@@ -303,6 +430,113 @@ function wakeCarriesIssue(payload: unknown, issueId: string): boolean {
  * the run's unblock request itself when it applies). */
 export type NativeBlockedRepairApplies = (input: { companyId: string; issueId: string; runId: string }, database: Db) => Promise<boolean>;
 
+function heldReplyBody(agentName: string, cardName: string | null, relatedCardName: string | null, hasActiveCard: boolean): string {
+  if (cardName) {
+    return `${agentName} answered while the card "${cardName}" was pending, but Paperclip kept that reply in the run's activity instead of this chat. The card is still pending.`;
+  }
+  if (hasActiveCard) {
+    return `${agentName} answered, but Paperclip kept that reply in the run's activity instead of this chat. An active card has no title or question prompt to name it.`;
+  }
+  if (relatedCardName) {
+    return `${agentName} answered, but Paperclip kept that reply in the run's activity instead of this chat. The earlier card "${relatedCardName}" is historical and is not being named as the cause of the hold.`;
+  }
+  return `${agentName} answered, but Paperclip kept that reply in the run's activity instead of this chat. No active question card explains the hold.`;
+}
+
+async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date): Promise<void> {
+  const [candidate] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    heldReplyOutstandingSql(issueComments.metadata),
+  )).limit(1);
+  if (!candidate) return;
+  await db.transaction(async tx => {
+    // Follow the comment writers' issue-first lock order. A card answer, a
+    // continuation reply, and this history update therefore settle serially.
+    await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+    const notes = await tx.select({ id: issueComments.id, metadata: issueComments.metadata,
+      presentation: issueComments.presentation, body: issueComments.body, createdAt: issueComments.createdAt })
+      .from(issueComments).where(and(
+        eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+        eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+        sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
+        heldReplyOutstandingSql(issueComments.metadata),
+      ));
+
+    for (const note of notes) {
+      const held = readHeldReplyMetadata(note.metadata);
+      if (!held || held.superseded) continue;
+      const candidateIds = [...new Set([held.cardId, ...held.continuationCardIds].filter((id): id is string => Boolean(id)))];
+      const answeredCards = candidateIds.length
+        ? await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+            eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+            eq(issueThreadInteractions.status, "answered"), inArray(issueThreadInteractions.id, candidateIds)))
+        : [];
+      let published: { id: string; runId: string | null } | undefined;
+      if (answeredCards.length) {
+        [published] = await tx.select({ id: issueComments.id, runId: issueComments.createdByRunId })
+          .from(issueComments).innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issueComments.createdByRunId))
+          .where(and(
+            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+            eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt),
+            gt(issueComments.createdAt, note.createdAt),
+            inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'interactionId'`, answeredCards.map(card => card.id)),
+          )).orderBy(issueComments.createdAt).limit(1);
+      }
+
+      if (published) {
+        const nextHeld: HeldReplyMetadata = {
+          ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
+          supersededByCommentId: published.id, supersededByRunId: published.runId ?? undefined,
+        };
+        const metadata = withHeldReplyMetadata(note.metadata, nextHeld) as never;
+        const body = `Earlier: ${note.body} The card was answered and a later reply was posted in this chat.`;
+        const presentation = note.presentation ? { ...note.presentation, title: "A later reply was posted" } : note.presentation;
+        await tx.update(issueComments).set({ body, presentation, metadata, updatedAt: now })
+          .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
+        continue;
+      }
+
+      if (answeredCards.length && held.state !== "card_answered_no_reply") {
+        const [run] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.id, held.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId))).limit(1);
+        const [agent] = run ? await tx.select({ name: agents.name }).from(agents)
+          .where(and(eq(agents.id, run.agentId), eq(agents.companyId, issue.companyId))).limit(1) : [];
+        const agentName = agent?.name?.trim() || "The agent";
+        const body = held.cardName
+          ? `Earlier: ${agentName} answered while the card "${held.cardName}" was pending, but Paperclip kept that reply in the run's activity instead of this chat. The card has been answered; no continuation reply is visible in this chat.`
+          : `Earlier: ${agentName} answered, but Paperclip kept that reply in the run's activity instead of this chat. A question card has been answered; no continuation reply is visible in this chat.`;
+        const nextHeld: HeldReplyMetadata = { ...held, state: "card_answered_no_reply" };
+        const metadata = withHeldReplyMetadata(note.metadata, nextHeld) as never;
+        const presentation = note.presentation ? { ...note.presentation, title: "No continuation reply is visible" } : note.presentation;
+        await tx.update(issueComments).set({ body, presentation, metadata, updatedAt: now })
+          .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
+      } else if (!candidateIds.length) {
+        // A generic held note has no card transition to follow. If its own run
+        // later becomes visibly published, preserve the note as history too.
+        const [publishedSourceReply] = await tx.select({ id: issueComments.id })
+          .from(issueComments).where(and(
+            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+            eq(issueComments.authorType, "agent"), eq(issueComments.createdByRunId, held.sourceRunId),
+            isNull(issueComments.deletedAt), gt(issueComments.createdAt, note.createdAt),
+          )).orderBy(issueComments.createdAt).limit(1);
+        if (publishedSourceReply) {
+          const nextHeld: HeldReplyMetadata = {
+            ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
+            supersededByCommentId: publishedSourceReply.id, supersededByRunId: held.sourceRunId,
+          };
+          const metadata = withHeldReplyMetadata(note.metadata, nextHeld) as never;
+          const body = `Earlier: ${note.body} The held reply was later posted in this chat.`;
+          const presentation = note.presentation ? { ...note.presentation, title: "The held reply was posted" } : note.presentation;
+          await tx.update(issueComments).set({ body, presentation, metadata, updatedAt: now })
+            .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
+        }
+      }
+    }
+  });
+}
+
 export async function settleUnansweredPersonMessage(
   db: Db,
   input: { companyId: string; issueId: string; now?: Date; issueCreatedAtGte?: Date | null;
@@ -316,6 +550,8 @@ export async function settleUnansweredPersonMessage(
   if (!issue) return { kind: "none" };
   if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
 
+  await reconcileHeldReplyNotes(db, issue, now);
+
   // An answer to a message supersedes that message's notice (and its
   // retrying line): the relation is message -> answer, not the notice's time.
   // Written under the same issue fence, in the same order (issue row, then its
@@ -323,6 +559,7 @@ export async function settleUnansweredPersonMessage(
   const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`not ${heldReplyMetadataSql(issueComments.metadata)}`,
     or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
       sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
   if (liveNotice) await db.transaction(async tx => {
@@ -332,6 +569,7 @@ export async function settleUnansweredPersonMessage(
     where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
+      and not ${heldReplyMetadataSql(sql.raw("n.metadata"))}
       and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
         and ${answeredSql(rawMessage("m"))})`);
@@ -440,7 +678,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
   const runs = await q.select({
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
-    errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
+    errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson,
+    contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
@@ -550,10 +789,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
+  const heldReplyRun = Boolean(run && isHeldReplyRun(run));
   let code: string;
-  if (agentPaused) {
+  if (agentPaused && !heldReplyRun) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
-  } else if (waitingToStart) {
+  } else if (waitingToStart && !heldReplyRun) {
     // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
     // carrying run has not started (a dead claim, a stuck queue): failure text.
     const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
@@ -608,7 +848,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // + NATIVE_REPAIR_PUBLISH_BOUND_MS (D4). If a guard of the repair (an
     // edited carried message, a newer status decision, a board-owned hold)
     // keeps it from publishing, this step posts the notice after that bound.
-    if (run.status === "succeeded" && nativeBlockedRepairApplies) {
+    if (run.status === "succeeded" && !heldReplyRun && nativeBlockedRepairApplies) {
       const [deferral] = await q.select({ at: sql<Date>`min(${heartbeatRunEvents.createdAt})` }).from(heartbeatRunEvents).where(and(
         eq(heartbeatRunEvents.companyId, issue.companyId), eq(heartbeatRunEvents.runId, run.id),
         eq(heartbeatRunEvents.eventType, NATIVE_REPAIR_DEFERRAL_EVENT),
@@ -621,7 +861,34 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
           ...(t0 === null ? { recordDeferral: { runId: run.id, agentId: run.agentId, messageId: message.id } } : {}) };
       }
     }
-    code = run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
+    code = heldReplyRun ? UNANSWERED_MESSAGE_HELD_REPLY_CODE
+      : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
+  }
+
+  let heldReplyCard: HeldReplyCard | null = null;
+  let continuationCardIds: string[] = [];
+  let relatedCardName: string | null = null;
+  if (heldReplyRun && run) {
+    const [activeCard] = await q.select({ id: issueThreadInteractions.id, title: issueThreadInteractions.title,
+      summary: issueThreadInteractions.summary, payload: issueThreadInteractions.payload })
+      .from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+        eq(issueThreadInteractions.status, "pending"), activeIssueInteractionCondition({ runId: run.id }),
+      )).orderBy(desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id)).limit(1);
+    heldReplyCard = activeCard ?? null;
+    // Ordinary questions can be historical for the hold predicate after a
+    // newer person message. Keep their IDs only as possible continuation links:
+    // they are never named as the cause unless the upstream predicate selected
+    // them above, but question-response-delivery can still wake from one.
+    const continuationCards = await q.select({ id: issueThreadInteractions.id, title: issueThreadInteractions.title,
+      summary: issueThreadInteractions.summary, payload: issueThreadInteractions.payload }).from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
+        eq(issueThreadInteractions.kind, "ask_user_questions"), eq(issueThreadInteractions.status, "pending"),
+        isNull(issueThreadInteractions.dismissedAt), sql`${issueThreadInteractions.sourceRunId} is distinct from ${run.id}`,
+        sql`${issueThreadInteractions.createdAt} <= ${run.createdAt.toISOString()}::timestamptz`,
+      )).orderBy(desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id)).limit(20);
+    continuationCardIds = continuationCards.map(card => card.id);
+    if (!heldReplyCard && continuationCards.length === 1) relatedCardName = heldReplyCardName(continuationCards[0]!);
   }
 
   // Already explained: the executor's held notice for this conversation, or a
@@ -640,27 +907,43 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
-  const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+  const heldReply = heldReplyRun && run ? {
+    version: 1 as const, sourceRunId: run.id,
+    // A sole prior question card is retained only as a continuation link; it
+    // is not named as the cause unless activeIssueInteractionCondition chose it.
+    cardId: heldReplyCard?.id ?? (continuationCardIds.length === 1 ? continuationCardIds[0]! : null),
+    cardName: heldReplyCard ? heldReplyCardName(heldReplyCard) : null,
+    relatedCardName,
+    cardRole: heldReplyCard ? "active_hold" as const : continuationCardIds.length === 1 ? "continuation_reference" as const : null,
+    continuationCardIds: [...new Set([heldReplyCard?.id, ...continuationCardIds].filter((id): id is string => Boolean(id)))],
+    state: heldReplyCard ? "waiting_for_card" as const : "generic" as const,
+  } : null;
+  const heldName = agentRow?.name?.trim() || "The agent";
+  const body = heldReply ? heldReplyBody(heldName, heldReply.cardName, heldReply.relatedCardName ?? null, Boolean(heldReplyCard))
+    : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
+      title: heldReply ? "The reply is held in run activity" : paused ? `${pausedName} is paused`
+        : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
       body,
-      tone: paused ? "warning" : waiting ? "info" : "warning",
-      nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+      tone: heldReply || waiting ? "info" : paused ? "warning" : "warning",
+      nextAction: heldReply ? "Open the source run to read the held reply."
+        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
         : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
     recoveryResponsibility: "user",
-    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
+    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: heldReply ? undefined : code } : null,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
     failureCode: waiting ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
+  if (heldReply) notice.metadata = withHeldReplyMetadata(notice.metadata, heldReply) as never;
   return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
