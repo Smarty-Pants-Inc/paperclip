@@ -263,7 +263,7 @@ suite("warm sandbox expiry", () => {
     const expiresAt = new Date(Date.now() + providerRemainingMs);
     await db.update(environmentLeases).set({ expiresAt }).where(eq(environmentLeases.id, leaseId));
     const retained = await row(leaseId);
-    expect(await nextWarmSandboxStopAt(db)).toBe(Math.min(retained.lastUsedAt.getTime() + 5 * MINUTE, expiresAt.getTime()));
+    expect(await nextWarmSandboxStopAt(db)).toBe(Math.min(retained.lastUsedAt.getTime() + 5 * MINUTE + WARM_SANDBOX_IDLE_CLOSE_MARGIN_MS, expiresAt.getTime()));
   });
 
   it("records the run's warm window on the lease only for a warm run", () => {
