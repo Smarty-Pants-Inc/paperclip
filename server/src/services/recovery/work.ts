@@ -1,6 +1,6 @@
 import { registerTaskWatchdogWork } from "../task-watchdog-work.js";
 import { and, asc, eq, gt, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
-import { issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
+import { issueComments, issueRecoveryActions, issueRelations, issues, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES, type DeliveryQueue } from "../delivery-work-notifications.js";
 import { decodeIssueRecoveryHint, ISSUE_RECOVERY_BACKSTOP_MS, issueRecoveryScopeMatches, resolveIssueGraph, type IssueRecoveryScope }
@@ -77,7 +77,10 @@ export function registerIssueRecoveryWork(
     worker.invalidate(JSON.stringify({ companyId: scope.companyId }));
     return true;
   }
-  function register(queue: DeliveryQueue, statuses: string[] | null, check: (scope: Scope) => Promise<unknown>, eligible?: SQL) {
+  /** `eligible` (#21517) narrows the loaded rows; `alsoBlockedWhen` (Smarty
+   * fork, B') widens a status-scoped queue to blocked tasks that match it. */
+  function register(queue: DeliveryQueue, statuses: string[] | null, check: (scope: Scope) => Promise<unknown>, eligible?: SQL,
+    alsoBlockedWhen?: () => ReturnType<typeof unansweredPersonMessageCondition>) {
     const cursors = new Map<string, string>();
     const passes = fullPasses();
     let enabled = false;
@@ -99,7 +102,9 @@ export function registerIssueRecoveryWork(
           scope?.issueIds ? inArray(issues.id, scope.issueIds) : undefined,
           cursor ? gt(issues.id, cursor) : undefined,
           statuses
-            ? inArray(issues.status, statuses)
+            ? alsoBlockedWhen
+              ? or(inArray(issues.status, statuses), and(eq(issues.status, "blocked"), alsoBlockedWhen()))
+              : inArray(issues.status, statuses)
             : or(isNotNull(issues.checkoutRunId), isNotNull(issues.executionRunId)),
           statuses ? isNull(issues.hiddenAt) : undefined,
           statuses ? isNull(issues.assigneeUserId) : undefined,
@@ -109,7 +114,17 @@ export function registerIssueRecoveryWork(
         const complete = rows.length < PAGE_SIZE;
         if (complete) cursors.delete(key); else cursors.set(key, rows.at(-1)!.id);
         passes.loaded(scope, complete);
-        return { rows: rows.map(row => ({ ...row, dueAt: Date.now() })), complete };
+        // ONE batched query per page, inside the recovery query budget: which
+        // of these tasks have a person's message to settle. The per-task check
+        // runs the unanswered-message step only for those (Smarty fork, C9).
+        // (It reads issue_comments, not issues: it is a comment scan, budgeted
+        // on its own in unanswered-person-message.test.ts, not a page load.)
+        const flagged = alsoBlockedWhen && rows.length
+          ? new Set((await db.select({ issueId: issueComments.issueId }).from(issueComments)
+            .where(and(inArray(issueComments.issueId, rows.map(row => row.id)), unansweredPersonMessageCommentCondition()))
+            .orderBy(asc(issueComments.issueId)).limit(PAGE_SIZE * 10)).map(row => row.issueId))
+          : null;
+        return { rows: rows.map(row => ({ ...row, dueAt: Date.now(), ...(flagged ? { unanswered: flagged.has(row.id) } : {}) })), complete };
       },
       check: async entry => {
         if (!enabled) return null;
@@ -203,7 +218,10 @@ export function registerIssueRecoveryWork(
   }
   // A blocked task is visited too while its person's last message is unanswered
   // (the stranded sweep's unanswered-message step, Smarty fork, TEMPORARY).
-  const assignments = register(DELIVERY_QUEUES.strandedAssignments, ["todo", "in_progress", "in_review"], owner.stranded);
+  // A blocked task is visited too while its person's last message is unanswered
+  // (the stranded sweep's unanswered-message step, Smarty fork, TEMPORARY).
+  const assignments = register(DELIVERY_QUEUES.strandedAssignments, ["todo", "in_progress", "in_review"], owner.stranded,
+    undefined, () => unansweredPersonMessageCondition(issues.id, issues.companyId));
   const orphanBlockers = registerCompany(DELIVERY_QUEUES.orphanBlockers, "blockers", async scope => { await owner.orphanBlockers(scope); });
   const recoveryActions = registerCompany(DELIVERY_QUEUES.activeRecoveryActions, "actions", async scope => {
     const result = await owner.recoveryActions(scope);
