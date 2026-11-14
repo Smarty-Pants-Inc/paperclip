@@ -415,6 +415,7 @@ import {
   type WorkspaceFileRef,
   workspaceFileRefSchema,
   isUuidLike,
+  requiresExecutionReconciliation,
   type ExecutionAgentQueue,
 } from "@paperclipai/shared";
 import { AgentQueueWaitChip } from "@/components/AgentQueueWait";
@@ -3829,8 +3830,9 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     boardAccess,
   );
   const canConfirmOwnerStop = canBoardConfirmOwnerStop(selectedCompanyId, boardAccess);
-  // Retained-file recovery reports whether it offers its own control. The task's
-  // Retry stays visible whenever it does not, so a retryable hold never dead-ends.
+  // Retained-file recovery reports whether it offers its own control. Keep the
+  // task Retry only when the server's execution blocker allows it and this recovery
+  // surface does not already own the control.
   const [retainedRecoveryOwnsRetry, setRetainedRecoveryOwnsRetry] = useState(true);
   // The break-glass override reconcile is `runtime:manage`-gated server-side, not gated on the
   // recovery-resolution permission — so hide its affordance behind the matching client check.
@@ -8294,10 +8296,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               action={issue.activeRecoveryAction ?? null} />
           )}
           {resolvedDetailTab === "chat" && (
+            // TODO(D10): replace Retry with a fresh thread from history.
             <ExecutionBlockerNotice className={shellSectionClass} presentation={issue.interruption} blockers={issue.blockedBy}
               issueId={issue.id} companyId={issue.companyId} agentName={agentMap.get(issue.assigneeAgentId ?? "")?.name} projectName={issue.project?.name}
-              canRetry={canResolveBoardRecoveryAction && !(issue.executionBlocker?.workspaceRepairRequired
-                && isRetainedWorkspaceExportCause(issue.executionBlocker.cause) && retainedRecoveryOwnsRetry)} onRetry={taskRetry.retry}
+              canRetry={canResolveBoardRecoveryAction &&
+                !(issue.executionBlocker?.canRetry === false &&
+                  requiresExecutionReconciliation(issue.executionBlocker.cause)) &&
+                !(issue.executionBlocker?.workspaceRepairRequired &&
+                  isRetainedWorkspaceExportCause(issue.executionBlocker.cause) &&
+                  retainedRecoveryOwnsRetry)}
+              onRetry={taskRetry.retry}
               optimistic={taskRetry.optimistic} takingLonger={taskRetry.takingLonger} error={taskRetry.error} />
           )}
 
