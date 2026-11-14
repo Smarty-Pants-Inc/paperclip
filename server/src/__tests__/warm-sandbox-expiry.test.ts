@@ -88,6 +88,19 @@ suite("warm sandbox expiry", () => {
     expect(await nextEnvironmentCleanupAt(db)).toBe(windowEnd);
   });
 
+  it("does not stop an expired native warm lease before its checkpoint is durable", async () => {
+    const leaseId = await warmRetained({ releasedAgoMs: 6 * MINUTE, windowMs: 5 * MINUTE });
+    const before = await row(leaseId);
+    await db.update(environmentLeases).set({ metadata: { ...before.metadata,
+      reusableSandboxLease: { adapterType: "paperclip_runner" } } }).where(eq(environmentLeases.id, leaseId));
+
+    // An elapsed warm window only makes the lease eligible for quiescence. It
+    // cannot prove the native checkpoint was published or the session closed.
+    expect(await stopWarmSandboxesPastWindow(db)).toEqual({ stopping: 0 });
+    expect((await row(leaseId)).status).toBe("retained");
+    expect((await row(leaseId)).metadata?.sandboxStopAndRetain).toBeUndefined();
+  });
+
   it("stops a sandbox once its warm window has passed and keeps it for the next turn", async () => {
     const leaseId = await warmRetained({ releasedAgoMs: 6 * MINUTE, windowMs: 5 * MINUTE });
 
