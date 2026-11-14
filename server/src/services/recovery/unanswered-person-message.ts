@@ -856,18 +856,23 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
  * The caller also requires no board-owned hold and no native same-run retry.
  */
 async function recoveryVerdictPending(q: Db, issue: DecisionIssue, run: { id: string; status: string; errorCode: string | null;
-  error: string | null; finishedAt: Date | null }, now: Date): Promise<boolean> {
+  error: string | null; finishedAt: Date | null }, now: Date, asOf = false): Promise<boolean> {
   // Imported at use: fresh-continuation-fallback.ts imports modules that import this one.
   const fallback = await import("../fresh-continuation-fallback.js");
   if (!["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) || !run.finishedAt) return false;
   if (!run.errorCode || !(fallback.BACKLOG_CONTINUATION_SOURCE_CODES as readonly string[]).includes(run.errorCode)) return false;
   if (run.finishedAt.getTime() + fallback.BACKLOG_CONTINUATION_MAX_AGE_MS <= now.getTime()) return false;
   if (isNativeContinuationRefusal(run) || fallback.isPersonOwnedFailureCode(run.errorCode)) return false;
-  const chain = await freshContinuationChain(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id });
+  // As of a past instant (a reset, RFL b2 F2): only the recovery facts that
+  // existed then. A record or chain step written later is a later verdict and
+  // never revokes a completed reset boundary.
+  const chain = await freshContinuationChain(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id,
+    ...(asOf ? { asOf: now } : {}) });
   if (chain.attempts >= fallback.FRESH_CONTINUATIONS_PER_CHAIN) return false;
   const [record] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-    sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${run.id}`)).limit(1);
+    sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${run.id}`,
+    ...(asOf ? [lte(issueRecoveryActions.createdAt, now)] : []))).limit(1);
   return !record;
 }
 
@@ -1201,7 +1206,7 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
     // note says so at once.
     if (!stillTrying && !boardHold && !heldReplyRun && !refusedRun && run.status !== "succeeded"
       && (!coordinator || !(NATIVE_PENDING_PHASES.includes(coordinator.phase) || coordinator.phase === "retryable_failure"))
-      && await recoveryVerdictPending(q, issue, run, now)) {
+      && await recoveryVerdictPending(q, issue, run, now, asOf)) {
       if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RETRYING_CODE) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
