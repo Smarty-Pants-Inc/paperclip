@@ -36,14 +36,14 @@ describe("Boat provider", () => {
     expect(lease).toMatchObject({ providerLeaseId: "bx_1", expiresAt: "2030-01-01T00:00:00Z" });
   });
   it("stops a sandbox when setup fails and includes Boat's setup error", async () => {
-    const fetch = vi.fn().mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } })).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", setupStatus: "failed", setupError: "dependency install failed" } })).mockResolvedValueOnce(response({ operation: { id: "stop_1", status: "pending" } }, 202)).mockResolvedValueOnce(response({ stop: { status: "completed" } })); vi.stubGlobal("fetch", fetch);
+    const fetch = vi.fn().mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } })).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", setupStatus: "failed", setupError: "dependency install failed" } })).mockResolvedValueOnce(response({ operation: { id: "stop_1", status: "pending" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "archiving", stop: { id: "stop_1", status: "completed" } } })); vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentAcquireLease?.({ driverKey: "boat", companyId: "co", environmentId: "env", runId: "run", config: { ...cfg, setupScript: "true" } })).rejects.toThrow("Boat sandbox bx_1 setup failed: dependency install failed");
     expect(fetch.mock.calls[3][0]).toBe("https://boat.dev/api/v1/sandboxes/bx_1/stop"); expect(fetch.mock.calls[3][1]?.method).toBe("POST"); expect(fetch).toHaveBeenCalledTimes(5);
     expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
   });
   it("stops a sandbox when setup times out", async () => {
     vi.useFakeTimers();
-    const fetch = vi.fn().mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } })).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", setupStatus: "running" } })).mockResolvedValueOnce(response({ operation: { id: "stop_1", status: "pending" } }, 202)).mockResolvedValueOnce(response({ stop: { status: "completed" } })); vi.stubGlobal("fetch", fetch);
+    const fetch = vi.fn().mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "ready" } })).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", setupStatus: "running" } })).mockResolvedValueOnce(response({ operation: { id: "stop_1", status: "pending" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "archiving", stop: { id: "stop_1", status: "completed" } } })); vi.stubGlobal("fetch", fetch);
     const acquire = plugin.definition.onEnvironmentAcquireLease?.({ driverKey: "boat", companyId: "co", environmentId: "env", runId: "run", config: { ...cfg, setupScript: "true", setupTimeoutSeconds: 1 } });
     await vi.advanceTimersByTimeAsync(1000);
     await expect(acquire).rejects.toThrow("Boat sandbox bx_1 setup timed out after 1 seconds");
@@ -73,14 +73,14 @@ describe("Boat provider", () => {
     expect(JSON.parse(String(fetch.mock.calls[0][1]?.body))).toMatchObject({ ttlSeconds: 1800, noEnv: true }); expect(lease).toMatchObject({ providerLeaseId: "bx_archived", expiresAt: "2030-01-01T00:00:00Z" }); expect(fetch).toHaveBeenCalledTimes(3);
   });
   it("stops and retains on release when reuseLease is enabled", async () => {
-    const fetch = vi.fn().mockResolvedValueOnce(response({ stop: { id: "stop_1" } }, 202)).mockResolvedValueOnce(response({ stop: { status: "completed" } })); vi.stubGlobal("fetch", fetch);
+    const fetch = vi.fn().mockResolvedValueOnce(response({ stop: { id: "stop_1" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "archiving", stop: { id: "stop_1", status: "completed" } } })); vi.stubGlobal("fetch", fetch);
     const receipt = await plugin.definition.onEnvironmentReleaseLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: { ...cfg, reuseLease: true }, providerLeaseId: "bx_1" });
     expect(fetch.mock.calls[0][1]?.method).toBe("POST"); expect(String(fetch.mock.calls[0][0])).toContain("/stop"); expect(receipt).toEqual({ providerLeaseId: "bx_1", state: "stopped" });
   });
   it("confirms stop completion before returning stopped on destroy", async () => {
-    const fetch = vi.fn().mockResolvedValueOnce(response({ operation: { id: "stop_1", status: "pending" } }, 202)).mockResolvedValueOnce(response({ stop: { status: "completed" } })); vi.stubGlobal("fetch", fetch);
+    const fetch = vi.fn().mockResolvedValueOnce(response({ operation: { id: "stop_1", status: "pending" } }, 202)).mockResolvedValueOnce(response({ sandbox: { id: "bx_1", state: "archiving", stop: { id: "stop_1", status: "completed" } } })); vi.stubGlobal("fetch", fetch);
     const receipt = await plugin.definition.onEnvironmentDestroyLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_1" });
-    expect(fetch).toHaveBeenCalledTimes(2); expect(fetch.mock.calls[0][1]?.method).toBe("POST"); expect(fetch.mock.calls[1][0]).toBe("https://boat.dev/api/v1/sandboxes/bx_1/stops/stop_1"); expect(receipt).toEqual({ providerLeaseId: "bx_1", state: "stopped" });
+    expect(fetch).toHaveBeenCalledTimes(2); expect(fetch.mock.calls[0][1]?.method).toBe("POST"); expect(fetch.mock.calls[1][0]).toBe("https://boat.dev/api/v1/sandboxes/bx_1"); expect(receipt).toEqual({ providerLeaseId: "bx_1", state: "stopped" });
   });
   it("does not report stopped or destroyed when stop returns 404", async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response({ error: "not_found" }, 404)); vi.stubGlobal("fetch", fetch);

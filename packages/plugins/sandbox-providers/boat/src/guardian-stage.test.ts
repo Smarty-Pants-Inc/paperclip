@@ -61,9 +61,8 @@ function mockBoat(options: { staged?: boolean; nodeVersion?: string; fail?: stri
     if (u.endsWith("/sandboxes") && method === "POST") return ok({ sandbox: { id: "bx_guardian" } });
     if (u.endsWith("/resume")) return ok({ sandbox: { id: "bx_guardian" } });
     if (u.endsWith('/stop') && method === 'POST') { stopped = true; return ok({ operation: { id: 'stop' } }); }
-    if (u.endsWith('/stops/stop')) return ok({stop:{status:'completed'}});
     if (method === "DELETE") { deleted = true; throw new Error('Unexpected DELETE'); }
-    if (u.endsWith("/sandboxes/bx_guardian")) return ok({ sandbox: { id: "bx_guardian", state: "ready" } });
+    if (u.endsWith("/sandboxes/bx_guardian")) return ok({ sandbox: { id: "bx_guardian", state: stopped ? "archived" : "ready", ...(stopped ? { stop: { id: "stop", status: "completed" } } : {}) } });
     throw new Error(`Unexpected mock route: ${method} ${new URL(u).pathname}`);
   }));
   return { commands, uploads, disk, get deleted() { return deleted; }, get stopped() { return stopped; } };

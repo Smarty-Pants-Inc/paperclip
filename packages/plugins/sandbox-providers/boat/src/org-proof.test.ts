@@ -74,15 +74,15 @@ const ownershipCases = [
   ["blank team id", { team: { id: " " } }, {}],
 ] as const;
 function lifecycleFixture(latest: Record<string, unknown>, options: { created?: Record<string, unknown>; resumed?: Record<string, unknown>; setup?: Record<string, unknown>; patch?: Record<string, unknown> } = {}) {
+  let stopped = false;
   const fetch = vi.fn(async (url: string, init?: RequestInit) => {
     if (url.endsWith("/orgs")) throw new Error("Ownership must never fall back to an account wallet");
-    if (url.endsWith("/stop")) return reply({ operation: { id: "stop_owned" } });
-    if (url.endsWith("/stops/stop_owned")) return reply({ stop: { status: "completed" } });
+    if (url.endsWith("/stop")) { stopped = true; return reply({ operation: { id: "stop_owned" } }); }
     if (url.endsWith("/sandboxes")) return reply({ sandbox: { id, state: "ready", team: { id: "team_create" }, ...options.created } });
     if (url.endsWith("/resume")) return reply({ sandbox: { id, state: "ready", team: { id: "team_post" }, ...options.resumed } });
     if (init?.method === "PATCH") return reply({ sandbox: { id, state: "ready", ...options.patch } });
     if (url.endsWith("/commands")) return reply({ exitCode: 0, stdout: JSON.stringify({ version: 1, provider: "boat", token: "a".repeat(64) }) });
-    if (url.endsWith(`/sandboxes/${id}`)) return reply({ sandbox: { id, state: "ready", ...latest, ...(options.setup && fetch.mock.calls.filter(([u]) => u.endsWith(`/sandboxes/${id}`)).length > 1 ? options.setup : {}) } });
+    if (url.endsWith(`/sandboxes/${id}`)) return reply({ sandbox: { id, state: "ready", ...latest, ...(options.setup && fetch.mock.calls.filter(([u]) => u.endsWith(`/sandboxes/${id}`)).length > 1 ? options.setup : {}), ...(stopped ? { id, state: "archived", stop: { id: "stop_owned", status: "completed" } } : {}) } });
     throw new Error("Unexpected fixture endpoint");
   });
   vi.stubGlobal("fetch", fetch); return fetch;

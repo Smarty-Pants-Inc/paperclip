@@ -259,20 +259,31 @@ async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseI
   idleActivity.resource(activityKey(config, id));
   const proof = idleActivity.proof(activityKey(config, id));
   const stopped = await request(config, `/sandboxes/${encodeURIComponent(id)}/stop`, { method: "POST", body: JSON.stringify({}) });
-  // The OpenAPI response uses operation; the prose uses stop, also nested on sandbox.
+  // Boat documents the operation as `stop`; OpenAPI may expose `operation`.
   // https://docs.boat.dev/api/reference/sandboxes/stop-and-archive-sandbox.md
-  const stop = stopped?.operation ?? stopped?.stop ?? stopped?.sandbox?.stop;
-  if (typeof stop?.id !== "string" || !stop.id.trim()) throw new Error("Boat stop response omitted operation/stop id");
+  const operation = stopped?.stop ?? stopped?.operation ?? stopped?.sandbox?.stop;
+  const stopId = typeof operation?.id === "string" && operation.id.trim() ? operation.id : undefined;
   const until = Date.now() + 120_000;
   while (Date.now() < until) {
-    const status = await request(config, `/sandboxes/${encodeURIComponent(id)}/stops/${encodeURIComponent(stop.id)}`);
-    const s = status.stop ?? status;
-    if (s.status === "completed") { idleActivity.confirm(proof); return { providerLeaseId: id, state: "stopped" }; }
+    // Boat's documented poll is GET /sandboxes/{id}; it also confirms a 200
+    // already-stopped response before we report success without an operation id.
+    const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
+    const sandbox = result.sandbox ?? result;
+    assertSandboxId(sandbox, id);
+    const stop = sandbox.stop ?? result.stop ?? result.operation ?? operation;
+    if (["archived", "stopped"].includes(sandbox.state) || stop?.status === "completed") {
+      idleActivity.confirm(proof); return { providerLeaseId: id, state: "stopped" };
+    }
+    // A missing id on 202 is not failure: observe the sandbox until its stop
+    // appears/completes or it reaches the documented archived state.
+    const observedId = typeof stop?.id === "string" && stop.id.trim() ? stop.id : stopId;
+    if (observedId && stop?.status && !["pending", "failing", "completed"].includes(stop.status)) {
+      throw new Error(`Boat stop ${observedId} entered ${stop.status}`);
+    }
     // Boat retries failing saves; never force a stop or discard unsaved files.
-    if (!["pending", "failing"].includes(s.status)) throw new Error(`Boat stop ${stop.id} entered ${s.status}`);
     await delay(1500);
   }
-  throw new Error(`Boat stop ${stop.id} did not complete`);
+  throw new Error(`Boat stop ${stopId ?? id} did not complete`);
 }
 // Existing SDK ownership envelope, consumed by core's creation inspection/reaper.
 function cleanupIdentity(config: Config, id: string, owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string): PluginEnvironmentCreationCleanup {
@@ -373,6 +384,21 @@ async function bindDuplexLease(params: Omit<DuplexLease, "providerLeaseId">, id:
   duplexChannels.bind(lease);
 }
 async function retireForLifecycle(lease: DuplexLease): Promise<SshRetireWarning[]> {
+  if (lease.config.duplexCarrier === "ssh" || sshCarrier.hasState(lease)) {
+    // Finish any in-flight install before deciding whether guest file/command
+    // retirement is safe; duplex suspension above prevents new opens racing it.
+    await sshCarrier.waitForPending(lease);
+    const config = parse(lease.config);
+    const result = await request(config, `/sandboxes/${encodeURIComponent(lease.providerLeaseId)}`);
+    const sandbox = result.sandbox ?? result;
+    assertSandboxId(sandbox, lease.providerLeaseId);
+    // Key retirement uploads a helper to /files and runs /commands. Neither may
+    // be sent after Boat archived the box, because direct calls can start it.
+    if (["archived", "stopped"].includes(sandbox.state)) {
+      await sshCarrier.deferRetireUntilResume(lease);
+      return [];
+    }
+  }
   try { await sshCarrier.retire(lease); return []; }
   catch (error) {
     if (!(error instanceof BoatDuplexError) || error.code !== "BOAT_SSH_RETIRE_FAILED") throw error;

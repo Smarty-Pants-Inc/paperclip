@@ -17,6 +17,7 @@ const identity = { provider, requestedRef: saved.name, id, name: saved.name, org
 type Call = { path: string; method: string; body: any };
 function fixture(options: { list?: unknown; snapshot?: Record<string, unknown>; create?: Record<string, unknown>; ready?: Record<string, unknown>; status?: number; listStatus?: number; lookupError?: Error } = {}) {
   const calls: Call[] = [];
+  let stopped = false;
   const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
     const u = new URL(url), path = u.pathname.replace("/api/v1", "") + u.search, method = init?.method ?? "GET";
@@ -27,9 +28,8 @@ function fixture(options: { list?: unknown; snapshot?: Record<string, unknown>; 
       return reply({ ok: true, type: "snapshot.saved.info", snapshot: { ...saved, ...options.snapshot } }, options.status);
     }
     if (path === "/sandboxes" && method === "POST") return reply({ sandbox: { ...sandbox, ...options.create } }, 202);
-    if (path === `/sandboxes/${sandbox.id}` && method === "GET") return reply({ sandbox: { ...sandbox, ...options.ready } });
-    if (path === `/sandboxes/${sandbox.id}/stop` && method === "POST") return reply({ operation: { id: "stop_qualification" } }, 202);
-    if (path === `/sandboxes/${sandbox.id}/stops/stop_qualification` && method === "GET") return reply({ stop: { status: "completed" } });
+    if (path === `/sandboxes/${sandbox.id}` && method === "GET") return reply({ sandbox: { ...sandbox, ...options.ready, ...(stopped ? { state: "archived", stop: { id: "stop_qualification", status: "completed" } } : {}) } });
+    if (path === `/sandboxes/${sandbox.id}/stop` && method === "POST") { stopped = true; return reply({ operation: { id: "stop_qualification" } }, 202); }
     throw new Error(`Unexpected provider operation: ${method} ${path}`);
   }));
   return calls;
@@ -125,7 +125,7 @@ describe("Boat lease snapshot qualification", () => {
     await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toThrow(/snapshot.*(team|organization)/i);
     expect(calls.slice(-2)).toMatchObject([
       { method: "POST", path: "/sandboxes/bx_qualification/stop", body: {} },
-      { method: "GET", path: "/sandboxes/bx_qualification/stops/stop_qualification" },
+      { method: "GET", path: "/sandboxes/bx_qualification" },
     ]);
     expect(calls.some(c => c.method === "DELETE")).toBe(false);
   });
@@ -141,7 +141,7 @@ describe("Boat lease snapshot qualification", () => {
     await expect(plugin.definition.onEnvironmentAcquireLease!(params)).rejects.toThrow(/snapshot.*(team|organization)/i);
     expect(calls.slice(-2)).toMatchObject([
       { method: "POST", path: "/sandboxes/bx_qualification/stop", body: {} },
-      { method: "GET", path: "/sandboxes/bx_qualification/stops/stop_qualification" },
+      { method: "GET", path: "/sandboxes/bx_qualification" },
     ]);
     expect(calls.some(c => c.method === "DELETE")).toBe(false);
   });

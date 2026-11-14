@@ -9,13 +9,12 @@ import manifest from "./manifest.js";
 // provider fixture; this is NOT a live Boat WSS or PRP/model qualification.
 it("discovers and dispatches Runner ingress through the real SDK, redacts failures, and drains only after stop", async () => {
   const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
-  let failHost = false;
+  let failHost = false, stopped = false;
   vi.stubGlobal("fetch", vi.fn(async (url: any, init?: RequestInit) => {
     if (String(url).endsWith("/host")) return failHost ? response({ message: "private-credential-must-not-escape" }, 503) : response({ port: 43127, url: "https://swift-otter-9021-43127.on.boat.dev?_token=private-token", isProtected: true, access: "private" });
-    if (String(url).endsWith("/stop") && init?.method === "POST") return response({ operation: { id: "stop" } }, 202);
-    if (String(url).endsWith("/stops/stop")) return response({ stop: { status: "completed" } });
+    if (String(url).endsWith("/stop") && init?.method === "POST") { stopped = true; return response({ operation: { id: "stop" } }, 202); }
     if (init?.method && init.method !== "GET") throw new Error("Unexpected mutation");
-    return response({ sandbox: { id: "bx_worker", state: "ready", updatedAt: "2026-11-12T00:00:00Z" } });
+    return response({ sandbox: { id: "bx_worker", state: stopped ? "archived" : "ready", updatedAt: "2026-11-12T00:00:00Z", ...(stopped ? { stop: { id: "stop", status: "completed" } } : {}) } });
   }));
   const input = new PassThrough(), output = new PassThrough(), lines = createInterface({ input: output });
   const pending = new Map<string, { resolve(value: any): void; reject(error: any): void; timer: NodeJS.Timeout }>();

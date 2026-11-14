@@ -170,6 +170,20 @@ export class BoatSshCarrier {
     state.retirement = retiring;
     return retiring;
   }
+  hasState(lease: DuplexLease): boolean { return this.states.has(scope(lease)); }
+  async waitForPending(lease: DuplexLease): Promise<void> { await this.states.get(scope(lease))?.pending?.catch(() => {}); }
+  /** Called on a confirmed stopped allocation: keep guest key removal pending for resume,
+   * but stop local transport without issuing direct commands or file writes to the box. */
+  async deferRetireUntilResume(lease: DuplexLease): Promise<void> {
+    const state = this.states.get(scope(lease));
+    if (!state) return;
+    await state.pending?.catch(() => {});
+    if (state.endpoint) { await stopMaster(state.endpoint); state.endpoint = undefined; }
+    const key = state.retirePending ?? state.key;
+    if (key) state.retirePending = { ...key };
+    state.key = undefined; state.address = undefined; state.refreshedAt = 0;
+    state.retireFailure = undefined;
+  }
   /** Only after provider destruction: no surviving guest authorization to retry. */
   forgetDestroyed(lease: DuplexLease): void { this.states.delete(scope(lease)); }
   async retireAll(companyId?: string): Promise<void> {

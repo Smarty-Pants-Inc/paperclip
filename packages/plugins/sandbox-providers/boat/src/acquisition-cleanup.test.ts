@@ -27,13 +27,16 @@ function fixture(options: { lost?: boolean; stopFailures?: number; pages?: boole
       if (options.pages && !url.searchParams.has("cursor")) return response({ sandboxes: [{ id, labels }], pageInfo: { nextCursor: "next" } });
       return response({ sandboxes: [{ id: options.pages ? "bx_abcdefgh" : id, labels }], pageInfo: { nextCursor: null } });
     }
-    if (method === "GET" && route === `/sandboxes/${id}`) return response({ sandbox: { id, state: "ready", setupStatus: "failed" } });
+    if (method === "GET" && /^\/sandboxes\/[^/?]+$/.test(route)) {
+      const sandboxId = route.slice("/sandboxes/".length);
+      return response({ sandbox: { id: sandboxId, state: running ? "ready" : "archived", setupStatus: "failed", ...(!running ? { stop: { id: "stop", status: "completed" } } : {}) } });
+    }
     if (method === "POST" && route.endsWith("/stop")) {
       expect(body).toEqual({});
       if (failures-- > 0) return response({ message: "outage" }, 503);
+      running = false;
       return response({ operation: { id: "stop" } });
     }
-    if (method === "GET" && route.endsWith("/stops/stop")) { running = false; return response({ stop: { status: "completed" } }); }
     throw new Error(`Unexpected HTTP ${method} ${url}`);
   });
   vi.stubGlobal("fetch", fetch);

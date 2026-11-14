@@ -22,7 +22,7 @@ function fixture() {
   const network = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
     const u = String(url), body = init?.body ? JSON.parse(String(init.body)) : {};
     if (u.endsWith("/sandboxes") && init?.method === "POST") return reply({ sandbox: { id: "bx_runner", state: "ready", updatedAt: revision } }, 202);
-    if (u.endsWith("/sandboxes/bx_runner")) return reply({ sandbox: { id: "bx_runner", state, updatedAt: revision, archiveAfter: "2030-01-01T00:00:00Z" } });
+    if (u.endsWith("/sandboxes/bx_runner")) return reply({ sandbox: { id: "bx_runner", state, updatedAt: revision, archiveAfter: "2030-01-01T00:00:00Z", ...(state === "archived" ? { stop: { id: "stop_1", status: "completed" } } : {}) } });
     if (u.endsWith("/host")) return reply({ port: 43127, url: `https://swift-otter-9021-43127.on.boat.dev?_token=${token}`, isProtected: true, access: "private" });
     if (u.endsWith("/resume")) { state = "ready"; revision = "2026-11-12T00:01:00Z"; return reply({ sandbox: { id: "bx_runner", state, updatedAt: revision } }, 202); }
     if (u.endsWith("/files") && init?.method === "PUT") { sentinel = JSON.parse(body.content); return reply({ success: true }); }

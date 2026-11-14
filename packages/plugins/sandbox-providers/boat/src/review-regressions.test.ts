@@ -31,7 +31,7 @@ describe("0.1.3 review regressions", () => {
     const stop = { id: "stop_123", status: "pending" };
     const body = envelope === "sandbox.stop" ? { sandbox: { id: base.providerLeaseId, stop } } : { [envelope]: stop };
     const fetch = vi.fn().mockResolvedValueOnce(response(body, 202))
-      .mockResolvedValueOnce(response({ stop: { ...stop, status: "completed" } }));
+      .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "archiving", stop: { ...stop, status: "completed" } } }));
     vi.stubGlobal("fetch", fetch);
     expect(await plugin.definition.onEnvironmentReleaseLease!(base)).toEqual({ providerLeaseId: base.providerLeaseId, state: "stopped" });
     expect(fetch.mock.calls.map(call => call[1]?.method ?? "GET")).toEqual(["POST", "GET"]);
@@ -41,8 +41,8 @@ describe("0.1.3 review regressions", () => {
   it("F2: a retrying failing stop is not a receipt; only completed settles", async () => {
     const stop = { id: "stop_123", status: "failing" };
     const fetch = vi.fn().mockResolvedValueOnce(response({ operation: stop }, 202))
-      .mockResolvedValueOnce(response({ stop }))
-      .mockResolvedValueOnce(response({ stop: { ...stop, status: "completed" } }));
+      .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "archiving", stop } }))
+      .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "archiving", stop: { ...stop, status: "completed" } } }));
     vi.stubGlobal("fetch", fetch);
     expect(await plugin.definition.onEnvironmentReleaseLease!(base)).toEqual({ providerLeaseId: base.providerLeaseId, state: "stopped" });
     expect(fetch).toHaveBeenCalledTimes(3);
@@ -50,7 +50,7 @@ describe("0.1.3 review regressions", () => {
 
   it("F3: dedicated stop retains the exact allocation even when reuse is disabled", async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response({ operation: { id: "stop_123" } }, 202))
-      .mockResolvedValueOnce(response({ stop: { id: "stop_123", status: "completed" } }));
+      .mockResolvedValueOnce(response({ sandbox: { id: base.providerLeaseId, state: "archiving", stop: { id: "stop_123", status: "completed" } } }));
     vi.stubGlobal("fetch", fetch);
     expect(await plugin.definition.onEnvironmentStopLease?.({ ...base, config: { ...config, reuseLease: false }, resourceDisposition: "stop_and_retain" })).toEqual({ providerLeaseId: base.providerLeaseId, state: "stopped" });
     expect(fetch.mock.calls.map(call => call[1]?.method ?? "GET")).toEqual(["POST", "GET"]);

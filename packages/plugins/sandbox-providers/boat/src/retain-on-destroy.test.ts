@@ -12,12 +12,12 @@ function response(body: unknown, status = 200) {
 }
 function stopResponses() {
   return vi.fn().mockResolvedValueOnce(response({ operation: { id: "stop_retained", status: "pending" } }, 202))
-    .mockResolvedValueOnce(response({ stop: { id: "stop_retained", status: "completed" } }));
+    .mockResolvedValueOnce(response({ sandbox: { id, state: "archiving", stop: { id: "stop_retained", status: "completed" } } }));
 }
 function assertNonForceStop(fetch: ReturnType<typeof vi.fn>, offset = 0) {
   expect(fetch.mock.calls.slice(offset).map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
     [`https://boat.dev/api/v1/sandboxes/${id}/stop`, "POST"],
-    [`https://boat.dev/api/v1/sandboxes/${id}/stops/stop_retained`, "GET"],
+    [`https://boat.dev/api/v1/sandboxes/${id}`, "GET"],
   ]);
   expect(JSON.parse(String(fetch.mock.calls[offset][1]?.body))).toEqual({});
   expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
@@ -25,6 +25,22 @@ function assertNonForceStop(fetch: ReturnType<typeof vi.fn>, offset = 0) {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe("retainOnDestroy compatibility", () => {
+  it("checks state before SSH retirement and sends no commands or files to an archived box", async () => {
+    const sshConfig = { ...config, duplexCarrier: "ssh" };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archived" } }))
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archived" } }, 200))
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archived" } }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(plugin.definition.onEnvironmentReleaseLease!({ ...base, config: sshConfig }))
+      .resolves.toEqual({ providerLeaseId: id, state: "stopped" });
+    expect(fetch.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      [`https://boat.dev/api/v1/sandboxes/${id}`, "GET"],
+      [`https://boat.dev/api/v1/sandboxes/${id}/stop`, "POST"],
+      [`https://boat.dev/api/v1/sandboxes/${id}`, "GET"],
+    ]);
+    expect(fetch.mock.calls.some(([url]) => String(url).includes("/commands") || String(url).includes("/files"))).toBe(false);
+  });
   it("declares an ignored boolean default true and always normalizes retention on", async () => {
     expect(manifest.environmentDrivers?.[0]?.configSchema?.properties?.retainOnDestroy).toMatchObject({
       type: "boolean", default: true, description: "ignored: sandboxes are always stopped and kept",
@@ -64,11 +80,47 @@ describe.each([undefined, false, true])("unconditional retention with retainOnDe
     else fetch.mockResolvedValueOnce(response({ sandbox: { id, state: "ready" } }))
       .mockResolvedValueOnce(response({ sandbox: { id, setupStatus: "failed", setupError: "install failed" } }));
     fetch.mockResolvedValueOnce(response({ operation: { id: "stop_retained" } }, 202))
-      .mockResolvedValueOnce(response({ stop: { id: "stop_retained", status: "completed" } }));
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archiving", stop: { id: "stop_retained", status: "completed" } } }));
     vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentAcquireLease!({ ...base, runId: "run", config: { ...retainedConfig, ...(failure === "setup" ? { setupScript: "false" } : {}) } }))
       .rejects.toThrow(failure === "setup" ? "install failed" : "entered error");
     assertNonForceStop(fetch, failure === "setup" ? 3 : 2);
+  });
+
+  it("accepts 200 already-stopped response only after GET confirms archived", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(response({ sandbox: { id, state: "archived" } }, 200))
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archived" } }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(plugin.definition.onEnvironmentReleaseLease!({ ...base, config: retainedConfig }))
+      .resolves.toEqual({ providerLeaseId: id, state: "stopped" });
+    expect(fetch.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      [`https://boat.dev/api/v1/sandboxes/${id}/stop`, "POST"],
+      [`https://boat.dev/api/v1/sandboxes/${id}`, "GET"],
+    ]);
+    expect(fetch.mock.calls.some(([url, init]) => String(url).includes("/commands") || String(url).includes("/files") || init?.method === "DELETE")).toBe(false);
+  });
+
+  it("does not turn a real Boat 500 into a successful stop", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(response({ error: "internal" }, 500));
+    vi.stubGlobal("fetch", fetch);
+    await expect(plugin.definition.onEnvironmentReleaseLease!({ ...base, config: retainedConfig }))
+      .rejects.toThrow("failed (500)");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+  });
+
+  it("confirms a 202 without an operation id by polling sandbox state", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(response({ ok: true }, 202))
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archiving" } }))
+      .mockResolvedValueOnce(response({ sandbox: { id, state: "archived" } }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(plugin.definition.onEnvironmentReleaseLease!({ ...base, config: retainedConfig }))
+      .resolves.toEqual({ providerLeaseId: id, state: "stopped" });
+    expect(fetch.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      [`https://boat.dev/api/v1/sandboxes/${id}/stop`, "POST"],
+      [`https://boat.dev/api/v1/sandboxes/${id}`, "GET"],
+      [`https://boat.dev/api/v1/sandboxes/${id}`, "GET"],
+    ]);
   });
 
   it.each(["http", "superseded", "missing-operation"])("destroy fails honestly without DELETE on %s", async failure => {
