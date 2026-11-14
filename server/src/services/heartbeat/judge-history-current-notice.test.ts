@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { expectOneCurrentSystemNote, expectSupersededSystemNote } from "../../__tests__/helpers/current-system-note.js";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -387,10 +388,10 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(selected.nativeExecution.binding.issueId).toBe(f.issue.id);
     expect(await selected.getNativeFreshSessionHandoff?.()).toContain(message!.body);
     const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
-    expect((await notices()).filter(comment => comment.authorType === "system")).toMatchObject([{
+    expect(expectOneCurrentSystemNote(await notices())).toMatchObject({
       body: expect.stringContaining("fresh thread in this conversation"),
-      metadata: { authorizationReason: `fresh_provider_thread:${continued.recoveryActionId}` },
-    }]);
+      metadata: { authorizationReason: `fresh_provider_thread_pending:${oldId}` },
+    });
     expect((await notices()).find(comment => comment.id === message!.id)?.body).toBe("Finish this in the saved conversation.");
     expect((await read(run!.id)).runnerProfileJson).toMatchObject({ piConversation: {
       id: freshId, previousId: oldId, reason: `fresh_continuation:${continued.recoveryActionId}`, generation: 2,
@@ -428,9 +429,11 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     });
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     expect(comments.find(comment => comment.id === person.id)?.body).toBe(person.body);
-    expect(comments.filter(comment => comment.authorType === "system"))
-      .toMatchObject([{ body: "Starting a fresh thread from saved history." }]);
-    expect(comments.filter(comment => comment.authorType === "system")).toHaveLength(1);
+    const current = expectOneCurrentSystemNote(comments);
+    expect(current.body).toBe("Starting a fresh thread from saved history.");
+    const previous = comments.find(comment => comment.body === "Stopping the earlier attempt before starting fresh.")!;
+    expect(comments.filter(comment => comment.authorType === "system")).toHaveLength(2);
+    expectSupersededSystemNote(previous, comments, current.id);
   });
 
   // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.

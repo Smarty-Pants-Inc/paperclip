@@ -129,7 +129,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       }
       const heldNotices = await held.visible();
       expect(heldNotices).toHaveLength(1);
-      expect(heldNotices[0]!.body).toContain("stopping the earlier attempt before starting fresh");
+      // Class 7: no pinned stop owner means a truthful failed end and Retry.
+      expect(heldNotices[0]!.body).toMatch(/cannot confirm.*stopped/i);
+      expect(heldNotices[0]!.body).toContain("Retry");
+      expect(heldNotices[0]!.body).not.toContain("I'm stopping");
     }
   });
 

@@ -28,10 +28,12 @@ describe("native continuation refusal", () => {
     "native_runner_warm_attachment_runner_exited:signal",
     "Error: native_runner_warm_attachment_runner_exited: runner process ended",
   ])("refuses the conversation for %s", value => {
-    expect(isNativeContinuationRefusal({ error: value })).toBe(true);
-    expect(isNativeContinuationRefusal({ error: value, errorCode: "native_continuation_requires_reconciliation" })).toBe(true);
+    // Class 2: metadata_format is strict D10, not a permanent refusal.
+    const permanent = value !== "native_controller_recovery_unsupported:metadata_format";
+    expect(isNativeContinuationRefusal({ error: value })).toBe(permanent);
+    expect(isNativeContinuationRefusal({ error: value, errorCode: "native_continuation_requires_reconciliation" })).toBe(permanent);
     // The code may be saved as the run's errorCode instead of its error.
-    expect(isNativeContinuationRefusal({ error: "Fixture failure", errorCode: value })).toBe(true);
+    expect(isNativeContinuationRefusal({ error: "Fixture failure", errorCode: value })).toBe(permanent);
   });
 
   it.each([

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { expectOneCurrentSystemNote, expectSupersededSystemNote } from "../__tests__/helpers/current-system-note.js";
 import { appendFileSync } from "node:fs";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -216,7 +217,10 @@ suite("fresh-continuation fallback", () => {
     report("P3", { results, again, before: before.map(n => ({ id: n.id, body: n.body, createdAt: n.createdAt, updatedAt: n.updatedAt })),
       after: after.map(n => ({ id: n.id, body: n.body, createdAt: n.createdAt, updatedAt: n.updatedAt, metadata: n.metadata })), freshActions: actions.length });
     expect(results.filter(k => k === "continued")).toHaveLength(1);
-    expect(after).toHaveLength(1);
+    expect(after).toHaveLength(2);
+    const current = expectOneCurrentSystemNote(after);
+    expect(current.body).toContain("fresh thread in this conversation");
+    expectSupersededSystemNote(before[0], after, current.id);
     expect(actions).toHaveLength(1);
     await expectOneFreshSuccessor(f);
     await deliver();

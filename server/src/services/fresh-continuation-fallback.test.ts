@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { expectOneCurrentSystemNote, expectSupersededSystemNote } from "../__tests__/helpers/current-system-note.js";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -162,10 +163,16 @@ suite("fresh-continuation fallback", () => {
     const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
       provider: "boat", providerLeaseId: `rfl-f1-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "successor_exists" });
-    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+      .toMatchObject({ kind: shape === "older_answer" ? "exact_recovery_pending" : "successor_exists" });
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    if (shape === "older_answer") {
+      // Class 5: an earlier completion never answers the refused follow-up.
+      expect(expectOneCurrentSystemNote(notes).body).toContain("stopping the earlier attempt");
+      expect(await successors(f.runId)).toHaveLength(0);
+    } else expect(notes).toHaveLength(0);
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0])
-      .toMatchObject({ status: "retained", metadata: { pluginId: "fixture-boat" } });
+      .toMatchObject({ status: shape === "older_answer" ? "pending_cleanup" : "retained",
+        metadata: { pluginId: "fixture-boat", ...(shape === "older_answer" ? { sandboxStopAndRetain: expect.any(Object) } : {}) } });
   });
 
   it("RFL extra legacy code-only rows still require physical stop, never generic isolation", async () => {
@@ -182,16 +189,34 @@ suite("fresh-continuation fallback", () => {
       .not.toHaveProperty("freshContinuation");
   });
 
+  it("RFL class 3 control: a generic envelope WITHOUT a D10 code retains isolated-workspace fallback", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
+      error: "ordinary_generic_recovery_failure" });
+    await db.update(heartbeatRuns).set({ processPid: 4242, processHostHash: "replaced-server",
+      processStartedAt: new Date(Date.now() - 600_000) }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "continued", isolation: "fresh_isolated_workspace" });
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
+      .toMatchObject({ freshContinuation: { isolation: "fresh_isolated_workspace", stopProof: "unproven_isolated" } });
+  });
+
   it.each(["no_lease", "local", "no_provider_id"])("RFL F2 nothing to stop ends and delivers (%s)", async shape => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     if (shape !== "no_lease") await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId,
       issueId: f.issueId, provider: shape === "local" ? "local" : "boat", providerLeaseId: null, status: "released" });
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "continued" });
+      .toMatchObject({ kind: shape === "no_provider_id" ? "exact_recovery_pending" : "continued" });
     const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
     expect(notes).toHaveLength(1);
-    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
-    await expectOneFreshSuccessor(f);
+    if (shape === "no_provider_id") {
+      // Class 6: no allocation id is not positive proof of absence.
+      expect(expectOneCurrentSystemNote(notes).body).toMatch(/cannot confirm.*stopped/i);
+      expect(notes[0].body).toContain("Retry");
+      expect(await successors(f.runId)).toHaveLength(0);
+    } else {
+      expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+      await expectOneFreshSuccessor(f);
+    }
   });
 
   it.each(["missing_allocation", "foreign_launch", "process_read_failed"])("RFL round5 F2-end truthful end and working Retry (%s)", async shape => {
@@ -493,8 +518,12 @@ suite("fresh-continuation fallback", () => {
     }
     for (const now of [new Date(), new Date(Date.now() + 24 * 3600_000)]) expect(await ensureFreshContinuation(db, {
       companyId, runId: f.runId, trigger: "held_recovery", now })).toMatchObject({ kind: "exact_recovery_pending" });
-    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))))
-      .toMatchObject([{ authorType: "system", body: expect.stringContaining("stopping the earlier attempt before starting fresh") }]);
+    const before = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    const pending = expectOneCurrentSystemNote(before);
+    if (shape === "live-peer") {
+      expect(pending.body).toMatch(/cannot confirm.*stopped/i);
+      expect(pending.body).toContain("Retry");
+    } else expect(pending.body).toContain("stopping the earlier attempt before starting fresh");
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
       .not.toHaveProperty("freshContinuation");
     if (peerId) await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, peerId));
@@ -502,8 +531,10 @@ suite("fresh-continuation fallback", () => {
       metadata: { pluginId: "fixture-boat", remoteExecutionTermination: receipt } }).where(eq(environmentLeases.id, lease.id));
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
     const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain("fresh thread in this conversation");
+    expect(notes).toHaveLength(2);
+    const current = expectOneCurrentSystemNote(notes);
+    expect(current.body).toContain("fresh thread in this conversation");
+    expectSupersededSystemNote(pending, notes, current.id);
     // Exercise the real delivery owner and heartbeat admission, not only a
     // continuation record. It queues exactly one fresh-history successor
     // without a person's Retry or a new message after stop proof lands.
@@ -621,10 +652,21 @@ suite("fresh-continuation fallback", () => {
     for (let pass = 0; pass < 3; pass++) {
       await settleUnrecoverableExecutions(db); await continueHeldExecutions(db); await deliver();
     }
-    expect(await successors(next.id)).toHaveLength(0);
-    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(before.length);
-    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).map(note => note.body))
-      .toEqual([NATIVE_CONTINUATION_REFUSED_ACTION]);
+    if (error === "native_controller_recovery_unsupported:metadata_format") {
+      // Class 2: metadata format uses the proven-gone fresh-thread gate.
+      expect(await successors(next.id)).toHaveLength(1);
+      const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      // The manually inserted, unowned old-release terminal fixture is not a
+      // D10 notice and is left untouched; exactly one protocol note is current.
+      expect(notes.filter(note => note.body === NATIVE_CONTINUATION_REFUSED_ACTION)).toHaveLength(1);
+      expect(expectOneCurrentSystemNote(notes.filter(note => note.metadata?.authorizationReason)).body)
+        .toBe(FRESH_THREAD_STARTED_NOTE);
+    } else {
+      expect(await successors(next.id)).toHaveLength(0);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(before.length);
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).map(note => note.body))
+        .toEqual([NATIVE_CONTINUATION_REFUSED_ACTION]);
+    }
   }, 60_000);
 
   it("durably stops a transient fallback chain at two attempts, including legacy records outside the hourly window", async () => {
@@ -732,8 +774,14 @@ suite("fresh-continuation fallback", () => {
       await sweepFallback();
       await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
     }
-    expect(await successors(next.id)).toHaveLength(0);
     const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    if (error === "native_controller_recovery_unsupported:metadata_format") {
+      // Class 2: one fresh thread and one current note, not a terminal new-task refusal.
+      expect(await successors(next.id)).toHaveLength(1);
+      expect(expectOneCurrentSystemNote(notices).body).toBe(FRESH_THREAD_STARTED_NOTE);
+      return;
+    }
+    expect(await successors(next.id)).toHaveLength(0);
     expect(notices).toHaveLength(1);
     expect(notices[0]!.body).toBe(NATIVE_CONTINUATION_REFUSED_ACTION);
     expect(notices[0]!.body).not.toMatch(/sending it again is safe/i);
@@ -747,14 +795,17 @@ suite("fresh-continuation fallback", () => {
   it("invalidates an older pending terminal fallback before it can occupy an agent slot", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     await settleUnrecoverableExecutions(db);
-    // Shape left by the previous release: pending before the permanent refusal
-    // was understood by the fallback. Do not create a new note or a queued run.
+    // Class 2: the legacy envelope's reserved D10 code is strict, not permanent.
+    // This boot's positive process-table read supplies the proven-gone gate.
     await db.update(heartbeatRuns).set({ error: "native_controller_recovery_unsupported:metadata_format" })
       .where(eq(heartbeatRuns.id, f.runId));
     await deliver();
-    expect(await successors(f.runId)).toHaveLength(0);
+    expect(await successors(f.runId)).toHaveLength(1);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0]!.evidence)
-      .toMatchObject({ continuationDelivery: "invalidated", continuationStopReason: "native_continuation_refused" });
+      .toMatchObject({ continuationDelivery: "delivered" });
+    // This is delivery of an already-recorded generic decision, not a new
+    // strict decision. Delivery must not invent a terminal new-task notice;
+    // typed session selection remains responsible for its admission notice.
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
   }, 60_000);
 
