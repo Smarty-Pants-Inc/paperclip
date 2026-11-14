@@ -166,6 +166,7 @@ describeEmbeddedPostgres("environmentService leases", () => {
         driver: { driver: "ssh", config: { host: "fixture.example.test", username: "fixture" } },
       };
       const delayedWriteDb = {
+        transaction: async (callback: (tx: unknown) => unknown) => callback(delayedWriteDb),
         update(table: typeof environments) {
           const prepared = db.update(table);
           return {
