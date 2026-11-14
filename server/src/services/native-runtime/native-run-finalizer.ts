@@ -93,6 +93,7 @@ import {
   authorizeNativeChatReviewPresentation,
   hasMaterializedNativeReviewResponse,
   restoreNativeChatReviewPresentationInTransaction,
+  rearmRestoredNativeChatReviewPublication,
 } from "./native-chat-review-presentation.js";
 import { logger } from "../../middleware/logger.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -1680,6 +1681,10 @@ export async function finalizeNativeRun(input: {
     workspaceFinalizeStatus: input.workspaceFinalizeStatus,
   });
   if (restoredResponseCommit) {
+    await input.db.transaction((tx) => rearmRestoredNativeChatReviewPublication(tx as unknown as Db, {
+      companyId: run.companyId, issueId: coordinator.issueId, runId: run.id,
+      resultJson: record(run.resultJson),
+    }));
     if (input.projectRunStatus) await projectCommittedRun({ db: input.db, run, coordinator: restoredResponseCommit });
     if (input.projectRunStatus && !input.skipNativeResponsePresentation) {
       await repairCommittedNativeChatResponse(input.db, {

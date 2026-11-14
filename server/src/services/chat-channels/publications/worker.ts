@@ -716,6 +716,22 @@ export function createChatPublicationWorker(db: Db, options: PublicationWorkerOp
                   publication,
                   runtimeContext: currentPublicationRuntimeContext,
                 });
+              if (authorizationClaim && "waitForNativeRecovery" in authorizationClaim) {
+                await db.transaction(async (tx) => {
+                  await credentialLease.assertOwned(tx);
+                  await notifyChatPublicationWork(tx, publication);
+                  await tx.update(chatPublications).set({
+                    state: "retry", nextAttemptAt: new Date(Date.now() + 250),
+                    redactedError: null, updatedAt: new Date(),
+                  }).where(and(
+                    eq(chatPublications.id, publication.id),
+                    eq(chatPublications.state, "streaming"),
+                    eq(chatPublications.attempts, publication.attempts + 1),
+                  ));
+                  await credentialLease.assertOwned(tx);
+                });
+                return;
+              }
               if (!authorizationClaim) {
                 await db.transaction(async (tx) => {
                   await credentialLease.assertOwned(tx);

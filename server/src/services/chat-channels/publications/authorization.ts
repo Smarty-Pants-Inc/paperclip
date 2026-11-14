@@ -65,7 +65,7 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
     conversation: ConversationRow;
     endpoint: EndpointRow;
     preparedText: string | null;
-  } | null> {
+  } | { waitForNativeRecovery: true } | null> {
     return db.transaction(async (tx) => {
       await input.credentialLease.assertOwned(tx);
       const currentPublication = await tx
@@ -88,7 +88,7 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
           return null;
       } catch (error) {
         if (error instanceof NativeChatReviewPresentationContentionError)
-          throw error;
+          return { waitForNativeRecovery: true };
         throw new FailedChatRetryPublicationReadError();
       }
       const attachmentFailureFence = attachmentFailureNoticeFence(
@@ -275,7 +275,9 @@ export function createChatPublicationAuthorization(db: Db, options: PublicationA
               return null;
           } catch (error) {
             if (isExternalChatWaitAuthorizationContention(error))
-              throw new NativeChatReviewPresentationContentionError();
+              return { waitForNativeRecovery: true };
+            if (error instanceof NativeChatReviewPresentationContentionError)
+              return { waitForNativeRecovery: true };
             throw error;
           }
         }

@@ -8,6 +8,7 @@ import {
   issueComments,
   issueThreadInteractions,
   issues,
+  chatPublications,
   nativeRunFinalizations,
   nativeRunResults,
   statusDecisions,
@@ -16,6 +17,9 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { nativeSha256 } from "./canonical.js";
+import { proveOwnerGone } from "../owner-proof.js";
+import { nativeLeaseHolderStamp, readNativeLeaseHolder } from "./native-token-lease-settlement.js";
+import { notifyChatPublicationWork } from "../chat-work-notifications.js";
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
 import {
@@ -366,6 +370,19 @@ export async function authorizeNativeChatReviewPresentation(
   const [coordinator] = await (lockMode === "read"
     ? coordinatorQuery.limit(1)
     : coordinatorQuery.for("update", { noWait: true }).limit(1));
+  if (!coordinator && lockMode === "nonblocking") {
+    const [recovering] = await db.select({ phase: nativeRunFinalizations.phase }).from(nativeRunFinalizations)
+      .where(and(eq(nativeRunFinalizations.runId, input.runId), eq(nativeRunFinalizations.companyId, input.companyId),
+        eq(nativeRunFinalizations.issueId, input.issueId), eq(nativeRunFinalizations.phase, "arbitrating"))).limit(1);
+    if (recovering) throw new NativeChatReviewPresentationContentionError();
+  }
+  if (coordinator?.phase === "arbitrating") {
+    const holder = readNativeLeaseHolder(coordinator.leaseHolder, coordinator.leaseOwner);
+    if (!holder || (await proveOwnerGone(nativeLeaseHolderStamp(holder, "native_finalizer_lease"))).verdict !== "alive") {
+      if (lockMode === "nonblocking") throw new NativeChatReviewPresentationContentionError();
+      return false;
+    }
+  }
   if (
     !coordinator ||
     !coordinator.assessmentId ||
@@ -616,17 +633,43 @@ export async function restoreNativeChatReviewPresentationInTransaction(
   if (!run) return false;
   // A valid existing projection still permits the caller to materialize its
   // response. Replaying recovery must not rewrite it or signal another scan.
-  if (!run.needsUpdate) return true;
-  await notifyChatRunMilestones(db, input);
-  const [updated] = await db
-    .update(heartbeatRuns)
-    .set({
-      resultJson: projectedResult,
-      updatedAt: new Date(),
-    })
-    .where(runOwner)
-    .returning({ id: heartbeatRuns.id });
-  return Boolean(updated);
+  if (run.needsUpdate) {
+    await notifyChatRunMilestones(db, input);
+    const [updated] = await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: projectedResult,
+        updatedAt: new Date(),
+      })
+      .where(runOwner)
+      .returning({ id: heartbeatRuns.id });
+    if (!updated) return false;
+  }
+  await rearmRestoredNativeChatReviewPublication(db, {
+    companyId: input.companyId, issueId: input.issueId, runId: input.runId, resultJson: projection,
+  });
+  return true;
+}
+
+/** Re-arm only the original comment publication after the identical decision is
+ * authorized again; the publication row and decision identity remain stable. */
+export async function rearmRestoredNativeChatReviewPublication(db: Db, input: {
+  companyId: string; issueId: string; runId: string; resultJson: Record<string, unknown>;
+}): Promise<void> {
+  if (!await authorizeNativeChatReviewPresentation(db, input)) return;
+  const [comment] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+    eq(issueComments.createdByRunId, input.runId), eq(issueComments.authorType, "agent"),
+    sql`${issueComments.metadata}->>'authorizationReason' = 'allow_chat_run_presentation'`,
+  )).limit(1);
+  if (!comment) return;
+  await notifyChatPublicationWork(db);
+  await db.update(chatPublications).set({ state: "pending", redactedError: null, nextAttemptAt: null, updatedAt: new Date() })
+    .where(and(
+      eq(chatPublications.companyId, input.companyId), eq(chatPublications.issueId, input.issueId),
+      eq(chatPublications.commentId, comment.id), eq(chatPublications.state, "cancelled"),
+      sql`${chatPublications.idempotencyKey} like ${`comment:${comment.id}:%`}`,
+    ));
 }
 
 /** The authorized comment and its publication intents were inserted together.
