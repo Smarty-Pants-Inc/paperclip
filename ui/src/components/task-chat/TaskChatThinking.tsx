@@ -12,7 +12,7 @@ export function TaskChatThinking({
   item,
   defaultOpen,
   rowClassName,
-  inline = readReasoningDisplay() === "inline",
+  inline = item.inline ?? readReasoningDisplay() === "inline",
   active = Boolean(item.streaming),
 }: {
   item: TaskChatThinkingItem;
