@@ -2,7 +2,7 @@ import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
 import { GENERIC_RUN_FAILURE_CODES, NATIVE_PRE_DISPATCH_FAILURE_CODE, NATIVE_PRE_DISPATCH_FAILURE_KEY, NATIVE_PRE_DISPATCH_FAILURE_RECORD, failureCauseFromAdapterResult, failureCauseFromError,
-  isNativePreDispatchTransientFailure } from "./run-failure-cause.js";
+  hasNativePreDispatchFailureRecord, isNativePreDispatchTransientFailure } from "./run-failure-cause.js";
 import { INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
 import { PREDECESSOR_RETIREMENT_FALLBACK_KEY, readPredecessorRetirementFallback, type PredecessorRetirementFallback } from "../native-runtime/predecessor-retirement.js";
 import { releaseUnchangedFallbackWorkspace } from "./predecessor-retirement-fallback.js";
@@ -1172,7 +1172,20 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: NATIVE_PRE_DISPATCH_FAILURE_CODE,
       updatedAt: new Date() }).where(and(eq(nativeRunFinalizations.companyId, run.companyId),
       eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.phase, "observed"), eq(nativeRunFinalizations.attempt, 0),
-      isNull(nativeRunFinalizations.leaseOwner), isNull(nativeRunFinalizations.controllerBootId), isNull(nativeRunFinalizations.resultId)));
+      isNull(nativeRunFinalizations.leaseOwner), isNull(nativeRunFinalizations.leaseExpiresAt),
+      isNull(nativeRunFinalizations.controllerBootId), isNull(nativeRunFinalizations.controllerPid), isNull(nativeRunFinalizations.resultId)));
+  }
+
+  async function settlePreDispatchFailureIfRecorded(run: Run) {
+    if (!hasNativePreDispatchFailureRecord(run.resultJson)) return;
+    try {
+      await settleUnclaimedNativeCoordinator(run);
+    } catch (error) {
+      // Preserve the original failure and finish its log/status/release. The
+      // unclosed coordinator still blocks admission; this is never permission
+      // to bypass ownership after a failed database write.
+      logger.warn({ err: error, runId: run.id }, "could not close the unclaimed native coordinator; keeping the native hold");
+    }
   }
 
   /**
@@ -1437,6 +1450,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     });
 
     if (failedRun) {
+      await settlePreDispatchFailureIfRecorded(failedRun);
       await appendRunEvent(failedRun, {
         eventType: "error",
         stream: "system",
@@ -1792,6 +1806,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     }
     const failedRun = await getRun(runId).catch(() => null);
     if (setupFailureWrite.updated && failedRun) {
+      // All positively pre-dispatch failures settle their unclaimed owner, not
+      // only transient DB faults. Otherwise pending cleanup holds every resend.
+      await settlePreDispatchFailureIfRecorded(failedRun);
       // Emit a run-log event so the failure is visible in the run timeline,
       // consistent with what the inner catch block does for adapter failures.
       await appendRunEvent(failedRun, {

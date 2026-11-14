@@ -20,6 +20,8 @@ import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import { agentRunSupersededByFreshContinuation } from "../../../agent-run-cancellation.js";
 import { freshContinuationIsolatesRun } from "../../../services/fresh-continuation-fallback.js";
+import { hasNativePreDispatchFailureRecord } from "../../../services/heartbeat/run-failure-cause.js";
+import { canBypassFailedNativePredecessor } from "../../../services/native-runtime/native-provider-work-proof.js";
 import type { Db } from "@paperclipai/db";
 import { deliveredQueuedCommentIds, EXTERNAL_CHAT_MESSAGE_WAKE_MUTATION, EXTERNAL_CHAT_MESSAGE_WAKE_REASON } from "../../../services/queued-comment-delivery.js";
 import { extractIssueReferenceIdentifiers, isUuidLike } from "@paperclipai/shared";
@@ -910,6 +912,11 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
     issue.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(issue.status);
   if (!applies || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
+  // The native owner, not HTTP status or the queue, proves no execution. An
+  // affirmative pre-dispatch failure leaves the saved input on the normal
+  // admission path; inventing a reconciliation hold would dead-end resends.
+  if (hasNativePreDispatchFailureRecord(run.resultJson)
+    && await canBypassFailedNativePredecessor(tx, { companyId: run.companyId, runId: run.id })) return false;
   // A pause's stop is intentional: the task keeps its status and resuming
   // continues it. It is never a reconciliation incident with no control. A
   // termination that replaced the pause shares its stop reason, so the agent

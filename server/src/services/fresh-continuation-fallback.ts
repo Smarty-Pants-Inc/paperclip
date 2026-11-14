@@ -364,6 +364,54 @@ export async function readFreshContinuationReadiness(db: Db, run: Pick<typeof he
   return { mode: "fresh_isolated_workspace" as const, retryIntentId: recordId, sourceRunId, retainedSourceIds: [] as string[] };
 }
 
+/** Read the existing fallback owner's decision, not a caller's force-fresh flag.
+ * The source has lost write authority and the decision records the workspace
+ * isolation. Consumers may leave that source's provider thread exactly once:
+ * only while their current thread still equals sourceSessionId. No execution
+ * or snapshot proof is relaxed by this authorization. Caller holds the task
+ * lock, which serializes this decision with admission, Stop and chat resets. */
+export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select">,
+  run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+  const [record] = await db.select({ action: issueRecoveryActions, source: heartbeatRuns })
+    .from(issueRecoveryActions).innerJoin(heartbeatRuns, and(
+      eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+      sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}'`,
+    )).where(and(eq(issueRecoveryActions.companyId, run.companyId),
+      eq(issueRecoveryActions.sourceIssueId, issueId), eq(issueRecoveryActions.status, "resolved"),
+      eq(issueRecoveryActions.outcome, "restored"), eq(issueRecoveryActions.ownerType, "system"),
+      eq(issueRecoveryActions.returnOwnerAgentId, run.agentId),
+      sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,schema}' = ${FRESH_CONTINUATION_SCHEMA}`,
+      eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.nativeIssueId, issueId),
+      eq(heartbeatRuns.runtimeMode, "native"),
+      sql`${heartbeatRuns.id} <> ${run.id}`,
+      sql`${heartbeatRuns.createdAt} < (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
+      sql`(${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}')::timestamptz <= (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
+    )).orderBy(desc(sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}'`), desc(issueRecoveryActions.id)).limit(1);
+  if (!record) return null;
+  const { action, source } = record;
+  const fresh = object(action.evidence.freshContinuation);
+  const settlement = object(action.evidence.freshContinuationSettlement);
+  const reconciliation = object(action.evidence.executionReconciliation);
+  const context = object(run.contextSnapshot);
+  if (fresh.schema !== FRESH_CONTINUATION_SCHEMA || settlement.schema !== FRESH_CONTINUATION_SCHEMA
+    || fresh.sourceRunId !== source.id || settlement.sourceRunId !== source.id
+    || settlement.actorType !== "system" || settlement.actorId !== FRESH_CONTINUATION_ACTOR
+    || settlement.decision !== "continue_in_fresh_run" || settlement.replay !== "none"
+    || reconciliation.actorId !== FRESH_CONTINUATION_ACTOR || reconciliation.runId !== source.id
+    || !["remote_epoch", "writer_ended", "fresh_isolated_workspace"].includes(String(fresh.isolation))
+    || settlement.isolation !== fresh.isolation
+    || (fresh.isolation === "fresh_isolated_workspace" && context.freshContinuationIsolation !== action.id)
+    || (fresh.isolation === "writer_ended" ? fresh.stopProof !== "writer_ended"
+      : !["unproven_epoch_abandoned", "unproven_isolated"].includes(String(fresh.stopProof)))
+    || typeof fresh.recordedAt !== "string" || source.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY] !== fresh.recordedAt
+    || !UNFINISHED_STATUSES.includes(source.status) || !source.finishedAt || !source.nativeSessionId
+    || source.contextSnapshot?.conversationSessionGeneration !== context.conversationSessionGeneration
+    || (context.recoveryActionId != null && context.recoveryActionId !== action.id)
+    || (action.evidence.continuationRunId != null && action.evidence.continuationRunId !== run.id)
+    || !["pending", "not_requested", "delivered"].includes(String(action.evidence.continuationDelivery))) return null;
+  return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId };
+}
+
 /**
  * True when a wake continues a cut-off run in a new isolated workspace. The
  * fallback cleared the task's workspace binding on purpose, and the run
