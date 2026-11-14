@@ -1014,6 +1014,27 @@ success value. The action may already have completed. Reconcile its saved
 result or receipt instead of repeating it. Replaying the same MCP call identity
 reuses the original handler execution, including when delivery failed.
 
+## Pi Node compile cache
+
+Pi RPC keeps Node's derived compile cache outside its conversation runtime:
+`<physical OS temporary directory>/paperclip-pi-cache-<uid>/node-compile-cache`
+(the process ID replaces the uid on platforms without `getuid`). This cache is
+reused by Pi launches under the same execution account; it is disposable and is
+not conversation history. The namespace and cache must be owned by the execution
+uid and private (`0700`), and the cache must pass an actual write probe. An
+existing unsafe path is never chmodded or trusted; provisioning failures disable
+caching without refusing the launch. An inherited `NODE_COMPILE_CACHE` cannot
+redirect it. A custom temporary directory that places the cache inside the Pi
+runtime disables caching instead.
+
+The native Pi persistence profile copies `runner/`, `pi-agent/` (without launch
+credentials/settings), and `pi/`. Conversation evidence retains whole retired
+session or backup trees. Keep the execution host's temporary directory outside
+those trees: the host-local compile cache is not part of either persistence
+boundary. No cache-name filter is applied during backup or evidence retention.
+Existing caches already inside older session trees are not moved or deleted by
+this launch-policy change.
+
 ## Prepared harness storage
 
 An execution environment can supply an existing Claude configuration directory

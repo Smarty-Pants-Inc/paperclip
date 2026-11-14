@@ -7,7 +7,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PiRpcDriver, type PiRpcHarnessSession } from "./pi-rpc-driver.js";
 import { PiRpcTransport, type PiRpcRecord } from "./pi-rpc-transport.js";
 
@@ -40,7 +40,11 @@ describe.skipIf(!binary || process.platform === "win32" || process.getuid?.() ==
       if (!address || typeof address === "string") throw new Error("No loopback port");
       for (let attempt = 1; attempt <= 2; ++attempt) {
         const run = join(root, String(attempt)), home = join(run, "agent"), workspace = join(run, "workspace"), sessions = join(run, "sessions");
-        const cache = join(sessions, "node-compile-cache"), probe = join(run, "native-cache.json");
+        const temporaryDirectory = join(run, "tmp");
+        const cacheRoot = join(temporaryDirectory, `paperclip-pi-cache-${process.getuid?.() ?? process.pid}`);
+        const cache = join(cacheRoot, "node-compile-cache"), probe = join(run, "native-cache.json");
+        await mkdir(cacheRoot, { recursive: true, mode: 0o700 });
+        vi.stubEnv("TMPDIR", temporaryDirectory);
         await mkdir(join(home, "extensions"), { recursive: true, mode: 0o700 });
         await mkdir(workspace); await mkdir(sessions, { mode: 0o700 });
         if (kind === "unwritable") await mkdir(cache, { mode: 0o500 });
@@ -119,6 +123,7 @@ describe.skipIf(!binary || process.platform === "win32" || process.getuid?.() ==
         await mkdir(process.env.PI_COMPILE_CACHE_PROOF_DIRECTORY, { recursive: true, mode: 0o700 });
         await writeFile(join(process.env.PI_COMPILE_CACHE_PROOF_DIRECTORY, `${kind}.json`), `${JSON.stringify(proof, null, 2)}\n`);
       }
+      vi.unstubAllEnvs();
       await chmod(shared, 0o700);
       await rm(root, { recursive: true, force: true });
     }

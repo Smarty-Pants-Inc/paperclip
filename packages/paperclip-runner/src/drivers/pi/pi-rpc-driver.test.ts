@@ -1,7 +1,7 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createCapabilityRunnerdProviderEnvironment } from "../../live/runnerd-codex-transport.js";
 import { mapPiRpcRecord, PiRpcDriver } from "./pi-rpc-driver.js";
@@ -277,7 +277,14 @@ describe("PiRpcDriver", () => {
       }).openSession({ runId: "home", normalizedSessionId: "home", workingDirectory: root });
       try {
         expect(launched?.AGENT_HOME).toBeUndefined();
-        expect(launched?.NODE_COMPILE_CACHE).toBe(join(root, "sessions/node-compile-cache"));
+        // Recorded production path explosion: derived caches must never enter
+        // failover backups or retained conversation trees.
+        const cache = launched!.NODE_COMPILE_CACHE!;
+        expect(relative(root, cache)).toMatch(/^\.\.(?:[\\/]|$)/u);
+        expect(cache).not.toBe("/tmp/node-compile-cache");
+        expect((await stat(dirname(cache))).mode & 0o777).toBe(0o700);
+        expect((await stat(cache)).mode & 0o777).toBe(0o700);
+        expect((await stat(cache)).uid).toBe(process.getuid!());
         expect(launched?.NODE_DISABLE_COMPILE_CACHE).toBeUndefined();
       } finally { await session.close(); }
     } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }

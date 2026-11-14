@@ -1,10 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { access, chmod, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PiRpcDriver, type NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
+import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
 import {
   buildNativeHarnessBackupManifestStreamed,
   resolveNativeHarnessPersistenceProfile,
@@ -17,6 +18,37 @@ import {
 // conversation copy. Use real archive/copy helpers and the driver's cold-open
 // boundary; a completed-turn JSONL fixture needs no model or provider credentials.
 describe("Pi conversation transcript sandbox backups", () => {
+  it("retires a Pi runtime with a populated launch cache without retaining cache paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-cache-evidence-"));
+    let cacheEntry: string | undefined;
+    try {
+      const base = join(root, "durable-sessions"), source = join(base, "a".repeat(64));
+      const runtime = join(source, "pi");
+      await mkdir(runtime, { recursive: true, mode: 0o700 });
+      const bytes = '{"type":"session","version":3,"id":"evidence"}\n';
+      await writeFile(join(runtime, "evidence.jsonl"), bytes, { mode: 0o600 });
+      const stopped = new Error("captured evidence launch");
+      const driver = new PiRpcDriver({ runtimeDirectory: runtime, model: "neutral/model", piRpcThinkingLevel: "high",
+        environment: { PI_CODING_AGENT_DIR: join(source, "pi-agent") },
+        transportFactory: options => {
+          cacheEntry = join(options.env!.NODE_COMPILE_CACHE!, "evidence-proof");
+          throw stopped;
+        },
+      });
+      await expect(driver.openSession({ runId: "evidence", normalizedSessionId: "evidence", workingDirectory: root }))
+        .rejects.toBe(stopped);
+      await writeFile(cacheEntry!, "populated compiled module", { mode: 0o600 });
+      expect(await retainNativePiConversationEvidence(source)).toBe(true);
+      const evidence = join(base, "conversation-evidence");
+      const paths = await readdir(evidence, { recursive: true });
+      expect(paths.filter(path => path.split(/[\\/]/u).includes("node-compile-cache"))).toEqual([]);
+      expect(await readFile(join(evidence, paths.find(path => path.endsWith("evidence.jsonl"))!), "utf8")).toBe(bytes);
+      expect(await readFile(cacheEntry!, "utf8")).toBe("populated compiled module");
+    } finally {
+      if (cacheEntry) await rm(cacheEntry, { force: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it.each(["archive", "sync"] as const)("restores completed-turn bytes before the driver cold-opens them (%s)", async transfer => {
     const root = await mkdtemp(join(tmpdir(), "pi-transcript-backup-"));
     try {
@@ -50,6 +82,21 @@ describe("Pi conversation transcript sandbox backups", () => {
       for (const name of launchFiles)
         await writeFile(join(live, "filesystem", "pi-agent", name), "AUTH_SENTINEL", { mode: 0o600 });
       await writeFile(join(live, "filesystem", "pi-agent", "retained.txt"), "agent home state", { mode: 0o600 });
+      // Provision through the real Pi launch path, then simulate a populated
+      // native compile cache. No cache-specific exclusion is passed to copying.
+      const stoppedAtLiveOpen = new Error("captured live Pi cache environment");
+      let compileCache: string | undefined;
+      const liveDriver = new PiRpcDriver({ runtimeDirectory: join(live, "filesystem", "pi"),
+        model: "neutral/model", piRpcThinkingLevel: "high",
+        environment: { PI_CODING_AGENT_DIR: join(live, "filesystem", "pi-agent") },
+        transportFactory: options => { compileCache = options.env!.NODE_COMPILE_CACHE; throw stoppedAtLiveOpen; },
+      });
+      await expect(liveDriver.openSession({ runId: "first-run", normalizedSessionId: sessionId, workingDirectory: live }))
+        .rejects.toBe(stoppedAtLiveOpen);
+      expect(compileCache).toBeDefined();
+      const cacheEntry = join(compileCache!, `backup-proof-${transfer}`);
+      await writeFile(cacheEntry, "populated compiled module", { mode: 0o600 });
+      const paths = async (directory: string) => readdir(directory, { recursive: true });
       const execute = async ({ command, args, stdin }: { command: string; args: string[]; stdin?: string }) => ({
         exitCode: 0, timedOut: false, stderr: "",
         stdout: execFileSync(command, args, { encoding: "utf8", input: stdin, maxBuffer: 64 * 1024 * 1024 }),
@@ -71,6 +118,8 @@ describe("Pi conversation transcript sandbox backups", () => {
       for (const directory of profile.directories)
         await syncRemoteRunnerDirectoryOut({ runner: runner as never, sourcePath: runtimePath(live, directory),
           targetPath: join(backupRoot, directory.name), mode: 0o700, excludeEntries: directory.excludeEntries });
+      expect((await paths(backupRoot)).filter(path => path.split(/[\\/]/u).includes("node-compile-cache"))).toEqual([]);
+      expect(await readFile(cacheEntry, "utf8")).toBe("populated compiled module");
       const manifest = await buildNativeHarnessBackupManifestStreamed({ backupRoot, execution, runnerInstanceId: "runner-1",
         sourceProviderLeaseId: "old-sandbox", providerSessionIdentity: { providerSessionId: sessionId } });
       await writeFile(join(backupRoot, "manifest.json"), JSON.stringify(manifest));
@@ -117,6 +166,18 @@ describe("Pi conversation transcript sandbox backups", () => {
       // A later corruption of the transcript invalidates the verified backup.
       await writeFile(join(backupRoot, "pi", `${sessionId}.jsonl`), "corrupt");
       expect(await verifyNativeHarnessBackupStreamed({ root: controller, execution, runnerInstanceId: "runner-1" })).toBeNull();
+      // Evidence retains the whole retired backup (rename, not a filtered copy).
+      // Restore valid bytes first and prove both history preservation and no cache.
+      await writeFile(join(backupRoot, "pi", `${sessionId}.jsonl`), transcript);
+      expect(await retainNativePiConversationEvidence(backupRoot, controller)).toBe(true);
+      const evidence = join(controller, "conversation-evidence");
+      const evidencePaths = await paths(evidence);
+      expect(evidencePaths.filter(path => path.split(/[\\/]/u).includes("node-compile-cache"))).toEqual([]);
+      const evidenceTranscript = evidencePaths.find(path => path.endsWith(`${sessionId}.jsonl`));
+      expect(evidenceTranscript).toBeDefined();
+      expect(await readFile(join(evidence, evidenceTranscript!))).toEqual(transcript);
+      expect(await readFile(cacheEntry, "utf8")).toBe("populated compiled module");
+      await rm(cacheEntry);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 });
