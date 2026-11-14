@@ -1381,7 +1381,11 @@ Stop, provider-work or payment authority and do not establish a hosted failure c
 Structured events in this guide remain in `heartbeat_run_events`. When the
 instance's existing file storage uses S3, new stdout/stderr NDJSON logs use the
 same stack bucket and configured prefix under `run-logs/`, with existing run
-references in Postgres. Local-disk instances remain local. Raw provider
+references in Postgres. Local-disk instances remain local. Retained native ingress
+routes resolve transport state diagnostics and performance spans through the current
+session diagnostic epoch. Warm reuse switches that epoch before `run.attach`,
+including when attachment fails. Retiring a run clears both destinations: an idle
+route does not append to a finalized predecessor log or reuse its trace. Raw provider
 traces have their own restricted, encrypted object path. See
 [run evidence storage](run-evidence-storage.md) for batching, durability,
 configuration, migration, retention, and qualification boundaries.

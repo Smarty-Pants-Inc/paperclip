@@ -1,3 +1,5 @@
+import type { NativeRunTrace } from "./native-run-trace.js";
+
 export interface NativeDiagnosticOwner {
   companyId: string;
   sessionScope: string;
@@ -11,7 +13,7 @@ export interface NativeDiagnosticLease {
 export type NativeIdleDiagnosticKind = "transport_close_requested" | "session_diagnostic";
 
 type Sink = (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-type Epoch = { owner: NativeDiagnosticOwner; sink?: Sink };
+type Epoch = { owner: NativeDiagnosticOwner; sink?: Sink; trace?: NativeRunTrace };
 const sessions = new WeakMap<object, NativeSessionDiagnostics>();
 
 export class NativeSessionDiagnostics {
@@ -29,18 +31,21 @@ export class NativeSessionDiagnostics {
     this.lastOwner = { ...initialOwner };
   }
 
-  activate(owner: NativeDiagnosticOwner, sink?: Sink): NativeDiagnosticLease {
+  activate(owner: NativeDiagnosticOwner, sink?: Sink, trace?: NativeRunTrace): NativeDiagnosticLease {
     if (!owner.runId || owner.companyId !== this.scope.companyId || owner.sessionScope !== this.scope.sessionScope)
       throw new Error("native_diagnostic_owner_scope_mismatch");
-    if (this.active && (this.active.owner.runId !== owner.runId || this.active.sink !== sink))
+    if (this.active && (this.active.owner.runId !== owner.runId || this.active.sink !== sink || this.active.trace !== trace))
       throw new Error("native_diagnostic_owner_busy");
-    const epoch: Epoch = this.active ?? { owner: { ...owner }, sink };
+    const epoch: Epoch = this.active ?? { owner: { ...owner }, sink, trace };
     this.active = epoch;
     this.lastOwner = epoch.owner;
     return {
       retire: () => { if (this.active === epoch) this.active = undefined; },
     };
   }
+
+  /** A retained route resolves the current run at each operation, never its creator. */
+  get trace(): NativeRunTrace | undefined { return this.active?.trace; }
 
   bind(session: object): void {
     const existing = sessions.get(session);
