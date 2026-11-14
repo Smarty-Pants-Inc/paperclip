@@ -3620,7 +3620,7 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
                                         reasoningDisplay={tailReasoningDisplay}
                                         emptyMessage={
                                           tailStatus === "queued"
-                                            ? "Waiting to start..."
+                                            ? undefined
                                             : (liveRun && liveRun.id === tailRunId
                                                 ? liveRun.currentStatusMessage
                                                 : null) ||
