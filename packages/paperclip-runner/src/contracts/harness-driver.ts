@@ -640,6 +640,20 @@ export const RUNNER_PREPARE_REFUSAL_CODES = [
   "native_controller_recovery_missing_evidence:retained_sandbox_binding",
 ] as const;
 export type RunnerPrepareRefusalCode = typeof RUNNER_PREPARE_REFUSAL_CODES[number];
+
+/** Codes emitted only by the Runner's skill/instruction refresh admission.
+ * Provider config/contract drift can refuse preparation but is not proof that a
+ * skill/instruction update took effect. */
+export function isInstructionRefreshPrepareCode(code: unknown): boolean {
+  return code === "provider_active_turn"
+    || code === "provider_live_descendants"
+    || code === "provider_active_goal"
+    || code === "provider_contract_changed";
+}
+
+export const INSTRUCTION_REFRESH_PREPARE_CODES = RUNNER_PREPARE_REFUSAL_CODES
+  .filter(isInstructionRefreshPrepareCode);
+
 export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepareRefusalCode | undefined {
   if (!error || typeof error !== "object" || depth > 5) return undefined;
   if (error instanceof NativeRunnerRefreshRequiredError && error.prepareRefusalCode) return error.prepareRefusalCode;

@@ -10,6 +10,7 @@ import { PENDING_CLEANUP_SWEEP_ATTEMPT_CAP } from "../environment-cleanup-state.
 import { isBuiltinSandboxProvider } from "../sandbox-provider-runtime.js";
 import { currentProcessSpaceHash } from "../controller-process-identity.js";
 import { hostname } from "node:os";
+import { isInstructionRefreshPrepareCode } from "../../vendor/paperclip-runner/index.js";
 
 export const FRESH_THREAD_STARTED_NOTE = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
 export const FRESH_THREAD_STOP_UNAVAILABLE_NOTE = "Paperclip cannot confirm that the earlier attempt stopped, so it has not started another thread. Your message and saved work are kept. Retry checks again and starts fresh only after the earlier attempt is confirmed stopped.";
@@ -21,13 +22,11 @@ export const FRESH_THREAD_TURN_NOTE = "Your message is saved; the current step m
 export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof heartbeatRuns.$inferSelect): Promise<string> {
   const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown; prepareRefusalCode?: unknown } | undefined;
   const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
-  // Only the typed instruction-refresh channel proves a skill change. Generic
-  // prepare refusal and unrelated specific prepare refusals stay neutral.
-  const typedRefreshCodes = new Set([
-    "provider_active_turn", "provider_live_descendants", "provider_active_goal", "provider_contract_changed",
-  ]);
+  // Only the Runner's typed instruction-refresh channel proves a skill change.
+  // Generic prepare refusal and unrelated specific prepare refusals stay neutral.
   if (code !== "native_runner_refresh_required"
-    || (refusal?.prepareRefusalCode != null && !typedRefreshCodes.has(String(refusal.prepareRefusalCode)))) return FRESH_THREAD_STARTED_NOTE;
+    || (refusal?.prepareRefusalCode != null
+      && !isInstructionRefreshPrepareCode(refusal.prepareRefusalCode))) return FRESH_THREAD_STARTED_NOTE;
   const [agent] = await db.select({ name: agents.name }).from(agents).where(and(
     eq(agents.companyId, run.companyId), eq(agents.id, run.agentId))).limit(1);
   return `your skill change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
