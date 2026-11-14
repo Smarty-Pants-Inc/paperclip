@@ -83,6 +83,80 @@ describe("worker configuration completion", () => {
   });
 });
 
+describe("plugin jobs after event notifications", () => {
+  // Trust-boundary regression: use a real SDK worker and the real host gate.
+  // SQL execution alone is stubbed; the plugin's namespace service owns it.
+  async function start() {
+    const query = vi.fn(async () => [{ value: 1 }]);
+    const companyGet = vi.fn(async () => ({ id: "company-b" }));
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["events.subscribe", "jobs.schedule", "database.namespace.read", "companies.read"],
+      services: { db: { query }, companies: { get: companyGet },
+        events: { subscribe: async () => ({ subscriptionId: "events" }) } } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: path.join(FIXTURES_DIR, "plugin-worker-events-jobs.mjs"),
+      // Workspace packages export TypeScript source in checkout mode.
+      execArgv: ["--import", import.meta.resolve("tsx")],
+      manifest: { ...TEST_MANIFEST, capabilities: ["events.subscribe", "jobs.schedule", "database.namespace.read", "companies.read"],
+        jobs: [{ jobKey: "query", displayName: "Query", schedule: "* * * * *" }] },
+      config: {}, instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1,
+      hostHandlers: handlers,
+    });
+    await handle.start();
+    return { handle, query, companyGet };
+  }
+  const job = (jobKey: string): HostToWorkerMethods["runJob"][0] => ({ job: {
+    jobKey, runId: "job-run", trigger: "schedule", scheduledAt: new Date().toISOString(),
+  } });
+  const event = (companyId: string, hold = false): HostToWorkerMethods["onEvent"][0] => ({ event: {
+    eventId: `event-${companyId}`, eventType: "issue.updated", companyId,
+    occurredAt: new Date().toISOString(), payload: { hold },
+  } });
+
+  it("runs a job's db.query immediately after completed events without inheriting company authority", async () => {
+    const { handle, query, companyGet } = await start();
+    try {
+      await handle.call("runJob", job("query"));
+      query.mockClear();
+      handle.notify("onEvent", event("company-a"));
+      handle.notify("onEvent", event("company-b"));
+      await vi.waitFor(async () => expect(await handle.call("getData", { key: "snapshot", params: {} })).toMatchObject({ completed: 2 }));
+      // Both notification scopes are still inside their 15-minute TTL.
+      await expect(handle.call("runJob", job("query"))).resolves.toBeNull();
+      expect(query).toHaveBeenCalledExactlyOnceWith({ sql: "SELECT 1 AS value" });
+      await expect(handle.call("getData", { key: "snapshot", params: {} })).resolves.toEqual({ events: 2, completed: 2, held: false, rows: [{ value: 1 }] });
+      await expect(handle.call("runJob", job("unscoped"))).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
+      await expect(handle.call("runJob", job("company"))).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(companyGet).not.toHaveBeenCalled();
+    } finally { await handle.stop(); }
+  });
+
+  it("keeps job queries independent while an event handler is still running", async () => {
+    const { handle, query } = await start();
+    try {
+      handle.notify("onEvent", event("company-a", true));
+      await vi.waitFor(async () => expect(await handle.call("getData", { key: "snapshot", params: {} })).toMatchObject({ held: true }));
+      await expect(handle.call("runJob", job("query"))).resolves.toBeNull();
+      expect(query).toHaveBeenCalledTimes(1);
+      await handle.call("getData", { key: "release", params: {} });
+      await vi.waitFor(async () => expect(await handle.call("getData", { key: "snapshot", params: {} })).toMatchObject({ completed: 1 }));
+    } finally { await handle.stop(); }
+  });
+
+  it.each(["query", "fail", "wait"])("settles the job invocation after %s without leaving a stale scope", async (key) => {
+    const { handle } = await start();
+    try {
+      if (key === "query") await handle.call("runJob", job(key));
+      else if (key === "fail") await expect(handle.call("runJob", job(key))).rejects.toThrow("job failed");
+      else await expect(handle.call("runJob", job(key), 10)).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.TIMEOUT });
+      await expect(handle.call("getData", { key: "unscoped-query", params: {} })).resolves.toEqual([{ value: 1 }]);
+    } finally { await handle.stop(); }
+  });
+});
+
 describe("plugin worker unavailable refusals", () => {
   it("refuses calls to a stopped or missing worker with a typed, unsent error", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
