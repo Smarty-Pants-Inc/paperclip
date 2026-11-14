@@ -123,12 +123,12 @@ function trackedDriver(driver: lifecycle.LifecycleDriver): lifecycle.LifecycleDr
     runPlugin: (agent, pluginId) => trackIdleWork(driver.runPlugin(agent, pluginId)) };
 }
 
-export function configureAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun = () => true) {
-  return lifecycle.configureAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(driver), canRun);
+export function configureAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun = () => true, concurrency = 4) {
+  return lifecycle.configureAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(driver), canRun, concurrency);
 }
 
-export function startAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun: () => boolean) {
-  return lifecycle.startAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(driver), canRun);
+export function startAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun: () => boolean, concurrency = 4) {
+  return lifecycle.startAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(driver), canRun, concurrency);
 }
 
 /** Budget evaluation owns the transaction and supplies the aggregate agent decision. */

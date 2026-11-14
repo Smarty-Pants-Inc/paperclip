@@ -26,9 +26,9 @@ export type { LifecycleDriver, LifecycleAgent, LifecycleFailure } from "./applic
 const wakes = new WeakMap<Db, () => void>();
 
 const workers = new WeakMap<Db, ReturnType<typeof createLifecycleWorker>>();
-export function configureAgentLifecycle(db: Db, effects: LifecycleEffects, driver: LifecycleDriver, canRun = () => true) {
+export function configureAgentLifecycle(db: Db, effects: LifecycleEffects, driver: LifecycleDriver, canRun = () => true, concurrency = 4) {
   assertRootDatabase(db);
-  const worker = createLifecycleWorker(createLifecycleStore(db, effects), driver, effects.reportFailure, canRun);
+  const worker = createLifecycleWorker(createLifecycleStore(db, effects), driver, effects.reportFailure, canRun, concurrency);
   workers.set(db, worker);
   return worker;
 }
@@ -120,8 +120,8 @@ export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
   };
 }
 
-export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: LifecycleDriver, canRun: () => boolean) {
-  const worker = configureAgentLifecycle(db, effects, driver, canRun);
+export function startAgentLifecycle(db: Db, effects: LifecycleEffects, driver: LifecycleDriver, canRun: () => boolean, concurrency = 4) {
+  const worker = configureAgentLifecycle(db, effects, driver, canRun, concurrency);
   let running: Promise<void> | undefined;
   let stopped = false;
   let nextDeadline: number | null = null;

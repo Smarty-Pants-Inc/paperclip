@@ -469,6 +469,7 @@ export async function createApp(
     chatWebhookPublicBaseUrl?: string;
     authReady: boolean;
     companyDeletionEnabled: boolean;
+    agentLifecycleConcurrency?: number;
     announcements?: { enabled: boolean; feedUrl: string };
     instanceId?: string;
     hostVersion?: string;
@@ -587,7 +588,7 @@ export async function createApp(
   app.use(runnerAttachmentDownloadRoutes(db, opts.storageService));
   const hostServicesDisposers = new Map<string, () => void>();
   let lifecyclePluginsReady = false;
-  const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
+  const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive(), opts.agentLifecycleConcurrency);
   const connectionIntentHeartbeat = heartbeatService(db, {
     pluginWorkerManager: workerManager,
   });

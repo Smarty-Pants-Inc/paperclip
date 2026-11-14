@@ -5,7 +5,7 @@ import { lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "./fail
 import { LIFECYCLE_STOP_FAILURE_LIMIT } from "./retry.js";
 
 /** Database leases protect each attempt across server processes. */
-export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
+export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true, concurrency = 4) {
   let stopped = false;
   const active = new Map<string, Promise<void>>();
   let running: Promise<void> | undefined;
@@ -115,7 +115,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
   async function sweep() {
     const pending = await attempt({ stage: "scan" }, () => store.pending(100, new Date()));
     const entries = pending.values();
-    await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
+    await Promise.all(Array.from({ length: Math.min(concurrency, pending.length) }, async () => {
       for (const id of entries) await start(id);
     }));
   }

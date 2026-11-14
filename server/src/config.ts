@@ -119,6 +119,7 @@ export interface Config extends StorageConfig {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  agentLifecycleConcurrency: number;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
   announcementsEnabled: boolean;
@@ -337,6 +338,14 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
   // cache. A version directory used within the grace window also stays. A
   // removed directory is written again from its version row on next use.
   // Negative, empty, or non-numeric values fall back to the defaults.
+  const agentLifecycleConcurrencyEnv = process.env.PAPERCLIP_AGENT_LIFECYCLE_CONCURRENCY?.trim();
+  const agentLifecycleConcurrencyRaw = Number(agentLifecycleConcurrencyEnv);
+  const agentLifecycleConcurrency = agentLifecycleConcurrencyEnv
+    && Number.isInteger(agentLifecycleConcurrencyRaw)
+    && agentLifecycleConcurrencyRaw >= 1
+    && agentLifecycleConcurrencyRaw <= 64
+    ? agentLifecycleConcurrencyRaw
+    : 4;
   const nonNegativeIntegerEnv = (name: string, fallback: number) => {
     const raw = process.env[name]?.trim();
     const value = Number(raw);
@@ -441,6 +450,7 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    agentLifecycleConcurrency,
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",
