@@ -71,6 +71,36 @@ const MAX_TTL_MS = 15000;
 const MAX_TOASTS = 5;
 const DEDUPE_WINDOW_MS = 3500;
 const DEDUPE_MAX_AGE_MS = 20000;
+const TASK_RETRY_REFUSAL_TOAST_KEY = "paperclip:task-retry-source-refusal:v1";
+
+function isDurableTaskRetryRefusal(toast: Pick<ToastItem, "title" | "body" | "tone">) {
+  return toast.tone === "error" && toast.title === "Recovery resolution failed" &&
+    toast.body?.includes("failed run changed before Try again was accepted") === true;
+}
+
+function readDurableTaskRetryRefusal(): ToastItem[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const value = window.localStorage.getItem(TASK_RETRY_REFUSAL_TOAST_KEY);
+    if (!value) return [];
+    const toast = JSON.parse(value) as ToastItem;
+    return typeof toast.id === "string" && typeof toast.title === "string" &&
+      typeof toast.body === "string" && isDurableTaskRetryRefusal(toast)
+      ? [{ ...toast, id: "task_retry_source_refusal", tone: "error", ttlMs: MAX_TTL_MS }]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistDurableTaskRetryRefusal(toasts: ToastItem[]) {
+  if (typeof window === "undefined") return;
+  try {
+    const refusal = toasts.find(isDurableTaskRetryRefusal);
+    if (refusal) window.localStorage.setItem(TASK_RETRY_REFUSAL_TOAST_KEY, JSON.stringify(refusal));
+    else window.localStorage.removeItem(TASK_RETRY_REFUSAL_TOAST_KEY);
+  } catch { /* Storage can be disabled; the recovery card remains the durable owner. */ }
+}
 
 const ToastStateContext = createContext<ToastItem[] | null>(null);
 const ToastActionsContext = createContext<ToastActionsContextValue | null>(null);
@@ -86,7 +116,7 @@ function generateToastId() {
 }
 
 export function ToastProvider({ children }: { children: ReactNode }) {
-  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [toasts, setToasts] = useState<ToastItem[]>(readDurableTaskRetryRefusal);
   const timersRef = useRef(new Map<string, number>());
   const dedupeRef = useRef(new Map<string, number>());
 
@@ -107,6 +137,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   );
 
   const clearToasts = useCallback(() => {
+    try { window.localStorage.removeItem(TASK_RETRY_REFUSAL_TOAST_KEY); } catch { /* Storage may be unavailable. */ }
     for (const handle of timersRef.current.values()) {
       window.clearTimeout(handle);
     }
@@ -141,7 +172,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       dedupeRef.current.set(dedupeKey, now);
       dedupeRef.current.set(contentKey, now);
 
-      const id = input.id ?? generateToastId();
+      const id = input.id ?? (isDurableTaskRetryRefusal({ title: input.title, body: input.body, tone })
+        ? "task_retry_source_refusal"
+        : generateToastId());
       clearTimer(id);
 
       setToasts((prev) => {
@@ -160,14 +193,20 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         return [nextToast, ...withoutCurrent].slice(0, MAX_TOASTS);
       });
 
-      const timeout = window.setTimeout(() => {
-        dismissToast(id);
-      }, ttlMs);
-      timersRef.current.set(id, timeout);
+      if (!isDurableTaskRetryRefusal({ title: input.title, body: input.body, tone })) {
+        const timeout = window.setTimeout(() => {
+          dismissToast(id);
+        }, ttlMs);
+        timersRef.current.set(id, timeout);
+      }
       return id;
     },
     [clearTimer, dismissToast],
   );
+
+  useEffect(() => {
+    persistDurableTaskRetryRefusal(toasts);
+  }, [toasts]);
 
   useEffect(() => () => {
     for (const handle of timersRef.current.values()) {
