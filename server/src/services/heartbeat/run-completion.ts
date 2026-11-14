@@ -841,8 +841,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         await settleAgent();
         return;
       }
-      const skipRunIssueComment =
-        parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
+      const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
       let resolvedPresentationDecision: RunPresentationDecision | null =
         null;
       try {
@@ -899,7 +898,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         });
         let presentationDecision: RunPresentationDecision =
           resolved.decision;
-
         if (
           issueId &&
           !skipRunIssueComment &&

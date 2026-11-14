@@ -3060,7 +3060,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       opts.requestedByActorType === "system" &&
       opts.allowRunCoalescing !== false &&
       !receiptRequest &&
-      !wakeCommentId &&
+      (!wakeCommentId || enrichedContextSnapshot.commentContinuation === true) &&
       queuedCommentIdsFromRunContext(enrichedContextSnapshot).length === 0 &&
       !isInteractionResolutionWakePayload(payload ?? {}) &&
       !hasInteractionContinuationWakeContext(enrichedContextSnapshot);
@@ -4164,7 +4164,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // queued send keeps its own exact admission; the disposition worker
           // settles the hold through the same fallback, and the saved input
           // then continues the task.
-          const systemWake = opts.requestedByActorType !== "user" && !taskRetryActorId && !wakeCommentId
+          const systemWake = opts.requestedByActorType !== "user" && !taskRetryActorId
+            && (!wakeCommentId || enrichedContextSnapshot.commentContinuation === true)
             && !durableRequest && !opts.queuedCommentInterruptId && !opts.queuedCommentRequestId && !opts.failedRunId
             && !executionReconciliationWake;
           // A recorded fresh continuation that has no run yet is this task's

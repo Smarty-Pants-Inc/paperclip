@@ -767,6 +767,7 @@ async function runReleaseRecoveryTail(
     deriveImmediateRecoveryContextLabels(issue.status);
   // This fresh normal-model seed carries no inherited recovery/model-profile fields.
   const recoveryContextSnapshot: Record<string, unknown> = {
+    ...await transaction.pendingContinuationCommentInput({ companyId: run.companyId, issueId: issue.id, contextSnapshot: run.contextSnapshot }),
     issueId: issue.id,
     taskId: issue.id,
     wakeReason: recoveryReason,

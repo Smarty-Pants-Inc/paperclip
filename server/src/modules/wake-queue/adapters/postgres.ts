@@ -1,3 +1,4 @@
+import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyQueuedRunDispatch, notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -758,9 +759,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       );
     },
 
+    async pendingContinuationCommentInput({ companyId, issueId, contextSnapshot }) {
+      return pendingContinuationCommentInput(tx, { companyId, issueId, contextSnapshot });
+    },
+
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
       await notifyStatusCardIssueChange(tx, companyId);
       const executionState = parseIssueExecutionState(issue.executionState);
+      const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -774,6 +780,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               issueId: issue.id,
               retryOfRunId: finishingRun.id,
               retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
+              _paperclipWakeContext: commentInput,
               currentStageId: executionState?.currentStageId ?? null,
               currentStageType: executionState?.currentStageType ?? null,
             },
@@ -804,6 +811,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
               retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
               source: "issue.execution_review_recovery",
+              ...commentInput,
               retryOfRunId: finishingRun.id,
               currentStageId: executionState?.currentStageId ?? null,
               currentStageType: executionState?.currentStageType ?? null,
@@ -849,6 +857,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       now,
     }) {
       await notifyChatRunMilestones(tx, { companyId, issueId: issue.id });
+      const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -857,7 +866,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           source: "automation",
           triggerDetail: "system",
           reason,
-          payload: withRecoveryContext({ issueId: issue.id, retryOfRunId: finishingRun.id }, "normal_model"),
+          payload: withRecoveryContext({ issueId: issue.id, retryOfRunId: finishingRun.id, _paperclipWakeContext: commentInput }, "normal_model"),
           status: "queued",
           requestedByActorType: "system",
           requestedByActorId: null,
@@ -876,7 +885,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot,
+          contextSnapshot: { ...contextSnapshot, ...commentInput },
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
