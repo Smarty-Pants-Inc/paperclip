@@ -1,7 +1,8 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
-  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
-  issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
+  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, environmentLeases, environments,
+  executionWorkspaces, heartbeatRuns, issueApprovals, issueComments, issueRecoveryActions, issueThreadInteractions, issues,
+  nativeRunFinalizations, toolInvocations, type Db,
 } from "@paperclipai/db";
 import {
   EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
@@ -28,6 +29,47 @@ import { notifyRoutineExecutionStatus } from "./routine-execution-status-notific
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
+import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import type { EnvironmentDriverExecuteInput, EnvironmentRuntimeService } from "./environment-runtime.js";
+
+export type ChatGapExecutorProof = (input: { companyId: string; runId: string }) => Promise<boolean>;
+type ChatGapEnvironmentRuntime = Pick<EnvironmentRuntimeService, "execute" | "readPredecessorSandboxRecord">;
+
+/** Uses the shared remote Runner generation-loss predicate on the failed run's own sandbox. */
+export async function proveChatGapFailedRunExecutorGone(
+  db: Db,
+  input: { companyId: string; runId: string },
+  runtime: ChatGapEnvironmentRuntime,
+): Promise<boolean> {
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+  if (!run || run.runtimeMode !== "native" || run.status === "succeeded" || !run.finishedAt
+    || !run.nativeSessionId || !run.runnerInstanceId || !run.nativeIssueId) return false;
+  const leases = await db.select({ lease: environmentLeases, environment: environments }).from(environmentLeases)
+    .innerJoin(environments, eq(environments.id, environmentLeases.environmentId)).where(and(
+      eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+      eq(environmentLeases.issueId, run.nativeIssueId)));
+  if (leases.length !== 1) return false;
+  const { lease, environment } = leases[0]!;
+  const remoteCwd = lease.metadata?.remoteCwd;
+  if (environment.driver !== "sandbox" || !lease.providerLeaseId || typeof remoteCwd !== "string" || !remoteCwd.startsWith("/"))
+    return false;
+  const start = run.processHostHash === "remote" && run.processStartedAt
+    ? { at: run.processStartedAt.toISOString(), source: "process" as const }
+    : run.startedAt ? { at: run.startedAt.toISOString(), source: "run" as const } : null;
+  const runner = { execute: request => runtime.execute({ ...request,
+    environment: environment as EnvironmentDriverExecuteInput["environment"],
+    lease: lease as EnvironmentDriverExecuteInput["lease"] }) } as CommandManagedRuntimeRunner;
+  try {
+    const { remoteRunnerGenerationLost } = await import("./native-runtime/native-session-executor.js");
+    return await remoteRunnerGenerationLost({ runner, remoteCwd,
+      identity: { runnerInstanceId: run.runnerInstanceId, normalizedSessionId: run.nativeSessionId },
+      predecessor: { readSandbox: () => runtime.readPredecessorSandboxRecord({ companyId: run.companyId, leaseId: lease.id }),
+        start, providerLeaseId: lease.providerLeaseId, probedProviderLeaseId: lease.providerLeaseId } });
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Fresh-continuation fallback: exact resumption of an unfinished run is an
@@ -36,16 +78,18 @@ import { readSystemRecovery } from "./system-recovery-state.js";
  * When a run ended without finishing its work and nothing exact follows it
  * (no resumed session, no replacement, no scheduled retry, no saved input),
  * `ensureFreshContinuation` starts the task again in a fresh session from its
- * last verified saved workspace and its conversation. The only succeeded-run
- * exception is an unanswered latest person message on a still-waiting in-review
- * chat; it is not a general eligibility rule for completed runs. It needs no
- * person and no proof that the old executor stopped:
+ * last verified saved workspace and its conversation. The chat-gap exception
+ * is narrow: an unanswered latest person message on a still-waiting in-review
+ * chat may continue after a succeeded run, or after a failed run only when the
+ * shared remote-runner predicate proves that run's executor gone. It is not a
+ * general eligibility rule for completed runs.
  *
  * - The old run keeps its own fencing. Its remote workspace epoch is abandoned
  *   when it still owns it, so its writer can never publish again and the next
  *   run restores the last committed save into a new root on a new allocation.
- *   The unverified files stay in the abandoned root (recorded on the
- *   workspace), unapplied.
+ *   For failed chat-gap runs this isolation is not a substitute for the required
+ *   executor-gone proof. The unverified files stay in the abandoned root
+ *   (recorded on the workspace), unapplied.
  * - The opening context of the continuation names the cut-off run and every
  *   action whose outcome is unknown, so the agent checks before repeating a
  *   side effect.
@@ -156,6 +200,8 @@ type Input = {
    * task in the same transaction, and that wake is the continuation.
    */
   delivery?: "record" | "caller_owns";
+  /** Fail-closed proof for the chat-gap exception; production binds this to remoteRunnerGenerationLost. */
+  proveChatGapExecutorGone?: ChatGapExecutorProof;
 };
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -587,6 +633,14 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   if (taskWait) return { kind: "person_owned", reason: taskWait };
   if (issue.status === "in_review" && (!isConversation(issue) || !unansweredConversationContinuation))
     return { kind: "person_owned", reason: "in_review" };
+  const chatGapBranch = isConversation(issue) && unansweredConversationContinuation
+    ? run.status === "succeeded" ? "succeeded_unanswered_message" as const : "failed_executor_proven_gone" as const
+    : null;
+  let chatGapExecutorProvenGone = false;
+  if (chatGapBranch === "failed_executor_proven_gone") {
+    chatGapExecutorProvenGone = await input.proveChatGapExecutorGone?.({ companyId, runId: run.id }) ?? false;
+    if (!chatGapExecutorProvenGone) return { kind: "person_owned", reason: "chat_executor_not_proven_gone" };
+  }
   let ownsBlock = false;
   if (issue.status === "blocked") {
     const receipts = holds.filter(hold => hold.evidence.nativeFailureBlock !== undefined || hold.evidence.legacyCancellationBlock !== undefined
@@ -668,6 +722,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: run.id, trigger: input.trigger,
     failureCode: run.errorCode ?? null, delivery, recordedAt: now.toISOString(), isolation,
     stopProof: isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
+    ...(chatGapBranch ? { chatGap: { predecessorRunId: run.id, predecessorTerminalState: run.status, branch: chatGapBranch,
+      executorProvenGone: chatGapBranch === "succeeded_unanswered_message" ? null : chatGapExecutorProvenGone } } : {}),
     unverifiedActions: unverified, createdObjects: created, ...(fenced ? { workspace: fenced } : {}) };
   const reconciliation = { ...decision, actorId: FRESH_CONTINUATION_ACTOR, recordedAt: now.toISOString() };
   // Who, what, why and when. A fresh run is not a replay: the interrupted turn
@@ -753,7 +809,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   await logActivity(tx, { companyId, actorType: "system", actorId: FRESH_CONTINUATION_ACTOR,
     action: "issue.continued_from_saved_work", entityType: "issue", entityId: issue.id, agentId: run.agentId, runId: run.id,
     details: { recoveryActionId: primaryId, sourceRunId: run.id, failureCode: run.errorCode ?? null, trigger: input.trigger,
-      delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length } });
+      delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length,
+      ...(chatGapBranch ? { predecessorRunId: run.id, predecessorTerminalState: run.status, chatGapBranch } : {}) } });
   logger.info({ runId: run.id, issueId: issue.id, failureCode: run.errorCode, trigger: input.trigger, delivery },
     "Run continues in a fresh run from saved work");
   return { kind: "continued", recoveryActionId: primaryId, delivery, isolation };
@@ -961,7 +1018,8 @@ export async function nextFreshContinuationCheckAt(db: Db, now = new Date()): Pr
  * releases, so tasks already waiting continue after deploy without a Retry.
  * Runs on the execution-disposition worker. Bounded per pass.
  */
-export async function continueHeldExecutions(db: Db, now = new Date(), limit = BACKLOG_CONTINUATIONS_PER_PASS) {
+export async function continueHeldExecutions(db: Db, now = new Date(), limit = BACKLOG_CONTINUATIONS_PER_PASS,
+  proveChatGapExecutorGone?: ChatGapExecutorProof) {
   if (now.getTime() - lastLeftAloneLogAt >= LEFT_ALONE_LOG_INTERVAL_MS) {
     lastLeftAloneLogAt = now.getTime();
     const leftAlone = await countHeldExecutionsLeftAlone(db, now).catch(() => null);
@@ -983,7 +1041,7 @@ export async function continueHeldExecutions(db: Db, now = new Date(), limit = B
     times.push(now.getTime());
     try {
       const result = await ensureFreshContinuation(db, { companyId: candidate.companyId, runId: candidate.runId,
-        trigger: "held_recovery", now });
+        trigger: "held_recovery", now, proveChatGapExecutorGone });
       if (result.kind === "continued") continued += 1;
       else await recordFreshContinuationCheck(db, { companyId: candidate.companyId, actionId: candidate.id }, result, now);
     } catch (error) {

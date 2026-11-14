@@ -39,7 +39,7 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
 import { continueFreshInTransaction, continueHeldExecutions, freshContinuationCheckDue, recordFreshContinuationCheck,
-  settleCoalescedFreshContinuationHolds } from "./fresh-continuation-fallback.js";
+  settleCoalescedFreshContinuationHolds, type ChatGapExecutorProof } from "./fresh-continuation-fallback.js";
 import { alias } from "drizzle-orm/pg-core";
 import { RECOVERY_BACKLOG_AGE_MS, RECOVERY_WAKE_REASONS } from "./heartbeat/queued-run-dispatch-order.js";
 import { parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
@@ -714,8 +714,9 @@ export function obsoleteExecutionConversationHold() {
 export async function settleUnrecoverableExecutions(
   db: Db,
   now = new Date(),
-  options: { failpoint?: (phase: "persisted") => void } = {},
+  options: { failpoint?: (phase: "persisted") => void; proveChatGapExecutorGone?: ChatGapExecutorProof } = {},
 ) {
+  const proveChatGapExecutorGone = options.proveChatGapExecutorGone;
   // Fold obsolete conversation holds without waking historical work on upgrade.
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = obsoleteExecutionConversationHold();
@@ -874,7 +875,7 @@ export async function settleUnrecoverableExecutions(
         // lane, which takes over the settled hold; the held sweep follows it.
         if (current && !isInterruptedNativePreparationCandidate(run)) {
           const fresh = await continueFreshInTransaction(tx as unknown as Db, { companyId: task.companyId, runId: run.id,
-            trigger: "recovery_refused", now });
+            trigger: "recovery_refused", now, proveChatGapExecutorGone });
           if (["continued", "already_continued", "successor_exists"].includes(fresh.kind)) return;
           if (fresh.kind === "backoff" || fresh.kind === "exact_recovery_pending") {
             await recordFreshContinuationCheck(tx as unknown as Db, { companyId: task.companyId, actionId: action.id }, fresh, now);
@@ -986,5 +987,5 @@ export async function settleUnrecoverableExecutions(
   }
   // Tasks already held by settled records (including those older releases
   // saved) continue from their saved work on this worker too.
-  await continueHeldExecutions(db, now);
+  await continueHeldExecutions(db, now, undefined, proveChatGapExecutorGone);
 }

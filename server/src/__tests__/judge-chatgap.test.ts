@@ -188,35 +188,38 @@ suite("RFL chat-gap independent acceptance", () => {
     { status: "in_progress", state: "active" },
     { status: "in_review", state: "waiting" },
     { status: "in_review", state: "active" },
-  ])("delivers an unanswered $status/$state chat through the real saved-work queue once, with the safety note", async ({ status, state }) => {
+  ])("holds an unanswered failed $status/$state chat until its executor is proven gone", async ({ status, state }) => {
     const f = await seed(status);
     await db.update(issues).set({ conversationState: state }).where(eq(issues.id, f.issueId));
     await finalizeFixture(f);
-    // Keep execution observable as queued; no provider/network execution is started.
-    const occupiedIssue = randomUUID();
-    await db.insert(issues).values({ id: occupiedIssue, companyId: f.companyId, title: "Occupied slot", status: "in_progress", assigneeAgentId: f.agentId });
-    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, issueId: occupiedIssue,
-      status: "running", contextSnapshot: { issueId: occupiedIssue } });
     expect(await ensureFreshContinuation(db, { companyId: f.companyId, runId: f.runId, trigger: "recovery_refused" }))
-      .toMatchObject({ kind: "continued" });
+      .toMatchObject({ kind: "person_owned", reason: "chat_executor_not_proven_gone" });
     const heartbeat = heartbeatService(db);
     await deliverReconciledExecutions(db, heartbeat.wakeup);
     await deliverReconciledExecutions(db, heartbeat.wakeup);
     const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.runId));
     const records = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
       eq(issueRecoveryActions.sourceIssueId, f.issueId)));
-    const record = records.find(row => row.evidence.freshContinuation);
-    const note = String((record?.evidence.executionReconciliation as Record<string, unknown>)?.outcomeEvidence);
-    expect(note).toContain("cut off before it finished");
-    expect(note).toContain("Completed actions with recorded results are still not repeated");
-    const wakes = await db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
-      .from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
-    console.log("RFL_DELIVERY", JSON.stringify({ status, state, successorCount: successors.length, wakes,
-      continuationDelivery: record?.evidence.continuationDelivery,
-      continuationInvalidatedReason: record?.evidence.continuationInvalidatedReason,
-      enableAgentChat: (await instanceSettingsService(db).getExperimental()).enableAgentChat }));
-    expect(successors).toHaveLength(1);
-    expect(successors[0]).toMatchObject({ status: "queued", contextSnapshot: { forceFreshSession: true, previousRunId: f.runId } });
-    expect(record?.evidence.continuationDelivery).toBe("delivered");
+    expect(successors).toHaveLength(0);
+    expect(records.some(row => row.evidence.freshContinuation)).toBe(false);
+  }, 60_000);
+
+  it("does not admit a legacy forceFreshSession chat recovery without recorded executor proof", async () => {
+    const f = await seed("in_review");
+    await finalizeFixture(f);
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system",
+      returnOwnerAgentId: f.agentId, cause: "native_continuation_requires_reconciliation", fingerprint: `legacy-chat-gap:${f.runId}`,
+      nextAction: "The previous chat attempt stopped.", resolvedAt: new Date(), attemptCount: 1,
+      evidence: { runId: f.runId, continuationDelivery: "pending", freshContinuation: { schema: "paperclip.fresh-continuation.v1",
+        sourceRunId: f.runId, recordedAt: new Date().toISOString(), isolation: "fresh_isolated_workspace" },
+        executionReconciliation: { runId: f.runId, providerStopped: true, actionOutcome: "mixed", outcomeEvidence: "legacy candidate" } } }).returning();
+    const heartbeat = heartbeatService(db);
+    await heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_recovery_action_restored",
+      idempotencyKey: `execution-reconciliation:${action!.id}`, payload: { issueId: f.issueId, recoveryActionId: action!.id },
+      requestedByActorType: "system", requestedByActorId: "execution-recovery",
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, recoveryActionId: action!.id, previousRunId: f.runId,
+        retryOfRunId: f.runId, forceFreshSession: true, wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" } });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.runId))).toHaveLength(0);
   }, 60_000);
 });

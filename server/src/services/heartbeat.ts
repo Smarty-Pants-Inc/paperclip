@@ -546,6 +546,7 @@ import {
 } from "../modules/wake-queue/index.js";
 
 import { taskWatchdogService } from "./task-watchdogs.js";
+import { proveChatGapFailedRunExecutorGone } from "./fresh-continuation-fallback.js";
 
 import {
   evaluateAgentInvokabilityFromDb,
@@ -999,6 +1000,8 @@ export function heartbeatService(
     environmentRuntimeService(db, {
       pluginWorkerManager: options.pluginWorkerManager,
     });
+  const proveChatGapExecutorGone = (input: { companyId: string; runId: string }) =>
+    proveChatGapFailedRunExecutorGone(db, input, environmentRuntime);
   const instructionCopies = agentInstructionWorkingCopyService(db, { environmentRuntime });
   const envOrchestrator = environmentRunOrchestrator(db, {
     pluginWorkerManager: options.pluginWorkerManager,
@@ -1335,6 +1338,7 @@ export function heartbeatService(
     releaseIssueExecutionAndPromote,
     issuesSvc,
     options,
+    proveChatGapExecutorGone,
     publishRunLifecyclePluginEvent,
     finalizeAgentStatus,
     getAgent,
@@ -4514,6 +4518,7 @@ export function heartbeatService(
       }),
 
     wakeup: trackWakeup,
+    proveChatGapFailedRunExecutorGone: proveChatGapExecutorGone,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
 

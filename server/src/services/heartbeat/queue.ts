@@ -5,7 +5,8 @@ import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed } from "./run-admission.js";
-import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds } from "../fresh-continuation-fallback.js";
+import { continueFreshInTransaction, hasPendingFreshContinuation, isFreshIsolatedContinuationWake, settleCoalescedFreshContinuationHolds,
+  type ChatGapExecutorProof } from "../fresh-continuation-fallback.js";
 import { deliverContinuationAsRun, foldWaitingRetriesIntoContinuation, foldWaitingRetriesIntoRecordedContinuation, undeliveredContinuation,
   undeliveredContinuationContext } from "../fresh-continuation-retry-fold.js";
 import { refreshRunStartYieldIfStale } from "../run-start-handover.js";
@@ -238,6 +239,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   Pick<HeartbeatRecoveryDependencies, "setRunStatusFromLive"> {
   sweepPendingCleanupLeases: ReturnType<typeof createHeartbeatRecovery>["sweepPendingCleanupLeases"];
   options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck">;
+  proveChatGapExecutorGone?: ChatGapExecutorProof;
   issuesSvc: Pick<ReturnType<typeof issueService>, "getDependencyReadiness" | "listDependencyReadiness" | "updateForCompany">;
   treeControlSvc: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
@@ -463,6 +465,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     applyWakeQueuePostCommitEffects,
     issuesSvc,
     options,
+    proveChatGapExecutorGone,
     publishRunLifecyclePluginEvent,
     finalizeAgentStatus,
     getAgent,
@@ -2785,7 +2788,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const carriers = await conversationRunsForLastMessages(reader, {
         companyId: agent.companyId, issues: [{ issueId: currentIssueId, agentId }], runId: previousRunId,
       });
-      return carriers.length === 1 && carriers[0]!.hasReply === false;
+      if (carriers.length !== 1 || carriers[0]!.hasReply !== false) return false;
+      const [predecessor] = await reader.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.id, previousRunId), eq(heartbeatRuns.agentId, agentId),
+        or(eq(heartbeatRuns.nativeIssueId, currentIssueId), eq(heartbeatRuns.issueId, currentIssueId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${currentIssueId}`))).limit(1);
+      if (!predecessor) return false;
+      // The succeeded branch is the unchanged J1 exception. A failed source may
+      // enter this force-fresh recovery lane only when fallback recorded the
+      // shared executor proof on that exact predecessor.
+      if (predecessor.status === "succeeded") return true;
+      const [recovery] = await reader.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, agent.companyId), eq(issueRecoveryActions.id, actionId),
+        eq(issueRecoveryActions.sourceIssueId, currentIssueId))).limit(1);
+      const chatGap = parseObject(parseObject(recovery?.evidence).freshContinuation).chatGap;
+      return parseObject(chatGap).predecessorRunId === previousRunId
+        && parseObject(chatGap).predecessorTerminalState === predecessor.status
+        && parseObject(chatGap).branch === "failed_executor_proven_gone"
+        && parseObject(chatGap).executorProvenGone === true;
     };
     const permitsUnansweredAssignedWorkContinuation = async (reader: Db, currentIssueId: string): Promise<boolean> => {
       const previousRunId = readNonEmptyString(enrichedContextSnapshot.previousRunId);
@@ -4138,7 +4158,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // gate (daily limit, slots, pause, budget), a skip or a crash can
             // never consume it. This system wake is coalesced into it.
             const fresh = freshSourceRunId ? await continueFreshInTransaction(tx as unknown as Db, {
-              companyId: issue.companyId, runId: freshSourceRunId, trigger: "continuation_wake", delivery: "record" }) : null;
+              companyId: issue.companyId, runId: freshSourceRunId, trigger: "continuation_wake", delivery: "record",
+              proveChatGapExecutorGone }) : null;
             if (fresh?.kind !== "continued" && fresh?.kind !== "already_continued") return deferBlockedExecution(continuationHold());
             return { kind: "skipped" as const };
           }

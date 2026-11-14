@@ -12,7 +12,7 @@ import { PENDING_CONTINUATION_BOUND_MS } from "./recovery-continuation-pacing.js
 import { getExecutionBlocker } from "./execution-blocker.js";
 import {
   FRESH_CONTINUATIONS_PER_HOUR, FRESH_CONTINUATION_SCHEMA, PERSON_OWNED_FAILURE_CODES, continueHeldExecutions, ensureFreshContinuation,
-  resetBacklogContinuationPacingForTests,
+  proveChatGapFailedRunExecutorGone, resetBacklogContinuationPacingForTests,
   freshContinuationNote, heldExecutionsAwaitingFreshContinuation, nextFreshContinuationCheckAt, recordFreshContinuationCheck, FRESH_CONTINUATION_PENDING_BOUND_MS, FRESH_CONTINUATION_PROGRESS_BOUND_MS, FRESH_CONTINUATION_SAVED_WORK_BOUND_MS,
 } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
@@ -570,7 +570,7 @@ suite("fresh-continuation fallback", () => {
     expect((await pendingRecord(f.issueId))!.evidence.continuationDelivery).toBe("invalidated");
   }, 60_000);
 
-  it("freshly continues an in_review conversation when its last person message has no reply or own card", async () => {
+  it("does not freshly continue a failed in_review chat while its executor is unproven", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
     await db.update(issues).set({ status: "in_review", conversationAgentId: agentId, conversationUserId: userId,
       conversationState: "waiting" }).where(eq(issues.id, f.issueId));
@@ -580,8 +580,63 @@ suite("fresh-continuation fallback", () => {
       .where(eq(heartbeatRuns.id, f.runId));
 
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "person_owned", reason: "chat_executor_not_proven_gone" });
+    expect(await continuedFrom(f.runId)).toHaveLength(0);
+  }, 60_000);
+
+  it("continues a failed chat only after the shared predicate proves its executor gone, and audits once", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+    await db.update(issues).set({ status: "in_review", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorUserId: userId,
+      authorType: "user", body: "Please answer this.", createdAt: new Date(Date.now() - 10 * 60_000) }).returning();
+    const startedAt = new Date(Date.now() - 12 * 60_000);
+    await db.update(heartbeatRuns).set({ startedAt, processStartedAt: startedAt, processHostHash: "remote",
+      nativeSessionId: randomUUID(), runnerInstanceId: randomUUID(),
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, f.runId));
+    const [environment] = await db.insert(environments).values({ name: `chat-gap-${f.runId}`, driver: "sandbox" }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+      environmentId: environment!.id, provider: "boat", providerLeaseId: `sandbox-${f.runId}`, status: "active",
+      leasePolicy: "retain_on_failure", metadata: { remoteCwd: "/workspace/chat-gap", driver: "sandbox" } }).returning();
+    const runtime = {
+      execute: vi.fn(async () => { throw new Error("marker must not be needed after a different-boot proof"); }),
+      readPredecessorSandboxRecord: vi.fn(async ({ leaseId }: { companyId: string; leaseId: string }) => {
+        expect(leaseId).toBe(lease!.id);
+        return { kind: "present" as const, state: "running", stoppedAt: null,
+          lastRebootAt: new Date(startedAt.getTime() + 1_000).toISOString() };
+      }),
+    };
+    const proof = (input: { companyId: string; runId: string }) => proveChatGapFailedRunExecutorGone(db, input, runtime as never);
+    expect(await proof({ companyId, runId: f.runId })).toBe(true);
+    await settleUnrecoverableExecutions(db, new Date(), { proveChatGapExecutorGone: proof });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused",
+      proveChatGapExecutorGone: proof })).toMatchObject({ kind: "already_continued" });
+    await occupySlot();
+    await deliver();
+    expect(await successors(f.runId)).toHaveLength(1);
+    const audits = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "issue.continued_from_saved_work"), eq(activityLog.runId, f.runId)));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.details).toMatchObject({ predecessorRunId: f.runId, predecessorTerminalState: "failed",
+      chatGapBranch: "failed_executor_proven_gone" });
+    expect(runtime.execute).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it("preserves the succeeded unanswered-message chat branch without an executor proof", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation" });
+    await db.update(issues).set({ status: "in_review", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "waiting" }).where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorUserId: userId,
+      authorType: "user", body: "Please answer this.", createdAt: new Date(Date.now() - 10 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ status: "succeeded", errorCode: null, error: null,
+      contextSnapshot: { issueId: f.issueId, wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" }))
       .toMatchObject({ kind: "continued" });
-    expect(await continuedFrom(f.runId)).toHaveLength(1);
+    const audits = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId),
+      eq(activityLog.action, "issue.continued_from_saved_work"), eq(activityLog.runId, f.runId)));
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.details).toMatchObject({ predecessorRunId: f.runId, predecessorTerminalState: "succeeded",
+      chatGapBranch: "succeeded_unanswered_message" });
   }, 60_000);
 
   it("keeps an in_review conversation person-owned when the last message has its own run's reply", async () => {
