@@ -30,6 +30,7 @@ export async function createNativeGitHubAccess(input: {
   const token = randomBytes(32).toString("hex");
   const location = { runId: `native-session-${randomUUID()}`, target: input.target };
   let active: Binding | null = null;
+  let activeGeneration: string | null = null;
   let stopped = false;
   let ready = true;
   let stopping: Promise<void> | undefined;
@@ -37,6 +38,9 @@ export async function createNativeGitHubAccess(input: {
   const server = createServer(async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "application/json");
+    // Register before draining so even a zero-length or already-buffered body has
+    // a completion fence. The generation and binding below are captured at headers.
+    const bodyComplete = new Promise<void>(resolve => req.once("end", resolve));
     req.resume();
     const reply = (status: number, body: unknown) => {
       res.writeHead(status);
@@ -55,11 +59,25 @@ export async function createNativeGitHubAccess(input: {
       return;
     }
     const binding = active;
+    const requestGeneration = req.headers["x-paperclip-bridge-generation"];
+    const capturedGeneration = activeGeneration;
     if (!binding || stopped) {
       reply(403, { error: "No active GitHub run" });
       return;
     }
+    const bridgedRequest = typeof req.headers["x-paperclip-run-id"] === "string";
+    const queuedBridgeRequest = req.headers["x-paperclip-bridge-transport"] === "queue_v1";
+    if (queuedBridgeRequest && typeof requestGeneration !== "string") {
+      reply(403, { error: "GitHub bridge request has no run generation" });
+      return;
+    }
     try {
+      await bodyComplete;
+      if (stopped || active !== binding || activeGeneration !== capturedGeneration ||
+          ((queuedBridgeRequest || bridgedRequest) && typeof requestGeneration === "string" && requestGeneration !== capturedGeneration)) {
+        reply(403, { error: "GitHub bridge request belongs to an inactive run generation" });
+        return;
+      }
       // Bind at receipt; body/headers cannot select a run or responsible user.
       const result = await input.resolveCredentials({ ...binding });
       if (active !== binding || stopped) {
@@ -79,6 +97,7 @@ export async function createNativeGitHubAccess(input: {
   const stop = () => stopping ??= (async () => {
     stopped = true;
     active = null;
+    activeGeneration = null;
     bridge?.markOrderlyCompletion?.();
     server.closeAllConnections();
     const bridgeStop = await Promise.allSettled([bridge?.stop()]);
@@ -143,12 +162,15 @@ export async function createNativeGitHubAccess(input: {
             binding.issueId !== input.scope.issueId) throw new Error("GitHub session scope mismatch");
         // Quarantine requests left by the previous run and resume polling before
         // publishing this run's authority. The broker stays inactive throughout.
-        await bridge?.resume?.();
+        const generation = randomUUID();
+        await bridge?.resume?.(generation);
         const owner = { ...binding };
         active = owner;
+        activeGeneration = generation;
         return async () => {
           if (active === owner) {
             active = null;
+            activeGeneration = null;
             await bridge?.pause?.();
           }
         };

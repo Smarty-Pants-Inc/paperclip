@@ -259,6 +259,8 @@ export interface SandboxCallbackBridgeRequest extends SandboxCallbackBridgeBody 
   path: string;
   query: string;
   headers: Record<string, string>;
+  /** Host-issued run generation stamped by the sandbox gateway at request acceptance. */
+  bridgeGeneration?: string;
   createdAt: string;
 }
 
@@ -310,7 +312,7 @@ export interface SandboxCallbackBridgeQueueClient {
 
 export interface SandboxCallbackBridgeWorkerHandle {
   pause(): Promise<void>;
-  resume(): Promise<void>;
+  resume(generation?: string): Promise<void>;
   stop(options?: { drainTimeoutMs?: number }): Promise<void>;
 }
 
@@ -1725,10 +1727,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
         });
       }
     },
-    resume: async () => {
+    resume: async (generation?: string) => {
       if (stopping || !paused) return;
       await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
-      await input.client.writeTextFile(runStatePath, "attached");
+      await input.client.writeTextFile(runStatePath, generation ? `attached:${generation}` : "attached");
       idlePollIntervalMs = pollIntervalMs;
       resetIdleOnNextEmpty = true;
       const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });
@@ -2500,10 +2502,16 @@ async function runFileGateway() {
       // before queue publication, so leftover sandbox processes fail immediately
       // instead of waiting for the host's next attached-run poll.
       const runState = await fs.readFile(path.posix.join(queueDir, "run-state.json"), "utf8").catch(() => "");
-      if (runState.trim() === "paused") {
+      const runStateValue = runState.trim();
+      if (runStateValue === "paused" || (runStateValue !== "" && runStateValue !== "attached" && !runStateValue.startsWith("attached:"))) {
         writeJsonResponse(res, 503, { error: "The Paperclip run is detached; bridge requests are unavailable." });
         return;
       }
+      // Capture the run generation with the request headers, before awaiting its body.
+      // The host will reject this request if the binding has changed by delivery time.
+      const bridgeGeneration = runStateValue.startsWith("attached:")
+        ? runStateValue.slice("attached:".length)
+        : "";
 
       if (await queueDepth() >= maxQueueDepth) {
         // Reclaim orphaned request files before rejecting; only a queue that
@@ -2538,6 +2546,7 @@ async function runFileGateway() {
         path: url.pathname,
         query: url.search,
         headers: normalizeHeaders(req.headers),
+        ...(bridgeGeneration ? { bridgeGeneration } : {}),
         ...encodeSandboxBridgeBody(multipartAttachment ? requestBody : requestBody.toString("utf8"), maxBodyBytes),
         createdAt: new Date().toISOString(),
       };
