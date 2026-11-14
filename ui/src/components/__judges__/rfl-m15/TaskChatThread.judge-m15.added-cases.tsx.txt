@@ -14,13 +14,22 @@
       judgeReceipt("live", { rendered, current: current.map(r => r.id), superseded: superseded.map(r => r.id), heldTitleOccurrences: titleCount });
       // PROPOSED AMENDMENT (needs an RFL ruling): in a chat the page props for "live" and "history" are identical
       // (compactHistory true, no expand control), so the live contract there is: exactly ONE note reads as current;
-      // the superseded one is a collapsed "· Superseded" row (RFL M1.5 F1 fix). The task view is unchanged.
-      if (conversationMode) {
+      // the superseded one is a collapsed "· Superseded" row (RFL M1.5 F1 fix). The task view: see the 13:50Z amendment below.
+      // AMENDED (RFL ruling 13:50Z, task view): a note leaves compact history ONLY where an expand control can show it.
+      // This paint has NO expand control in either view (a chat, or a short task with nothing earlier), so the contract
+      // above holds in the task view too. With an expand control present the task view's live contract stays as is (below).
+      expect(Array.from(container.querySelectorAll("button")).some(b => /More messages|More run output/.test(b.textContent ?? "")), "no expand control on screen").toBe(false);
+      {
         const labelled = (id: string) => (anchor(id)?.querySelector("button[aria-expanded]")?.textContent ?? "").includes("· Superseded");
         expect(rendered.filter(id => !labelled(id))).toEqual([current[0]!.id]);
         expect(superseded.every(r => labelled(r.id) && anchor(r.id)!.querySelector('[data-testid="task-chat-system-notice-details"]') === null)).toBe(true);
         expect((container.textContent ?? "").split("· Superseded").length - 1).toBe(superseded.length);
-      } else {
+      }
+      if (!conversationMode) {
+        // With an expand control present (IssueDetail's "More messages"), the task view's live contract is unchanged.
+        paint({ comments: rows as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true, onExpandHistory: () => {}, historyControl: <button type="button">More messages</button> });
+        const rendered = rows.filter(r => anchor(r.id) !== null).map(r => r.id);
+        const titleCount = (container.textContent ?? "").split("This conversation can't continue").length - 1;
       expect(rendered).toEqual([current[0]!.id]);
       expect(titleCount).toBe(1);
       }
