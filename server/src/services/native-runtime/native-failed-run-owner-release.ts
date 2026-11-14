@@ -265,7 +265,7 @@ async function settleFailedRunOwner(db: Db, release: Release, now: Date): Promis
         // The provider read already completed outside these locks. Preserve its
         // exact lease snapshot through the existing CAS/stop-receipt owner;
         // never dispatch a stop against a merely uncertain running turn.
-        const prepared = await prepareUnconfirmedSourceSandboxStop(tx, lease);
+        const prepared = ["released", "expired"].includes(lease.status) ? lease : await prepareUnconfirmedSourceSandboxStop(tx, lease);
         if (!prepared || !await settleStopOnlyCleanup(tx, prepared, {
           attemptId: String(prepared.metadata?.pendingCleanupAttemptId), receipt: observation.receipt,
           receiptSource: "provider_inspection" })) return false;

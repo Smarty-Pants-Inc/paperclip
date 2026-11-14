@@ -40,6 +40,7 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
+import { inspectFreshThreadStopResources } from "./native-runtime/fresh-thread-stop-gate.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
 import { continueFreshInTransaction, continueHeldExecutions, freshContinuationCheckDue, recordFreshContinuationCheck,
   settleCoalescedFreshContinuationHolds, freshContinuationChain, FRESH_CONTINUATIONS_PER_CHAIN } from "./fresh-continuation-fallback.js";
@@ -660,7 +661,7 @@ function supersedingNativeWorkspaceHold(db: Db, input: {
 
 export function unresolvedExecutionDispositions(db: Db, limit: number) {
   return db
-    .select({ action: issueRecoveryActions })
+    .select({ action: issueRecoveryActions, run: heartbeatRuns })
     .from(issueRecoveryActions)
     .innerJoin(
       heartbeatRuns,
@@ -736,7 +737,7 @@ export function obsoleteExecutionConversationHold() {
 export async function settleUnrecoverableExecutions(
   db: Db,
   now = new Date(),
-  options: { failpoint?: (phase: "persisted") => void } = {},
+  options: { failpoint?: (phase: "persisted") => void; inspectLeaseResource?: (leaseId: string) => Promise<unknown> } = {},
 ) {
   // Fold obsolete conversation holds without waking historical work on upgrade.
   // Keep their evidence and record the policy change in the task's activity log.
@@ -775,11 +776,14 @@ export async function settleUnrecoverableExecutions(
   // Filter eligibility before applying the batch limit. A queue of sessions
   // awaiting replacement must not starve settled incidents behind it.
   const candidates = await unresolvedExecutionDispositions(db, 25);
-  for (const { action: candidate } of candidates) {
+  for (const { action: candidate, run: source } of candidates) {
     const runId = candidate.evidence.runId;
     if (typeof runId !== "string") continue;
     const goneControllerBootId = await provenGoneLegacyControllerBootId(db, candidate.companyId, runId).catch(() => null);
     try {
+      if (isFreshThreadRefusal(source) && options.inspectLeaseResource) {
+        await inspectFreshThreadStopResources(db, source, candidate.sourceIssueId, options.inspectLeaseResource);
+      }
       await db.transaction(async (tx) => {
         await tx.execute(
           sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
