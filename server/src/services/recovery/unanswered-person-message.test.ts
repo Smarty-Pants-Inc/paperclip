@@ -1216,7 +1216,16 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(note).toBeDefined();
     expect(note!.deletedAt).toBeNull();
     expect(heldReplyOf(note!)).toMatchObject({ superseded: true, cardId: card!.id });
-    expect(await f.visible()).toHaveLength(1);
+    // RFL d8line2 F1 (11:25Z; org 09:18Z): never edited in place. The held note is kept byte-identical as history,
+    // marked supersededBy the visible continuation reply; no CURRENT B' note remains (this row asserted the
+    // in-place "Earlier: ..." rewrite, which stayed current, before).
+    expect(note!.body).toBe(initialNote!.body);
+    expect(note!.presentation).toEqual(initialNote!.presentation);
+    const [visibleReply] = await db.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.createdByRunId, continuation!.runId)));
+    expect((note!.metadata as Record<string, unknown> | null)?.supersededBy).toBe(visibleReply!.id);
+    expect(await f.history()).toHaveLength(1);
+    expect(await f.visible()).toHaveLength(0);
   });
 
   it("D8: a card answered before the continuation fails gets ONE NEW true note; the earlier held note is kept unchanged and marked superseded (RFL 10:12Z R2)", async () => {
