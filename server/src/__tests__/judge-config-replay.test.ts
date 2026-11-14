@@ -155,8 +155,13 @@ suite('judge: stored-config respawn acceptance', () => {
       await f.httpSave(f.b, { enabled: false, revision: 2 });
       expect((await f.snapshot()).latest[f.b]).toEqual({ enabled: false, revision: 2 });
       writeFileSync(gate, 'release');
-      await vi.waitFor(async () => expect((await f.snapshot()).changes).toHaveLength(3), { timeout: 5000 });
+      await vi.waitFor(async () => expect((await f.snapshot()).changes).toHaveLength(2), { timeout: 5000 });
+      // Observe the live worker after releasing replay; do not hide late delivery with shutdown.
+      await new Promise(resolve => setTimeout(resolve, 1000));
       const s = await f.snapshot();
+      expect(s.changes.filter((x: any) => x.companyId === f.b).at(-1)).toEqual({ companyId: f.b, config: { enabled: false, revision: 2 } });
+      expect(s.changes.slice(s.changes.findIndex((x: any) => x.companyId === f.b && x.config.revision === 2) + 1)
+        .filter((x: any) => x.companyId === f.b && x.config.revision < 2)).toEqual([]);
       const stored = await f.registry.getConfig(f.id, f.b);
       console.log('JUDGE_SETTINGS_RACE', JSON.stringify({ changes: s.changes, runtimeB: s.latest[f.b], storedB: stored?.configJson }));
       expect(s.latest[f.b]).toEqual(stored?.configJson);
