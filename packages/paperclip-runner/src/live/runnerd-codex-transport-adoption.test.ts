@@ -29,6 +29,7 @@ async function verifyLiveRunnerAdoption(
   semanticRecoveryMode?: "denied-before-cancel" | "cleanup-only",
   stopExitProofFault?: "missing" | "false",
   livenessUnverifiedWhileConnected?: "within-grace" | "past-grace" | "reset-by-success",
+  idleProbeBudget: boolean | "disconnect" = false,
 ) {
   const stateDirectory = await mkdtemp(join(tmpdir(), "runnerd-live-adopt-"));
   const pendingCompletion = toolHandlerOrder?.startsWith("completion-") === true;
@@ -208,6 +209,8 @@ async function verifyLiveRunnerAdoption(
     const signal = vi.fn(() => true);
     const probeError = new Error("fixture remote process identity is unavailable");
     let rejectLiveness = false;
+    let livenessProbes = 0;
+    if (idleProbeBudget || livenessUnverifiedWhileConnected) vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
     const intervals = uncertainAtClose ? vi.spyOn(globalThis, "setInterval") : null;
     const clearedIntervals = uncertainAtClose ? vi.spyOn(globalThis, "clearInterval") : null;
     restoreIntervalSpies = () => { intervals?.mockRestore(); clearedIntervals?.mockRestore(); };
@@ -215,7 +218,7 @@ async function verifyLiveRunnerAdoption(
       ...options,
       ...(preparedTask && !adoptionAuthorization.startsWith("legacy") ? { authorizeRunnerAdoption } : {}),
       ...(uncertainAtClose ? { closeGraceMs: 2_000 } : {}),
-      ...(livenessUnverifiedWhileConnected ? { runnerReconnectGraceMs: livenessUnverifiedWhileConnected === "within-grace" ? 60_000 : 2_000 } : {}),
+      ...(livenessUnverifiedWhileConnected ? { runnerReconnectGraceMs: livenessUnverifiedWhileConnected === "within-grace" ? 60_000 : 12_000 } : {}),
       ...(semanticRecoveryMode === "cleanup-only" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
       // Hash different stable bytes without replacing the real runner artifact
       // used by concurrent tests. Adoption must never execute this path.
@@ -240,6 +243,7 @@ async function verifyLiveRunnerAdoption(
         startedAt: runnerStartedAt,
         signal,
         isAlive: () => {
+          livenessProbes++;
           if (rejectLiveness) return Promise.reject(probeError);
           try {
             process.kill(runnerPid!, 0);
@@ -313,18 +317,41 @@ async function verifyLiveRunnerAdoption(
       }),
     );
     if (toolHandlerOrder?.endsWith("after")) adopted.transport.setServerRequestHandler(redispatchedTool);
+    if (idleProbeBudget) {
+      // Real authenticated adoption, with only the recurring clock faked.
+      livenessProbes = 0;
+      if (idleProbeBudget === "disconnect") {
+        authority!.disconnectActiveRunner();
+        // No fake-clock advance: an authenticated channel close must probe now,
+        // rather than waiting for the five-second safety net.
+        await vi.waitFor(() => expect(livenessProbes).toBe(1));
+      } else {
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(livenessProbes, "no idle probe before the 5 s fallback").toBe(0);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(livenessProbes).toBe(1);
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(livenessProbes, "at most one adopted liveness probe per 5 seconds").toBeLessThanOrEqual(2);
+        expect(livenessProbes, "the missed-event fallback remains armed").toBe(2);
+      }
+      await adopted.detachControllerForRestart();
+      livenessProbes = 0;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(livenessProbes, "retained history after detach must not keep a watcher alive").toBe(0);
+      return;
+    }
     if (livenessUnverifiedWhileConnected) {
-      const pause = (ms: number) => new Promise(resolveWait => setTimeout(resolveWait, ms));
+      const pause = (ms: number) => vi.advanceTimersByTimeAsync(ms);
       expect(authority?.activeRunnerConnectionCount()).toBe(1);
       rejectLiveness = true;
       if (livenessUnverifiedWhileConnected === "reset-by-success") {
-        await pause(1_400);
+        await pause(10_000);
         rejectLiveness = false;
-        await pause(500);
+        await pause(5_000);
         rejectLiveness = true;
-        await pause(1_400);
+        await pause(10_000);
       } else {
-        await pause(livenessUnverifiedWhileConnected === "within-grace" ? 1_500 : 3_000);
+        await pause(livenessUnverifiedWhileConnected === "within-grace" ? 10_000 : 20_000);
       }
       rejectLiveness = false;
       if (livenessUnverifiedWhileConnected === "past-grace") {
@@ -507,6 +534,7 @@ async function verifyLiveRunnerAdoption(
       expect(commandTypes).not.toContain("runner.suspend");
     }
   } finally {
+    if (idleProbeBudget || livenessUnverifiedWhileConnected) vi.useRealTimers();
     releaseRecovery();
     await adopted?.transport.close().catch(() => undefined);
     if (uncertainAtClose) {
@@ -550,6 +578,14 @@ it.each(["deny", "legacy", "legacy-missing", "missing-binding"] as const)("prese
 it.each(["within-grace", "past-grace", "reset-by-success"] as const)(
   "bounds a rejected liveness probe of a connected adopted runner by the reconnect grace (%s)",
   mode => verifyLiveRunnerAdoption(false, false, false, false, false, false, "allow", undefined, false, undefined, undefined, mode), 30_000);
+
+// Keep reason: the observed retained-runner probe amplification. Exercise three
+// separate real adopted transports, not a copied timer implementation.
+it.each([1, 2, 3])("bounds idle adopted transport %i to one fallback probe per 5 seconds", () =>
+  verifyLiveRunnerAdoption(false, false, false, false, false, false, "allow", undefined, false, undefined, undefined, undefined, true), 30_000);
+
+it("probes an adopted runner immediately on authenticated channel close", () =>
+  verifyLiveRunnerAdoption(false, false, false, false, false, false, "allow", undefined, false, undefined, undefined, undefined, "disconnect"), 30_000);
 
 it("retains authenticated adopted-runner ownership when a close probe rejects", () => verifyLiveRunnerAdoption(false, false, false, false, false, false, "allow", undefined, true), 30_000);
 

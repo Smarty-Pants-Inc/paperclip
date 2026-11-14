@@ -22,6 +22,7 @@
  * the same path an operator-created plugin environment takes.
  */
 
+import { notifyEnvironmentConfigChange } from "./environment-config-revision.js";
 import { and, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { companies, environments } from "@paperclipai/db";
@@ -224,6 +225,7 @@ export async function ensureManagedPluginEnvironment(
       stableJson(currentMetadata) === stableJson(desiredMetadata);
     if (matches) return { row, action: "unchanged" };
 
+    await notifyEnvironmentConfigChange(tx);
     const updated = await tx
       .update(environments)
       .set({
@@ -254,6 +256,7 @@ export async function archiveManagedPluginEnvironment(
   const marker = managedPluginEnvironmentMarker(input);
   const publications: ActivityPublication[] = [];
   const archived = await db.transaction(async (tx) => {
+    await notifyEnvironmentConfigChange(tx);
     const row = await tx
       .update(environments)
       .set({ status: "archived", updatedAt: new Date() })
