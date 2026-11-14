@@ -138,6 +138,11 @@ import * as nativeCredentialStores from "./native-credential-store.js";
 import * as managedCredentialWriteback from "../managed-ai-credential-writeback.js";
 import { completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import * as nativeExecutionDriver from "./native-runner-execution-driver.js";
+import * as runnerPrpOutbound from "../../realtime/runner-prp-outbound.js";
+import { Readable } from "node:stream";
+import type { StorageProvider } from "../../storage/types.js";
+import { createDurableRunLogStore } from "../run-log-store.js";
+import { createObjectRunLogStore } from "../object-run-log-store.js";
 import * as offLoopFileWork from "./off-loop-file-work.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -193,6 +198,7 @@ type BackendFactoryOptions = {
 };
 
 type RunnerTransportOptions = {
+  controlPlaneRegistration?: import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"];
   authorityRunId?: string;
   onAccountingEvent?: (event: PrpEvent) => Promise<void>;
   onCredentialsUpdated?: (event: PrpEvent) => Promise<void>;
@@ -12852,6 +12858,128 @@ describe("native warm session supervision", () => {
       expect(retainedTransport!.evidence().diagnostics.some(message => message.includes("runner transport close requested"))).toBe(true);
       expect(firstLog).not.toHaveBeenCalled();
       expect(secondLog).not.toHaveBeenCalled();
+    });
+
+    it.each(["local_file", "s3_segments"] as const)("attributes retained ingress failure state and spans to the incoming warm run before onSession (%s)", async storage => {
+      // Recorded catch: warm transport callbacks outlived run A's log writer (#20529 S2).
+      const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
+      const createDriver = nativeExecutionDriver.createNativeRunnerExecutionDriver;
+      let stateChange!: NonNullable<Parameters<typeof runnerPrpOutbound.connectRunnerPrpIngress>[0]["onStateChange"]>;
+      let failReady = false;
+      const failure = new Error("runner_ingress_unavailable: synthetic warm route failure");
+      const outbound = vi.spyOn(runnerPrpOutbound, "connectRunnerPrpIngress").mockImplementation(input => {
+        stateChange = input.onStateChange!;
+        return { get ready() { return failReady ? Promise.reject(failure) : Promise.resolve(); },
+          failure: new Promise<never>(() => {}), quiesce: () => {}, close: async () => {} };
+      });
+      const driver = vi.spyOn(nativeExecutionDriver, "createNativeRunnerExecutionDriver").mockImplementation(input => createDriver(
+        Object.assign(Object.create(input), { target: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", leaseId: "retained-lease",
+          effectiveCapabilities: { runnerWebSocketIngress: true }, getRunnerIngressEndpoint: async () => ({
+            kind: "authenticated_websocket", websocketUrl: "wss://warm.example/runner", generation: "same-runner",
+            secretHeaders: [], refresh: async () => { throw new Error("unexpected refresh"); }, close: async () => {},
+          }) }, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted: Promise.resolve(),
+          controllerPersistence: undefined, beforeConnect: undefined })));
+      const appendEvent = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockResolvedValue({
+        row: {} as never, disposition: "committed", highestContiguousSourceSeq: 0 });
+      onTestFinished(() => { outbound.mockRestore(); driver.mockRestore(); appendEvent.mockRestore(); });
+      const { base } = fixture("warm-ingress-diagnostics");
+      const next = { ...base, binding: { ...base.binding, runId: "warm-ingress-diagnostics-second" } };
+      // Real log stores; only the S3 byte transport is in memory (conditional ETags included).
+      const objects = new Map<string, Buffer>();
+      const etag = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+      const provider: StorageProvider = {
+        id: "s3", putObject: async () => { throw new Error("unexpected unconditional put"); },
+        putObjectConditional: async request => {
+          const old = objects.get(request.objectKey);
+          if (request.ifNoneMatch ? old : !old || etag(old) !== request.ifMatch)
+            throw Object.assign(new Error("conflict"), { name: "PreconditionFailed" });
+          const chunks: Buffer[] = [];
+          if (Buffer.isBuffer(request.body)) chunks.push(request.body);
+          else for await (const bytes of request.body) chunks.push(Buffer.from(bytes));
+          const body = Buffer.concat(chunks); objects.set(request.objectKey, body);
+          return { etag: etag(body) };
+        },
+        getObject: async request => {
+          const bytes = objects.get(request.objectKey);
+          if (!bytes) throw Object.assign(new Error("missing"), { name: "NoSuchKey" });
+          const body = request.range ? bytes.subarray(request.range.start, request.range.end + 1) : bytes;
+          return { stream: Readable.from([body]), etag: etag(bytes) };
+        },
+        headObject: async request => ({ exists: objects.has(request.objectKey) }),
+        deleteObject: async request => { objects.delete(request.objectKey); },
+        listObjects: async request => ({ keys: [...objects.keys()].filter(key => key.startsWith(request.prefix)) }),
+      };
+      const store = storage === "local_file" ? createDurableRunLogStore({ basePath: join(isolatedHome, "logs") })
+        : createObjectRunLogStore({ provider, keyPrefix: "logs", flushMs: 1, assertWriterAuthority: async () => {} });
+      const firstHandle = await store.begin(base.binding), nextHandle = await store.begin(next.binding);
+      const rejectedWrites: unknown[] = [];
+      const sink = (handle: typeof firstHandle) => vi.fn(async (stream: "stdout" | "stderr", chunk: string) => {
+        try { await store.append(handle, { stream, chunk, ts: new Date().toISOString() }); }
+        catch (error) { rejectedWrites.push(error); }
+      });
+      const firstLog = sink(firstHandle), nextLog = sink(nextHandle);
+      const firstEvent = vi.fn(async (_event: AdapterRuntimeEvent) => {}), nextEvent = vi.fn(async (_event: AdapterRuntimeEvent) => {});
+      let registration!: Awaited<ReturnType<NonNullable<ReturnType<typeof createDriver>["controlPlaneRegistration"]>>>;
+      let session: { identity: () => unknown; attachRun: () => Promise<void>; close: () => Promise<void> };
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const factory = state.createTransport.mock.calls.at(-1)![0];
+        const identity = { ...factory.prpIdentity, normalizedSessionId: base.session.normalizedSessionId };
+        await mkdir(join(factory.stateDirectory!, "control-plane"), { recursive: true });
+        await mkdir(join(factory.stateDirectory!, "runner"), { recursive: true });
+        await writeFile(join(factory.stateDirectory!, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+        await writeFile(join(factory.stateDirectory!, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(identity, "ready")));
+        registration = await factory.controlPlaneRegistration!({} as never);
+        await registration.activate!(); await registration.ready!();
+        stateChange("authenticated");
+        session = { identity: () => ({ ...base.binding, sessionId: base.session.normalizedSessionId }),
+          attachRun: async () => {
+            stateChange("reconnecting", "runner_connection_lease_expired");
+            stateChange("failed", "runner_ingress_unavailable");
+            failReady = true;
+            await registration.ready!();
+          }, close: async () => { await registration.release(); } };
+        await options.onSession?.(session);
+        return result;
+      }).mockImplementationOnce(async options => {
+        expect(options.existingSession).toBe(session);
+        Object.assign(options.backend, { descriptor: () => ({ kind: "test", name: "retained ingress fixture" }) });
+        return actual.executeNativeSession(options as never);
+      });
+      await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", useRunnerd: true,
+        onLog: firstLog, onEvent: firstEvent });
+      const current = leaseDb(next);
+      const nextDb = { ...current, select: (columns?: Record<string, unknown>) => columns?.status && columns?.runnerProfileJson
+        ? { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ status: "succeeded", runnerProfileJson: { nativeExecutionInput: base } }]) }) }) }
+        : current.select(columns as never) } as unknown as Db;
+      await store.finalize(firstHandle);
+      const firstContent = (await store.read(firstHandle)).content;
+      firstLog.mockClear(); firstEvent.mockClear();
+      const failed = await executePaperclipNativeSession({ db: nextDb, execution: next, runnerInstanceId: "runner", useRunnerd: true,
+        onLog: nextLog, onEvent: nextEvent }).catch(error => error);
+      expect(failed).toBeInstanceOf(Error);
+      await store.finalize(nextHandle);
+      const nextContent = (await store.read(nextHandle)).content;
+      expect.soft(nextContent).toContain("state=reconnecting failure=runner_connection_lease_expired");
+      expect.soft(nextContent).toContain("state=failed failure=runner_ingress_unavailable");
+      expect.soft((await store.read(firstHandle)).content).toBe(firstContent);
+      expect.soft(rejectedWrites).toEqual([]);
+      expect.soft(nextLog).toHaveBeenCalledWith("stderr", expect.stringContaining("state=reconnecting failure=runner_connection_lease_expired"));
+      expect.soft(nextLog).toHaveBeenCalledWith("stderr", expect.stringContaining("state=failed failure=runner_ingress_unavailable"));
+      for (const span of ["runner.prp.authenticate", "runner.transport.ready"]) {
+        expect.soft(nextEvent).toHaveBeenCalledWith(expect.objectContaining({ eventType: "run.performance.span", payload: expect.objectContaining({
+          span, outcome: "failed" }) }));
+      }
+      expect.soft(firstLog).not.toHaveBeenCalled();
+      expect(firstEvent.mock.calls.some(([event]) => (event as { payload?: { span?: string } }).payload?.span?.startsWith("runner.transport.") ||
+        (event as { payload?: { span?: string } }).payload?.span === "runner.prp.authenticate")).toBe(false);
+      // A finalized run owns neither destination while the connection remains retained.
+      nextLog.mockClear(); nextEvent.mockClear();
+      stateChange("closed");
+      await expect(registration.ready!()).rejects.toBe(failure);
+      expect(firstLog).not.toHaveBeenCalled(); expect(nextLog).not.toHaveBeenCalled();
+      expect(nextEvent).not.toHaveBeenCalled();
+      expect(rejectedWrites).toEqual([]);
     });
 
     it("attributes attachment-failure diagnostics to the incoming warm run before onSession", async () => {
