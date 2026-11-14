@@ -265,6 +265,17 @@ function isRunnerResponseComment(params: {
   );
 }
 
+function latestFinalAssistantText(
+  entries: readonly { kind: string; channel?: string; text?: string }[],
+): string | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.kind === "assistant" && entry.channel === "final" && entry.text?.trim())
+      return entry.text;
+  }
+  return null;
+}
+
 // PAP-462 B4: backstop for how long the just-settled run's transcript stays
 // mounted when neither a settled turn nor a reply comment ever arrives to hand
 // off to (e.g. a stopped run with no tool activity). Normal completions hand off
@@ -1181,18 +1192,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : (settlingRun?.startedAtMs ?? null);
   const heldPaperclipRunnerFinalText = useMemo(() => {
     if (!heldPaperclipRunnerRunId) return null;
-    const entries = transcriptByRun.get(heldPaperclipRunnerRunId) ?? [];
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index];
-      if (
-        entry.kind === "assistant" &&
-        entry.channel === "final" &&
-        entry.text.trim()
-      ) {
-        return entry.text;
-      }
-    }
-    return null;
+    return latestFinalAssistantText(transcriptByRun.get(heldPaperclipRunnerRunId) ?? []);
   }, [heldPaperclipRunnerRunId, transcriptByRun]);
 
   // Runs observed non-terminal while mounted: their turns ANIMATE the fold when
@@ -1781,6 +1781,15 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         entries.some((entry) => entry.kind === "run_terminal");
       const decidedCommentId = presentationDecisionCommentId(meta?.resultJson);
       const progressCommentIds = semanticProgressCommentIds(meta?.resultJson);
+      // Without a recorded decision (the runs list omits it), the reply is
+      // the run's own comment. A reply that reached the client without run
+      // provenance is still this run's reply when it repeats the run's final
+      // answer, the rule the live hold uses; otherwise both would render.
+      const sourceFinalText =
+        decidedCommentId === undefined && sourceIsPaperclipRunner
+          ? latestFinalAssistantText(entries)
+          : null;
+      const sourceStartedAtMs = toMs(meta?.startedAt ?? meta?.createdAt) || null;
       const sourcePresentationCommentId =
         decidedCommentId === undefined
           ? ([...projectedComments]
@@ -1788,8 +1797,16 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               .find(
                 (comment) =>
                   !comment.deletedAt &&
-                  comment.runId === source.id &&
-                  !progressCommentIds.has(comment.id),
+                  !progressCommentIds.has(comment.id) &&
+                  (comment.runId === source.id ||
+                    (!comment.createdByRunId &&
+                      !comment.derivedCreatedByRunId &&
+                      isRunnerResponseComment({
+                        comment,
+                        runId: source.id,
+                        runStartedAtMs: sourceStartedAtMs,
+                        finalText: sourceFinalText,
+                      }))),
               )?.id ?? null)
           : decidedCommentId !== null &&
               projectedComments.some(
