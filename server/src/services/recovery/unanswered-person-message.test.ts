@@ -763,7 +763,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // text; the waiting note carries no failure code.
   const rowsOf = (notice: { metadata: unknown }) =>
     ((notice.metadata as { sections?: Array<{ rows: Array<{ label?: string; value?: string }> }> })?.sections ?? []).flatMap(section => section.rows);
-  it("E3.04 (2nd bound): a carrying queued run that never starts -> waiting note at ~2 min, the SAME note becomes the failure text at ~10 min", async () => {
+  // RFL line1 A1 (11:07Z; org 09:18Z): never edit a note in place. The failure text is a NEW note; the waiting note is
+  // kept byte-identical and marked supersededBy it (this row asserted the in-place upgrade before).
+  it("E3.04 (2nd bound): a carrying queued run that never starts -> waiting note at ~2 min, a NEW failure note at ~10 min supersedes it (never edited)", async () => {
     // org 09:11Z: chat fixture; the chat-aware action wording.
     const f = await fixture();
     const commentId = await f.message();
@@ -780,10 +782,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       unansweredPersonMessageCommentCondition()))).length, "the waiting note keeps the obligation open").toBeGreaterThan(0);
     await settleAt(f, 6 * 60_000);
     expect((await f.visible())[0]!.body).toBe(WAITING);
+    const waitingBefore = notices[0]!;
     await settleAt(f, 11 * 60_000);
     notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.id).toBe(noteId);
+    expect(notices[0]!.id, "a NEW note").not.toBe(noteId);
+    const kept = (await f.history()).find(note => note.id === noteId)!;
+    expect(kept.body, "the waiting note is never edited").toBe(waitingBefore.body);
+    expect(kept.presentation).toEqual(waitingBefore.presentation);
+    expect((kept.metadata as Record<string, unknown> | null)?.supersededBy).toBe(notices[0]!.id);
     expect(notices[0]!.body).toBe(CHAT_NO_RUN);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
@@ -869,7 +876,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
-  it("paused while a waiting-to-start note stands: the SAME note becomes the paused text", async () => {
+  // RFL line1 A1: the paused text is a NEW note; the waiting note is kept unchanged and marked supersededBy it.
+  it("paused while a waiting-to-start note stands: a NEW paused note supersedes the waiting note (never edited)", async () => {
     const f = await fixture();
     const commentId = await f.message();
     await f.run({ commentId, status: "queued" });
@@ -881,8 +889,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, 4 * 60_000);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.id).toBe(waitingNote!.id);
+    expect(notices[0]!.id, "a NEW note").not.toBe(waitingNote!.id);
     expect(notices[0]!.body).toBe(PAUSED_TEXT);
+    const kept = (await f.history()).find(note => note.id === waitingNote!.id)!;
+    expect(kept.body, "the waiting note is never edited").toBe(waitingNote!.body);
+    expect((kept.metadata as Record<string, unknown> | null)?.supersededBy).toBe(notices[0]!.id);
   });
 
   // org 09:11Z (app-lead's SMAAA-1907 screenshots): in a CHAT (Paperclip's isConversation,
