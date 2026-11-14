@@ -1,10 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { enterRunPreparationPhase } from "./execution-preparation-deadline.js";
 import { withDatabaseOperation } from "@paperclipai/db";
 import { EXECUTION_PREPARATION_SPAN_ATTRS, getActiveStepContext, runWithRuntimeParent } from "@paperclipai/adapter-utils/acpx-engine/startup-timing";
 import { createHash } from "node:crypto";
 import { isSpanContextValid, ROOT_CONTEXT, SpanStatusCode, trace, type Context } from "@opentelemetry/api";
 
-type PreparationPhase = "environment_selection" | "execution_configuration" | "session"
+type PreparationPhase = "scheduling_suppression" | "run_read" | "claim" | "session_cleanup"
+  | "environment_selection" | "execution_configuration" | "session"
   | "agent_read" | "chat_completion" | "conversation" | "runtime_state" | "issue_context"
   | "run_identity" | "trust_preset" | "task_context"
   | "chat_retry_admission" | "workspace_selection" | "dependency_readiness" | "issue_checkout"
@@ -198,7 +200,11 @@ export function drainRunPreparationPhases(runId: string): RecordedPreparationPha
 
 function measure<T>(runId: string, name: string, work: () => T | Promise<T>, independent = false, counts: { fileCount?: number; bytes?: number } = {}, activeParent?: Context, recordRunId?: string): Promise<T> {
   const startedAtMs = Date.now();
-  const operation = measureTraced(runId, name, work, independent, counts, activeParent, recordRunId);
+  const leave = name.startsWith("task.") ? () => {} : enterRunPreparationPhase(runId, name.replace(/^heartbeat\.prepare\./, ""));
+  const operation = measureTraced(runId, name, work, independent, counts, activeParent, recordRunId).then(
+    value => { leave(); return value; },
+    error => { leave(); throw error; },
+  );
   // Only pre-dispatch preparation reaches the run log here; execution attempts
   // and runtime timings belong to the turn, not to the next attempt's prepare.
   if (isPreparationPhaseName(name)) operation.then(
@@ -294,7 +300,10 @@ export function measureRunPhase<T>(phase: ExecutionPhase, work: () => T | Promis
       // causal parent while the child publishes its own context to plugin workers.
       const value = endpointEnabled()
         ? await measure(owned.runId, phase, work, false, counts, getActiveStepContext()?.parentContext as Context | undefined, recordedRunId ?? undefined)
-        : await work();
+        : await (async () => {
+          const leave = enterRunPreparationPhase(owned.runId, phase);
+          try { return await work(); } finally { leave(); }
+        })();
       outcome = "ok";
       return value;
     } finally {

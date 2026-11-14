@@ -30,10 +30,23 @@ vi.mock("../services/fresh-workspace-continuation.js", async importOriginal => {
   } };
 });
 
+const budgetFault = vi.hoisted(() => ({ entered: false, stall: false, release: undefined as (() => void) | undefined }));
+vi.mock("../services/budget-reservations.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/budget-reservations.js")>();
+  return { ...actual, reserveRunBudget: async (...args: Parameters<typeof actual.reserveRunBudget>) => {
+    const reservation = await actual.reserveRunBudget(...args);
+    if (budgetFault.stall) {
+      budgetFault.entered = true;
+      await new Promise<void>(resolve => { budgetFault.release = resolve; });
+    }
+    return reservation;
+  } };
+});
+
 const support = await getRecoveryPostgresSupport({});
 async function until(description: string, check: () => boolean | Promise<boolean>, timeoutMs = 10_000) {
   const end = performance.now() + timeoutMs;
-  while (performance.now() < end) { if (await check()) return; await sleep(10); }
+  while (performance.now() < end) { if (await check()) return; await sleep(timeoutMs > 10_000 ? 250 : 10); }
   throw new Error(`Timed out waiting for ${description}`);
 }
 function completingBackend(db: ReturnType<typeof createDb>): NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
@@ -112,13 +125,16 @@ describe.skipIf(!support.supported)("claimed recovery run preparation deadline",
     return { issueId: issue!.id, messageId: message!.id, runId: run!.id };
   }
 
-  it("fails a hung readiness phase within 45 seconds, releases its claim, and emits one true failure note", async () => {
+  it.each([{ target: "readiness", realClock: false }, { target: "readiness", realClock: true }, { target: "budget", realClock: false }])(
+    "fails hung $target preparation within 45 seconds, releases its claim, and emits one true note (wall clock: $realClock)", async ({ target, realClock }) => {
     const { companyId } = fixture.current;
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
     const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: completingBackend(db) });
     const readRun = async (id: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0]!;
-    readinessFault.stall = true;
-    readinessFault.entered = false;
+    const fault = target === "readiness" ? readinessFault : budgetFault;
+    const expectedPhase = target === "readiness" ? "workspace_selection" : "execution.budget_reservation";
+    fault.stall = true;
+    fault.entered = false;
     // Advance only the preparation deadline, not PostgreSQL's socket/idle
     // timers. Faking every timer prevents the real database from connecting.
     const originalSetTimeout = globalThis.setTimeout;
@@ -130,23 +146,35 @@ describe.skipIf(!support.supported)("claimed recovery run preparation deadline",
     }) as typeof setTimeout);
     try {
       const { runId, issueId } = await restoredTask(db, heartbeat);
-      await until("real readiness phase", () => readinessFault.entered);
-      expect(readinessFault.observedMode).toBe("fresh_isolated_workspace");
-      expect(await readRun(runId)).toMatchObject({ status: "running", runtimeMode: "legacy", runtimeModeReason: null,
-        runtimeModeResolvedAt: null, processPid: null, runnerInstanceId: null });
-      expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(0);
+      await until("real preparation phase", () => fault.entered);
+      const before = await readRun(runId);
+      if (target === "readiness") {
+        expect(readinessFault.observedMode).toBe("fresh_isolated_workspace");
+        expect(before).toMatchObject({ status: "running", runtimeMode: "legacy", runtimeModeReason: null,
+          runtimeModeResolvedAt: null, processPid: null, runnerInstanceId: null });
+        expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).toHaveLength(0);
+      } else {
+        expect(before).toMatchObject({ status: "running", runtimeMode: "native", processPid: null });
+        expect(before.runtimeModeResolvedAt).not.toBeNull();
+      }
       expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionRunId).toBe(runId);
 
-      for (const expire of deadlineCallbacks) expire();
+      if (!realClock) for (const expire of deadlineCallbacks) expire();
       // No reaper invocation: the claimed attempt itself must end promptly.
-      await until("named preparation failure", async () => (await readRun(runId)).status !== "running", 1_000);
+      await until("named preparation failure", async () => (await readRun(runId)).status !== "running", realClock ? 50_000 : 1_000);
       const failed = await readRun(runId);
       expect(failed).toMatchObject({ status: "failed", errorCode: "setup_preparation_stalled",
-        error: expect.stringContaining("workspace_selection"), processPid: null, runnerInstanceId: null,
-        resultJson: expect.objectContaining({ preparation: expect.objectContaining({ phase: "workspace_selection", deadlineMs: 45_000 }),
+        error: expect.stringContaining(expectedPhase), processPid: null,
+        resultJson: expect.objectContaining({ preparation: expect.objectContaining({ phase: expectedPhase, deadlineMs: 45_000 }),
           executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }) });
       await until("execution claim released", async () =>
         (await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionRunId === null);
+      const released = (await db.select().from(issues).where(eq(issues.id, issueId)))[0]!;
+      expect(released).toMatchObject({ executionRunId: null, checkoutRunId: null, executionLockedAt: null, executionAgentNameKey: null });
+      // The deadline completion itself must reach the existing notice owner;
+      // the later reconciliation passes below may not be its first publisher.
+      await until("deadline's existing failure-note owner", async () =>
+        (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")))).length === 1, 2_000);
       // Use the existing failure-note owner twice, as repeated worker passes do.
       const noticeTime = new Date(failed.finishedAt!.getTime() + 15_001);
       await settleUnansweredPersonMessage(db, { companyId, issueId, now: noticeTime });
@@ -157,14 +185,24 @@ describe.skipIf(!support.supported)("claimed recovery run preparation deadline",
       expect(JSON.stringify(notes[0]!.metadata)).toContain("setup_preparation_stalled");
 
       // A late readiness result cannot select a runtime or dispatch a provider.
-      readinessFault.release?.();
+      fault.release?.();
       timerSpy.mockRestore();
       await heartbeat.drainActiveRunExecutions();
-      expect(await readRun(runId)).toMatchObject({ status: "failed", errorCode: "setup_preparation_stalled",
-        runtimeModeResolvedAt: null, processPid: null, runnerInstanceId: null });
+      const settled = await readRun(runId);
+      expect(settled).toMatchObject({ status: "failed", errorCode: "setup_preparation_stalled", processPid: null });
+      if (target === "readiness") expect(settled).toMatchObject({ runtimeModeResolvedAt: null, runnerInstanceId: null });
+      if (realClock) expect(failed.finishedAt!.getTime() - failed.startedAt!.getTime()).toBeLessThan(50_000);
+      console.info("preparation-deadline-proof", JSON.stringify({ target, realClock, runId, issueId,
+        before: { status: before.status, runtimeMode: before.runtimeMode, runtimeModeReason: before.runtimeModeReason,
+          runtimeModeResolvedAt: before.runtimeModeResolvedAt, processPid: before.processPid, runnerInstanceId: before.runnerInstanceId },
+        after: { status: failed.status, errorCode: failed.errorCode, error: failed.error, resultJson: failed.resultJson,
+          executionRunId: released.executionRunId, checkoutRunId: released.checkoutRunId,
+          executionLockedAt: released.executionLockedAt, claimReleased: true, noteCount: notes.length,
+          note: notes[0]!.body, metadata: notes[0]!.metadata,
+          claimToFailureMs: failed.finishedAt!.getTime() - failed.startedAt!.getTime() }, lateDispatchPrevented: true }));
     } finally {
-      readinessFault.stall = false;
-      readinessFault.release?.();
+      fault.stall = false;
+      fault.release?.();
       timerSpy.mockRestore();
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();
@@ -183,6 +221,9 @@ describe.skipIf(!support.supported)("claimed recovery run preparation deadline",
       expect(run!.runtimeModeReason).toBeTruthy();
       expect(run!.runtimeModeResolverVersion).toBeTruthy();
       expect(run!.runtimeModeResolvedAt).not.toBeNull();
+      console.info("preparation-normal-recovery-proof", JSON.stringify({ runId, status: run!.status, runtimeMode: run!.runtimeMode,
+        runtimeModeReason: run!.runtimeModeReason, runtimeModeResolverVersion: run!.runtimeModeResolverVersion,
+        runtimeModeResolvedAt: run!.runtimeModeResolvedAt, errorCode: run!.errorCode }));
     } finally {
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();

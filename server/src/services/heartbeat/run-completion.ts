@@ -78,6 +78,8 @@ import type { createHeartbeatRunState, getAdapterSessionCodec } from "./run-stat
 import type { EffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import type { Db, agents } from "@paperclipai/db";
 import { setupCommandFailureResultJson } from "../workspace-setup-command-failure.js";
+import { RunPreparationStalledError } from "../execution-preparation-deadline.js";
+import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -1663,7 +1665,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       ? outerErr : null;
     const runnerRevisionMismatch = !providerDispatchStarted && run.runtimeMode === "legacy"
       && run.nativeSessionId === null && run.runnerInstanceId === null && isRunnerRevisionMismatch(outerErr);
+    const preparationStalled = !providerDispatchStarted && outerErr instanceof RunPreparationStalledError ? outerErr : null;
     const setupFailureErrorCode =
+      preparationStalled?.code ??
       (controllerLeaseLost ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
       remoteWorkspacePreparationTimeout?.code ??
@@ -1728,6 +1732,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const connectionFailure = readGitConnectionFailure(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
+      ...preparationStalled?.resultJson,
       ...(failureCause ? { failureCause } : {}),
       ...(repositoryCatalogUnavailable ? { errorFamily: "transient_upstream",
         ...(repositoryCatalogUnavailable.retryAt ? { retryNotBefore: new Date(repositoryCatalogUnavailable.retryAt).toISOString() } : {}),
@@ -1748,7 +1753,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       ...(!providerDispatchStarted
         ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
         : {}),
-      ...(!providerDispatchStarted && !signal.aborted
+      ...(!providerDispatchStarted && (!signal.aborted || preparationStalled)
         ? await nativePreDispatchFailureResult(runId, nativeDispatchMayHaveStarted) : null),
     };
     const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {
@@ -1885,9 +1890,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           nativePreDispatchRetryScheduled = retry?.outcome === "scheduled" && isNativePreDispatchTransientFailure(livenessRun);
         }
       }
+      if (preparationStalled && setupFailureResultJson[NATIVE_PRE_DISPATCH_FAILURE_KEY]) {
+        // The deadline itself aborted the signal, but the existing evidence
+        // reader proved dispatch never claimed this observed coordinator.
+        await settleUnclaimedNativeCoordinator(livenessRun);
+      }
       await settleStorageWaitMessage(livenessRun, storageWait, outerErr);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: storageWaitScheduled || nativePreDispatchRetryScheduled ||
+        suppressImmediateRecovery: Boolean(preparationStalled) || storageWaitScheduled || nativePreDispatchRetryScheduled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||
@@ -1908,6 +1918,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           );
         },
       );
+      if (preparationStalled && setupFailureIssueId) {
+        // The same fenced, message-keyed owner used by recovery sweeps. No
+        // second comment writer, and repeated passes cannot duplicate it.
+        await settleUnansweredPersonMessage(db, { companyId: run.companyId, issueId: setupFailureIssueId })
+          .catch(error => logger.warn({ err: error, runId }, "stalled preparation notice remains with recovery"));
+      }
     }
     // This path owned the failed-status write, which deferred the report.
     const reviewedChatReportRun = reviewedChatBindingNotReady && setupFailureWrite.updated

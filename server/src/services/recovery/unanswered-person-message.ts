@@ -23,6 +23,7 @@ import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { SETUP_PREPARATION_STALLED_CODE } from "../execution-preparation-deadline.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -92,7 +93,7 @@ export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
 // Codes the notice metadata may name. A run's error is reduced to its leading
 // code token; anything not listed is unclassified_failure, never raw text.
 const SHOWN_CODES = new Set([
-  "adapter_failed", "cancelled", "timeout", "timed_out", "interrupted", "process_lost", "setup_failed",
+  "adapter_failed", "cancelled", "timeout", "timed_out", "interrupted", "process_lost", "setup_failed", SETUP_PREPARATION_STALLED_CODE,
   "native_controller_recovery_missing_evidence", "native_controller_recovery_dependency_unavailable",
   "native_controller_recovery_unsupported", "native_controller_recovery_wait_authority_changed",
   "native_controller_recovery_metadata_too_large", "native_session_cleanup_quarantined",
@@ -546,7 +547,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // run the person's message ended on: its refusal is the explanation
   // (fork-lead a6342a4d4, fresh-continuation-chain.ts).
   const latest = runs[0];
-  const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
+  const run = messageRun && latest && latest.id !== messageRun.id
+    && (isNativeContinuationRefusal(latest) || latest.errorCode === SETUP_PREPARATION_STALLED_CODE)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
@@ -578,7 +580,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     code = UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
-    const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
+    // Setup's deadline owner already made its retry decision and released the
+    // claim before asking us to publish. There is no provider answer to await.
+    const due = (run.finishedAt ?? run.updatedAt).getTime()
+      + (run.errorCode === SETUP_PREPARATION_STALLED_CODE ? 0 : UNANSWERED_MESSAGE_SETTLE_MS);
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
     if (run.issueCommentStatus === "retry_queued") {
       const wait = await bounded(now.getTime() + 30_000);
@@ -641,6 +646,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
   const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : code === SETUP_PREPARATION_STALLED_CODE ? "Task setup took too long, so this run could not start. Sending your message again is safe."
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;

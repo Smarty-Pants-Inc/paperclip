@@ -71,6 +71,10 @@ For local adapters, set:
 - optional env vars and extra CLI args
 - use **Test environment** in agent configuration to run adapter-specific diagnostics before saving
 
+Before adapter/provider dispatch, a newly claimed run has a separate **45-second preparation deadline**. This is not `timeoutSec`: workspace readiness, configuration, and ownership/admission waits happen before the adapter starts. If preparation cannot reach dispatch, the run fails with `setup_preparation_stalled`; its error and `resultJson.preparation` name the pending phase and elapsed time. The issue execution claim is released through the normal completion owner, and the existing unanswered-message owner posts one notice for an affected person's message rather than promising that work is running. An unanswered-message notice is not an additional provider response.
+
+The deadline aborts preparation and fences late dispatch. It does not claim that an outstanding workspace operation has stopped: that operation remains tracked and its resources stay with the existing cleanup/admission owners. Native restart attachments retain their existing ownership deadlines. After dispatch begins, adapter/native execution limits and the process-loss reaper remain authoritative; runtime selection policy is unchanged.
+
 ## 3.4 Prompt templates
 
 You can set:
@@ -105,6 +109,8 @@ For each heartbeat run you get:
 - full logs (stored outside core run rows, optimized for large output)
 
 In local/dev setups, full logs are stored on disk under the configured run-log path.
+
+Server logs emit `heartbeat preparation phase` at each named preparation step, including nested workspace and admission waits. Each line contains `runId`, `phase`, and `elapsedMs` since preparation began, without configuration values or credentials. This entry is emitted before waiting, even if the step never returns and no adapter run-log event exists yet.
 
 ## 6. Live updates in the UI
 

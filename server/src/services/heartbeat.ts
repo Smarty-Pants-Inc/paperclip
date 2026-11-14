@@ -46,6 +46,7 @@ import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } 
 import { dotRunnerBroker } from "./dot-runner-broker.js";
 import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isWorkspaceSyncDetailPhase } from "./execution-preparation-timing.js";
 import { createHeartbeatPreparationTiming } from "./heartbeat/preparation-timing.js";
+import { createRunPreparationDeadline } from "./execution-preparation-deadline.js";
 import { createHeartbeatInstructionCopyRelease, createHeartbeatInstructionWorkingCopy } from "./heartbeat/instruction-working-copy.js";
 import { AgentDirectoryPreparationDeferral, deferRunForBusyAgentDirectory, prepareWithAgentDirectoryDeferral } from "./heartbeat/agent-directory-busy.js";
 import { preparePredecessorRetirementFallback } from "./heartbeat/predecessor-retirement-fallback.js";
@@ -1940,7 +1941,29 @@ export function heartbeatService(
       onNativeExecutionLeaseAcquired?: () => Promise<void>;
     } = {},
   ) {
-    return withRunExecutionTiming(runId, () => runInOwnStorageScope(() => executeRunAttempt(runId, runOptions)));
+    const executionControl = createAdapterExecutionControl();
+    const preparation = createRunPreparationDeadline({
+      runId,
+      controller: executionControl.controller,
+      // A recovery attachment may already have provider effects. Its existing
+      // ownership/recovery deadline remains authoritative; this is new setup.
+      enabled: !runOptions.nativeLeaseOwner && !runOptions.nativeRestartRecovery,
+      onExpired: async error => {
+        const run = await getRun(runId);
+        if (!run || run.status !== "running") return;
+        await runCompletion.failRunSetup({ run, runId, outerErr: error,
+          signal: executionControl.controller.signal, providerDispatchStarted: false,
+          nativeDispatchMayHaveStarted: false, identityRedactor: createAgentIdentityRedactor(),
+          readFailureReportSecrets: () => [],
+        });
+      },
+    });
+    try {
+      return await withRunExecutionTiming(runId, () => runInOwnStorageScope(() =>
+        preparation.run(() => executeRunAttempt(runId, runOptions, executionControl, preparation))));
+    } finally {
+      await preparation.stop();
+    }
   }
 
   const { deferRunForProviderLimit } = createProviderLimitWait(db, {
@@ -1956,10 +1979,13 @@ export function heartbeatService(
     runId: string,
     runOptions: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim; portablePreparationLeaseId?: string;
       onNativeExecutionLeaseAcquired?: () => Promise<void> },
+    executionControl: ReturnType<typeof createAdapterExecutionControl>,
+    preparation: ReturnType<typeof createRunPreparationDeadline>,
   ) {
     const attemptStartedAtMs = Date.now();
+    const timePreparation = createHeartbeatPreparationTiming(runId);
     let attestedQuestionResponseAtMs: number | null = null;
-    if ((await getSchedulingSuppression()).suppressed) {
+    if ((await timePreparation("scheduling_suppression", getSchedulingSuppression)).suppressed) {
       try {
         await releaseRunClaimedJustBeforeSuppression(runId);
       } catch (err) {
@@ -1975,12 +2001,13 @@ export function heartbeatService(
     let legacyLocalAdapterEntered = false;
     let legacyPreparationFailedBeforeDispatch = false;
     let persistUsageCaptureFailure: (() => Promise<void>) | undefined;
-    let run = await getRun(runId);
+    let run = await timePreparation("run_read", () => getRun(runId));
     if (!run) return;
     if (run.status !== "queued" && run.status !== "running") return;
 
     if (run.status === "queued") {
-      const claimed = await claimQueuedRun(run);
+      const queuedRun = run;
+      const claimed = await timePreparation("claim", () => claimQueuedRun(queuedRun));
       if (!claimed) {
         // claimQueuedRun can also leave the run queued when dependencies are unresolved.
         return;
@@ -2080,15 +2107,15 @@ export function heartbeatService(
     const cleanupGateIssueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
     if (cleanupGateIssueId) {
       const { retireStoppedSessionCleanupGates } = await import("./native-runtime/native-session-executor.js");
-      await retireStoppedSessionCleanupGates(db, { companyId: run.companyId, issueId: cleanupGateIssueId,
-        ...(run.runtimeMode === "native" ? { run } : {}) });
+      const cleanupRun = run;
+      await timePreparation("session_cleanup", () => retireStoppedSessionCleanupGates(db, {
+        companyId: cleanupRun.companyId, issueId: cleanupGateIssueId,
+        ...(cleanupRun.runtimeMode === "native" ? { run: cleanupRun } : {}) }));
     }
 
     if (run.runtimeMode === "legacy" && run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId) return;
     activeRunExecutions.add(run.id);
-    const timePreparation = createHeartbeatPreparationTiming(run.id);
-    const executionControl = createAdapterExecutionControl();
     endStorageOutageWaitOn(executionControl.controller.signal);
     reportStorageOutageWaitsTo(createStorageWaitNotice({ run, appendRunEvent }));
     // This coarse scope also covers host finalization after the adapter returns.
@@ -3149,6 +3176,7 @@ export function heartbeatService(
         let entered = false, handedOff = false;
         try {
           return await dispatchResolvedInteractionContinuationAfterAdmission((markDispatchStarted) => {
+            preparation.dispatchStarted();
             entered = true;
             dispatchGateEntered = true;
             return dispatch(markDispatchStarted);
@@ -3819,6 +3847,7 @@ export function heartbeatService(
           issueContext, onLog,
         }));
       } catch (err) {
+        if (preparation.error) throw preparation.error;
         await persistUsageCaptureFailure?.();
         const agentDirectoryDeferral = await deferRunForBusyAgentDirectory(db, {
           run, error: err, leaseOwner: runOptions.nativeLeaseOwner, restartRecovery: runOptions.nativeRestartRecovery,
@@ -4003,7 +4032,12 @@ export function heartbeatService(
         if (failed?.preserveFailedWorkspace) await preserveNativeWorkspaceOnFailure();
       }
     } catch (outerErr) {
-      if (nativeStartupCleanupScheduled || nativeStartupCleanupError || outerErr instanceof NativeStartupCleanupPendingError) {
+      if (preparation.error) {
+        // The deadline's completion owner settles even a phase that never
+        // resolves. Join that one write rather than competing with it here.
+        await preparation.settle();
+        legacyPreparationFailedBeforeDispatch = true;
+      } else if (nativeStartupCleanupScheduled || nativeStartupCleanupError || outerErr instanceof NativeStartupCleanupPendingError) {
         const pending = outerErr instanceof NativeStartupCleanupPendingError ? outerErr : nativeStartupCleanupError;
         if (!nativeStartupCleanupScheduled && pending) await requestStartupCleanup(pending).catch(error => {
           logger.warn({ err: error, runId: run.id }, "Native startup cleanup intent will retry through owned recovery");
@@ -4073,6 +4107,7 @@ export function heartbeatService(
             logger.warn({ err: error, runId: run.id }, "Failed native recovery preparation could not be settled"));
       }
     } finally {
+      await preparation.stop();
       let caseHandoffCleanupSettled = false;
       let failedProcessCancellationSeen = failedProcessRunCancellations.has(run.id);
       await instructionWorkingCopy?.nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
@@ -4363,7 +4398,7 @@ export function heartbeatService(
         // Re-run the same queue-first recovery decision after cleanup. Its
         // earlier retry request could not authorize work while this executor
         // still held its controller or environment lease.
-        await releaseIssueExecutionAndPromote(latestRun).catch(err => {
+        await releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: Boolean(preparation.error) }).catch(err => {
           logger.error({ err, runId: run.id }, "failed to settle explicit continuation after cleanup");
         });
       }
