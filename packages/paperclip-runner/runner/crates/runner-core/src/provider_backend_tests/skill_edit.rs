@@ -139,7 +139,11 @@ mod skill_edit {
         if expected == "prepared" {
             // Independent RFL probe: preserve the OLD checkpoint bytes somewhere
             // in its owned tree, and use a distinct file for the fresh session.
-            let artifacts = std::path::PathBuf::from(std::env::var("TL07_JUDGE_ARTIFACTS").unwrap());
+            let artifacts = std::env::var("TL07_JUDGE_ARTIFACTS").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+                let dir = std::env::temp_dir().join(format!("tl07-judge-{}", std::process::id()));
+                fs::create_dir_all(&dir).unwrap();
+                dir
+            });
             fs::write(artifacts.join(format!("trace-{blocker}-before.json")), &bytes).unwrap();
             let after = fs::read(next.state_path()).unwrap();
             fs::write(artifacts.join(format!("trace-{blocker}-after.json")), &after).unwrap();
