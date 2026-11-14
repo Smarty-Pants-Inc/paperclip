@@ -411,10 +411,11 @@ export async function settleUnansweredPersonMessage(
       presentation: fenced.notice.presentation,
       metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
     }, tx);
-    // One note per held conversation (SMA-183): a held-conversation note for
-    // the person's latest message replaces B''s live note for an earlier
-    // message (soft-deleted, as an answer supersedes one; its key still marks
-    // that message noticed). Other notes stay one per message.
+    // One CURRENT note per held conversation (SMA-183): a held-conversation
+    // note for the person's latest message supersedes B''s live note for an
+    // earlier message. That note is kept (never deleted, org 09:18Z) and marked
+    // metadata.supersededBy; its key still marks that message noticed. Other
+    // notes stay one per message.
     if (comment?.id && fenced.supersedeCommentId) {
       await tx.execute(sql`update ${issueComments} set metadata = coalesce(metadata, '{}'::jsonb)
         || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
@@ -422,8 +423,11 @@ export async function settleUnansweredPersonMessage(
     }
     if (comment?.id && fenced.replacesEarlier) {
       const messageId = fenced.reason.slice(UNANSWERED_MESSAGE_REASON_PREFIX.length);
-      await tx.execute(sql`update ${issueComments} n set deleted_at = ${now.toISOString()}::timestamptz, updated_at = ${now.toISOString()}::timestamptz
+      // org 09:18Z: never delete; mark superseded (kept as history).
+      await tx.execute(sql`update ${issueComments} n set metadata = coalesce(n.metadata, '{}'::jsonb)
+          || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
         where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
+          and not coalesce(n.metadata ? 'supersededBy', false)
           and n.id <> ${comment.id} and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
           and exists (select 1 from ${issueComments} m, ${issueComments} latest
             where m.company_id = n.company_id and m.issue_id = n.issue_id
