@@ -19,6 +19,8 @@ import { listFreshContinuations } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { prepareUnconfirmedSourceSandboxStop, retryUnconfirmedSourceSandboxStop } from "./sandbox-stop-and-retain.js";
+import { freshThreadStopGate, readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
+import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
 // Keep reason: SEED-B's recorded data-loss/silence incident, and the allocation
 // ownership trust boundary. Only context materialization/sandbox I/O are peers;
@@ -57,7 +59,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
   });
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); if (root) await rm(root, { recursive: true, force: true }); });
 
-  it.each(["idle-release", "observed-owner", "observed-proof-arrives", "proof-arrives", "running", "stopping", "unknown", "other-lease", "tl07-idle", "tl07-running"] as const)(
+  it.each(["idle-release", "receipt-window-end", "released-no-receipt", "expired-no-receipt", "retained-age-stop", "observed-owner", "observed-proof-arrives", "proof-arrives", "running", "stopping", "unknown", "other-lease", "tl07-idle", "tl07-running"] as const)(
     "%s: immutable receipt, one current note, no impossible run; proof wakes the saved message", async shape => {
     const t0 = Date.now();
     const tl07 = shape.startsWith("tl07-");
@@ -98,11 +100,26 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     await db.insert(nativeRunFinalizations).values({ runId: source.id, companyId: company.id, issueId: issue.id, phase: "terminal_failure", failureCode: source.errorCode, recoveryState: "blocked" });
     const [blocked] = await db.update(issues).set({ status: "blocked", blockedTransitionAt: source.finishedAt }).where(eq(issues.id, issue.id)).returning();
     const [hold] = await db.insert(issueRecoveryActions).values({ companyId: company.id, sourceIssueId: issue.id, kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "board", returnOwnerAgentId: agent.id, fingerprint: `f1-seed-b:${source.id}`, nextAction: "Attempt 1/3: do not open a replacement", evidence: { runId: source.id, nativeFailureBlock: { runId: source.id, statusVersion: blocked.statusVersion } } }).returning();
-    const preconfirmed = ["idle-release", "observed-owner", "other-lease"].includes(shape);
-    const [lease] = await db.insert(environmentLeases).values({ companyId: company.id, issueId: issue.id, heartbeatRunId: old.id, provider: "boat", providerLeaseId: "bx_ysh5xvy5", leasePolicy: "reuse_by_environment", status: preconfirmed ? "released" : "retained", cleanupStatus: preconfirmed ? "success" : null, acquiredAt: new Date(t0 - 590_000), releasedAt: preconfirmed ? new Date(t0 - 300_000) : null, metadata: { pluginId: "fixture-boat" } }).returning();
-    if (preconfirmed) await db.update(environmentLeases).set({ metadata: { ...lease.metadata, remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: company.id, runId: old.id, leaseId: lease.id, provider: "boat", providerLeaseId: lease.providerLeaseId, state: "stopped" } } }).where(eq(environmentLeases.id, lease.id));
+    const inspectedStop = ["released-no-receipt", "expired-no-receipt", "retained-age-stop"].includes(shape);
+    const endedWithoutReceipt = shape === "released-no-receipt" || shape === "expired-no-receipt";
+    const preconfirmed = ["idle-release", "receipt-window-end", "observed-owner", "other-lease"].includes(shape);
+    const [lease] = await db.insert(environmentLeases).values({ companyId: company.id, issueId: issue.id, heartbeatRunId: old.id, provider: "boat", providerLeaseId: "bx_ysh5xvy5", leasePolicy: "reuse_by_environment", status: shape === "expired-no-receipt" ? "expired" : preconfirmed || endedWithoutReceipt ? "released" : "retained", cleanupStatus: preconfirmed || endedWithoutReceipt || shape === "retained-age-stop" ? "success" : null, acquiredAt: new Date(t0 - 590_000), releasedAt: preconfirmed || endedWithoutReceipt ? new Date(t0 - 300_000) : null, metadata: { pluginId: "fixture-boat" } }).returning();
+    if (preconfirmed) await db.update(environmentLeases).set({ metadata: { ...lease.metadata, remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: company.id, runId: old.id, leaseId: lease.id, provider: "boat", providerLeaseId: lease.providerLeaseId, state: "stopped", ...(shape === "receipt-window-end" ? { confirmedAt: lease.releasedAt!.toISOString() } : {}) } } }).where(eq(environmentLeases.id, lease.id));
     const before = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]!;
-    if (!preconfirmed) await db.update(environmentLeases).set({ metadata: { ...before.metadata,
+    if (shape === "receipt-window-end") {
+      expect(before.metadata?.remoteExecutionTermination).not.toHaveProperty("kind");
+      expect((before.metadata?.remoteExecutionTermination as { confirmedAt: string }).confirmedAt).toBe(before.releasedAt!.toISOString());
+      expect(hasRemoteTerminationReceipt(before)).toBe(true);
+      expect(hasBoundRemoteStopReceipt(before)).toBe(true);
+      expect((await readFreshThreadStopProof(db, source, issue.id)).gone).toBe(true);
+    }
+    if (endedWithoutReceipt) {
+      await db.transaction(tx => freshThreadStopGate(tx as unknown as Db, source, issue.id));
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(before);
+      expect(await prepareUnconfirmedSourceSandboxStop(db, before)).toBeNull();
+      expect(await retryUnconfirmedSourceSandboxStop(db, before)).toBeNull();
+    }
+    if (!preconfirmed && !inspectedStop) await db.update(environmentLeases).set({ metadata: { ...before.metadata,
       pendingCleanupController: { bootId: "stale-boot", processStartedAt: "2026-11-14T11:49:42.000Z" } } }).where(eq(environmentLeases.id, lease.id));
     if (shape === "other-lease") {
       const [peerIssue] = await db.insert(issues).values({ companyId: company.id, title: "Allocation's actual holder", status: "in_progress", assigneeAgentId: agent.id }).returning();
@@ -110,7 +127,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       await db.insert(nativeRunFinalizations).values({ companyId: company.id, issueId: peerIssue.id, runId: peer.id, phase: "observed", leaseOwner: "actual-allocation-holder", leaseExpiresAt: new Date(t0 + 3600_000) });
       await db.insert(environmentLeases).values({ companyId: company.id, heartbeatRunId: peer.id, issueId: peerIssue.id, provider: "boat", providerLeaseId: lease.providerLeaseId, status: "active" });
     }
-    let providerState: string = shape === "running" ? "active" : shape;
+    let providerState: string = inspectedStop ? "stopped" : shape === "running" ? "active" : shape;
     const inspectLeaseResource = vi.fn(async () => {
       // A separate transaction can take the task lock NOWAIT at the provider
       // boundary. Calling this from the locked admission gate would fail.
@@ -120,11 +137,11 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     const stop = vi.fn(async () => undefined);
     const hb = heartbeatService(db, { environmentRuntime: { inspectLeaseResource, retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
     const tick = async (n: number) => {
-      vi.setSystemTime(t0 + n * 300_000);
+      vi.setSystemTime(t0 + n * (inspectedStop ? 30_000 : 300_000));
       await hb.reapOrphanedRuns();
-      await settleUnrecoverableExecutions(db);
+      await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
       await hb.sweepPendingCleanupLeases();
-      await settleUnrecoverableExecutions(db);
+      await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
       if (process.env.TASK_OUT) await appendFile(join(process.env.TASK_OUT, "seed-states.jsonl"), JSON.stringify({ shape, n, runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issue.id)), leases: await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, issue.id)), actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issue.id)) }) + "\n");
     };
     const notes = async () => (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).filter(c => c.authorType === "system");
@@ -132,7 +149,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issue.id))).length;
     for (let n = 0; n < 3; n++) {
       await tick(n);
-      if ((!preconfirmed && shape !== "tl07-idle") || shape === "other-lease") {
+      if ((!preconfirmed && !inspectedStop && shape !== "tl07-idle") || shape === "other-lease") {
         expect(await runCount()).toBe(2);
         expect(await listFreshContinuations(db, { companyId: company.id, issueId: issue.id })).toHaveLength(0);
         expect(await current()).toHaveLength(1);
@@ -147,7 +164,17 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       expect(stop).not.toHaveBeenCalled();
       expect(inspectLeaseResource).not.toHaveBeenCalled();
     }
-    if (!["idle-release", "observed-owner", "observed-proof-arrives", "proof-arrives", "tl07-idle"].includes(shape)) {
+    if (inspectedStop) {
+      expect(inspectLeaseResource).toHaveBeenCalled();
+      expect(stop).not.toHaveBeenCalled();
+      const [settledLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      expect(settledLease.status).toBe(endedWithoutReceipt ? before.status : "released");
+      expect(hasRemoteTerminationReceipt(settledLease)).toBe(true);
+      expect(settledLease.metadata).not.toHaveProperty("sandboxStopAndRetainReceipt");
+      if (endedWithoutReceipt) expect(settledLease.releasedAt).toEqual(before.releasedAt);
+      expect(await current()).toHaveLength(1);
+    }
+    if (!["idle-release", "receipt-window-end", "observed-owner", "observed-proof-arrives", "proof-arrives", "tl07-idle"].includes(shape) && !inspectedStop) {
       expect(await runCount()).toBe(2);
       return;
     }
@@ -191,7 +218,8 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     expect(await runCount()).toBe(3);
     expect(await current()).toHaveLength(1);
     expect((await current())[0].body).toContain("fresh thread");
-    expect(await notes()).toHaveLength(proofLands ? 2 : 1);
+    expect(await notes()).toHaveLength(proofLands || endedWithoutReceipt ? 2 : 1);
+    if (inspectedStop) expect(Date.now() - t0).toBeLessThanOrEqual(60_000);
     if (observedOwner) expect(await readRun(old.id)).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
   }, 60_000);
 });
