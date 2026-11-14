@@ -1257,6 +1257,8 @@ export interface IssueCommentMetadata {
   recoveryResponsibility?: "system" | "user";
   /** Generated file-preparation receipt; presentation only, never authorization. */
   attachmentPreparation?: { attachmentId: string };
+  /** Later state appends a notice; the original body remains conversation history. */
+  supersededByCommentId?: string;
   /** Inbound channel attribution; never an authorization input. */
   sourceChannel?: ChatProvider;
   sourceRunId?: string | null;

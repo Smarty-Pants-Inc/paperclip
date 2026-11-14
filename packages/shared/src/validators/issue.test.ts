@@ -55,6 +55,16 @@ describe("issue validators", () => {
     }
   });
 
+  it("RFL F3 preserves the typed notice-supersession pointer and older metadata", () => {
+    const metadata = { version: 1, sections: [{ rows: [{ type: "text", text: "Original notice" }] }] };
+    const supersededByCommentId = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+    expect(issueCommentMetadataSchema.parse({ ...metadata, supersededByCommentId }))
+      .toEqual({ ...metadata, supersededByCommentId });
+    expect(issueCommentMetadataSchema.parse(metadata)).toEqual(metadata);
+    for (const value of [null, "not-a-comment-id", 123])
+      expect(issueCommentMetadataSchema.safeParse({ ...metadata, supersededByCommentId: value }).success).toBe(false);
+  });
+
   it("accepts an optional attachment-preparation identity and rejects malformed markers", () => {
     const metadata = { version: 1, sections: [{ rows: [{ type: "text", text: "Details" }] }] };
     const attachmentPreparation = { attachmentId: "9af8228f-0be7-45ae-a104-6fbe0af6f1d3" };

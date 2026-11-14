@@ -1,30 +1,49 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
+import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
+import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 
 export const FRESH_THREAD_STARTED_NOTE = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
 export const FRESH_THREAD_STOPPING_NOTE = "I'm stopping the earlier attempt before starting fresh. Your message is saved; the fresh thread will read this conversation's history.";
-export const FRESH_THREAD_TURN_NOTE = "Your message is saved; your skill change takes effect after the current step. Then a fresh thread will read this conversation's history.";
+export const FRESH_THREAD_TURN_NOTE = "Your message is saved; the current step must finish before starting a fresh thread from this conversation's history.";
 
-/** One stable notice across stop waiting, turn waiting, and admitted fresh
- * history. Caller holds the same task/run locks as the continuation owner. */
+function turnWaitingNote(run: typeof heartbeatRuns.$inferSelect): string {
+  const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown } | undefined;
+  const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
+  const reason = code === "runner_remote_state_unavailable" ? "The earlier environment is unavailable."
+    : code === "native_controller_recovery_missing_evidence:snapshot_binding"
+      || code === "native_controller_recovery_unsupported:metadata_format" ? "The saved thread cannot be restored."
+    : code === "native_runner_refresh_required" || code === "native_runner_launch_profile_mismatch"
+      ? "The working configuration has changed." : "The earlier thread must be replaced.";
+  return `${reason} ${FRESH_THREAD_TURN_NOTE}`;
+}
+
+/** One current notice across stop waiting, turn waiting, and admitted fresh
+ * history; older notices remain immutable, marked superseded. Caller holds
+ * the same task/run locks as the continuation owner. */
 export async function writeFreshThreadNotice(tx: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string, body: string) {
   const sessionId = run.nativeSessionId;
   const reason = `fresh_provider_thread_pending:${sessionId ?? run.id}`;
-  const [heldNotice] = sessionId ? await tx.select({ id: issueComments.id })
-    .from(issueComments).where(and(eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId),
-      eq(issueComments.authorType, "system"), sql`${issueComments.metadata}->>'authorizationReason' = ${`native_prior_owner_held:${sessionId}`}`)).limit(1) : [];
-  if (heldNotice) await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
-    '{authorizationReason}', to_jsonb(${reason}::text))` })
-    .where(and(eq(issueComments.companyId, run.companyId), eq(issueComments.id, heldNotice.id)));
-  // The same visible row now belongs to the automatic boundary. Leaving the
-  // old held prefix would make its projection survive even a successful fresh
-  // session (whose normalized id intentionally differs from the old one).
   await writePiSessionHistoryLossNotice(tx, tx as never, { companyId: run.companyId,
     issueId, runId: run.id, agentId: run.agentId, authorizationReason: reason, body, replaceExisting: true });
+  if (!sessionId) return;
+  const [current] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${reason}`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`)).limit(1);
+  // Supersede a held note without taking its authorizationReason or wording
+  // away from its owner. Standing-notice projection excludes superseded rows.
+  if (current) await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
+    '{supersededByCommentId}', to_jsonb(${current.id}::text))` }).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${`native_prior_owner_held:${sessionId}`}`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`));
 }
 
 /** Strict admission gate for impossible reconciliation. Unlike the generic
@@ -38,9 +57,12 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
     eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.nativeIssueId, issueId),
     sessionId ? eq(heartbeatRuns.nativeSessionId, sessionId) : eq(heartbeatRuns.id, run.id),
     sql`${heartbeatRuns.createdAt} <= (select created_at from ${heartbeatRuns} where id = ${run.id})`));
+  // Legacy rows may bind their issue only through issueId/contextSnapshot.
+  // Never lose the contender's recorded local process from the owner proof.
+  if (!owners.some(owner => owner.id === run.id)) owners.push(run);
   // A live earlier turn owns the conversation. Do not even request its stop.
   if (owners.some(owner => owner.id !== run.id && ["running", "queued", "scheduled_retry"].includes(owner.status))) {
-    await notice(FRESH_THREAD_TURN_NOTE);
+    await notice(turnWaitingNote(run));
     return { gone: false as const, reason: "active_provider_turn", noticeAuthorizationReason };
   }
   const turnRefusal = run.resultJson?.nativeFreshContinuationRefusal as { waitForTurn?: unknown } | undefined;
@@ -48,14 +70,33 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
     && owner.finishedAt && run.finishedAt && owner.finishedAt > run.finishedAt);
   const leases = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
     inArray(environmentLeases.heartbeatRunId, owners.map(owner => owner.id).concat(run.id))));
-  let gone = leases.length > 0;
+  // No remote allocation and no recorded process is a positive empty owner
+  // set, not an unfulfillable request for a provider stop receipt. Recorded
+  // local children still require the shared exact process proof below.
+  let gone = true;
+  const checked = new Set<string>();
   for (const original of leases) {
-    const lease = await resolveRemoteTerminationLease(tx, original);
-    if (!lease.provider || lease.provider === "local" || !lease.providerLeaseId) { gone = false; continue; }
+    let lease = await resolveRemoteTerminationLease(tx, original);
+    if (!lease.provider || lease.provider === "local" || !lease.providerLeaseId) continue;
+    if (original.status === "expired" && original.leasePolicy === "reuse_by_environment"
+      && Object.hasOwn(original.metadata ?? {}, "reusableLeaseSuccessor")) {
+      const history = await tx.select().from(environmentLeases).where(and(
+        eq(environmentLeases.provider, original.provider!), eq(environmentLeases.providerLeaseId, original.providerLeaseId!)));
+      const tips = history.filter(row => !Object.hasOwn(row.metadata ?? {}, "reusableLeaseSuccessor"));
+      const tip = tips.length === 1 ? tips[0] : undefined;
+      const predecessors = tip ? retiredReusableLeasePredecessors(tip, history.filter(row => row.id !== tip.id)) : null;
+      // Only this conversation's ended owner can request the chain tip's stop.
+      // An expired predecessor is immutable history, never pending_cleanup.
+      if (!tip || !predecessors?.some(row => row.id === original.id)
+        || !owners.some(owner => owner.id === tip.heartbeatRunId)) { gone = false; continue; }
+      lease = tip;
+    }
+    if (checked.has(lease.id)) continue;
+    checked.add(lease.id);
     // Reuse by a different holder may have restarted a formerly stopped box.
     // Never stop that holder or borrow its old stop receipt.
     const peers = await tx.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
-      eq(environmentLeases.provider, lease.provider), eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
+      eq(environmentLeases.provider, lease.provider!), eq(environmentLeases.providerLeaseId, lease.providerLeaseId!),
       sql`${environmentLeases.id} <> ${lease.id}`, inArray(environmentLeases.status, [...SANDBOX_ALLOCATION_HOLDER_STATUSES]))).limit(1);
     if (peers.length) { gone = false; continue; }
     const termination = lease.metadata?.remoteExecutionTermination as { confirmedAt?: unknown } | undefined;
@@ -68,14 +109,21 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
     // Persist the existing stop-only intent; cleanup's plugin release contract
     // supplies the independently bound stopped/destroyed receipt. A void
     // release, 'stopping', expired lease, or successful RPC is NOT evidence.
-    if (!waitingTurn) await prepareUnconfirmedSourceSandboxStop(tx, original);
+    if (!waitingTurn) await prepareUnconfirmedSourceSandboxStop(tx, lease);
   }
-  if (!leases.length && (run.processPid !== null || run.processGroupId !== null)) {
-    const proof = await proveRunProcessGone(run, run.id);
-    gone = proof?.verdict === "gone";
+  // Remote execution has its allocation-bound proof above; process stamps for
+  // owners with no remote allocation cannot be skipped just because a local
+  // lease row exists (or belongs to an earlier stranded attempt).
+  for (const owner of owners) {
+    const hasRemoteAllocation = leases.some(lease => lease.heartbeatRunId === owner.id
+      && lease.provider && lease.provider !== "local" && lease.providerLeaseId);
+    if (!hasRemoteAllocation && (owner.processPid !== null || owner.processGroupId !== null)) {
+      const proof = await proveRunProcessGone(owner, owner.id);
+      if (proof?.verdict !== "gone") gone = false;
+    }
   }
   // Only the settlement owner can say it is starting fresh: a newer run or a
   // person-owned gate may still make a positive physical proof inapplicable.
-  if (!gone) await notice(waitingTurn ? FRESH_THREAD_TURN_NOTE : FRESH_THREAD_STOPPING_NOTE);
+  if (!gone) await notice(waitingTurn ? turnWaitingNote(run) : FRESH_THREAD_STOPPING_NOTE);
   return { gone, reason: gone ? "previous_execution_gone" : waitingTurn ? "active_provider_turn" : "previous_execution_stop_unconfirmed", noticeAuthorizationReason };
 }
