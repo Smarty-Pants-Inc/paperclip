@@ -64,6 +64,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
         await notifyRunDispatch(tx, { companyId });
         await notifyDeferredExecutionEligibility(tx, { companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
       }
       if (!isAgentStatusInvokable(before) && isAgentStatusInvokable(after)) {
         await notifyNativeResponsePresentation(tx, { companyId, agentId });

@@ -214,6 +214,27 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null });
   });
 
+  it("retains the schedule when pause races monitor claim and wake admission", async () => {
+    const f = await fixture();
+    f.deps.enqueueWakeup.mockImplementationOnce(async () => {
+      await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agent.id));
+      throw conflict("Agent is not invokable in its current state", { status: "paused", reason: "paused" });
+    });
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 1, enqueued: 0, skipped: 1 });
+    expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: dueAt,
+      monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+    expect(await f.scheduler.nextIssueMonitorAt()).toBeNull();
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 0, enqueued: 0, skipped: 0 });
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agent.id));
+    expect(await f.scheduler.nextIssueMonitorAt()).toBe(dueAt.getTime());
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 1, enqueued: 1, skipped: 0 });
+    expect(await f.scheduler.tickTimers(now)).toEqual({ checked: 0, enqueued: 0, skipped: 0 });
+    expect(f.deps.enqueueWakeup).toHaveBeenCalledTimes(2);
+    expect(f.deps.enqueueWakeup.mock.calls[0]![1]!.idempotencyKey)
+      .toBe(f.deps.enqueueWakeup.mock.calls[1]![1]!.idempotencyKey);
+    expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+  });
+
   it("lets a human check a blocked task without resuming automatic checks", async () => {
     const f = await fixture();
     await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issue.id));
