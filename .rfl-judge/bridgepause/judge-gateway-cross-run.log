@@ -1,0 +1,27 @@
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - `__dirname` (vitest.config.ts:7:25). Use `import.meta.dirname` instead
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+
+ RUN  v5.0.3 /srv/scratch/paul/tasks/tmp/sl-task-i7jRsPTU/bridge-judge.boFcrX/pc
+
+stdout | src/services/native-runtime/judge-gateway-cross-run.test.ts > JUDGE actual file gateway: a request begun by A must not acquire B authority after body delivery straddles release
+{"transport":"actual queue_v1 gateway + worker + native broker","status":200,"resolvedRuns":["run-B"],"responseAuthority":"run-B"}
+
+ ❯ |@paperclipai/server| src/services/native-runtime/judge-gateway-cross-run.test.ts (1 test | 1 failed) 709ms
+   × JUDGE actual file gateway: a request begun by A must not acquire B authority after body delivery straddles release 709ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |@paperclipai/server| src/services/native-runtime/judge-gateway-cross-run.test.ts > JUDGE actual file gateway: a request begun by A must not acquire B authority after body delivery straddles release
+AssertionError: expected [ 'run-B' ] to not include 'run-B'
+ ❯ src/services/native-runtime/judge-gateway-cross-run.test.ts:57:26
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  09:55:28
+   Duration  2.55s (transform 52%, tests 29%, import 17%, setup 2%)
+
