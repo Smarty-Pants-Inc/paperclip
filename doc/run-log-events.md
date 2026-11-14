@@ -1384,7 +1384,10 @@ same stack bucket and configured prefix under `run-logs/`, with existing run
 references in Postgres. Local-disk instances remain local. Retained native ingress
 routes resolve transport state diagnostics and performance spans through the current
 session diagnostic epoch. Warm reuse switches that epoch before `run.attach`,
-including when attachment fails. Retiring a run clears both destinations: an idle
+including when attachment fails. Transport chunks retain their original stdout or
+stderr stream through that epoch; synthesized diagnostic messages default to stderr.
+Readers preserve that distinction: the transcript parses stdout and renders stderr
+as diagnostic entries. Retiring a run clears both destinations: an idle
 route does not append to a finalized predecessor log or reuse its trace. Raw provider
 traces have their own restricted, encrypted object path. See
 [run evidence storage](run-evidence-storage.md) for batching, durability,

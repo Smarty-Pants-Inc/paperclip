@@ -58,7 +58,7 @@ export class NativeSessionDiagnostics {
     catch { process.emitWarning("Native session diagnostic reporting failed"); }
   }
 
-  record(chunk: string): void {
+  record(chunk: string, stream: "stdout" | "stderr" = "stderr"): void {
     const epoch = this.active;
     if (!epoch?.sink) {
       const kind = chunk.startsWith("[paperclip-runner] runnerd diagnostic: runner transport close requested:")
@@ -67,7 +67,7 @@ export class NativeSessionDiagnostics {
       return;
     }
     try {
-      void epoch.sink("stderr", chunk).catch(() => this.report(() => this.failed(epoch.owner)));
+      void epoch.sink(stream, chunk).catch(() => this.report(() => this.failed(epoch.owner)));
     } catch {
       this.report(() => this.failed(epoch.owner));
     }

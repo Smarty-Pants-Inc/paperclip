@@ -12864,6 +12864,7 @@ describe("native warm session supervision", () => {
       // Recorded catch: warm transport callbacks outlived run A's log writer (#20529 S2).
       const actual = await vi.importActual<typeof import("../../vendor/paperclip-runner/index.js")>("../../vendor/paperclip-runner/index.js");
       const createDriver = nativeExecutionDriver.createNativeRunnerExecutionDriver;
+      let retainedLog!: NonNullable<Parameters<typeof createDriver>[0]["onLog"]>;
       let stateChange!: NonNullable<Parameters<typeof runnerPrpOutbound.connectRunnerPrpIngress>[0]["onStateChange"]>;
       let failReady = false;
       const failure = new Error("runner_ingress_unavailable: synthetic warm route failure");
@@ -12934,6 +12935,8 @@ describe("native warm session supervision", () => {
         stateChange("authenticated");
         session = { identity: () => ({ ...base.binding, sessionId: base.session.normalizedSessionId }),
           attachRun: async () => {
+            await retainedLog("stdout", "retained transport stdout\n");
+            await retainedLog("stderr", "retained transport stderr\n");
             stateChange("reconnecting", "runner_connection_lease_expired");
             stateChange("failed", "runner_ingress_unavailable");
             failReady = true;
@@ -12948,6 +12951,7 @@ describe("native warm session supervision", () => {
       });
       await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", useRunnerd: true,
         onLog: firstLog, onEvent: firstEvent });
+      retainedLog = driver.mock.calls.at(-1)![0].onLog!;
       const current = leaseDb(next);
       const nextDb = { ...current, select: (columns?: Record<string, unknown>) => columns?.status && columns?.runnerProfileJson
         ? { from: () => ({ where: () => ({ limit: () => Promise.resolve([{ status: "succeeded", runnerProfileJson: { nativeExecutionInput: base } }]) }) }) }
@@ -12964,6 +12968,13 @@ describe("native warm session supervision", () => {
       expect.soft(nextContent).toContain("state=failed failure=runner_ingress_unavailable");
       expect.soft((await store.read(firstHandle)).content).toBe(firstContent);
       expect.soft(rejectedWrites).toEqual([]);
+      expect.soft(nextLog).toHaveBeenCalledWith("stdout", "retained transport stdout\n");
+      expect.soft(nextLog).toHaveBeenCalledWith("stderr", "retained transport stderr\n");
+      const transportRows = nextContent.trim().split("\n").map(line => JSON.parse(line) as { stream: string; chunk: string })
+        .filter(row => row.chunk.startsWith("retained transport "));
+      expect.soft(transportRows.map(row => [row.stream, row.chunk])).toEqual([
+        ["stdout", "retained transport stdout\n"], ["stderr", "retained transport stderr\n"],
+      ]);
       expect.soft(nextLog).toHaveBeenCalledWith("stderr", expect.stringContaining("state=reconnecting failure=runner_connection_lease_expired"));
       expect.soft(nextLog).toHaveBeenCalledWith("stderr", expect.stringContaining("state=failed failure=runner_ingress_unavailable"));
       for (const span of ["runner.prp.authenticate", "runner.transport.ready"]) {
