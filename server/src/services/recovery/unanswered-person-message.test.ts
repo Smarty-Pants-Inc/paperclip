@@ -592,6 +592,80 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(1);
   });
 
+  // SMA-189 (rows-sma189.json; RFL 09:19Z (R-a)/(R-b)): a TASK (origin manual, no conversation).
+  // da90cdd6 carried the person's 09:01:01 message and stayed one run for 15 minutes: eight cycles of
+  // 'run started' -> ~80 s -> 'native session transport interrupted; same-run resume persisted' (the
+  // run's native finalization is a retryable_failure with its next attempt scheduled), then it failed
+  // runner_process_termination_unconfirmed. B' posted "wasn't answered ... Sending it again is safe" at
+  // 09:04:55, between two cycles, once its 2-minute T0 bound (first deferral ~09:02:52) had passed;
+  // when the run finally failed, nothing true was posted.
+  // RFL 09:35Z: one note per STATE. While same-run restarts continue past T0, ONE true progress note
+  // (never "unanswered" or "safe"); at the terminal failure ONE failure note, and the progress note is
+  // marked superseded by it (metadata.supersededBy), never deleted (RFL 09:45Z).
+  it("SMA-189: a run in same-run resume cycles is still at work: nothing within T0, ONE progress note past it, then ONE true failure note that supersedes it (kept, not deleted), never 'safe'", async () => {
+    const f = await fixture({ chat: false, status: "in_progress" });
+    const commentId = await f.message("what needs me today?");
+    const runId = await f.run({ commentId, status: "running" });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    // Cycle 1 ends: the transport is interrupted and a same-run resume is persisted.
+    const cycleEnds = async (atMs: number, nextAttemptInMs: number) => {
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_session_interrupted",
+        error: "native session transport interrupted", finishedAt: new Date(Date.now() + atMs - 20_000) }).where(eq(heartbeatRuns.id, runId));
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+      await finalization(f, runId, "retryable_failure", new Date(Date.now() + atMs + nextAttemptInMs));
+    };
+    const cycleStarts = async () => {
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+      await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, errorCode: null, error: null }).where(eq(heartbeatRuns.id, runId));
+    };
+    await cycleEnds(90_000, 30_000);
+    await settleAt(f, 90_000);
+    expect(await f.visible(), "no note between cycles (1)").toHaveLength(0);
+    await cycleStarts();
+    await settleAt(f, 150_000);
+    // Cycle 2 ends after B''s T0 bound: still the same run, its next attempt scheduled.
+    await cycleEnds(210_000, 30_000);
+    await settleAt(f, 210_000);
+    let notices = await f.visible();
+    expect(notices, "past T0: ONE progress note").toHaveLength(1);
+    const progress = notices[0]!;
+    expect(progress.body).toBe("Managed Pi is still trying to reach its workspace; your message is kept.");
+    expect(progress.body).not.toMatch(/wasn't answered|sending it again is safe|new task|new chat/i);
+    await cycleStarts();
+    await settleAt(f, 270_000);
+    await cycleEnds(330_000, 30_000);
+    await settleAt(f, 330_000);
+    notices = await f.visible();
+    expect(notices, "no note per cycle").toHaveLength(1);
+    expect(notices[0]!.id).toBe(progress.id);
+    expect(notices[0]!.body).toBe(progress.body);
+    // The run finally fails: its termination is unconfirmed.
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_session_interrupted",
+      error: "runner_process_termination_unconfirmed: runnerd process supervision failed: runner_remote_process_identity_unavailable_cleanup_failed",
+      finishedAt: new Date(Date.now() + 15 * 60_000) }).where(eq(heartbeatRuns.id, runId));
+    await finalization(f, runId, "terminal_failure", null);
+    await settleAt(f, 16 * 60_000);
+    await settleAt(f, 17 * 60_000);
+    // One note per STATE (RFL 09:35Z), and never a vanishing note (org 09:18Z, RFL 09:45Z): the
+    // failure note is a new note; the progress note stays, visible as history, marked superseded.
+    notices = await f.visible();
+    expect(notices, "one note per state: the progress note (history) and ONE failure note").toHaveLength(2);
+    const failure = notices.find(notice => notice.id !== progress.id)!;
+    expect(failure.body).not.toMatch(/sending it again is safe/i);
+    // A task keeps the task wording; termination unconfirmed holds the conversation (HELD_CODES).
+    expect(failure.body).toBe(HELD);
+    expect(failure.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    const [kept] = await db.select().from(issueComments).where(eq(issueComments.id, progress.id));
+    expect(kept, "the progress note's row still exists").toBeDefined();
+    expect(kept!.deletedAt, "the progress note is never deleted").toBeNull();
+    expect(kept!.body).toBe(progress.body);
+    expect((kept!.metadata as Record<string, unknown> | null)?.supersededBy, "marked superseded by the failure note").toBe(failure.id);
+    await settleAt(f, 18 * 60_000);
+    expect(await f.visible(), "no further note").toHaveLength(2);
+  });
+
   it("M1.1 (5) control: the retry starts a run carrying the message within the bound, which answers -> no notice", async () => {
     const f = await fixture();
     const commentId = await f.message();
