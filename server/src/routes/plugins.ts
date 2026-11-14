@@ -49,6 +49,7 @@ import {
   PLUGIN_STATUSES,
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
+import { pluginConfigDelivery } from "../services/plugin-config-delivery.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import {
   getPluginUiContributionMetadata,
@@ -2466,11 +2467,8 @@ export function pluginRoutes(
         }
 
         try {
-          await bridgeDeps.workerManager.call(
-            plugin.id,
-            "configChanged",
-            { config: body.configJson, companyId },
-          );
+          // Use the same live-row, per-generation revision fence as replay.
+          await pluginConfigDelivery(db, bridgeDeps.workerManager).deliver(plugin.id, companyId);
         } catch (rpcErr) {
           if (
             rpcErr instanceof JsonRpcCallError &&
