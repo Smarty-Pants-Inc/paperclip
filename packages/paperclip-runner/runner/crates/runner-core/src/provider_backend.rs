@@ -2252,7 +2252,7 @@ impl CodexCommandExecutor {
         if config.command != profile.command.path
             || config.args.as_slice() != [proxy_script.as_ref()]
         {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "OpenCode run.prepare launch does not match the runner-owned qualified profile",
             ));
         }
@@ -2281,7 +2281,7 @@ impl CodexCommandExecutor {
         if config.command != profile.command.path
             || config.args.as_slice() != [proxy_script.as_ref()]
         {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Pi run.prepare launch does not match the runner-owned qualified profile",
             ));
         }
@@ -2343,7 +2343,7 @@ impl CodexCommandExecutor {
         if config.command != profile.command.path
             || config.args.as_slice() != [proxy_script.as_ref()]
         {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Cursor Cloud run.prepare launch does not match the runner-owned qualified profile",
             ));
         }
@@ -2734,7 +2734,7 @@ impl CodexCommandExecutor {
         state.validate()?;
         let expected_pi_profile_digest = self.bind_pi_launch_profile(&state.config)?;
         if state.pi_launch_profile_digest != expected_pi_profile_digest {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Pi runner launch profile changed across durable recovery",
             )
             .with_classification(PROVIDER_STATE_INCOMPATIBLE));
@@ -2746,7 +2746,7 @@ impl CodexCommandExecutor {
             state.opencode_launch_profile_digest = expected_launch_profile_digest.clone();
         }
         if state.opencode_launch_profile_digest != expected_launch_profile_digest {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "OpenCode runner launch profile changed across durable recovery",
             )
             .with_classification(PROVIDER_STATE_INCOMPATIBLE));
@@ -2754,7 +2754,7 @@ impl CodexCommandExecutor {
         let expected_cursor_cloud_profile_digest =
             self.bind_cursor_cloud_launch_profile(&state.config)?;
         if state.cursor_cloud_launch_profile_digest != expected_cursor_cloud_profile_digest {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Cursor Cloud runner launch profile changed across durable recovery",
             )
             .with_classification(PROVIDER_STATE_INCOMPATIBLE));
@@ -3479,17 +3479,17 @@ impl CodexCommandExecutor {
                 ));
             }
             if state.pi_launch_profile_digest != pi_launch_profile_digest {
-                return Err(DurableRunnerError::invalid(
+                return Err(DurableRunnerError::launch_profile_mismatch(
                     "Pi runner launch profile changed across the durable run",
                 ));
             }
             if state.opencode_launch_profile_digest != opencode_launch_profile_digest {
-                return Err(DurableRunnerError::invalid(
+                return Err(DurableRunnerError::launch_profile_mismatch(
                     "OpenCode runner launch profile changed across the durable run",
                 ));
             }
             if state.cursor_cloud_launch_profile_digest != cursor_cloud_launch_profile_digest {
-                return Err(DurableRunnerError::invalid(
+                return Err(DurableRunnerError::launch_profile_mismatch(
                     "Cursor Cloud runner launch profile changed across the durable run",
                 ));
             }
@@ -8520,6 +8520,22 @@ done
         restored.restore().unwrap();
         assert!(restored.provider.is_none());
         (directory, restored, payload)
+    }
+
+    #[test]
+    fn prepare_launch_drift_is_a_structured_refusal_without_rewriting_history() {
+        let (directory, mut executor, payload) = prepared_skill_checkpoint("pi_rpc", true);
+        executor.state.as_mut().unwrap().pi_launch_profile_digest = Some("previous-profile".to_owned());
+        executor.save_state().unwrap();
+        let saved = fs::read(executor.state_path()).unwrap();
+        for _ in 0..2 {
+            let error = executor.prepare(&payload).unwrap_err();
+            assert_eq!(error.refusal_code(), Some("provider_launch_profile_mismatch"));
+            assert_eq!(error.to_string(), "Pi runner launch profile changed across the durable run");
+            assert_eq!(fs::read(executor.state_path()).unwrap(), saved);
+            assert!(executor.provider.is_none(), "a refusal cannot start a provider");
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

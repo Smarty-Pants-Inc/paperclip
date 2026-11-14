@@ -28,7 +28,7 @@ import {
   NativeSessionProtocolIntegrityError,
   nativeRestartContinuationInFlight, nativeRestartInterruptedTurnId,
 } from "./contracts/native-session-backend.js";
-import { PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
+import { PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE, runnerRecoveryFailureClass } from "./contracts/harness-driver.js";
 import type {
   PrpEvent,
   PrpStructuredRunResult,
@@ -6939,6 +6939,42 @@ describe("executeNativeSession recovery", () => {
     }
     // No Runner or provider process starts for a session that cannot resume here.
     expect(transportFactory).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "same_session_only",
+    "allow_replacement_after_governed_wait",
+    "allow_replacement_after_resume_failure",
+  ] as const)("preserves launch-refused history under %s without a retry/reset path", async (providerRecoveryPolicy) => {
+    const checkpoint: PersistedNativeSession = {
+      backendKind: "mock", sessionId: "driver-profile-refused", identity,
+      providerSessionId: "provider-profile-refused", providerRecoveryPolicy,
+      cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [],
+    };
+    const openRun = vi.fn(async () => undefined);
+    const openSession = vi.fn();
+    const openReplacementSession = vi.fn();
+    const backend: NativeSessionBackend = {
+      descriptor: async () => ({ kind: "mock", name: "profile-refused", version: "1",
+        capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }),
+      openSession, openReplacementSession,
+      recoverSession: async () => ({ recovered: false, reason: "opaque qualified profile refusal",
+        failureClass: "provider_launch_profile_mismatch" as NonNullable<NativeSessionRecoveryResult["failureClass"]> }),
+    };
+    const port: ControlPlanePort = {
+      openRun, appendEvent: vi.fn(), completeRun: vi.fn(),
+      loadSessionCheckpoint: async () => structuredClone(checkpoint),
+      replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+    };
+    const failure = await executeNativeSession({
+      input, backend, controlPlane: port,
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+    }).catch((error: unknown) => error);
+    expect(runnerRecoveryFailureClass(failure)).toBe("provider_launch_profile_mismatch");
+    expect(failure).toHaveProperty("code", "native_runner_launch_profile_mismatch");
+    expect(openReplacementSession).not.toHaveBeenCalled();
+    expect(openSession).not.toHaveBeenCalled();
+    expect(openRun).not.toHaveBeenCalled();
   });
 
   it("never replaces a session after a deterministic, non-destructive recovery refusal", async () => {

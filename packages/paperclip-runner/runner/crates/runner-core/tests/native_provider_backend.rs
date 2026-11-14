@@ -3324,6 +3324,47 @@ fn pi_rpc_prepare_payload(directory: &Path) -> Value {
 
 #[test]
 #[cfg(unix)]
+fn launch_profile_refusal_is_structured_and_preserves_saved_state_for_every_native_facade() {
+    for provider in ["pi_rpc", "opencode", "cursor_cloud"] {
+        let directory = temporary_directory(&format!("{provider}-structured-launch-refusal"));
+        let (mut config, payload) = if provider == "cursor_cloud" {
+            (cursor_cloud_config(&directory), cursor_cloud_prepare_payload(&directory))
+        } else {
+            let mut config = opencode_config(&directory);
+            let payload = if provider == "pi_rpc" {
+                config.pi_launch_profile = config.opencode_launch_profile.take();
+                pi_rpc_prepare_payload(&directory)
+            } else { opencode_prepare_payload(&directory) };
+            (config, payload)
+        };
+        let mut first = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        first.execute(&command(1, "run.prepare", payload.clone())).unwrap();
+        first.shutdown().unwrap();
+        drop(first);
+        let state_path = directory.join("codex-provider-state.json");
+        let saved = fs::read(&state_path).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        match provider {
+            "pi_rpc" => config.pi_launch_profile.as_mut().unwrap().proxy_script.sha256 = digest,
+            // OpenCode deliberately permits a settled proxy-only rebuild;
+            // its admitted provider executable is the immutable profile fence.
+            "opencode" => config.opencode_launch_profile.as_mut().unwrap().executable.sha256 = digest,
+            _ => config.cursor_cloud_launch_profile.as_mut().unwrap().proxy_script.sha256 = digest,
+        }
+        let mut recovered = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        for sequence in 2..=3 {
+            let error = recovered.execute(&command(sequence, "run.prepare", payload.clone())).unwrap_err();
+            assert_eq!(error.refusal_code(), Some("provider_launch_profile_mismatch"), "{provider}: {error}");
+            // Add specificity without breaking old Runner recovery consumers.
+            assert_eq!(error.classification(), Some(PROVIDER_STATE_INCOMPATIBLE));
+            assert_eq!(fs::read(&state_path).unwrap(), saved, "{provider} must not reset saved state");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+#[cfg(unix)]
 fn pi_rpc_selects_the_resident_native_facade_and_keeps_its_identity() {
     let directory = temporary_directory("pi-rpc-selection");
     let mut config = opencode_config(&directory);

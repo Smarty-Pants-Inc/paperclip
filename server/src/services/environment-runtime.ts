@@ -21,6 +21,7 @@ import {
   reusableSandboxReplacementPlan,
   type ReusableSandboxReplacementPlan,
   sandboxStateTransitionFailure,
+  verifiedNativeSandboxHandoffProof,
 } from "./reusable-sandbox-resume-replacement.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
@@ -1022,8 +1023,8 @@ async function buildReusableSandboxLeaseFingerprints(input: {
   const workspaceMigration = input.executionWorkspaceId
     ? await readNativeWorkspaceMigration(input.db, { companyId: input.companyId, id: input.executionWorkspaceId }) : null;
   // Both digests share the exact company/session/security context and one
-  // Runner-supplied build input. Null explicitly reproduces the legacy digest
-  // only for a run that still owns its already-admitted active lease.
+  // Runner-supplied build input. Null reproduces the legacy digest for an
+  // already-admitted lease whose historical pack identity remains UNKNOWN.
   const currentRunnerPackIdentity = runnerPackReuseIdentity(input.adapterType);
   const fingerprintForConfig = (providerConfig: Record<string, unknown>, runnerPackIdentity = currentRunnerPackIdentity) => createEffectiveRunConfigFingerprints({
     lease: {
@@ -1716,7 +1717,11 @@ function createSandboxEnvironmentDriver(
       // A release never changes an in-flight run's admitted Runner. Only the
       // next run compares against today's pack and replaces the old box.
       const ownsActiveLease = lease.status === "active" && lease.heartbeatRunId === input.heartbeatRunId;
-      const admittedPack = ownsActiveLease ? admittedRunnerPackIdentity(lease.metadata) : undefined;
+      const unknownNativePack = input.adapterType === "paperclip_runner" && admittedRunnerPackIdentity(lease.metadata) === null;
+      // Absence is UNKNOWN, not evidence that today's pack differs. Recheck
+      // today's security/scope inputs against the actual historical digest;
+      // never manufacture a current-pack attestation for the old allocation.
+      const admittedPack = ownsActiveLease || unknownNativePack ? admittedRunnerPackIdentity(lease.metadata) : undefined;
       const hasIdentityFingerprint = isRecord(lease.metadata?.reusableSandboxLease)
         && readLeaseFingerprint(lease.metadata.reusableSandboxLease.leaseIdentityFingerprint) !== null;
       const compatible = (hasIdentityFingerprint
@@ -1728,9 +1733,15 @@ function createSandboxEnvironmentDriver(
         // secret, plugin and mount drift therefore still fail closed.
         || reusableSandboxLeaseScopeMatches({ ...scope, config: admittedConfig,
             leaseFingerprint: input.fingerprints.fingerprintForConfig(admittedConfig, admittedPack),
-            allowLegacyRuntimeFingerprint: ownsActiveLease });
+            allowLegacyRuntimeFingerprint: ownsActiveLease || unknownNativePack });
       if (!compatible) continue;
       compatibleLeases.push(lease);
+      if (unknownNativePack
+        && input.fingerprints.fingerprintForConfig(admittedConfig, null).fingerprint
+          === input.fingerprints.fingerprintForConfig(input.config, null).fingerprint) {
+        pinnedConfigs.set(lease.id, admittedConfig);
+        continue;
+      }
       if (input.exactMatches.length === 0 && !rolloverLease && await reusableSandboxConfigurationChangeIsSafe({
         db, lease, config: input.config, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
         executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType,
@@ -1750,9 +1761,29 @@ function createSandboxEnvironmentDriver(
     return { pinnedConfigs, compatibleLeases, rolloverLease };
   }
 
+  async function nativeSandboxHandoffProofForSource(source: EnvironmentLease | null, heartbeatRunId: string | null) {
+    if (!source || (source.metadata?.reusableSandboxLease as { adapterType?: string } | undefined)?.adapterType !== "paperclip_runner") return null;
+    const proof = await verifiedNativeSandboxHandoffProof({ db, lease: source, companyId: source.companyId, heartbeatRunId });
+    if (proof) return proof;
+    await noticeHandoffFailure(source, heartbeatRunId);
+    throw new Error("runner_pack_reuse_blocked: checkpoint, confirmed stop and conversation custody were not jointly verified; the source was preserved");
+  }
+
+  async function noticeHandoffFailure(source: EnvironmentLease, heartbeatRunId: string | null) {
+    const agentId = readString(source.metadata?.agentId);
+    if (heartbeatRunId && source.issueId && agentId) await noticeRunnerReuseRefusal(db, {
+      companyId: source.companyId, issueId: source.issueId, agentId, runId: heartbeatRunId, reason: "runner_pack_reuse_blocked",
+    });
+  }
+
   async function retireCompatibleConfigurationSource(source: EnvironmentLease, replacement: EnvironmentLease, heartbeatRunId: string,
     reason: "compatible_environment_change" | "lease_fingerprint_mismatch" = "compatible_environment_change") {
-    if (await retireReplacedReusableSandboxLease({ db, lease: source, companyId: source.companyId,
+    // Creation is not admission. Reverify custody after it and let the strict
+    // source-metadata CAS refuse a checkpoint/owner change during creation.
+    const nativeSource = (source.metadata?.reusableSandboxLease as { adapterType?: string } | undefined)?.adapterType === "paperclip_runner";
+    const stillVerified = !nativeSource || await verifiedNativeSandboxHandoffProof({ db, lease: source,
+      companyId: source.companyId, heartbeatRunId });
+    if (stillVerified && await retireReplacedReusableSandboxLease({ db, lease: source, companyId: source.companyId,
       heartbeatRunId, reason,
       ...(source.metadata?.reusableSandboxLease
         && (source.metadata.reusableSandboxLease as { adapterType?: string }).adapterType === "paperclip_runner"
@@ -1770,6 +1801,7 @@ function createSandboxEnvironmentDriver(
     } else await environmentsSvc.releaseLease(replacement.id, "pending_cleanup", {
       failureReason: `${reason}_source_changed`, cleanupStatus: "failed",
     });
+    await noticeHandoffFailure(source, heartbeatRunId);
     throw new Error("Reusable sandbox changed during compatible configuration drain; retry acquisition.");
   }
 
@@ -2307,6 +2339,9 @@ function createSandboxEnvironmentDriver(
             });
           }
         }
+        // This gate runs BEFORE successor allocation/effects. The complete
+        // source certificate is recorded on the replacement below.
+        const handoffProof = await nativeSandboxHandoffProofForSource(fingerprintMismatchLease ?? rolloverLease, input.heartbeatRunId);
         const acquiredLease = providerLease ?? await createOwnedSandbox(db, {
           companyId: input.companyId, environmentId: input.environment.id,
           heartbeatRunId: input.heartbeatRunId, issueId: input.issueId, executionWorkspaceId: input.executionWorkspaceId,
@@ -2372,7 +2407,8 @@ function createSandboxEnvironmentDriver(
           metadata: acquiredLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
         });
-        const reusableScope = reusableLease?.status === "active" && reusableLease.heartbeatRunId === input.heartbeatRunId
+        const reusableScope = reusableLease && (reusableLease.status === "active" && reusableLease.heartbeatRunId === input.heartbeatRunId
+          || providerLease && input.adapterType === "paperclip_runner" && admittedRunnerPackIdentity(reusableLease.metadata) === null)
           ? reusableLease.metadata?.reusableSandboxLease
           : resolvedLeasePolicy === "reuse_by_environment"
           ? buildReusableSandboxLeaseScope({
@@ -2392,6 +2428,7 @@ function createSandboxEnvironmentDriver(
           : null;
 
         const pluginLeaseMetadata = {
+          ...(handoffProof ? { nativeSandboxHandoffProof: { ...handoffProof, successorProviderLeaseId: acquiredLease.providerLeaseId } } : {}),
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
           executionWorkspaceMode: input.executionWorkspaceMode,
@@ -2590,6 +2627,7 @@ function createSandboxEnvironmentDriver(
       const pinnedConfig = reusableLease ? compatible.pinnedConfigs.get(reusableLease.id) : undefined;
       const rolloverLease = reusableLease ? null : compatible.rolloverLease;
       const acquisitionConfig = (pinnedConfig ?? parsed.config) as SandboxEnvironmentConfig;
+      const handoffProof = await nativeSandboxHandoffProofForSource(fingerprintMismatchLease ?? rolloverLease, input.heartbeatRunId);
       let providerLease;
       try {
         providerLease = await createOwnedSandbox(db, {
@@ -2633,7 +2671,8 @@ function createSandboxEnvironmentDriver(
       const resolvedLeasePolicy = supportsReusableLeases && parsed.config.reuseLease && input.heartbeatRunId !== null
         ? "reuse_by_environment"
         : "ephemeral";
-      const reusableScope = reusableLease?.status === "active" && reusableLease.heartbeatRunId === input.heartbeatRunId
+      const reusableScope = reusableLease && (reusableLease.status === "active" && reusableLease.heartbeatRunId === input.heartbeatRunId
+        || providerLease && input.adapterType === "paperclip_runner" && admittedRunnerPackIdentity(reusableLease.metadata) === null)
         ? reusableLease.metadata?.reusableSandboxLease
         : resolvedLeasePolicy === "reuse_by_environment"
         ? buildReusableSandboxLeaseScope({
@@ -2676,6 +2715,7 @@ function createSandboxEnvironmentDriver(
         ...((fingerprintMismatchLease ?? rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
           ? { nativeHarnessBackup: (fingerprintMismatchLease ?? rolloverLease ?? reusableLease)!.metadata!.nativeHarnessBackup }
           : {}),
+        ...(handoffProof ? { nativeSandboxHandoffProof: { ...handoffProof, successorProviderLeaseId: providerLease.providerLeaseId } } : {}),
         ...(reusableLease &&
         providerLease.providerLeaseId === reusableLease.providerLeaseId &&
         reusableLease.metadata?.nativeWorkspaceSync

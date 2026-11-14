@@ -1,33 +1,14 @@
 import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { issueService } from "../issues.js";
+import { PROVIDER_LAUNCH_PROFILE_MISMATCH, runnerRecoveryFailureClass } from "../../vendor/paperclip-runner/index.js";
+import { RUNNER_REUSE_REFUSAL_NEXT_ACTION, runnerReuseRefusalText } from "./runner-reuse-refusal-notice.js";
 
-export const NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH = "native_runner_launch_profile_mismatch";
-const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
-  ? value as Record<string, unknown> : {};
+export { NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH } from "./runner-reuse-refusal-notice.js";
 
-/** A failed Runner command receipt, never a provider/model message. The warm
- * recovery boundary serializes the receipt into its Error; preserve that case
- * without accepting an arbitrary mention of the launch-profile diagnostic. */
-export function runnerLaunchProfileMismatch(error: unknown, depth = 0): boolean {
-  if (depth > 5) return false;
-  const value = record(error);
-  let receipt = record(value.runnerCommandResult);
-  if (error instanceof Error) {
-    const match = /^(?:native_session_recovery_failed: )?(?:Error: )?PRP command (run\.(?:attach|prepare)) failed: (\{[^\n]*\})$/.exec(error.message);
-    if (match) {
-      try {
-        const parsed = record(JSON.parse(match[2]!));
-        if (parsed.commandType === match[1]) receipt = parsed;
-      } catch { /* A malformed receipt is not authority. */ }
-    }
-  }
-  const result = record(receipt.result);
-  if (["run.attach", "run.prepare"].includes(String(receipt.commandType)) && receipt.status === "failed"
-    && result.code === "command_execution_failed" && typeof result.message === "string"
-    && (/^(?:Pi|OpenCode|Cursor Cloud|ACPX descriptor sidecar)(?: run\.prepare)? launch does not match the runner-owned qualified profile$/.test(result.message)
-      || /^(?:Pi|OpenCode|Cursor Cloud) runner launch profile changed across durable recovery$/.test(result.message))) return true;
-  return runnerLaunchProfileMismatch(value.cause, depth + 1);
+/** Core consumes the Runner's normalized class, not provider names or prose. */
+export function runnerLaunchProfileMismatch(error: unknown): boolean {
+  return runnerRecoveryFailureClass(error) === PROVIDER_LAUNCH_PROFILE_MISMATCH;
 }
 
 /** Refusal is the safe escape when we cannot prove that retiring the computer
@@ -53,19 +34,43 @@ export async function noticeRunnerReuseRefusal(db: Db, input: {
       || issue.assigneeAgentId !== agentId || (issue.conversationAgentId && (issue.conversationAgentId !== agentId
         || run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration))) return;
     const authorizationReason = `${reason}:${runId}`;
-    const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    const [existing] = await tx.select().from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
       sql`(${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}
         or (${issueComments.deletedAt} is null and ${issueComments.authorType} = 'system'
           and ${issueComments.metadata}->>'sourceRunId' = ${runId}
           and starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')))`)).limit(1);
-    if (existing) return;
-    const detail = reason === "runner_launch_profile_mismatch"
-      ? "the saved computer's Runner launch profile is incompatible with this release"
-      : "the Runner changed and a complete saved conversation could not be verified";
-    await issueService(db).addComment(issueId,
-      `I could not run this message because ${detail}. The old computer and conversation were preserved; I did not start an empty conversation or retry the incompatible Runner. Recovery needs a verified conversation save before a fresh computer can be used.`,
+    const body = runnerReuseRefusalText(reason);
+    if (existing) {
+      // A previous-release sweep may have won the durable issue fence. Repair
+      // that very note, keeping its message identity and source-run evidence;
+      // another connection/restart must not retain misleading resend advice.
+      if (existing.deletedAt === null && existing.authorType === "system") {
+        let hasNextAction = false;
+        const nextAction = { type: "key_value" as const, label: "Next action", value: RUNNER_REUSE_REFUSAL_NEXT_ACTION };
+        const sections = (existing.metadata?.sections ?? []).map(section => ({ ...section,
+          rows: section.rows.map(row => {
+            if (row.type !== "key_value" || row.label !== "Next action") return row;
+            hasNextAction = true;
+            return nextAction;
+          }),
+        }));
+        if (!hasNextAction) sections.push({ title: "Recovery", rows: [nextAction] });
+        const metadata = { ...existing.metadata, version: 1 as const, sections };
+        const presentation = { ...existing.presentation, kind: "system_notice" as const, tone: "warning" as const,
+          title: "Runner recovery needed", detailsDefaultOpen: false };
+        if (existing.body !== body || JSON.stringify(existing.metadata) !== JSON.stringify(metadata)
+          || JSON.stringify(existing.presentation) !== JSON.stringify(presentation)) {
+          await tx.update(issueComments).set({ body, metadata, presentation, updatedAt: new Date() }).where(eq(issueComments.id, existing.id));
+        }
+      }
+      return;
+    }
+    await issueService(db).addComment(issueId, body,
       {}, { authorType: "system", presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false },
-        metadata: { version: 1, authorizationReason, sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Runner recovery needed" }] }] } }, tx);
+        metadata: { version: 1, authorizationReason, sourceRunId: runId, sections: [
+          { title: "Recovery", rows: [{ type: "key_value", label: "Next action", value: RUNNER_REUSE_REFUSAL_NEXT_ACTION }] },
+          { title: "Run evidence", rows: [{ type: "run_link", runId, agentId, title: "Runner recovery needed" }] },
+        ] } }, tx);
   });
 }

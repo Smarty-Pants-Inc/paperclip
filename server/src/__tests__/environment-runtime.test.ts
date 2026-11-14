@@ -5171,6 +5171,81 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
   });
 
+  it.each(["legacy unchanged", "modern unchanged", "changed pack stop barrier"])("RFL independent pack admission: %s", async mode => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rfl-pack-admission-"));
+    const priorPack = process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH;
+    const priorState = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH = root;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = root;
+    try {
+      const writePack = async (letter: string) => {
+        const payload = {runnerSourceRevision: letter.repeat(40), runnerInputsDigest: letter.repeat(64), target: {platform:"linux",architecture:"x64"}};
+        await writeFile(path.join(root,"provider-pack.json"), JSON.stringify({schema:"paperclip-runner/remote-provider-pack/v1",
+          digest:`sha256:${createHash("sha256").update(stableStringify(payload)).digest("hex")}`, payload}));
+      };
+      await writePack("a");
+      const {companyId, agentId, environment, runId} = await seedEnvironment({driver:"sandbox",
+        config:{provider:"fake-plugin",from:"same-published-snapshot",reuseLease:true,timeoutMs:1234}});
+      const issueId=randomUUID(), pluginId=randomUUID();
+      await db.insert(issues).values({id:issueId,companyId,title:"RFL pack cutover fixture",status:"todo",assigneeAgentId:agentId});
+      await insertSandboxProviderPlugin(pluginId,{environmentDrivers:[{driverKey:"fake-plugin",kind:"sandbox_provider",displayName:"RFL",
+        supportsReusableLeases:true,configSchema:{type:"object"}}]});
+      let count=0;
+      const events: string[]=[];
+      const worker={isRunning:()=>true,getWorker:()=>({supportedMethods:["environmentResumeLease","environmentReleaseLease","environmentDestroyLease","environmentExecute"]}),
+        call:vi.fn(async (_id:string, method:string, params:any) => {
+          events.push(method);
+          if(method==="environmentAcquireLease") return {providerLeaseId:`rfl-box-${++count}`,metadata:{...params.config,remoteCwd:"/workspace"}};
+          if(method==="environmentResumeLease") return {providerLeaseId:params.providerLeaseId,metadata:{...params.config,remoteCwd:"/workspace"}};
+          if(["environmentReleaseLease","environmentDestroyLease"].includes(method)) return undefined;
+          throw new Error(`Unexpected method ${method}`);
+        })} as unknown as PluginWorkerManager;
+      const original=environmentRuntimeService(db,{pluginWorkerManager:worker});
+      const input={companyId,environment,issueId,agentId,adapterType:"paperclip_runner",heartbeatRunId:runId,persistedExecutionWorkspace:null};
+      // M1's hashing function has no pack input. Produce its actual full/runtime
+      // fingerprint shape, not a modern digest with only the metadata erased.
+      const oldShape=mode==="legacy unchanged" ? vi.spyOn(runnerPackIdentity,"runnerPackReuseIdentity").mockReturnValue(null) : null;
+      const first=await (async()=>{try{return await original.acquireRunLease(input);}finally{oldShape?.mockRestore();}})();
+      const sessionId=randomUUID(), scope="rfl-saved-chat", runnerInstanceId="rfl-prior-runner";
+      const backup=path.join(root,createHash("sha256").update(scope).digest("hex"),"failover-backups","current");
+      await Promise.all([mkdir(path.join(backup,"runner"),{recursive:true}),mkdir(path.join(backup,"pi"),{recursive:true}),mkdir(path.join(backup,"pi-agent"),{recursive:true})]);
+      await writeFile(path.join(backup,"runner","runner-state.json"),"saved prior authority");
+      await writeFile(path.join(backup,"pi",`${sessionId}.jsonl`),'{"role":"user","content":"saved conversation"}\n');
+      const manifest=buildNativeHarnessBackupManifest({backupRoot:backup,runnerInstanceId,sourceProviderLeaseId:first.lease.providerLeaseId!,
+        providerSessionIdentity:{providerSessionId:"rfl-pi-thread"},execution:{provider:{kind:"pi_rpc"},binding:{companyId,runId,issueId,agentId,executionWorkspaceId:null},
+          workspace:{cwd:"/workspace"},session:{normalizedSessionId:sessionId,driverKind:"pi_rpc"}} as never});
+      const manifestPath=path.join(backup,"manifest.json");
+      await writeFile(manifestPath,JSON.stringify(manifest));
+      const stamp=createNativeHarnessBackupStamp({manifestPath,sessionScopeId:scope,normalizedSessionId:sessionId,runnerInstanceId,
+        authorizedProviderLeaseId:first.lease.providerLeaseId!,completedAt:manifest.completedAt});
+      await environmentService(db).updateLeaseMetadata(first.lease.id,{...first.lease.metadata,nativeHarnessBackup:stamp});
+      await original.releaseRunLeases(runId);
+      await db.update(heartbeatRuns).set({status:"succeeded",finishedAt:new Date(),nativeSessionId:sessionId}).where(eq(heartbeatRuns.id,runId));
+      const nextRunId=randomUUID(); await insertRunningManualRun(nextRunId,companyId,agentId);
+      await db.update(heartbeatRuns).set({contextSnapshot:{issueId}}).where(eq(heartbeatRuns.id,nextRunId));
+      if(mode==="changed pack stop barrier") await writePack("b");
+      events.length=0;
+      const restarted=environmentRuntimeService(db,{pluginWorkerManager:worker});
+      const next=await restarted.acquireRunLease({...input,heartbeatRunId:nextRunId});
+      console.log("RFL_PACK_ADMISSION",JSON.stringify({mode,source:first.lease.providerLeaseId,successor:next.lease.providerLeaseId,
+        oldScope:first.lease.metadata?.reusableSandboxLease,newScope:next.lease.metadata?.reusableSandboxLease,events}));
+      if(mode==="changed pack stop barrier") {
+        expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
+        // Acquisition hands this lease back to the caller for successor work.
+        // A future cleanup sweep is not a stop barrier for an old warm runner.
+        expect(events, "a source stop/checkpoint must precede returning runnable successor authority").toContain("environmentDestroyLease");
+      } else {
+        expect(next.lease.providerLeaseId, "unchanged pack must not replace a previous-release lease").toBe(first.lease.providerLeaseId);
+        expect(count).toBe(1);
+        expect(next.lease.metadata?.reusableSandboxLease).toEqual(first.lease.metadata?.reusableSandboxLease);
+      }
+    } finally {
+      if(priorPack===undefined) delete process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH; else process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH=priorPack;
+      if(priorState===undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR; else process.env.PAPERCLIP_RUNNER_STATE_DIR=priorState;
+      await rm(root,{recursive:true,force:true});
+    }
+  });
+
   // Keep: the C8 → M1 incident lost a person's next chat turn at a release boundary.
   it.each(["changed pack", "same pack", "in flight", "legacy in flight", "legacy pack", "legacy full fingerprint", "missing backup", "source changed", "creation failed"] as const)(
     "admits reusable runners by their build-owned pack identity: %s", async scenario => {

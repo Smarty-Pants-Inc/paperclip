@@ -17,6 +17,8 @@ import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-noti
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
+import { NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH, RUNNER_REUSE_REFUSAL_NEXT_ACTION, runnerReuseRefusalReason, runnerReuseRefusalText } from "../native-runtime/runner-reuse-refusal-notice.js";
+import { noticeRunnerReuseRefusal } from "../native-runtime/runner-reuse-refusal.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -131,6 +133,8 @@ const NATIVE_PENDING_PHASES = ["result_persisted", "ready_for_assessment", "arbi
 /** The code for a run: the error's leading code token when it is a shown
  * code, else a specific errorCode, else the generic run code. */
 export function unansweredMessageCode(run: { status: string; error: string | null; errorCode: string | null }): string {
+  const refusal = runnerReuseRefusalReason(run);
+  if (refusal) return refusal === "runner_launch_profile_mismatch" ? NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH : refusal;
   const token = /^(?:Error:\s*)?([a-z][a-z0-9_]{2,100})(?=$|[:;\s])/.exec(run.error?.trim() ?? "")?.[1];
   if (token && SHOWN_CODES.has(token)) return token;
   if (run.errorCode && !GENERIC_RUN_CODES.has(run.errorCode)) {
@@ -290,7 +294,7 @@ export async function settleUnansweredPersonMessage(
   // retrying line): the relation is message -> answer, not the notice's time.
   // Written under the same issue fence, in the same order (issue row, then its
   // comments) as the notice writers.
-  const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+  const [liveNotice] = await db.select({ id: issueComments.id, metadata: issueComments.metadata }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
     or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
@@ -306,6 +310,20 @@ export async function settleUnansweredPersonMessage(
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
         and ${answeredSql(rawMessage("m"))})`);
   });
+
+  // Reconcile previous-release advice even if only the restart sweep runs.
+  // The existing writer rechecks task owner/session generation under issue →
+  // run locks and updates the same comment, never posts a second one.
+  const sourceRunId = liveNotice?.metadata?.sourceRunId;
+  if (typeof sourceRunId === "string") {
+    const [sourceRun] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, sourceRunId), eq(heartbeatRuns.companyId, issue.companyId)));
+    const reason = sourceRun && runnerReuseRefusalReason(sourceRun);
+    if (sourceRun && reason) await noticeRunnerReuseRefusal(db, {
+      companyId: issue.companyId, issueId: issue.id, agentId: sourceRun.agentId, runId: sourceRun.id,
+      ...(sourceRun.nativeSessionId ? { normalizedSessionId: sourceRun.nativeSessionId } : {}), reason,
+    });
+  }
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
   if (decision.kind === "pending") {
@@ -483,15 +501,17 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (explained) return { kind: "explained" };
 
   const held = HELD_CODES.has(code);
-  const body = code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
+  const runnerRefusal = run && runnerReuseRefusalReason(run);
+  const body = runnerRefusal ? runnerReuseRefusalText(runnerRefusal) : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: held ? "This conversation can't continue" : "Your message wasn't answered",
+      title: runnerRefusal ? "Runner recovery needed" : held ? "This conversation can't continue" : "Your message wasn't answered",
       body,
       tone: "warning",
-      nextAction: held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
+      nextAction: runnerRefusal ? RUNNER_REUSE_REFUSAL_NEXT_ACTION
+        : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

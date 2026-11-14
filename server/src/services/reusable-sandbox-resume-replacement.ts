@@ -171,6 +171,32 @@ export async function reusableSandboxConfigurationChangeIsSafe(input: {
     currentRunId: input.heartbeatRunId, normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt });
 }
 
+/** One admission certificate joins the existing verified checkpoint/custody
+ * stamp to the exact stop-only receipt. Neither a terminal DB run, a saved
+ * backup alone, nor a provider's `stopping` response grants successor work. */
+export async function verifiedNativeSandboxHandoffProof(input: {
+  db: Db; lease: EnvironmentLease; companyId: string; heartbeatRunId: string | null;
+}): Promise<Record<string, unknown> | null> {
+  const { lease } = input;
+  if (!hasConfirmedSandboxStopAndRetain(lease) || !await reusableSandboxConfigurationChangeIsSafe({
+    ...input, config: {}, executionWorkspaceId: lease.executionWorkspaceId,
+    adapterType: "paperclip_runner", allowSourceChange: true,
+  })) return null;
+  const stamp = readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId!);
+  if (!stamp) return null;
+  return {
+    schema: "paperclip.native-sandbox-handoff-proof.v1", companyId: input.companyId,
+    sourceLeaseId: lease.id, sourceProviderLeaseId: lease.providerLeaseId, sourceRunId: lease.heartbeatRunId,
+    successorRunId: input.heartbeatRunId,
+    checkpoint: { normalizedSessionId: stamp.normalizedSessionId, runnerInstanceId: stamp.runnerInstanceId,
+      manifestSha256: stamp.manifestSha256, completedAt: stamp.completedAt },
+    custodyReceipt: stamp,
+    stopReceipt: lease.metadata!.sandboxStopAndRetainReceipt,
+    stopConfirmation: lease.metadata!.remoteExecutionTermination,
+    verifiedAt: new Date().toISOString(),
+  };
+}
+
 /**
  * Retire a preserved lease after its replacement lease is recorded. The old
  * native checkpoint source stays released with its verified stop receipt and
