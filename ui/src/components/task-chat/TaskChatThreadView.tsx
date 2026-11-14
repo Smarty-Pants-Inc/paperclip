@@ -7,6 +7,7 @@ import { TaskChatTaskCreatedCard } from "./TaskChatTaskCreatedCard";
 import { useMemo, type ReactNode } from "react";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import type {
   TaskChatInteractionItem,
@@ -85,6 +86,8 @@ interface TaskChatThreadViewProps {
   attachments?: IssueAttachment[];
   onOpenSkill?: (skillId: string, name: string) => void;
   onOpenBrowser?: (browserId: string) => void;
+  deferredRunIds?: ReadonlySet<string>;
+  onExpandRunHistory?: () => void;
 }
 
 function renderItem(
@@ -107,6 +110,8 @@ function renderItem(
   attachments: IssueAttachment[] = [],
   onOpenSkill?: (skillId: string, name: string) => void,
   onOpenBrowser?: (browserId: string) => void,
+  deferredRunIds?: ReadonlySet<string>,
+  onExpandRunHistory?: () => void,
 ) {
   switch (item.kind) {
     case "pending_question": return <CoordinatorChatPendingQuestion item={item.question} />;
@@ -132,6 +137,7 @@ function renderItem(
           }
         : item.attachedTurn;
       const turn = attachedTurnItem ? (
+        <>
         <TaskChatTurn
           item={attachedTurnItem}
           timestampPrefix={
@@ -156,9 +162,17 @@ function renderItem(
               attachments,
               onOpenSkill,
               onOpenBrowser,
+              deferredRunIds,
+              onExpandRunHistory,
             )
           }
         />
+        {attachedTurnItem.standaloneHeader && item.sourceRunId && deferredRunIds?.has(item.sourceRunId) && onExpandRunHistory ? (
+          <div className="-mt-2">
+            <Button type="button" variant="ghost" size="sm" onClick={onExpandRunHistory}>Show steps</Button>
+          </div>
+        ) : null}
+        </>
       ) : undefined;
       // MCP Apps views ride with the reply, outside the folded tool history.
       const appViews = item.author === "agent" && item.sourceRunId
@@ -188,7 +202,12 @@ function renderItem(
           attachments={attachments}
         />
       );
-      return appViews && !item.attachedTurn?.standaloneHeader ? <>{appViews}{bubble}</> : bubble;
+      const runHistoryControl = item.sourceRunId && !item.attachedTurn?.standaloneHeader && deferredRunIds?.has(item.sourceRunId) && onExpandRunHistory ? (
+        <div className="-mt-3">
+          <Button type="button" variant="ghost" size="sm" onClick={onExpandRunHistory}>Show steps</Button>
+        </div>
+      ) : null;
+      return <>{appViews && !item.attachedTurn?.standaloneHeader ? appViews : null}{bubble}{runHistoryControl}</>;
     }
     case "marker":
       return (
@@ -246,8 +265,10 @@ function renderItem(
       return renderBrief ? renderBrief() : null;
     case "subagent_group":
       return <TaskChatSubagentTree subagents={item.subagents} />;
-    case "turn":
+    case "turn": {
+      const runId = item.id.endsWith(":turn") ? item.id.slice(0, -5) : undefined;
       return (
+        <>
         <TaskChatTurn
           item={item}
           renderChild={(child) =>
@@ -268,10 +289,19 @@ function renderItem(
               attachments,
               onOpenSkill,
               onOpenBrowser,
+              deferredRunIds,
+              onExpandRunHistory,
             )
           }
         />
+        {runId && deferredRunIds?.has(runId) && onExpandRunHistory ? (
+          <div className="-mt-2">
+            <Button type="button" variant="ghost" size="sm" onClick={onExpandRunHistory}>Show steps</Button>
+          </div>
+        ) : null}
+        </>
       );
+    }
     case "protocol":
       return (
         <TaskChatProtocolCard
@@ -336,6 +366,8 @@ export function TaskChatThreadView({
   attachments = EMPTY_ATTACHMENTS,
   onOpenSkill,
   onOpenBrowser,
+  deferredRunIds,
+  onExpandRunHistory,
 }: TaskChatThreadViewProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
   const { items: compactedItems, retryMarkers } = useMemo(() => compactAdjacentErrors(items), [items]);
@@ -365,6 +397,7 @@ export function TaskChatThreadView({
         runRetry ?? onTryAgainNoLiveExecutionPath,
         runRetry ? retryFailedRunId === runId : tryAgainNoLiveExecutionPathPending,
         retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
+        deferredRunIds, onExpandRunHistory,
       );
     };
     const renderedItems = streamlined
@@ -422,6 +455,7 @@ export function TaskChatThreadView({
     renderInteraction, renderBrief, renderMessageActions, renderQueuedAction,
     onTryAgainNoLiveExecutionPath, tryAgainNoLiveExecutionPathPending,
     retryableMarkerId, onRetryFailedRun, retryFailedRunId, attachments, onOpenSkill, onOpenBrowser,
+    deferredRunIds, onExpandRunHistory,
   ]);
   const body = (
     <div

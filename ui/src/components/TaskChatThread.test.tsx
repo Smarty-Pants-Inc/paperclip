@@ -206,6 +206,28 @@ describe.each(["legacy", "native"] as const)("historical %s system status", (run
     ]);
   };
 
+  it("shows a per-turn control for compacted task output without a description and loads its tool steps", () => {
+    const onExpandHistory = vi.fn();
+    const props = {
+      issueId: "compact-no-description", compactHistory: true, onExpandHistory,
+      comments: [comment("saved-answer", "Saved investigation result", "saved-run")],
+      linkedRuns: [run("saved-run", "succeeded", 0)], onAdd: async () => {},
+    };
+    render(<TaskChatThread {...props} />);
+    const showSteps = [...container.querySelectorAll("button")].find(button => button.textContent === "Show steps");
+    expect(showSteps).toBeDefined();
+    act(() => showSteps!.click());
+    expect(onExpandHistory).toHaveBeenCalledOnce();
+
+    setTranscript("saved-run");
+    transcriptState.hydratedRunIds = new Set(["saved-run"]);
+    render(<TaskChatThread {...props} compactHistory={false} />);
+    const activityToggle = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-turn-summary"]');
+    expect(activityToggle).not.toBeNull();
+    act(() => activityToggle!.click());
+    expect(container.textContent).toContain("Read files");
+  });
+
   it.each([true, false].flatMap(streamlined => ["done", "cancelled"].map(issueStatus => ({ streamlined, issueStatus }))))("removes failures, stops, waits and stored notices on $issueStatus tasks (streamlined=$streamlined)", ({ streamlined, issueStatus }) => {
     streamlinedState.enabled = streamlined;
     setTranscript("failed");

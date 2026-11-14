@@ -3074,9 +3074,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ],
   );
 
+  const compactRunHistoryIds = useMemo(() => new Set([
+    ...deferredTranscriptRunIds,
+    ...logRuns.filter((run) => truncatedRunIds?.has(run.id)).map((run) => run.id),
+  ]), [deferredTranscriptRunIds, logRuns, truncatedRunIds]);
   const historyControl = props.historyControl ?? (
     props.compactHistory && props.onExpandHistory
-    && (deferredTranscriptRunIds.size > 0 || logRuns.some((run) => truncatedRunIds?.has(run.id)))
+    && compactRunHistoryIds.size > 0
       ? <Button type="button" variant="ghost" size="sm" onClick={props.onExpandHistory}>More run output</Button>
       : null
   );
@@ -3481,6 +3485,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         retryFailedRunId={retryFailedRunId}
                         onOpenSkill={onOpenSkill}
                         onOpenBrowser={onOpenBrowser}
+                        deferredRunIds={props.compactHistory && !conversationMode ? compactRunHistoryIds : undefined}
+                        onExpandRunHistory={props.compactHistory && !conversationMode ? props.onExpandHistory : undefined}
                         tail={
                           tailRunId ||
                           optimisticRunnerStartup ||
