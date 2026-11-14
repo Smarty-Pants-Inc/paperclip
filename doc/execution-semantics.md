@@ -2476,6 +2476,42 @@ Railway services too: a process can crash and restart inside the same deployment
 and some saved ownership records do not contain a deployment identity.
 `PAPERCLIP_CONTROLLER_INSTANCE_LEASE=off` explicitly disables it.
 
+Controller fencing is **record-driven, not an all-boot expiry sweep**. The
+ownership reconciler enumerates in-progress ownership records, not every
+`controller_instances` row. Its shared owner prover calls
+`proveControllerInstance(db, bootId, touchedAt)` with the owned record's last
+write when it needs the cross-process-space lease proof. Any older epoch can be
+fenced; this is not limited to the immediately previous boot. An unreferenced
+historical boot, or one whose records no longer need this proof, can therefore
+remain neither stopped nor fenced after its lease expires. In particular, a
+same-process-space `pid_dead` or `pid_reused` verdict returns before the
+controller-lease prover: settling that owned record need not fence its boot.
+
+For an operational investigation of such a row:
+
+1. Read the exact boot row and find the persisted ownership records that name
+   it. Preserve their actual last-write timestamps. A command's age is not an
+   ownership timestamp, and an expired lease alone is not a recorded close.
+2. Use the existing **mutating** ownership-reconciliation path for those records
+   on a serving controller with the instance lease enabled and registered. Its
+   `proveControllerInstance` call takes the exact boot id and the owned record's
+   actual last write; it fences only after the lease/write-plus-TTL grace and
+   only with this controller's newer epoch. A direct maintenance invocation of
+   that same function requires the same registered controller context. It is
+   not a standalone CLI command or an unconditional SQL update.
+3. Read back `fenced_at` and `fenced_by_epoch` (or a genuine graceful
+   `stopped_at`) before retrying settlement. A read-only pass, an absent owned
+   record timestamp, or an unregistered prover returns `expired` without
+   fencing. If no applicable ownership record is available, the ordinary
+   reconciler cannot be claimed to reach the historical row; escalate that
+   evidence gap rather than manufacture an owner or a timestamp.
+
+Legacy lifecycle-command settlement deliberately does not run this mutating
+proof itself. It keeps refusing while **any** other boot lacks a recorded stop
+or fence, including a long-expired boot on the same host. Fencing that boot
+through the existing route discharges this one guard; every other lifecycle,
+delivery, checkpoint, provider-work and ownership guard still applies.
+
 Native execution and restart claims register held preparation with this lease before
 a runner PID or checkpoint exists. Passive identity reads do not register work.
 Restart recovery uses the recorded controller
