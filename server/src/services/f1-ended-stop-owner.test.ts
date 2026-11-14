@@ -47,6 +47,28 @@ describe.skipIf(!support.supported)("F1 ended allocation stop owner", () => {
       await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
       expect(inspect).toHaveBeenCalledOnce();
       const prepared = await f.readLease();
+      if (observation !== "running") {
+        // RFL 22:57Z (3): ERROR/ABSENT is not stop authority. Preserve every
+        // byte of ended evidence and keep one truthful current notice.
+        const stop = vi.fn(async () => undefined);
+        const hb = heartbeatService(db, { environmentRuntime: { retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
+        expect(prepared).toEqual(f.lease);
+        for (let n = 0; n < 3; n++) {
+          await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
+          await db.transaction(tx => freshThreadStopGate(tx as unknown as Db, f.run, f.issue.id));
+          await hb.sweepPendingCleanupLeases();
+          expect(await f.readLease()).toEqual(f.lease);
+          expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
+        }
+        expect(stop).not.toHaveBeenCalled();
+        expect(inspect).toHaveBeenCalledTimes(4);
+        const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issue.id), eq(issueComments.authorType, "system")));
+        expect(notes.filter(note => !note.metadata?.supersededByCommentId)).toMatchObject([{ body: expect.stringContaining("cannot confirm that the earlier attempt stopped") }]);
+        expect(notes.filter(note => !note.metadata?.supersededByCommentId)).toHaveLength(1);
+        expect(notes).toHaveLength(2); // original waiting history + cannot-confirm, never a loop
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
+        return;
+      }
       expect(prepared.status).toBe("pending_cleanup");
       expect(readStopOnlyCleanup(prepared)).not.toBeNull();
       expect(prepared.metadata).toMatchObject({ leaseController: f.lease.metadata!.leaseController, historicalEvidence: "must survive", sandboxStopAndRetain: { endedLeaseEvidence: { status, cleanupStatus: "success", failureReason: "historical-idle-close", releasedAt: f.lease.releasedAt!.toISOString(), metadata: f.lease.metadata } } });
