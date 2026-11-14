@@ -264,17 +264,24 @@ its current binding. A `run.prepare` for a different known run may adopt its own
 contract only over settled state: no active or ambiguous turn, startup attempt,
 receipt-limit interruption, pending tool call, substantive undelivered event,
 continuing goal, deferred terminal, descendant work, or live provider request.
-Restore's `session.resumed` and startup ownership/retirement diagnostics describe
-admission history, not active work; they do not block this attachment. Unknown
-diagnostics and other undelivered events remain fenced. The existing attachment
-path retains diagnostics for draining and discards its superseded restore notice.
+Restore's `session.resumed`, idle `session.reconciled` (both previous and active
+provider-turn IDs explicitly null), and startup ownership/retirement diagnostics
+describe admission history, not active work; they do not block this attachment.
+A settled observed provider exit also retains an attachable checkpoint when the
+executor stays alive: the next open restores the same thread under the successor's
+binding without requiring a handle to the already-exited process. Unknown
+diagnostics, non-idle reconciliation, and other undelivered events remain fenced.
+The existing attachment path retains diagnostics for draining and discards its
+superseded restore notice.
 The stricter empty-event rule for OpenCode launch-profile rebinding is unchanged.
 An existing thread uses the ordinary `run.attach` rebinding path; preparation
 before a thread exists updates the saved binding directly. Same-run contract
 changes and provider-profile changes still refuse without replacing saved state.
-Pi's run-scoped runtime context (including updated company skills) may refresh at
-this same boundary; a changed context retires the predecessor process before the
-next turn opens the retained conversation with its new contract and context.
+An existing Pi thread's run-scoped instructions and runtime context (including
+updated company skills) may refresh at this same authenticated new-run boundary;
+other provider-profile changes and same-run instruction changes still refuse. A changed context retires
+the predecessor process before the next turn opens the retained conversation with
+its new contract and context.
 
 C8 snapshots have no recorded run owner. After the public `run.prepare` command
 restores that state under the authenticated current runner authority, it may
