@@ -1,6 +1,133 @@
 mod skill_edit {
     use super::*;
 
+    // Keep: durable cross-process admission must queue skill edits rather than
+    // fail a run or mutate instructions while the predecessor owns work.
+    #[test]
+    fn skill_edit_live_work_prepare_waits_for_boundary() {
+        refresh_admission("active_turn", "refresh_wait");
+    }
+
+    #[test]
+    fn skill_edit_deferred_terminal_prepare_waits_for_boundary() {
+        refresh_admission("deferred_terminal", "refresh_wait");
+    }
+
+    #[test]
+    fn skill_edit_descendant_prepare_waits_for_boundary() {
+        refresh_admission("descendant", "refresh_wait");
+    }
+
+    #[test]
+    fn skill_edit_active_goal_prepare_selects_fresh_history() {
+        refresh_admission("goal", "refresh_fresh");
+    }
+
+    #[test]
+    fn skill_edit_contract_prepare_selects_fresh_history() {
+        refresh_admission("contract", "refresh_fresh");
+    }
+
+    fn refresh_admission(blocker: &str, expected: &str) {
+        let provider = if blocker == "deferred_terminal" {
+            "pi_rpc"
+        } else {
+            "codex"
+        };
+        let (directory, mut old, mut payload) = prepared_skill_checkpoint(provider, true);
+        let state = old.state.as_mut().unwrap();
+        state.run_identity = Some(prepare_contract_identity("run-A"));
+        match blocker {
+            "active_turn" => {
+                state.active_provider_turn_id = Some("old-turn".to_owned());
+                state.lifecycle = "turn_active".to_owned();
+            }
+            "deferred_terminal" => {
+                state.tool_bridge =
+                    tool_result_authority_state("pi_rpc", "get_task_context").tool_bridge;
+                state
+                    .tool_bridge
+                    .begin_call(
+                        "deferred-call".to_owned(),
+                        "get_task_context".to_owned(),
+                        json!({}),
+                    )
+                    .unwrap();
+                state.tool_bridge.settle_turn("turn_completed").unwrap();
+                state.pi_deferred_terminal = Some("turn.completed".to_owned());
+            }
+            "descendant" => {
+                state
+                    .descendant_thread_ids
+                    .insert("child-thread".to_owned());
+            }
+            "goal" => {
+                state.goal = Some(SessionGoalSnapshot {
+                    objective: "Old work".to_owned(),
+                    status: "active".to_owned(),
+                    token_budget: None,
+                    tokens_used: 0,
+                    elapsed_seconds: 0,
+                    iterations: 0,
+                    last_reason: None,
+                    created_at: None,
+                    updated_at: None,
+                    completed_at: None,
+                    working_now: false,
+                })
+            }
+            "contract" => {
+                payload["completionContract"] =
+                    json!({"revision":"new-contract", "criterionIds":["objective"]})
+            }
+            _ => unreachable!(),
+        }
+        old.save_state().unwrap();
+        let bytes = fs::read(old.state_path()).unwrap();
+        // A genuinely different executor reads the old owner's saved state.
+        let mut next = CodexCommandExecutor::new(&directory);
+        next.pi_launch_profile = old.pi_launch_profile.clone();
+        next.event_identity = Some(prepare_contract_identity("run-B"));
+        payload["provider"]["instructions"] = json!("Edited skill: M14_ONLY_NEW_SKILL_MARKER");
+        let result = next.execute(&crate::durable::Command {
+            schema: "paperclip.prp.command.v1".to_owned(),
+            command_id: "next-prepare".to_owned(),
+            controller_seq: 1,
+            command_type: "run.prepare".to_owned(),
+            issued_at: "2026-11-14T09:00:00Z".to_owned(),
+            deadline_at: None,
+            precondition: None,
+            payload,
+        });
+        assert!(
+            result.is_ok(),
+            "{blocker}: prepare must select {expected}, not fail: {result:?}"
+        );
+        assert_eq!(result.unwrap().result["status"], expected, "{blocker}");
+        assert_eq!(
+            fs::read(old.state_path()).unwrap(),
+            bytes,
+            "admission must not rewrite predecessor"
+        );
+        // A no-op prepare receipt is not sufficient: the contender's ordinary
+        // event pump and close must not restore, reconcile, or stop old work.
+        let events = next
+            .poll_events()
+            .expect("waiting admission must not restore the old provider");
+        assert!(
+            events.is_empty(),
+            "old-owner events cannot acquire the contender's authority"
+        );
+        next.shutdown()
+            .expect("unadmitted contender cleanup must not restore the old provider");
+        assert_eq!(
+            fs::read(old.state_path()).unwrap(),
+            bytes,
+            "poll/cleanup must preserve the predecessor"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     // Keep: TL07 (open conversation) and TL08 (DONE-task follow-up). A new
     // invocation must see the edited assigned skill, without changing the
     // provider, skill-inclusion policy, tools or completion contract.
