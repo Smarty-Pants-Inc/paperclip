@@ -90,7 +90,8 @@ describe.skipIf(!support.supported)("F1 automatic successor submitted input", ()
       const successor = successors[0];
       expect(successor.nativeSessionId).not.toBe(f.sessionId);
       expect(final.runs.find(run => run.id === f.owner.id)).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
-      expect(final.actions.some(action => action.status === "resolved" && action.outcome === "restored")).toBe(true);
+      expect(final.actions.find(action => action.fingerprint === `native-continuation:${f.owner.id}`))
+        .toMatchObject({ status: "resolved", outcome: "restored", evidence: { runId: f.owner.id } });
       expect(final.issue.status).not.toBe("blocked");
       expect(final.blocker).toBeNull();
       expect(final.comments.filter(comment => comment.authorType === "system" && !comment.metadata?.supersededByCommentId)).toHaveLength(1);
