@@ -428,6 +428,36 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     expect(newNotes[0].body).toContain(newMarker);
   }, 120_000);
 
+  it("guardian job reads its company config", async () => {
+    const f = await seed(false, true, false);
+    // TEST CLOCK: enableFixtureCompany calls the real config API, then backdates
+    // enabled_at; the real comment API request follows enablement and its
+    // persisted timestamp is aged to f.old so it is already due.
+    // v0.0.2 consumes the durable configured_companies allowlist; this does not
+    // claim the job called ctx.config.get.
+    await enableFixtureCompany(f.company.id, true);
+    const enabledAt = await readEnabledAt(f.company.id);
+    const posted = await runtime.api<{ id: string; authorType: string }>(`/issues/${f.issue.id}/comments`, {
+      body: "Please review this enabled-company request.",
+    });
+    expect(posted.authorType).toBe("user");
+    [f.request] = await db.update(issueComments).set({ createdAt: f.old, updatedAt: f.old })
+      .where(eq(issueComments.id, posted.id)).returning();
+    expect(f.request!.authorUserId).toBe("local-board");
+    expect(f.request!.createdAt.getTime()).toBeGreaterThanOrEqual(enabledAt.getTime());
+    expect(Date.now() - f.request!.createdAt.getTime()).toBeGreaterThanOrEqual(60_000);
+    expect(await notes(f, "company config / before job")).toHaveLength(0);
+
+    const completed = await runtime.runJob(pluginId);
+    expect(completed.status).toBe("succeeded");
+    const note = await oneNote(f, "hasn't been picked up", "company config / after job");
+    console.log("GUARDIAN_JOB_CONFIG", JSON.stringify({
+      companyId: f.company.id, requestId: f.request!.id, enabledAt: enabledAt.toISOString(),
+      requestAt: f.request!.createdAt.toISOString(), jobId: completed.id,
+      jobStatus: completed.status, noteId: note.id, noteAt: note.createdAt,
+    }));
+  });
+
   it("2 / I1: queued run never started", async () => {
     const f = await seed();
     await seedRun(f, "queued");
