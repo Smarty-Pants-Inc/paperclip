@@ -25,6 +25,7 @@ import type { LifecycleAgent } from "../modules/agent-lifecycle/index.js";
 import { resolveDecisionSigningSecret } from "./decision-signing.js";
 import { sandboxBinding } from "./environment-probe.js";
 import { serverVersion } from "../version.js";
+import { adapterTestErrorResult, recordAdapterTestFailure } from "../lib/adapter-test-failure.js";
 
 /**
  * Digest of what a passed harness test proves: the agent's fully resolved
@@ -47,7 +48,7 @@ export function harnessVerificationDigest(input: {
   return `v2:hmac-sha256:${createHmac("sha256", resolveDecisionSigningSecret()).update("harness-verification-v2:").update(canonical).digest("hex")}`;
 }
 
-export function assertHarnessTestPassed(result: AdapterEnvironmentTestResult) {
+export function assertHarnessTestPassed(result: AdapterEnvironmentTestResult, config: Record<string, unknown> = {}) {
   const verified = result.checks.some(check => check.level === "info" &&
     (/hello_probe_(passed|succeeded)$/.test(check.code) || check.code === "ai_connection_api_key_reverified" || check.code === "copilot_metadata_verified"
       || (result.adapterType === "paperclip_runner" && check.code === "cursor_cloud_account_ready")));
@@ -66,7 +67,7 @@ export function assertHarnessTestPassed(result: AdapterEnvironmentTestResult) {
       : has("_hello_probe_timed_out") ? "harness_probe_timed_out"
       : has("_hello_probe_unexpected_output") ? "harness_probe_unexpected_output"
       : "harness_test_failed";
-    throw Object.assign(new Error("The harness test failed"), { code });
+    throw recordAdapterTestFailure(Object.assign(new Error("The harness test failed"), { code }), result, config);
   }
 }
 
@@ -168,14 +169,25 @@ export function agentHarnessVerificationService(db: Db, manager: PluginWorkerMan
       if (target.fallbackChecks.length) throw Object.assign(new Error("The test environment is unavailable"), { code: "test_environment_unavailable" });
       const input = { companyId: agent.companyId, adapterType: agent.adapterType, config,
         executionTarget: target.executionTarget, environmentName: target.environmentName };
-      const result = binding ? await withManagedAiProbe(db, { ...input, agentId: agent.id, responsibleUserId, binding },
-        managed => {
-          // The account this probe actually uses; the recorded digest must describe it.
-          probed.account = { connectionId: managed.attribution.connectionId, grantId: managed.attribution.grantId };
-          return tests.testManagedEnvironment(agent.adapterType, { ...input, config: managed.config }, binding!, managed, agent.id);
-        })
-        : await requireServerAdapter(agent.adapterType).testEnvironment(input);
-      assertHarnessTestPassed(result);
+      let probeConfig = config;
+      let probeStarted = !binding;
+      try {
+        const result = binding ? await withManagedAiProbe(db, { ...input, agentId: agent.id, responsibleUserId, binding },
+          managed => {
+            // The account this probe actually uses; the recorded digest must describe it.
+            probed.account = { connectionId: managed.attribution.connectionId, grantId: managed.attribution.grantId };
+            probeConfig = managed.config;
+            probeStarted = true;
+            return tests.testManagedEnvironment(agent.adapterType, { ...input, config: managed.config }, binding!, managed, agent.id);
+          })
+          : await requireServerAdapter(agent.adapterType).testEnvironment(input);
+        assertHarnessTestPassed(result, probeConfig);
+      } catch (error) {
+        // Account selection/preparation is not a probe failure and may run
+        // before we know the selected credential values needed for redaction.
+        if (!probeStarted) throw error;
+        throw recordAdapterTestFailure(error, adapterTestErrorResult(agent.adapterType, error, probeConfig));
+      }
       status = "released";
       // A passing subscription probe can save the credential it refreshed, which
       // advances the version but keeps the AI session epoch; a person's rotation

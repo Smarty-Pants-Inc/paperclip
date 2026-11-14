@@ -10,6 +10,7 @@ import { isAgentStatusInvokable } from "@paperclipai/shared";
 import { notifyNativeResponsePresentation } from "./native-response-presentation-notifications.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { logger } from "../middleware/logger.js";
+import { readAdapterTestFailure } from "../lib/adapter-test-failure.js";
 import { agents, companies, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import { persistActivity, type ActivityPublication } from "./activity-log.js";
@@ -74,7 +75,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     },
     reportFailure(context, error) {
       const code = lifecycle.lifecycleFailureCode(error);
-      logger.warn({ ...context, failureCode: code ?? "unclassified" }, "Agent lifecycle operation failed");
+      logger.warn({ ...context, failureCode: code ?? "unclassified", ...readAdapterTestFailure(error) }, "Agent lifecycle operation failed");
     },
     transaction: withAccountingTransaction,
     deleteDependencies: deleteAgentDependencies,

@@ -848,8 +848,9 @@ describe("agent routes adapter validation", () => {
         .send({ agentId: "11111111-1111-4111-8111-111111111111", adapterConfig: {
           ...adapterConfig, env: { CODEX_HOME: { type: "plain", value: "***REDACTED***" } },
         } }));
-      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.status, JSON.stringify(res.body)).toBe(status === "fail" ? 422 : 200);
       expect(res.body).toMatchObject({ adapterType: "codex_local", status });
+      if (status === "fail") expect(res.body.code).toBe("adapter_auth_missing");
       expect(probe).toHaveBeenCalledOnce();
       expect(probe).toHaveBeenCalledWith(expect.objectContaining({ adapterType: "codex_local", config: adapterConfig }));
       expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalledWith("company-1", adapterConfig, expect.objectContaining({ adapterType: "codex_local" }));
@@ -885,6 +886,33 @@ describe("agent routes adapter validation", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(422);
     expect(res.body.details).toMatchObject({ code: "agent_runner_unavailable" });
     expect(mockAgentService.create).not.toHaveBeenCalled();
+  });
+
+  // Keep: the production diagnostic route returned bare 500s for thrown probes.
+  it.each(["result", "throw"] as const)("returns the native probe's structured redacted failure over HTTP for %s", async mode => {
+    const adapterConfig = { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", env: { CUSTOM_CREDENTIAL: "opaque-route-canary" } };
+    mockAgentService.getById.mockResolvedValue({ ...(await mockAgentService.getById()), adapterType: "paperclip_runner", adapterConfig });
+    const code = "pi_rpc_hello_probe_failed";
+    const message = 'Pi exited: Model "paperclip/claude-opus-5-5" not found; api_key=sk-route-canary; opaque-route-canary';
+    const probe = vi.fn(async () => {
+      if (mode === "throw") throw Object.assign(new Error(message), { code });
+      return { adapterType: "paperclip_runner", status: "fail" as const, testedAt: new Date(0).toISOString(),
+        checks: [{ code, level: "error" as const, message, detail: "d".repeat(3_000) }] };
+    });
+    const { registerServerAdapter } = await import("../adapters/index.js");
+    registerServerAdapter({ ...externalAdapter, type: "paperclip_runner", testEnvironment: probe });
+    try {
+      const app = await createApp();
+      const res = await requestApp(app, baseUrl => request(baseUrl)
+        .post("/api/companies/company-1/adapters/paperclip_runner/test-environment")
+        .send({ agentId: "11111111-1111-4111-8111-111111111111", adapterConfig }));
+      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.body).toMatchObject({ adapterType: "paperclip_runner", status: "fail", code,
+        checks: [expect.objectContaining({ code, level: "error", message: expect.stringContaining('Model "paperclip/claude-opus-5-5" not found') })] });
+      expect(JSON.stringify(res.body)).not.toMatch(/opaque-route-canary|sk-route-canary/);
+      expect(res.body.checks[0].detail?.length ?? 0).toBeLessThanOrEqual(2_000);
+      expect(probe).toHaveBeenCalledOnce();
+    } finally { await unregisterTestAdapter("paperclip_runner"); }
   });
 
   it("rechecks selection policy when a saved native adapter switches to an experimentally gated harness", async () => {

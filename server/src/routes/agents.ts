@@ -1,4 +1,4 @@
-import { PI_THINKING_LEVELS } from "../vendor/paperclip-runner/index.js";
+import { NativeEnvironmentProbeCleanupError, PI_THINKING_LEVELS } from "../vendor/paperclip-runner/index.js";
 import { resolveLoginEnvironmentTarget } from "../services/login-environment.js";
 import { checkAgentProtectedEnvironmentKeys } from "../services/protected-environment-keys.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
@@ -19,6 +19,7 @@ import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, normalizeClau
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
 import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver, pluginRunnerAiConnectionRequiredMessage, pluginRunnerAiConnectionRequiredTestResult } from "../services/plugin-runner-ai-connection.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
+import { adapterTestErrorResult, adapterTestFailureDiagnostic, redactAdapterTestResult } from "../lib/adapter-test-failure.js";
 import { qualifyAgentRunner } from "../services/agent-runner-qualification.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { isAgentSetupDraft } from "../modules/agent-lifecycle/index.js";
@@ -3341,6 +3342,12 @@ export function agentRoutes(
       const aiBinding = requestedBinding?.mode === "router" ? undefined : requestedBinding;
       if (aiBinding && req.body.testCredentials && Object.keys(req.body.testCredentials).length) throw unprocessable("A managed connection test cannot override its credentials");
       const inputAdapterConfig = aiBinding ? { ...req.body.adapterConfig, env: stripAiAuthBindings(req.body.adapterConfig?.env) } : (req.body?.adapterConfig ?? {}) as Record<string, unknown>;
+      const respond = (result: AdapterEnvironmentTestResult, config = inputAdapterConfig) => {
+        const redacted = redactAdapterTestResult(result, config);
+        const failure = redacted.status === "fail" ? adapterTestFailureDiagnostic(redacted) : null;
+        res.status(failure ? 422 : 200).json({ ...redactEventPayload({ ...redacted }),
+          ...(failure ? { code: failure.failureCode, error: failure.failureDetail } : {}) });
+      };
       const savedAgentId = typeof req.body.agentId === "string" ? req.body.agentId : null;
       const savedAgent = savedAgentId
         ? await getAccessibleResource(req, res, svc.getById(savedAgentId), "Agent not found")
@@ -3426,7 +3433,7 @@ export function agentRoutes(
       if (!retainsSavedExecution) await assertSelectableAdapterType(type, adapterConfigForTest, companyId);
       if (poolBinding?.mode === "router") {
         await validateManagedAgentBinding(req, companyId, savedAgentId ?? "", type, adapterConfigForTest, poolBinding, requestedEnvironmentId, "none", !savedAgentId || testingSetup);
-        res.json({ adapterType: type, status: "warn", testedAt: new Date().toISOString(), checks: [{ code: "ai_connection_pool_task_test_required", level: "warn", message: "Pool configuration is available. Run a task to verify the selected account and harness; this preview does not allocate a task or contact a provider." }] });
+        respond({ adapterType: type, status: "warn", testedAt: new Date().toISOString(), checks: [{ code: "ai_connection_pool_task_test_required", level: "warn", message: "Pool configuration is available. Run a task to verify the selected account and harness; this preview does not allocate a task or contact a provider." }] });
         return;
       }
       if (type === "paperclip_runner" && inputAdapterConfig.provider === "openai_dot") {
@@ -3451,7 +3458,7 @@ export function agentRoutes(
           ...(environment?.driver === "sandbox" && inputAdapterConfig.dotWorkspaceAccess === true
             ? [{ code: "dot_workspace", level: "error" as const, message: "Managed Dot runners do not expose workspace access. Turn off workspace access before assigning work." }] : []),
         ];
-        res.json({ adapterType: type, status: checks.some(c => c.level === "error") ? "fail" : checks.some(c => c.level === "warn") ? "warn" : "pass", testedAt: new Date().toISOString(), checks });
+        respond({ adapterType: type, status: checks.some(c => c.level === "error") ? "fail" : checks.some(c => c.level === "warn") ? "warn" : "pass", testedAt: new Date().toISOString(), checks });
         return;
       }
       // A plugin Runner-task environment runs only managed AI connections in an isolated
@@ -3459,7 +3466,7 @@ export function agentRoutes(
       const preconfiguredTestHome = type === "paperclip_runner" && adapterConfigForTest.homeMode === "preconfigured";
       if (type === "paperclip_runner" && requestedEnvironment && (preconfiguredTestHome || !aiBinding)
         && await pluginEnvironmentRunnerTaskDriver(db, requestedEnvironment)) {
-        res.json(pluginRunnerAiConnectionRequiredTestResult(type, preconfiguredTestHome));
+        respond(pluginRunnerAiConnectionRequiredTestResult(type, preconfiguredTestHome));
         return;
       }
       const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
@@ -3566,7 +3573,7 @@ export function agentRoutes(
             checks: combinedChecks,
             testedAt: new Date().toISOString(),
           };
-          res.json(synthesized);
+          respond(synthesized, effectiveAdapterConfig);
           return;
         }
 
@@ -3583,14 +3590,27 @@ export function agentRoutes(
             effectiveAdapterConfig.apiKey = req.body.testCredentials.API_SERVER_KEY;
           }
         }
+        let diagnosticConfig = effectiveAdapterConfig;
+        const probe = async (work: () => Promise<AdapterEnvironmentTestResult>) => {
+          try { return await work(); }
+          catch (error) {
+            // Authorization/selection HTTP failures already have their own
+            // status and code. Only a thrown probe becomes diagnostic output.
+            // Managed cleanup must reach withManagedAiProbe, which retains
+            // credential ownership until native retirement is confirmed.
+            if (error instanceof HttpError || aiBinding && error instanceof NativeEnvironmentProbeCleanupError) throw error;
+            return adapterTestErrorResult(type, error, diagnosticConfig);
+          }
+        };
         const result = aiBinding ? await withManagedAiProbe(db, { companyId, agentId: req.body.agentId ?? "", responsibleUserId: responsibleUserForAiRequest(req), adapterType: type, binding: aiBinding, config: effectiveAdapterConfig, allowUninstalledPersonal: !savedAgentId || testingSetup, allowUninstalledShared: (!savedAgentId || testingSetup) && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, aiBinding) }, async managed => {
+          diagnosticConfig = managed.config;
           const managedAiCredentialHome = type === "paperclip_runner" && (asRecord(managed.config)?.provider === "codex"
             || (asRecord(managed.config)?.provider === "acpx" && asRecord(managed.config)?.acpxAgent === "antigravity")) && managed.home
             ? path.join(managed.home, "provider") : undefined;
-          const tested = await testManagedEnvironment(type, { companyId, adapterType: type, config: managed.config, managedAiCredentialHome, executionTarget, environmentName }, aiBinding, managed, savedAgentId ?? undefined);
+          const tested = await probe(() => testManagedEnvironment(type, { companyId, adapterType: type, config: managed.config, managedAiCredentialHome, executionTarget, environmentName }, aiBinding, managed, savedAgentId ?? undefined));
           tested.checks.unshift({ code: "ai_connection_tested", level: "info", message: `Tested ${managed.accountName} — ${managed.accountOwnerUserId ? managed.accountOwnerUserId === responsibleUserForAiRequest(req) ? "your personal account" : "the owner’s account authorized for this agent" : "company-shared account"}. Responsible user: ${req.actor.type === "agent" ? responsibleUserForAiRequest(req) ?? "unavailable" : "the signed-in user"}.` });
           return tested;
-        }) : await adapter.testEnvironment({ companyId, adapterType: type, config: effectiveAdapterConfig, executionTarget, environmentName });
+        }) : await probe(() => adapter.testEnvironment({ companyId, adapterType: type, config: effectiveAdapterConfig, executionTarget, environmentName }));
 
         const prefixChecks = [
           ...(sandboxIdentityCheck ? [sandboxIdentityCheck] : []),
@@ -3602,11 +3622,11 @@ export function agentRoutes(
         const status = environmentEnvChecks.some((c) => c.level === "error") ? "fail" : result.status;
         if (status === "fail") releaseStatus = "failed";
         // Adapter diagnostics may include credential-bearing provider metadata.
-        res.json(redactEventPayload({
+        respond({
           ...result,
           status,
           checks: prefixChecks.length > 0 ? [...prefixChecks, ...result.checks] : result.checks,
-        }));
+        }, diagnosticConfig);
       } catch (err) {
         releaseStatus = "failed";
         throw err;

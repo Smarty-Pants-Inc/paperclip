@@ -3,6 +3,7 @@ import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.
 import { isLifecycleWorkPending } from "../domain/policy.js";
 import { lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "./failure.js";
 import { LIFECYCLE_STOP_FAILURE_LIMIT } from "./retry.js";
+import { readAdapterTestFailure } from "../../../lib/adapter-test-failure.js";
 
 /** Database leases protect each attempt across server processes. */
 export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
@@ -102,8 +103,9 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
         failureContext = { ...failureContext, verificationFailures };
         const message = lifecycleFailureMessage(failureContext, error);
         const retryRequired = lifecycleVerificationNeedsRetry(failureContext, error);
-        if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined
-          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
+        const diagnostic = readAdapterTestFailure(error);
+        if (!await runStep("defer", () => retryRequired || verificationFailures !== undefined || diagnostic
+          ? store.defer(agent, owner, message, new Date(), { retryRequired, ...diagnostic, ...(verificationFailures !== undefined ? { verificationFailures } : {}) })
           : deferIncomplete(message, { pluginId: failureContext.pluginId }))) continue;
         return;
       } finally {

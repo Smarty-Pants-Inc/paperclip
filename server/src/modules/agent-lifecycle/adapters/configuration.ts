@@ -51,6 +51,7 @@ export async function updateAgentConfiguration(tx: Db, effects: LifecycleEffects
     lifecycleOperation: { ...current.lifecycleOperation!, id: randomUUID(), hostComplete: false,
       completedPluginIds: [], attempts: 0, leaseOwner: undefined, leaseUntil: undefined, leaseHolder: undefined,
       retryAt: undefined, retryRequired: undefined, verificationFailures: undefined,
+      failureCode: undefined, failureDetail: undefined,
       waitingForSignal: undefined, recheckRequested: undefined,
       // With no new hold, completed pause work resumes automatically, then verifies the new environment.
       ...(pauseForEnvironment ? { resumeState: "verifying" as const,

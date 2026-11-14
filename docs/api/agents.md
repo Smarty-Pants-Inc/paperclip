@@ -63,6 +63,32 @@ Returns the agent record for the currently authenticated agent.
 }
 ```
 
+## Test an Adapter Environment
+
+```
+POST /api/companies/{companyId}/adapters/{type}/test-environment
+{"adapterConfig": { ... }, "agentId": "{optionalSavedAgentId}"}
+```
+
+Requires agent-creation permission and, for a saved agent, permission to configure
+that agent. A completed probe returns `adapterType`, `status`, `testedAt` and
+`checks` (`code`, `level`, `message`, and optional `detail`, `hint`, `retryable`).
+Passes and warnings return HTTP `200`. A failed probe returns HTTP `422` with the
+same structured checks, plus `code` for the failed check and `error` for its
+bounded guidance. A non-HTTP exception thrown by the probe also returns a
+structured failure rather than a bare `500`; an unclassified exception uses
+`adapter_probe_failed`. Existing HTTP errors, managed-native cleanup-pending
+responses, authorization, configuration selection, allocation and release errors
+retain their existing HTTP error contracts and cleanup ownership. Probe text is secret-redacted and each
+message, detail and hint is limited to 2,000 characters.
+
+When saved-agent lifecycle verification fails, `lifecycleOperation.failureCode`
+and `lifecycleOperation.failureDetail` retain the failed check's own code and
+bounded, secret-redacted guidance. The lifecycle's broad retry classification is
+unchanged. A single lifecycle warning includes these fields with the agent and
+operation IDs. Retry, repaired configuration and successful verification clear
+stale probe diagnostics; these fields do not imply that verification passed.
+
 ## Create Agent
 
 ```

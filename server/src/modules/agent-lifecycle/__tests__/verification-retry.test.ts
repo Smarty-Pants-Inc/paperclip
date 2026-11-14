@@ -13,6 +13,8 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 
 import { aiConnectionService } from "../../../services/ai-connections.js";
+import { assertHarnessTestPassed } from "../../../services/agent-harness-verification.js";
+import { logger } from "../../../middleware/logger.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_LIFECYCLE_VERIFICATION_RETRY_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -54,6 +56,50 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     }
     return { agent: await current(agent.id), work, driver, runHost };
   }
+
+  // Keep: production C8 hires lost the actual failed Pi check at this boundary.
+  it.each(["pi_rpc_hello_probe_failed", "pi_probe_model_mismatch", "pi_probe_cleanup_unconfirmed"])("persists and warns once with the failed probe's own code and bounded redacted detail: %s", async code => {
+    const log = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const credential = "opaque-probe-credential-canary";
+    const detail = `Model "paperclip/claude-opus-5-5" not found; api_key=sk-diagnostic-canary; ${credential}; ${"x".repeat(3_000)}`;
+    const [agent] = await db.insert(agents).values({ companyId, name: "Pi diagnostic", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "pi_rpc", model: "paperclip/claude-opus-5-5" }, status: "paused",
+      lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    const driver = { requiredPluginIds: async () => [], runPlugin: async () => "complete" as const,
+      runHost: async () => {
+        assertHarnessTestPassed({ adapterType: "paperclip_runner", status: "fail", testedAt: new Date().toISOString(),
+          checks: [{ code, level: "error", message: "Native Pi hello failed", detail }] },
+        { env: { CUSTOM_CREDENTIAL: credential } });
+        return "complete" as const;
+      } };
+    const work = configureAgentLifecycle(db, driver); workers.push(work);
+    try {
+      await work.process(agent!.id);
+      const saved = await current(agent!.id);
+      expect(saved.lifecycleState).toBe("verifying");
+      expect(saved.lifecycleOperation).toMatchObject({ failureCode: code, failureDetail: expect.stringContaining('Model "paperclip/claude-opus-5-5" not found'), verificationFailures: 1 });
+      const diagnostic = saved.lifecycleOperation as unknown as { failureDetail: string };
+      expect(diagnostic.failureDetail.length).toBeLessThanOrEqual(2_000);
+      expect(JSON.stringify(saved.lifecycleOperation)).not.toMatch(/opaque-probe-credential-canary|sk-diagnostic-canary/);
+      expect(log).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ stage: "host", agentId: agent!.id,
+        operationId: agent!.lifecycleOperation!.id, failureCode: code, failureDetail: diagnostic.failureDetail }), "Agent lifecycle operation failed");
+      expect(JSON.stringify(log.mock.calls)).not.toMatch(/opaque-probe-credential-canary|sk-diagnostic-canary/);
+      // Install the repaired driver before Retry publishes work to the live
+      // coordinator, not after it can already start another failing probe.
+      driver.runHost = async () => "complete";
+      await createAgentLifecycle(db).retry(agent!.id);
+      const retried = await current(agent!.id);
+      expect(retried.lifecycleOperation ?? {}).not.toHaveProperty("failureCode");
+      expect(retried.lifecycleOperation ?? {}).not.toHaveProperty("failureDetail");
+      await work.process(agent!.id);
+      const ready = await current(agent!.id);
+      expect(ready).toMatchObject({ lifecycleState: "ready", lifecycleError: null });
+      expect(ready.lifecycleOperation ?? {}).not.toHaveProperty("failureCode");
+      expect(ready.lifecycleOperation ?? {}).not.toHaveProperty("failureDetail");
+      expect(log).toHaveBeenCalledOnce();
+    } finally { log.mockRestore(); }
+  });
 
   it("parks a real missing-default selection across restart and permits repair through the normal ready handoff", async () => {
     const userId = randomUUID();
@@ -164,12 +210,15 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         expectedVersion: agent!.lifecycleVersion, configurationRepaired: true },
       () => notifyDeliveryWork(tx, DELIVERY_QUEUES.agentLifecycle))).toBe(true);
     });
-    await store.defer(claimed!, owner, "Old missing account", new Date(), { retryRequired: true });
+    await store.defer(claimed!, owner, "Old missing account", new Date(), { retryRequired: true,
+      failureCode: "old_probe_failed", failureDetail: "Old probe diagnostic" });
     const repaired = await current(agent!.id);
     expect(repaired.lifecycleError).toBeNull();
     expect(repaired.lifecycleOperation).not.toHaveProperty("retryRequired");
     expect(repaired.lifecycleOperation).not.toHaveProperty("retryAt");
     expect(repaired.lifecycleOperation).not.toHaveProperty("verificationFailures");
+    expect(repaired.lifecycleOperation).not.toHaveProperty("failureCode");
+    expect(repaired.lifecycleOperation).not.toHaveProperty("failureDetail");
     expect(await store.claim(agent!.id, "new-check", new Date())).not.toBeNull();
   });
 
