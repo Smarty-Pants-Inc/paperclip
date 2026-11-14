@@ -16,6 +16,7 @@ import { environmentService } from "../services/environments.js";
 import { HttpError } from "../errors.js";
 import * as secretOwner from "../services/secrets.js";
 import { readIdleSleepSafety } from "../services/idle-sleep-safety.js";
+import { idleWorkSnapshot } from "../services/task-admission.js";
 import { nextEnvironmentCleanupAt } from "../services/environment-cleanup-state.js";
 import { readProcessStartedAt } from "../services/hot-restart.js";
 import { hasRemoteTerminationReceipt, remoteTerminationReceipt, resolveRemoteTerminationLease } from "../services/remote-execution-termination.js";
@@ -517,6 +518,9 @@ describe("durable sandbox creation through the runtime entry point", () => {
     // A quiet plugin worker cannot discharge the retained creation uncertainty.
     expect(await readIdleSleepSafety(db, () => hold, Date.now, ownerId, async () => "none"))
       .toEqual({ version: 1, backgroundWork: "present" });
+    // Establish the quiet local-work precondition before supplying a quiet plugin
+    // proof. Pending local work correctly makes that proof unknown, not present.
+    await vi.waitFor(() => expect(idleWorkSnapshot().active).toBe(0), { timeout: 5_000, interval: 10 });
     expect(await readIdleSleepSafety(db, () => hold, Date.now, ownerId, async () => "none",
       async () => ({ backgroundWork: "none", pluginIds: [pluginId] })))
       .toEqual({ version: 1, backgroundWork: "present" });
