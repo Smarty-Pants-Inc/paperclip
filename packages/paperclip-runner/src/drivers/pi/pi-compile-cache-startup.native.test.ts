@@ -53,7 +53,7 @@ it.skipIf(!binary).each(["os", "runtime"] as const)("measures five cold/seeded a
       allSeeded &&= copied === Object.keys(source).length;
     }
     expect(inventory(image)).toEqual(source);
-    if (location === "os") expect(inventory(legacy)).toEqual(source);
+    expect(inventory(legacy)).toEqual(source);
     if (process.env.JUDGE_PROOF_DIRECTORY) {
       await mkdir(process.env.JUDGE_PROOF_DIRECTORY, { recursive: true });
       await writeFile(join(process.env.JUDGE_PROOF_DIRECTORY, `full-image-startup-${location}.json`), JSON.stringify({ node: process.version, pi: "1.5.2", host: "ryzen3", location, samples, medianFirstMs: median(first), medianWarmMs: median(warm), seeded: allSeeded, sourceFiles: Object.keys(source).length, sourceUnchanged: true,
@@ -61,6 +61,7 @@ it.skipIf(!binary).each(["os", "runtime"] as const)("measures five cold/seeded a
     }
     expect((await readdir(join(hostTmp, `paperclip-pi-cache-${process.getuid!()}`))).filter(name => name.startsWith(".image-seed-"))).toEqual([]);
     expect(allSeeded).toBe(true);
-    if (location === "runtime") expect(inventory(legacy)).toEqual({});
+    // Runtime seeds, like OS seeds, remain read-only even after warm launches.
+    expect(inventory(legacy)).toEqual(source);
   } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
 }, 120_000);

@@ -203,6 +203,7 @@ export class PiRpcDriver implements HarnessDriver {
       ...((environment.PAPERCLIP_RUNNER_STATE_DIR ?? process.env.PAPERCLIP_RUNNER_STATE_DIR)
         ? [environment.PAPERCLIP_RUNNER_STATE_DIR ?? process.env.PAPERCLIP_RUNNER_STATE_DIR!] : []),
     ]));
+    // Historical entry point is now read-only; never remove persisted state.
     await removeLegacyPiCompileCache(directory);
     const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
     const fatalSessionStartExtensionPaths = [extension, verifiedPiChildBridgePath(pathToFileURL(extension).href)];

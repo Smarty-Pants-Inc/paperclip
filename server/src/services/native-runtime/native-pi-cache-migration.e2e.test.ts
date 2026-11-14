@@ -6,12 +6,12 @@ import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { expect, it, vi } from "vitest";
 import { PiRpcDriver, type HarnessSession, type NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
-import { buildNativeHarnessBackupManifestStreamed, resolveNativeHarnessPersistenceProfile, stageRemoteRunnerDirectory, syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
+import { buildNativeHarnessBackupManifest, buildNativeHarnessBackupManifestStreamed, resolveNativeHarnessPersistenceProfile, stageRemoteRunnerDirectory, syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
 import { createNativeHarnessBackupStamp, verifyNativeHarnessBackupStamp, verifyNativeHarnessBackupStampAsync } from "./native-harness-backup-stamp.js";
 import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
 
 const binary = process.env.PI_TEST_BINARY;
-it.skipIf(!binary).each(["archive", "sync"] as const)("upgrades a legacy cache before a real turn, then stamps and retains cache-free state (%s)", async transfer => {
+it.skipIf(!binary).each(["archive", "sync"] as const)("preserves a legacy cache through a real turn, then stamps a cache-free backup and recalls history (%s)", async transfer => {
   const root = await mkdtemp(join(tmpdir(), "pi-cache-upgrade-"));
   const fact = `PI_CACHE_UPGRADE_MEMORY_${randomUUID()}`;
   const requests: Array<{ messages: Array<{ role: string; content: unknown }> }> = [];
@@ -62,6 +62,7 @@ it.skipIf(!binary).each(["archive", "sync"] as const)("upgrades a legacy cache b
     expect(await turn(session, "Remember the fact in your response, without writing workspace files.")).toBe(fact);
     await session.close({ reason: "completed upgrade turn" }); session = undefined;
     const transcript = await readFile(sessionPath(live)); expect(transcript.toString("utf8")).toContain(fact);
+    expect(await readFile(join(legacy, "legacy-bytecode"), "utf8")).toBe("disposable compiled code");
     await mkdir(join(live, "runner"), { recursive: true, mode: 0o700 });
     await writeFile(join(live, "runner", "runner-state.json"), JSON.stringify({ lifecycle: "suspended" }), { mode: 0o600 });
     const execution = { provider: { kind: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "off" },
@@ -80,10 +81,12 @@ it.skipIf(!binary).each(["archive", "sync"] as const)("upgrades a legacy cache b
     const runner = { execute: async ({ command, args, stdin }: { command: string; args: string[]; stdin?: string }) => ({
       exitCode: 0, timedOut: false, stderr: "", stdout: execFileSync(command, args, { input: stdin, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }),
     }), ...(transfer === "sync" ? { syncIn: copy, syncOut: copy } : {}) };
-    for (const directory of profile.directories) await syncRemoteRunnerDirectoryOut({ runner: runner as never, sourcePath: pathFor(live, directory), targetPath: join(backup, directory.name), mode: 0o700, excludeEntries: directory.excludeEntries });
+    for (const directory of profile.directories) await syncRemoteRunnerDirectoryOut({ runner: runner as never, sourcePath: pathFor(live, directory), targetPath: join(backup, directory.name), mode: 0o700, excludeEntries: directory.excludeEntries, excludeDirectories: directory.excludeDirectories });
     const cachePaths = async (directory: string) => (await readdir(directory, { recursive: true })).filter(path => path.split(/[\\/]/u).includes("node-compile-cache"));
     const backupCachePaths = await cachePaths(backup);
     const manifest = await buildNativeHarnessBackupManifestStreamed({ backupRoot: backup, execution, runnerInstanceId: "runner-1", sourceProviderLeaseId: "old-sandbox", providerSessionIdentity: { providerSessionId: sessionId } });
+    // All manifest and stamp paths hash exactly the already-filtered tree.
+    expect(buildNativeHarnessBackupManifest({ backupRoot: backup, execution, runnerInstanceId: "runner-1", sourceProviderLeaseId: "old-sandbox", providerSessionIdentity: { providerSessionId: sessionId }, completedAt: manifest.completedAt })).toEqual(manifest);
     await writeFile(join(backup, "manifest.json"), JSON.stringify(manifest));
     const stamp = createNativeHarnessBackupStamp({ manifestPath: join(backup, "manifest.json"), sessionScopeId: scopeId, authorizedProviderLeaseId: "new-sandbox", normalizedSessionId: sessionId, runnerInstanceId: "runner-1", completedAt: manifest.completedAt });
     const stampVerified = verifyNativeHarnessBackupStamp(stamp, "new-sandbox");
@@ -96,6 +99,11 @@ it.skipIf(!binary).each(["archive", "sync"] as const)("upgrades a legacy cache b
     const evidencePaths = await readdir(join(stateBase, "conversation-evidence"), { recursive: true });
     const evidenceTranscript = evidencePaths.find(path => path.endsWith(`${sessionId}.jsonl`)); expect(evidenceTranscript).toBeDefined();
     expect(await readFile(join(stateBase, "conversation-evidence", evidenceTranscript!))).toEqual(transcript);
+    // Evidence is an atomic whole-tree rename, not a filtered copy. Old legacy
+    // caches stay with the original trace; removing them would reintroduce the race.
+    const evidenceLegacy = evidencePaths.find(path => path.endsWith("node-compile-cache/v24-old/legacy-bytecode"));
+    expect(evidenceLegacy).toBeDefined();
+    expect(await readFile(join(stateBase, "conversation-evidence", evidenceLegacy!), "utf8")).toBe("disposable compiled code");
     session = await open(replacement, "following-run");
     const recall = await turn(session, "Recall the fact from your previous response."); expect(recall).toBe(fact);
     expect(requests).toHaveLength(2);
@@ -112,7 +120,8 @@ it.skipIf(!binary).each(["archive", "sync"] as const)("upgrades a legacy cache b
       vi.stubEnv("PAPERCLIP_RUNNER_STATE_DIR", stateBase);
       await writeFile(join(process.env.JUDGE_PROOF_DIRECTORY, `legacy-${transfer}.json`), JSON.stringify({ transfer, nativePi: binary, backupCachePaths, evidenceCachePaths, stamp, stampVerified, retainedState, retainedStampVerified, transcriptSha256: createHash("sha256").update(transcript).digest("hex"), nativeRecall: recall === fact, requestCount: requests.length }, null, 2) + "\n");
     }
-    expect(backupCachePaths).toEqual([]); expect(evidenceCachePaths).toEqual([]);
+    expect(backupCachePaths).toEqual([]);
+    expect(evidenceCachePaths).toHaveLength(3); // root, version directory, original bytecode
   } finally {
     await session?.close({ reason: "test cleanup" }); model.closeAllConnections(); await new Promise<void>(resolve => model.close(() => resolve()));
     vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true });

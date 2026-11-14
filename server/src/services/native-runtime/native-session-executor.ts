@@ -1,6 +1,7 @@
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
+import { localCheckpointDirectoryExclusions, remoteCheckpointDirectoryExclusions, validateCheckpointExclusions } from "./checkpoint-directory-exclusions.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -8007,6 +8008,8 @@ export interface NativeHarnessPersistenceDirectory {
   name: "runner" | "codex-home" | "opencode" | "acpx" | "pi-agent" | "pi";
   location: "runner" | "filesystem";
   excludeEntries: readonly string[];
+  /** Exact relative paths excluded only when they are real directories. */
+  excludeDirectories?: readonly string[];
   /** Cold-resume files whose valid backup can repair missing or invalid history.
    * An unusable backup remains the provider's ordinary recovery decision. */
   resumeFiles?: readonly string[];
@@ -8103,6 +8106,9 @@ export function resolveNativeHarnessPersistenceProfile(
       // Pi RPC cold-opens conversation JSONL here, not inside pi-agent/.
       ...(execution.provider.kind === "pi_rpc"
         ? [{ name: "pi" as const, location: "filesystem" as const, excludeEntries: [],
+            // Both scope/pi and scope/filesystem/pi copy this runtime root.
+            // Never delete a legacy cache: same-uid renames can put traces there.
+            excludeDirectories: ["node-compile-cache"],
             resumeFiles: [`${nativeSessionKey(execution)}.jsonl`] }]
         : []),
     ],
@@ -8424,6 +8430,9 @@ export function providerSessionIdentityTransitionIsAllowed(input: {
   );
 }
 
+// Hash the copied projection, never the live source. In particular, do NOT
+// skip excluded names here: an unexpected cache in a backup is real copied
+// state and must change its manifest/stamp rather than becoming invisible.
 function digestBackupDirectory(directory: string): {
   sha256: string;
   bytes: number;
@@ -15038,22 +15047,7 @@ export async function stageRemoteRunnerFile(input: {
 }
 
 function archiveExcludeArgs(entries: readonly string[]): string[] {
-  for (const entry of entries) {
-    const segments = entry.split("/");
-    if (
-      entry.length === 0 ||
-      entry.startsWith("/") ||
-      segments.some(
-        (segment) =>
-          segment === "" ||
-          segment === "." ||
-          segment === ".." ||
-          !/^[A-Za-z0-9._-]+$/.test(segment),
-      )
-    ) {
-      throw new Error("runner_remote_checkpoint_exclusion_invalid");
-    }
-  }
+  validateCheckpointExclusions(entries);
   return entries.map((entry) => `--exclude=./${entry}`);
 }
 
@@ -15083,8 +15077,10 @@ export async function stageRemoteRunnerDirectory(input: {
   targetPath: string;
   mode: number;
   excludeEntries?: readonly string[];
+  excludeDirectories?: readonly string[];
 }): Promise<void> {
-  const excludeArgs = archiveExcludeArgs(input.excludeEntries ?? []);
+  const excludedDirectories = await localCheckpointDirectoryExclusions(input.sourcePath, input.excludeDirectories ?? []);
+  const excludeArgs = archiveExcludeArgs([...(input.excludeEntries ?? []), ...excludedDirectories]);
   if (input.runner.syncIn) {
     let stagingRoot: string | null = null;
     let sourcePath = input.sourcePath;
@@ -15483,7 +15479,8 @@ export async function retryTransientRemoteCheckpointRead<T>(
  * the directory root, so this fallback also leaves out a nested entry that has
  * an excluded name (for example a nested `tmp`). It never copies more than the
  * snapshot would, and a checkpoint without those entries is more useful than
- * no checkpoint.
+ * no checkpoint. Exact directory-only exclusions instead use the streaming
+ * archive fallback, since provider patterns cannot enforce their path/type rule.
  */
 export async function syncRemoteRunnerDirectoryOut(input: {
   runner: CommandManagedRuntimeRunner;
@@ -15491,7 +15488,10 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   targetPath: string;
   mode: number;
   excludeEntries?: readonly string[];
+  excludeDirectories?: readonly string[];
 }): Promise<void> {
+  validateCheckpointExclusions(input.excludeEntries ?? []);
+  validateCheckpointExclusions(input.excludeDirectories ?? []);
   if (
     !(await remoteRunnerPathExists({
       runner: input.runner,
@@ -15501,7 +15501,10 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   )
     return;
   mkdirSync(resolve(input.targetPath, ".."), { recursive: true, mode: 0o700 });
-  const excluded = input.excludeEntries ?? [];
+  const excludedDirectories = await remoteCheckpointDirectoryExclusions({
+    runner: input.runner, sourcePath: input.sourcePath, entries: input.excludeDirectories ?? [],
+  });
+  const excluded = [...(input.excludeEntries ?? []), ...excludedDirectories];
   const excludeArgs = archiveExcludeArgs(excluded)
     .map((argument) => `'${argument}'`)
     .join(" ");
@@ -15512,6 +15515,7 @@ export async function syncRemoteRunnerDirectoryOut(input: {
     let syncSourcePath = input.sourcePath;
     let snapshotPath: string | null = null;
     let providerExclude: string[] | null = null;
+    let streamArchive = false;
     if (excluded.length > 0) {
       const checkpointId = randomUUID();
       snapshotPath = posix.join(
@@ -15546,36 +15550,45 @@ export async function syncRemoteRunnerDirectoryOut(input: {
         ) {
           throw new Error("runner_remote_checkpoint_snapshot_failed");
         }
-        providerExclude = [...excluded];
-        manifest = await readRemoteCheckpointManifest({
-          runner: input.runner, sourcePath: input.sourcePath, excluded, unanchored: true,
-        });
+        if ((input.excludeDirectories?.length ?? 0) > 0) {
+          // Provider patterns are unanchored and not type-aware. They cannot
+          // implement an exact directory exclusion; use the existing streaming
+          // archive below instead, without a sandbox snapshot/archive on disk.
+          streamArchive = true;
+        } else {
+          providerExclude = [...excluded];
+          manifest = await readRemoteCheckpointManifest({
+            runner: input.runner, sourcePath: input.sourcePath, excluded, unanchored: true,
+          });
+        }
       } else {
         syncSourcePath = snapshotPath;
       }
     }
-    try {
-      await input.runner.syncOut([
-        {
-          operationId: `runner-checkpoint-dir-${randomUUID()}`,
-          files: [
-            {
-              sourcePath: syncSourcePath,
-              targetPath: input.targetPath,
-              kind: "directory",
-              mode: input.mode,
-              ...(providerExclude ? { exclude: providerExclude } : {}),
-            },
-          ],
-        },
-      ]);
-      await verifyLocalCheckpointManifest(input.targetPath, manifest);
-    } finally {
-      if (snapshotPath) {
-        await removeRemoteCheckpointSnapshot(input.runner, snapshotPath);
+    if (!streamArchive) {
+      try {
+        await input.runner.syncOut([
+          {
+            operationId: `runner-checkpoint-dir-${randomUUID()}`,
+            files: [
+              {
+                sourcePath: syncSourcePath,
+                targetPath: input.targetPath,
+                kind: "directory",
+                mode: input.mode,
+                ...(providerExclude ? { exclude: providerExclude } : {}),
+              },
+            ],
+          },
+        ]);
+        await verifyLocalCheckpointManifest(input.targetPath, manifest);
+      } finally {
+        if (snapshotPath) {
+          await removeRemoteCheckpointSnapshot(input.runner, snapshotPath);
+        }
       }
+      return;
     }
-    return;
   }
   const escapedSource = input.sourcePath.replaceAll("'", "'\\''");
   const result = await input.runner.execute({
@@ -18362,6 +18375,7 @@ async function createRunnerdBackendWithinSessionClaim(
             sourcePath: resolve(backup.root, directory.name),
             targetPath,
             mode: 0o700,
+            excludeDirectories: directory.excludeDirectories,
           });
         }
       },
@@ -18641,6 +18655,7 @@ async function createRunnerdBackendWithinSessionClaim(
                         targetPath: remoteDirectory,
                         mode: 0o700,
                         excludeEntries: directory.excludeEntries,
+                        excludeDirectories: directory.excludeDirectories,
                       });
                     }
                   }
@@ -18831,6 +18846,7 @@ async function createRunnerdBackendWithinSessionClaim(
                     targetPath,
                     mode: 0o700,
                     excludeEntries: directory.excludeEntries,
+                    excludeDirectories: directory.excludeDirectories,
                   });
                   if (!existsSync(targetPath)) {
                     throw new Error("runner_harness_state_mismatch: checkpoint_directory_missing");

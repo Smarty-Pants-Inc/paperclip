@@ -23,6 +23,10 @@ function persistedDirectories(runtimeDirectory: string, additional: readonly str
   return roots;
 }
 
+/** @deprecated Compatibility probe only: legacy persisted trees are never removed.
+ * Same-uid writers can rename conversation evidence into a checked pathname at
+ * any await boundary. Neither ownership nor lstat can authorize recursive rm.
+ * Keep this read-only entry point for older callers; backups exclude caches. */
 export async function removeLegacyPiCompileCache(runtimeDirectory: string): Promise<void> {
   try {
     const uid = process.getuid?.();
@@ -32,7 +36,7 @@ export async function removeLegacyPiCompileCache(runtimeDirectory: string): Prom
     const cache = join(runtimeDirectory, "node-compile-cache");
     const metadata = await lstat(cache);
     if (!metadata.isDirectory() || metadata.uid !== uid) return;
-    await rm(cache, { recursive: true, force: true });
+    // Deliberately no mutation, even after successful validation.
   } catch {
   }
 }

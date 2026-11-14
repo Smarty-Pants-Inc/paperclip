@@ -1039,19 +1039,34 @@ roots. Standalone custom runtimes have no inferred sibling layout; callers of
 the environment helper can supply additional persisted directories. No fallback
 cache is placed inside these trees when the host temporary directory is unsafe.
 
-Before launching Pi, the driver removes only the exact legacy
-`<physical runtimeDirectory>/node-compile-cache` when it is a real directory
-owned by the execution uid. It never follows cache symlinks, removes a file or
-foreign-owner root, or searches for other cache names. Cleanup errors do not
-refuse the turn. Conversation JSONL bytes are untouched. Cleanup runs before
-backup manifest hashing/copying, so the next backup's normal manifest and stamp
-still describe its exact copied tree. Backup and evidence code need no filters;
-old backup/evidence trees are not rewritten. Restoring an old backup triggers
-this same cleanup on its next Pi launch. An already-live Pi must be relaunched
-to adopt the policy.
+Legacy `<runtimeDirectory>/node-compile-cache` trees are **never deleted** by
+Pi launch. A same-uid agent can rename a conversation, runner journal or retired
+evidence into a checked pathname between `lstat` and recursive removal; ownership
+and symlink checks cannot make that deletion safe. The historical cleanup entry
+point remains a read-only compatibility probe.
 
-If the new cache is empty, launch first tries the legacy runtime cache before
-removing it, then the image's existing
+Instead, native checkpoint capture and restore exclude exactly the real
+`node-compile-cache` directory at the Pi runtime root (`scope/pi` locally,
+`scope/filesystem/pi` remotely). The existing archive/sync exclusion mechanism
+selects only literal root-relative real directories, never files, symlinks,
+symlink ancestors, nested same-name paths, or similarly named siblings. Source
+bytes are untouched. If a sync snapshot runs out of disk, Pi's exact-directory
+policy uses the streaming archive fallback instead of the provider's broader,
+unanchored filename patterns. The source inventory uses the same selected
+exclusions as the transfer. Manifest builders and synchronous/asynchronous stamp
+verifiers hash **all actual copied bytes**; they do not hide an unexpected cache
+inside a backup. No manifest/stamp schema or recovery authority changes.
+
+Conversation evidence still atomically renames the **whole** retired tree.
+Old session caches therefore remain in old evidence alongside the original
+trace; filtering that rename would require destructive changes and is deliberately
+not attempted. Existing backup/evidence objects are not rewritten. Old backups
+remain verifiable under their original full-tree digests; subsequent filtered
+captures omit the legacy cache. Relaunch is needed only to move an already-live
+Pi process's cache writes to the external namespace.
+
+If the new cache is empty, launch first tries the legacy runtime cache read-only,
+then the image's existing
 `<physical OS temporary directory>/node-compile-cache`. The copy accepts only
 real directories/files owned by this uid or root, protected from other users'
 writes (a private source root also protects Node's umask-created descendants).

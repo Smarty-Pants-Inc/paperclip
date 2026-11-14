@@ -53,6 +53,9 @@ function isRealFile(path: string): boolean {
   }
 }
 
+// Exclusions belong to capture, before the manifest is built. Authenticate the
+// complete copied tree, including any unexpected cache path: ignoring it here
+// would let a stamp claim a different tree from the one actually persisted.
 function digestDirectory(directory: string): { sha256: string; bytes: number } {
   const hash = createHash("sha256");
   let bytes = 0;
@@ -65,12 +68,12 @@ function digestDirectory(directory: string): { sha256: string; bytes: number } {
       const path = resolve(current, entry.name);
       const relativePath = relative ? `${relative}/${entry.name}` : entry.name;
       const stats = lstatSync(path);
-      if (entry.isDirectory()) {
+      if (stats.isDirectory()) {
         hash.update(`directory:${relativePath}:${stats.mode & 0o777}\0`);
         visit(path, relativePath);
-      } else if (entry.isSymbolicLink()) {
+      } else if (stats.isSymbolicLink()) {
         hash.update(`symlink:${relativePath}:${readlinkSync(path)}\0`);
-      } else if (entry.isFile()) {
+      } else if (stats.isFile()) {
         const contents = readFileSync(path);
         bytes += contents.byteLength;
         hash.update(

@@ -5176,9 +5176,16 @@ inside the sandbox. If that copy fails with a full-disk diagnostic, the controll
 removes the partial copy and passes the exclusions to the provider's sync-out.
 That transfer can stream without another sandbox archive. Provider exclusions can
 also omit a nested entry with the same name; credentials remain excluded. Other
-copy failures and timeouts still fail. Workspace capture itself still needs free
-sandbox space. Its failed save operation names `remote_workspace_sandbox_disk_full`
-when that capacity is exhausted, without changing ownership rules. Finalization
+copy failures and timeouts still fail. Pi's legacy `node-compile-cache` is a
+narrower policy: only the exact real directory at its runtime root is excluded,
+not a file, symlink or nested same-name entry. Capture and source inventory use
+the same selection; Pi's full-disk fallback streams the filtered archive instead
+of using unanchored provider patterns. Backup manifests and stamps authenticate
+the complete copied tree, not a second filtered view. Pi launch never deletes a
+legacy cache, and whole-tree retired conversation evidence retains any old cache
+along with its traces. Workspace capture itself still needs free sandbox space.
+Its failed save operation names `remote_workspace_sandbox_disk_full` when that
+capacity is exhausted, without changing ownership rules. Finalization
 does not retry that copy-back: nothing frees the sandbox between its attempts.
 The first full-disk failure ends finalization as
 `native_workspace_sync_out_retry_exhausted` and keeps the accepted result. Saved-work

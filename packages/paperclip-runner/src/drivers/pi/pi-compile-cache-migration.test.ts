@@ -24,7 +24,7 @@ async function launch(f: Awaited<ReturnType<typeof fixture>>) {
   }).openSession({ runId: "migration", normalizedSessionId: "migration", workingDirectory: f.root })).rejects.toBe(captured);
   return env!;
 }
-it("removes only the owned legacy cache before launching and never follows a nested symlink", async () => {
+it("preserves the entire legacy cache before launching, including nested symlinks", async () => {
   const f = await fixture(); const outside = join(f.root, "outside"); await mkdir(outside);
   await writeFile(join(outside, "keep"), "not cache");
   await mkdir(join(f.legacy, "v24-old"), { recursive: true, mode: 0o700 });
@@ -32,7 +32,9 @@ it("removes only the owned legacy cache before launching and never follows a nes
   await symlink(outside, join(f.legacy, "linked"));
   await writeFile(join(f.runtime, "session.jsonl"), "conversation");
   await launch(f);
-  await expect(lstat(f.legacy)).rejects.toMatchObject({ code: "ENOENT" });
+  expect((await lstat(f.legacy)).isDirectory()).toBe(true);
+  expect(await readFile(join(f.legacy, "v24-old", "bytecode"), "utf8")).toBe("derived");
+  expect((await lstat(join(f.legacy, "linked"))).isSymbolicLink()).toBe(true);
   expect(await readFile(join(outside, "keep"), "utf8")).toBe("not cache");
   expect(await readFile(join(f.runtime, "session.jsonl"), "utf8")).toBe("conversation");
 });
@@ -62,12 +64,12 @@ it("keeps the declared session boundary when pi/ is a symlink to an external run
   vi.stubEnv("TMPDIR", join(f.session, "runner"));
   expect((await launch(f)).NODE_DISABLE_COMPILE_CACHE).toBe("1");
 });
-it("seeds a compatible legacy runtime cache before removing its exact directory", async () => {
+it("seeds a compatible legacy runtime cache without modifying its source", async () => {
   const f = await fixture(); await mkdir(join(f.legacy, "v24"), { recursive: true, mode: 0o700 });
   await writeFile(join(f.legacy, "v24", "compiled"), "snapshot warm code");
   expect((await launch(f)).NODE_COMPILE_CACHE).toBe(f.cache);
   expect(await readFile(join(f.cache, "v24", "compiled"), "utf8")).toBe("snapshot warm code");
-  await expect(lstat(f.legacy)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await readFile(join(f.legacy, "v24", "compiled"), "utf8")).toBe("snapshot warm code");
 });
 it.each([true, false])("covers a custom session's siblings without relying on a named state base (remote=%s)", async remote => {
   const f = await fixture(remote, "custom-state"); vi.stubEnv("TMPDIR", join(f.session, "runner"));
