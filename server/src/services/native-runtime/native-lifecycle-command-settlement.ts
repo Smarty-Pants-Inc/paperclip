@@ -8,6 +8,8 @@ import { abandonNativeRunnerCheckpointCommands, loadNativeRunnerCheckpoint } fro
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { isSettledRemoteWarmControlState } from "./remote-warm-session-recovery.js";
 import { provesNoNativeRunProviderWork } from "./native-provider-work-proof.js";
+import { currentProcessProbe, proveOwnerGone } from "../owner-proof.js";
+import { proveControllerInstance } from "../controller-instance-lease.js";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const lifecycle = new Set(["runner.drain", "runner.suspend", "runner.shutdown"]);
@@ -39,10 +41,11 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
   // Do not call it abandoned. The PRP send path checkpoints this count BEFORE
   // sending, so zero in both durable sources proves it was never released.
   if (control.commandDeliveryCounts == null || commands.some(command => Number(record(control.commandDeliveryCounts)[String(command.commandId)] ?? 0) !== 0)) return null;
+  const hasLegacyCommands = commands.some(command => command.issuer === undefined);
   const current = await currentNativeControllerIdentity();
   const binding = { companyId: input.companyId, issueId: input.issueId, runId: input.identity.runId! };
   const prove = async (db: Pick<Db, "select" | "execute">): Promise<boolean> => {
-    const boots = await db.select().from(controllerInstances);
+    const boots = hasLegacyCommands ? await db.select().from(controllerInstances) : [];
     const boot = boots.find(row => row.bootId === current.bootId);
     const [prior] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, binding.runId),
       eq(heartbeatRuns.companyId, binding.companyId), eq(heartbeatRuns.agentId, input.agentId),
@@ -76,7 +79,14 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
       if (command.issuer !== undefined) {
         const issuer = record(command.issuer);
         if (typeof issuer.bootId !== "string" || !Number.isSafeInteger(issuer.generation) || Number(issuer.generation) < 1
-          || issuer.bootId === current.bootId || !boots.some(row => row.bootId === issuer.bootId && row.fencedAt !== null)) return false;
+          || issuer.bootId === current.bootId) return false;
+        const proof = await proveOwnerGone({ kind: "local", scope: "native_lifecycle_command", generation: Number(issuer.generation),
+          bootId: issuer.bootId, host: null, pid: null, processStartedAt: null, processSpace: null,
+          processSpaceUnrecorded: true, requireRecordedProcessSpace: true }, {
+          ...currentProcessProbe(), readOnly: true,
+          controllerInstance: (bootId, touchedAt) => proveControllerInstance(db as Db, bootId, touchedAt, { readOnly: true }),
+        });
+        if (proof.verdict !== "gone") return false;
       } else {
         // Temporary M1 compatibility only. Delete this branch at M2.
         const issuedAt = typeof command.issuedAt === "string" ? Date.parse(command.issuedAt) : NaN;
@@ -90,15 +100,22 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
   return { commands, commit: async () => {
     const path = join(input.root, "control-plane", "control-plane-state.json");
     const abandonedAt = new Date().toISOString();
-    await input.db.transaction(async tx => {
-      // A new boot cannot enter during the legacy all-other-boots proof.
-      await tx.execute(sql`lock table controller_instances in share mode`);
-      await lockSourceRecoveryCoordinators(tx, binding.companyId, [binding.runId, input.currentRunId]);
-      if (readFileSync(path, "utf8") !== input.bytes || !await prove(tx as unknown as Db)) {
-        throw new Error("native_lifecycle_settlement_proof_changed");
+    try {
+      await input.db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '1s'`);
+        await lockSourceRecoveryCoordinators(tx, binding.companyId, [binding.runId, input.currentRunId]);
+        if (hasLegacyCommands) await tx.execute(sql`lock table controller_instances in share mode`);
+        if (readFileSync(path, "utf8") !== input.bytes || !await prove(tx as unknown as Db)) {
+          throw new Error("native_lifecycle_settlement_proof_changed");
+        }
+        await abandonNativeRunnerCheckpointCommands(tx as Transaction, binding, commands, abandonedAt, current.bootId);
+      });
+    } catch (error) {
+      for (let cause: unknown = error; cause && typeof cause === "object"; cause = record(cause).cause) {
+        if (record(cause).code === "55P03") throw new Error("native_lifecycle_settlement_lock_timeout", { cause: error });
       }
-      await abandonNativeRunnerCheckpointCommands(tx as Transaction, binding, commands, abandonedAt, current.bootId);
-    });
+      throw error;
+    }
     const ids = new Set(commands.map(command => command.commandId));
     const settled = { ...control, commands: allCommands.map(command => ids.has(command.commandId)
       ? { ...command, status: "rejected", result: { status: "rejected", code: "controller_command_abandoned" },

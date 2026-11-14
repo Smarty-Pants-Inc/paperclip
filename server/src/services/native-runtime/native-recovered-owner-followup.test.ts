@@ -20,6 +20,8 @@ import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter, restoreNative
 import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
+import { planNativeLifecycleSettlement } from "./native-lifecycle-command-settlement.js";
+import { waitForCondition } from "../../__tests__/helpers/native-restart.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
@@ -129,7 +131,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const identity = { runId, normalizedSessionId: native.normalizedSessionId, runnerInstanceId: native.runnerInstanceId,
       environmentLeaseId: native.environmentLeaseId, turnId: native.turnId, itemId: native.itemId };
     const priorController = options.controller ?? { bootId: randomUUID(), pid: 2_147_483_000,
-      processStartedAt: new Date(Date.now() - 60_000) };
+      processStartedAt: new Date(Math.min(Date.now(), (await currentNativeControllerIdentity()).processStartedAt.getTime()) - 60_000) };
     const owner = { companyId, issueId, runId, authorityRunId: runId, bootId: priorController.bootId, generation: 1, leaseOwner: randomUUID() };
     if (options.interruptedLifecycle && priorController.bootId !== (await currentNativeControllerIdentity()).bootId) {
       await db.insert(controllerInstances).values({ bootId: priorController.bootId, processSpace: "settlement-test-old",
@@ -1195,13 +1197,159 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("native_legacy_lifecycle_abandoned");
   }, 60_000);
 
-  it("SMA-122 stamped negative: stopped is not fenced and must never fall back to the legacy predicate", async () => {
-    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, stamped: true });
+  it("stamped command: a recorded graceful issuer stop settles without legacy timestamp inference", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, stamped: true,
+      lifecycleIssuedAt: new Date().toISOString() });
     await db.update(controllerInstances).set({ fencedAt: null, stoppedAt: new Date() })
       .where(eq(controllerInstances.bootId, prior.priorController.bootId));
     const followUp = await admitFollowUp(prior);
-    expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
+    expect(await followUp.start()).toBe(ADMITTED);
+    const checkpoint = await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId });
+    for (const type of ["runner.drain", "runner.suspend"]) {
+      const command = [...checkpoint!.records.values()].map(bytes => JSON.parse(bytes)).find(value => value.type === type);
+      expect(command).toMatchObject({ status: "rejected", issuer: { bootId: prior.priorController.bootId, generation: 1 },
+        abandonment: { disposition: "ABANDONED" } });
+    }
+    expect(followUp.logs.join("")).not.toContain("native_legacy_lifecycle_abandoned");
   }, 60_000);
+
+  it.each(["expired", "missing", "live"] as const)("stamped negative: an issuer with %s but no recorded close remains decisive", async state => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, stamped: true });
+    if (state === "missing") await db.delete(controllerInstances).where(eq(controllerInstances.bootId, prior.priorController.bootId));
+    else await db.update(controllerInstances).set({ fencedAt: null, stoppedAt: null,
+      leaseExpiresAt: new Date(Date.now() + (state === "live" ? 60_000 : -360_000)) })
+      .where(eq(controllerInstances.bootId, prior.priorController.bootId));
+    try {
+      expect(await (await admitFollowUp(prior)).start()).toBe(stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
+    } finally {
+      await db.update(controllerInstances).set({ stoppedAt: new Date() }).where(eq(controllerInstances.bootId, prior.priorController.bootId));
+    }
+  }, 60_000);
+
+  it.each(["delivered", "active_journal", "active_snapshot"] as const)(
+    "gracefully stopped issuer still refuses a non-idle session: %s", async state => {
+      const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, stamped: true,
+        ...(state === "delivered" ? { deliveryCount: 1 } : {}),
+        ...(state === "active_journal" ? { activeAfterTerminal: true } : {}) });
+      await db.update(controllerInstances).set({ fencedAt: null, stoppedAt: new Date() })
+        .where(eq(controllerInstances.bootId, prior.priorController.bootId));
+      const followUp = await admitFollowUp(prior);
+      if (state === "active_snapshot") {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson,
+          sessionCheckpoint: { ...(run.runnerProfileJson!.sessionCheckpoint as object), activeTurnId: "still-active" } } })
+          .where(eq(heartbeatRuns.id, prior.runId));
+      }
+      const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
+      const checkpoint = (await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }))!;
+      checkpoint.restoreSessionDirectory(root);
+      const path = join(root, "control-plane", "control-plane-state.json"), bytes = await readFile(path, "utf8");
+      expect(await planNativeLifecycleSettlement({ db, root, bytes, identity: prior.identity, companyId, agentId,
+        issueId: prior.issueId, currentRunId: followUp.runId })).toBeNull();
+      expect(await readFile(path, "utf8")).toBe(bytes);
+      expect([...(await loadNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }))!.records])
+        .toEqual([...checkpoint.records]);
+    }, 60_000);
+
+  async function lifecyclePlan(stamped: boolean) {
+    const boot = await currentNativeControllerIdentity();
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, stamped,
+      lifecycleIssuedAt: new Date(boot.processStartedAt.getTime() - 6_000).toISOString() });
+    const followUp = await admitFollowUp(prior);
+    const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
+    const binding = { companyId, issueId: prior.issueId, runId: prior.runId };
+    const checkpoint = (await loadNativeRunnerCheckpoint(db, binding))!;
+    checkpoint.restoreSessionDirectory(root);
+    const path = join(root, "control-plane", "control-plane-state.json");
+    const bytes = await readFile(path, "utf8");
+    const plan = await planNativeLifecycleSettlement({ db, root, bytes, identity: prior.identity, companyId, agentId,
+      issueId: prior.issueId, currentRunId: followUp.runId });
+    expect(plan).not.toBeNull();
+    return { plan: plan!, prior, followUp, root, path, bytes, binding, checkpoint };
+  }
+
+  it.each([false, true])("settlement lock order: a bounded coordinator wait never stalls another boot's lease renewal (stamped=%s)", async stamped => {
+    const fixture = await lifecyclePlan(stamped);
+    const tag = `settlement-${randomUUID()}`;
+    let release!: () => void, locked!: () => void;
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holder = db.transaction(async tx => {
+      await lockSourceRecoveryCoordinators(tx, companyId, [fixture.prior.runId]);
+      locked(); await gate;
+    });
+    await ready;
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, "transaction").mockImplementationOnce(callback => transaction(async tx => {
+      await tx.execute(sql`select set_config('application_name', ${tag}, true)`);
+      await tx.execute(sql`set local statement_timeout = '3s'`);
+      return callback(tx);
+    }));
+    const settlement = fixture.plan.commit().then(value => ({ value }), error => ({ error }));
+    try {
+      await waitForCondition("settlement waiting on coordinator", async () => {
+        const rows = await db.execute(sql`select 1 from pg_stat_activity where application_name = ${tag} and wait_event_type = 'Lock'`);
+        return rows.length === 1;
+      }, 2_000);
+      await db.transaction(async tx => {
+        await tx.execute(sql`set local statement_timeout = '500ms'`);
+        await tx.update(controllerInstances).set({ renewedAt: new Date() })
+          .where(eq(controllerInstances.bootId, (await currentNativeControllerIdentity()).bootId));
+      });
+      expect(await settlement).toMatchObject({ error: { message: "native_lifecycle_settlement_lock_timeout" } });
+      expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
+      expect([...(await loadNativeRunnerCheckpoint(db, fixture.binding))!.records]).toEqual([...fixture.checkpoint.records]);
+    } finally { release(); await holder; await settlement; spy.mockRestore(); }
+  }, 15_000);
+
+  it("stamped-only settlement skips the controller table SHARE lock while a lease renewal is in flight", async () => {
+    const fixture = await lifecyclePlan(true);
+    let release!: () => void, locked!: () => void;
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.update(controllerInstances).set({ renewedAt: new Date() })
+        .where(eq(controllerInstances.bootId, (await currentNativeControllerIdentity()).bootId));
+      locked(); await gate;
+    });
+    await ready;
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, "transaction").mockImplementationOnce(callback => transaction(async tx => {
+      await tx.execute(sql`set local statement_timeout = '2s'`);
+      return callback(tx);
+    }));
+    try { await expect(fixture.plan.commit()).resolves.toContain("ABANDONED"); }
+    finally { release(); await holder; spy.mockRestore(); }
+  }, 15_000);
+
+  it("legacy settlement lock timeout refuses with a reason and leaves DB and local journal unchanged", async () => {
+    const fixture = await lifecyclePlan(false);
+    let release!: () => void, locked!: () => void;
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const holder = db.transaction(async tx => {
+      await tx.update(controllerInstances).set({ renewedAt: new Date() })
+        .where(eq(controllerInstances.bootId, (await currentNativeControllerIdentity()).bootId));
+      locked(); await gate;
+    });
+    await ready;
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, "transaction").mockImplementationOnce(callback => transaction(async tx => {
+      await tx.execute(sql`set local statement_timeout = '3s'`);
+      return callback(tx);
+    }));
+    try {
+      expect(await inspectFinishedPerTurnRunnerdOwner({ db, root: fixture.root, identity: fixture.prior.identity,
+        execution: fixture.prior.executionFor(fixture.followUp.runId), runnerExecutionTarget: {
+          kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute: fixture.followUp.remoteExecute },
+          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: fixture.followUp.providerLeaseId },
+        } as never })).toMatchObject({ finished: false, refused: "lifecycle_settlement_lock_timeout" });
+      expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
+      const after = (await loadNativeRunnerCheckpoint(db, fixture.binding))!;
+      expect([...after.records]).toEqual([...fixture.checkpoint.records]);
+    } finally { release(); await holder; spy.mockRestore(); }
+    await expect(fixture.plan.commit()).resolves.toContain("ABANDONED");
+  }, 15_000);
 
   it("SMA-122 B1 negative: a second unfenced controller keeps legacy lifecycle pending", async () => {
     const other = randomUUID();
