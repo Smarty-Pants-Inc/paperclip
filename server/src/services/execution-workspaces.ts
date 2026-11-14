@@ -1937,6 +1937,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   // when a sweep reaches the end of the candidate set.
   let terminalSweepCursor: { updatedAt: string; id: string } | null = null;
   const terminalInspections = new Map<string, { revision: string; issueIds: Set<string>; nextAt: number; parked?: boolean }>();
+  const terminalInspectionCandidates = new Set<string>();
   const terminalWorkspaceDeadlines = new Map<string, number>();
   const isolatedRehomeDeadlines = new Map<string, number>();
   const isolatedRehomeNotBefore = new Map<string, number>();
@@ -3591,6 +3592,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       if (!targets && !cursor) {
         terminalSweepBoundary = now();
         terminalWorkspaceDeadlines.clear();
+        terminalInspectionCandidates.clear();
         isolatedRehomeDeadlines.clear();
         nestedCloneMigrationDeadlines.clear();
         terminalSweepRescanRequested = false;
@@ -3702,6 +3704,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
       for (const candidate of candidates) {
         let workspace = candidate.workspace;
+        terminalInspectionCandidates.add(workspace.id);
         signal?.throwIfAborted();
         // Trash deletion is part of compaction, so a sweep that skips compaction
         // also leaves leftover trash for a later sweep.
@@ -3966,7 +3969,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             result.skippedBackoff += 1;
             continue;
           }
-          if (terminalInspections.size >= 256) terminalInspections.delete(terminalInspections.keys().next().value!);
+          // Keep the backoff for every candidate in the rotation. A fixed FIFO
+          // cap evicts still-live entries and makes a larger idle set run Git on
+          // every pass. Completed rotations retire entries no longer eligible.
           terminalInspections.set(workspace.id, {
             revision, issueIds: new Set(issueTree.map(issue => issue.id)),
             nextAt: now().getTime() + opts.terminalWorkspaceInspectionBackoffMs,
@@ -4319,6 +4324,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             entityId: archived.id,
             details: { sourceIssueId: archived.sourceIssueId, failure },
           });
+        }
+      }
+      if (terminalSweepCursor === null) {
+        for (const id of terminalInspections.keys()) {
+          if (!terminalInspectionCandidates.has(id)) terminalInspections.delete(id);
         }
       }
       return result;
