@@ -1,3 +1,8 @@
+import { documentService } from "../documents.js";
+import { isIssueReviewVerdictInteraction } from "../issue-review-policy.js";
+import { decideNativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
+import { nativeSessionFailureSourceCode } from "./native-session-executor.js";
+import { NATIVE_ADDRESSED_INTERACTION_FAILURE_ACTION } from "./native-addressed-interaction-failure.js";
 import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
@@ -99,6 +104,7 @@ afterAll(async () => {
 });
 
 async function fixture(role: "addressed" | "assignee", withAttachment = false, options: {
+  reviewPolicy?: "not_creator";
   issueStatus?: "in_progress" | "in_review";
   target?: {
     type: "issue_document";
@@ -122,6 +128,7 @@ async function fixture(role: "addressed" | "assignee", withAttachment = false, o
     companyId,
     title: addressed ? "Respond to an addressed confirmation" : "Continue the assigned task",
     status: options.issueStatus ?? "in_progress",
+    ...(options.reviewPolicy ? { reviewPolicy: options.reviewPolicy } : {}),
     workMode: "standard",
     assigneeAgentId: addressed ? ownerAgentId : responderAgentId,
     createdByAgentId: ownerAgentId,
@@ -593,5 +600,182 @@ describe("native addressed failure lifecycle through the executor and PostgreSQL
       executionRunId: input.runId,
       checkoutRunId: input.runId,
     });
+  }, 120_000);
+});
+
+type M14AddressedProviderFailureCase = {
+  label: string;
+  issueStatus: "in_progress" | "in_review";
+  documentTarget: boolean;
+};
+
+type M14CurrentDocumentTarget = {
+  type: "issue_document";
+  issueId: string;
+  documentId: string;
+  key: string;
+  revisionId: string;
+  revisionNumber: number;
+  label: string;
+};
+
+const m14AddressedProviderFailureCases: M14AddressedProviderFailureCase[] = [
+  { label: "ordinary in_progress / null target (W1 counterexample)", issueStatus: "in_progress", documentTarget: false },
+  { label: "ordinary in_progress / current document (W1 counterexample)", issueStatus: "in_progress", documentTarget: true },
+  { label: "review verdict in_review / null target (M1.4 regression)", issueStatus: "in_review", documentTarget: false },
+  { label: "review verdict in_review / current document (M1.4 regression)", issueStatus: "in_review", documentTarget: true },
+];
+
+describe("M1.4 addressed provider failures must never silently strand a review-verdict card", () => {
+  // Keep reason: a trust-boundary failure must be visible without granting a verdict or stealing KA's execution.
+  it.each(m14AddressedProviderFailureCases)("publishes one owner-facing failure notice: $label", async ({ issueStatus, documentTarget }: M14AddressedProviderFailureCase) => {
+    const input = await fixture("addressed", false, { issueStatus, reviewPolicy: "not_creator" });
+    const payloadCanary = "W1-M14-PRIVATE-CARD-PAYLOAD-CANARY";
+    const providerCanary = "W1-M14-PRIVATE-PROVIDER-RAW-CANARY";
+
+    let target: M14CurrentDocumentTarget | null = null;
+    if (documentTarget) {
+      const { document } = await documentService(db).upsertIssueDocument({
+        issueId: input.issueId,
+        key: "m14-review-brief",
+        title: "M14 current review brief",
+        format: "markdown",
+        body: "Current same-issue review evidence.",
+        createdByAgentId: ownerAgentId,
+        createdByRunId: input.ownerRunId,
+      });
+      expect(document).toMatchObject({ issueId: input.issueId, createdByAgentId: ownerAgentId });
+      expect(document.latestRevisionId).toEqual(expect.any(String));
+      target = {
+        type: "issue_document",
+        issueId: input.issueId,
+        documentId: document.id,
+        key: document.key,
+        revisionId: document.latestRevisionId!,
+        revisionNumber: document.latestRevisionNumber,
+        label: payloadCanary,
+      };
+      const current = await documentService(db).getIssueDocumentByKey(input.issueId, target.key);
+      expect(current).toMatchObject({
+        id: target.documentId, issueId: input.issueId, key: "m14-review-brief",
+        latestRevisionId: target.revisionId, latestRevisionNumber: target.revisionNumber,
+      });
+      const revision = await documentService(db).getIssueDocumentRevision(input.issueId, target.key, target.revisionId);
+      expect(revision).toMatchObject({
+        id: target.revisionId, documentId: target.documentId, issueId: input.issueId,
+        createdByAgentId: ownerAgentId, createdByRunId: input.ownerRunId, isLatest: true,
+      });
+    }
+    await db.update(issueThreadInteractions).set({ payload: {
+      version: 1, prompt: payloadCanary, ...(target ? { target } : {}),
+    } }).where(eq(issueThreadInteractions.id, input.interactionId!));
+
+    // Document/service setup may notify recovery; snapshot only after all setup writes.
+    const [issueBefore] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+    input.issueBefore = issueBefore;
+    const [cardBefore] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+    expect(issueBefore).toMatchObject({
+      status: issueStatus, reviewPolicy: "not_creator", createdByAgentId: ownerAgentId,
+      assigneeAgentId: ownerAgentId, executionRunId: input.ownerRunId, checkoutRunId: input.ownerRunId,
+      executionAgentNameKey: "ka", executionLockedAt: expect.any(Date),
+    });
+    expect(input.ownerRunBefore).toMatchObject({ companyId, agentId: ownerAgentId, status: "running" });
+    expect(cardBefore).toMatchObject({
+      companyId, issueId: input.issueId, kind: "request_confirmation", status: "pending",
+      createdByAgentId: ownerAgentId, sourceRunId: input.ownerRunId, addresseeAgentId: responderAgentId,
+      requestedResolverPolicy: "not_creator", effectiveResolverPolicy: "not_creator",
+      resolvedAt: null, resolvedByAgentId: null, resolvedByUserId: null, resolvedByRunId: null, result: null,
+    });
+    expect((cardBefore.payload as { target?: unknown }).target ?? null).toEqual(target);
+    expect(input.runContextSnapshot).toMatchObject({
+      issueId: input.issueId, taskId: input.issueId, sourceRunId: input.ownerRunId,
+      interactionId: input.interactionId, wakeReason: "interaction_pending",
+    });
+    expect(input.runContextSnapshot.nativeReviewDecisionId).toBeUndefined();
+    expect(input.runContextSnapshot.nativeReviewInteractionId).toBeUndefined();
+    if (issueStatus === "in_review") {
+      expect(await isIssueReviewVerdictInteraction(db, { issue: issueBefore, interaction: cardBefore })).toBe(true);
+    }
+    const [responder] = await db.select().from(agents).where(eq(agents.id, responderAgentId));
+    expect(responder).toMatchObject({ companyId, name: "KP", status: "active" });
+    expect(responderAgentId).not.toBe(issueBefore.assigneeAgentId);
+    const [membership] = await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalType, "agent"),
+      eq(companyMemberships.principalId, responderAgentId),
+    ));
+    expect(membership).toMatchObject({ status: "active", membershipRole: "member" });
+    const binding = { companyId, issueId: input.issueId, agentId: responderAgentId, runId: input.runId };
+    expect(input.execution.binding).toMatchObject(binding);
+    // Real authorization includes issue read/mutate scope, review policy, source provenance, and the exact target.
+    expect(await decideNativeAddressedInteractionGrant(db, binding)).toMatchObject({
+      allowed: true, grant: { ...binding, interaction: { id: input.interactionId, status: "pending" } },
+    });
+    await expectHeldOwnerUnchanged(input);
+
+    const genericError = new Error(`provider_stdout_closed: ${providerCanary}`);
+    expect(genericError).not.toBeInstanceOf(NativeAddressedInteractionAdmissionError);
+    expect(nativeSessionFailureSourceCode(genericError)).toBe("provider_stdout_closed");
+    await executeFailure(input, { failure: genericError });
+    expect(provider.execute).toHaveBeenCalledTimes(1);
+    await expect(provider.execute.mock.results[0]?.value).rejects.toBe(genericError);
+
+    const readNotices = async (): Promise<Array<typeof issueComments.$inferSelect>> => db.select().from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, input.issueId),
+      eq(issueComments.authorType, "system"),
+    ));
+    const notices = await readNotices();
+    // FIRST post-provider lifecycle expectation: the intended RED is the missing owner-visible comment.
+    // Do not filter by W1 key/run: an actual generic owner-visible alternative must also be observed.
+    expect(notices).toHaveLength(1);
+    const [notice] = notices;
+    expect(notice).toMatchObject({
+      body: NATIVE_ADDRESSED_INTERACTION_PENDING_FAILURE_MESSAGE,
+      createdByRunId: input.runId,
+      clientRequestId: `native-addressed-failure:${input.interactionId}:reason:provider_failure`,
+      presentation: { kind: "system_notice", tone: "danger" },
+      metadata: { recoveryResponsibility: "user", sourceRunId: input.runId },
+    });
+    const metadataRows = ((notice.metadata as { sections?: Array<{ rows?: Array<Record<string, unknown>> }> } | null)?.sections ?? [])
+      .flatMap(section => section.rows ?? []);
+    // Static body says failure/card-pending; structured run/addressee, owner and action identify KP/KA safely.
+    expect(metadataRows).toEqual(expect.arrayContaining([
+      { type: "run_link", label: "Source run", runId: input.runId, agentId: responderAgentId, title: "failed" },
+      { type: "agent_link", label: "Addressee", agentId: responderAgentId, name: "KP" },
+      { type: "agent_link", label: "Recovery owner", agentId: ownerAgentId, name: "KA" },
+      { type: "key_value", label: "Owner basis", value: "Card creator" },
+      { type: "key_value", label: "Next action", value: NATIVE_ADDRESSED_INTERACTION_FAILURE_ACTION },
+    ]));
+    const readAudits = async (): Promise<Array<typeof activityLog.$inferSelect>> => db.select().from(activityLog).where(and(
+      eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.addressed_interaction_failed"),
+      eq(activityLog.entityId, input.issueId),
+    ));
+    const audits = await readAudits();
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({ details: {
+      interactionId: input.interactionId, commentId: notice.id, state: "pending",
+      failureCode: NATIVE_ADDRESSED_INTERACTION_FAILED, failureReason: "provider_failure",
+    } });
+    const published = JSON.stringify({ body: notice.body, metadata: notice.metadata, audits });
+    expect(published).not.toContain(payloadCanary);
+    expect(published).not.toContain(providerCanary);
+    expect(published).not.toContain(genericError.message);
+
+    const { run, coordinator } = await settled(input);
+    expect(coordinator).toMatchObject({
+      phase: "terminal_failure", failureCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
+      nextAttemptAt: null, leaseOwner: null, recoveryState: null, resultId: null,
+    });
+    expect(run).toMatchObject({
+      status: "failed", nativePhase: "terminal_failure", errorCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
+    });
+    const [cardAfter] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+    expect(cardAfter).toEqual(cardBefore);
+    await expectHeldOwnerUnchanged(input);
+
+    // Existing card/reason idempotency applies to provider failures too; no native-review context is fabricated.
+    await expect(appendNativeAddressedInteractionFailureNotice(db, binding, input.interactionId!, genericError)).resolves.toBeNull();
+    expect(await readNotices()).toEqual(notices);
+    expect(await readAudits()).toEqual(audits);
+    await expectHeldOwnerUnchanged(input);
   }, 120_000);
 });
