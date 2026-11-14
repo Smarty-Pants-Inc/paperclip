@@ -8677,7 +8677,13 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   stalledDependencies={issue.stalledDependencies}
                   successfulRunHandoff={issue.successfulRunHandoff ?? null}
                   scheduledRetry={issue.scheduledRetry ?? null}
-                  recoveryAction={issue.interruption?.responsibility === "system" || isPreviousServerStopCause(issue.activeRecoveryAction?.cause) ? null : issue.activeRecoveryAction ?? null}
+                  // Interruption responsibility describes the stopped run, not ownership of an
+                  // active board recovery action. Keep that card reachable after a normal reload.
+                  recoveryAction={
+                    isPreviousServerStopCause(issue.activeRecoveryAction?.cause)
+                      ? null
+                      : issue.activeRecoveryAction ?? null
+                  }
                   onResolveRecoveryAction={handleResolveRecoveryAction}
                   onReissueIsolatedRecoveryAction={
                     handleReissueIsolatedRecoveryAction
@@ -8864,7 +8870,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                   }
                   resumeAssigneePending={resumeAssigneeAgent.isPending}
                   onTryAgainNoLiveExecutionPath={
-                    issue.status === "blocked" && !issue.interruption && issue.activeRecoveryAction
+                    issue.status === "blocked" && issue.activeRecoveryAction
                       ? handleTryAgainNoLiveExecutionPath
                       : undefined
                   }

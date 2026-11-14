@@ -38,6 +38,7 @@ import {
   IssueAssigneePausedNotice,
   IssueChatThread,
 } from "@/components/IssueChatThread";
+import { IssueRecoveryActionCard } from "@/components/IssueRecoveryActionCard";
 import {
   useLiveRunTranscripts,
   type RunTranscriptSource,
@@ -3484,7 +3485,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                         tail={
                           tailRunId ||
                           optimisticRunnerStartup ||
-                          bottomBlockerLinks ? (
+                          bottomBlockerLinks ||
+                          (showComposer && props.recoveryAction?.ownerType === "board" &&
+                            ["active", "escalated"].includes(props.recoveryAction.status)) ? (
                             <>
                               {tailRunId || optimisticRunnerStartup ? (
                                 <div data-testid="task-chat-live-transcript">
@@ -3575,6 +3578,29 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                     : item.kind === "interaction" ? renderInteraction(item) : null}
                                 </div>
                               ))}
+                              {showComposer && props.recoveryAction?.ownerType === "board" &&
+                              ["active", "escalated"].includes(props.recoveryAction.status) ? (
+                                <div
+                                  data-testid="task-chat-recovery-action-card"
+                                  className="mx-auto w-full max-w-(--tc-shell-max-w) px-4 pb-4"
+                                >
+                                  <IssueRecoveryActionCard
+                                    action={props.recoveryAction}
+                                    agentMap={agentMap}
+                                    scheduledRetry={props.scheduledRetry}
+                                    onResolve={props.onResolveRecoveryAction}
+                                    onReissueIsolated={props.onReissueIsolatedRecoveryAction}
+                                    reissuePending={props.reissueIsolatedRecoveryActionPending}
+                                    onReconcileForward={props.onReconcileForwardRecoveryAction}
+                                    onBreakGlassOverride={props.onBreakGlassOverrideRecoveryAction}
+                                    onQuarantineRestore={props.onQuarantineRestoreRecoveryAction}
+                                    quarantineRestorePending={props.quarantineRestoreRecoveryActionPending}
+                                    canBreakGlass={props.canBreakGlassRecoveryAction}
+                                    reconcilePending={props.reconcileRecoveryActionPending}
+                                    canFalsePositive={props.canFalsePositiveRecoveryAction}
+                                  />
+                                </div>
+                              ) : null}
                               {bottomBlockerLinks}
                             </>
                           ) : null

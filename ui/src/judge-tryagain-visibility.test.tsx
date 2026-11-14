@@ -23,7 +23,7 @@ vi.mock("@/hooks/useWorkspaceIsolationControls", () => ({
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 const refusal = "The failed run changed before Try again was accepted. The recovery card remains unresolved; refresh the task and try again.";
-const cardRefusal = "This recovery card was made for an older run. The task changed before Try again was accepted, so this card cannot retry the current task.";
+const cardRefusal = "The earlier Try again request named a run that was no longer current.";
 const error = apiErrorFromResponse(new Response(null, { status: 409 }), {
   error: refusal, details: { code: "task_retry_source_changed" },
 });
@@ -59,6 +59,11 @@ describe("Judge: native-continuation recovery refusal stays visible on the card"
     const resolve = container.querySelector<HTMLButtonElement>('[data-testid="recovery-action-resolve-trigger"]');
     expect(resolve).not.toBeNull();
     expect(resolve!.disabled).toBe(false);
+    if (resolve!.getAttribute("data-state") !== "open") act(() => resolve!.click());
+    const retry = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      .find(button => button.querySelector("span")?.textContent?.trim() === "Try again");
+    expect(retry).toBeDefined();
+    expect(retry!.disabled).toBe(false);
   }
   beforeEach(() => {
     vi.useFakeTimers();
@@ -79,7 +84,7 @@ describe("Judge: native-continuation recovery refusal stays visible on the card"
     expect(container.textContent).toContain(refusal);
     expect(container.querySelector('aside[aria-live="polite"]')).not.toBeNull();
   });
-  it("the only refusal explanation must not disappear after ten seconds", () => {
+  it("keeps the current-run refusal and enabled Try again after ten seconds", () => {
     mountFromNormalGet();
     expect(localStorage.length).toBe(0);
     expectRefusalAndAvailableAction();
@@ -87,7 +92,7 @@ describe("Judge: native-continuation recovery refusal stays visible on the card"
     console.info("JUDGE refusal card after TTL", { text: container.textContent, elapsedMs: 10_001 });
     expectRefusalAndAvailableAction();
   });
-  it("the refusal explanation must survive a new page/provider mount", () => {
+  it("keeps the current-run refusal and enabled Try again after remount", () => {
     mountFromNormalGet();
     expect(localStorage.length).toBe(0);
     expectRefusalAndAvailableAction();
