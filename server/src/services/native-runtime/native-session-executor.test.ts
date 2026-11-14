@@ -1421,6 +1421,9 @@ exit 23
         const launch = launches.at(-1)!;
         expect(spawnSync(launch.command, launch.args, { cwd: root, encoding: "utf8" }).status).toBe(0);
         await vi.waitFor(async () => expect(await readFile(done, "utf8")).toBe("23"));
+        // The shared log is a copy the detached copier appends after runnerd exits; let it land.
+        await vi.waitFor(async () => expect(await readFile(join(diagnostics, REMOTE_RUNNER_PROCESS_STDERR_FILE), "utf8"))
+          .toContain(`${generation}\n`), { timeout: 5_000 });
       }
       const logs = (await readdir(diagnostics)).sort();
       const contents = new Map(await Promise.all(logs.map(async name => {
@@ -1429,10 +1432,11 @@ exit 23
         return [name, await readFile(path, "utf8")] as const;
       })));
       // Trace-keep (C8 2868978cf) alongside upstream's bounded process log: each
-      // generation keeps its own durable pre-exec file, and runnerd's stderr from
-      // both generations stays in the recovery-readable process log.
+      // generation's own launch-stderr file keeps its whole stderr, as in C8, and
+      // runnerd's stderr from both generations is also in the recovery-readable process log.
       const launchFiles = logs.filter(name => /^runnerd\.launch-stderr\..+\.log$/.test(name));
       expect(launchFiles).toHaveLength(2);
+      expect(launchFiles.map(name => contents.get(name)).sort()).toEqual(["first-generation-crash\n", "second-generation-crash\n"]);
       expect(contents.get(REMOTE_RUNNER_PROCESS_STDERR_FILE)).toBe("first-generation-crash\nsecond-generation-crash\n");
       expect(logs).toEqual([...launchFiles, REMOTE_RUNNER_PROCESS_STDERR_FILE].sort());
       expect((await lstat(diagnostics)).mode & 0o777).toBe(0o700);
