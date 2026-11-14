@@ -6522,10 +6522,15 @@ rl.on("line", (line) => {
     { label: "transport collision", data: { transport: "paperclip_plugin", content: [{ type: "text", text: "plain text" }] } },
     { label: "image existing references", data: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png", reference: "legacy-ref", sha256: "legacy-sha", sizeBytes: 123 }] } },
     { label: "image nested attachment", data: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png", attachment: { type: "image", data: "cGl4ZWxz", mimeType: "image/png" } }] } },
-  ])("preserves pre-image HTTP bytes for legacy $label data.content", async ({ data }) => {
+    {
+      label: "sensitive image metadata (governed)",
+      data: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png", reference: "Authorization: Bearer synthetic-reference-credential", sha256: { password: "synthetic-sha-secret" }, sizeBytes: 123, attachment: { type: "image", data: "cGl4ZWxz", mimeType: "image/png", password: "synthetic-nested-secret" }, password: { type: "image", data: "cGl4ZWxz", mimeType: "image/png" } }] },
+      governedData: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png", reference: "Authorization: ***REDACTED***", sha256: { password: "***REDACTED***" }, sizeBytes: 123, attachment: { type: "image", data: "cGl4ZWxz", mimeType: "image/png", password: "***REDACTED***" }, password: "***REDACTED***" }] },
+    },
+  ])("preserves pre-image HTTP bytes for legacy $label data.content", async ({ data, governedData }) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
-    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const { run, project } = await createIssueAndRun(db, company.id, agent.id);
     await allowAllToolsForAgent(db, company.id, agent.id);
     const legacy = { content: " a\n\tΩ ", data };
     const worker = { isRunning: () => true, call: vi.fn(async () => legacy) } as unknown as PluginWorkerManager;
@@ -6545,10 +6550,28 @@ rl.on("line", (line) => {
       .set("authorization", `Bearer ${token.token}`)
       .send({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "demo.legacy:read", arguments: {} } });
     expect(response.status, response.body.error?.message).toBe(200);
-    const oldEnvelope = { pluginId: "demo.legacy", toolName: "read", result: legacy };
+    const oldEnvelope = { pluginId: "demo.legacy", toolName: "read", result: governedData ? { ...legacy, data: governedData } : legacy };
     expect(response.text).toBe(JSON.stringify({ jsonrpc: "2.0", id: 7, result: { content: [{ type: "text", text: JSON.stringify(oldEnvelope) }], isError: false } }));
     expect(response.body.result.content.every((block: { type: string }) => block.type === "text")).toBe(true);
+    const direct = await gateway.executePluginTool({
+      actor: { type: "agent", companyId: company.id, agentId: agent.id, runId: run.id },
+      tool: "demo.legacy:read", parameters: {},
+      runContext: { companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id },
+    });
+    expect(JSON.stringify(direct)).toBe(JSON.stringify(oldEnvelope));
     expect(putFile).not.toHaveBeenCalled();
+    const invocations = await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id));
+    const audit = await db.select().from(activityLog).where(eq(activityLog.companyId, company.id));
+    const calls = await db.select().from(toolCallEvents).where(eq(toolCallEvents.companyId, company.id));
+    expect(invocations).toHaveLength(2);
+    expect(invocations.every(invocation => invocation.status === "succeeded")).toBe(true);
+    const persisted = JSON.stringify({ invocations, audit, calls });
+    expect(persisted).not.toContain("cGl4ZWxz");
+    for (const secret of ["synthetic-reference-credential", "synthetic-sha-secret", "synthetic-nested-secret"]) {
+      expect(response.text).not.toContain(secret);
+      expect(JSON.stringify(direct)).not.toContain(secret);
+      expect(persisted).not.toContain(secret);
+    }
   });
 
   // R3 keep: final deliverable/receipt trust boundary, both gateway paths.

@@ -14,12 +14,13 @@ export function referenceToolImages(value: unknown): unknown {
   const prototype = Object.getPrototypeOf(value);
   if (prototype !== Object.prototype && prototype !== null) return value;
   const record = value as Record<string, unknown>;
-  if (record.type === "image" && typeof record.data === "string") {
-    const metadata = Object.fromEntries(Object.entries(record).filter(([key]) => key !== "data")
-      .map(([key, item]) => [key, referenceToolImages(item)]));
-    return { ...metadata, ...toolImageReference(record.data) };
-  }
-  return Object.fromEntries(Object.entries(record).map(([key, item]) => [key, referenceToolImages(item)]));
+  // Replace only the opaque body, in its own slot. Sibling reference/sha256/
+  // sizeBytes fields may be ordinary legacy metadata: keep them available to
+  // governance rather than overwriting them with host-generated values.
+  const image = record.type === "image" && typeof record.data === "string";
+  return Object.fromEntries(Object.entries(record).map(([key, item]) => [key,
+    image && key === "data" ? toolImageReference(item as string) : referenceToolImages(item),
+  ]));
 }
 
 /** Restore only the opaque image bodies; all accompanying text stays governed. */
@@ -31,14 +32,19 @@ export function restoreToolImages(governed: unknown, original: unknown): unknown
   const prototype = Object.getPrototypeOf(governed);
   if (prototype !== Object.prototype && prototype !== null) return governed;
   const before = original as Record<string, unknown>;
-  if (before.type === "image" && typeof before.data === "string") {
-    const { reference: _reference, sha256: _sha256, sizeBytes: _sizeBytes, ...block } = governed as Record<string, unknown>;
-    // Preserve legacy JSON field order too: data.content may be arbitrary
-    // metadata whose old text envelope must remain byte-identical. Restore
-    // only the opaque body; every other surviving field remains governed.
-    const keys = [...new Set([...Object.keys(before), ...Object.keys(block)])];
-    return Object.fromEntries(keys.filter(key => key === "data" || Object.prototype.hasOwnProperty.call(block, key))
-      .map(key => [key, key === "data" ? before.data : block[key]]));
-  }
-  return Object.fromEntries(Object.entries(governed).map(([key, item]) => [key, restoreToolImages(item, before[key])]));
+  const image = before.type === "image" && typeof before.data === "string";
+  return Object.fromEntries(Object.entries(governed).map(([key, item]) => {
+    if (image && key === "data") {
+      // Restore only an unchanged host reference. A removed/redacted body or
+      // parent must stay removed/redacted; never copy original metadata back.
+      const reference = toolImageReference(before.data as string);
+      const body = item !== null && typeof item === "object" ? item as Record<string, unknown> : null;
+      return [key, body && Object.keys(body).length === 3
+        && body.reference === reference.reference && body.sha256 === reference.sha256 && body.sizeBytes === reference.sizeBytes
+        ? before.data : item];
+    }
+    // Walk surviving metadata too, including nested image-looking objects and
+    // legacy reference fields. Iterating governed keys preserves their order.
+    return [key, restoreToolImages(item, before[key])];
+  }));
 }
