@@ -157,7 +157,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
     const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
     expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain("stopping the earlier attempt before starting fresh");
+    expect(notes[0].body).toContain("Paperclip cannot confirm that the earlier attempt stopped");
   });
 
   // Keep: D1, a read-only authorization cannot write a stop intent or a note;
