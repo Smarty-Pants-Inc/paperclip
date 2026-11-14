@@ -74,13 +74,14 @@ import {
   prependIssueBrief,
   settledCompactionMarkers,
   settledRunChildren,
-  readReasoningDisplay,
+  readReasoningDisplayOverride,
   REASONING_DISPLAY_STORAGE_KEY,
   splitTranscriptAtAnchors,
   transcriptToTaskChatItems,
   runtimeRequestSegmentContext,
   reconcileSegmentRuntimeRequests,
   type SettledTurnMergeMeta,
+  type ReasoningDisplay,
 } from "@/components/task-chat/transcript-adapter";
 import { TaskChatDescriptionBubble } from "@/components/task-chat/TaskChatDescriptionBubble";
 import {
@@ -136,6 +137,7 @@ import { useStreamlinedUiEnabled } from "@/hooks/useStreamlinedUiEnabled";
 import { useDismissedTaskQuestions } from "@/hooks/useDismissedTaskQuestions";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { findUIAdapter } from "@/adapters/registry";
 import { useIssuePlanDocument } from "@/hooks/useIssuePlanDocument";
 import { isRedundantAiRecoveryNotice, latestSameRunHandoffTimestamp } from "@/lib/issue-chat-messages";
 import { isLiveIssueRun, isTerminalIssueStatus } from "@/lib/liveIssueIds";
@@ -526,12 +528,21 @@ function durableInputLabel(
  * to the tool history. Turns without a reply bubble keep the standalone
  * folded row. flag-OFF remains byte-for-byte IssueChatThread.
  */
+function adapterReasoningDisplay(adapterType: string | null | undefined): ReasoningDisplay {
+  return adapterType && findUIAdapter(adapterType)?.transcriptPresentation?.liveReasoningView === "inline"
+    ? "inline"
+    : "fold";
+}
+
 export function TaskChatThread(props: TaskChatThreadProps) {
   const coordinatorEnabled = useCoordinatorPresentation();
-  const [reasoningDisplay, setReasoningDisplay] = useState(readReasoningDisplay);
+  const [reasoningDisplayOverride, setReasoningDisplayOverride] = useState(readReasoningDisplayOverride);
   const { status: connectionStatus } = useConnectivity();
   const { enabled: streamlinedPreference } = useStreamlinedUiEnabled();
   const streamlinedUiEnabled = coordinatorEnabled || streamlinedPreference;
+  const reasoningDisplay = reasoningDisplayOverride ?? adapterReasoningDisplay(
+    props.activeRun?.adapterType ?? props.linkedRuns?.at(-1)?.adapterType,
+  );
   const {
     initialHistoryPending = false,
     initialHistoryError = false,
@@ -2205,7 +2216,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
           rest: partitionRunHealthItems(timelineItemsBySegment[segmentIndex] ?? []).rest,
         };
-        const children = settledRunChildren(runHealth.rest, reasoningDisplay);
+        const runReasoningDisplay = reasoningDisplayOverride ?? adapterReasoningDisplay(source.adapterType);
+        const children = settledRunChildren(runHealth.rest, runReasoningDisplay);
         // A compaction-only run is fully shown by its divider.
         if (children.length === 0 && !finalResponse && (!sourceIsPaperclipRunner || compactionMarkers.length > 0)) {
           if (compactionMarkers.length > 0) settledRunIds.add(source.id);
@@ -2247,7 +2259,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               : undefined,
             // Inline reasoning must not be hidden inside the legacy turn's
             // outer Activity disclosure after it settles or is reloaded.
-            standaloneHeader: sourceIsPaperclipRunner || reasoningDisplay === "inline",
+            standaloneHeader: sourceIsPaperclipRunner || runReasoningDisplay === "inline",
             continuedAfterSteering: sourceIsPaperclipRunner && segmentIndex > 0,
             animateFold: liveSeenRef.current.has(source.id),
             items: children,
@@ -2311,7 +2323,8 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               ? paperclipRunnerTimelineItems(parsed)
               : parsed,
           );
-          const children = settledRunChildren(runHealth.rest, reasoningDisplay);
+          const liveRunReasoningDisplay = reasoningDisplayOverride ?? adapterReasoningDisplay(liveRun.adapterType);
+          const children = settledRunChildren(runHealth.rest, liveRunReasoningDisplay);
           if (children.length === 0 && runHealth.failures.length === 0) continue;
           const turnId = `${liveRun.id}:turn:${segmentIndex}`;
           const segmentDurationMs =
@@ -2345,7 +2358,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 ? agentMap?.get(liveRun.agentId)?.icon
                 : undefined,
               standaloneHeader:
-                isNativePaperclipRunnerRun(liveRun) || reasoningDisplay === "inline",
+                isNativePaperclipRunnerRun(liveRun) || liveRunReasoningDisplay === "inline",
               continuedAfterSteering:
                 isNativePaperclipRunnerRun(liveRun) && segmentIndex > 0,
               items: children,
@@ -2442,6 +2455,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     currentUserId,
     userLabelMap,
     reasoningDisplay,
+    reasoningDisplayOverride,
   ]);
 
   // Hand off once the settled turn or its reply comment is in the thread; a
@@ -3468,7 +3482,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                     onClick={() => {
                       const next = reasoningDisplay === "inline" ? "fold" : "inline";
                       try { window.localStorage.setItem(REASONING_DISPLAY_STORAGE_KEY, next); } catch { /* per-device preference is optional */ }
-                      setReasoningDisplay(next);
+                      setReasoningDisplayOverride(next);
                     }}
                     className="rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     data-testid="task-chat-reasoning-display-toggle"
@@ -3609,6 +3623,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                       <McpAppTurnViews runId={tailRunId} refreshKey={mcpAppRunRefreshKey(tailItems, tailStatus)} />
                                       <TaskChatLiveTail
                                         items={tailItems}
+                                        reasoningDisplay={reasoningDisplayOverride ?? adapterReasoningDisplay(tailRunSource?.adapterType)}
                                         emptyMessage={
                                           tailStatus === "queued"
                                             ? "Waiting to start..."

@@ -7,7 +7,7 @@ import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatRunnerActivityGroup } from "./TaskChatRunnerActivityGroup";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
-import { buildTurnTimelineRows } from "./transcript-adapter";
+import { buildTurnTimelineRows, readReasoningDisplay, type ReasoningDisplay } from "./transcript-adapter";
 import { visibleTranscriptPlaceholder } from "./TaskChatShimmer";
 
 /**
@@ -25,6 +25,7 @@ export function TaskChatLiveTail({
   emptyMessage,
   excludeFinal = false,
   onRuntimeRequestDecision,
+  reasoningDisplay = readReasoningDisplay(),
 }: {
   items: readonly TaskChatItem[];
   /** Shown when nothing renderable has streamed yet (queued / pre-first-token). */
@@ -35,11 +36,12 @@ export function TaskChatLiveTail({
     item: TaskChatRuntimeRequestItem,
     decision: TaskChatRuntimeRequestDecision,
   ) => void | Promise<void>;
+  reasoningDisplay?: ReasoningDisplay;
 }) {
   const visibleItems = excludeFinal
     ? items.filter((item) => item.kind !== "message" || item.interstitial)
     : items;
-  const rows = groupImageResources(buildTurnTimelineRows(visibleItems, true))
+  const rows = groupImageResources(buildTurnTimelineRows(visibleItems, true, reasoningDisplay))
     .map((item) => renderTailRow(item, onRuntimeRequestDecision))
     .filter((row): row is ReactElement => row != null);
 

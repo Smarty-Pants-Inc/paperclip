@@ -197,6 +197,8 @@ export interface TaskChatMessageItem {
 export interface TaskChatThinkingItem {
   id: string;
   kind: "thinking";
+  /** Explicit display decision made by the timeline adapter for this run. */
+  inline?: boolean;
   lines: string[];
   streaming?: boolean;
   /** When true, render collapsed ("Worked for N") with an expand affordance. */

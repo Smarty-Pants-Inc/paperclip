@@ -2060,15 +2060,18 @@ function subagentsFromDelegation(
 export type ReasoningDisplay = "fold" | "inline";
 export const REASONING_DISPLAY_STORAGE_KEY = "paperclip:task-chat:reasoning-display:v1";
 
-export function readReasoningDisplay(defaultDisplay: ReasoningDisplay = "fold"): ReasoningDisplay {
-  if (typeof window === "undefined") return defaultDisplay;
+export function readReasoningDisplayOverride(): ReasoningDisplay | null {
+  if (typeof window === "undefined") return null;
   try {
     const stored = window.localStorage.getItem(REASONING_DISPLAY_STORAGE_KEY);
-    if (stored === "inline" || stored === "fold") return stored;
-    return defaultDisplay;
+    return stored === "inline" || stored === "fold" ? stored : null;
   } catch {
-    return "fold";
+    return null;
   }
+}
+
+export function readReasoningDisplay(defaultDisplay: ReasoningDisplay = "fold"): ReasoningDisplay {
+  return readReasoningDisplayOverride() ?? defaultDisplay;
 }
 
 export function buildTurnTimelineRows(
@@ -2249,7 +2252,7 @@ export function buildTurnTimelineRows(
       // Inline reasoning is a transcript row in its original chronological
       // position; tools remain grouped in the existing activity fold.
       current = null;
-      rows.push(item);
+      rows.push({ ...item, inline: true });
     } else if (
       item.kind === "tool" ||
       item.kind === "usage" ||
