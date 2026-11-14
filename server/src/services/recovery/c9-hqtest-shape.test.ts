@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   agents, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations,
 } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -51,7 +52,7 @@ describe.skipIf(!support.supported)("hq-test warm1/warm2 shape", () => {
     const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
       .filter(comment => comment.metadata?.recoveryResponsibility !== "system")
-      .filter(comment => !(comment.metadata as Record<string, unknown> | null)?.supersededBy); // RFL 10:14Z: CURRENT notes
+      .filter(comment => isCurrentNotice(comment.metadata)); // RFL 10:14Z/11:43Z: CURRENT notes (the shared rule)
     return { companyId, agentId, issueId, messageId: message!.id, runId: run!.id, visible };
   }
 

@@ -5,6 +5,7 @@ import {
   agentWakeupRequests, agents, authUsers, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { truncateTablesWithDeadlockRetry } from "../../__tests__/helpers/truncate-with-deadlock-retry.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
@@ -174,7 +175,7 @@ suite("B' waits for the continuation path (Smarty fork, TEMPORARY)", () => {
     const all = await systemComments(f.issueId);
     expect(all.map(n => n.body).filter(body => SAFE.test(body)), "never 'sending again is safe'").toEqual([]);
     expect(all, "the superseded note is kept, not deleted").toHaveLength(2);
-    const notices = all.filter(n => !(n.metadata as Record<string, unknown> | null)?.supersededBy);
+    const notices = all.filter(n => isCurrentNotice(n.metadata)); // RFL 11:43Z: the shared rule
     expect(notices, "one current note: the resend's note supersedes the first").toHaveLength(1);
     const superseded = all.find(n => n.id !== notices[0]!.id)!;
     expect((superseded.metadata as Record<string, unknown> | null)?.supersededBy).toBe(notices[0]!.id);

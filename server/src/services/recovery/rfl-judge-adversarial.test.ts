@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { agents, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues, agentWakeupRequests, approvals, issueApprovals } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -33,7 +34,7 @@ describe.skipIf(!support.supported)("RFL independent unanswered-message safety",
       error: "runner_state_identity_mismatch: prior_owner_active", createdAt: new Date(old + 1_000), finishedAt: new Date(old + 2_000) });
     const notices = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
       .filter(row => row.metadata?.recoveryResponsibility !== "system")
-      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededBy); // RFL 10:14Z: CURRENT notes (never-delete part 1)
+      .filter(row => isCurrentNotice(row.metadata)); // RFL 10:14Z/11:43Z: CURRENT notes (the shared rule)
     // Match the production worker's flags, including skipping the unrelated
     // company-wide active-action reconciliation.
     const sweep = () => heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId, skipRelatedRecovery: true, skipExternalConversationSettlement: true });

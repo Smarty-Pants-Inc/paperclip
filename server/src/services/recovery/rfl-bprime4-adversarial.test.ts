@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issueComments, issueThreadInteractions, issues } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { and, eq, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -43,7 +44,7 @@ describe.skipIf(!support.supported)("RFL Bprime4 message attribution", () => {
     const notices = async () => (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
       eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
       .filter(row => row.metadata?.recoveryResponsibility !== "system")
-      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededBy) // RFL 10:14Z: CURRENT notes (never-delete part 1);
+      .filter(row => isCurrentNotice(row.metadata)) // RFL 10:14Z/11:43Z: CURRENT notes (the shared rule);
     return { companyId, agentId, issueId, userId, base, message, run, reply, card, sweep, notices };
   }
 

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { and, eq, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -43,7 +44,7 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     const notices = async () => (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
       eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
       .filter(row => row.metadata?.recoveryResponsibility !== "system")
-      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededBy) // RFL 10:14Z: CURRENT notes (never-delete part 1);
+      .filter(row => isCurrentNotice(row.metadata)) // RFL 10:14Z/11:43Z: CURRENT notes (the shared rule);
     const flags = async () => ({
       discovered: (await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, issueId), unansweredPersonMessageCondition(issues.id, issues.companyId)))).length > 0,
       batched: (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, issueId), unansweredPersonMessageCommentCondition()))).length > 0,

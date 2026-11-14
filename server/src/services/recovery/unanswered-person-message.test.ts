@@ -15,6 +15,7 @@ import {
   nativeRunFinalizations,
   nativeRunResults,
 } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -105,7 +106,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
       .filter(comment => (comment.metadata as Record<string, unknown> | null)?.recoveryResponsibility !== "system");
     const visible = async () => (await history())
-      .filter(comment => !(comment.metadata as Record<string, unknown> | null)?.supersededBy);
+      .filter(comment => isCurrentNotice(comment.metadata)); // RFL 11:43Z: the ONE shared CURRENT rule
     return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, history, at };
   }
 
@@ -198,7 +199,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // org 09:18Z / RFL 09:45Z (M1.4): the first note is kept (never deleted), marked superseded.
     const all = await f.history();
     expect(all, "the superseded first note is kept").toHaveLength(2);
-    notices = all.filter(notice => !(notice.metadata as Record<string, unknown> | null)?.supersededBy);
+    notices = all.filter(notice => isCurrentNotice(notice.metadata));
     expect(notices).toHaveLength(1);
     expect(notices[0]!.body).toBe(CHAT_HELD);
     expect(notices[0]!.body).not.toMatch(/sending it again is safe/i);
@@ -1247,7 +1248,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const kept = notes.find(note => note.id === initialNote!.id)!;
     expect(kept.body, "the earlier note's body is unchanged").toBe(initialNote!.body);
     expect(kept.deletedAt).toBeNull();
-    const current = notes.filter(note => !(note.metadata as Record<string, unknown> | null)?.supersededBy);
+    const current = notes.filter(note => isCurrentNotice(note.metadata));
     expect(current).toHaveLength(1);
     expect(current[0]!.id).not.toBe(initialNote!.id);
     expect((kept.metadata as Record<string, unknown> | null)?.supersededBy).toBe(current[0]!.id);
@@ -1288,7 +1289,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const kept = notes.find(note => note.id === initialNote!.id)!;
     expect(kept.body, "the earlier note's body is unchanged").toBe(initialNote!.body);
     expect(kept.deletedAt).toBeNull();
-    const current = notes.filter(note => !(note.metadata as Record<string, unknown> | null)?.supersededBy);
+    const current = notes.filter(note => isCurrentNotice(note.metadata));
     expect(current).toHaveLength(1);
     expect(current[0]!.id).not.toBe(initialNote!.id);
     expect((kept.metadata as Record<string, unknown> | null)?.supersededBy).toBe(current[0]!.id);

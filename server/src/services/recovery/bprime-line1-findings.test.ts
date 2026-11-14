@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, authUsers, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { heartbeatService } from "../heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "./unanswered-person-message.js";
@@ -42,7 +43,7 @@ describe.skipIf(!support.supported)("RFL bprime-line1 (11:07Z) A1/A2/A4: never e
     const settle = (ms = 0) => settleUnansweredPersonMessage(db, { companyId, issueId, now: at(ms) });
     const all = () => db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system")));
-    const current = async () => (await all()).filter(n => !n.deletedAt && !supersededBy(n));
+    const current = async () => (await all()).filter(n => !n.deletedAt && isCurrentNotice(n.metadata)); // RFL 11:43Z: the shared rule
     const flagged = async () => (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, issueId),
       unansweredPersonMessageCommentCondition()))).length;
     return { companyId, agentId, issueId, userId, holdId: hold!.id, first, at, message, queue, settle, all, current, flagged };

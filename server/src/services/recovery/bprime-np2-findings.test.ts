@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, authUsers, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { heartbeatService } from "../heartbeat.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { settleUnansweredPersonMessage } from "./unanswered-person-message.js";
@@ -36,7 +37,7 @@ describe.skipIf(!support.supported)("RFL bprime-np2 (10:22Z) F1/F2/F3: notice-st
     const settle = (ahead=0, q=db) => settleUnansweredPersonMessage(q, { companyId, issueId, now: at(ahead) });
     const all = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
     const live = async () => (await all()).filter(n => !n.deletedAt);
-    const current = async () => (await live()).filter(n => !(n.metadata as Record<string, unknown> | null)?.supersededBy);
+    const current = async () => (await live()).filter(n => isCurrentNotice(n.metadata)); // RFL 11:43Z: the shared rule
     return { companyId, agentId, issueId, runId, userId, messageId: m!.id, holdId: hold!.id, now, at, settle, all, live, current };
   }
   it("a queued message behind a reconciliation hold must not promise it will start by itself", async () => {

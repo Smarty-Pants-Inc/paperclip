@@ -5,9 +5,11 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, authUsers, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
-import { issueCommentMetadataSchema } from "@paperclipai/shared";
+import { isCurrentNotice, issueCommentMetadataSchema } from "@paperclipai/shared";
+import { sql } from "drizzle-orm";
 import { issueService } from "../services/issues.js";
-import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
+import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "../services/recovery/unanswered-person-message.js";
+import { noticeHeldUnfinishedPredecessor } from "../services/native-runtime/native-session-executor.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 const support = await getEmbeddedPostgresTestSupport();
 type Meta = Record<string, unknown> | null;
@@ -64,6 +66,82 @@ describe.skipIf(!support.supported)("RFL supnotice F1: issueService list/get ret
       expect(row!.metadata?.sections, `${read} keeps the rest of the structured metadata`).toEqual((stored!.metadata as Meta)?.sections);
     }
   }
+
+  // RFL 11:43Z: a card accept (card-resolver W1 F1) marks a kept note supersededByInteractionId. The SAME JSONB
+  // merge shape is used here; the note must read back with the marker, and every server reader must treat it as
+  // NOT current (one shared rule, isCurrentNotice / ISSUE_COMMENT_SUPERSESSION_KEYS).
+  const markByCard = async (noteId: string) => {
+    const interactionId = randomUUID();
+    await db.execute(sql`update ${issueComments} set metadata = coalesce(metadata, '{}'::jsonb)
+      || jsonb_build_object('supersededByInteractionId', ${interactionId}::text) where id = ${noteId}`);
+    return interactionId;
+  };
+
+  it("a card-superseded note reads back from listComments/getComment with supersededByInteractionId and its metadata intact", async () => {
+    const f = await heldChat();
+    await f.settle();
+    const [note] = await f.notes();
+    const interactionId = await markByCard(note!.id);
+    const service = issueService(db);
+    for (const row of [(await service.listComments(f.issueId, { order: "asc" })).find(c => c.id === note!.id), await service.getComment(note!.id)]) {
+      expect(row!.metadata, "the read keeps the marked note's metadata").not.toBeNull();
+      expect((row!.metadata as Meta)?.supersededByInteractionId).toBe(interactionId);
+      expect(row!.metadata?.sections).toEqual((note!.metadata as Meta)?.sections);
+      expect(isCurrentNotice(row!.metadata), "the shared rule: a card-superseded note is history").toBe(false);
+    }
+  });
+
+  it("a card-superseded note is NOT current for discovery or the answer writer: no re-flag, no second marker", async () => {
+    const f = await heldChat();
+    await f.settle();
+    const [note] = await f.notes();
+    const interactionId = await markByCard(note!.id);
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, body: "Here is your answer", createdAt: f.at(1000) });
+    const flagged = await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      unansweredPersonMessageCommentCondition()));
+    expect(flagged, "discovery does not flag a superseded note for retiring").toHaveLength(0);
+    expect((await f.settle(2000)).kind).toBe("answered");
+    const [kept] = await db.select().from(issueComments).where(eq(issueComments.id, note!.id));
+    expect(kept!.deletedAt).toBeNull();
+    expect(kept!.body).toBe(note!.body);
+    expect((kept!.metadata as Meta)?.supersededByInteractionId).toBe(interactionId);
+    expect((kept!.metadata as Meta)?.supersededBy, "an already-superseded note is not marked again").toBeUndefined();
+  });
+
+  it("the latest message's only note superseded by a card: settling it again posts no second note (the obligation moved to the card)", async () => {
+    const f = await heldChat();
+    await f.settle();
+    const [note] = await f.notes();
+    await markByCard(note!.id);
+    expect((await f.settle(60_000)).kind).toBe("noticed_before");
+    expect(await f.notes()).toHaveLength(1);
+  });
+
+  it("the executor's held-notice dedupe skips a card-superseded B' note; a CURRENT one still suppresses it", async () => {
+    for (const superseded of [true, false]) {
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Dedupe", issuePrefix: companyId.slice(0, 8) });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Held agent", adapterType: "paperclip_runner", status: "active" });
+      await db.insert(issues).values({ id: issueId, companyId, title: "Held task", status: "in_progress", assigneeAgentId: agentId });
+      const [bprime] = await db.insert(issueComments).values({ companyId, issueId, authorType: "system", body: "B' note",
+        metadata: { version: 1, sections: [{ rows: [{ type: "text", text: "Details" }] }], authorizationReason: `unanswered_message:${randomUUID()}` } }).returning();
+      if (superseded) await markByCard(bprime!.id);
+      let runningId = "";
+      for (const status of ["failed", "running"] as const) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        const [row] = await db.insert(heartbeatRuns).values({ companyId, agentId, status, runtimeMode: "native", nativeIssueId: issueId,
+          nativeSessionId: sessionId }).returning();
+        runningId = row!.id;
+      }
+      await noticeHeldUnfinishedPredecessor({ db, execution: { provider: { kind: "pi_rpc" },
+        binding: { companyId, agentId, issueId, runId: runningId }, session: { normalizedSessionId: sessionId } } as never },
+        new Error("runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate"));
+      const held = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(c => (c.metadata as Meta)?.authorizationReason === `native_prior_owner_held:${sessionId}`);
+      expect(held, superseded ? "a superseded B' note does not stand" : "a current B' note already told the person").toHaveLength(superseded ? 1 : 0);
+    }
+  });
 
   it("an answered held note (marked by the answer writer) reads back with supersededBy = the answer", async () => {
     const f = await heldChat();
