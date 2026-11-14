@@ -23497,6 +23497,7 @@ describe("runnerd provider runtime wiring", () => {
     } else {
       await expect(options.prepareExternalRunnerState()).rejects.toMatchObject({
         code: resumed ? "runner_harness_state_mismatch: resumed_unavailable" : "runner_harness_state_mismatch: backup_without_reusable_lease",
+        message: expect.stringContaining(resumed ? "resumed_unavailable" : "backup_without_reusable_lease"),
       });
       expect(syncIn).not.toHaveBeenCalled();
       expect(updates.filter(update => update.table === environmentLeases)).toEqual([]);
