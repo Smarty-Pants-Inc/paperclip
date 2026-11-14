@@ -17,16 +17,18 @@ const failure = (reason: string) => new Error(`native_sandbox_runner_${reason}`)
  * ends local supervision: it must never synthesize remote-exit evidence.
  */
 export function createSandboxRunnerSupervision() {
-  let generation = 0, paused = false, detached = false;
+  let generation = 0, paused = false, idle = false, detached = false;
   const waiting = new Set<() => void>();
   const notify = () => { for (const wake of waiting) wake(); waiting.clear(); };
   return {
     get generation() { return generation; }, get paused() { return paused; }, get detached() { return detached; },
-    accepts: (observed: number) => !paused && !detached && observed === generation,
+    accepts: (observed: number) => !paused && !idle && !detached && observed === generation,
     pause() { paused = true; generation++; notify(); },
     resume() { if (detached) throw failure("owner_cancelled"); paused = false; generation++; notify(); },
+    pauseForIdle() { idle = true; generation++; notify(); },
+    resumeForRun() { if (detached) throw failure("owner_cancelled"); idle = false; generation++; notify(); },
     detach() { detached = true; generation++; notify(); },
-    async waitUntilActive() { while (paused && !detached) await new Promise<void>(resolve => waiting.add(resolve)); },
+    async waitUntilActive() { while ((paused || idle) && !detached) await new Promise<void>(resolve => waiting.add(resolve)); },
   };
 }
 export type SandboxRunnerSupervision = ReturnType<typeof createSandboxRunnerSupervision>;

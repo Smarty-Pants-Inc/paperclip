@@ -12785,6 +12785,7 @@ async function executePaperclipNativeSessionAttempt(
       input.useRunnerd && input.backend === undefined
         ? await timeController("backend_setup", () => executionContext ? executionContext.wait(createExecutionBackend) : createExecutionBackend())
         : null;
+    if (existingWarmSession) sandboxSessionOwners.get(existingWarmSession)?.supervision.resumeForRun();
     const continueAfterUnavailableSandboxReuse = async (error: unknown): Promise<boolean> => {
       const retained = existingWarmSession ? sandboxSessionOwners.get(existingWarmSession) : runnerdBackend?.sandboxRetention;
       const target = input.runnerExecutionTarget;
@@ -14307,6 +14308,9 @@ async function executePaperclipNativeSessionAttempt(
       }
       if (retainSession && ownedSession?.ownerToken === warmSessionOwnerToken && !ownedSession.closeOnReleaseReason
         && (pluginTaskSessionOwners.get(ownedSession.session)?.driver.releaseResume || sandboxSessionOwners.get(ownedSession.session)?.driver)) {
+        // Run finalization leaves this warm process and its lease retained, but
+        // no run owns periodic process verification until a real reattach.
+        sandboxSessionOwners.get(ownedSession.session)?.supervision.pauseForIdle();
         const scope = warmSessionId, entry = ownedSession, token = warmSessionOwnerToken;
         entry.finishRelease = async () => {
           const current = () => warmNativeSessions.get(scope) === entry && entry.ownerToken === token;
