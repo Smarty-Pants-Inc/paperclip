@@ -6487,6 +6487,32 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
         expect(anchor(superseded.id), "reachable after expanding").not.toBeNull();
         expect(labelledSuperseded(superseded.id)).toBe(true);
       });
+
+      // RFL 14:06Z, the empty-thread gap: the empty-thread screen shows no expand control. A thread whose ONLY items
+      // are superseded notes must keep them, collapsed and labelled, even when the page passes an expand control
+      // (IssueDetail's "More messages", given when earlier messages exist); otherwise compact history drops them and
+      // the empty-thread screen hides the notes and the control together. Task view and chat alike.
+      it(`only superseded notes, page expand control passed (${name}): they stay as collapsed '· Superseded' rows, not the empty-thread screen`, () => {
+        const superseded = heldNoteComments(rows).filter(comment => !isCurrentNotice(comment.metadata));
+        expect(superseded.length, "the row set has a superseded note").toBeGreaterThan(0);
+        const onExpandHistory = vi.fn();
+        paint({ comments: superseded as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true, onExpandHistory,
+          historyControl: <button type="button" onClick={onExpandHistory}>More messages</button> });
+        expect(container.textContent, "not the empty-thread screen").not.toContain("No messages yet.");
+        for (const note of superseded) {
+          expect(anchor(note.id), "the only notes stay reachable").not.toBeNull();
+          expect(labelledSuperseded(note.id), "it reads as superseded, not current").toBe(true);
+          expect(noticeToggle(note.id)!.getAttribute("aria-expanded"), "collapsed").toBe("false");
+          expect(noticeDetails(note.id), "details closed until opened").toBeNull();
+          expect(anchor(note.id)!.textContent, "no Try again on a superseded row").not.toContain("Try again");
+        }
+        expect((container.textContent ?? "").split("· Superseded").length - 1, "one label per note").toBe(superseded.length);
+        expect(Array.from(container.querySelectorAll("button")).some(button => button.textContent === "More messages"),
+          "the page's expand control stays on screen with them").toBe(true);
+        flushSync(() => noticeToggle(superseded[0]!.id)!.click());
+        expect(noticeDetails(superseded[0]!.id), "its text is one click away").not.toBeNull();
+        expect(onExpandHistory).not.toHaveBeenCalled();
+      });
     }
 
     it("(b) hides the same comment when recoveryResponsibility is 'system' (upstream's filter kept)", () => {
