@@ -363,7 +363,7 @@ export async function reconcileAbandonedExecutionControl(
           // stops offering Retry until a later committed success supersedes it.
           await issueService(db).addComment(task.id, EXECUTION_DEADLINE_NOTICE_BODY,
             {}, { authorType: "system", presentation: { kind: "system_notice", tone: "danger",
-              title: "Reply could not finish", density: "compact", detailsDefaultOpen: false },
+              title: "Reply could not finish", density: "compact", detailsDefaultOpen: true },
               metadata: { version: 1, sourceRunId: run.id, recoveryResponsibility: "system",
                 authorizationReason: `${EXECUTION_DEADLINE_NOTICE_REASON_PREFIX}${run.id}`,
                 sections: [{ title: "Failure details", rows: [
