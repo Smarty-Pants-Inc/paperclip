@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+// RFL judge-d10-extra: type-only fix (authorized).
+import { once } from "node:events";
 import { appendFileSync } from "node:fs";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -141,7 +143,6 @@ suite("fresh-continuation fallback", () => {
 
   it.each(["no_lease", "local_lease", "no_provider_id"])("J-NO-PROOF a same-boot live child with an absent process stamp must not admit fresh (%s)", async shape => {
     const { spawn } = await import("node:child_process");
-    const { once } = await import("node:events");
     const f = await seededExtra();
     // A real child, attributed to this run at launch, before its PID has been persisted.
     // A controller crash between spawn and persist leaves precisely this DB shape.
