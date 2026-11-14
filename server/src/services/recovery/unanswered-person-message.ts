@@ -17,6 +17,8 @@ import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-noti
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
+import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
+import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -405,15 +407,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // Only a run that carries THIS message is evidence about it. An unrelated
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
-  const run = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
   // reply. A card from an earlier turn or one the board addressed to someone
   // else, and any approval, can hold the task but do not answer the message.
-  if (run && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) {
+  if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
     return { kind: "answered" };
   }
+
+  const latest = runs[0];
+  const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
+    && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
+      runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
   let code: string;
   if (!run) {
@@ -482,7 +489,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`)).limit(1);
   if (explained) return { kind: "explained" };
 
-  const held = HELD_CODES.has(code);
+  const held = isNativeContinuationRefusal(run) || HELD_CODES.has(code);
   const body = code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;

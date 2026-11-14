@@ -27,6 +27,8 @@ import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
+import { freshContinuationChain } from "./fresh-continuation-chain.js";
+export { freshContinuationChain } from "./fresh-continuation-chain.js";
 
 /**
  * Fresh-continuation fallback: exact resumption of an unfinished run is an
@@ -164,38 +166,6 @@ const object = (value: unknown): Record<string, unknown> =>
 function holdRunId(evidence: Record<string, unknown>): string | null {
   const value = evidence.runId ?? evidence.sourceRunId;
   return typeof value === "string" ? value : null;
-}
-
-/**
- * Count the existing durable records, not a rolling window or a process-local
- * counter. Following run lineage also counts records written before chain
- * markers existed. UNION deduplicates even cyclic legacy lineage; every hop
- * and every action is scoped to this company and task.
- */
-export async function freshContinuationChain(db: Db, input: { companyId: string; issueId: string; runId: string }) {
-  const uuid = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
-  const [chain] = await db.execute<{ rootRunId: string; attempts: number }>(sql`
-    with recursive source_chain as (
-      select id, coalesce(retry_of_run_id::text, nullif(context_snapshot->>'previousRunId', ''),
-        nullif(context_snapshot->>'retryOfRunId', '')) as parent_id
-      from heartbeat_runs where company_id = ${input.companyId} and id = ${input.runId}
-        and (issue_id = ${input.issueId} or native_issue_id = ${input.issueId} or context_snapshot->>'issueId' = ${input.issueId})
-      union
-      select parent.id, coalesce(parent.retry_of_run_id::text, nullif(parent.context_snapshot->>'previousRunId', ''),
-        nullif(parent.context_snapshot->>'retryOfRunId', ''))
-      from heartbeat_runs parent join source_chain child
-        on parent.id = case when child.parent_id ~ ${uuid} then child.parent_id::uuid end
-      where parent.company_id = ${input.companyId}
-        and (parent.issue_id = ${input.issueId} or parent.native_issue_id = ${input.issueId}
-          or parent.context_snapshot->>'issueId' = ${input.issueId})
-    )
-    select coalesce((select id::text from source_chain ancestor
-      order by (parent_id is null or not exists (select 1 from source_chain parent where parent.id::text = ancestor.parent_id)) desc,
-        id limit 1), ${input.runId}) as "rootRunId",
-      (select count(*)::int from issue_recovery_actions action
-        where action.company_id = ${input.companyId} and action.source_issue_id = ${input.issueId}
-          and action.evidence#>>'{freshContinuation,sourceRunId}' in (select id::text from source_chain)) as attempts`);
-  return chain!;
 }
 
 /** Task-level waits that belong to a person. Read under the task lock. */
