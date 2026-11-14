@@ -625,7 +625,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     };
     await ordinary(inspect({ execution: { ...current, binding: { ...current.binding, companyId: randomUUID() } } }));
     await ordinary(inspect({ matchesExecution: () => false }));
-    await expect(readSandbox({ remoteCwd: "/unrelated" })).rejects.toThrow("retained_sandbox_binding");
+    await expect(readSandbox({ remoteCwd: "/unrelated" })).rejects.toMatchObject({
+      code: "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+    });
     for (const leaseExpiresAt of [null, new Date(Date.now() - 1_000)]) {
       await db.update(nativeRunFinalizations).set({ leaseExpiresAt }).where(eq(nativeRunFinalizations.runId, fixture.scope.runId));
       await ordinary(inspect());

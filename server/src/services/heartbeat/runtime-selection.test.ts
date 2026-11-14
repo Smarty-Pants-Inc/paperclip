@@ -595,7 +595,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   // not a stand-in success from a classifier or a note-only recovery.
   it.each(["confirmed-stop", "unconfirmed-stop", "metadata-format", "already-stranded", "idle-descendants", "active-turn", "held-notice", "already-stranded-unconfirmed",
     "codex-confirmed-stop", "codex-unconfirmed-stop", "codex-metadata-format", "codex-already-stranded", "codex-idle-descendants", "codex-active-turn", "codex-held-notice", "codex-already-stranded-unconfirmed",
-    "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare"] as const)(
+    "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare",
+    "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed"] as const)(
     "designed end answers from history with one note and no Retry (%s)", async shape => {
     const scenario = shape.replace(/^codex-/, "");
     const f = shape.startsWith("codex-") ? await fixture() : await piFixture();
@@ -607,7 +608,9 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       authorType: "user", authorUserId: "local-board", body: `Answer the saved ${shape} request, using the earlier history.` }).returning();
     await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
       seq: 64, stream: "system", eventType: "native.process_start_requested", createdAt: new Date("2026-11-14T08:16:07.439508Z") });
-    const error = scenario === "launch-profile" ? "native_runner_launch_profile_mismatch"
+    const error = scenario === "backup-without-lease" ? "runner_harness_state_mismatch: backup_without_reusable_lease"
+      : scenario === "retained-binding" || scenario.startsWith("seed-a") ? "native_controller_recovery_missing_evidence:retained_sandbox_binding"
+      : scenario === "launch-profile" ? "native_runner_launch_profile_mismatch"
       : scenario === "generic-prepare" ? "native_runner_refresh_required"
       : scenario === "metadata-format" || scenario.startsWith("already-stranded")
       ? "native_controller_recovery_unsupported:metadata_format"
@@ -632,14 +635,38 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const [lease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId, heartbeatRunId: leaseRunId,
       issueId: f.issue.id, provider: "boat", providerLeaseId: "bx_33zmdkqu", status: "expired", cleanupStatus: "success",
       acquiredAt: new Date("2026-11-14T08:15:56.610Z"), releasedAt: new Date(), metadata: { pluginId: "fixture-boat" } }).returning();
+    // Seed A: the first follow-up loses its reusable lease; automatic recovery
+    // and the person's resend both refuse the resumed retained binding. These
+    // are real persisted failure rows, not an invented successful continuation.
+    const seedLeases: (typeof lease)[] = [];
+    if (scenario.startsWith("seed-a")) {
+      for (const [index, code] of ["runner_harness_state_mismatch: backup_without_reusable_lease",
+        "native_controller_recovery_missing_evidence:retained_sandbox_binding"].entries()) {
+        const [failed] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+          nativeIssueId: f.issue.id, nativeSessionId: oldId, runtimeMode: "native", status: "failed",
+          errorCode: index === 0 ? "native_session_interrupted" : "native_continuation_requires_reconciliation",
+          error: code, finishedAt: new Date(), createdAt: new Date(f.run.createdAt.getTime() - 2000 + index * 500) }).returning();
+        const [oldLease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId,
+          heartbeatRunId: failed.id, issueId: f.issue.id, provider: "boat", providerLeaseId: `seed-a-box-${index}`,
+          status: "pending_cleanup", cleanupStatus: "failed", acquiredAt: new Date("2026-11-14T08:15:56.610Z"),
+          metadata: { pluginId: "fixture-boat", cleanupError: "sandbox_stop_pending" } }).returning();
+        seedLeases.push(oldLease);
+      }
+    }
     const confirmStop = async () => {
+      for (const oldLease of seedLeases) await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(),
+        cleanupStatus: "success", metadata: { pluginId: "fixture-boat", remoteExecutionTermination: {
+          schema: "paperclip.remote-termination.v1", companyId: oldLease.companyId, runId: oldLease.heartbeatRunId,
+          leaseId: oldLease.id, provider: oldLease.provider, providerLeaseId: oldLease.providerLeaseId,
+          state: "stopped", confirmedAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, oldLease.id));
       const confirmedAt = new Date().toISOString();
       await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success",
         metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
           companyId: lease.companyId, runId: leaseRunId, leaseId: lease.id, provider: lease.provider,
           providerLeaseId: lease.providerLeaseId, state: "stopped", confirmedAt } } }).where(eq(environmentLeases.id, lease.id));
     };
-    const waiting = scenario === "unconfirmed-stop" || scenario === "active-turn" || scenario === "already-stranded-unconfirmed";
+    const waiting = scenario === "unconfirmed-stop" || scenario === "active-turn" || scenario === "already-stranded-unconfirmed"
+      || scenario === "seed-a-unconfirmed";
     if (!waiting) await confirmStop();
     const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.agent.companyId, sourceIssueId: f.issue.id,
       kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "board",

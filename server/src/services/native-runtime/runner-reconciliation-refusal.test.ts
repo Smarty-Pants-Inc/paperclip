@@ -25,6 +25,22 @@ it.each(FRESH_THREAD_REFUSAL_CODES)("only the closed structured code authorizes 
   expect(isFreshThreadRefusal({ errorCode: "adapter_failed", resultJson: { providerFailure: { message: code } } })).toBe(false);
 });
 
+it.each([
+  "runner_harness_state_mismatch: backup_without_reusable_lease",
+  "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+])("D10b preserves exact controller and C1 refusal without trusting prose (%s)", code => {
+  expect(freshThreadRefusalCode(nativeReconciliationError(code))).toBe(code);
+  expect(freshThreadRefusalCode(new Error(code))).toBeNull();
+  expect(isFreshThreadRefusal({ errorCode: "native_session_interrupted", error: code })).toBe(true);
+  expect(isFreshThreadRefusal({ error: `provider said ${code}` })).toBe(false);
+  for (const commandType of ["run.prepare", "run.attach"]) {
+    const receipt = { runnerCommandResult: { commandType, status: "failed",
+      result: { code: "command_execution_failed", refusalCode: code, message: "opaque" } } };
+    expect(runnerPrepareRefusalCode(receipt)).toBe(code);
+    expect(freshThreadRefusalCode(receipt)).toBe(code);
+  }
+});
+
 it("normalizes prepare/attach refresh refusals without reading provider text", () => {
   for (const commandType of ["run.prepare", "run.attach"]) expect(freshThreadRefusalCode({ runnerCommandResult: {
     commandType, status: "failed", result: { code: "command_execution_failed", refusalCode: "provider_refresh_required", message: "opaque" },
