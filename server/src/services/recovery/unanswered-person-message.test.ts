@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
 import { noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
+import { settleUnansweredPersonMessage } from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -461,6 +462,157 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await g.reply(replied);
     await g.sweep();
     expect(await g.visible()).toHaveLength(0);
+  });
+
+  // M1.1 (RFL 02:57Z, hq-test warm1/warm2: 'native_session_recovery_failed:
+  // runner_remote_state_unavailable', 0 notices): a queued wake carrying the
+  // issue kept the decision pending every 30 s forever. The wait is now bounded
+  // by a durable T0 (recorded once) + 2 min.
+  const AFTER_WAKE_BOUND_MS = 3 * 60_000;
+  const settleAt = (f: { companyId: string; issueId: string }, ms: number) =>
+    settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now: new Date(Date.now() + ms) });
+  const queueWake = (f: { companyId: string; agentId: string; issueId: string }, payload: Record<string, unknown>) =>
+    db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+      reason: "issue_continuation_needed", status: "queued", payload }).returning().then(rows => rows[0]!);
+
+  it("M1.1 (1): a queued wake carrying the issue that never runs -> no notice inside the bound, exactly one after it", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "failed", errorCode: "native_session_recovery_failed",
+      error: "native_session_recovery_failed: runner_remote_state_unavailable" });
+    await queueWake(f, { issueId: f.issueId });
+    await f.sweep();
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(JSON.stringify(notices[0])).not.toContain("runner_remote_state_unavailable");
+  });
+
+  it("M1.1 (2): a queued wake that DOES start a run carrying the message within the bound -> no notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    const wake = await queueWake(f, { issueId: f.issueId, commentId });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    const started = await f.run({ commentId, status: "running" });
+    await db.update(agentWakeupRequests).set({ status: "completed", runId: started, finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wake.id));
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect(await f.visible()).toHaveLength(0);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, started));
+    await f.reply(started);
+    await settleAt(f, AFTER_WAKE_BOUND_MS + 60_000);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("M1.1 (3): two workers racing T0 and then the bound -> exactly one notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "failed", errorCode: "native_session_recovery_failed",
+      error: "native_session_recovery_failed: runner_remote_state_unavailable" });
+    await queueWake(f, { issueId: f.issueId });
+    await Promise.all([f.sweep(), f.sweep()]);
+    expect(await f.visible()).toHaveLength(0);
+    await Promise.all([settleAt(f, AFTER_WAKE_BOUND_MS), settleAt(f, AFTER_WAKE_BOUND_MS)]);
+    expect(await f.visible()).toHaveLength(1);
+  });
+
+  // M1.1 widened (03:03Z): every wait for a further attempt except a turn in
+  // progress is bounded the same way. One RED per wait, each with a control.
+  const finalization = (f: { companyId: string; issueId: string }, runId: string, phase: string, nextAttemptAt: Date | null = null) =>
+    db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId, phase, nextAttemptAt });
+
+  it("M1.1 (4): a native finalization stuck in workspace_pending -> exactly one notice after the bound", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const runId = await f.run({ commentId, status: "succeeded" });
+    await finalization(f, runId, "workspace_pending");
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+  });
+
+  it("M1.1 (4) control: workspace_pending that commits and answers within the bound -> no notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const runId = await f.run({ commentId, status: "succeeded" });
+    await finalization(f, runId, "workspace_pending");
+    await f.sweep();
+    await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, runId));
+    await f.reply(runId);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("M1.1 (5): a retryable_failure with no next attempt -> exactly one notice after the bound", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const runId = await f.run({ commentId, status: "failed", errorCode: "native_session_interrupted",
+      error: "native_session_recovery_failed: runner_remote_state_unavailable" });
+    await finalization(f, runId, "retryable_failure", null);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect(await f.visible()).toHaveLength(1);
+  });
+
+  it("M1.1 (5) control: the retry starts a run carrying the message within the bound, which answers -> no notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const runId = await f.run({ commentId, status: "failed", errorCode: "native_session_interrupted" });
+    await finalization(f, runId, "retryable_failure", null);
+    await f.sweep();
+    const retry = await f.run({ commentId, status: "running", retryOfRunId: runId });
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect(await f.visible()).toHaveLength(0);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, retry));
+    await f.reply(retry);
+    await settleAt(f, AFTER_WAKE_BOUND_MS + 60_000);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("M1.1 (6): a missing-comment retry (retry_queued) that never runs -> exactly one notice after the bound", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const runId = await f.run({ commentId, status: "succeeded" });
+    await db.update(heartbeatRuns).set({ issueCommentStatus: "retry_queued" }).where(eq(heartbeatRuns.id, runId));
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(NO_REPLY);
+  });
+
+  it("M1.1 (6) control: the missing-comment retry posts the reply within the bound -> no notice", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const runId = await f.run({ commentId, status: "succeeded" });
+    await db.update(heartbeatRuns).set({ issueCommentStatus: "retry_queued" }).where(eq(heartbeatRuns.id, runId));
+    await f.sweep();
+    await f.reply(runId);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("M1.1 control: a running turn on the task that does not carry the message (busy agent) is never bounded -> no notice", async () => {
+    const f = await fixture();
+    await f.reply(await f.run({ commentId: await f.message("first"), status: "succeeded" }));
+    await f.run({ commentId: null, status: "running", wakeReason: "issue_continuation_needed" });
+    const second = await f.message("A follow-up during the long turn.");
+    await queueWake(f, { issueId: f.issueId, commentId: second });
+    await f.sweep();
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    await settleAt(f, 30 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
   });
 
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
