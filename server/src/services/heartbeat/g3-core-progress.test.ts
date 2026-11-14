@@ -14,6 +14,7 @@ import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { listUndispatchedQueuedRuns } from "../queued-run-dispatch-liveness.js";
 import { recoveryService } from "../recovery/service.js";
+import { heartbeatService } from "../heartbeat.js";
 import { environmentRuntimeService } from "../environment-runtime.js";
 import { environmentService } from "../environments.js";
 import { currentControllerProcessStamp } from "../controller-process-identity.js";
@@ -38,6 +39,7 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
   let db: Db;
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   const executionOwners: Array<ReturnType<typeof createHeartbeatQueueTestDependencies>> = [];
+  const bprimeNoticeIds = new Map<string, Set<string>>();
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("g3-core-progress");
     db = createDb(database.connectionString, { maxConnections: 6 });
@@ -50,6 +52,7 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
       for each row execute function g3_record_wake_status()`);
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   beforeEach(async () => {
+    bprimeNoticeIds.clear();
     await db.transaction(async tx => {
       await tx.execute(sql`set local client_min_messages = warning`);
       await tx.execute(sql`truncate table companies, g3_wake_status_history restart identity cascade`);
@@ -60,6 +63,8 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
       while (deps.activeRunExecutionPromises.size) await Promise.allSettled([...deps.activeRunExecutionPromises]);
       await Promise.allSettled([...deps.activeWakeupPromises]);
     }
+    // The added real stranded sweep owns any execution it might admit.
+    await heartbeatService(db).drainActiveRunExecutions();
     vi.restoreAllMocks();
   });
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
@@ -150,6 +155,36 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
       sourceRunId: f.source.id, successorRunId: run.id, status: run.status }));
     return run;
   }
+  // B′ is identified by the exact durable authorization reason, not body text.
+  // Include soft-deleted notes and retain observed IDs across sweeps so a later
+  // rewrite/removal cannot hide a duplicate already seen for this person input.
+  async function observeBPrime(f: Fixture, input: Awaited<ReturnType<typeof savedComment>>, phase: string, maximum: 0 | 1) {
+    const notes = await db.select().from(issueComments).where(and(
+      eq(issueComments.companyId, f.company.id), eq(issueComments.issueId, f.issue.id),
+      eq(issueComments.authorType, "system"),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${input.comment.id}`}`,
+    ));
+    const seen = bprimeNoticeIds.get(input.comment.id) ?? new Set<string>();
+    for (const note of notes) seen.add(note.id);
+    bprimeNoticeIds.set(input.comment.id, seen);
+    console.log("G3 BPRIME", JSON.stringify({ test: expect.getState().currentTestName, phase,
+      issueId: f.issue.id, commentId: input.comment.id, sourceStatus: (await readRun(f.source.id)).status,
+      noteIds: notes.map(note => note.id), totalObserved: seen.size,
+      ...(phase === "before-progress" ? { noteBeforeProgress: notes.length > 0 } : {}) }));
+    if (maximum === 0) {
+      expect(notes, `B′ must stay quiet in the live control (${phase})`).toHaveLength(0);
+      expect(seen.size, "B′ must never have appeared for this control input").toBe(0);
+    } else {
+      expect(notes.length, `B′ must post at most one note for this input (${phase})`).toBeLessThanOrEqual(1);
+      expect(seen.size, "B′ total distinct notices across before/after progress").toBeLessThanOrEqual(1);
+    }
+  }
+  async function sweepBPrime(f: Fixture, input: Awaited<ReturnType<typeof savedComment>>, phase: string, maximum: 0 | 1 = 1) {
+    if (maximum === 0) expect((await readRun(f.source.id)).status, "B′ control sweep must run while the owner is live").toBe("running");
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.company.id });
+    await observeBPrime(f, input, phase, maximum);
+  }
+
   function staleLocks() { return recoveryService(db, { enqueueWakeup: async () => { throw new Error("Unexpected new wake during lock settlement"); } }); }
   async function finish(f: Fixture) {
     await f.controls.setRunStatusFromLive(f.source.id, "succeeded", ["running"], { finishedAt: new Date() });
@@ -167,9 +202,11 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
     expect((await readIssue(f)).executionRunId).toBe(f.source.id); // the lock clear rolled back too
     expect(await successors(f)).toHaveLength(0);
     f.fault.missingUser = false;
+    await sweepBPrime(f, input, "before-progress");
     await staleLocks().sweepStaleIssueLocks({ companyId: f.company.id, issueId: f.issue.id });
     await f.queue.resumeQueuedRuns();
     await f.queue.resumeQueuedRuns();
+    await sweepBPrime(f, input, "after-progress");
     await expectTakenOnce(f, input);
   });
 
@@ -245,6 +282,7 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
     await ownerRecovery(f).recoverActiveExecutions({ companyId: f.company.id, runId: f.source.id });
     await staleLocks().sweepStaleIssueLocks({ companyId: f.company.id, issueId: f.issue.id });
     await f.queue.resumeQueuedRuns();
+    for (let sweep = 1; sweep <= 3; sweep++) await sweepBPrime(f, input, `live-control-${sweep}`, 0);
     expect(await readRun(f.source.id)).toMatchObject({ status: "running", error: null });
     expect((await readIssue(f)).executionRunId).toBe(f.source.id);
     expect(await readWake(input.wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
@@ -282,12 +320,14 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
     expect(await f.queue.startNextQueuedRunForAgent(f.agent.id)).toEqual([]);
     expect(await readRun(queued.id)).toMatchObject({ status: "queued", startedAt: null });
     expect(f.deps.executeRun).not.toHaveBeenCalled();
+    await sweepBPrime(f, input, "before-progress");
     // Real lifecycle settlement emits the dispatch work signal, not a message.
     const errors: Array<{ error: unknown; queue: string }> = [];
     const coordinator = await startDispatcher(f, errors);
     try {
       await f.controls.setRunStatusFromLive(other.id, "succeeded", ["running"], { finishedAt: new Date() });
       await expect.poll(async () => (await readRun(queued.id)).status, { timeout: 15_000 }).toBe("running");
+      await sweepBPrime(f, input, "after-progress");
       const all = await successors(f);
       expect(all.map(r => r.id).sort()).toEqual([other.id, queued.id].sort());
       expect(await readWake(input.wake.id)).toMatchObject({ status: "claimed", runId: queued.id });
@@ -314,8 +354,10 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
       console.log("G3 CLAIM DIAGNOSTICS", JSON.stringify({ runId: queued.id, wakeId: input.wake.id,
         runError: runAtFailure.error, runErrorCode: runAtFailure.errorCode, wakeError: wakeAtFailure.error,
         events, activities, coordinatorErrors: errors.map(({ error, queue }) => ({ message: String(error), queue })) }));
+      await sweepBPrime(f, input, "before-progress");
       // No explicit retry/wake call: the existing 30-second failure deadline owns recovery.
       await expect.poll(async () => (await readRun(queued.id)).status, { timeout: 45_000, interval: 250 }).toBe("running");
+      await sweepBPrime(f, input, "after-progress");
       await expectTakenOnce(f, input);
       expect((await successors(f))[0].id).toBe(queued.id);
     } finally { await coordinator.stop(); }
@@ -326,21 +368,26 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
     expect((await readRun(f.source.id)).contextSnapshot?.wakeCommentIds ?? []).not.toContain(input.comment.id);
     await f.queue.resumeQueuedRuns();
     expect(await successors(f)).toHaveLength(0);
+    await sweepBPrime(f, input, "before-progress");
     await finish(f);
     // Exercise missed finalizer delivery: owner settlement and the R4-a sweep,
     // not a second Send or a test-authored successor/lock clear.
     await staleLocks().sweepStaleIssueLocks({ companyId: f.company.id, issueId: f.issue.id });
     await f.queue.resumeQueuedRuns();
     await f.queue.resumeQueuedRuns();
+    await sweepBPrime(f, input, "after-progress");
     await expectTakenOnce(f, input);
   });
 
   it("E3.09 control: authoritative read and accepted-result coverage consumes M2 without a successor", async () => {
     const f = await seed("running"), input = await savedComment(f, true);
+    await sweepBPrime(f, input, "live-control-1-before-read", 0);
     await recordTaskHistoryRead(db, { companyId: f.company.id, agentId: f.agent.id, runId: f.source.id, comments: [input.comment] });
+    await sweepBPrime(f, input, "live-control-2-after-read", 0);
     await appendHeartbeatRunEvent(db, { companyId: f.company.id, agentId: f.agent.id, runId: f.source.id,
       eventType: "run.result.accepted", stream: "system", level: "info",
       payload: { prpEvent: { payload: { result: { evidence: [{ ref: `comment:${input.comment.id}` }] } } } } });
+    await sweepBPrime(f, input, "live-control-3-after-accepted-result", 0);
     await finish(f);
     await staleLocks().sweepStaleIssueLocks({ companyId: f.company.id, issueId: f.issue.id });
     await f.queue.resumeQueuedRuns();
@@ -348,5 +395,6 @@ describe.skipIf(!support.supported)("G3 core saved-input progress", () => {
     expect(await successors(f)).toHaveLength(0);
     expect(await readWake(input.wake.id)).toMatchObject({ status: "cancelled", error: QUEUED_MESSAGES_DELIVERED_REASON, runId: null });
     expect(f.deps.executeRun).not.toHaveBeenCalled();
+    await observeBPrime(f, input, "after-consumed-settlement", 0);
   });
 });
