@@ -13636,13 +13636,14 @@ export function issueService(db: Db) {
       // The query below locks human comments on caller-owned transactions too,
       // sharing the fence with both question creation and Slack settlement.
       const issueQuery = dbOrTx
-        .select({ companyId: issues.companyId, conversationAgentId: issues.conversationAgentId })
+        .select({ companyId: issues.companyId, conversationAgentId: issues.conversationAgentId,
+          originKind: issues.originKind })
         .from(issues)
         .where(eq(issues.id, issueId));
       // Caller-owned transactions (including chat and review comments) must
       // serialize with question creation before inserting the human comment.
       const issue = await (actor.userId || (actor.runId && dbOrTx !== db) ? issueQuery.for("update") : issueQuery)
-        .then((rows: Array<{ companyId: string; conversationAgentId: string | null }>) => rows[0] ?? null);
+        .then((rows: Array<{ companyId: string; conversationAgentId: string | null; originKind: string | null }>) => rows[0] ?? null);
 
       if (!issue) throw notFound("Issue not found");
 
@@ -13930,6 +13931,41 @@ export function issueService(db: Db) {
       }
       if (!comment) throw new Error("Failed to create issue comment");
       if (options?.completionReply && actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, comment.id);
+
+      // A channel-origin issue without conversation identity cannot use the
+      // direct-chat waiting status. When its exact assigned-work continuation
+      // answers the person message that admitted it, complete that one-shot
+      // chat task before the run completes so the review-path owner does not
+      // launch an unrelated recovery turn on the already-answered message.
+      if (authorType === "agent" && actor.agentId && createdByRun && issue.originKind === "chat_channel"
+        && !issue.conversationAgentId) {
+        const [chatGapRun] = await dbOrTx.select({ companyId: heartbeatRuns.companyId,
+          agentId: heartbeatRuns.agentId, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, createdByRun.id), eq(heartbeatRuns.companyId, issue.companyId),
+          eq(heartbeatRuns.agentId, actor.agentId))).limit(1);
+        const context = parseObject(createdByRun.contextSnapshot);
+        const wakeCommentId = readStringFromRecord(context, "wakeCommentId")
+          ?? readStringFromRecord(context, "commentId");
+        const isAssignedWorkContinuation = context.source === "issue.assigned_work_invariant"
+          && context.wakeReason === "issue_continuation_needed"
+          && chatGapRun?.status === "running"
+          && chatGapRun.companyId === issue.companyId
+          && chatGapRun.agentId === actor.agentId
+          && (context.issueId === issueId || context.taskId === issueId);
+        if (isAssignedWorkContinuation && wakeCommentId) {
+          const [current] = await dbOrTx.select({ status: issues.status }).from(issues)
+            .where(and(eq(issues.id, issueId), eq(issues.companyId, issue.companyId))).for("update");
+          const [personMessage] = await dbOrTx.select({ id: issueComments.id, createdAt: issueComments.createdAt })
+            .from(issueComments).where(and(eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issueId),
+              sql`${issueComments.authorUserId} is not null and ${issueComments.authorAgentId} is null
+                and ${issueComments.createdByRunId} is null and ${issueComments.deletedAt} is null`))
+            .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+          if (current?.status === "in_review" && personMessage?.id === wakeCommentId
+            && new Date(comment.createdAt).getTime() > new Date(personMessage.createdAt).getTime()) {
+            await issueService(dbOrTx).update(issueId, { status: "done", companyGuard: issue.companyId }, dbOrTx);
+          }
+        }
+      }
 
       const boundAttachments: Array<{
         id: string;

@@ -146,6 +146,11 @@ describe("assigned-work invariant", () => {
       });
     }
 
+    it("does not re-continue an answered conversation after a system block", () => {
+      expect(evaluateAssignedWork(facts({ issue: { status: "blocked", isConversation: true, conversationAnswered: true },
+        blockedBy: "system" }), now)).toEqual({ kind: "ok", clause: "waiting", reason: "conversation" });
+    });
+
     it("does not accept a provider limit with no resume time", () => {
       expect(evaluateAssignedWork(facts({ activeRecoveryAction: { cause: "provider_quota", ownerType: "board", resumeAt: null } }), now))
         .toMatchObject({ kind: "violation" });
