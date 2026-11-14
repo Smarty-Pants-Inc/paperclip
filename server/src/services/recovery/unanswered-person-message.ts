@@ -1,4 +1,5 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { answeredPersonMessageSql } from "../person-message-answer.js";
 import {
   activityLog,
   agentWakeupRequests,
@@ -184,17 +185,9 @@ const reasonOf = (column: AnyPgColumn) => sql<string>`${column}->>'authorization
  * never answers m.
  */
 function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }): SQL {
-  return sql`exists (select 1 from ${issueComments} a
-    left join ${heartbeatRuns} r on r.id = a.created_by_run_id and r.company_id = a.company_id
-    where a.company_id = ${m.companyId} and a.issue_id = ${m.issueId} and a.author_type = 'agent' and a.deleted_at is null
-      and a.created_at > ${m.createdAt}
-      and (a.created_by_run_id is null or exists (select 1 from ${issueComments} b
-        where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
-          and (r.context_snapshot->>'wakeCommentId' = b.id::text or r.context_snapshot->>'commentId' = b.id::text
-            or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
-            or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
-            or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text))))`;
+  // The ONE shared definition (person-message-answer.ts), so B's notice and the continuation carry never
+  // disagree on a message (RFL 20:22Z: run-less agent comments never answer; org 20:29Z: imported history).
+  return answeredPersonMessageSql(m);
 }
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
