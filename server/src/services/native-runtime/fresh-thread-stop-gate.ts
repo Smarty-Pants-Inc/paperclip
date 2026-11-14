@@ -1,6 +1,6 @@
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
-import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 import { noLocalRunnerProcessesForRuns, proveRunProcessGone } from "../run-process-owner.js";
 import { writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
@@ -106,15 +106,13 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
   // Legacy rows may bind their issue only through issueId/contextSnapshot.
   // Never lose the contender's recorded local process from the owner proof.
   if (!owners.some(owner => owner.id === run.id)) owners.push(run);
-  // A live earlier turn owns the conversation. Do not even request its stop.
-  if (owners.some(owner => owner.id !== run.id && ["running", "queued", "scheduled_retry"].includes(owner.status))) {
-    await effects?.record("waiting");
-    await effects?.notice(turnWaitingNote(run));
-    return { gone: false as const, reason: "active_provider_turn", noticeAuthorizationReason };
-  }
+  // Evaluate physical evidence even for an observed owner stranded as running.
+  // Its settlement owner must still retire that claim; a genuinely live turn
+  // keeps its authority and must never receive a stop request from this gate.
+  const activeTurn = owners.some(owner => owner.id !== run.id && ["running", "queued", "scheduled_retry"].includes(owner.status));
   const turnRefusal = run.resultJson?.nativeFreshContinuationRefusal as { waitForTurn?: unknown } | undefined;
-  const waitingTurn = turnRefusal?.waitForTurn === true && !owners.some(owner => owner.id !== run.id
-    && owner.finishedAt && run.finishedAt && owner.finishedAt > run.finishedAt);
+  const waitingTurn = activeTurn || (turnRefusal?.waitForTurn === true && !owners.some(owner => owner.id !== run.id
+    && owner.finishedAt && run.finishedAt && owner.finishedAt > run.finishedAt));
   const leases = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
     inArray(environmentLeases.heartbeatRunId, owners.map(owner => owner.id).concat(run.id))));
   // Missing rows are not proof. Allocations require bound provider receipts;
@@ -149,11 +147,18 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
     if (peers.length) { gone = false; unavailable = true; continue; }
     const termination = lease.metadata?.remoteExecutionTermination as { confirmedAt?: unknown } | undefined;
     const confirmedAt = typeof termination?.confirmedAt === "string" ? Date.parse(termination.confirmedAt) : NaN;
-    const confirmedRelease = hasRemoteTerminationReceipt(lease) && Number.isFinite(confirmedAt)
-      && confirmedAt >= lease.acquiredAt.getTime() && lease.releasedAt !== null && confirmedAt <= lease.releasedAt.getTime()
+    // The stop owner accepts legacy bound receipts without confirmedAt. A
+    // retain-dispatch receipt is a stronger file-retention promise, not a
+    // prerequisite for physical stop. Explicitly invalid dates still refuse.
+    const confirmedRelease = hasRemoteTerminationReceipt(lease)
+      && (termination?.confirmedAt === undefined || (Number.isFinite(confirmedAt)
+        && confirmedAt >= lease.acquiredAt.getTime() && lease.releasedAt !== null && confirmedAt <= lease.releasedAt.getTime()))
       && lease.metadata?.pendingCleanupInFlight !== true;
     if (hasConfirmedSandboxStopAndRetain(lease) || confirmedRelease) continue;
     gone = false;
+    // Even an inadmissible ended receipt is immutable evidence, not permission
+    // to erase it and launch a new stop request.
+    if (["released", "expired"].includes(lease.status) && hasBoundRemoteStopReceipt(lease)) { unavailable = true; continue; }
     // Persist the existing stop-only intent; cleanup's plugin release contract
     // supplies the independently bound stopped/destroyed receipt. A void
     // release, 'stopping', expired lease, or successful RPC is NOT evidence.
@@ -204,6 +209,7 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
         && event.payload?.hostname && event.payload.hostname !== hostname());
     if (foreignOwner || !await noLocalRunnerProcessesForRuns(unidentifiedLocalOwners)) { gone = false; unavailable = true; }
   }
+  if (activeTurn) gone = false; // settlement, not a read, retires the old claim
   // Only the settlement owner can say it is starting fresh: a newer run or a
   // person-owned gate may still make a positive physical proof inapplicable.
   await effects?.record(gone ? "gone" : !waitingTurn && unavailable ? "unavailable" : "waiting");

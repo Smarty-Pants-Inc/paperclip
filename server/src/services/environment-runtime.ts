@@ -4576,7 +4576,7 @@ export function environmentRuntimeService(
     /**
      * A FRESH provider read of a predecessor run's sandbox, for the shared
      * prior-owner-proven-gone predicate (remoteRunnerGenerationLost). Unlike
-     * inspectLeaseResource (failed ephemeral cleanup only), this reads any
+     * inspectLeaseResource (cleanup/stop verification only), this reads any
      * lease of the company through its provider's read-only inspection, never
      * a cached or label state. It throws when the provider cannot answer for
      * that exact sandbox, which the predicate treats as not proven.
@@ -4589,16 +4589,21 @@ export function environmentRuntimeService(
       return predecessorSandboxRecordFromObservation(observation, lease.providerLeaseId);
     },
 
-    async inspectLeaseResource(leaseId: string): Promise<PluginEnvironmentLeaseObservation | undefined> {
+    async inspectLeaseResource(leaseId: string, options?: { freshThreadStop?: true }): Promise<PluginEnvironmentLeaseObservation | undefined> {
       const lease = await environmentsSvc.getLeaseById(leaseId);
-      if (!lease || lease.status !== "failed" || lease.leasePolicy !== "ephemeral" || !lease.providerLeaseId) return undefined;
+      if (!lease || !lease.providerLeaseId) return undefined;
+      const stopVerification = options?.freshThreadStop === true
+        || lease.status === "pending_cleanup" && readStopOnlyCleanup(lease) !== null;
+      if (!stopVerification && (lease.status !== "failed" || lease.leasePolicy !== "ephemeral")) return undefined;
       const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
       // Legacy Cloud leases can lack a credential version that permits a
       // provider-local observation. Cloud's manager verifies the historical
       // organization and signs only exact absence; no replacement key or
       // cleanup label is treated as proof. Explicit provider answers win.
-      return await getDriver(getLeaseDriverKey(lease, environment))?.inspectLeaseResource?.({ environment, lease })
-        ?? await inspectCloudSandboxCleanupAbsence(lease);
+      const observation = await getDriver(getLeaseDriverKey(lease, environment))?.inspectLeaseResource?.({ environment, lease });
+      // Cleanup-manager absence is cleanup authority only. Fresh-thread proof
+      // requires the recorded provider's exact-resource observation.
+      return observation ?? (stopVerification ? undefined : await inspectCloudSandboxCleanupAbsence(lease));
     },
 
     async retryPendingSandboxTeardown(input: {

@@ -30,11 +30,13 @@ import { listExpiredNativeRunnerAuthorities } from "../native-runtime/native-run
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
+import { hasNativeWorkspaceExportResume } from "../native-runtime/native-workspace-export-resume.js";
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { expireAbandonedWorkspaceFileHoldsWhenDue, parkAbandonedWorkspaceFilesLease, recordAbandonedWorkspaceFilesRemoved } from "../remote-workspace-abandoned-files-hold.js";
 import { stopWarmSandboxesPastWindowWhenDue } from "../warm-sandbox-expiry.js";
 import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
 import {
+  acceptedStopOnlyReceipt,
   hasStopOnlyCleanup,
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
@@ -52,7 +54,7 @@ import {
 } from "../legacy-controller-lease.js";
 import { proveOwnerGone } from "../owner-proof.js";
 import { preparingControllerOwnerStamp } from "../native-runtime/native-owner-stamps.js";
-import { remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { readEnvironmentStopFailure, type PluginEnvironmentStopFailure } from "@paperclipai/plugin-sdk";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
@@ -99,7 +101,7 @@ import {
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
 } from "../native-runtime/index.js";
-import { settleUnstartedNativeSessionResume } from "../native-runtime/native-failed-run-owner-release.js";
+import { settleStoppedRemoteNativeOwner, settleUnstartedNativeSessionResume } from "../native-runtime/native-failed-run-owner-release.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import {
@@ -1881,12 +1883,20 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           // Tear the sandbox down from the recorded provider config and the
           // cleanup-authorized secret versions. Preserve any provider receipt;
           // a completed retry must grant the same evidence as initial cleanup.
-          const receipt = await environmentRuntime.retryPendingSandboxTeardown({
-            environment,
-            lease,
-          });
+          // The durable stop-only claim owns this read. Provider I/O is outside
+          // all task/gate transactions; an exact stopped/destroyed observation
+          // settles through the SAME attempt-fenced receipt owner. Live, unknown
+          // or unavailable observations grant nothing and keep ordinary cleanup.
+          const observation = hasStopOnlyCleanup(lease) && !hasNativeWorkspaceExportResume(lease)
+            && !hasBoundRemoteStopReceipt(lease)
+            ? await environmentRuntime.inspectLeaseResource?.(lease.id).catch(() => undefined)
+            : undefined;
+          const observedStop = acceptedStopOnlyReceipt(lease, observation);
+          const receipt = observedStop ? observation
+            : await environmentRuntime.retryPendingSandboxTeardown({ environment, lease });
           const released = hasStopOnlyCleanup(lease)
-            ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt })
+            ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt,
+              ...(observedStop ? { receiptSource: "provider_inspection" as const } : {}) })
             : await environmentsSvc.releaseLease(lease.id, "expired", {
             expectedPendingCleanupAttemptId: claimed,
             cleanupStatus: "success",
@@ -2416,7 +2426,21 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // that owner until the owner claims it, stops (then it is recovered like
     // any run whose controller is gone), or does not claim it within the grace.
     const preparingOwnerAlive = new Set<string>();
+    const stoppedNativeRunIds = new Set<string>();
     for (const { run, nativeCoordinatorPhase, nativeControllerBootId, nativeLeaseOwner } of activeRuns) {
+      // Physical proof precedes exact recovery's startup/observed-owner refusal.
+      // Reuse this inventory and the existing terminal owner, never a new scan.
+      if (run.runtimeMode === "native" && nativeCoordinatorPhase === "observed"
+        && run.errorCode === NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE
+        && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id)
+        && await settleStoppedRemoteNativeOwner(db, run.id, now,
+          environmentRuntime.inspectLeaseResource
+            ? leaseId => environmentRuntime.inspectLeaseResource(leaseId, { freshThreadStop: true }) : undefined)) {
+        const settled = await getRun(run.id);
+        if (settled) await releaseIssueExecutionAndPromote(settled);
+        stoppedNativeRunIds.add(run.id);
+        continue;
+      }
       if (run.runtimeMode !== "native" || nativeCoordinatorPhase !== "observed" || nativeControllerBootId
         || nativeLeaseOwner || activeRunExecutions.has(run.id) || runningProcesses.has(run.id)) continue;
       const owner = readControllerProcess(run.controllerProcess);
@@ -2435,7 +2459,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       run.runtimeMode === "native" && nativeCoordinatorPhase === "observed"
       && (!nativeControllerLeaseExpiresAt || nativeControllerLeaseExpiresAt <= now)
       && !isNativeRunnerOwnershipHeld(run) && !preparingOwnerAlive.has(run.id)
-      && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id),
+      && !stoppedNativeRunIds.has(run.id) && !activeRunExecutions.has(run.id) && !runningProcesses.has(run.id),
     ).map(({ run }) => run.id);
     const earlyStartupRunIds = activeRuns.filter(row => expiredNativeRunIds.includes(row.run.id) &&
       readNativeStartupContext(row.run, { leaseOwner: row.nativeLeaseOwner, controllerGeneration: row.nativeControllerGeneration ?? 0,
@@ -2479,7 +2503,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       ]),
     );
 
-    const reaped: string[] = [];
+    const reaped: string[] = [...stoppedNativeRunIds];
     const currentNativeController = await currentNativeControllerIdentity();
 
     for (const {
@@ -2494,6 +2518,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       nativeControllerLeaseExpiresAt,
       nativeWorkspaceFinalizationPending,
     } of activeRuns) {
+      if (stoppedNativeRunIds.has(run.id)) continue;
       if (run.runtimeMode === "native" && readNativeStartupCleanup(run)) continue;
       if (run.runtimeMode === "legacy" && isRunHandedOffForShutdown(run.id)) continue;
       if (parseObject(run.contextSnapshot).nativeQuestionCancellation) continue;
