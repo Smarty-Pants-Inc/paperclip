@@ -289,7 +289,7 @@ import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.
 import { dispatchToolCallback, recoverToolCallback, type SemanticInputAdmission } from "../../vendor/paperclip-runner/index.js";
 import { createAssignedMcpTools, getAssignedMcpGateway } from "./assigned-mcp-tools.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-review-participant.js";
-import { getNativeAddressedInteractionGrant, readNativeAddressedInteractionId } from "./native-addressed-interaction.js";
+import { NativeAddressedInteractionAdmissionError, readNativeAddressedInteractionId, requireNativeAddressedInteractionGrant } from "./native-addressed-interaction.js";
 import { appendNativeAddressedInteractionFailureNotice, NATIVE_ADDRESSED_INTERACTION_FAILED, NATIVE_ADDRESSED_INTERACTION_FAILURE_ACTION, readNativeAddressedInteractionFailure } from "./native-addressed-interaction-failure.js";
 import { NativeChatAttachmentReadScope } from "./chat-attachment-read.js";
 import {
@@ -9433,6 +9433,7 @@ export function nativeSessionFailureSourceCode(
   if (/native_adopted_runner_authentication_timeout/i.test(message)) {
     return "native_adopted_runner_authentication_timeout";
   }
+  if (error instanceof NativeAddressedInteractionAdmissionError) return NATIVE_ADDRESSED_INTERACTION_FAILED;
   if (/runner_remote_provider_artifact_incompatible/i.test(message)) {
     return "runner_remote_provider_artifact_incompatible";
   }
@@ -10954,7 +10955,8 @@ async function executePaperclipNativeSessionUnnoticed(input: {
         }
       };
       preparedInput = { ...input, chatAttachmentReadScope };
-      if (downloadRemoteAttachment || input.execution.provider.kind === "pi_rpc") {
+      if (downloadRemoteAttachment || input.execution.provider.kind === "pi_rpc"
+        || readNativeAddressedInteractionId(input.runContextSnapshot)) {
         return {
           ...preparedInput,
           bindAttachmentSession: (session: NativeSession | null) => {
@@ -13639,7 +13641,7 @@ async function executePaperclipNativeSessionAttempt(
       const now = new Date();
       const rawFailureCode = nativeSessionFailureSourceCode(error);
       const addressedFailure = !ownershipUnverified && readNativeAddressedInteractionId(input.runContextSnapshot)
-        ? await readNativeAddressedInteractionFailure(input.db, input.execution.binding) : null;
+        ? await readNativeAddressedInteractionFailure(input.db, input.execution.binding, error) : null;
       const startupClassifiedFailureCode = addressedFailure
         ? NATIVE_ADDRESSED_INTERACTION_FAILED : rawFailureCode;
       // A timed-out session.open may still have opened a provider session
@@ -14064,7 +14066,7 @@ async function executePaperclipNativeSessionAttempt(
         }
         if (addressedFailure) {
           addressedFailurePublication = await appendNativeAddressedInteractionFailureNotice(
-            tx as unknown as Db, input.execution.binding, addressedFailure.interactionId,
+            tx as unknown as Db, input.execution.binding, addressedFailure.interactionId, error,
           );
         }
         const stillOwnsTask =
@@ -17271,8 +17273,7 @@ async function createRunnerdBackendWithinSessionClaim(
       )).limit(1).then((rows) => rows[0]?.contextSnapshot));
   const addressedParticipant = Boolean(readNativeAddressedInteractionId(reviewRun?.contextSnapshot)
     && (reviewRun?.assigneeAgentId !== input.execution.binding.agentId || reviewRun?.executionRunId !== input.execution.binding.runId));
-  if (addressedParticipant && !await getNativeAddressedInteractionGrant(input.db, input.execution.binding))
-    throw new Error("native_addressed_interaction_no_longer_available");
+  if (addressedParticipant) await requireNativeAddressedInteractionGrant(input.db, input.execution.binding);
   const connectorAssignments = !addressedParticipant && input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
   const nativeReview = readNativeReviewAssignmentContext(runContextSnapshot);
   if (nativeReview && !await getNativeReviewAssignment(input.db, {
