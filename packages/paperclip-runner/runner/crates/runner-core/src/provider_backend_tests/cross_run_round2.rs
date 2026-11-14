@@ -327,6 +327,7 @@ done
         payload["completionContract"]["revision"] = json!("revision-2");
         if skills_changed {
             payload["provider"]["runtimeContext"]["skills"][0]["digest"] = json!("v2");
+            payload["provider"]["instructions"] = json!("Edited assigned company skill instructions v2");
         } else {
             let mut only_revision = seed_payload;
             only_revision["completionContract"]["revision"] = json!("revision-2");
@@ -424,6 +425,8 @@ done
             );
             assert_eq!(starts[1]["params"]["paperclipRunId"], "run-B");
             assert_eq!(starts[1]["params"]["threadId"], previous["threadId"]);
+            assert!(starts[1]["params"]["baseInstructions"].as_str().unwrap()
+                .starts_with(payload["provider"]["instructions"].as_str().unwrap()));
             let resumes = frames
                 .iter()
                 .filter(|frame| frame["method"] == "thread/resume")
