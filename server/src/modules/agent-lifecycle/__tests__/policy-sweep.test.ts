@@ -19,6 +19,37 @@ const support = await getEmbeddedPostgresTestSupport();
   }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
 
+  it("starts a due resume before the remaining verification queue fills all four loops", async () => {
+    const [company] = await db.insert(companies).values({ name: "Lifecycle head of line", issuePrefix: "HOL" }).returning();
+    const dueAt = new Date(Date.now() - 60_000);
+    await db.insert(agents).values(Array.from({ length: 118 }, (_, index) => ({
+      companyId: company.id, name: `Verify ${index}`, status: "paused", lifecycleState: "verifying" as const,
+      lifecycleRequiredPluginIds: [], lifecycleOperation: { id: `verify-${index}`, hostComplete: false, completedPluginIds: [], attempts: 0 },
+      updatedAt: dueAt,
+    })));
+    await db.insert(agents).values({ companyId: company.id, name: "Resume", status: "paused", lifecycleState: "resuming",
+      lifecycleRequiredPluginIds: [], lifecycleOperation: { id: "resume", hostComplete: false, completedPluginIds: [], attempts: 0 },
+      updatedAt: new Date() });
+    let releaseVerifies!: () => void;
+    const verifiesHeld = new Promise<void>(resolve => { releaseVerifies = resolve; });
+    const host = vi.fn(async (agent: { lifecycleState: string }) => {
+      if (agent.lifecycleState === "verifying") await verifiesHeld;
+      return "complete" as const;
+    });
+    const work = startAgentLifecycle(db, createAgentLifecycleEffects(), {
+      requiredPluginIds: async () => [], runHost: host, runPlugin: async () => "complete",
+    }, () => true);
+    const sweep = work.sweep();
+    try {
+      await vi.waitFor(() => expect(host.mock.calls.some(([agent]) => agent.lifecycleState === "resuming")).toBe(true), { timeout: 500 });
+    } finally {
+      releaseVerifies();
+      await sweep;
+      await work.stop();
+    }
+    expect(host.mock.calls[0]?.[0].lifecycleState).toBe("resuming");
+  });
+
   it("projects only company mismatches in pages of 100 using one transaction per page", async () => {
     const [company] = await db.insert(companies).values({ name: "Policy pages", issuePrefix: "POL" }).returning();
     const eligible = await db.insert(agents).values(Array.from({ length: 101 }, (_, index) => ({
