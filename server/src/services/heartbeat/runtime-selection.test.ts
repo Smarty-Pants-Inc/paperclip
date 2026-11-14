@@ -35,6 +35,10 @@ import { agentInstructionWorkingCopyService } from "../agent-instruction-working
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
 import { materializePiSessionRecoveryNotice } from "../native-runtime/pi-session-recovery-notice.js";
+import { canBypassFailedNativePredecessor } from "../native-runtime/native-provider-work-proof.js";
+import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
+import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer.js";
+import { resolveNativeControllerRecovery } from "../native-runtime/native-controller-recovery.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -260,8 +264,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       runtimeConfig: {}, adapterConfig: f.input.agent.adapterConfig, agent: f.input.agent, issue: f.issue, target: null, workspaceId: null });
     return f;
   }
-  async function nextPiTurn(f: Awaited<ReturnType<typeof piFixture>>) {
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.input.run.id));
+  async function nextPiTurn(f: Awaited<ReturnType<typeof piFixture>>, completePrevious = true) {
+    if (completePrevious) await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.input.run.id));
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
       issueId: f.issue.id, status: "running", scopeKind: "issue" }).returning();
     f.input.run = run;
@@ -282,6 +286,56 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(next).toMatchObject({ nativeExecution: { session: { normalizedSessionId: id } } });
     expect((await read(f.input.run.id)).nativeSessionId).toBe(id);
   });
+  it.each(["opening", "follow-up"])("answers automatic recovery and the next Pi message after pre-setup HTTP429 (%s)", async shape => {
+    const f = await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id, authorType: "user",
+      authorUserId: "local-board", body: "Preserve this original saved Pi request.", createdAt: new Date(f.run.createdAt.getTime() - 1000) });
+    const answer = async (selection: Awaited<ReturnType<typeof selectHeartbeatRuntime>>, text: string, currentMessage?: string) => {
+      if (!selection.selected || !selection.nativeExecution) throw new Error("Expected native selection");
+      await db.update(issues).set({ executionRunId: f.input.run.id }).where(eq(issues.id, f.issue.id));
+      const getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId, agentId: f.agent.id,
+        issueId: f.issue.id, before: f.input.run.createdAt });
+      const result = await answerWithNativePeer({ db, execution: selection.nativeExecution, runnerInstanceId: selection.nativeRunnerInstanceId!,
+        text, getFreshSessionHandoff });
+      expect(result.answered).toMatchObject({ exitCode: 0, resultJson: { nativeResult: { summary: text } } });
+      expect(result.settled).toMatchObject({ status: "succeeded", nativeIssueId: f.issue.id,
+        nativeSessionId: selection.nativeExecution.session.normalizedSessionId });
+      expect(JSON.stringify(result.prompts)).toContain("original saved Pi request");
+      if (currentMessage) expect(JSON.stringify(result.prompts)).toContain(currentMessage);
+    };
+    let failedSelection = await selectHeartbeatRuntime(db, f.input);
+    if (!failedSelection.selected || !failedSelection.nativeExecution) throw new Error("Expected first selection");
+    const conversation = failedSelection.nativeExecution.session.normalizedSessionId;
+    if (shape === "follow-up") {
+      await answer(failedSelection, "The earlier Pi turn answered successfully.");
+      await nextPiTurn(f);
+      failedSelection = await selectHeartbeatRuntime(db, f.input);
+    }
+    const failedRunId = f.input.run.id;
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "setup_failed", error: "Boat HTTP429 before SETUP",
+      resultJson: { failureCause: "provider_http_429", nativePreDispatchFailure: { version: 1, providerWorkStarted: false },
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, failedRunId));
+    // Like failRunSetup, close only the never-claimed coordinator. The receipt
+    // writer itself is exercised by run-completion's Boat HTTP429 regression.
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure" }).where(eq(nativeRunFinalizations.runId, failedRunId));
+    expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: failedRunId })).toBe(true);
+    await nextPiTurn(f, false);
+    const recovered = await selectHeartbeatRuntime(db, f.input);
+    expect(recovered).toMatchObject({ nativeExecution: { session: { normalizedSessionId: conversation } } });
+    expect(await resolveNativeControllerRecovery(db, { companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
+      normalizedSessionId: conversation!, currentRunId: f.input.run.id })).toMatchObject({ kind: shape === "opening" ? "no_prior_execution" : "recoverable" });
+    await answer(recovered, "Automatic Pi recovery answered the saved request.");
+    const [nextMessage] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id, authorType: "user",
+      authorUserId: "local-board", body: "Answer this next Pi message in the same conversation." }).returning();
+    await nextPiTurn(f);
+    f.input.task.context.paperclipTaskMarkdown = nextMessage.body;
+    const next = await selectHeartbeatRuntime(db, f.input);
+    expect(next).toMatchObject({ nativeExecution: { session: { normalizedSessionId: conversation } } });
+    await answer(next, "The next Pi message was answered in the same conversation.", nextMessage.body);
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(row => row.authorType === "system")).toHaveLength(0);
+  }, 60_000);
+
   it("adopts a verified legacy Pi pointer without ending the existing conversation", async () => {
     const f = await piFixture();
     const first = await selectHeartbeatRuntime(db, f.input);

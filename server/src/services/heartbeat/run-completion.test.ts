@@ -1642,6 +1642,20 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
         { retryReason: "interrupted_preparation" });
     });
 
+    it("records and settles an unclaimed native coordinator after a Boat HTTP429 before setup", async () => {
+      const f = await nativeFixture();
+      const { issue } = await admitNativeExecution(f);
+      await db.insert(nativeRunFinalizations).values({ companyId: f.run.companyId, issueId: issue.id, runId: f.run.id, phase: "observed" });
+      const cause = Object.assign(new Error("Boat HTTP429 before SETUP"), { providerFailure: {
+        schema: "paperclip.provider-failure.v1", provider: "boat", phase: "startup", category: "rate_limit",
+        message: "Boat refused allocation", httpStatus: 429, retryability: "transient" } });
+      await f.completion.failRunSetup({ ...f.setup(cause), nativeDispatchMayHaveStarted: false });
+      expect(await read(f.run.id)).toMatchObject({ status: "failed", resultJson: {
+        nativePreDispatchFailure: { version: 1, providerWorkStarted: false } } });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id)))[0])
+        .toMatchObject({ phase: "terminal_failure", failureCode: "native_pre_dispatch_failure", attempt: 0, leaseOwner: null, controllerBootId: null });
+    });
+
     it("keeps the hold once the run's history shows a native process start", async () => {
       const f = await nativeFixture();
       await appendHeartbeatRunEvent(db, { companyId: f.run.companyId, runId: f.run.id, agentId: f.run.agentId,
