@@ -6719,6 +6719,7 @@ describe("executeNativeSession recovery", () => {
   // the recorded D10 row-5 refusal must not become a generic retry/replacement.
   it.each([
     "runner_remote_state_unavailable",
+    "runner_harness_state_mismatch: resumed_unavailable",
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
   ] as const)("D10b preserves exact refusal through actual driver recovery (%s)", async refusalCode => {

@@ -26,6 +26,7 @@ it.each(FRESH_THREAD_REFUSAL_CODES)("only the closed structured code authorizes 
 });
 
 it.each([
+  "runner_harness_state_mismatch: resumed_unavailable",
   "runner_harness_state_mismatch: backup_without_reusable_lease",
   "native_controller_recovery_missing_evidence:retained_sandbox_binding",
 ])("D10b preserves exact controller and C1 refusal without trusting prose (%s)", code => {

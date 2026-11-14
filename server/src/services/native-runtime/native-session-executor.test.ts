@@ -13673,6 +13673,35 @@ describe("native warm session supervision", () => {
     // Staging: the follow-up on the reused sandbox failed
     // before provider work because the previous controller's journal drain
     // outlived the close grace. Nothing could ever start the task again.
+    it("TL08 releases the new claim after stale-lease retirement fails on the same warm box", async () => {
+      const { base, next: nextRun } = fixture("tl08-new-lease-same-box");
+      const next = { ...nextRun, session: base.session };
+      const close = vi.fn().mockRejectedValue(new Error("Boat sandbox lease is no longer active."));
+      const release = vi.spyOn(nativeLeaseRenewal, "releaseUnstartedNativeExecutionClaim").mockResolvedValue(true);
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        options.onSession?.({ close }); return result;
+      });
+      const target = (leaseId: string) => ({ kind: "remote" as const, transport: "sandbox" as const,
+        environmentId: "tl08-environment", leaseId, remoteCwd: "/tmp/tl08-warm-box",
+        sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: "bx_8v7gcucz" } });
+      try {
+        await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner",
+          runnerExecutionTarget: target("previous-lease") });
+        release.mockClear();
+        await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner",
+          refreshTools: true, runnerExecutionTarget: target("new-lease") })).rejects.toMatchObject({
+          code: "native_predecessor_retirement_unproven", predecessorRunId: base.binding.runId,
+          providerLeaseId: "bx_8v7gcucz", cause: { message: "Boat sandbox lease is no longer active." } });
+        expect(state.execute).toHaveBeenCalledOnce();
+        expect(release).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: next.binding.runId,
+          companyId: next.binding.companyId, issueId: next.binding.issueId, attempt: 1 }));
+      } finally {
+        close.mockResolvedValue(undefined);
+        await closeIdleWarmNativeSessionsForRestart();
+        release.mockRestore();
+      }
+    });
+
     it("sends the follow-up to a fresh sandbox when its predecessor cannot be retired", async () => {
       const { base, next } = fixture("identity-unretirable");
       const drain = new Error("Controller journal drain timed out; preserve the session before replacing its writer.");
@@ -23433,7 +23462,9 @@ describe("runnerd provider runtime wiring", () => {
           supersededByRunId: current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
           reusableSandboxLease: { version: 1, executionWorkspaceId: current.binding.executionWorkspaceId } }) }));
     } else {
-      await expect(options.prepareExternalRunnerState()).rejects.toThrow(resumed ? "resumed_unavailable" : "backup_without_reusable_lease");
+      await expect(options.prepareExternalRunnerState()).rejects.toMatchObject({
+        code: resumed ? "runner_harness_state_mismatch: resumed_unavailable" : "runner_harness_state_mismatch: backup_without_reusable_lease",
+      });
       expect(syncIn).not.toHaveBeenCalled();
       expect(updates.filter(update => update.table === environmentLeases)).toEqual([]);
     }
