@@ -1272,6 +1272,109 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     return { plan: plan!, prior, followUp, root, path, bytes, binding, checkpoint };
   }
 
+  async function ownershipChild() {
+    const child = spawn(process.execPath, ['--import', new URL('../../../../cli/node_modules/tsx/dist/loader.mjs', import.meta.url).pathname,
+      new URL('./settle9-ownership-child.ts', import.meta.url).pathname], {
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: {...process.env, SETTLE9_TEST_DB: database.connectionString},
+    });
+    const exited = new Promise<number | null>(resolve => child.once('exit', resolve));
+    let stderr = ''; child.stderr!.on('data', chunk => { stderr += String(chunk); }); child.stdout!.resume();
+    const message = () => new Promise<Record<string, any>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`ownership child timeout: ${stderr}`)), 15000);
+      child.once('message', value => { clearTimeout(timer); resolve(value as Record<string, any>); });
+    });
+    const ready = await message(); expect(ready.kind).toBe('ready');
+    await db.insert(controllerInstances).values({bootId: ready.bootId, epoch: 3336, pid: ready.pid,
+      processSpace: ready.processSpace, startedAt: sql`now()-interval '3 days'`, renewedAt: sql`now()-interval '2 days'`,
+      leaseExpiresAt: sql`now()-interval '2 days'`});
+    return {ready, request: (value: Record<string, unknown>) => { const next = message(); child.send(value); return next; },
+      close: async () => {
+        if (child.connected) child.send({action:'quit'});
+        const kill = setTimeout(() => child.kill('SIGKILL'), 5000);
+        const code = await exited; clearTimeout(kill);
+        await db.delete(controllerInstances).where(eq(controllerInstances.bootId, ready.bootId));
+        expect(code, stderr).toBe(0);
+      }};
+  }
+
+  // Keep: data safety and the real 4f539509 production catch. No global fence.
+  it('SETTLE9 unrelated stale boot owns nothing: abandonment writes zero controller rows', async () => {
+    const fixture = await lifecyclePlan(false), stale = randomUUID();
+    await db.insert(controllerInstances).values({bootId: stale, epoch: 3336, pid: 7, processSpace: '4f539509-shape',
+      startedAt: sql`now()-interval '3 days'`, leaseExpiresAt: sql`now()-interval '2 days'`});
+    const before = await db.select().from(controllerInstances);
+    try {
+      const plan = await planNativeLifecycleSettlement({db, root: fixture.root, bytes: fixture.bytes, identity: fixture.prior.identity,
+        companyId, agentId, issueId: fixture.prior.issueId, currentRunId: fixture.followUp.runId});
+      expect(plan).not.toBeNull();
+      await expect(plan!.commit()).resolves.toContain('ABANDONED');
+      expect(await db.select().from(controllerInstances)).toEqual(before);
+    } finally { await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale)); }
+  }, 30000);
+
+  it('SETTLE9 a stale boot owning a settled run refuses without fencing it', async () => {
+    const fixture = await lifecyclePlan(false), owner = await ownershipChild(), leaseId = randomUUID();
+    try {
+      await db.insert(environmentLeases).values({id: leaseId, companyId, heartbeatRunId: fixture.prior.runId, status:'active',
+        metadata:{leaseController:{bootId:owner.ready.bootId, pid:owner.ready.pid, hostHash:owner.ready.processSpace,
+          processStartedAt:new Date(Date.now()-86400000).toISOString()}}});
+      await expect(fixture.plan.commit()).rejects.toThrow('native_lifecycle_settlement_proof_changed');
+      expect(await readFile(fixture.path, 'utf8')).toBe(fixture.bytes);
+      const [boot] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, owner.ready.bootId));
+      expect(boot!.fencedAt).toBeNull();
+    } finally { await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId)); await owner.close(); }
+  }, 30000);
+
+  it.each(['unrelated', 'settled'] as const)('SETTLE9 real second process ownership during and after settlement: %s', async scope => {
+    const fixture = await lifecyclePlan(false), owner = await ownershipChild(), environmentId = randomUUID();
+    await db.insert(environments).values({id: environmentId, name: 'settle9', driver:'sandbox'});
+    const unrelatedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({id:unrelatedRunId, companyId, agentId, status:'running', runtimeMode:'native', nativeIssueId:fixture.prior.issueId});
+    await db.insert(nativeRunFinalizations).values({runId:unrelatedRunId, companyId, issueId:fixture.prior.issueId, phase:'observed'});
+    let release!: () => void, locked!: () => void;
+    const gate = new Promise<void>(resolve => {release = resolve;});
+    const ready = new Promise<void>(resolve => {locked = resolve;});
+    const transaction = db.transaction.bind(db);
+    const spy = vi.spyOn(db, 'transaction').mockImplementationOnce(callback => transaction(async tx => {
+      await lockSourceRecoveryCoordinators(tx, companyId, [fixture.prior.runId, fixture.followUp.runId]);
+      locked(); await gate; return callback(tx);
+    }));
+    const settlement = fixture.plan.commit().then(value => ({value}), error => ({error}));
+    await ready;
+    const request = {action:'acquire', companyId, environmentId, runId:scope === 'settled' ? fixture.prior.runId : unrelatedRunId};
+    let result: Record<string, any> | undefined;
+    const pending = owner.request(request).then(value => {result = value; return value;});
+    try {
+      if (scope === 'unrelated') expect((await pending).kind).toBe('acquired');
+      else {
+        await waitForCondition('same-run ownership waits for settlement coordinator', async () => {
+          const rows = await db.execute(sql`select 1 from pg_stat_activity where datname=current_database() and wait_event_type='Lock'
+            and query like '%native_run_finalizations%'`); return rows.length > 0;
+        }, 2000);
+        expect(result).toBeUndefined();
+      }
+      release();
+      const outcome = await settlement, acquired = await pending;
+      expect(outcome).toHaveProperty('value');
+      expect(acquired.kind).toBe(scope === 'settled' ? 'refused' : 'acquired');
+      if (scope === 'settled') {
+        expect((await owner.request(request)).kind).toBe('refused');
+        expect((await owner.request({action:'renew', companyId, runId:fixture.prior.runId, issueId:fixture.prior.issueId,
+          leaseOwner:'stale-lease', attempt:0})).kind).toBe('refused');
+        expect((await owner.request({action:'start', companyId, runId:fixture.prior.runId, leaseOwner:'stale-lease'})).kind).toBe('refused');
+      }
+      expect(await owner.request({action:'controller-renew'})).toMatchObject({kind:'controller-renewed', lost:[]});
+      const [boot] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, owner.ready.bootId));
+      expect(boot!.fencedAt).toBeNull();
+      await writeFile(join(process.env.TASK_OUT!, `settle9-${scope}-${process.env.SETTLE9_LABEL ?? 'head'}.json`),
+        JSON.stringify({scope, secondProcess:owner.ready, settlement:outcome, acquired, fencedAt:boot!.fencedAt}, null, 2));
+    } finally {
+      release(); await settlement; await pending; spy.mockRestore();
+      await db.delete(environmentLeases).where(eq(environmentLeases.environmentId, environmentId));
+      await db.delete(environments).where(eq(environments.id, environmentId)); await owner.close();
+    }
+  }, 30000);
+
   it.each([false, true])("settlement lock order: a bounded coordinator wait never stalls another boot's lease renewal (stamped=%s)", async stamped => {
     const fixture = await lifecyclePlan(stamped);
     const tag = `settlement-${randomUUID()}`;
