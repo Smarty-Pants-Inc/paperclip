@@ -127,8 +127,9 @@ fn abandoned_flood_trial(flood_after_b_waits: bool) {
     assert_eq!(active.receive_json_until(Some(Instant::now() + Duration::from_secs(1))).unwrap().unwrap()["peer"], "A");
     a.upgraded.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
 
-    let b = abandoned_flood_peer(address, "B");
+    let b;
     if flood_after_b_waits {
+        b = abandoned_flood_peer(address, "B");
         assert!(
             b.upgraded.recv_timeout(Duration::from_millis(100)).is_err(),
             "B must be waiting for A's admission"
@@ -136,6 +137,7 @@ fn abandoned_flood_trial(flood_after_b_waits: bool) {
         abandoned_upgrade_flood(address, path);
     } else {
         abandoned_upgrade_flood(address, path);
+        b = abandoned_flood_peer(address, "B");
         assert!(
             b.upgraded.recv_timeout(Duration::from_millis(100)).is_err(),
             "B must wait rather than be admitted while A is live"
