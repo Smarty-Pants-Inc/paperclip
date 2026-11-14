@@ -779,18 +779,18 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         method: "POST", headers: { authorization: `Bearer ${broker.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}` },
       });
       try {
-        const releaseA = broker.activate(input);
+        const releaseA = await broker.activate(input);
         const a = await post();
         expect(a.status).toBe(200);
         expect((await a.json()).login).toBe("A");
         await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, input.runId));
         // Even a delayed controller release cannot authorize a finished DB run.
         expect((await post()).status).toBe(403);
-        releaseA();
+        await releaseA();
         const next = { ...input, runId: randomUUID() };
         await db.insert(heartbeatRuns).values({ id: next.runId, companyId: next.companyId, agentId: next.agentId, status: "running", contextSnapshot: { issueId: input.issueId } });
         await initializeRunIdentity(db, { companyId: input.companyId, runId: next.runId, responsibleUserId: "B", cause: "instruction" });
-        broker.activate(next);
+        await broker.activate(next);
         const b = await post();
         expect(b.status).toBe(200);
         expect((await b.json()).login).toBe("B");

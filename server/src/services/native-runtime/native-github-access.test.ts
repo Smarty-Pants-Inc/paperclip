@@ -110,12 +110,12 @@ it.each([false, true])("resolves managed GitHub credentials from OpenCode shell 
     }
     return JSON.parse(await readFile(path.join(b.root, "github", "data", "fake-github-operation.json"), "utf8"));
   };
-  const releaseA = b.activate(run("a"));
+  const releaseA = await b.activate(run("a"));
   expect(await operate()).toMatchObject({ stdout: "fixture-a", error: null });
-  releaseA();
-  const releaseB = b.activate(run("b"));
+  await releaseA();
+  const releaseB = await b.activate(run("b"));
   expect(await operate()).toMatchObject({ stdout: "fixture-b", error: null });
-  releaseB();
+  await releaseB();
   expect(await operate()).toMatchObject({ stdout: "anonymous", error: null });
   expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["a", "b"]);
   const childEnvironment = JSON.parse(await readFile(path.join(b.root, "github", "data", "fake-environment.json"), "utf8"));
@@ -132,26 +132,26 @@ it("uses the selected duplex transport across credential rotation without file p
   } }));
   const commandsAfterStartup = b.execute.mock.calls.length;
   expect((await request(b)).status).toBe(403);
-  const releaseA = b.activate(run("a"));
+  const releaseA = await b.activate(run("a"));
   expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-a" } });
-  releaseA();
+  await releaseA();
   expect((await request(b)).status).toBe(403);
-  const releaseB = b.activate(run("b"));
-  releaseA();
+  const releaseB = await b.activate(run("b"));
+  await releaseA();
   expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-b" } });
   expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["a", "b"]);
   expect(recorder.recordSpan).toHaveBeenCalledWith(expect.objectContaining({ name: "sandbox.duplex.request" }));
   expect(recorder.emitEvent).not.toHaveBeenCalledWith(expect.objectContaining({ dimensions: expect.objectContaining({ transport: "file" }) }));
   expect(b.execute.mock.calls).toHaveLength(commandsAfterStartup);
-  releaseB();
+  await releaseB();
   await b.stop();
-  expect(() => b.activate(run("c"))).toThrow("closed");
+  await expect(b.activate(run("c"))).rejects.toThrow("closed");
 });
 it("marks a lost HTTP/2 bridge unavailable before the next warm admission", async () => {
   const b = await broker(undefined, true, false, undefined, { enabled: true, capability: true });
-  const release = b.activate(run("a"));
+  const release = await b.activate(run("a"));
   expect((await request(b)).status).toBe(200);
-  release();
+  await release();
   expect(b.ready).toBe(true);
   const channel = await b.openDuplexChannel.mock.results[0]!.value;
   channel.stop();
@@ -160,9 +160,9 @@ it("marks a lost HTTP/2 bridge unavailable before the next warm admission", asyn
 it("closes a healthy HTTP/2 bridge without reporting a lost active run", async () => {
   const onLog = vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => undefined);
   const b = await broker(undefined, true, false, onLog, { enabled: true, capability: true });
-  const release = b.activate(run("a"));
+  const release = await b.activate(run("a"));
   expect((await request(b)).status).toBe(200);
-  release();
+  await release();
   await b.stop();
   expect(b.ready).toBe(false);
   expect(onLog.mock.calls.filter(([, chunk]) => chunk.includes("channel lost"))).toEqual([]);
@@ -176,10 +176,10 @@ it.each([
   const b = await broker(undefined, true, false, undefined, options);
   expect(b.bridgeModes).toEqual(["queue_v1"]);
   expect(b.openDuplexChannel).toHaveBeenCalledTimes(options.opens);
-  const release = b.activate(run("fallback"));
+  const release = await b.activate(run("fallback"));
   expect(await (await request(b)).json()).toMatchObject({ env: { GH_TOKEN: "fixture-fallback" } });
-  release();
-  expect((await request(b)).status).toBe(403);
+  await release();
+  expect((await request(b)).status).toBe(503);
 });
 it.each([false, true])("keeps one live parent and its original launcher environment across two authorized runs (callback bridge: %s)", async (remote) => {
   const b = await broker(undefined, remote);
@@ -194,29 +194,30 @@ it.each([false, true])("keeps one live parent and its original launcher environm
   const operation = () => new Promise<{ pid: number; value: string; stderr: string }>(resolve => {
     lines.once("line", line => resolve(JSON.parse(line))); parent.stdin.write("run\n");
   });
-  expect((await request(b)).status).toBe(403);
-  const releaseA = b.activate(run("run-a"));
+  expect((await request(b)).status).toBe(remote ? 503 : 403);
+  const releaseA = await b.activate(run("run-a"));
   const a = await operation();
   expect(a.value).toBe("fixture-run-a");
-  releaseA();
+  await releaseA();
+  expect((await request(b)).status).toBe(remote ? 503 : 403);
   expect((await operation()).value).toBe("anonymous");
-  const releaseB = b.activate(run("run-b"));
-  releaseA(); // A's delayed cleanup cannot revoke B.
+  const releaseB = await b.activate(run("run-b"));
+  await releaseA(); // A's delayed cleanup cannot revoke B.
   const second = await operation();
   expect(second.value).toBe("fixture-run-b");
   expect(second.pid).toBe(a.pid);
   expect(b.resolveCredentials.mock.calls.map(([binding]) => binding.runId)).toEqual(["run-a", "run-b"]);
   expect(await readFile(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), "utf8")).not.toContain(b.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
-  releaseB(); await b.stop();
+  await releaseB(); await b.stop();
   await expect(access(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).rejects.toThrow();
 }, 45_000);
 it("rejects other scopes, concurrent bindings, browser requests and forged authority", async () => {
   const b = await broker();
   for (const field of ["companyId", "agentId", "issueId"] as const) {
-    expect(() => b.activate({ ...run("a"), [field]: "other" })).toThrow("scope mismatch");
+    await expect(b.activate({ ...run("a"), [field]: "other" })).rejects.toThrow("scope mismatch");
   }
-  const release = b.activate(run("a"));
-  expect(() => b.activate(run("b"))).toThrow("busy");
+  const release = await b.activate(run("a"));
+  await expect(b.activate(run("b"))).rejects.toThrow("busy");
   const rejectedHeaders: Record<string, string>[] = [{ authorization: "Bearer wrong" }, { authorization: "é".repeat(71) },
     { authorization: `Bearer ${b.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}`, origin: "https://browser.test" }];
   for (const headers of rejectedHeaders) {
@@ -228,17 +229,17 @@ it("rejects other scopes, concurrent bindings, browser requests and forged autho
   expect(response.status).toBe(200);
   expect(response.headers.get("cache-control")).toBe("no-store");
   expect(b.resolveCredentials).toHaveBeenCalledExactlyOnceWith(run("a"));
-  release(); await b.stop();
-  expect(() => b.activate(run("b"))).toThrow("closed");
+  await release(); await b.stop();
+  await expect(b.activate(run("b"))).rejects.toThrow("closed");
 });
 it("does not release an in-flight credential after its run has been replaced", async () => {
   let complete!: (value: { status: string; env: { GH_TOKEN: string } }) => void;
   const resolver = vi.fn(() => new Promise<{ status: string; env: { GH_TOKEN: string } }>(resolve => { complete = resolve; }));
   const b = await broker(resolver);
-  const release = b.activate(run("a"));
+  const release = await b.activate(run("a"));
   const pending = request(b);
   await vi.waitFor(() => expect(resolver).toHaveBeenCalledOnce());
-  release(); b.activate(run("b"));
+  await release(); await b.activate(run("b"));
   complete({ status: "available", env: { GH_TOKEN: "must-not-escape" } });
   const response = await pending;
   expect(response.status).toBe(403);
@@ -246,7 +247,7 @@ it("does not release an in-flight credential after its run has been replaced", a
 });
 it.each([403, 409, 500])("preserves denial/steering without leaking errors (%s)", async (status) => {
   const b = await broker(vi.fn(async () => { throw Object.assign(new Error("secret-value"), { status }); }));
-  b.activate(run("a"));
+  await b.activate(run("a"));
   const response = await request(b);
   expect(response.status).toBe(status === 500 ? 503 : status);
   expect(await response.text()).not.toContain("secret-value");
@@ -256,7 +257,7 @@ it.each([false, true])("keeps anonymous launchers usable when the remote broker 
   const onLog = vi.fn(async () => { if (loggingFails) throw new Error("fixture log sink unavailable"); });
   const b = await broker(undefined, true, true, onLog);
   expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining("continuing without managed GitHub access"));
-  b.activate(run("a"));
+  await b.activate(run("a"));
   expect(b.ready).toBe(false);
   expect(b.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("");
   const result = await promisify(execFile)(path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, "gh"), [], {
