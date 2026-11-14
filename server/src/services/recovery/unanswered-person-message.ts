@@ -269,6 +269,8 @@ type HeldReplyMetadata = {
   cardRole?: "active_hold" | "continuation_reference" | null;
   continuationCardIds: string[];
   state: "waiting_for_card" | "generic" | "card_answered_no_reply" | "superseded";
+  /** On a follow-up note (state card_answered_no_reply): the follow-up run it reports, or null when none started. */
+  followUpRunId?: string | null;
   superseded?: boolean;
   supersededAt?: string;
   supersededByCommentId?: string;
@@ -331,6 +333,7 @@ function readHeldReplyMetadata(value: unknown): HeldReplyMetadata | null {
       ? held.continuationCardIds.filter((id): id is string => typeof id === "string") : [],
     state: held.state === "superseded" || held.state === "card_answered_no_reply" || held.state === "waiting_for_card"
       ? held.state : "generic",
+    ...(typeof held.followUpRunId === "string" || held.followUpRunId === null ? { followUpRunId: held.followUpRunId as string | null } : {}),
     ...(held.superseded === true ? { superseded: true } : {}),
     ...(typeof held.supersededAt === "string" ? { supersededAt: held.supersededAt } : {}),
     ...(typeof held.supersededByCommentId === "string" ? { supersededByCommentId: held.supersededByCommentId } : {}),
@@ -361,11 +364,14 @@ function heldReplyMetadataSql(metadata: SQL | AnyPgColumn): SQL {
 }
 
 function heldReplyOutstandingSql(metadata: SQL | AnyPgColumn): SQL {
-  return sql`exists (select 1 from jsonb_array_elements(coalesce(${metadata}->'sections', '[]'::jsonb)) held_section,
+  // A card accept (supersededByInteractionId) keeps the record open: that
+  // card's follow-up still decides. A comment (supersededBy) closes it.
+  return sql`(coalesce(${metadata}->>'supersededBy', '') = '' and exists (select 1
+    from jsonb_array_elements(coalesce(${metadata}->'sections', '[]'::jsonb)) held_section,
     jsonb_array_elements(coalesce(held_section->'rows', '[]'::jsonb)) held_row
     where held_section->>'title' = ${HELD_REPLY_METADATA_SECTION}
       and held_row->>'label' = ${HELD_REPLY_METADATA_LABEL}
-      and coalesce(held_row->>'value', '') not like '%\"superseded\":true%')`;
+      and coalesce(held_row->>'value', '') not like '%\"superseded\":true%'))`;
 }
 
 /**
@@ -417,7 +423,6 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       and n.author_type = 'system' and n.deleted_at is null
       and ${notSupersededSql(sql.raw("n.metadata"))}
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and not ${heldReplyMetadataSql(sql.raw("n.metadata"))}
       and ${answeredSql(rawMessage("m"))}))`;
 }
 
@@ -444,7 +449,6 @@ export function unansweredPersonMessageCommentCondition(): SQL {
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and ${notSupersededSql(issueComments.metadata)}
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and not ${heldReplyMetadataSql(issueComments.metadata)}
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
@@ -501,6 +505,18 @@ function heldReplyBody(agentName: string, cardName: string | null, relatedCardNa
   return `${agentName} answered, but Paperclip kept that reply in the run's activity instead of this chat. No active question card explains the hold.`;
 }
 
+/** Paperclip's durable continuation state, read as for the message's own run
+ * (SMA-189): a follow-up whose native finalization is still pending, or whose
+ * same-run resume is scheduled and not overdue, has not ended (RFL d8line2 F5). */
+async function followUpStillAtWork(q: Db, companyId: string, runId: string, now: Date): Promise<boolean> {
+  const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
+    .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId), eq(nativeRunFinalizations.runId, runId)));
+  if (!coordinator) return false;
+  if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) return true;
+  return coordinator.phase === "retryable_failure"
+    && (!coordinator.nextAttemptAt || coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime());
+}
+
 async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date): Promise<void> {
   const [candidate] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
@@ -513,83 +529,108 @@ async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date):
     // continuation reply, and this history update therefore settle serially.
     await tx.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const notes = await tx.select({ id: issueComments.id, metadata: issueComments.metadata,
-      presentation: issueComments.presentation, body: issueComments.body, createdAt: issueComments.createdAt })
+    const q = tx as unknown as Db;
+    const notes = await tx.select({ id: issueComments.id, metadata: issueComments.metadata, createdAt: issueComments.createdAt })
       .from(issueComments).where(and(
         eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
         eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
         sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
         heldReplyOutstandingSql(issueComments.metadata),
-      ));
+      )).orderBy(issueComments.createdAt, issueComments.id);
+    type Note = (typeof notes)[number];
 
+    // Never edit or delete a posted note (org 09:18Z; RFL d8line2 F1/F2): the
+    // note is kept byte-identical, its held record is closed, and it is marked
+    // metadata.supersededBy = the comment that took its place.
+    const supersede = async (note: Note, held: HeldReplyMetadata, byCommentId: string, byRunId?: string | null) => {
+      const nextHeld: HeldReplyMetadata = { ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
+        supersededByCommentId: byCommentId, ...(byRunId ? { supersededByRunId: byRunId } : {}) };
+      const metadata = { ...withHeldReplyMetadata(note.metadata, nextHeld), supersededBy: byCommentId } as never;
+      await tx.update(issueComments).set({ metadata, updatedAt: now })
+        .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
+    };
+
+    type Group = { cardIds: string[]; ended: { id: string; status: string; agentId: string; errorCode: string | null } | null;
+      members: Array<{ note: Note; held: HeldReplyMetadata }> };
+    const groups = new Map<string, Group>();
+    const followUpNotes: Array<{ note: Note; held: HeldReplyMetadata }> = [];
     for (const note of notes) {
       const held = readHeldReplyMetadata(note.metadata);
       if (!held || held.superseded) continue;
       const candidateIds = [...new Set([held.cardId, ...held.continuationCardIds].filter((id): id is string => Boolean(id)))];
-      const answeredCards = candidateIds.length
-        ? await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+      const answeredIds = candidateIds.length
+        ? (await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
             eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
-            eq(issueThreadInteractions.status, "answered"), inArray(issueThreadInteractions.id, candidateIds)))
+            eq(issueThreadInteractions.status, "answered"), inArray(issueThreadInteractions.id, candidateIds)))).map(card => card.id)
         : [];
-      let published: { id: string; runId: string | null } | undefined;
-      if (answeredCards.length) {
-        [published] = await tx.select({ id: issueComments.id, runId: issueComments.createdByRunId })
-          .from(issueComments).innerJoin(heartbeatRuns, eq(heartbeatRuns.id, issueComments.createdByRunId))
-          .where(and(
-            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-            eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt),
-            gt(issueComments.createdAt, note.createdAt),
-            inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'interactionId'`, answeredCards.map(card => card.id)),
-          )).orderBy(issueComments.createdAt).limit(1);
-      }
-
+      // The visible reply that answers this note (F1/F2): the held run's own
+      // reply published later, or a continuation reply of one of its answered
+      // cards. The same check serves a held note and a follow-up note.
+      const [published] = await tx.select({ id: issueComments.id, runId: issueComments.createdByRunId })
+        .from(issueComments).leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, issueComments.createdByRunId),
+          eq(heartbeatRuns.companyId, issueComments.companyId)))
+        .where(and(
+          eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+          eq(issueComments.authorType, "agent"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, note.createdAt),
+          or(eq(issueComments.createdByRunId, held.sourceRunId), answeredIds.length
+            ? inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'interactionId'`, answeredIds) : sql`false`),
+        )).orderBy(issueComments.createdAt, issueComments.id).limit(1);
       if (published) {
-        const nextHeld: HeldReplyMetadata = {
-          ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
-          supersededByCommentId: published.id, supersededByRunId: published.runId ?? undefined,
-        };
-        const metadata = withHeldReplyMetadata(note.metadata, nextHeld) as never;
-        const body = `Earlier: ${note.body} The card was answered and a later reply was posted in this chat.`;
-        const presentation = note.presentation ? { ...note.presentation, title: "A later reply was posted" } : note.presentation;
-        await tx.update(issueComments).set({ body, presentation, metadata, updatedAt: now })
-          .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
+        await supersede(note, held, published.id, published.runId);
         continue;
       }
+      // A follow-up note already says what happened; only a reply replaces it.
+      if (held.state === "card_answered_no_reply") { followUpNotes.push({ note, held }); continue; }
+      if (!answeredIds.length) continue;
+      // RFL 10:12Z (R2): the card was answered and no reply is visible. Once
+      // its follow-up has truly ENDED without one (or none started within the
+      // no-run grace), ONE NEW note per (card, follow-up) says so (F3).
+      const continuationRuns = await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+        agentId: heartbeatRuns.agentId, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, issue.companyId),
+          or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+          inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'interactionId'`, answeredIds),
+        )).orderBy(desc(heartbeatRuns.createdAt)).limit(5);
+      if (continuationRuns.some(candidate => LIVE.includes(candidate.status))) continue;
+      const ended = continuationRuns[0] ?? null;
+      if (ended && await followUpStillAtWork(q, issue.companyId, ended.id, now)) continue;
+      if (!ended) {
+        const [answeredCard] = await tx.select({ resolvedAt: issueThreadInteractions.resolvedAt }).from(issueThreadInteractions)
+          .where(and(eq(issueThreadInteractions.companyId, issue.companyId), inArray(issueThreadInteractions.id, answeredIds)))
+          .orderBy(desc(issueThreadInteractions.resolvedAt)).limit(1);
+        const answeredAt = answeredCard?.resolvedAt?.getTime() ?? now.getTime();
+        if (answeredAt + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS > now.getTime()) continue;
+      }
+      const cardIds = [...answeredIds].sort();
+      const key = `${cardIds.join(",")}|${ended?.id ?? ""}`;
+      const group = groups.get(key) ?? { cardIds, ended, members: [] };
+      group.members.push({ note, held });
+      groups.set(key, group);
+    }
 
-      if (answeredCards.length && held.state !== "card_answered_no_reply") {
-        // RFL 10:12Z (R2): the card was answered and no continuation reply is
-        // visible. Never edit the posted note in place (it may have been read;
-        // notes are history, org 09:18Z): once the follow-up has ENDED without
-        // a reply (or none started within the no-run grace), post ONE NEW true
-        // note with the next action (chat-aware) and mark this note superseded.
-        const continuationRuns = await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
-          agentId: heartbeatRuns.agentId, errorCode: heartbeatRuns.errorCode })
-          .from(heartbeatRuns).where(and(
-            eq(heartbeatRuns.companyId, issue.companyId),
-            or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
-            inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'interactionId'`, answeredCards.map(card => card.id)),
-          )).orderBy(desc(heartbeatRuns.createdAt)).limit(5);
-        if (continuationRuns.some(candidate => LIVE.includes(candidate.status))) continue;
-        const ended = continuationRuns[0] ?? null;
-        if (!ended) {
-          const [answeredCard] = await tx.select({ resolvedAt: issueThreadInteractions.resolvedAt }).from(issueThreadInteractions)
-            .where(and(eq(issueThreadInteractions.companyId, issue.companyId), inArray(issueThreadInteractions.id, answeredCards.map(card => card.id))))
-            .orderBy(desc(issueThreadInteractions.resolvedAt)).limit(1);
-          const answeredAt = answeredCard?.resolvedAt?.getTime() ?? now.getTime();
-          if (answeredAt + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS > now.getTime()) continue;
-        }
+    for (const group of groups.values()) {
+      // ONE current note per (card, follow-up) (F3): a follow-up note an
+      // earlier sweep posted for the same card and follow-up takes these too.
+      const existing = followUpNotes.find(({ held }) => (held.followUpRunId ?? null) === (group.ended?.id ?? null)
+        && held.continuationCardIds.some(id => group.cardIds.includes(id)));
+      let targetId = existing?.note.id ?? null;
+      if (!targetId) {
+        const latest = group.members[group.members.length - 1]!;
         const [run] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
-          .where(and(eq(heartbeatRuns.id, held.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId))).limit(1);
+          .where(and(eq(heartbeatRuns.id, latest.held.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId))).limit(1);
         const [agent] = run ? await tx.select({ name: agents.name }).from(agents)
           .where(and(eq(agents.id, run.agentId), eq(agents.companyId, issue.companyId))).limit(1) : [];
         const agentName = agent?.name?.trim() || "the agent";
         const chat = Boolean(issue.conversationAgentId && issue.conversationUserId);
-        const card = held.cardName ? `The card "${held.cardName}"` : "A question card";
+        const card = latest.held.cardName ? `The card "${latest.held.cardName}"` : "A question card";
+        const ended = group.ended;
         const outcome = !ended ? `no follow-up run started for ${agentName}.`
           : ended.status === "succeeded" ? `${agentName}'s follow-up run ended without a reply in this chat.`
           : `${agentName}'s follow-up run failed before it replied in this chat.`;
-        const reason = typeof objectRecord(note.metadata).authorizationReason === "string"
-          ? objectRecord(note.metadata).authorizationReason as string : null;
+        // The note carries the LATEST held message's key, so that message reads as noticed.
+        const reason = typeof objectRecord(latest.note.metadata).authorizationReason === "string"
+          ? objectRecord(latest.note.metadata).authorizationReason as string : null;
         const fresh = buildStrandedRecoveryEscalationNotice({
           seed: {
             title: "No reply after the card was answered",
@@ -603,37 +644,23 @@ async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date):
           recoveryResponsibility: "user",
           sourceRun: ended ? { id: ended.id, agentId: ended.agentId, status: ended.status, errorCode: ended.errorCode } : null,
         });
-        const comment = await issueService(tx as unknown as Db).addComment(issue.id, fresh.body, {}, {
+        // F2: the follow-up note keeps the held/card relation (its own held
+        // record), so a late reply supersedes it and nothing deletes it.
+        const record: HeldReplyMetadata = {
+          version: 1, sourceRunId: latest.held.sourceRunId, cardId: latest.held.cardId, cardName: latest.held.cardName,
+          relatedCardName: latest.held.relatedCardName ?? null, cardRole: latest.held.cardRole ?? null,
+          continuationCardIds: [...new Set(group.members.flatMap(({ held }) => [held.cardId, ...held.continuationCardIds])
+            .filter((id): id is string => Boolean(id)))],
+          state: "card_answered_no_reply", followUpRunId: ended?.id ?? null,
+        };
+        const comment = await issueService(q).addComment(issue.id, fresh.body, {}, {
           authorType: "system", presentation: fresh.presentation,
-          metadata: { ...fresh.metadata, ...(reason ? { authorizationReason: reason } : {}) },
+          metadata: withHeldReplyMetadata({ ...fresh.metadata, ...(reason ? { authorizationReason: reason } : {}) }, record) as never,
         }, tx);
         if (!comment?.id) continue;
-        const nextHeld: HeldReplyMetadata = { ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
-          supersededByCommentId: comment.id };
-        const metadata = { ...withHeldReplyMetadata(note.metadata, nextHeld), supersededBy: comment.id } as never;
-        await tx.update(issueComments).set({ metadata, updatedAt: now })
-          .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
-      } else if (!candidateIds.length) {
-        // A generic held note has no card transition to follow. If its own run
-        // later becomes visibly published, preserve the note as history too.
-        const [publishedSourceReply] = await tx.select({ id: issueComments.id })
-          .from(issueComments).where(and(
-            eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-            eq(issueComments.authorType, "agent"), eq(issueComments.createdByRunId, held.sourceRunId),
-            isNull(issueComments.deletedAt), gt(issueComments.createdAt, note.createdAt),
-          )).orderBy(issueComments.createdAt).limit(1);
-        if (publishedSourceReply) {
-          const nextHeld: HeldReplyMetadata = {
-            ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
-            supersededByCommentId: publishedSourceReply.id, supersededByRunId: held.sourceRunId,
-          };
-          const metadata = withHeldReplyMetadata(note.metadata, nextHeld) as never;
-          const body = `Earlier: ${note.body} The held reply was later posted in this chat.`;
-          const presentation = note.presentation ? { ...note.presentation, title: "The held reply was posted" } : note.presentation;
-          await tx.update(issueComments).set({ body, presentation, metadata, updatedAt: now })
-            .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
-        }
+        targetId = comment.id;
       }
+      for (const member of group.members) await supersede(member.note, member.held, targetId);
     }
   });
 }
@@ -661,7 +688,7 @@ export async function settleUnansweredPersonMessage(
   const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
-    sql`not ${heldReplyMetadataSql(issueComments.metadata)}`, notSupersededSql(issueComments.metadata),
+    notSupersededSql(issueComments.metadata),
     or(sql`starts_with(${reasonOf(issueComments.metadata)}, ${UNANSWERED_MESSAGE_REASON_PREFIX})`,
       sql`starts_with(${reasonOf(issueComments.metadata)}, ${RETRYING_MESSAGE_REASON_PREFIX})`))).limit(1);
   if (liveNotice) await db.transaction(async tx => {
@@ -678,7 +705,6 @@ export async function settleUnansweredPersonMessage(
       and ${notSupersededSql(sql.raw("n.metadata"))}
       and (starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
-      and not ${heldReplyMetadataSql(sql.raw("n.metadata"))}
       and exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
         and ${answeredSql(rawMessage("m"))})`);
@@ -1095,7 +1121,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     const continuationCards = await q.select({ id: issueThreadInteractions.id, title: issueThreadInteractions.title,
       summary: issueThreadInteractions.summary, payload: issueThreadInteractions.payload }).from(issueThreadInteractions).where(and(
         eq(issueThreadInteractions.companyId, issue.companyId), eq(issueThreadInteractions.issueId, issue.id),
-        eq(issueThreadInteractions.kind, "ask_user_questions"), eq(issueThreadInteractions.status, "pending"),
+        eq(issueThreadInteractions.kind, "ask_user_questions"),
+        // RFL d8line2 F4: a card the person answered AFTER this message (the
+        // answer won the race with the first sweep) is still this hold's
+        // continuation reference; an older answered card is history (R3).
+        or(eq(issueThreadInteractions.status, "pending"), and(eq(issueThreadInteractions.status, "answered"),
+          sql`${issueThreadInteractions.resolvedAt} >= ${message.createdAt.toISOString()}::timestamptz`)),
         isNull(issueThreadInteractions.dismissedAt), sql`${issueThreadInteractions.sourceRunId} is distinct from ${run.id}`,
         sql`${issueThreadInteractions.createdAt} <= ${run.createdAt.toISOString()}::timestamptz`,
       )).orderBy(desc(issueThreadInteractions.createdAt), desc(issueThreadInteractions.id)).limit(20);
