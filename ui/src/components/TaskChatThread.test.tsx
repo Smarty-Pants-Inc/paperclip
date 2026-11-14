@@ -30,7 +30,10 @@ import { TaskChatScrollNavigation, useTaskChatScrollNavigation } from "./task-ch
 import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
 import type { HeartbeatRunEvent } from "@paperclipai/shared";
 import type { HeartbeatRun } from "@paperclipai/shared";
+import { isCurrentNotice } from "@paperclipai/shared";
 import { waitForStoppedRuns } from "@/lib/wait-for-stopped-runs";
+import rflHeldNoteRows from "@/fixtures/bprime-held-notes/rfl-faf2a201-ui-notice-rows.json";
+import lineHeldNoteRows from "@/fixtures/bprime-held-notes/line-cd45a050-ui-notice-rows.json";
 
 const transcriptState = vi.hoisted(() => ({
   transcriptByRun: new Map(),
@@ -6345,6 +6348,27 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       expect(notice.deletedAt).toBeNull();
       expect(notice.metadata.supersededBy).toBe("answer-comment");
     });
+
+    // RFL bprime-line1 A3 (11:07Z, score 12), replayed through the REAL component: actual PostgreSQL rows of two
+    // held messages (2 kept notes, 1 current), from RFL's judge on faf2a201 (ui-notice-rows.json, sha256 a710e66b...)
+    // and from the same export on this line (cd45a050). The live view (compactHistory) renders exactly ONE B' note,
+    // the current one; expanded history still renders the kept superseded row (RFL supnotice F2).
+    it.each([["RFL's faf2a201 rows", rflHeldNoteRows], ["this line's cd45a050 rows", lineHeldNoteRows]])(
+      "A3 replay (%s): the live chat renders exactly ONE held note, the current one; expanded history keeps the superseded row", (_name, rows) => {
+        type Row = Record<string, unknown> & { id: string; metadata: unknown; createdAt: string; updatedAt: string };
+        const comments = (rows as unknown as Row[]).map(row => ({ ...row,
+          createdAt: new Date(row.createdAt), updatedAt: new Date(row.updatedAt), deletedAt: null }));
+        expect(comments).toHaveLength(2);
+        const current = comments.filter(comment => isCurrentNotice(comment.metadata));
+        expect(current, "the persisted rows: 2 kept, 1 current").toHaveLength(1);
+        const superseded = comments.find(comment => !isCurrentNotice(comment.metadata))!;
+        const rendered = () => comments.filter(comment => anchor(comment.id) !== null).map(comment => comment.id);
+        paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true });
+        expect(rendered(), "live view: exactly ONE held note, the current one").toEqual([current[0]!.id]);
+        paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: false });
+        expect(rendered(), "expanded history: the kept superseded row is reachable").toContain(superseded.id);
+        expect(rendered()).toContain(current[0]!.id);
+      });
 
     it("(b) hides the same comment when recoveryResponsibility is 'system' (upstream's filter kept)", () => {
       paint({ comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5, { recoveryResponsibility: "system" })],
