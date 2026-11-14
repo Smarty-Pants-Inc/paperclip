@@ -330,11 +330,13 @@ export const NEW_TASK_CONTINUE_ACTION = "Create a new task to continue the work.
 
 /**
  * The banner never names a Retry the person cannot press. When Retry is not
- * offered, a sentence directing to it is replaced: "Retry or send a message"
- * keeps the message, and any other Retry instruction becomes the new-task
- * action. Smarty fork (C9 M1.1, TEMPORARY): stored recovery copy such as
- * UNRESTORED_FILES_NEXT_ACTION says "Press Retry" while a restore hold
- * disables it.
+ * offered, every sentence that directs to Retry (including "Retry or send a
+ * message") is replaced by the new-task action, which is always available.
+ * It is not replaced by "send a message": where Retry is refused (a restore
+ * hold, a held conversation, a refusal a click cannot change) a new message
+ * can be refused the same way. Smarty fork (C9 M1.1, TEMPORARY): stored
+ * recovery copy such as UNRESTORED_FILES_NEXT_ACTION (#21348) says "Press
+ * Retry" while a restore hold disables it.
  */
 export function withoutUnavailableRetry(text: string, retryOffered: boolean): string {
   if (retryOffered || !/\bRetry\b/.test(text)) return text;
@@ -343,7 +345,6 @@ export function withoutUnavailableRetry(text: string, retryOffered: boolean): st
   const kept = sentences.flatMap(sentence => {
     const trimmed = sentence.trim();
     if (!/\bRetry\b/.test(trimmed)) return [trimmed];
-    if (/^Retry or send a (new )?message\b/i.test(trimmed)) return ["Send a message to continue."];
     replaced = true;
     return [];
   });
