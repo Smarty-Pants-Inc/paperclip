@@ -520,7 +520,7 @@ describe("successful run handoff decision", () => {
       kind: "system_notice",
       tone: "warning",
       title: "Missing issue disposition",
-      detailsDefaultOpen: false,
+      detailsDefaultOpen: true,
     });
     expect(notice.metadata.sourceRunId).toBe("22222222-2222-4222-8222-222222222222");
     expect(notice.metadata.sections).toEqual(expect.arrayContaining([
@@ -583,7 +583,7 @@ describe("successful run handoff decision", () => {
     expect(notice.presentation).toMatchObject({
       kind: "system_notice",
       tone: "danger",
-      detailsDefaultOpen: false,
+      detailsDefaultOpen: true,
     });
     expect(notice.metadata.sourceRunId).toBe("22222222-2222-4222-8222-222222222222");
     expect(notice.metadata.sections).toEqual(expect.arrayContaining([
