@@ -72,6 +72,17 @@ describe("owned Pi bind extension", () => {
     await rm(path);
     expect(() => readPiBindInitial({ PAPERCLIP_PI_BIND_INITIAL: inline, PAPERCLIP_PI_BIND_INITIAL_FILE: path })).toThrow("rejected");
   });
+  it("measures actual active native/add-on tools, excluding the currently registered host tools", async () => {
+    const f = await fixture({ initial: { ...initial, tools: [{ name: "host_tool", description: "host tool", inputSchema: { type: "object" } }] } });
+    f.pi.setActiveTools([...f.active(), "subagent"]);
+    expect(await sendPiBindRequest(f.socketPath, { schema: 1, type: "tool_inventory", nonce: "inventory", sessionId: "session" })).toMatchObject({ type: "tool_inventory", nativeTools: ["read", "subagent"] });
+  });
+  it.each(["openai-completions", "anthropic-messages", "openai-responses"] as const)("guards the final request only for an API with a documented cap: %s", async api => {
+    const f = await fixture(); f.ctx.model!.api = api;
+    const request = () => f.emit("before_provider_request", { payload: { tools: Array.from({ length: 129 }, () => ({})) } });
+    if (api === "openai-completions") { expect(request).toThrow("total tool cap 128"); expect(f.ctx.abort).toHaveBeenCalledTimes(1); }
+    else { expect(request).not.toThrow(); expect(f.ctx.abort).not.toHaveBeenCalled(); }
+  });
   it("bootstraps immutable first authority without any socket roundtrip or provider registration", async () => {
     const f = await fixture();
     expect(f.pi.registerProvider).not.toHaveBeenCalled();

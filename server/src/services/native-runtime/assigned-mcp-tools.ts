@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { Db } from "@paperclipai/db";
+import { toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
+import { and, eq, or } from "drizzle-orm";
 import { logger } from "../../middleware/logger.js";
 import { admitToolInputSchema, canonicalToolInputSchema, TOOL_INPUT_SCHEMA_MAX_BYTES } from "../../vendor/paperclip-runner/index.js";
 import { deduplicateToolDescriptors, ToolGatewayHttpError, type ToolGatewayDescriptor, type ToolGatewayService } from "../tool-gateway.js";
@@ -119,6 +120,27 @@ async function admitAssignedToolSchema(serialized: string, schema: Record<string
   return outcome.ok ? { ok: true, schema: canonicalToolInputSchema(schema)!.schema } : outcome;
 }
 
+type ConnectionProvenance = { connectionId: string; connectionName: string; installedAt?: string };
+
+/** Snapshot the earliest install that actually exposes a connection to this
+ * agent (direct agent grant or company install), not connection creation/name.
+ */
+export async function assignedToolConnectionProvenance(db: Db, binding: { companyId: string; agentId: string }): Promise<Map<string, ConnectionProvenance>> {
+  const rows = await db.select({ connectionId: toolConnectionInstalls.connectionId, connectionName: toolConnections.name, createdAt: toolConnectionInstalls.createdAt })
+    .from(toolConnectionInstalls).innerJoin(toolConnections, and(eq(toolConnections.id, toolConnectionInstalls.connectionId), eq(toolConnections.companyId, toolConnectionInstalls.companyId)))
+    .where(and(eq(toolConnectionInstalls.companyId, binding.companyId), or(
+      and(eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, binding.companyId)),
+      and(eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, binding.agentId)),
+    )));
+  const provenance = new Map<string, ConnectionProvenance>();
+  for (const row of rows) {
+    const installedAt = row.createdAt.toISOString();
+    const previous = provenance.get(row.connectionId);
+    if (!previous?.installedAt || installedAt < previous.installedAt) provenance.set(row.connectionId, { connectionId: row.connectionId, connectionName: row.connectionName, installedAt });
+  }
+  return provenance;
+}
+
 /** Server-owned MCP bindings projected into the runner's existing tool channel. */
 export async function createAssignedMcpTools(input: {
   gateway: ToolGatewayService;
@@ -127,11 +149,14 @@ export async function createAssignedMcpTools(input: {
   workMode?: WorkMode;
   /** Bound provider grammar complexity independently of protocol byte capacity. */
   delivery?: "on_demand";
+  /** Host-private Pi selection provenance, never forwarded in a provider schema. */
+  provenanceBinding?: { db: Db; companyId: string; agentId: string };
 }) {
   const listed = await input.gateway.listToolsForNamedGateway({
     gatewayPublicId: input.gatewayPublicId,
     bearerToken: input.bearerToken,
   });
+  const provenance = input.provenanceBinding && listed.length ? await assignedToolConnectionProvenance(input.provenanceBinding.db, input.provenanceBinding) : new Map<string, ConnectionProvenance>();
   const tools = new Map<string, ToolGatewayDescriptor>();
   const schemas = new Map<string, Record<string, unknown>>();
   const unavailable: Array<{ tool: string; reason: string }> = [];
@@ -253,6 +278,12 @@ export async function createAssignedMcpTools(input: {
       const compact = structuredClone(ON_DEMAND_TOOLS);
       if (fits && !fits(compact)) throw new Error("assigned_mcp_tool_catalog_capacity_exceeded");
       return compact;
+    },
+    provenance(name: string): ConnectionProvenance | undefined {
+      const descriptor = tools.get(name);
+      if (!descriptor) return undefined;
+      const connectionId = descriptor.connectionId ?? "unattributed";
+      return provenance.get(connectionId) ?? { connectionId, connectionName: descriptor.connectionId ?? "Unattributed gateway tools" };
     },
     has(name: string): boolean {
       return tools.has(name) || name === SEARCH_TOOL || name === CALL_TOOL;

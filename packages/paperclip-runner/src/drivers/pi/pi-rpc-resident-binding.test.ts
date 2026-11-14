@@ -66,29 +66,44 @@ class FakeTransport {
   } }) }; }
   async close() { this.closed = this.exited = true; this.#wake?.({ value: undefined, done: true }); this.#wake = undefined; }
 }
-async function faux() {
+async function faux(protocol: "chat" | "messages" = "chat", rejectForSize = false) {
   const requests: Array<Record<string, any>> = [];
   const server = httpServer((req, res) => {
     let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; });
     req.on("end", () => {
       if (req.headers.authorization !== "Bearer upstream-binding-canary") { res.writeHead(401).end(); return; }
       requests.push(JSON.parse(body)); const n = requests.length;
+      if (rejectForSize) {
+        res.writeHead(413, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "request_too_large", message: `Fixture request too large: ${requests.at(-1)!.tools.length} tools; catalog not trimmed` } }));
+        return;
+      }
       res.writeHead(200, { "content-type": "text/event-stream" });
+      if (protocol === "messages") {
+        for (const event of [
+          { type: "message_start", message: { id: `faux-${n}`, type: "message", role: "assistant", model: "faux", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 3, output_tokens: 0 } } },
+          { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+          { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `reply ${n}` } },
+          { type: "content_block_stop", index: 0 },
+          { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 2 } },
+          { type: "message_stop" },
+        ]) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+        res.end(); return;
+      }
       for (const chunk of [{ choices: [{ index: 0, delta: { content: `reply ${n}` }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 } }]) res.write(`data: ${JSON.stringify({ id: `faux-${n}`, object: "chat.completion.chunk", ...chunk })}\n\n`);
       res.end("data: [DONE]\n\n");
     });
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve)); httpPeers.push(server);
   const address = server.address(); if (!address || typeof address === "string") throw new Error("faux bind failed");
-  return { requests, environment: { PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: "upstream-binding-canary" } };
+  return { requests, environment: { PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: protocol, PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: "upstream-binding-canary" } };
 }
-async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale" | "lost" | "begin-lost", recovery = false) {
+async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale" | "lost" | "begin-lost", recovery = false, nativeTools: string[] = []) {
   const root = await mkdtemp(join(tmpdir(), "pi-resident-binding-")); const workspace = join(root, "workspace"); await mkdir(workspace);
   const upstream = await faux(); const transport = new FakeTransport(); const ipc: PiBindCommand[] = [];
   transport.thinkingLevel = options.piRpcThinkingLevel ?? "off";
   let launch!: PiRpcTransportOptions;
   const driver = new PiRpcDriver({ model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), systemInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 }, startupTimeoutMs: 120,
-    environment: { ...upstream.environment, PI_CODING_AGENT_DIR: join(root, "agent") }, ...options,
+    ...options, environment: { ...upstream.environment, PI_CODING_AGENT_DIR: join(root, "agent"), ...options.environment },
     transportFactory: opts => {
       launch = opts;
       if (opts.env?.PAPERCLIP_PI_BIND_SOCKET) {
@@ -96,9 +111,12 @@ async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale
           sockets.add(socket); socket.once("close", () => sockets.delete(socket)); socket.on("error", () => undefined);
           let buffer = ""; socket.setEncoding("utf8"); socket.on("data", chunk => {
             buffer += chunk; if (!buffer.endsWith("\n")) return;
-            const request = JSON.parse(buffer) as PiBindCommand; ipc.push(request); transport.order.push(`ipc:${request.type}`);
+            const request = JSON.parse(buffer) as PiBindCommand;
+            // Lifecycle order assertions below exclude the read-only inventory.
+            if (request.type !== "tool_inventory") { ipc.push(request); transport.order.push(`ipc:${request.type}`); }
             if ((request.type === "bind" && fault === "lost") || (request.type === "begin_turn" && fault === "begin-lost")) return;
             const receipt = request.type === "bind" ? { schema: 1, nonce: request.nonce, sessionId: request.sessionId, type: "bind", epoch: fault === "stale" ? request.epoch - 1 : request.epoch, runId: request.runId, provider: request.provider.name, model: request.model, thinkingLevel: request.thinkingLevel, ...bindContent(request) }
+              : request.type === "tool_inventory" ? { ...request, nativeTools }
               : request.type === "stop_children" ? { schema: 1, type: request.type, nonce: request.nonce, sessionId: request.sessionId, settled: [], uncertain: [] }
               : request.type === "park_ready" ? { schema: 1, type: request.type, nonce: request.nonce, sessionId: request.sessionId, ready: true, reasons: [] }
               : { ...request, ack: true };
@@ -409,23 +427,25 @@ describe("resident Pi model binding", () => {
       ? { kind: "connection", connectionId: name.startsWith("app_mcp_app_gallery_gith") ? "10-github"
         : name.startsWith("app_mcp_app_gallery_goog") ? "20-google" : "00-other",
         connectionName: name.startsWith("app_mcp_app_gallery_gith") ? "GitHub"
-          : name.startsWith("app_mcp_app_gallery_goog") ? "Google Workspace" : "Other assigned apps" }
+          : name.startsWith("app_mcp_app_gallery_goog") ? "Google Workspace" : "Other assigned apps",
+        installedAt: name.startsWith("app_mcp_app_gallery_gith") ? "2026-01-02T00:00:00Z"
+          : name.startsWith("app_mcp_app_gallery_goog") ? "2026-01-03T00:00:00Z" : "2026-01-01T00:00:00Z" }
       : { kind: "core" } }));
     expect(tools).toHaveLength(151);
     expect(tools.filter(entry => entry.paperclipToolSource.connectionId === "10-github")).toHaveLength(48);
     expect(tools.filter(entry => entry.paperclipToolSource.connectionId === "20-google")).toHaveLength(24);
     const f = await fixture({ dynamicTools: tools.slice().sort((a, b) => a.name.localeCompare(b.name)) });
-    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+    const initial = f.ipc.find(command => command.type === "bind") as Extract<PiBindCommand, { type: "bind" }>;
     const core = tools.filter(entry => entry.paperclipToolSource.kind === "core").map(entry => entry.name);
     expect(initial.tools.map((entry: { name: string }) => entry.name)).toEqual(expect.arrayContaining(core));
     expect(initial.tools).toHaveLength(128);
     expect(initial.tools.slice(0, core.length).map((entry: { name: string }) => entry.name).sort()).toEqual(core.sort());
-    const warning = "Pi dynamic tool cap 128: omitted 23 connection tools: Google Workspace (20-google): 23. All 58 Paperclip core tools retained.";
+    const warning = "Pi total tool cap 128 (0 active native/extension tools): omitted 23 connection tools: Google Workspace (20-google): 23. All 61 Paperclip core tools retained.";
     expect(initial.instructions.split(warning)).toHaveLength(2);
     expect(initial.tools.every((entry: Record<string, unknown>) => !Object.hasOwn(entry, "paperclipToolSource"))).toBe(true);
     await vi.waitFor(() => expect(f.events.filter(event => event.payload.code === "pi_dynamic_tool_limit")).toHaveLength(1));
     expect(f.events.find(event => event.payload.code === "pi_dynamic_tool_limit")).toMatchObject({ eventType: "harness.diagnostic", payload: {
-      code: "pi_dynamic_tool_limit", message: warning, cap: 128, coreToolCount: 58, omittedToolCount: 23,
+      code: "pi_dynamic_tool_limit", message: warning, cap: 128, coreToolCount: 61, omittedToolCount: 23,
       omittedConnections: [{ connectionId: "20-google", connectionName: "Google Workspace", omittedToolCount: 23 }],
     } });
     await f.session.startTurn({ message: { role: "user", text: "work with the retained tools" } }); await finish(f);
@@ -433,11 +453,56 @@ describe("resident Pi model binding", () => {
   });
   it("keeps 128 usable tools and diagnoses an oversized catalog instead of rejecting the binding", async () => {
     const f = await fixture({ dynamicTools: Array.from({ length: 129 }, (_, i) => tool(`tool_${i}`)) });
-    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+    const initial = f.ipc.find(command => command.type === "bind") as Extract<PiBindCommand, { type: "bind" }>;
     expect(initial.tools).toHaveLength(128);
-    expect(initial.tools.at(-1).name).toBe("tool_127");
+    expect(initial.tools.at(-1)?.name).toBe("tool_98"); // immutable name order, not incidental input order
     await vi.waitFor(() => expect(f.events.some(event => event.eventType === "harness.diagnostic" && event.payload.code === "pi_dynamic_tool_limit")).toBe(true));
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+  });
+  it("reserves the measured active native/extension tools within Chat's TOTAL limit", async () => {
+    const core = ["request_human_input", "search_api", "read_task_document"].map(name => ({ ...tool(name), paperclipToolSource: { kind: "core" } }));
+    const connections = Array.from({ length: 148 }, (_, i) => ({ ...tool(`app_${String(i).padStart(3, "0")}`), paperclipToolSource: { kind: "connection", connectionId: "github-id", connectionName: "Renamed GitHub", installedAt: "2026-01-01T00:00:00Z" } }));
+    const f = await fixture({ dynamicTools: [...connections, ...core] }, undefined, false, ["bash", "read", "write", "edit", "grep", "find", "subagent"]);
+    const delivered = f.ipc.find(command => command.type === "bind") as Extract<PiBindCommand, { type: "bind" }>;
+    expect(delivered.tools).toHaveLength(121);
+    expect(delivered.tools.slice(0, 3).map(tool => tool.name)).toEqual(core.map(tool => tool.name));
+    await vi.waitFor(() => expect(f.events.some(event => event.payload.code === "pi_dynamic_tool_limit")).toBe(true));
+    expect(f.events.find(event => event.payload.code === "pi_dynamic_tool_limit")?.payload).toMatchObject({ nativeToolCount: 7, omittedToolCount: 30,
+      omittedConnections: [{ connectionId: "github-id", connectionName: "Renamed GitHub", omittedToolCount: 30 }] });
+    expect(f.events.find(event => event.eventType === "session.started")?.payload.context).toMatchObject({ toolDelivery: { api: "openai-completions", nativeToolCount: 7, dynamicToolCount: 121, totalToolCount: 128 } });
+    await f.session.attachRun({ runId: "run-a", dynamicTools: [...connections, ...core] });
+    expect(f.events.filter(event => event.payload.code === "pi_dynamic_tool_limit")).toHaveLength(1);
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    await f.session.attachRun({ runId: "run-b" });
+    expect(f.ipc.filter(command => command.type === "bind").at(-1)).toMatchObject({ tools: delivered.tools });
+  });
+  it("does not change a below-cap catalog or emit a tool diagnostic/instruction note", async () => {
+    const tools = [tool("request_human_input"), tool("search_api"), tool("read_task_document"), tool("app_one")];
+    const f = await fixture({ dynamicTools: tools }, undefined, false, ["bash", "subagent"]);
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+    expect(initial.tools).toEqual(tools);
+    expect(f.ipc.some(command => command.type === "bind")).toBe(false);
+    expect(initial.instructions).not.toContain("tool_delivery_notice");
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    expect(f.events.filter(event => String(event.payload.code).startsWith("pi_dynamic_tool"))).toEqual([]);
+  });
+  it.each(["responses", "messages"])("delivers all 151 dynamic tools on %s without guessing Chat's 128 limit", async protocol => {
+    const tools = d981ToolNames.map(tool);
+    const f = await fixture({ dynamicTools: tools, environment: { PAPERCLIP_AI_PROVIDER_PROTOCOL: protocol } }, undefined, false, ["bash", "subagent"]);
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+    expect(initial.tools).toHaveLength(151);
+    expect(new Set(initial.tools.map((tool: { name: string }) => tool.name))).toEqual(new Set(d981ToolNames));
+    await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
+    expect(f.events.filter(event => event.payload.code === "pi_dynamic_tool_limit")).toEqual([]);
+    expect(f.events.find(event => event.eventType === "session.started")?.payload.context).toMatchObject({ toolDelivery: { nativeToolCount: 2, dynamicToolCount: 151, totalToolCount: 153 } });
+  });
+  it("rejects core plus measured native tools over Chat's limit before any prompt, with one true cause", async () => {
+    const request = vi.spyOn(FakeTransport.prototype, "request");
+    try {
+      const tools = Array.from({ length: 128 }, (_, i) => ({ ...tool(`core_${i}`), paperclipToolSource: { kind: "core" } }));
+      await expect(fixture({ dynamicTools: tools }, undefined, false, ["bash"])).rejects.toThrow("pi_core_tool_limit: Pi cannot deliver 128 Paperclip core tools plus 1 active native/extension tools: openai-completions total tool cap 128. No prompt was sent.");
+      expect(request.mock.calls.some(([type]) => type === "prompt")).toBe(false);
+    } finally { request.mockRestore(); }
   });
   it("uses stable distinct aliases independent of catalog order and isolates unserializable schemas", async () => {
     const circular: Record<string, unknown> = {}; circular.self = circular;
@@ -584,6 +649,53 @@ describe("resident Pi model binding", () => {
 
 const real = describe.skipIf(!process.env.PI_TEST_BINARY);
 real("real Pi 1.5.2 resident binding", () => {
+  it.each(["chat", "messages"] as const)("sends the actual %s provider payload with measured native + core/connection tool delivery", async protocol => {
+    const root = await mkdtemp(join(tmpdir(), `pi-toolcap-${protocol}-`)); const workspace = join(root, "workspace"); await mkdir(workspace);
+    const upstream = await faux(protocol);
+    const dynamicTools = d981ToolNames.map(name => ({ ...tool(name), paperclipToolSource: name.startsWith("app_")
+      ? { kind: "connection", connectionId: "assigned-apps", connectionName: "Assigned apps", installedAt: "2026-01-01T00:00:00Z" } : { kind: "core" } }));
+    const session = await new PiRpcDriver({ command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), dynamicTools,
+      environment: { ...upstream.environment, PI_CODING_AGENT_DIR: join(root, "agent") }, shutdownTimeoutMs: 1000,
+    }).openSession({ runId: "toolcap-proof", normalizedSessionId: "toolcap-native", workingDirectory: workspace }) as PiRpcHarnessSession;
+    sessions.push(session); const events: PrpEvent[] = []; const iterator = session.events()[Symbol.asyncIterator]();
+    await session.startTurn({ message: { role: "user", text: "Say hello. Do not call tools." } });
+    for (;;) { const next = await iterator.next(); if (next.done) throw new Error("stream ended"); events.push(next.value);
+      if (["turn.failed", "turn.cancelled"].includes(next.value.eventType)) throw new Error(JSON.stringify(next.value));
+      if (next.value.eventType === "turn.completed") break;
+    }
+    expect(upstream.requests).toHaveLength(1);
+    const wire = upstream.requests[0]!.tools as Array<{ name?: string; function?: { name: string } }>;
+    const delivered = events.find(event => event.eventType === "session.started")!.payload.context as { toolDelivery: { api: string; nativeToolCount: number; dynamicToolCount: number; totalToolCount: number } };
+    expect(delivered.toolDelivery.nativeToolCount).toBeGreaterThan(0);
+    expect(wire).toHaveLength(delivered.toolDelivery.totalToolCount);
+    const names = wire.map(tool => tool.function?.name ?? tool.name);
+    expect(names).toEqual(expect.arrayContaining(["request_human_input", "search_api", "read_task_document"]));
+    if (protocol === "messages") {
+      expect(delivered.toolDelivery).toMatchObject({ api: "anthropic-messages", dynamicToolCount: 151 });
+      expect(names).toEqual(expect.arrayContaining(d981ToolNames));
+      expect(events.filter(event => event.payload.code === "pi_dynamic_tool_limit")).toHaveLength(0);
+    } else {
+      expect(delivered.toolDelivery).toMatchObject({ api: "openai-completions", totalToolCount: 128 });
+      expect(wire).toHaveLength(128);
+      expect(events.filter(event => event.payload.code === "pi_dynamic_tool_limit")).toHaveLength(1);
+    }
+    const proof = { protocol, delivery: delivered.toolDelivery, requestTools: names, terminal: "turn.completed" };
+    await writeFile(join(root, "proof.json"), JSON.stringify(proof, null, 2)); console.log(`TOOLCAP_NATIVE_PROOF ${join(root, "proof.json")}`);
+  }, 60_000);
+  it("fails loudly on an actual Messages size rejection without retrying with a smaller catalog", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-toolcap-size-")); const workspace = join(root, "workspace"); await mkdir(workspace); const upstream = await faux("messages", true);
+    const session = await new PiRpcDriver({ command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), dynamicTools: d981ToolNames.map(tool),
+      environment: { ...upstream.environment, PI_CODING_AGENT_DIR: join(root, "agent") }, shutdownTimeoutMs: 1000,
+    }).openSession({ runId: "size-proof", normalizedSessionId: "size-native", workingDirectory: workspace }) as PiRpcHarnessSession;
+    sessions.push(session); const iterator = session.events()[Symbol.asyncIterator](); await session.startTurn({ message: { role: "user", text: "Say hello" } });
+    let terminal: PrpEvent;
+    for (;;) { const next = await iterator.next(); if (next.done) throw new Error("stream ended"); if (["turn.failed", "turn.completed", "turn.cancelled"].includes(next.value.eventType)) { terminal = next.value; break; } }
+    expect(terminal.eventType).toBe("turn.failed");
+    expect(JSON.stringify(terminal.payload)).toContain("Fixture request too large");
+    expect(upstream.requests).toHaveLength(1);
+    expect(upstream.requests[0]!.tools.length).toBeGreaterThan(151);
+    expect(upstream.requests[0]!.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(d981ToolNames));
+  }, 60_000);
   it("runs three turns across two runs in one PID/session with refreshed instructions and tools, idle revoked", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-resident-real-")); const workspace = join(root, "workspace"); await mkdir(workspace);
     const upstream = await faux(); const agent = join(root, "agent"); await mkdir(agent);

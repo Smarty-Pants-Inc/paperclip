@@ -245,6 +245,8 @@ type Binding = {
   /** Server-owned suppression for baseline evals; true never overrides operator opt-in. */
   connectorAssignments?: Pick<ConnectorAssignment, "tools">[];
   assignedMcpTools?: Awaited<ReturnType<typeof createAssignedMcpTools>>;
+  /** Pi's host-private source labels for core-first, install-ordered delivery. */
+  toolProvenance?: boolean;
   apiToolsEnabled?: boolean;
   workMode?: "standard" | "planning" | "ask" | "skill_test";
   casesEnabled?: boolean;
@@ -462,7 +464,16 @@ export class PaperclipRunnerToolAuthority {
       runnerCodexDynamicToolsFit([...connectionTools, ...tools, ...definitions])) ?? [];
     const all = [...connectionTools, ...assignedTools, ...definitions]
       .filter(tool => workMode !== "skill_test" || nativeSkillTestToolAllowed(String(tool.name)));
-    return this.binding.museRuntime ? all.filter(definition => MUSE_NATIVE_OPERATIONS.has(String(definition.name))) : all;
+    const visible = this.binding.museRuntime ? all.filter(definition => MUSE_NATIVE_OPERATIONS.has(String(definition.name))) : all;
+    if (this.binding.toolProvenance) {
+      // Server-owned bridge wrappers are core too; only gateway app descriptors
+      // consume the connection portion of the tool budget.
+      const core = new Set([...definitions, ...connectionTools].map(tool => String(tool.name)));
+      return visible.map(tool => ({ ...tool, paperclipToolSource: core.has(String(tool.name))
+        ? { kind: "core" }
+        : { kind: "connection", ...this.binding.assignedMcpTools?.provenance?.(String(tool.name)) } }));
+    }
+    return visible;
   }
 
   async recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {

@@ -282,6 +282,30 @@ own `runner.runtime.stage` and `runner.process.launch` spans. These rows stay in
 the instance run log; with an operator OTLP endpoint they are also Observability
 spans. They are not Telemetry.
 
+## Pi RPC tool delivery
+
+Pi applies the [Chat Completions maximum of 128 functions](https://platform.openai.com/docs/api-reference/chat/create#chat-create-tools)
+only to `openai-completions`, counting the actual active native/extension tools
+as well as Paperclip tools. Paperclip core tools come from the live semantic
+catalog and controller-owned bridge definitions. If connections overflow the
+remaining budget, selection follows the earliest applicable company/agent install
+date, then immutable connection ID, then original tool name. A connection rename
+does not change selection. Core plus native overflow rejects before prompting.
+No 128-tool cap is inferred for [Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)
+or other APIs; this does not mean those APIs have no other limits. Provider size
+rejections fail the turn with their cause, not a retry with fewer tools.
+
+An overflow emits one `harness.diagnostic` per run, code
+`pi_dynamic_tool_limit`, with `api`, total-request `cap`, `nativeToolCount`,
+`coreToolCount`, dynamic `deliveredToolCount`, `omittedToolCount`, and
+`omittedConnections` (connection ID, display name, omitted count). The facade's
+existing warning channel preserves these fields into the structured run event.
+The human-readable message appears as a `Runner:` line in the selected run's
+Transcript (agent Activity), with its existing system-message group opened
+automatically, and the same notice enters the agent's instructions.
+A fitting catalog is unchanged and emits no limit notice. These connection labels
+stay in company-scoped run data; they are not first-party Telemetry or trace attributes.
+
 ## Pi RPC warm-turn timing
 
 Reused native Pi sessions record content-free `run.performance.span` rows using

@@ -10,7 +10,7 @@ import { piManagedModelRegistration } from "../pi-managed-model.js";
 import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
 import { installPiPerformanceDiagnostics } from "../pi-performance-diagnostics.js";
 import {
-  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
+  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, PI_DYNAMIC_TOOL_LIMIT_BY_API, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
   validatePiBindCommand, validatePiToolResult,
   type BindReceipt, type Origin, type ParkReadyResult, type PiBindCommand, type PiBindingConfig,
@@ -27,7 +27,7 @@ export interface PiBindContext {
   isIdle(): boolean;
   hasPendingMessages(): boolean;
   abort(): void;
-  model?: { provider: string; id: string };
+  model?: { provider: string; id: string; api?: PiBindProvider["api"] };
   modelRegistry?: { find(provider: string, id: string): any };
 }
 export interface PiBindTool {
@@ -42,7 +42,7 @@ export interface PiBindApi {
   on(event: "session_shutdown", handler: LifecycleHandler): () => void;
   on(event: "input", handler: LifecycleHandler): () => void;
   on(event: "before_agent_start", handler: LifecycleHandler): () => void;
-  on(event: "before_provider_request", handler: () => void): () => void;
+  on(event: "before_provider_request", handler: LifecycleHandler): () => void;
   /** Present in Pi 1.5.2; optional for older structural host fixtures. */
   appendEntry?(customType: string, data: unknown): void;
   on(event: "cache_warming_decision", handler: LifecycleHandler): () => void;
@@ -131,6 +131,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   let offUnboundParent: (() => void) | undefined;
   let pendingDialogs = 0;
   let registeredProvider: string | undefined;
+  let providerApi: PiBindProvider["api"] | undefined;
   const registeredTools = new Map<string, PiDynamicTool>();
   const pendingTools = new Set<string>();
   const sockets = new Set<Socket>();
@@ -187,11 +188,14 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     if (results.some(value => value !== results[0]) || (candidate.homeDigest && results[0] !== candidate.homeDigest)) throw new Error(PI_BIND_ERROR);
     return results[0];
   }
-  function updateTools(candidate: PiBindingConfig) {
+  function nativeTools(): string[] { return pi.getActiveTools().filter(name => !registeredTools.has(name)); }
+  function updateTools(candidate: PiBindingConfig, api?: PiBindProvider["api"]) {
     const wanted = new Map(candidate.tools.map(tool => [tool.name, tool]));
     const allNames = new Set([...registeredTools.keys(), ...wanted.keys()]);
     if (allNames.size > 256) throw new Error(PI_BIND_ERROR);
-    const native = pi.getActiveTools().filter(name => !registeredTools.has(name) && !wanted.has(name));
+    const native = nativeTools().filter(name => !wanted.has(name));
+    const cap = api === undefined ? undefined : PI_DYNAMIC_TOOL_LIMIT_BY_API[api];
+    if (cap !== undefined && native.length + wanted.size > cap) throw new Error(`Pi ${api} total tool cap ${cap} exceeded: ${native.length} active native/extension + ${wanted.size} dynamic tools`);
     for (const name of allNames) {
       const definition = wanted.get(name) ?? registeredTools.get(name)!;
       const capturedBinding = Object.freeze({ epoch: candidate.epoch, runId: candidate.runId });
@@ -276,6 +280,7 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
       if (!authority.announce(request.toolCallId, request.origin)) throw new Error(PI_BIND_ERROR);
       return { ...envelope, type: "announce", ack: true, toolCallId: request.toolCallId, origin: request.origin };
     }
+    if (request.type === "tool_inventory") return { ...envelope, type: "tool_inventory", nativeTools: nativeTools() };
     if (request.type === "park_ready") return { ...envelope, type: "park_ready", ...await parkReady() };
     if (request.type === "stop_children") return { ...envelope, type: "stop_children", ...await stopChildren() };
     if (commandBusy) throw new Error(PI_BIND_ERROR);
@@ -298,7 +303,8 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
         try {
           homeDigest = await admitHome(candidate);
           if (closed || version !== fenceVersion) throw new Error(PI_BIND_ERROR);
-          await registerProvider(request); updateTools(candidate);
+          await registerProvider(request); updateTools(candidate, request.provider.api);
+          providerApi = request.provider.api;
           if (closed || version !== fenceVersion) throw new Error(PI_BIND_ERROR);
           authority.bind(candidate); config = candidate; failed = false;
         } catch { fence(); failed = true; throw new Error(PI_BIND_ERROR); }
@@ -391,6 +397,18 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     }
     running = admitted; admitted = null;
     return { systemPrompt: replacePiHostInstructions(event.systemPrompt, config.instructions, process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY) };
+  });
+  // Recheck the actual serialized request too: another extension may have added
+  // tools after startup inventory. Never trim here or silently lose authority.
+  pi.on("before_provider_request", (event, context) => {
+    const api = context.model?.api ?? providerApi;
+    const cap = api === undefined ? undefined : PI_DYNAMIC_TOOL_LIMIT_BY_API[api];
+    if (cap === undefined) return;
+    const tools = event.payload?.tools;
+    if (Array.isArray(tools) && tools.length > cap) {
+      fence(); context.abort();
+      throw new Error(`Pi ${api} total tool cap ${cap} exceeded in provider request: ${tools.length} tools. Request refused; no tools were silently trimmed.`);
+    }
   });
   pi.on("cache_warming_decision", () => ({ action: "stop" }));
   pi.on("tool_execution_start", event => {

@@ -57,7 +57,9 @@ describe("Pi pre-dispatch logical-request observation (not physical wire/interna
     const writes: Array<{ customType: string; data: unknown }> = [];
     const { handlers, ctx } = extension(mode, (customType, data) => { writes.push({ customType, data }); });
     const hooks = handlers.get("before_provider_request") ?? [];
-    expect(hooks, "the default host extension must install the actual Pi request hook").toHaveLength(1);
+    // The observer is installed once; managed sessions also install a separate
+    // fail-loud request tool-count guard.
+    expect(hooks, "the default host extension must install the actual Pi request hook").toHaveLength(mode === "managed" ? 2 : 1);
     const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
     let payloadReads = 0;
     const poisoned = Object.defineProperty({ type: "before_provider_request" }, "payload", { enumerable: true, get() { payloadReads++; throw new Error("PRIVATE_PROVIDER_PAYLOAD"); } });

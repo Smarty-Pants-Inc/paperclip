@@ -519,6 +519,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
           params: {
             threadId: opened.ids().driverSessionId,
             message: payload.message ?? payload.code,
+            ...(payload.code === "pi_dynamic_tool_limit" ? { category: "pi_dynamic_tool_limit", toolDelivery: payload } : {}),
           },
         });
       }

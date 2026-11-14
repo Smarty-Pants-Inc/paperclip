@@ -23,6 +23,9 @@ import {
   issues,
   projectWorkspaces,
   projects,
+  toolApplications,
+  toolConnections,
+  toolConnectionInstalls,
 } from "@paperclipai/db";
 import { createFullDatabaseResponseCapture, installDatabaseResponseCapture } from "../../__tests__/helpers/full-database-response-capture.js";
 import { startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
@@ -31,7 +34,7 @@ import { documentService } from "../documents.js";
 import { issueService } from "../issues.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { PaperclipRunnerSemanticAuthority } from "./runner-semantic-authority.js";
-import { createAssignedMcpTools } from "./assigned-mcp-tools.js";
+import { assignedToolConnectionProvenance, createAssignedMcpTools } from "./assigned-mcp-tools.js";
 import type { ToolGatewayService } from "../tool-gateway.js";
 import { CURRENT_WAKE_COMMENTS_BINDING_SCHEMA, READ_CURRENT_WAKE_COMMENTS_TOOL_NAME } from "./current-wake-comments.js";
 import { NativeChatAttachmentReadScope, READ_CHAT_ATTACHMENT_TOOL_NAME } from "./chat-attachment-read.js";
@@ -105,6 +108,29 @@ describe("PaperclipRunnerToolAuthority", () => {
 
   afterAll(async () => {
     await temporary?.cleanup();
+  });
+
+  it("reads actual applicable install dates, isolates company/agent scopes, and does not reorder provenance on rename", async () => {
+    const foreignCompanyId = randomUUID(), applicationId = randomUUID(), foreignApplicationId = randomUUID();
+    const connectionId = randomUUID(), foreignConnectionId = randomUUID();
+    await db.insert(companies).values({ id: foreignCompanyId, name: "Provenance isolation", issuePrefix: "PVI" });
+    await db.insert(toolApplications).values([{ id: applicationId, companyId, name: "Provenance test", type: "mcp_http" }, { id: foreignApplicationId, companyId: foreignCompanyId, name: "Provenance test", type: "mcp_http" }]);
+    await db.insert(toolConnections).values([{ id: connectionId, applicationId, companyId, name: "GitHub", uid: randomUUID(), transport: "mcp_remote" }, { id: foreignConnectionId, applicationId: foreignApplicationId, companyId: foreignCompanyId, name: "Foreign", uid: randomUUID(), transport: "mcp_remote" }]);
+    await db.insert(toolConnectionInstalls).values([
+      { companyId, connectionId, targetType: "agent", targetId: agentId, createdAt: new Date("2026-02-01T00:00:00Z") },
+      { companyId, connectionId, targetType: "company", targetId: companyId, createdAt: new Date("2026-01-01T00:00:00Z") },
+      { companyId, connectionId, targetType: "agent", targetId: randomUUID(), createdAt: new Date("2025-01-01T00:00:00Z") },
+      { companyId: foreignCompanyId, connectionId: foreignConnectionId, targetType: "agent", targetId: agentId, createdAt: new Date("2024-01-01T00:00:00Z") },
+    ]);
+    try {
+      expect([...(await assignedToolConnectionProvenance(db, { companyId, agentId })).values()]).toEqual([{ connectionId, connectionName: "GitHub", installedAt: "2026-01-01T00:00:00.000Z" }]);
+      await db.update(toolConnections).set({ name: "Renamed" }).where(eq(toolConnections.id, connectionId));
+      expect((await assignedToolConnectionProvenance(db, { companyId, agentId })).get(connectionId)).toEqual({ connectionId, connectionName: "Renamed", installedAt: "2026-01-01T00:00:00.000Z" });
+    } finally {
+      await db.delete(toolConnections).where(inArray(toolConnections.id, [connectionId, foreignConnectionId]));
+      await db.delete(toolApplications).where(eq(toolApplications.id, applicationId));
+      await db.delete(companies).where(eq(companies.id, foreignCompanyId));
+    }
   });
 
   it("routes call_api through the private controller instead of the public callback origin", async () => {
@@ -1095,12 +1121,26 @@ describe("PaperclipRunnerToolAuthority", () => {
     }
   });
 
+  it("marks host-owned tools core and passes pinned connection provenance only to Pi", () => {
+    const assignedTool = { name: "app_github_read", description: "Read GitHub", inputSchema: { type: "object" }, paperclipToolSource: { kind: "core" } };
+    const source = { connectionId: "github-id", connectionName: "Renamed GitHub", installedAt: "2026-01-01T00:00:00.000Z" };
+    const assignedMcpTools = { definitions: () => [assignedTool], has: (name: string) => name === assignedTool.name, execute: vi.fn(), provenance: () => source };
+    const binding = { companyId, agentId, issueId, runId, assignedMcpTools };
+    const ordinary = new PaperclipRunnerToolAuthority(db, binding).definitions();
+    const pi = new PaperclipRunnerToolAuthority(db, { ...binding, toolProvenance: true }).definitions();
+    expect(pi.find(tool => tool.name === assignedTool.name)?.paperclipToolSource).toEqual({ kind: "connection", ...source });
+    for (const name of ["request_human_input", "search_api", "read_task_document"]) {
+      expect(pi.find(tool => tool.name === name)?.paperclipToolSource, name).toEqual({ kind: "core" });
+      expect(ordinary.find(tool => tool.name === name)).not.toHaveProperty("paperclipToolSource");
+    }
+  });
+
   it("relays assigned MCP calls only while the native run still owns its task", async () => {
     const tool = { name: "app_mem0_recall", description: "Recall memory", inputSchema: { type: "object" } };
     const execute = vi.fn().mockResolvedValue({ content: "synthetic memory" });
     const authority = new PaperclipRunnerToolAuthority(db, {
       companyId, agentId, issueId, runId,
-      assignedMcpTools: { definitions: () => [tool], has: (name) => name === tool.name, execute },
+      assignedMcpTools: { definitions: () => [tool], has: (name) => name === tool.name, execute, provenance: () => undefined },
     });
     expect(authority.definitions()).toContainEqual(tool);
     const call = { tool: tool.name, callId: "assigned-mcp", arguments: { query: "compass" } };

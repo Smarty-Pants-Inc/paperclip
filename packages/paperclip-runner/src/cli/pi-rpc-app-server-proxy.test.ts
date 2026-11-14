@@ -140,6 +140,20 @@ it("forwards Pi RPC timings through the existing sanitized performance notificat
   } finally { await proxy.close(); }
 });
 
+it("preserves the loud tool-cap diagnostic's structured connection counts through the production warning facade", async () => {
+  const sink = new FakeSink(); const session = new FakeSession();
+  const proxy = createPiRpcAppServerProxy({ stdout: sink, environment: { PAPERCLIP_RUN_ID: "run-1" }, createDriver: () => makeDriver(session) });
+  try {
+    proxy.acceptLine(JSON.stringify({ id: 1, method: "thread/start", params: { cwd: process.cwd(), model: "neutral/model" } }));
+    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.id === 1)).toBe(true));
+    const payload = { code: "pi_dynamic_tool_limit", message: "Pi total tool cap 128: omitted 30 tools: GitHub: 6; Google Workspace: 24", cap: 128, api: "openai-completions", nativeToolCount: 7, coreToolCount: 61, deliveredToolCount: 121, omittedToolCount: 30,
+      omittedConnections: [{ connectionId: "github-id", connectionName: "GitHub", omittedToolCount: 6 }, { connectionId: "google-id", connectionName: "Google Workspace", omittedToolCount: 24 }] };
+    session.push("harness.diagnostic", payload);
+    await vi.waitFor(() => expect(sink.decoded().some(frame => frame.method === "warning")).toBe(true));
+    expect(sink.decoded().filter(frame => frame.method === "warning")).toEqual([{ method: "warning", params: { threadId: session.id, message: payload.message, category: payload.code, toolDelivery: payload } }]);
+  } finally { await proxy.close(); }
+});
+
 it("thread/resume passes the saved native identity and execution-host cwd to driver recovery", async () => {
   const sink = new FakeSink(); const session = new FakeSession();
   const driver = makeDriver(session);
