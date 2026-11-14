@@ -156,7 +156,7 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
     // Cleanup retains ownership, including after its automatic budget. A
     // deliberate Retry may re-arm that SAME stop-only intent, never execute.
     if (!readStopOnlyCleanup(lease) && lease.metadata?.pendingCleanupInFlight !== true
-      && lease.metadata?.pluginId == null && !isBuiltinSandboxProvider(lease.provider)) unavailable = true;
+      && lease.metadata?.pluginId == null && !isBuiltinSandboxProvider(lease.provider!)) unavailable = true;
     const requested = !waitingTurn ? await effects?.requestStop(lease) : undefined;
     if (exhausted && (!retryStop || !requested)) unavailable = true;
   }

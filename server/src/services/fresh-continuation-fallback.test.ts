@@ -258,7 +258,7 @@ suite("fresh-continuation fallback", () => {
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
       .toMatchObject({ kind: "exact_recovery_pending" });
     const [pending] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
-    const metadata = { ...pending.metadata, pendingCleanupRetryAttempts: 5, pendingCleanupRetryCapWarned: true,
+    const metadata: Record<string, unknown> = { ...pending.metadata, pendingCleanupRetryAttempts: 5, pendingCleanupRetryCapWarned: true,
       pendingCleanupRetryAfterMs: Date.now() + 3600_000 };
     await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, lease.id));
     await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" });
