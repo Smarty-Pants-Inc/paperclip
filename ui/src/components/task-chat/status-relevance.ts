@@ -1,4 +1,5 @@
 import type { ExecutionProjection, IssueRecoveryAction } from "@paperclipai/shared";
+export { isSupersededNotice } from "@paperclipai/shared";
 import type { IssueChatComment } from "@/lib/issue-chat-messages";
 import { isTerminalIssueStatus } from "@/lib/liveIssueIds";
 import type { TaskChatItem } from "./task-chat-model";
@@ -22,24 +23,6 @@ function timestamp(value: Date | string | null | undefined): number {
 function isAdmissionWait(run: StatusRun): boolean {
   return run.status === "cancelled" && !run.startedAt
     && ["execution_reconciliation_required", "workspace_busy", "issue_not_in_progress", "issue_terminal_status"].includes(run.errorCode ?? "");
-}
-
-/**
- * A system notice a later note or answer replaced (`metadata.supersededBy`).
- * Presentation only, like the rest of this file: the row stays in history and
- * is never removed; it just stops being presented as current status.
- */
-export function isSupersededNotice(comment: {
-  authorType?: string | null;
-  presentation?: { kind?: string | null } | null;
-  metadata?: object | null;
-  conversationSessionGeneration?: number | null;
-}): boolean {
-  // Session resets are durable conversation boundaries, not execution status.
-  if (comment.conversationSessionGeneration != null) return false;
-  if (comment.authorType !== "system" && comment.presentation?.kind !== "system_notice") return false;
-  const supersededBy = comment.metadata && "supersededBy" in comment.metadata ? comment.metadata.supersededBy : null;
-  return typeof supersededBy === "string" && supersededBy.trim().length > 0;
 }
 
 /** Presentation only: retain every run and comment in the underlying history. */

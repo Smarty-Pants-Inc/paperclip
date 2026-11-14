@@ -6,7 +6,6 @@ import { WorkspaceBaseRefRecoveryNotice } from "./WorkspaceBaseRefRecoveryNotice
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "./DispositionRecoveryNotice";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { TaskChatRunnerTurn } from "./task-chat/TaskChatRunnerTurn";
-import { isSupersededNotice } from "./task-chat/status-relevance";
 import { useRunnerSubmission } from "@/hooks/useRunnerSubmission";
 import type { ComposerRunSettings } from "./task-chat/composer-run-settings";
 import { ComposerRunSettingsPicker } from "./task-chat/ComposerRunSettingsPicker";
@@ -60,6 +59,7 @@ import type {
   IssueWorkProduct,
   IssueAssigneeAdapterOverrides,
 } from "@paperclipai/shared";
+import { isSupersededNotice } from "@paperclipai/shared";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import { findUIAdapter } from "../adapters/registry";
 import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
@@ -3696,9 +3696,10 @@ function SystemNoticeCommentContent({
     );
   }
 
-  // A superseded notice is history, not current status (status-relevance.ts):
-  // keep the row, collapsed, with its details one click away.
-  if (isSupersededNotice({ authorType, presentation, metadata: commentMetadata })) {
+  // A superseded notice is history, not current status: keep the row,
+  // collapsed, with its details one click away.
+  if ((authorType === "system" || presentation?.kind === "system_notice")
+    && isSupersededNotice(commentMetadata)) {
     const tone = presentation?.tone ?? "neutral";
     return (
       <CompactSystemNoticeRow
