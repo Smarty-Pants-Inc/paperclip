@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
@@ -57,12 +57,12 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
   });
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); if (root) await rm(root, { recursive: true, force: true }); });
 
-  it.each(["idle-release", "observed-owner", "proof-arrives", "running", "stopping", "unknown", "other-lease", "tl07-idle", "tl07-running"] as const)(
+  it.each(["idle-release", "observed-owner", "observed-proof-arrives", "proof-arrives", "running", "stopping", "unknown", "other-lease", "tl07-idle", "tl07-running"] as const)(
     "%s: immutable receipt, one current note, no impossible run; proof wakes the saved message", async shape => {
     const t0 = Date.now();
     const tl07 = shape.startsWith("tl07-");
     const liveTurn = shape === "tl07-running";
-    const observedOwner = shape === "observed-owner";
+    const observedOwner = shape.startsWith("observed-");
     vi.useFakeTimers({ toFake: ["Date"] });
     const userId = randomUUID();
     await db.insert(authUsers).values({ id: userId, name: "Board", email: `${userId}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
@@ -102,9 +102,21 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     const [lease] = await db.insert(environmentLeases).values({ companyId: company.id, issueId: issue.id, heartbeatRunId: old.id, provider: "boat", providerLeaseId: "bx_ysh5xvy5", leasePolicy: "reuse_by_environment", status: preconfirmed ? "released" : "retained", cleanupStatus: preconfirmed ? "success" : null, acquiredAt: new Date(t0 - 590_000), releasedAt: preconfirmed ? new Date(t0 - 300_000) : null, metadata: { pluginId: "fixture-boat" } }).returning();
     if (preconfirmed) await db.update(environmentLeases).set({ metadata: { ...lease.metadata, remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: company.id, runId: old.id, leaseId: lease.id, provider: "boat", providerLeaseId: lease.providerLeaseId, state: "stopped" } } }).where(eq(environmentLeases.id, lease.id));
     const before = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]!;
-    if (shape === "other-lease") await db.insert(environmentLeases).values({ companyId: company.id, provider: "boat", providerLeaseId: lease.providerLeaseId, status: "active" });
+    if (!preconfirmed) await db.update(environmentLeases).set({ metadata: { ...before.metadata,
+      pendingCleanupController: { bootId: "stale-boot", processStartedAt: "2026-11-14T11:49:42.000Z" } } }).where(eq(environmentLeases.id, lease.id));
+    if (shape === "other-lease") {
+      const [peerIssue] = await db.insert(issues).values({ companyId: company.id, title: "Allocation's actual holder", status: "in_progress", assigneeAgentId: agent.id }).returning();
+      const [peer] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: peerIssue.id, status: "running", runtimeMode: "native", nativeIssueId: peerIssue.id, controllerLeaseExpiresAt: new Date(t0 + 3600_000), contextSnapshot: { issueId: peerIssue.id } }).returning();
+      await db.insert(nativeRunFinalizations).values({ companyId: company.id, issueId: peerIssue.id, runId: peer.id, phase: "observed", leaseOwner: "actual-allocation-holder", leaseExpiresAt: new Date(t0 + 3600_000) });
+      await db.insert(environmentLeases).values({ companyId: company.id, heartbeatRunId: peer.id, issueId: peerIssue.id, provider: "boat", providerLeaseId: lease.providerLeaseId, status: "active" });
+    }
     let providerState: string = shape === "running" ? "active" : shape;
-    const inspectLeaseResource = vi.fn(async () => ({ providerLeaseId: lease.providerLeaseId!, state: providerState }));
+    const inspectLeaseResource = vi.fn(async () => {
+      // A separate transaction can take the task lock NOWAIT at the provider
+      // boundary. Calling this from the locked admission gate would fail.
+      await db.transaction(async tx => { await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issue.id)).for("update", { noWait: true }); });
+      return { providerLeaseId: lease.providerLeaseId!, state: providerState };
+    });
     const stop = vi.fn(async () => undefined);
     const hb = heartbeatService(db, { environmentRuntime: { inspectLeaseResource, retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
     const tick = async (n: number) => {
@@ -113,6 +125,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       await settleUnrecoverableExecutions(db);
       await hb.sweepPendingCleanupLeases();
       await settleUnrecoverableExecutions(db);
+      if (process.env.TASK_OUT) await appendFile(join(process.env.TASK_OUT, "seed-states.jsonl"), JSON.stringify({ shape, n, runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issue.id)), leases: await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, issue.id)), actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issue.id)) }) + "\n");
     };
     const notes = async () => (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).filter(c => c.authorType === "system");
     const current = async () => (await notes()).filter(c => !c.metadata?.supersededByCommentId);
@@ -123,7 +136,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
         expect(await runCount()).toBe(2);
         expect(await listFreshContinuations(db, { companyId: company.id, issueId: issue.id })).toHaveLength(0);
         expect(await current()).toHaveLength(1);
-        expect((await current())[0].body).toMatch(liveTurn ? /current step must finish/ : /earlier attempt.*stop|stopping the earlier attempt/);
+        expect((await current())[0].body).toMatch(liveTurn || observedOwner ? /current step must finish/ : /earlier attempt.*stop|stopping the earlier attempt/);
         expect(await notes()).toHaveLength(1); // no repeated note at ~5-min sweeps
       }
     }
@@ -134,11 +147,18 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       expect(stop).not.toHaveBeenCalled();
       expect(inspectLeaseResource).not.toHaveBeenCalled();
     }
-    if (!["idle-release", "observed-owner", "proof-arrives", "tl07-idle"].includes(shape)) {
+    if (!["idle-release", "observed-owner", "observed-proof-arrives", "proof-arrives", "tl07-idle"].includes(shape)) {
       expect(await runCount()).toBe(2);
       return;
     }
-    if (shape === "proof-arrives") { providerState = "stopped"; await tick(3); expect(inspectLeaseResource).toHaveBeenCalled(); }
+    const proofLands = shape === "proof-arrives" || shape === "observed-proof-arrives";
+    if (proofLands) {
+      providerState = "stopped"; await tick(3); expect(inspectLeaseResource).toHaveBeenCalled();
+      const [stoppedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      expect(stoppedLease).toMatchObject({ status: "released", cleanupStatus: "success", metadata: { remoteExecutionTermination: { leaseId: lease.id, runId: old.id, providerLeaseId: lease.providerLeaseId, state: "stopped" } } });
+      expect(stoppedLease.metadata).not.toHaveProperty("sandboxStopAndRetainReceipt");
+      expect((stoppedLease.metadata?.pendingCleanupController as { bootId?: string } | undefined)?.bootId).not.toBe("stale-boot");
+    }
     // Occupy the agent slot so real delivery/admission leaves its automatically
     // admitted run observable as queued. No test mints a successor run or resends
     // input. Then exercise that run's real selection/executor with a native peer.
@@ -155,9 +175,14 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     expect(await getExecutionBlocker(db, company.id, issue.id)).toBeNull();
     const [next] = await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successors[0].id)).returning();
     await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, issue.id));
+    // The controlled peer starts the genuinely queued admission in place of
+    // dispatch's external provider. Mirror dispatch's agent running projection;
+    // this is not a claim that the test exercises the queue's process launcher.
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, agent.id));
     const selected = await selectHeartbeatRuntime(db, inputFor(next));
     if (!selected.selected || !selected.nativeExecution) throw new Error("Fresh selection not admitted");
     expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(sessionId);
+    if (process.env.TASK_OUT) await appendFile(join(process.env.TASK_OUT, "seed-before-answer.jsonl"), JSON.stringify({ shape, run: await readRun(next.id), agent: (await db.select().from(agents).where(eq(agents.id, agent.id)))[0], issue: (await db.select().from(issues).where(eq(issues.id, issue.id)))[0] }) + "\n");
     const answer = await answerWithNativePeer({ db, execution: selected.nativeExecution, runnerInstanceId: selected.nativeRunnerInstanceId!, text: "ALDER-B", getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
     expect(answer.settled.status).toBe("succeeded");
     expect(JSON.stringify(answer.prompts)).toContain("ALDER-B");
@@ -166,7 +191,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     expect(await runCount()).toBe(3);
     expect(await current()).toHaveLength(1);
     expect((await current())[0].body).toContain("fresh thread");
-    expect(await notes()).toHaveLength(shape === "proof-arrives" ? 2 : 1);
-    if (shape === "observed-owner") expect(await readRun(old.id)).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
+    expect(await notes()).toHaveLength(proofLands ? 2 : 1);
+    if (observedOwner) expect(await readRun(old.id)).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
   }, 60_000);
 });
