@@ -166,7 +166,7 @@ export async function selectPiConversation(db: Db, input: {
       await writePiSessionHistoryLossNotice(db, tx, { ...input,
         authorizationReason: freshBoundary.noticeAuthorizationReason ?? `fresh_provider_thread:${freshBoundary.recoveryActionId}`,
         replaceExisting: true,
-        body: "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed." });
+        body: freshBoundary.startedNote });
     }
     if (legacyUnverified) {
       // The issue lock and this transaction make the notice and first recorded
@@ -214,9 +214,8 @@ export async function selectFreshContinuationThread(db: Db, input: {
       adapterType: "paperclip_runner", taskKey: issue.id, sessionParamsJson: { sessionId: id } });
     await tx.update(heartbeatRuns).set({ nativeSessionId: id }).where(eq(heartbeatRuns.id, run.id));
     const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
-    const { FRESH_THREAD_STARTED_NOTE } = await import("./fresh-thread-stop-gate.js");
     await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason: fresh.noticeAuthorizationReason,
-      body: FRESH_THREAD_STARTED_NOTE, replaceExisting: true });
+      body: fresh.startedNote, replaceExisting: true });
     return id;
   });
 }

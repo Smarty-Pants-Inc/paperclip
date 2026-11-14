@@ -105,6 +105,59 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     };
     return { input, issue, run, agent };
   }
+  // Keep: recorded row-5 failure across the actual remote-read/driver/runtime
+  // contract, then into the durable fresh-history owner, without prose authority.
+  it("RFL round4 F2 row5 remote state read failure reaches the designed-end gate through actual recovery", async () => {
+    const { input, run, issue, agent } = await fixture();
+    const selected = await selectHeartbeatRuntime(db, input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
+    const sessionId = randomUUID();
+    const execution = structuredClone(selected.nativeExecution);
+    execution.session.normalizedSessionId = sessionId;
+    execution.workspace.cwd = instructionRoot;
+    const { readRemoteRunnerState } = await import("../native-runtime/native-session-executor.js");
+    const remoteFailure = await readRemoteRunnerState({ stateDirectory: "/remote/d10-row5",
+      runner: { execute: async () => ({ exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "remote state unavailable" }) } as never,
+    }).catch((error: unknown) => error);
+    expect(remoteFailure).toMatchObject({ code: "runner_remote_state_unavailable" });
+    const transport = { request: async () => { throw remoteFailure; }, notify() {},
+      async *notifications() {}, setServerRequestHandler() {}, async close() {} };
+    const transportFactory = vi.fn(() => transport);
+    const backend = runner.createNativeSessionBackend(execution, { codexTransportFactory: transportFactory });
+    const openRun = vi.fn(), completeRun = vi.fn();
+    const failure = await runner.executeNativeSession({ input: execution, backend,
+      runnerInstanceId: "round4-row5", controlPlaneInstanceId: "round4-server",
+      controlPlane: { openRun, completeRun, appendEvent: vi.fn(),
+        loadSessionCheckpoint: async () => ({ backendKind: "runner", driverKind: "codex_app_server",
+          sessionId: "row5-earlier", providerSessionId: "row5-provider", identity: {
+            runId: run.id, companyId: agent.companyId, agentId: agent.id, issueId: issue.id,
+            sessionId,
+          }, workingDirectory: execution.workspace.cwd ?? undefined, cursor: "0", activeTurnId: null,
+          pendingRuntimeRequests: [], lineage: [], providerRecoveryPolicy: "same_session_only" }),
+        replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+      },
+    }).catch((error: unknown) => error);
+    const { freshThreadRefusalCode } = await import("../native-runtime/runner-reconciliation-refusal.js");
+    expect(failure).toMatchObject({ code: "runner_remote_state_unavailable" });
+    const code = freshThreadRefusalCode(failure);
+    expect(code).toBe("runner_remote_state_unavailable");
+    expect(transportFactory).toHaveBeenCalledOnce();
+    expect(openRun).not.toHaveBeenCalled();
+    expect(completeRun).not.toHaveBeenCalled();
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+      errorCode: code, nativeIssueId: issue.id, nativeSessionId: execution.session.normalizedSessionId })
+      .where(eq(heartbeatRuns.id, run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: code })
+      .where(eq(nativeRunFinalizations.runId, run.id));
+    await db.insert(environmentLeases).values({ companyId: agent.companyId, heartbeatRunId: run.id,
+      issueId: issue.id, provider: "boat", providerLeaseId: `row5-${randomUUID()}`, status: "retained" });
+    expect(await ensureFreshContinuation(db, { companyId: agent.companyId, runId: run.id, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toContain("stopping the earlier attempt before starting fresh");
+  });
+
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
   const coordinators = (id: string) => db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id));
   const sandbox = { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: "/workspace", reusableLeaseConfigured: false };
@@ -602,6 +655,39 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     }
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
   }, 60_000);
+
+  it.each(["pi", "codex"])("RFL round4 F9 preserves the skill-change note through actual %s selection and replay", async provider => {
+    const f = provider === "pi" ? await piFixture() : await fixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected first selection");
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: "native_runner_refresh_required" })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_runner_refresh_required" })
+      .where(eq(nativeRunFinalizations.runId, f.run.id));
+    const continued = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id, trigger: "held_recovery" });
+    expect(continued).toMatchObject({ kind: "continued" });
+    const [action] = await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
+      issueId: f.issue.id, status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000),
+      contextSnapshot: { issueId: f.issue.id, previousRunId: f.run.id, recoveryActionId: action.id, forceFreshSession: true,
+        ...(action.evidence.freshContinuation && (action.evidence.freshContinuation as Record<string, unknown>).isolation === "fresh_isolated_workspace"
+          ? { freshContinuationIsolation: action.id } : {}) } }).returning();
+    f.input.run = run; f.input.session.persistedNativeExecutionInput = null; f.input.session.persistedRunnerProfile = {};
+    f.input.task.context = run.contextSnapshot!;
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected fresh selection");
+    expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(first.nativeExecution.session.normalizedSessionId);
+    f.input.run = await read(run.id);
+    f.input.session.persistedNativeExecutionInput = selected.nativeExecution;
+    f.input.session.persistedRunnerProfile = f.input.run.runnerProfileJson ?? {};
+    await selectHeartbeatRuntime(db, f.input);
+    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+      .filter(comment => comment.authorType === "system");
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toContain(`your skill change is in effect; ${f.agent.name} restarted its working thread`);
+    expect(notes[0].body).not.toContain("could not be safely restored");
+  });
 
   it("does not treat a forceFreshSession flag or forged recovery action id as provider-thread authority", async () => {
     const f = await piFixture();

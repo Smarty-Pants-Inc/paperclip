@@ -30,7 +30,7 @@ import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 export { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
-import { FRESH_THREAD_STARTED_NOTE, freshThreadStopGate, writeFreshThreadNotice } from "./native-runtime/fresh-thread-stop-gate.js";
+import { freshThreadStartedNote, freshThreadStopGate, writeFreshThreadNotice } from "./native-runtime/fresh-thread-stop-gate.js";
 
 /**
  * Fresh-continuation fallback: exact resumption of an unfinished run is an
@@ -450,6 +450,7 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   const stop = await freshThreadStopGate(db as Db, source, issueId);
   if (!stop.gone) return null;
   return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
+    startedNote: await freshThreadStartedNote(db, source),
     ...(typeof fresh.noticeAuthorizationReason === "string" ? { noticeAuthorizationReason: fresh.noticeAuthorizationReason } : {}) };
 }
 
@@ -569,7 +570,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
       await tx.update(issueRecoveryActions).set({ evidence: { ...prior.evidence,
         freshContinuation: { ...object(prior.evidence.freshContinuation), previousExecutionGone: true,
           noticeAuthorizationReason: gate.noticeAuthorizationReason } } }).where(eq(issueRecoveryActions.id, prior.id));
-      await writeFreshThreadNotice(tx, run, issue.id, FRESH_THREAD_STARTED_NOTE);
+      await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
     }
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
     return { kind: "already_continued", recoveryActionId: prior.id };
@@ -879,7 +880,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     action: "issue.continued_from_saved_work", entityType: "issue", entityId: issue.id, agentId: run.agentId, runId: run.id,
     details: { recoveryActionId: primaryId, sourceRunId: run.id, failureCode: run.errorCode ?? null, trigger: input.trigger,
       delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length } });
-  if (strictBoundary) await writeFreshThreadNotice(tx, run, issue.id, FRESH_THREAD_STARTED_NOTE);
+  if (strictBoundary) await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
   logger.info({ runId: run.id, issueId: issue.id, failureCode: run.errorCode, trigger: input.trigger, delivery },
     "Unfinished run continues in a fresh run from saved work");
   return { kind: "continued", recoveryActionId: primaryId, delivery, isolation };

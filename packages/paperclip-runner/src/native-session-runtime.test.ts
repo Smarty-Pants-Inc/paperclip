@@ -6715,6 +6715,35 @@ describe("executeNativeSession recovery", () => {
     }
   });
 
+  // Keep: real driver -> HarnessDriverBackend -> runtime recovery boundary,
+  // the recorded D10 row-5 refusal must not become a generic retry/replacement.
+  it.each(["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const)(
+    "RFL round4 F2 row5 preserves structured remote-state refusal across actual recovery (%s)", async providerRecoveryPolicy => {
+      const executionInput = { ...input, workspace: { ...input.workspace, cwd: WORKSPACE } };
+      const transport = new FakeCodexTransport();
+      transport.rejectMethods.set("initialize", Object.assign(new Error("opaque remote read failure"),
+        { code: "runner_remote_state_unavailable" }));
+      const transportFactory = vi.fn(() => transport);
+      const backend = createCodexNativeSessionBackend(executionInput, {
+        runnerInstanceId: "runner-recovery", transportFactory,
+      });
+      const openRun = vi.fn(), appendEvent = vi.fn(), completeRun = vi.fn();
+      const failure = await executeNativeSession({ input: executionInput, backend,
+        runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+        controlPlane: { openRun, appendEvent, completeRun,
+          loadSessionCheckpoint: async () => ({ backendKind: "runner", driverKind: "codex_app_server",
+            sessionId: "earlier-driver", providerSessionId: "earlier-provider", identity,
+            workingDirectory: WORKSPACE, cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [], providerRecoveryPolicy }),
+          replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+        },
+      }).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ code: "runner_remote_state_unavailable" });
+      expect(openRun).not.toHaveBeenCalled();
+      expect(completeRun).not.toHaveBeenCalled();
+      expect(transport.calls.some(call => ["thread/start", "turn/start"].includes(call.method))).toBe(false);
+      expect(transportFactory).toHaveBeenCalledOnce();
+    });
+
   it("C3 retains launch-profile refusal before every legacy replacement callback", async () => {
     for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
       const checkpoint: PersistedNativeSession = { backendKind: "mock", sessionId: "earlier-driver", identity,
