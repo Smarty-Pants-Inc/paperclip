@@ -7863,7 +7863,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.presentation).toMatchObject({
       kind: "system_notice",
       tone: "danger",
-      detailsDefaultOpen: false,
+      detailsDefaultOpen: true,
     });
     expect(comments[0]?.presentation).not.toHaveProperty("density");
     expect(comments[0]?.metadata).toMatchObject({
