@@ -2874,8 +2874,8 @@ export function createPluginWorkerHandle(
       // plugin is authorized to act on proactively, resolve it to that
       // company's scope so the governed-access gate admits it. This never
       // widens access beyond the plugin's configured companies, and only
-      // applies when the worker is NOT inside a host-issued invocation (which
-      // would carry an id and keep its strict single-company match below).
+      // applies here when the worker is NOT inside a host-issued invocation.
+      // Scoped invocations keep their strict single-company match below.
       const proactiveCompanyId = referencedCompanyId(
         message.method,
         (message as { params?: unknown }).params,
@@ -2889,6 +2889,15 @@ export function createPluginWorkerHandle(
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
+    // A plugin-instance invocation (such as a job) carries no company of its
+    // own. Resolve explicit company references using the same configured-company
+    // allowlist as proactive calls, without inheriting another invocation's scope.
+    if (entry.scope === null) {
+      const companyId = referencedCompanyId(message.method, (message as { params?: unknown }).params);
+      if (companyId && proactiveCompanyScopes.has(companyId)) {
+        return { invocationScope: { companyId }, traceparent: entry.traceparent, providerSpanBudget: entry.providerSpanBudget };
+      }
+    }
     return { invocationScope: entry.scope, traceparent: entry.traceparent, providerSpanBudget:entry.providerSpanBudget };
   }
 
