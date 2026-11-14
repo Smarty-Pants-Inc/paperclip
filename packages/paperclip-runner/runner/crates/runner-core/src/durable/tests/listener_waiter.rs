@@ -205,6 +205,77 @@ fn listener_waiter_cancellation(rotate: bool) {
 }
 
 #[test]
+fn disconnected_waiter_does_not_claim_released_admission() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let path = "/api/runner/v1/connect/run_1";
+    let endpoint = RunnerTransportEndpoint::from_listener(listener, path.to_owned());
+
+    let (a_peer, _) = client(
+        format!("ws://{address}{path}"),
+        TcpStream::connect(address).unwrap(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut controller_a = loop {
+        if let Some(socket) = endpoint.open(65536, None, deadline).unwrap() {
+            break socket;
+        }
+        assert!(Instant::now() < deadline, "A was not admitted");
+        thread::sleep(Duration::from_millis(1));
+    };
+    let RunnerSocket::Listen(socket) = &mut controller_a else {
+        unreachable!()
+    };
+    socket.authenticated().unwrap();
+
+    let mut abandoned = TcpStream::connect(address).unwrap();
+    abandoned
+        .write_all(
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let _ = abandoned.shutdown(std::net::Shutdown::Both);
+    drop(abandoned);
+    thread::sleep(Duration::from_millis(100));
+    drop(controller_a);
+    drop(a_peer);
+
+    let dead = endpoint
+        .open(65536, None, Instant::now() + Duration::from_millis(200))
+        .unwrap();
+    assert!(dead.is_none(), "disconnected waiter was published as ready");
+
+    let (received, worker) = mpsc::channel();
+    let c_address = address;
+    let c_path = path.to_owned();
+    let c_peer = thread::spawn(move || {
+        let result = client(
+            format!("ws://{c_address}{c_path}"),
+            TcpStream::connect(c_address).unwrap(),
+        );
+        received.send(result.is_ok()).unwrap();
+        result
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let controller_c = loop {
+        if let Some(socket) = endpoint.open(65536, None, deadline).unwrap() {
+            break socket;
+        }
+        assert!(Instant::now() < deadline, "C was not admitted after B disconnected");
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(worker.recv_timeout(Duration::from_secs(1)).unwrap());
+    let c_peer = c_peer.join().unwrap().unwrap().0;
+    drop(controller_c);
+    drop(c_peer);
+}
+
+#[test]
 fn listener_waiter_shutdown_wakes_and_joins_valid_upgrade() {
     listener_waiter_cancellation(false);
 }
