@@ -34,6 +34,7 @@ import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait
 import { PENDING_CONTINUATION_BOUND_MS } from "../recovery-continuation-pacing.js";
 import { attributeBlock, BLOCK_ATTRIBUTION_WINDOW_MS, blockedStatusDetailsSql } from "../interruption-block-release.js";
 import { ASSIGNED_WORK_CONTINUED_ACTION, taskAutomaticAttempts } from "./task-automatic-attempts.js";
+import { isReattachPhaseActive, reattachPhaseRecheckAt } from "../heartbeat/run-admission.js";
 import { ensureFreshContinuation, type FreshContinuationResult } from "../fresh-continuation-fallback.js";
 import { canContinueRecoveryRunAutomatically } from "../continuation-cause.js";
 import { STRANDED_CONTINUATION_MAX_AGE_MS, STRANDED_KIND, strandedHoldContinuesAutomatically, type StrandedHoldRun } from "./stranded-hold-continuation.js";
@@ -95,7 +96,7 @@ export type AssignedWorkDeps = {
 
 export type AssignedWorkCheck = {
   verdict: AssignedWorkVerdict;
-  outcome: "ok" | "settling" | "repaired" | "settled_lost_run" | "deferred_rate_limit" | "deferred_cap" | "stale_reported" | "left_to_hold_owner" | "left_to_native_recovery" | "changed" | "enqueue_refused"
+  outcome: "ok" | "settling" | "repaired" | "settled_lost_run" | "deferred_rate_limit" | "deferred_cap" | "deferred_reattach_phase" | "stale_reported" | "left_to_hold_owner" | "left_to_native_recovery" | "changed" | "enqueue_refused"
     | "waiting_on_recovery" | "left_to_handover";
   retryAt: Date | null;
 };
@@ -567,6 +568,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     if (verdict.kind === "not_applicable" || verdict.kind === "ok") return { verdict, outcome: "ok", retryAt: null };
     if (verdict.kind === "settling") return { verdict, outcome: "settling", retryAt: verdict.recheckAt };
     if (verdict.stale) return { verdict, outcome: "stale_reported", retryAt: null };
+    if (isReattachPhaseActive()) return { verdict, outcome: "deferred_reattach_phase", retryAt: reattachPhaseRecheckAt(at.getTime()) };
     if (verdict.reason === "blocked_with_live_run") {
       return { verdict, outcome: await liftBlockBehindLiveRun(issue, at) ? "repaired" : "changed", retryAt: null };
     }
