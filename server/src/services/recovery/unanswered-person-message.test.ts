@@ -129,7 +129,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       }
       const heldNotices = await held.visible();
       expect(heldNotices).toHaveLength(1);
-      expect(heldNotices[0]!.body).toContain("stopping the earlier attempt before starting fresh");
+      expect(heldNotices[0]!.body).toContain("cannot confirm that the earlier attempt stopped");
+      expect(heldNotices[0]!.body).toContain("Retry");
+      expect(heldNotices[0]!.body).not.toContain("I'm stopping");
     }
   });
 

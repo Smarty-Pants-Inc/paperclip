@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { currentNotices } from "../rfl-current-notice-assertions.js";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -389,7 +390,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     expect((await notices()).filter(comment => comment.authorType === "system")).toMatchObject([{
       body: expect.stringContaining("fresh thread in this conversation"),
-      metadata: { authorizationReason: `fresh_provider_thread:${continued.recoveryActionId}` },
+      metadata: { authorizationReason: `fresh_provider_thread_pending:${oldId}` },
     }]);
     expect((await notices()).find(comment => comment.id === message!.id)?.body).toBe("Finish this in the saved conversation.");
     expect((await read(run!.id)).runnerProfileJson).toMatchObject({ piConversation: {
@@ -428,9 +429,12 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     });
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     expect(comments.find(comment => comment.id === person.id)?.body).toBe(person.body);
-    expect(comments.filter(comment => comment.authorType === "system"))
-      .toMatchObject([{ body: "Starting a fresh thread from saved history." }]);
-    expect(comments.filter(comment => comment.authorType === "system")).toHaveLength(1);
+    const allNotes = comments.filter(comment => comment.authorType === "system");
+    expect(allNotes).toHaveLength(2);
+    const old = allNotes.find(note => note.body === "Stopping the earlier attempt before starting fresh.")!;
+    expect(old).toBeDefined();
+    expect(currentNotices(allNotes)).toMatchObject([{ body: "Starting a fresh thread from saved history." }]);
+    expect(old.metadata?.supersededByCommentId).toBe(currentNotices(allNotes)[0].id);
   });
 
   // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.
