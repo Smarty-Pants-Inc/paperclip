@@ -377,7 +377,7 @@ describe("remote launch asset staging", () => {
     expect(active.max).toBeGreaterThan(1);
     expect(active.max).toBeLessThanOrEqual(4);
     expect(f.input.stageDirectory).toHaveBeenCalledTimes(11);
-    expect(f.input.stageDirectory.mock.calls.map(([asset]) => [asset.targetPath, asset.mode])).toEqual([
+    expect(vi.mocked(f.input.stageDirectory).mock.calls.map(([asset]) => [asset.targetPath, asset.mode])).toEqual([
       [context.target.instructions.bundle.rootPath, 0o555],
       ...context.target.skills.map(skill => [skill.bundle.rootPath, 0o555]),
     ]);
