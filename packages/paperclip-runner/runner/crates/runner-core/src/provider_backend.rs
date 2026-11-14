@@ -1532,6 +1532,15 @@ impl CodexProviderState {
                     // Unknown diagnostics and substantive retained facts still fence
                     // prepare; attachment retains the admitted notices for draining.
                     event.event_type == "session.resumed"
+                        || (event.event_type == "session.reconciled"
+                            && event
+                                .payload
+                                .get("previousProviderTurnId")
+                                .is_some_and(Value::is_null)
+                            && event
+                                .payload
+                                .get("activeProviderTurnId")
+                                .is_some_and(Value::is_null))
                         || (event.event_type == "harness.diagnostic"
                             && matches!(
                                 event.payload.get("code").and_then(Value::as_str),
@@ -3470,7 +3479,18 @@ impl CodexCommandExecutor {
                         && !provider.has_active_goal()
                         && !provider.has_known_descendants()
                 });
-            if state.config != config
+            // Pi attachment already refreshes run instructions. Compare the
+            // stable profile here, without letting a same-run or live-work
+            // request disguise an instruction change as a context refresh.
+            let mut stable_config = config.clone();
+            if rebind_run
+                && state.thread_id.is_some()
+                && state.config.provider == "pi_rpc"
+                && config.provider == "pi_rpc"
+            {
+                stable_config.instructions = state.config.instructions.clone();
+            }
+            if state.config != stable_config
                 || (state.completion_contract != completion_contract && !rebind_run)
                 || ((different_run || legacy_attachment) && !rebind_run)
             {
@@ -3847,6 +3867,12 @@ impl CodexCommandExecutor {
             .state
             .clone()
             .ok_or_else(|| DurableRunnerError::invalid("Codex provider has not been prepared"))?;
+        // Evaluate the predecessor before attachment clears run-scoped receipt
+        // flags; a reset must not manufacture settlement of an exited session.
+        let settled_exited_checkpoint = next_state.lifecycle == "provider_exited"
+            && next_state.is_settled_except_retained_events()
+            && next_state.pi_deferred_terminal.is_none()
+            && next_state.descendant_thread_ids.is_empty();
         // execute() restores the durable provider before dispatching run.attach.
         // Attachment asks one question: is anything live or waiting right now?
         // Pending events describe the past, so they never block it. They stay in
@@ -4080,9 +4106,11 @@ impl CodexCommandExecutor {
                         ))
                     })
             }
-        } else if next_state.lifecycle == "prepared" && next_state.provider_process_generation > 0 {
-            // turn.stop deliberately terminates the exact old process and
-            // retains a prepared, settled thread checkpoint. Rebind only its
+        } else if next_state.provider_process_generation > 0
+            && (next_state.lifecycle == "prepared" || settled_exited_checkpoint)
+        {
+            // turn.stop and an observed idle provider exit both retain a
+            // settled thread with no process left to attach. Rebind only its
             // validated run-scoped settings here; open_session then restores
             // that same thread under the new authority. Never restart during
             // drain/suspend or require the stopped process to still exist.
@@ -8449,6 +8477,7 @@ done
     include!("provider_backend_tests/cross_run_base.rs");
     include!("provider_backend_tests/cross_run_judge.rs");
     include!("provider_backend_tests/cross_run_round2.rs");
+    include!("provider_backend_tests/reopen_done.rs");
 
     fn prepared_skill_checkpoint(
         provider: &str,
@@ -8659,6 +8688,7 @@ while IFS= read -r line; do
   esac
 done
 "#, requests.display())).unwrap();
+        fs::set_permissions(&proxy, fs::Permissions::from_mode(0o600)).unwrap();
         let artifact = |path: PathBuf| crate::durable::QualifiedLaunchArtifact {
             sha256: format!("sha256:{:x}", Sha256::digest(fs::read(&path).unwrap())),
             path,
