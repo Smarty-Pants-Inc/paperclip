@@ -63,6 +63,6 @@ export function systemNoticePresentation(input: {
     kind: "system_notice",
     tone: input.tone,
     title: input.title,
-    detailsDefaultOpen: false,
+    detailsDefaultOpen: true,
   };
 }
