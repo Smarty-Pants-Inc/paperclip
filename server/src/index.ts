@@ -1364,6 +1364,11 @@ async function startServerWithDatabaseTeardown(
     evidenceRetentionDays: config.nativeRunnerEvidenceRetentionDays,
     shouldContinue: () => !heartbeatSchedulerStopped && !isIdleTaskDrainActive() && !isWarmStandby(),
   });
+  // Report stranded transcript captures regardless of the optional expiration
+  // feature. This is read-only and shares the native backup maintenance startup
+  // delay/cadence, so disabled expiration cannot silence the warning.
+  const stopNativeHarnessBackupStalePendingScan = nativeHarnessBackupExpiration.registerStalePendingScan();
+  server.on("close", stopNativeHarnessBackupStalePendingScan);
   const externalObjects = externalObjectService(db as any, {
     pluginWorkerManager,
     enabled: async () => (await instanceSettingsService(db).getExperimental()).enableExternalObjects === true,

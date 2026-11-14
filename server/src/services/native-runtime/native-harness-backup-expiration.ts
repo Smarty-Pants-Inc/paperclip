@@ -484,6 +484,44 @@ export function nativeHarnessBackupExpirationService(
     }
   }
 
+  async function reportStalePendingBackups() {
+    const base = path.resolve(defaults.stateBase ?? nativeHarnessStateBase());
+    let after: string | undefined;
+    while (true) {
+      const page = await backupScopes(after, 100);
+      for (const scopeDigest of page.names) {
+        const scopeRoot = path.join(base, scopeDigest);
+        if (!(await isRealDirectory(scopeRoot))) continue;
+        await reportStalePending(path.join(scopeRoot, "failover-backups"), scopeDigest, Date.now());
+        const continuityRoot = path.join(scopeRoot, "continuity-breaks");
+        if (!(await isRealDirectory(continuityRoot))) continue;
+        for (const archive of (await fs.readdir(continuityRoot).catch(missingPath)) ?? []) {
+          const archiveRoot = path.join(continuityRoot, archive);
+          if (await isRealDirectory(archiveRoot)) {
+            await reportStalePending(path.join(archiveRoot, "failover-backups"), scopeDigest, Date.now());
+          }
+        }
+      }
+      if (page.complete) return;
+      after = page.names.at(-1);
+    }
+  }
+
+  function registerStalePendingScan(schedule: { startupDelayMs?: number; intervalMs?: number } = {}) {
+    const startupDelayMs = schedule.startupDelayMs ?? NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS;
+    const intervalMs = schedule.intervalMs ?? NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const scan = async () => {
+      if (stopped) return;
+      try { await reportStalePendingBackups(); }
+      catch (err) { logger.warn({ err }, "Native harness stale pending backup scan failed"); }
+      if (!stopped) timer = setTimeout(() => { void scan(); }, intervalMs);
+    };
+    timer = setTimeout(() => { void scan(); }, startupDelayMs);
+    return () => { stopped = true; clearTimeout(timer); };
+  }
+
   async function settleLeftovers(backupRoot: string) {
     const current = path.join(backupRoot, "current");
     for (const name of (await fs.readdir(backupRoot).catch(missingPath)) ?? []) {
@@ -992,5 +1030,5 @@ export function nativeHarnessBackupExpirationService(
   }
 
   return { tick, noteEvidence, nextEvidenceAt, tickCheckpoints, registerCheckpointExpiration,
-    reconcileBackup, backupScopes, expireBackup, resolveBackupScope };
+    reportStalePendingBackups, registerStalePendingScan, reconcileBackup, backupScopes, expireBackup, resolveBackupScope };
 }
