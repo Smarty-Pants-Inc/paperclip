@@ -8,6 +8,7 @@ import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRu
 import { and, eq, isNull } from "drizzle-orm";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companyPortabilityService } from "../services/company-portability.js";
+import { companyService } from "../services/companies.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
@@ -152,6 +153,64 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       expect(runs).toHaveLength(1);
       expect(runs[0]).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "issue_monitor_due" } });
       expect(await notes(f.issue.id)).toHaveLength(0);
+    } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); }
+  });
+
+  // Keep reason: recorded monpause incident; the real due timer consumed an
+  // imported agent's armed monitor while admission was closed by a pause.
+  it.each([
+    { status: "in_progress", hold: "import" },
+    { status: "in_review", hold: "import" },
+    { status: "in_progress", hold: "manual" },
+    { status: "in_review", hold: "manual" },
+    { status: "in_progress", hold: "company" },
+    { status: "in_review", hold: "company" },
+  ])("overdue monitor survives $hold pause and resumes exactly once ($status)", async ({ status, hold }) => {
+    const f = await imported(true, status);
+    const due = new Date(Date.now() + 60_000);
+    await db.update(issues).set({ monitorNextCheckAt: due }).where(eq(issues.id, f.issue.id));
+    const heartbeat = heartbeatService(db, { runStartHandover: { isYielding: () => true, refreshIfStale: async () => {} } });
+    const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+      runPlugin: async () => "complete", runHost: async () => "complete" });
+    try {
+      await worker.process(f.agentId);
+      if (hold !== "import") {
+        await createAgentLifecycle(db).resumeAgent(f.agentId);
+        await worker.process(f.agentId);
+        if (hold === "manual") await createAgentLifecycle(db).pauseAgent(f.agentId, "manual");
+        else await companyService(db).update(f.companyId, { status: "paused" });
+      }
+      for (let tick = 1; tick <= 2; tick++) {
+        const result = await heartbeat.tickIssueMonitors(new Date(due.getTime() + tick));
+        const [waiting] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        console.log(JSON.stringify({ check: "overdue-monitor-paused", status, hold, tick, result,
+          schedule: waiting!.monitorNextCheckAt, attempts: waiting!.monitorAttemptCount }));
+        expect(result.triggered).toBe(0);
+        expect(waiting).toMatchObject({ status, monitorNextCheckAt: due, monitorWakeRequestedAt: null,
+          monitorAttemptCount: 0, monitorNotes: "Check the amber bridge bolts" });
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+        expect(await notes(f.issue.id)).toHaveLength(0);
+      }
+      // A held past-due deadline must not hot-loop the existing work scheduler.
+      expect(await heartbeat.nextIssueMonitorAt()).toBeNull();
+      if (hold === "company") await companyService(db).update(f.companyId, { status: "active" });
+      else {
+        await createAgentLifecycle(db).resumeAgent(f.agentId);
+        await worker.process(f.agentId);
+      }
+      expect(await heartbeat.nextIssueMonitorAt()).toBe(due.getTime());
+      // Competing controllers and the next tick must not duplicate admission.
+      await Promise.all([heartbeat.tickIssueMonitors(new Date(due.getTime() + 3)),
+        heartbeat.tickIssueMonitors(new Date(due.getTime() + 3))]);
+      await heartbeat.tickIssueMonitors(new Date(due.getTime() + 4));
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "issue_monitor_due" } });
+      const [consumed] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+      expect(consumed).toMatchObject({ monitorNextCheckAt: null, monitorWakeRequestedAt: null, monitorAttemptCount: 1 });
+      expect(await notes(f.issue.id)).toHaveLength(0);
+      console.log(JSON.stringify({ check: "overdue-monitor-resumed", status, hold,
+        runs: runs.map(run => ({ id: run.id, status: run.status, reason: run.contextSnapshot?.wakeReason })) }));
     } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); }
   });
 
