@@ -2325,9 +2325,11 @@ impl CodexCommandExecutor {
                 "provider_live_descendants"
             };
             self.refresh_admission = Some("refresh_wait");
-            return Ok(Some(CommandExecution::result(json!({ "status": "refresh_wait",
+            return Ok(Some(CommandExecution::result(
+                json!({ "status": "refresh_wait",
                 "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
-                "waitForTurn": active }))));
+                "waitForTurn": active }),
+            )));
         }
         if !goal && !changed_contract {
             return Ok(None);
@@ -2346,9 +2348,11 @@ impl CodexCommandExecutor {
                     "provider_contract_changed"
                 };
                 self.refresh_admission = Some("refresh_fresh");
-                return Ok(Some(CommandExecution::result(json!({ "status": "refresh_fresh",
+                return Ok(Some(CommandExecution::result(
+                    json!({ "status": "refresh_fresh",
                     "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
-                    "waitForTurn": false }))));
+                    "waitForTurn": false }),
+                )));
             }
         };
         // The old session is now closed. Its task history belongs to the server;
