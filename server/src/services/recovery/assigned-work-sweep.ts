@@ -682,6 +682,12 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       await settleContinuationActivity(claimed, claimed.reason, "restored_to_review");
       return { verdict: claimed.verdict, outcome: "repaired", retryAt: null };
     }
+    // Answer attribution roots the assigned-work ancestry at the exact person message.
+    const personMessages = facts.issue.isConversation ? await db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+      sql`${issueComments.authorUserId} is not null and ${issueComments.authorAgentId} is null
+        and ${issueComments.createdByRunId} is null and ${issueComments.deletedAt} is null`,
+    )).orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1) : [];
     const run = await deps.enqueueWakeup(issue.assigneeAgentId!, {
       source: facts.latestRun ? "automation" : "assignment", triggerDetail: "system",
       reason: facts.latestRun ? "issue_continuation_needed" : "issue_assigned",
@@ -689,7 +695,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       requestedByActorType: "system", requestedByActorId: null,
       contextSnapshot: { issueId: issue.id, taskId: issue.id, wakeReason: facts.latestRun ? "issue_continuation_needed" : "issue_assigned",
         source: ASSIGNED_WORK_CONTINUATION_SOURCE, assignedWorkViolation: claimed.reason,
-        ...(facts.latestRun ? { previousRunId: facts.latestRun.id } : {}) },
+        ...(facts.latestRun ? { previousRunId: facts.latestRun.id } : {}),
+        ...(personMessages[0] ? { wakeCommentId: personMessages[0].id } : {}) },
     }).catch(error => {
       logger.warn({ err: error, companyId: issue.companyId, issueId: issue.id }, "assigned-work continuation was not admitted");
       return null;
