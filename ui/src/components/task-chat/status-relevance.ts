@@ -24,6 +24,24 @@ function isAdmissionWait(run: StatusRun): boolean {
     && ["execution_reconciliation_required", "workspace_busy", "issue_not_in_progress", "issue_terminal_status"].includes(run.errorCode ?? "");
 }
 
+/**
+ * A system notice a later note or answer replaced (`metadata.supersededBy`).
+ * Presentation only, like the rest of this file: the row stays in history and
+ * is never removed; it just stops being presented as current status.
+ */
+export function isSupersededNotice(comment: {
+  authorType?: string | null;
+  presentation?: { kind?: string | null } | null;
+  metadata?: object | null;
+  conversationSessionGeneration?: number | null;
+}): boolean {
+  // Session resets are durable conversation boundaries, not execution status.
+  if (comment.conversationSessionGeneration != null) return false;
+  if (comment.authorType !== "system" && comment.presentation?.kind !== "system_notice") return false;
+  const supersededBy = comment.metadata && "supersededBy" in comment.metadata ? comment.metadata.supersededBy : null;
+  return typeof supersededBy === "string" && supersededBy.trim().length > 0;
+}
+
 /** Presentation only: retain every run and comment in the underlying history. */
 export function taskChatStatusRelevance(
   issueStatus: string | null | undefined,
@@ -69,11 +87,9 @@ export function taskChatStatusRelevance(
   };
 
   const isHistoricalNotice = (comment: IssueChatComment): boolean => {
-    if (comment.authorType !== "system" && comment.presentation?.kind !== "system_notice") return false;
-    const supersededBy = comment.metadata && "supersededBy" in comment.metadata ? comment.metadata.supersededBy : null;
-    if (typeof supersededBy === "string" && supersededBy.trim()) return true;
     // Session resets are durable conversation boundaries, not execution status.
     if (comment.conversationSessionGeneration != null) return false;
+    if (comment.authorType !== "system" && comment.presentation?.kind !== "system_notice") return false;
     const sourceRunId = comment.metadata?.sourceRunId ?? comment.createdByRunId
       ?? comment.runId ?? comment.derivedCreatedByRunId;
     const recoveryActionId = comment.metadata?.recovery?.actionId;
