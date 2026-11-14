@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport } from "../../__tests__/helpers/embedded-postgres.js";
 import { registerLocalRuntimeApiServer } from "../../runtime-api.js";
-import { F1_HISTORY, F1_MESSAGE, F1_REFUSALS, f1PersonFlow } from "./f1-person-flow.test-fixture.js";
+import { F1_HISTORY, F1_MESSAGE, F1_REFUSALS, f1PersonFlow } from "../../__tests__/helpers/f1-person-flow.js";
 
 let peerDb: Db;
 

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport } from "../../__tests__/helpers/embedded-postgres.js";
-import { F1_REFUSALS, f1PersonFlow } from "./f1-person-flow.test-fixture.js";
+import { F1_REFUSALS, f1PersonFlow } from "../../__tests__/helpers/f1-person-flow.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 // Keep: recorded RFL F1-2 incident and the trust boundary between a physically

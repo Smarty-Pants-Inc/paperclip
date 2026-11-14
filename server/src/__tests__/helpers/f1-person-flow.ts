@@ -9,14 +9,14 @@ import {
   heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, type Db,
 } from "@paperclipai/db";
 import { vi } from "vitest";
-import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
-import { deliverConversationComments } from "../agent-conversations.js";
-import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
-import { getExecutionBlocker } from "../execution-blocker.js";
-import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-import { heartbeatService } from "../heartbeat.js";
-import { issueService } from "../issues.js";
-import { persistHeartbeatRunProcessMetadata } from "./run-lifecycle.js";
+import { startEmbeddedPostgresTestDatabase } from "./embedded-postgres.js";
+import { deliverConversationComments } from "../../services/agent-conversations.js";
+import { createDeliveryWorkCoordinator } from "../../services/delivery-work-coordinator.js";
+import { getExecutionBlocker } from "../../services/execution-blocker.js";
+import { settleUnrecoverableExecutions } from "../../services/execution-recovery-resolution.js";
+import { heartbeatService } from "../../services/heartbeat.js";
+import { issueService } from "../../services/issues.js";
+import { persistHeartbeatRunProcessMetadata } from "../../services/heartbeat/run-lifecycle.js";
 
 export const F1_REFUSALS = ["runner_harness_state_mismatch: resumed_unavailable",
   "native_controller_recovery_missing_evidence:retained_sandbox_binding"] as const;
