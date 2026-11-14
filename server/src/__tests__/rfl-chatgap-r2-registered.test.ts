@@ -138,10 +138,7 @@ describeIssueRecovery("RFL round 2 registered production sweep", () => {
       expect(issueRead.body.status).toBe("blocked");
       expect(visibleCommentBodies).toContain("Recovery process can't run right now, so Paperclip stopped this task instead of retrying it. It is still assigned to them. To continue, resume or fix the agent, or assign the task to someone else.");
     } else {
-      expect(issueRead.body.interruption).toMatchObject({ state: "failed", canRetry: true });
-      const visibleStopNotice = issueRead.body.interruption.retryWait?.message
-        ?? (issueRead.body.interruption.state === "failed" ? "Couldn’t finish this attempt. Your message is saved." : null);
-      expect(visibleStopNotice).toBe("Couldn’t finish this attempt. Your message is saved.");
+      expect(issueRead.body.interruption).toMatchObject({ state: "failed", responsibility: "system", canRetry: true });
       expect(visibleCommentBodies).toContain("What is the result?");
     }
     appendFileSync(`${process.env.TASK_OUT}/registered-receipts.jsonl`, JSON.stringify({ name: `gate-evidence-${gate}`, gateEvidence }) + "\n");

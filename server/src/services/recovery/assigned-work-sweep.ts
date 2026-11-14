@@ -446,7 +446,6 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       issueId ? eq(issues.id, issueId) : undefined,
       inArray(issues.status, [...OPEN_STATUSES]),
       sql`(${issues.status} <> 'in_review' or (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'))`,
-      sql`(${issues.status} <> 'in_review' or ${issues.conversationState} = 'waiting')`,
       sql`${issues.assigneeAgentId} is not null`,
       isNull(issues.assigneeUserId),
       isNull(issues.hiddenAt),
@@ -457,8 +456,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
    * The cheap, indexed pre-filter the sweep reconstructs from: open assigned
    * tasks with no run that is plainly live, no pending wake and no pending
    * question. Everything it lets through is judged by the full predicate.
-   * Person-facing chats are considered only when their latest human message
-   * is not answered by the run that carried it; old blocks are only reported.
+   * Person-facing chats are considered when their latest human message is not
+   * answered by the run that carried it, regardless of the conversation-state label; old blocks are only reported.
    */
   async function listSuspects(scope: { companyId?: string; issueId?: string; createdAfter?: Date | null }, cursor: string | null, limit: number) {
     const at = now();
@@ -480,7 +479,6 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         scope.createdAfter ? gte(issues.createdAt, scope.createdAfter) : undefined,
         inArray(issues.status, [...OPEN_STATUSES]),
         sql`(${issues.status} <> 'in_review' or (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'))`,
-        sql`(${issues.status} <> 'in_review' or ${issues.conversationState} = 'waiting')`,
         sql`${issues.assigneeAgentId} is not null`,
         isNull(issues.assigneeUserId),
         isNull(issues.hiddenAt),

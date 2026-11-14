@@ -116,14 +116,18 @@ describeIssueRecovery("RFL independent round 3 delta attacks", () => {
     expect(result.some(r=>r.runId===id)).toBe(false);
     expect(result.some(r=>r.hasReply)).toBe(false);
   });
-  it("the stated waiting-only exception does not continue in_review state=active", async () => {
+  it("an unanswered in_review state=active chat still receives one continuation", async () => {
     const conversationState = "active";
-    const f=await seed(await setup()); await responder(f);
+    const f=await seed(await setup()); const failures=await responder(f);
     await state.db.update(issues).set({conversationState}).where(eq(issues.id,f.issueId));
     await state.start(); await flush();
     const result=await runs(f);
+    const successors=result.filter(r=>r.id!==f.runId);
     record(`nonwaiting-${conversationState}`,result.map(r=>({id:r.id,status:r.status,source:r.contextSnapshot?.source})));
-    expect(result.filter(r=>r.id!==f.runId)).toHaveLength(0);
+    expect(failures).toEqual([]);
+    expect(successors).toHaveLength(1);
+    const comments=await state.db.select().from(issueComments).where(eq(issueComments.issueId,f.issueId));
+    expect(comments.filter(c=>c.authorAgentId===f.agentId && c.createdByRunId===successors[0]!.id)).toHaveLength(1);
   });
   it("registered discovery reaches an unanswered chat after a full page of recovery-answered chats", async () => {
     const f=await setup();

@@ -128,7 +128,7 @@ export type AssignedWorkFacts = {
     unblockOwner: { agentId: string } | { userId: string } | "board" | null;
     monitorNextCheckAt: Date | null;
     isConversation: boolean;
-    /** Chat recovery in review applies only after the conversation is waiting on a person. */
+    /** Persisted state is diagnostic only; the unanswered-message and safety predicates determine eligibility. */
     conversationState?: string | null;
     /** At least one non-deleted person-authored message exists. */
     conversationHasPersonMessage?: boolean;
@@ -189,7 +189,7 @@ const IN_SCOPE_STATUSES = new Set(["todo", "in_progress", "blocked", "in_review"
 export function evaluateAssignedWork(facts: AssignedWorkFacts, now: Date = new Date()): AssignedWorkVerdict {
   const { issue } = facts;
   if (!IN_SCOPE_STATUSES.has(issue.status) || !issue.assigneeAgentId || issue.assigneeUserId || issue.hidden
-    || (issue.status === "in_review" && (issue.conversationState !== "waiting" || !issue.isConversation || issue.conversationHasPersonMessage !== true
+    || (issue.status === "in_review" && (!issue.isConversation || issue.conversationHasPersonMessage !== true
       || issue.conversationAnswered !== false || facts.latestRun?.status !== "succeeded"))) {
     return { kind: "not_applicable" };
   }
