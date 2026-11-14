@@ -56,6 +56,35 @@ async function raw(socketPath: string, frame: string | Buffer) {
 const refused = `${JSON.stringify({ error: PI_BIND_ERROR })}\n`;
 
 describe("Pi host semantic callback server (real Unix socket)", () => {
+  it.each(["session_mismatch", "origin_mismatch", "call_identity_unannounced", "deadline", "result_invalid", "dispatch_exception"])("records %s once internally and keeps the exact private refusal frame", async reason => {
+    const reasons: string[] = [];
+    const f = await fixture({
+      timeoutMs: 30,
+      onRefusal: code => { reasons.push(code); },
+      handleTool: async () => {
+        if (reason === "deadline") return new Promise(() => {});
+        if (reason === "result_invalid") return { content: "SECRET_RESULT" } as never;
+        if (reason === "dispatch_exception") throw new Error("SECRET_EXCEPTION");
+        return result;
+      },
+    });
+    if (reason !== "call_identity_unannounced") f.authority.announce("call", origin);
+    const request = call({ arguments: { secret: "SECRET_ARGUMENTS" },
+      ...(reason === "session_mismatch" ? { sessionId: "other" } : {}),
+      ...(reason === "origin_mismatch" ? { origin: next } : {}),
+    });
+    expect(await raw(f.socketPath, `${JSON.stringify(request)}\n`)).toBe(refused);
+    expect(reasons).toEqual([reason]);
+    expect(JSON.stringify(reasons)).not.toContain("SECRET");
+  });
+  it("does not diagnose accepted-call socket/turn cleanup, even when the diagnostic sink throws", async () => {
+    const diagnose = vi.fn(() => { throw new Error("SECRET_DIAGNOSTIC"); });
+    const f = await fixture({ onRefusal: diagnose });
+    f.authority.announce("call", origin);
+    await expect(sendPiToolRequest(f.socketPath, call())).resolves.toEqual(result);
+    await f.server.close();
+    expect(diagnose).not.toHaveBeenCalled();
+  });
   it("serves the announced current call via sendPiToolRequest and preserves empty arguments", async () => {
     const seen: PiToolCallRequest[] = [];
     const f = await fixture({ handleTool: async request => { seen.push(request); return result; } });

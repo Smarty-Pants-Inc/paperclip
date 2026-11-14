@@ -55,6 +55,42 @@ These diagnostics explain local intervals, not deployed latency improvement;
 use a real warm-turn trace for that claim. Ordering and failure-path regressions live in
 `pi-rpc-resident-binding.test.ts` and `pi-rpc-stop.test.ts`.
 
+## Tool callback refusal diagnostics
+
+Callback authority gates still fail closed. The model sees exactly
+`Pi tool callback refused`; the private callback socket keeps its existing
+`Pi private request rejected` frame. Accepted calls emit no refusal diagnostic.
+
+The existing run-event stream records a `harness.diagnostic` with
+`code: "pi_tool_callback_refused"`, a closed-vocabulary `reason`, and
+`boundary: "host"` or `"extension"`. Reasons are `binding_missing`,
+`binding_stale`, `tool_not_admitted`, `authority_rejected`,
+`call_identity_unannounced`, `call_identity_reused`, `origin_mismatch`,
+`session_mismatch`, `aborted`, `deadline`, `result_invalid`, `request_invalid`,
+`arguments_mismatch`, and `dispatch_exception`. No arguments, result bodies,
+exception messages, credentials or socket paths are included.
+
+Host callbacks publish directly through the driver's existing diagnostic path.
+The extension appends a non-model custom entry,
+`paperclip.pi-tool-refusal.v1`, containing only the code, reason and native call
+ID. The driver projects it using the native execution's captured ownership,
+including an unfinished tool's owner after settlement. Unknown, conflicting or
+completed/retired identities do not borrow a newer turn. Only the closed reason
+and boundary reach the projected diagnostic; opaque custom-entry fields are not
+traversed. Diagnostic-write errors do not replace the generic refusal.
+
+One refused execution may have both host and extension diagnostics. The private
+socket deliberately does not transmit its leaf cause: the host records the
+precise guard, while the extension can record `dispatch_exception` for that
+failed private exchange. These are boundary observations, not separate tool
+attempts. Use the host observation for the host's leaf cause.
+
+The regression checks in `extension/index.test.ts`, `pi-bind-protocol.test.ts`,
+`pi-rpc-callback-server.test.ts`, `pi-rpc-resident-binding.test.ts`,
+`pi-event-projector.test.ts` and `pi-rpc-driver.test.ts` cover distinct guard
+reasons, accepted-call silence, unchanged public/private errors, private-data
+exclusion and captured ownership. They do not establish a deployed latency fix.
+
 ## Late receipts and bounded identity history
 
 Settlement releases the turn's projector, arguments, text and exact identity

@@ -7,7 +7,8 @@ import { createServer, type Socket } from "node:net";
 import { basename, dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
-  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, dispatchPiToolCall,
+  PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, dispatchPiToolCall, PiToolCallbackRefusal, piToolRefusalReason,
+  type PiToolRefusalReason,
   validSocketPath, validatePiToolCallReceipt, validatePiToolCallRequest,
   type PiToolCallReceipt, type PiToolCallRequest, type PiToolResult, type RunAuthority,
 } from "./pi-bind-protocol.js";
@@ -21,6 +22,8 @@ export interface PiCallbackServerOptions {
   waitForAnnouncement: (call: PiToolCallRequest, signal: AbortSignal) => Promise<void>;
   /** Must honor cancellation before effects, as required by dispatchPiToolCall. */
   handleTool: (call: PiToolCallRequest, signal: AbortSignal) => Promise<PiToolResult>;
+  /** Internal run diagnostics only; the private/model-facing refusal is unchanged. */
+  onRefusal?: (reason: PiToolRefusalReason, call: PiToolCallRequest) => void;
   /** Separate read/announcement/result deadlines; host execution gets a fresh budget.
    * Waiting for a dispatch slot never consumes the host execution deadline. */
   timeoutMs?: number;
@@ -122,10 +125,16 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
     // At most one 1 MiB backing buffer per reader, even for one-byte chunks.
     let buffer: Buffer | undefined, bytes = 0, reading = false, handled = false, replied = false;
     let queued: Job | undefined;
+    let capturedCall: PiToolCallRequest | undefined, diagnosed = false;
+    const diagnose = (reason: PiToolRefusalReason) => {
+      if (!capturedCall || diagnosed) return;
+      diagnosed = true;
+      try { options.onRefusal?.(reason, capturedCall); } catch { /* Diagnostics cannot change refusal. */ }
+    };
     const stopReading = () => { if (reading) { reading = false; --readers; } };
     const armDeadline = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => { if (replied) socket.destroy(); else reject(); }, timeoutMs);
+      timer = setTimeout(() => { if (replied) socket.destroy(); else reject("deadline"); }, timeoutMs);
     };
     const reply = (frame: string, rejectCall = false) => {
       if (replied || socket.destroyed) return;
@@ -136,7 +145,11 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
       socket.end(frame, () => socket.destroy());
       drain();
     };
-    const reject = () => reply(REFUSAL, true);
+    const reject = (reason: PiToolRefusalReason = "aborted") => {
+      if (replied) return; // Successful result-write cleanup is not a refusal.
+      diagnose(reason); reply(REFUSAL, true);
+    };
+    const abortDispatch = () => reject("aborted");
     pending.set(socket, { controller, startReading: () => {
       if (reading || handled || replied || socket.destroyed) return false;
       reading = true; ++readers; armDeadline(); socket.resume(); return true;
@@ -152,37 +165,43 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
       let signal: AbortSignal | undefined;
       try {
         // This captured call, including all extra fields, was frozen before any await.
-        if (call.sessionId !== sessionId || !authority.accept(call.origin)) throw refused();
+        if (call.sessionId !== sessionId) throw new PiToolCallbackRefusal("session_mismatch");
+        if (!authority.accept(call.origin)) throw new PiToolCallbackRefusal(authority.refusalReason(call.origin) ?? "authority_rejected");
         const turnSignal = authority.signalFor(call.origin);
-        if (!turnSignal) throw refused();
+        if (!turnSignal) throw new PiToolCallbackRefusal("authority_rejected");
         signal = AbortSignal.any([controller.signal, turnSignal]);
-        signal.addEventListener("abort", reject, { once: true });
+        signal.addEventListener("abort", abortDispatch, { once: true });
         signal.throwIfAborted();
         armDeadline(); // Announcement wait is bounded, but is not host execution.
         await waitForStream(waitForAnnouncement, call, signal);
         signal.throwIfAborted();
-        if (!authority.accept(call.origin)) throw refused();
+        if (!authority.accept(call.origin)) throw new PiToolCallbackRefusal(authority.refusalReason(call.origin) ?? "authority_rejected");
         deadline = performance.now() + timeoutMs;
         armDeadline();
         // Keep the identical deeply immutable snapshot at both consumer boundaries.
         // The helper still performs atomic once-only consume, cancellation and result gates.
         const result = await dispatchPiToolCall(authority, call, (_captured, toolSignal) => {
           toolSignal.throwIfAborted();
-          if (performance.now() >= deadline) throw refused();
+          if (performance.now() >= deadline) throw new PiToolCallbackRefusal("deadline");
           return handleTool(call, toolSignal);
         }, { signal, timeoutMs });
         const receipt: PiToolCallReceipt = {
           schema: 1, type: "tool_result", nonce: call.nonce, sessionId: call.sessionId,
           origin: call.origin, toolCallId: call.toolCallId, result,
         };
-        const frame = `${JSON.stringify(receipt)}\n`;
-        // Validate the emitted bytes too: details/toJSON must not change the wire shape.
-        if (Buffer.byteLength(frame) > PI_BIND_MAX_FRAME_BYTES || !validatePiToolCallReceipt(JSON.parse(frame), call)) throw refused();
+        let frame: string;
+        try {
+          frame = `${JSON.stringify(receipt)}\n`;
+          // Validate the emitted bytes too: details/toJSON must not change the wire shape.
+          if (Buffer.byteLength(frame) > PI_BIND_MAX_FRAME_BYTES || !validatePiToolCallReceipt(JSON.parse(frame), call)) throw new Error();
+        } catch { throw new PiToolCallbackRefusal("result_invalid"); }
         signal.throwIfAborted();
-        if (closed || !authority.accept(call.origin, call.toolCallId) || performance.now() >= deadline) throw refused();
+        if (closed) throw new PiToolCallbackRefusal("aborted");
+        if (!authority.accept(call.origin, call.toolCallId)) throw new PiToolCallbackRefusal(authority.refusalReason(call.origin, call.toolCallId) ?? "authority_rejected");
+        if (performance.now() >= deadline) throw new PiToolCallbackRefusal("deadline");
         reply(frame);
-      } catch { reject(); }
-      finally { signal?.removeEventListener("abort", reject); }
+      } catch (error) { reject(piToolRefusalReason(error, signal?.aborted ? "aborted" : "dispatch_exception")); }
+      finally { signal?.removeEventListener("abort", abortDispatch); }
     }
     socket.on("data", (chunk: Buffer) => {
       if (replied) return;
@@ -201,11 +220,13 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
         const request: unknown = JSON.parse(frame.subarray(0, frame.length - 1).toString("utf8"));
         if (!validatePiToolCallRequest(request)) throw refused();
         const captured = freezeCall(request);
+        capturedCall = captured;
         // Fence queued work immediately on settlement; do not consume its native
         // announcement or start its host deadline until a slot is available.
-        if (captured.sessionId !== sessionId || !authority.accept(captured.origin)) throw refused();
+        if (captured.sessionId !== sessionId) throw new PiToolCallbackRefusal("session_mismatch");
+        if (!authority.accept(captured.origin)) throw new PiToolCallbackRefusal(authority.refusalReason(captured.origin) ?? "authority_rejected");
         const turnSignal = authority.signalFor(captured.origin);
-        if (!turnSignal) throw refused();
+        if (!turnSignal) throw new PiToolCallbackRefusal("authority_rejected");
         const queuedSignal = AbortSignal.any([controller.signal, turnSignal]);
         const abort = () => reject();
         queuedSignal.addEventListener("abort", abort, { once: true });
@@ -217,7 +238,7 @@ export async function startPiCallbackServer(options: PiCallbackServerOptions): P
         } };
         queue.push(queued);
         drain();
-      } catch { reject(); }
+      } catch (error) { reject(piToolRefusalReason(error, controller.signal.aborted ? "aborted" : "request_invalid")); }
     });
     drain();
   });

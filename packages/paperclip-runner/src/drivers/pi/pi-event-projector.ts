@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { redactProviderDiagnostic } from "../diagnostic-redaction.js";
 import { piPerformanceEntrySpans } from "./pi-performance-diagnostics.js";
+import { piToolRefusalEntry, PI_TOOL_REFUSAL_DIAGNOSTIC } from "./pi-bind-protocol.js";
 import { PROVIDER_PERFORMANCE_DIAGNOSTIC } from "../../contracts/provider-performance.js";
 
 /** Driver-admitted ownership, captured once for the lifetime of a Runner turn. */
@@ -323,6 +324,9 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     // Each request batch bypasses the generic 16-notice activity cap; equal
     // milliseconds are distinct hook observations, not dedupe identities.
     if (source.type === "entry_appended") {
+      const refusal = piToolRefusalEntry(source.entry);
+      if (refusal) return [{ ...origin, eventType: "harness.diagnostic",
+        payload: { code: PI_TOOL_REFUSAL_DIAGNOSTIC, reason: refusal.reason, boundary: "extension" } }];
       const spans = piPerformanceEntrySpans(source.entry, Date.now());
       return spans.length ? [{ ...origin, eventType: "harness.diagnostic",
         payload: { code: PROVIDER_PERFORMANCE_DIAGNOSTIC, spans } }]

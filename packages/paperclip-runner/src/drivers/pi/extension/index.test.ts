@@ -36,6 +36,7 @@ async function fixture(overrides: { initial?: PiBindInitial; hooks?: Parameters<
   const ctx: PiBindContext = { sessionManager: { getSessionId: () => "native-pi-session-not-host-id" }, isIdle: () => idle, hasPendingMessages: () => pending, abort: vi.fn(() => {}), model: { provider: "paperclip", id: "m" }, modelRegistry: { find: (provider, id) => ({ provider, id }) } };
   const pi: PiBindApi = {
     on: (event, handler) => { handlers.set(event, handler); return () => handlers.delete(event); },
+    appendEntry: vi.fn(),
     registerProvider: vi.fn(), unregisterProvider: vi.fn(),
     registerTool: tool => { tools.set(tool.name, tool); if (tool.exposure !== "hidden") active = [...new Set([...active, tool.name])]; },
     getActiveTools: () => active, setActiveTools: names => { active = names; },
@@ -61,6 +62,61 @@ async function raw(path: string, request: unknown): Promise<any> {
 }
 
 describe("owned Pi bind extension", () => {
+  // Keep: d4260467's second finish attempt hid the callback trust-boundary failure.
+  it.each(["binding_missing", "call_identity_unannounced", "call_identity_reused", "result_invalid", "dispatch_exception", "aborted"])("records %s internally while the model sees only the unchanged refusal", async reason => {
+    const dispatch = vi.fn(async () => {
+      if (reason === "dispatch_exception") throw new Error("SECRET_HANDLER_ARGUMENTS");
+      if (reason === "result_invalid") return { content: "SECRET_RESULT" } as never;
+      return { content: [{ type: "text" as const, text: "accepted" }], details: {} };
+    });
+    const f = await fixture({ initial: { ...initial, tools: [{ name: "paperclip_finish", description: "finish", inputSchema: { type: "object" } }] }, hooks: { dispatchTool: dispatch } });
+    if (reason !== "binding_missing") {
+      await f.emit("input", { source: "rpc" }); await f.emit("before_agent_start", { systemPrompt: "native" });
+      if (reason !== "call_identity_unannounced") await f.emit("tool_execution_start", { toolCallId: "finish-call", toolName: "paperclip_finish" });
+    }
+    const tool = f.tools.get("paperclip_finish")!;
+    if (reason === "call_identity_reused") {
+      await tool.execute("finish-call", {}, undefined, undefined, f.ctx);
+      expect(f.pi.appendEntry).not.toHaveBeenCalled();
+    }
+    const controller = new AbortController();
+    if (reason === "aborted") controller.abort(new Error("SECRET_ABORT"));
+    await expect(tool.execute("finish-call", { secret: "SECRET_ARGUMENTS" }, controller.signal, undefined, f.ctx))
+      .rejects.toMatchObject({ message: "Pi tool callback refused" });
+    expect(f.pi.appendEntry).toHaveBeenCalledExactlyOnceWith("paperclip.pi-tool-refusal.v1", {
+      code: "pi_tool_callback_refused", reason, toolCallId: "finish-call",
+    });
+    expect(JSON.stringify(vi.mocked(f.pi.appendEntry!).mock.calls)).not.toContain("SECRET");
+    expect(dispatch).toHaveBeenCalledTimes(["binding_missing", "call_identity_unannounced", "aborted"].includes(reason) ? 0 : 1);
+  });
+  it.each(["binding_stale", "tool_not_admitted"])("diagnoses the %s guard on warm rebinding without dispatching", async reason => {
+    const dispatch = vi.fn(async () => ({ content: [], details: {} }));
+    const f = await fixture({ initial: { ...initial, tools: [{ name: "removed", description: "removed", inputSchema: { type: "object" } }] }, hooks: { dispatchTool: dispatch } });
+    const old = f.tools.get("removed")!;
+    await f.emit("agent_settled");
+    await sendPiBindRequest(f.socketPath, bind);
+    await sendPiBindRequest(f.socketPath, command("begin_turn", next));
+    await f.emit("input", { source: "rpc" }); await f.emit("before_agent_start", { systemPrompt: "native" });
+    const tool = reason === "binding_stale" ? old : f.tools.get("removed")!;
+    await expect(tool.execute("removed-call", {}, undefined, undefined, f.ctx)).rejects.toMatchObject({ message: "Pi tool callback refused" });
+    expect(f.pi.appendEntry).toHaveBeenCalledExactlyOnceWith("paperclip.pi-tool-refusal.v1", {
+      code: "pi_tool_callback_refused", reason, toolCallId: "removed-call",
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+  it("keeps a refusal generic even if the diagnostic writer fails", async () => {
+    const f = await fixture({ initial: { ...initial, tools: [{ name: "finish", description: "finish", inputSchema: { type: "object" } }] } });
+    vi.mocked(f.pi.appendEntry!).mockImplementation(() => { throw new Error("SECRET_DIAGNOSTIC"); });
+    await expect(f.tools.get("finish")!.execute("call", {}, undefined, undefined, f.ctx)).rejects.toMatchObject({ message: "Pi tool callback refused" });
+    expect(f.pi.appendEntry).toHaveBeenCalledTimes(1);
+  });
+  it("records no refusal for an accepted completion callback", async () => {
+    const f = await fixture({ initial: { ...initial, tools: [{ name: "paperclip_finish", description: "finish", inputSchema: { type: "object" } }] }, hooks: { dispatchTool: async () => ({ content: [], details: {} }) } });
+    await f.emit("input", { source: "rpc" }); await f.emit("before_agent_start", { systemPrompt: "native" });
+    await f.emit("tool_execution_start", { toolCallId: "accepted-finish", toolName: "paperclip_finish" });
+    await expect(f.tools.get("paperclip_finish")!.execute("accepted-finish", {}, undefined, undefined, f.ctx)).resolves.toEqual({ content: [], details: {} });
+    expect(f.pi.appendEntry).not.toHaveBeenCalled();
+  });
   it("reads legacy inline INITIAL, preferring the selected private file without fallback on file errors", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-initial-")); roots.push(root);
     const path = join(root, "initial.json");

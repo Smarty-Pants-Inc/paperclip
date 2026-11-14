@@ -43,6 +43,26 @@ function receipt() {
 }
 
 describe("resident Pi authority", () => {
+  it.each(["binding_missing", "origin_mismatch", "call_identity_unannounced", "call_identity_reused", "request_invalid", "result_invalid", "deadline", "aborted", "dispatch_exception"])("retains the internal %s cause through the shared dispatch guard while its error message stays generic", async reason => {
+    const authority = new RunAuthority();
+    if (reason !== "binding_missing") { authority.bind(origin); authority.beginTurn(origin); }
+    const call: PiToolCallRequest = { schema: 1, type: "tool_call", nonce: "n", sessionId: "session", origin: reason === "origin_mismatch" ? { ...origin, runId: "old" } : origin,
+      toolCallId: "reason-call", tool: "paperclip_finish", arguments: { secret: "SECRET_ARGUMENTS" } };
+    if (reason !== "call_identity_unannounced") authority.announce(call.toolCallId, origin);
+    if (reason === "call_identity_reused") authority.consume(origin, call.toolCallId);
+    if (reason === "request_invalid") call.arguments = () => "SECRET_UNCLONEABLE";
+    const controller = new AbortController();
+    if (reason === "aborted") controller.abort(new Error("SECRET_ABORT_REASON"));
+    let effects = 0;
+    await expect(dispatchPiToolCall(authority, call, async () => {
+      ++effects;
+      if (reason === "dispatch_exception") throw new Error("SECRET_HANDLER_ERROR");
+      if (reason === "result_invalid") return { content: [{ type: "image", text: "SECRET_RESULT" }], details: {} } as never;
+      if (reason === "deadline") return new Promise(() => {});
+      return { content: [], details: {} };
+    }, { signal: controller.signal, timeoutMs: 15 })).rejects.toMatchObject({ message: "Pi tool callback refused", reason });
+    expect(effects).toBe(["result_invalid", "deadline", "dispatch_exception"].includes(reason) ? 1 : 0);
+  });
   it("requires the originating run AND a turn-local announcement; freezes captured identity", () => {
     const authority = new RunAuthority(); authority.bind(origin);
     authority.beginTurn(origin);

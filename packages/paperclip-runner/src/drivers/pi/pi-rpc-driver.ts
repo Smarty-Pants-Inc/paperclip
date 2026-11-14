@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, piManagedProviderApi, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
 import { PI_BIND_MAX_FRAME_BYTES, RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
+import { PiToolCallbackRefusal, piToolRefusalEntry, PI_TOOL_REFUSAL_DIAGNOSTIC, type PiToolRefusalReason } from "./pi-bind-protocol.js";
 import { writePrivateFile } from "../private-file.js";
 import { loadPiBuiltinModelCatalog, mergedPiModelsJson, readPiModelsSnapshot } from "./pi-models-merge.js";
 import { buildPiManagedModel, originalPiModelsFile, type PiManagedModel } from "./pi-managed-model.js";
@@ -556,6 +557,9 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#promptTimeoutMs = state.promptTimeoutMs;
     this.#turnIdleTimeoutMs = state.turnIdleTimeoutMs ?? PI_TURN_IDLE_TIMEOUT_MS;
     this.#callbacks?.setActivityListener(() => this.#armTurnIdleTimer());
+    this.#callbacks?.setRefusalListener((reason, origin) => {
+      this.#emit("harness.diagnostic", { code: PI_TOOL_REFUSAL_DIAGNOSTIC, reason, boundary: "host" }, origin ?? { runId: this.#runId });
+    });
     this.#abortTimeoutMs = Number.isFinite(state.abortTimeoutMs) ? Math.max(1, Math.min(30_000, state.abortTimeoutMs!)) : 5000;
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
@@ -1435,6 +1439,22 @@ export class PiRpcHarnessSession implements HarnessSession {
       return;
     }
     const keys = piRecordIdentityKeys(event);
+    const refusal = event.type === "entry_appended" ? piToolRefusalEntry(event.entry) : null;
+    if (refusal) {
+      const toolKeys = piToolIdentityKeys(refusal.toolCallId);
+      const owner = this.#owners.get(toolKeys[0]!);
+      const pending = this.#pendingNativeTools.get(refusal.toolCallId);
+      const origin = owner ?? pending;
+      // Pending native work retains its captured owner after settlement. Unknown,
+      // conflicting or completed/retired identities never borrow the active run.
+      if (owner !== null && origin && keys.every(key => {
+        const known = this.#owners.get(key);
+        return toolKeys.includes(key) || known?.runId === origin.runId && known.turnId === origin.turnId;
+      })) {
+        this.#emit("harness.diagnostic", { code: PI_TOOL_REFUSAL_DIAGNOSTIC, reason: refusal.reason, boundary: "extension" }, origin);
+      }
+      return;
+    }
     // A delayed terminal can clear its captured park blocker without reviving
     // a settled projector. Conflicting/unknown extra identities cannot clear
     // it: retain the same fail-closed provenance rule as event projection.
@@ -1673,15 +1693,25 @@ class PiHostCallbacks {
   #toolNames: Record<string, string> = Object.create(null);
   #activeCount = 0;
   #activityListener?: () => void;
+  #refusalListener?: (reason: PiToolRefusalReason, origin: Origin | null) => void;
   setActivityListener(listener: () => void): void { this.#activityListener = listener; }
+  setRefusalListener(listener: (reason: PiToolRefusalReason, origin: Origin | null) => void): void { this.#refusalListener = listener; }
   activeCount(): number { return this.#activeCount; }
   constructor(sessionId: string, handler: PiRpcDriverOptions["dynamicToolHandler"]) { this.#sessionId = sessionId; this.#handler = handler; }
   setNativeSessionId(id: string): void { if (this.#nativeSessionId !== null) throw new Error("Pi callback identity already assigned"); this.#nativeSessionId = id; }
   async listen(socketPath: string, timeoutMs = 60000): Promise<void> {
     this.#server = await startPiCallbackServer({ socketPath, sessionId: this.#sessionId, authority: this.authority, timeoutMs,
       waitForAnnouncement: (call, signal) => this.#wait(call, signal),
+      onRefusal: (reason, call) => {
+        // Ownership comes from the native announcement/admitted authority, never IPC fields.
+        const origin = this.#announcements.get(call.toolCallId)?.origin
+          ?? (this.authority.accept(call.origin) ? this.authority.capture() : null);
+        this.#refusalListener?.(reason, origin ?? null);
+      },
       handleTool: async (call, signal) => {
-        if (!this.#handler || !this.#nativeSessionId || !this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
+        if (!this.#handler || !this.#nativeSessionId) throw new PiToolCallbackRefusal("binding_missing");
+        if (!this.#matches(call)) throw new PiToolCallbackRefusal(this.#matchRefusal(call));
+        if (!this.authority.accept(call.origin, call.toolCallId)) throw new PiToolCallbackRefusal(this.authority.refusalReason(call.origin, call.toolCallId) ?? "authority_rejected");
         const { runId, turnId } = call.origin;
         let active = true;
         const finished = () => { if (active) { active = false; --this.#activeCount; this.#activityListener?.(); } };
@@ -1692,7 +1722,8 @@ class PiHostCallbacks {
           signal.throwIfAborted();
           const result = await this.#handler({ runId, turnId, threadId: this.#nativeSessionId, tool: Object.hasOwn(this.#toolNames, call.tool) ? this.#toolNames[call.tool]! : call.tool, callId: call.toolCallId, arguments: structuredClone(call.arguments), signal });
           signal.throwIfAborted();
-          if (!this.#matches(call) || !this.authority.accept(call.origin, call.toolCallId)) throw new Error("Pi tool callback refused");
+          if (!this.#matches(call)) throw new PiToolCallbackRefusal(this.#matchRefusal(call));
+          if (!this.authority.accept(call.origin, call.toolCallId)) throw new PiToolCallbackRefusal(this.authority.refusalReason(call.origin, call.toolCallId) ?? "authority_rejected");
           return normalizePiToolResult(result);
         } finally { signal.removeEventListener("abort", finished); finished(); }
       },
@@ -1717,32 +1748,41 @@ class PiHostCallbacks {
     const announced = this.#announcements.get(call.toolCallId);
     return !!announced && sameJson(announced.origin, call.origin) && announced.tool === call.tool && sameJson(announced.arguments, call.arguments);
   }
+  #matchRefusal(call: PiToolCallRequest): PiToolRefusalReason {
+    const announced = this.#announcements.get(call.toolCallId);
+    if (!announced) return "call_identity_unannounced";
+    if (!sameJson(announced.origin, call.origin)) return "origin_mismatch";
+    if (announced.tool !== call.tool) return "tool_not_admitted";
+    return "arguments_mismatch";
+  }
   async #wait(call: PiToolCallRequest, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
-    if (!this.authority.accept(call.origin)) throw new Error("Pi tool callback refused");
+    if (!this.authority.accept(call.origin)) throw new PiToolCallbackRefusal(this.authority.refusalReason(call.origin) ?? "authority_rejected");
     if (!this.#announcements.has(call.toolCallId)) {
       await new Promise<void>((resolve, reject) => {
         const set = this.#waiters.get(call.toolCallId) ?? new Set<() => void>();
         const wake = () => { cleanup(); resolve(); };
-        const abort = () => { cleanup(); reject(new Error("Pi tool callback refused")); };
+        const abort = () => { cleanup(); reject(new PiToolCallbackRefusal("aborted")); };
         const cleanup = () => { set.delete(wake); if (!set.size) this.#waiters.delete(call.toolCallId); signal.removeEventListener("abort", abort); };
         set.add(wake); this.#waiters.set(call.toolCallId, set); signal.addEventListener("abort", abort, { once: true });
         if (signal.aborted) abort();
       });
     }
     signal.throwIfAborted();
-    if (!this.authority.accept(call.origin, call.toolCallId) || !this.#matches(call)) throw new Error("Pi tool callback refused");
+    if (!this.authority.accept(call.origin, call.toolCallId)) throw new PiToolCallbackRefusal(this.authority.refusalReason(call.origin, call.toolCallId) ?? "authority_rejected");
+    if (!this.#matches(call)) throw new PiToolCallbackRefusal(this.#matchRefusal(call));
   }
 }
 
 function normalizePiToolResult(value: unknown): PiToolResult {
   // Snapshot plain JSON before trusting even a controller's result. No toJSON,
   // image coercion, arbitrary stringification, or success-by-default fallback.
-  const captured: unknown = structuredClone(value);
+  let captured: unknown;
+  try { captured = structuredClone(value); } catch { throw new PiToolCallbackRefusal("result_invalid"); }
   if (validatePiToolResult(captured)) return captured;
-  if (!isRecord(captured) || !Array.isArray(captured.contentItems) || typeof captured.success !== "boolean" || captured.contentItems.length > 128) throw new Error("Pi tool result refused");
+  if (!isRecord(captured) || !Array.isArray(captured.contentItems) || typeof captured.success !== "boolean" || captured.contentItems.length > 128) throw new PiToolCallbackRefusal("result_invalid");
   const content = captured.contentItems.map(item => {
-    if (!isRecord(item) || !["text", "inputText", "outputText"].includes(String(item.type)) || typeof item.text !== "string") throw new Error("Pi tool result refused");
+    if (!isRecord(item) || !["text", "inputText", "outputText"].includes(String(item.type)) || typeof item.text !== "string") throw new PiToolCallbackRefusal("result_invalid");
     return { type: "text" as const, text: item.text };
   });
   return { content, details: {}, isError: !captured.success };
@@ -1800,7 +1840,8 @@ function piRecordIdentityKeys(event: PiRpcRecord): string[] {
   if (typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
     keys.push(`stamp:${createHash("sha256").update(JSON.stringify([message.role, message.provider, message.model, message.timestamp])).digest("hex")}`);
   }
-  keys.push(...piToolIdentityKeys(event.toolCallId ?? message.toolCallId));
+  const refusal = event.type === "entry_appended" ? piToolRefusalEntry(event.entry) : null;
+  keys.push(...piToolIdentityKeys(event.toolCallId ?? message.toolCallId ?? refusal?.toolCallId));
   return [...new Set(keys)];
 }
 

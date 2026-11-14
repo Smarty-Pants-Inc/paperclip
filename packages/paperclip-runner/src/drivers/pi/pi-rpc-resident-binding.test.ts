@@ -132,6 +132,35 @@ async function revoked(provider: { baseUrl: string; apiKey: string }) {
 }
 
 describe("resident Pi model binding", () => {
+  // Keep: real host IPC/driver run-event boundary for the d4260467 refusal blind spot.
+  it.each(["arguments_mismatch", "tool_not_admitted", "result_invalid", "dispatch_exception", "call_identity_reused"])("writes %s to the owning run diagnostic without exposing arguments or changing the private error", async reason => {
+    const handler = vi.fn(async () => {
+      if (reason === "dispatch_exception") throw new Error("SECRET_HOST_EXCEPTION");
+      if (reason === "result_invalid") return { contentItems: "SECRET_HOST_RESULT" };
+      return { content: [], details: {} };
+    });
+    const f = await fixture({ dynamicToolHandler: handler });
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+    const turn = await f.session.startTurn({ message: { role: "user", text: "finish" } });
+    f.transport.send({ type: "agent_start" });
+    f.transport.send({ type: "tool_execution_start", toolCallId: "refusal-call", toolName: "old_tool", args: { value: "SECRET_ANNOUNCED" } });
+    await vi.waitFor(() => expect(f.events.some(event => event.eventType === "tool.execution.started")).toBe(true));
+    const call = { schema: 1 as const, type: "tool_call" as const, nonce: "refusal", sessionId: initial.sessionId,
+      origin: { epoch: initial.epoch, runId: initial.runId, turnId: turn.turnId }, toolCallId: "refusal-call", tool: reason === "tool_not_admitted" ? "unadmitted_tool" : "old_tool",
+      arguments: { value: reason === "arguments_mismatch" ? "SECRET_CHANGED" : "SECRET_ANNOUNCED" } };
+    if (reason === "call_identity_reused") {
+      await expect(sendPiToolRequest(initial.toolSocketPath, call)).resolves.toEqual({ content: [], details: {} });
+      expect(f.events.filter(event => event.payload.code === "pi_tool_callback_refused")).toEqual([]);
+    }
+    await expect(sendPiToolRequest(initial.toolSocketPath, call)).rejects.toMatchObject({ message: "Pi private request rejected" });
+    await vi.waitFor(() => expect(f.events.filter(event => event.payload.code === "pi_tool_callback_refused")).toHaveLength(1));
+    const diagnostics = f.events.filter(event => event.payload.code === "pi_tool_callback_refused");
+    expect(diagnostics[0]).toMatchObject({ eventType: "harness.diagnostic", runId: "run-a", turnId: turn.turnId,
+      payload: { code: "pi_tool_callback_refused", boundary: "host", reason } });
+    expect(JSON.stringify(diagnostics)).not.toContain("SECRET");
+    if (process.env.PI_TOOL_REFUSAL_DIAGNOSTICS_OUT) await writeFile(join(process.env.PI_TOOL_REFUSAL_DIAGNOSTICS_OUT, `${reason}.json`), JSON.stringify(diagnostics, null, 2));
+    expect(handler).toHaveBeenCalledTimes(["arguments_mismatch", "tool_not_admitted"].includes(reason) ? 0 : 1);
+  });
   it("settles unused recovery bootstrap authority before attaching a different current run", async () => {
     const f = await fixture({ deferInitialBinding: true });
     expect(f.ipc.map(command => command.type)).toEqual(["settle"]);

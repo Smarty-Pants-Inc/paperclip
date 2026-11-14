@@ -11,6 +11,7 @@ import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
 import { installPiPerformanceDiagnostics } from "../pi-performance-diagnostics.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, RunAuthority, bindContent, digest, dispatchPiToolCall,
+  PiToolCallbackRefusal, piToolRefusalReason, PI_TOOL_REFUSAL_ENTRY, PI_TOOL_REFUSAL_DIAGNOSTIC,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
   validatePiBindCommand, validatePiToolResult,
   type BindReceipt, type Origin, type ParkReadyResult, type PiBindCommand, type PiBindingConfig,
@@ -201,17 +202,27 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
         async execute(toolCallId, args, signal) {
           // The execution-start snapshot is immutable and belongs to THIS closure's binding.
           const origin = running;
-          if (!origin || origin.epoch !== capturedBinding.epoch || origin.runId !== capturedBinding.runId
-            || !wanted.has(name) || !authority.accept(origin, toolCallId)) throw new Error("Pi tool callback refused");
-          const call: PiToolCallRequest = { schema: 1, type: "tool_call", nonce: randomUUID(), sessionId, origin, toolCallId, tool: name, arguments: args };
-          const dispatch = hooks().map(hook => hook.dispatchTool).filter(Boolean).at(-1);
           try {
+            if (!origin) throw new PiToolCallbackRefusal("binding_missing");
+            if (origin.epoch !== capturedBinding.epoch || origin.runId !== capturedBinding.runId) throw new PiToolCallbackRefusal("binding_stale");
+            if (!wanted.has(name)) throw new PiToolCallbackRefusal("tool_not_admitted");
+            if (!authority.accept(origin, toolCallId)) throw new PiToolCallbackRefusal(authority.refusalReason(origin, toolCallId) ?? "authority_rejected");
+            const call: PiToolCallRequest = { schema: 1, type: "tool_call", nonce: randomUUID(), sessionId, origin, toolCallId, tool: name, arguments: args };
+            const dispatch = hooks().map(hook => hook.dispatchTool).filter(Boolean).at(-1);
             const result = await dispatchPiToolCall(authority, call, (captured, innerSignal) => dispatch ? dispatch(captured, innerSignal)
               : candidate.toolSocketPath ? sendPiToolRequest(candidate.toolSocketPath, captured, { signal: innerSignal, timeoutMs: 60000 })
-                : Promise.reject(new Error(PI_BIND_ERROR)), { signal, timeoutMs: 60000 });
-            if (!authority.accept(origin, toolCallId) || !validatePiToolResult(result) || Buffer.byteLength(JSON.stringify(result)) > PI_BIND_MAX_FRAME_BYTES / 2) throw new Error(PI_BIND_ERROR);
+                : Promise.reject(new PiToolCallbackRefusal("binding_missing")), { signal, timeoutMs: 60000 });
+            if (!authority.accept(origin, toolCallId)) throw new PiToolCallbackRefusal(authority.refusalReason(origin, toolCallId) ?? "authority_rejected");
+            try {
+              if (!validatePiToolResult(result) || Buffer.byteLength(JSON.stringify(result)) > PI_BIND_MAX_FRAME_BYTES / 2) throw new Error();
+            } catch { throw new PiToolCallbackRefusal("result_invalid"); }
             return result;
-          } catch { throw new Error("Pi tool callback refused"); }
+          } catch (error) {
+            try {
+              pi.appendEntry?.(PI_TOOL_REFUSAL_ENTRY, { code: PI_TOOL_REFUSAL_DIAGNOSTIC, reason: piToolRefusalReason(error), toolCallId });
+            } catch { /* A diagnostic must never replace the refusal or leak its cause. */ }
+            throw new Error("Pi tool callback refused");
+          }
         },
       });
       registeredTools.set(name, definition);

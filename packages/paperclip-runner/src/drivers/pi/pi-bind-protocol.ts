@@ -5,6 +5,32 @@ import { connect } from "node:net";
 export const PI_BIND_MAX_FRAME_BYTES = 1024 * 1024;
 export const PI_BIND_TIMEOUT_MS = 5000;
 export const PI_BIND_ERROR = "Pi private request rejected";
+/** Internal-only vocabulary. Never include arguments, handler errors or capabilities. */
+export const PI_TOOL_REFUSAL_REASONS = [
+  "binding_missing", "binding_stale", "tool_not_admitted", "authority_rejected",
+  "call_identity_unannounced", "call_identity_reused", "origin_mismatch", "session_mismatch",
+  "aborted", "deadline", "result_invalid", "request_invalid", "arguments_mismatch", "dispatch_exception",
+] as const;
+export type PiToolRefusalReason = typeof PI_TOOL_REFUSAL_REASONS[number];
+export const PI_TOOL_REFUSAL_ENTRY = "paperclip.pi-tool-refusal.v1";
+export const PI_TOOL_REFUSAL_DIAGNOSTIC = "pi_tool_callback_refused";
+export class PiToolCallbackRefusal extends Error {
+  constructor(readonly reason: PiToolRefusalReason) { super("Pi tool callback refused"); }
+}
+export function isPiToolRefusalReason(value: unknown): value is PiToolRefusalReason {
+  return typeof value === "string" && (PI_TOOL_REFUSAL_REASONS as readonly string[]).includes(value);
+}
+export function piToolRefusalReason(error: unknown, fallback: PiToolRefusalReason = "dispatch_exception"): PiToolRefusalReason {
+  return error instanceof PiToolCallbackRefusal && isPiToolRefusalReason(error.reason) ? error.reason : fallback;
+}
+/** Read only owned, bounded fields; custom entries can contain arbitrary private data. */
+export function piToolRefusalEntry(value: unknown): { reason: PiToolRefusalReason; toolCallId: string } | null {
+  try {
+    if (!object(value) || value.type !== "custom" || value.customType !== PI_TOOL_REFUSAL_ENTRY || !object(value.data)) return null;
+    const { code, reason, toolCallId } = value.data;
+    return code === PI_TOOL_REFUSAL_DIAGNOSTIC && isPiToolRefusalReason(reason) && text(toolCallId, 1024) ? { reason, toolCallId } : null;
+  } catch { return null; }
+}
 export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export interface Origin { readonly epoch: number; readonly runId: string; readonly turnId: string }
 export interface PiDynamicTool { name: string; description: string; inputSchema: Record<string, unknown> }
@@ -367,6 +393,14 @@ export class RunAuthority {
   accept(origin: Origin, toolCallId?: string): boolean {
     return !!this.#active && sameOrigin(this.#active, origin) && (toolCallId === undefined || this.#announced.has(toolCallId));
   }
+  /** Diagnostic only: does not announce, consume, fence or otherwise grant authority. */
+  refusalReason(origin: Origin, toolCallId?: string, consuming = false): PiToolRefusalReason | null {
+    if (!this.#active) return "binding_missing";
+    if (!sameOrigin(this.#active, origin)) return "origin_mismatch";
+    if (toolCallId !== undefined && !this.#announced.has(toolCallId)) return "call_identity_unannounced";
+    if (consuming && toolCallId !== undefined && this.#consumed.has(toolCallId)) return "call_identity_reused";
+    return null;
+  }
   consume(origin: Origin, toolCallId: string): boolean {
     if (!this.accept(origin, toolCallId) || this.#consumed.has(toolCallId)) return false;
     this.#consumed.add(toolCallId); return true;
@@ -385,15 +419,16 @@ export async function dispatchPiToolCall(
   handler: (request: PiToolCallRequest, signal: AbortSignal) => Promise<PiToolResult>,
   options: PiPrivateRequestOptions = {},
 ): Promise<PiToolResult> {
-  if (!validatePiToolCallRequest(request) || !authority.consume(request.origin, request.toolCallId)) throw new Error("Pi tool callback refused");
+  if (!validatePiToolCallRequest(request)) throw new PiToolCallbackRefusal("request_invalid");
+  if (!authority.consume(request.origin, request.toolCallId)) throw new PiToolCallbackRefusal(authority.refusalReason(request.origin, request.toolCallId, true) ?? "authority_rejected");
   const origin = Object.freeze({ ...request.origin });
   let captured: PiToolCallRequest;
   try { captured = Object.freeze({ ...request, origin, arguments: structuredClone(request.arguments) }); }
-  catch { throw new Error("Pi tool callback refused"); }
+  catch { throw new PiToolCallbackRefusal("request_invalid"); }
   const originSignal = authority.signalFor(origin);
-  if (!originSignal) throw new Error("Pi tool callback refused");
+  if (!originSignal) throw new PiToolCallbackRefusal("authority_rejected");
   const timeoutMs = options.timeoutMs ?? 60000;
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) throw new Error("Pi tool callback refused");
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) throw new PiToolCallbackRefusal("deadline");
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, originSignal, ...(options.signal ? [options.signal] : [])]);
   let rejectAbort: (() => void) | undefined;
@@ -402,12 +437,15 @@ export async function dispatchPiToolCall(
     signal.throwIfAborted();
     const result = await Promise.race([
       Promise.resolve().then(() => { signal.throwIfAborted(); return handler(captured, signal); }),
-      new Promise<never>((_, reject) => { rejectAbort = () => reject(new Error("Pi tool callback refused")); signal.addEventListener("abort", rejectAbort, { once: true }); }),
+      new Promise<never>((_, reject) => { rejectAbort = () => reject(new PiToolCallbackRefusal(controller.signal.aborted ? "deadline" : "aborted")); signal.addEventListener("abort", rejectAbort, { once: true }); }),
     ]);
     signal.throwIfAborted();
-    if (!authority.accept(origin, captured.toolCallId) || !validatePiToolResult(result) || Buffer.byteLength(JSON.stringify(result)) > PI_BIND_MAX_FRAME_BYTES / 2) throw new Error();
+    if (!authority.accept(origin, captured.toolCallId)) throw new PiToolCallbackRefusal(authority.refusalReason(origin, captured.toolCallId) ?? "authority_rejected");
+    try {
+      if (!validatePiToolResult(result) || Buffer.byteLength(JSON.stringify(result)) > PI_BIND_MAX_FRAME_BYTES / 2) throw new Error();
+    } catch { throw new PiToolCallbackRefusal("result_invalid"); }
     return result;
-  } catch { throw new Error("Pi tool callback refused"); }
+  } catch (error) { throw new PiToolCallbackRefusal(piToolRefusalReason(error, signal.aborted ? controller.signal.aborted ? "deadline" : "aborted" : "dispatch_exception")); }
   finally { clearTimeout(timer); if (rejectAbort) signal.removeEventListener("abort", rejectAbort); }
 }
 export function guardCallback(authority: RunAuthority, capturedOrigin: Origin, toolCallId: string | undefined, diagnose: (message: string) => void): boolean {

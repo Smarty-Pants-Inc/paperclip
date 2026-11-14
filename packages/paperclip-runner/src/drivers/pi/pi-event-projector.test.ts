@@ -25,6 +25,22 @@ const envelope = (event: PiProjectedEvent, index: number): PrpEvent => ({
 });
 
 describe("real Pi 1.5.2 RPC -> canonical events -> existing reducer/transcript", () => {
+  it("projects only closed-vocabulary refusal metadata, without traversing private custom-entry fields", () => {
+    const projector = createPiEventProjector({ runId: "owned-run", turnId: "owned-turn" });
+    const data = Object.defineProperty({ code: "pi_tool_callback_refused", reason: "arguments_mismatch", toolCallId: "call",
+      runId: "forged-run", turnId: "forged-turn" }, "arguments", { enumerable: true, get() { throw new Error("SECRET_OPAQUE_ARGUMENTS"); } });
+    const entry = { type: "custom", customType: "paperclip.pi-tool-refusal.v1", data };
+    const output = projector.project({ type: "entry_appended", entry });
+    expect(output).toEqual([{ eventType: "harness.diagnostic", runId: "owned-run", turnId: "owned-turn",
+      payload: { code: "pi_tool_callback_refused", reason: "arguments_mismatch", boundary: "extension" } }]);
+    for (const event of output.map(envelope)) expect(validatePrpEvent(event)).toMatchObject({ ok: true });
+    const invalid = [
+      { ...entry, customType: "other" }, { ...entry, type: "message" },
+      ...["SECRET_REASON", "", null].map(reason => ({ ...entry, data: { code: "pi_tool_callback_refused", reason, toolCallId: "call" } })),
+      { ...entry, data: { code: "pi_tool_callback_refused", reason: "deadline", toolCallId: "x".repeat(1025) } },
+    ];
+    for (const value of invalid) expect(projector.project({ type: "entry_appended", entry: value }).some(event => event.payload.code === "pi_tool_callback_refused")).toBe(false);
+  });
   it("matches the recorded wire golden and every closed PRP schema", () => {
     const actual = realProjection();
     expect(actual).toEqual(JSON.parse(fixture("baseline-1.5.2.normalized.json")));

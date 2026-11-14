@@ -73,6 +73,37 @@ async function inputProxyFixture() {
   return { ...f, frames, request, async close() { await proxy.close(); await f.close(); } };
 }
 describe("PiRpcDriver", () => {
+  // Keep: late refusal diagnostics must not be dropped or attributed to a newer turn.
+  it("projects extension refusals through the real driver using native call ownership, even after settlement", async () => {
+    const f = await failureFixture();
+    const append = (reason: string, toolCallId = "finish-old", extra: Record<string, unknown> = {}) => ({
+      type: "entry_appended", entry: { type: "custom", customType: "paperclip.pi-tool-refusal.v1",
+        data: { code: "pi_tool_callback_refused", reason, toolCallId, arguments: "SECRET_ARGUMENTS", ...extra } },
+    });
+    try {
+      const first = await f.session.startTurn({ message: { role: "user", text: "old" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send({ type: "tool_execution_start", toolCallId: "finish-old", toolName: "paperclip_finish", args: {} });
+      f.transport.send(append("arguments_mismatch"));
+      await vi.waitFor(() => expect(f.events.filter(event => event.payload.code === "pi_tool_callback_refused")).toHaveLength(1));
+      f.transport.send({ type: "agent_settled" }); await flushFailure();
+      const next = await f.session.startTurn({ message: { role: "user", text: "new" } });
+      f.transport.send({ type: "agent_start" });
+      f.transport.send(append("binding_stale"));
+      f.transport.send(append("dispatch_exception", "unknown-call"));
+      f.transport.send(append("SECRET_NOT_A_REASON"));
+      f.transport.send(append("deadline", "finish-old", { runId: "forged-run", turnId: next.turnId }));
+      await flushFailure();
+      const diagnostics = f.events.filter(event => event.payload.code === "pi_tool_callback_refused");
+      expect(diagnostics.map(event => event.payload)).toEqual(["arguments_mismatch", "binding_stale", "deadline"].map(reason => ({
+        code: "pi_tool_callback_refused", reason, boundary: "extension",
+      })));
+      expect(diagnostics.every(event => event.runId === "run-old" && event.turnId === first.turnId)).toBe(true);
+      expect(JSON.stringify(diagnostics)).not.toMatch(/SECRET|forged/);
+      for (const event of diagnostics) expect(validatePrpEvent(event)).toMatchObject({ ok: true });
+      expect(f.events.some(event => event.turnId === next.turnId && event.eventType === "turn.completed")).toBe(false);
+    } finally { await f.close(); }
+  });
   it("drains failed direct-env admission timings without requiring a turn or session close", async () => {
     const f = await failureFixture();
     const request = f.transport.request.bind(f.transport);
