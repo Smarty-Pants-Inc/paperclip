@@ -12,7 +12,6 @@ import { NativeSessionDiagnostics, nativeSessionDiagnostics, type NativeDiagnost
 import { recordAgentProviderRateLimits } from "../agent-provider-rate-limits.js";
 import { nativePostResultFailureCategory, type NativePostResultFailureCategory } from "./native-post-result-failure.js";
 import { logger } from "../../middleware/logger.js";
-import { RESTART_WARM_CLOSE_CONCURRENCY } from "../../shutdown.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
@@ -781,6 +780,7 @@ type WarmNativeSession = {
 };
 
 const WARM_CLOSE_FAILURE_DETAIL_MAX = 2_000;
+const WARM_NATIVE_SESSION_CLOSE_CONCURRENCY = 4;
 
 export function describeWarmCloseFailure(error: unknown): string {
   const describe = (value: unknown): string => {
@@ -1163,7 +1163,6 @@ async function warmSandboxDestroyed(db: Db, entry: WarmNativeSession): Promise<b
 export async function closeIdleWarmNativeSessionsForRestart(): Promise<WarmNativeSessionCloseResult> {
   return closeIdleWarmNativeSessions({
     reason: "controller restart",
-    concurrency: RESTART_WARM_CLOSE_CONCURRENCY,
     closeBusyOnRelease: true,
     detachReleased: true,
   });
@@ -1178,7 +1177,6 @@ export async function prepareIdleWarmNativeSessionsForSleep(input: {
 async function closeIdleWarmNativeSessions(input: {
   environmentId?: string;
   reason: string;
-  concurrency?: number;
   closeBusyOnRelease?: boolean;
   detachReleased?: boolean;
   canRetire?: () => boolean;
@@ -1189,80 +1187,91 @@ async function closeIdleWarmNativeSessions(input: {
   let busy = 0;
   let failed = 0;
   const failures: WarmNativeSessionCloseFailure[] = [];
-  const entries = [...warmNativeSessions];
-  let nextIndex = 0;
-  const closeNext = async (): Promise<void> => {
-    while (true) {
-      if (input.canRetire && !input.canRetire()) return;
-      const next = entries[nextIndex++];
-      if (!next) return;
-      const [sessionId, entry] = next;
-      if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) continue;
-      if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)
-        || (input.canRetire && (entry.instructionPreparationRunId || closingWarmNativeSessions.has(sessionId)))) {
-        // A busy turn can complete while another idle session is checkpointing.
-        // Fence that entry now so its eventual release cannot leave a new idle
-        // owner behind after the shutdown sweep has already passed it.
-        if (input.closeBusyOnRelease) entry.closeOnReleaseReason = input.reason;
+  let stopped = false;
+  const closeEntry = async (sessionId: string, entry: WarmNativeSession) => {
+    if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)
+      || (input.canRetire && (entry.instructionPreparationRunId || closingWarmNativeSessions.has(sessionId)))) {
+      // A busy turn can complete while another idle session is checkpointing.
+      // Fence that entry now so its eventual release cannot leave a new idle
+      // owner behind after the shutdown sweep has already passed it.
+      if (input.closeBusyOnRelease) entry.closeOnReleaseReason = input.reason;
+      busy += 1;
+      return;
+    }
+    // The host owns retention after release; a quiet local handle needs no retirement for sleep.
+    if (input.canRetire && entry.released && !entry.closeOnReleaseReason) return;
+    const detach = input.detachReleased === true && entry.released === true && !entry.closeOnReleaseReason;
+    if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+    // Keep a fenced owner until both retirement and stopped collection succeed.
+    // Failure must not make a live directory eligible for a replacement owner.
+    entry.busy = true;
+    if (!detach) entry.closeOnReleaseReason = input.reason;
+    let forcedStopFailure: unknown;
+    const closing = Promise.resolve().then(() =>
+      detach ? detachReleasedWarmNativeSession(entry) : closeWarmNativeSession(entry, input.reason, input.forceStopUnsettled ? {
+        discardUnsettledSession: true,
+        onForcedStopFailed: error => { forcedStopFailure = error; },
+      } : undefined),
+    );
+    closingWarmNativeSessions.set(sessionId, closing);
+    try {
+      await closing;
+      forgetWarmNativeSession(sessionId, entry);
+      closed += 1;
+    } catch (error) {
+      if (detach) entry.closeOnReleaseReason = "released Runner local detach is unconfirmed";
+      if (!detach && error instanceof AgentDirectoryOperationBusyError) {
         busy += 1;
-        continue;
+        return;
       }
-      // The host owns retention after release; a quiet local handle needs no retirement for sleep.
-      if (input.canRetire && entry.released && !entry.closeOnReleaseReason) continue;
-      const detach = input.detachReleased === true && entry.released === true && !entry.closeOnReleaseReason;
-      if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
-      // Keep a fenced owner until both retirement and stopped collection succeed.
-      // Failure must not make a live directory eligible for a replacement owner.
-      entry.busy = true;
-      if (!detach) entry.closeOnReleaseReason = input.reason;
-      let forcedStopFailure: unknown;
-      const closing = Promise.resolve().then(() =>
-        detach ? detachReleasedWarmNativeSession(entry) : closeWarmNativeSession(entry, input.reason, input.forceStopUnsettled ? {
-          discardUnsettledSession: true,
-          onForcedStopFailed: error => { forcedStopFailure = error; },
-        } : undefined),
-      );
-      closingWarmNativeSessions.set(sessionId, closing);
-      try {
-        await closing;
+      const destroyed = !detach && input.forceStopUnsettled && input.db
+        ? await warmSandboxDestroyed(input.db, entry).catch(proofError => {
+          logger.warn({ err: proofError, runId: entry.runId }, "could not read the warm session's sandbox lease");
+          return false;
+        })
+        : false;
+      if (destroyed) {
+        logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+          providerLeaseId: entry.providerLeaseId ?? null, reason: input.reason, closeFailure: describeWarmCloseFailure(error) },
+        "warm native session's sandbox was already destroyed; released its owner");
         forgetWarmNativeSession(sessionId, entry);
         closed += 1;
-      } catch (error) {
-        if (detach) entry.closeOnReleaseReason = "released Runner local detach is unconfirmed";
-        if (!detach && error instanceof AgentDirectoryOperationBusyError) {
-          busy += 1;
-          continue;
-        }
-        const destroyed = !detach && input.forceStopUnsettled && input.db
-          ? await warmSandboxDestroyed(input.db, entry).catch(proofError => {
-            logger.warn({ err: proofError, runId: entry.runId }, "could not read the warm session's sandbox lease");
-            return false;
-          })
-          : false;
-        if (destroyed) {
-          logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
-            providerLeaseId: entry.providerLeaseId ?? null, reason: input.reason, closeFailure: describeWarmCloseFailure(error) },
-          "warm native session's sandbox was already destroyed; released its owner");
-          forgetWarmNativeSession(sessionId, entry);
-          closed += 1;
-          continue;
-        }
-        failed += 1;
-        const forced = forcedStopFailure === undefined ? "" : `; forced Runner stop failed: ${describeWarmCloseFailure(forcedStopFailure)}`;
-        failures.push({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
-          providerLeaseId: entry.providerLeaseId ?? null,
-          reason: `${detach ? "released Runner detach failed" : "close failed"}: ${describeWarmCloseFailure(error)}${forced}` });
-      } finally {
-        entry.busy = false;
-        if (closingWarmNativeSessions.get(sessionId) === closing) {
-          closingWarmNativeSessions.delete(sessionId);
-        }
-        releaseIdleSessionToolAuthority(sessionId);
+        return;
       }
-      if (input.canRetire && !input.canRetire()) return;
+      failed += 1;
+      const forced = forcedStopFailure === undefined ? "" : `; forced Runner stop failed: ${describeWarmCloseFailure(forcedStopFailure)}`;
+      failures.push({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+        providerLeaseId: entry.providerLeaseId ?? null,
+        reason: `${detach ? "released Runner detach failed" : "close failed"}: ${describeWarmCloseFailure(error)}${forced}` });
+    } finally {
+      entry.busy = false;
+      if (closingWarmNativeSessions.get(sessionId) === closing) {
+        closingWarmNativeSessions.delete(sessionId);
+      }
+      releaseIdleSessionToolAuthority(sessionId);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(input.concurrency ?? 1, entries.length) }, () => closeNext()));
+  const agentQueues = new Map<string, [string, WarmNativeSession][]>();
+  for (const [sessionId, entry] of [...warmNativeSessions]) {
+    if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) continue;
+    const agentKey = `${entry.companyId}:${entry.agentId}`;
+    const queue = agentQueues.get(agentKey);
+    if (queue) queue.push([sessionId, entry]); else agentQueues.set(agentKey, [[sessionId, entry]]);
+  }
+  const pendingAgents = [...agentQueues.values()];
+  const closeAgentQueues = async () => {
+    for (let queue = pendingAgents.shift(); queue; queue = pendingAgents.shift()) {
+      for (const [sessionId, entry] of queue) {
+        if (stopped || (input.canRetire && !input.canRetire())) {
+          stopped = true;
+          return;
+        }
+        await closeEntry(sessionId, entry);
+      }
+    }
+  };
+  const concurrency = input.canRetire ? 1 : WARM_NATIVE_SESSION_CLOSE_CONCURRENCY;
+  await Promise.all(Array.from({ length: Math.min(concurrency, pendingAgents.length) }, closeAgentQueues));
   if (failures.length > 0) logger.warn({ reason: input.reason, failures }, "idle warm native sessions did not close");
   return { closed, busy, failed, failures };
 }
