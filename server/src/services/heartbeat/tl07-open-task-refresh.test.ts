@@ -13,6 +13,7 @@ import { buildNativeRuntimeContext } from "../native-runtime/runtime-context.js"
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
 import { prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
+import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { selectHeartbeatRuntime, type HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
 import { createCapabilityRunnerdCodexTransport } from "../../../../packages/paperclip-runner/src/live/runnerd-codex-transport.js";
 
@@ -42,7 +43,7 @@ it.skipIf(!support.supported)("TL07 open task: idle instruction refresh answers 
     const [company] = await db.insert(companies).values({ name: "TL07 refresh", issuePrefix: "TL7" }).returning();
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "TL07 agent", status: "running",
       adapterType: "paperclip_runner", adapterConfig: { provider: "codex", model: "gpt-5.6-luna" } }).returning();
-    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Open task for TL07", status: "open",
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Open task for TL07", status: "todo",
       description: "Keep the conversation available for a follow-up.", assigneeAgentId: agent.id }).returning();
     const [prior] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id,
       authorType: "user", authorUserId: "local-board", body: "Remember the history token: TL07-ORCHID.",
@@ -60,7 +61,8 @@ it.skipIf(!support.supported)("TL07 open task: idle instruction refresh answers 
         context: { paperclipTaskMarkdown: `${issue.title}\n${followup.body}` }, executionContinuation: null,
         safeWakeComments: [], safeWakeCommentContext: null, paperclipWakePayload: null, acceptedPlanContinuationWake: false },
       session: { persistedNativeExecutionInput: null, persistedRunnerProfile: {}, taskResumeSessionId: null,
-        isFailedChatRunRetry: false, getFreshSessionHandoff: vi.fn(async () => "") },
+        isFailedChatRunRetry: false, getFreshSessionHandoff: createNativeSessionHandoffLoader({ db,
+          companyId: company.id, agentId: agent.id, issueId: issue.id, before: run.createdAt }) },
       workspace: { persistedExecutionWorkspace: null,
         executionWorkspace: { cwd: instructionRoot, repoUrl: null, repoRef: null, branchName: null },
         executionTarget: null, isDotRun: false, projectRepositoryPaths: [],
@@ -87,7 +89,7 @@ it.skipIf(!support.supported)("TL07 open task: idle instruction refresh answers 
     if (!selected.selected || !selected.nativeExecution || !selected.getNativeFreshSessionHandoff)
       throw new Error("expected real native selection and history handoff");
     selected.nativeExecution.workspace.cwd = instructionRoot;
-    expect(issue.status).toBe("open");
+    expect(issue.status).toBe("todo");
 
     // Real runner transport seam: a cold idle predecessor with an active task goal
     // must close successfully before a fresh instruction-bound session is admitted.

@@ -40,6 +40,19 @@ it.each(["active-turn", "descendants", "goal"] as const)("surfaces %s refresh ad
     const before = await readFile(nextState, "utf8");
     next = createCapabilityRunnerdCodexTransport({ ...options, stateDirectory: join(root, "next"),
       prpIdentity: { ...identity, runId: "next-run", turnId: "next-turn", itemId: "next-item" } });
+    if (blocker === "goal") {
+      const opened = await next.transport.request("thread/start", { cwd: root, model: "gpt-test",
+        baseInstructions: "Edited skill v2", dynamicTools: [] });
+      expect(opened).toHaveProperty("thread.id");
+      const controlPlane = JSON.parse(await readFile(join(root, "next/control-plane/control-plane-state.json"), "utf8"));
+      const stateText = JSON.stringify(controlPlane);
+      const closeAt = stateText.indexOf("session.closed");
+      const startAt = stateText.indexOf("session.started");
+      expect(closeAt).toBeGreaterThanOrEqual(0);
+      expect(startAt).toBeGreaterThan(closeAt);
+      expect(stateText).toContain("providerSessionId");
+      return;
+    }
     const error = await next.transport.request("thread/start", { cwd: root, model: "gpt-test",
       baseInstructions: "Edited skill v2", dynamicTools: [] }).then(() => null, error => error);
     expect(error).toBeInstanceOf(NativeRunnerRefreshRequiredError);
