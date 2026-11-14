@@ -1,0 +1,51 @@
+
+    // ---------------- M1.5 judge-owned UI checks (actual PostgreSQL rows exported from head 29040953) ----------------
+    const judgeRows = () => (JSON.parse(judgeFs.readFileSync(process.env.JUDGE_NOTICE_RECEIPT!, "utf8")) as Array<Record<string, unknown> & { id: string; metadata: unknown; createdAt: string; updatedAt: string; body: string }>)
+      .map(row => ({ ...row, createdAt: new Date(row.createdAt), updatedAt: new Date(row.updatedAt), deletedAt: null }));
+    const judgeReceipt = (name: string, value: unknown) => judgeFs.writeFileSync(`${process.env.JUDGE_UI_RECEIPT_DIR}/${name}-conversationMode-${conversationMode}.json`, JSON.stringify(value, null, 2) + "\n");
+
+    it("judge-m15 live: exactly ONE current held note is rendered; the superseded one is not", () => {
+      const rows = judgeRows(); const current = rows.filter(r => isCurrentNotice(r.metadata)); const superseded = rows.filter(r => !isCurrentNotice(r.metadata));
+      expect(rows).toHaveLength(2); expect(current).toHaveLength(1);
+      paint({ comments: rows as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true });
+      const rendered = rows.filter(r => anchor(r.id) !== null).map(r => r.id);
+      const titleCount = (container.textContent ?? "").split("This conversation can't continue").length - 1;
+      judgeFs.writeFileSync(`${process.env.JUDGE_UI_RECEIPT_DIR}/live-conversationMode-${conversationMode}.html`, container.innerHTML);
+      judgeReceipt("live", { rendered, current: current.map(r => r.id), superseded: superseded.map(r => r.id), heldTitleOccurrences: titleCount });
+      expect(rendered).toEqual([current[0]!.id]);
+      expect(titleCount).toBe(1);
+    });
+
+    // IssueDetail.tsx:2657-2660 passes compactHistory = !historyExpanded, and for a conversation onExpandHistory = undefined and
+    // historyControl = null; useIssueHistoryWindow.ts:25 makes historyExpanded false for EVERY conversation (continuous = true).
+    it("judge-m15 history: with exactly the props IssueDetail passes, the kept superseded note must be reachable", () => {
+      const rows = judgeRows(); const superseded = rows.find(r => !isCurrentNotice(r.metadata))!;
+      const pageProps = conversationMode
+        ? { compactHistory: true, onExpandHistory: undefined, historyControl: null }       // a chat: never expanded, no control
+        : { compactHistory: false };                                                       // a task after "More messages" / full activity
+      paint({ comments: rows as never, linkedRuns: [], issueStatus: "blocked", ...pageProps });
+      const controls = Array.from(container.querySelectorAll("button")).map(b => (b.textContent ?? "").trim()).filter(Boolean);
+      const reachable = anchor(superseded.id) !== null;
+      judgeFs.writeFileSync(`${process.env.JUDGE_UI_RECEIPT_DIR}/history-conversationMode-${conversationMode}.html`, container.innerHTML);
+      judgeReceipt("history", { pageProps: Object.keys(pageProps), supersededId: superseded.id, supersededRowRendered: reachable, buttonsOnScreen: controls,
+        supersededRowText: anchor(superseded.id)?.textContent ?? null });
+      expect(reachable, "the kept superseded note is reachable in this surface's history").toBe(true);
+    });
+
+    it.skipIf(conversationMode)("judge-m15 classic: the superseded note is a collapsed 'Superseded' row, its text one click away; the current note is shown", () => {
+      const rows = judgeRows(); const current = rows.find(r => isCurrentNotice(r.metadata))!; const superseded = rows.find(r => !isCurrentNotice(r.metadata))!;
+      // distinct bodies so the two rows can be told apart in the DOM text
+      const marked = rows.map(r => r.id === superseded.id ? { ...r, body: "SUPERSEDED-BODY " + r.body } : { ...r, body: "CURRENT-BODY " + r.body });
+      render(<IssueChatThread comments={marked as never} onAdd={async () => {}} issueStatus="blocked" linkedRuns={[]} currentUserId="viewer" />);
+      const before = container.textContent ?? "";
+      judgeFs.writeFileSync(`${process.env.JUDGE_UI_RECEIPT_DIR}/classic-before-click.html`, container.innerHTML);
+      const row = Array.from(container.querySelectorAll("button")).find(b => (b.textContent ?? "").includes("Superseded"));
+      const beforeFacts = { hasSupersededLabel: before.includes("· Superseded"), supersededBodyShown: before.includes("SUPERSEDED-BODY"), currentBodyShown: before.includes("CURRENT-BODY"), rowButtonFound: Boolean(row) };
+      if (row) flushSync(() => row.click());
+      const after = container.textContent ?? "";
+      judgeFs.writeFileSync(`${process.env.JUDGE_UI_RECEIPT_DIR}/classic-after-click.html`, container.innerHTML);
+      judgeReceipt("classic", { before: beforeFacts, afterClick: { supersededBodyShown: after.includes("SUPERSEDED-BODY"), currentBodyShown: after.includes("CURRENT-BODY") } });
+      expect(beforeFacts).toEqual({ hasSupersededLabel: true, supersededBodyShown: false, currentBodyShown: true, rowButtonFound: true });
+      expect(after.includes("SUPERSEDED-BODY"), "history: the superseded text is one click away").toBe(true);
+    });
+
