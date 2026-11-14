@@ -663,7 +663,9 @@ function retargetRunAttachPayload(
     provider.instructions = currentInstructions.text;
     provider.runtimeContext = structuredClone(runtimeContext === undefined ? currentInstructions.context : runtimeContext);
     payload.provider = provider;
-  } else if (provider.kind === "cursor_cloud" && currentInstructions !== undefined) {
+  } else if ((provider.kind === "codex" || provider.kind === "cursor_cloud") && currentInstructions !== undefined) {
+    // Codex attachment checkpoints and resumes its thread with this run's
+    // developer instructions, rather than silently retaining the old grant.
     provider.instructions = currentInstructions.context && runtimeContext !== undefined
       ? retargetComposedInstructions(currentInstructions.text, currentInstructions.context, runtimeContext)
       : currentInstructions.text;
