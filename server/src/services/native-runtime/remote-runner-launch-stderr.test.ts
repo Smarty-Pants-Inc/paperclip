@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -93,6 +93,58 @@ describe("remote runnerd stderr evidence", () => {
       expect((await stat(path)).mode & 0o777).toBe(0o600);
       expect(await readFile(path, "utf8")).toContain("missing-parent");
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  // Trust-boundary failure path: runnerd must never start without its generation's evidence file.
+  it.each(["EACCES", "noclobber"] as const)("fails promptly before exec when the generation log open gets %s", async (failure) => {
+    // Root bypasses mode 0500, so running this permission regression as root is not valid proof.
+    expect(process.geteuid?.(), "run the real-file EACCES regression as a non-root user").toBeGreaterThan(0);
+    const root = await mkdtemp(join(tmpdir(), "runner-launch-open-failure-"));
+    const directory = join(root, "diagnostics");
+    const identity = join(root, "state", "identity");
+    const marker = join(root, "child-started");
+    const nonce = "open-failure-nonce";
+    const existing = "previous generation evidence\n";
+    try {
+      await mkdir(join(root, "state"));
+      await mkdir(directory, { mode: 0o700 });
+      if (failure === "EACCES") await chmod(directory, 0o500);
+      // The real launcher deliberately chmods the directory to 0700. Restore 0500
+      // immediately after that setup call to inject a real EACCES at the open,
+      // rather than accidentally testing the chmod repair or an earlier failure.
+      // The production script below is unchanged; only this shell's chmod is wrapped.
+      const setup = failure === "EACCES"
+        ? 'failure_diagnostics=$4; chmod() { command chmod "$@" || return; if test "$1" = 0700 && test "$2" = "$failure_diagnostics"; then command chmod 0500 "$2"; fi; }; '
+        // Use this shell's actual PID: no guessed PID, glob, or race with the open.
+        : `umask 077; printf '%s' '${existing}' > "$4/runnerd.launch-stderr.$2.$$.log"; `;
+      const result = spawnSync("/bin/sh", ["-c", setup + REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT,
+        "paperclip-runner-child", identity, nonce, "runner-id", directory, process.execPath, "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "runnerd started")`, "--", "--runner-id", "runner-id"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, LC_ALL: "C" },
+        timeout: 5_000, killSignal: "SIGKILL" });
+      // A timeout/signal is not a clear failure: require the shell's own nonzero exit.
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status).not.toBeNull();
+      expect(result.status).toBeGreaterThan(0);
+      const name = `runnerd.launch-stderr.${nonce}.${result.pid}.log`;
+      expect(result.stderr).toContain(join(directory, name));
+      expect(result.stderr).toMatch(failure === "EACCES" ? /Permission denied/i : /File exists|cannot overwrite/i);
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(identity)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readdir(join(root, "state"))).toEqual([]);
+      expect(await copierPids(result.pid)).toEqual([]);
+      if (failure === "EACCES") {
+        expect((await stat(directory)).mode & 0o777).toBe(0o500);
+        expect(await readdir(directory)).toEqual([]);
+      } else {
+        expect(await readdir(directory)).toEqual([name]);
+        expect(await readFile(join(directory, name), "utf8")).toBe(existing);
+      }
+    } finally {
+      await chmod(directory, 0o700);
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   // Upstream's rotation alone kept only the last two generations; no generation's evidence may be discarded.
