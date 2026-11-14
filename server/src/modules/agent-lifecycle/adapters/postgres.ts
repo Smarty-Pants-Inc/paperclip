@@ -328,7 +328,8 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         pendingLifecycleWork,
         sql`coalesce((${agents.lifecycleOperation}->>'leaseUntil')::timestamptz, '-infinity') <= ${now.toISOString()}::timestamptz`,
         sql`coalesce((${agents.lifecycleOperation}->>'retryAt')::timestamptz, '-infinity') <= ${now.toISOString()}::timestamptz`,
-      )).orderBy(sql`case when ${agents.lifecycleState} = 'resuming' then 0 else 1 end`,
+      )).orderBy(sql`case when ${agents.lifecycleState} = 'resuming'
+        and coalesce(${agents.lifecycleOperation}->>'resumeState', 'ready') = 'ready' then 0 else 1 end`,
         asc(agents.updatedAt), asc(agents.id)).limit(limit).then(rows => rows.map(row => row.id));
     },
   };
