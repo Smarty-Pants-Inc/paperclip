@@ -2198,6 +2198,7 @@ pub struct CodexCommandExecutor {
     event_identity: Option<ProviderEventIdentity>,
     restore_checked: bool,
     restore_error: Option<DurableRunnerError>,
+    prepare_input_refusal_code: Option<&'static str>,
     pi_launch_profile: Option<OpenCodeLaunchProfile>,
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
     cursor_cloud_launch_profile: Option<CursorCloudLaunchProfile>,
@@ -2219,6 +2220,7 @@ impl CodexCommandExecutor {
             event_identity: None,
             restore_checked: false,
             restore_error: None,
+            prepare_input_refusal_code: None,
             pi_launch_profile: None,
             opencode_launch_profile: None,
             cursor_cloud_launch_profile: None,
@@ -2261,7 +2263,7 @@ impl CodexCommandExecutor {
         if config.command != profile.command.path
             || config.args.as_slice() != [proxy_script.as_ref()]
         {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "OpenCode run.prepare launch does not match the runner-owned qualified profile",
             ));
         }
@@ -2290,7 +2292,7 @@ impl CodexCommandExecutor {
         if config.command != profile.command.path
             || config.args.as_slice() != [proxy_script.as_ref()]
         {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Pi run.prepare launch does not match the runner-owned qualified profile",
             ));
         }
@@ -2352,7 +2354,7 @@ impl CodexCommandExecutor {
         if config.command != profile.command.path
             || config.args.as_slice() != [proxy_script.as_ref()]
         {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Cursor Cloud run.prepare launch does not match the runner-owned qualified profile",
             ));
         }
@@ -2741,9 +2743,18 @@ impl CodexCommandExecutor {
             ))
         })?;
         state.validate()?;
+        // Capture before restore_provider_if_needed can settle the old turn.
+        // This field labels errors only; it never participates in admission.
+        self.prepare_input_refusal_code = if state.active_provider_turn_id.is_some()
+            || state.pi_deferred_terminal.is_some() || state.ambiguous_turn_start_pending {
+            Some("provider_active_turn")
+        } else if !state.descendant_thread_ids.is_empty() { Some("provider_live_descendants")
+        } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now) {
+            Some("provider_active_goal")
+        } else { None };
         let expected_pi_profile_digest = self.bind_pi_launch_profile(&state.config)?;
         if state.pi_launch_profile_digest != expected_pi_profile_digest {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Pi runner launch profile changed across durable recovery",
             )
             .with_classification(PROVIDER_STATE_INCOMPATIBLE));
@@ -2755,7 +2766,7 @@ impl CodexCommandExecutor {
             state.opencode_launch_profile_digest = expected_launch_profile_digest.clone();
         }
         if state.opencode_launch_profile_digest != expected_launch_profile_digest {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "OpenCode runner launch profile changed across durable recovery",
             )
             .with_classification(PROVIDER_STATE_INCOMPATIBLE));
@@ -2763,7 +2774,7 @@ impl CodexCommandExecutor {
         let expected_cursor_cloud_profile_digest =
             self.bind_cursor_cloud_launch_profile(&state.config)?;
         if state.cursor_cloud_launch_profile_digest != expected_cursor_cloud_profile_digest {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "Cursor Cloud runner launch profile changed across durable recovery",
             )
             .with_classification(PROVIDER_STATE_INCOMPATIBLE));
@@ -3495,29 +3506,50 @@ impl CodexCommandExecutor {
                 || (state.completion_contract != completion_contract && !rebind_run)
                 || ((different_run || legacy_attachment) && !rebind_run)
             {
+                // Additive diagnostics only: retain the exact refusal predicate
+                // and priority above. No restore/replacement decision changes.
+                let code = if state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
+                    || state.ambiguous_turn_start_pending || state.startup_attempt.is_some()
+                    || self.provider.as_ref().is_some_and(|p| !p.run_attachment_live_work().is_empty()) {
+                    "provider_active_turn"
+                } else if !state.descendant_thread_ids.is_empty()
+                    || self.provider.as_ref().is_some_and(|p| p.has_known_descendants()) {
+                    "provider_live_descendants"
+                } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now)
+                    || self.provider.as_ref().is_some_and(|p| p.has_active_goal()) {
+                    "provider_active_goal"
+                } else if state.tool_bridge.pending_calls().next().is_some() {
+                    "provider_pending_tool_calls"
+                } else if state.lifecycle == "reconciliation_required" {
+                    "provider_reconciliation_required"
+                } else if state.config != stable_config {
+                    "provider_config_changed"
+                } else if state.completion_contract != completion_contract {
+                    "provider_contract_changed_same_run"
+                } else { "provider_prepare_refused" };
                 return Err(DurableRunnerError::invalid(
                     "Codex provider or completion contract changed across the durable run",
-                ));
+                ).with_refusal_code(code));
             }
             if state.pi_launch_profile_digest != pi_launch_profile_digest {
-                return Err(DurableRunnerError::invalid(
+                return Err(DurableRunnerError::launch_profile_mismatch(
                     "Pi runner launch profile changed across the durable run",
                 ));
             }
             if state.opencode_launch_profile_digest != opencode_launch_profile_digest {
-                return Err(DurableRunnerError::invalid(
+                return Err(DurableRunnerError::launch_profile_mismatch(
                     "OpenCode runner launch profile changed across the durable run",
                 ));
             }
             if state.cursor_cloud_launch_profile_digest != cursor_cloud_launch_profile_digest {
-                return Err(DurableRunnerError::invalid(
+                return Err(DurableRunnerError::launch_profile_mismatch(
                     "Cursor Cloud runner launch profile changed across the durable run",
                 ));
             }
             if state.lifecycle == "closed" {
                 return Err(DurableRunnerError::invalid(
                     "Codex provider session is already closed",
-                ));
+                ).with_refusal_code("provider_session_closed"));
             }
             if rebind_run && state.thread_id.is_some() {
                 let refresh_pi_process =
@@ -3606,9 +3638,18 @@ impl CodexCommandExecutor {
                     .as_ref()
                     .is_some_and(|provider| !provider.run_attachment_live_work().is_empty())
             {
+                let code = if state.active_provider_turn_id.is_some() || state.ambiguous_turn_start_pending {
+                    "provider_active_turn"
+                } else if state.tool_bridge.pending_calls().next().is_some() {
+                    "provider_pending_tool_calls"
+                } else if goal_continues_after_turn(state, goal_active) {
+                    "provider_active_goal"
+                } else if state.lifecycle == "reconciliation_required" {
+                    "provider_reconciliation_required"
+                } else { "provider_prepare_refused" };
                 return Err(DurableRunnerError::invalid(
                     "run.prepare Pi context refresh requires a settled provider session",
-                ));
+                ).with_refusal_code(code));
             }
             if let Some(provider) = self.provider.as_mut() {
                 let (accounting, drained) =
@@ -3920,10 +3961,20 @@ impl CodexCommandExecutor {
             blockers.push("durable_active_goal");
         }
         if !blockers.is_empty() {
+            let code = if next_state.active_provider_turn_id.is_some() || next_state.ambiguous_turn_start_pending {
+                "provider_active_turn"
+            } else if !next_state.descendant_thread_ids.is_empty()
+                || self.provider.as_ref().is_some_and(|p| p.has_known_descendants()) {
+                "provider_live_descendants"
+            } else if goal_continues_after_turn(&next_state, goal_active) { "provider_active_goal"
+            } else if blockers.contains(&"durable_pending_tool_calls") { "provider_pending_tool_calls"
+            } else if next_state.lifecycle == "closed" { "provider_session_closed"
+            } else if next_state.lifecycle == "reconciliation_required" { "provider_reconciliation_required"
+            } else { "provider_prepare_refused" };
             let error = DurableRunnerError::invalid(format!(
                 "run.attach requires a settled Codex provider session: {}",
                 blockers.join(", ")
-            ));
+            )).with_refusal_code(code);
             // A pending tool call is a side effect without a recorded result.
             // The controller must not replace this session to get past it.
             return Err(if blockers.contains(&"durable_pending_tool_calls") {
@@ -6543,6 +6594,16 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+        // Restore can settle an old turn before prepare inspects the changed
+        // contract. Preserve its input blocker for the additive refusal channel;
+        // do not change restore, admission, or the replacement decision.
+        self.prepare_input_refusal_code = self.state.as_ref().and_then(|state| {
+            if state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
+                || state.ambiguous_turn_start_pending { Some("provider_active_turn")
+            } else if !state.descendant_thread_ids.is_empty() { Some("provider_live_descendants")
+            } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now) { Some("provider_active_goal")
+            } else { None }
+        });
         self.startup_command = Some(ProviderStartupCommand {
             command_id: command.command_id.clone(),
             controller_seq: command.controller_seq,
@@ -6623,7 +6684,29 @@ impl CommandExecutor for CodexCommandExecutor {
             }
         })();
         self.startup_command = None;
-        outcome
+        outcome.map_err(|error: DurableRunnerError| {
+            if !matches!(command.command_type.as_str(), "run.prepare" | "run.attach") { return error; }
+            if let Some(blocker) = self.prepare_input_refusal_code {
+                if matches!(error.refusal_code(), None | Some("provider_prepare_refused")
+                    | Some("provider_config_changed") | Some("provider_contract_changed_same_run")) {
+                    return error.with_refusal_code(blocker);
+                }
+            }
+            if error.refusal_code().is_some() { return error; }
+            // Restore may refuse before prepare reaches its own fences. Carry
+            // the durable blocker without changing restore, its error, or any
+            // classification/replacement decision.
+            let code = self.state.as_ref().map(|state| {
+                if state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
+                    || state.ambiguous_turn_start_pending { "provider_active_turn"
+                } else if !state.descendant_thread_ids.is_empty() { "provider_live_descendants"
+                } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now) { "provider_active_goal"
+                } else if state.tool_bridge.pending_calls().next().is_some() { "provider_pending_tool_calls"
+                } else if state.lifecycle == "reconciliation_required" { "provider_reconciliation_required"
+                } else { "provider_prepare_refused" }
+            }).unwrap_or("provider_prepare_refused");
+            error.with_refusal_code(code)
+        })
     }
 
     fn rotate_authority(&mut self, config: &DurableRunnerConfig) {
@@ -8588,6 +8671,56 @@ done
         restored.restore().unwrap();
         assert!(restored.provider.is_none());
         (directory, restored, payload)
+    }
+
+    #[test]
+    fn prepare_refusals_have_specific_codes_without_changing_admission_or_saved_state() {
+        for (shape, code) in [
+            ("active_turn", "provider_active_turn"),
+            ("descendant", "provider_live_descendants"),
+            ("goal", "provider_active_goal"),
+            ("config", "provider_config_changed"),
+            ("contract", "provider_contract_changed_same_run"),
+        ] {
+            let (directory, mut executor, mut payload) = prepared_skill_checkpoint("codex", true);
+            let state = executor.state.as_mut().unwrap();
+            state.run_identity = Some(prepare_contract_identity("run-A"));
+            executor.event_identity = Some(prepare_contract_identity(if shape == "contract" { "run-A" } else { "run-B" }));
+            match shape {
+                "active_turn" => { state.active_provider_turn_id = Some("old-turn".to_owned()); state.lifecycle = "turn_active".to_owned(); }
+                "descendant" => { state.descendant_thread_ids.insert("child".to_owned()); }
+                "goal" => { state.goal = Some(SessionGoalSnapshot { objective: "old".to_owned(), status: "active".to_owned(), token_budget: None, tokens_used: 0, elapsed_seconds: 0, iterations: 0, last_reason: None, created_at: None, updated_at: None, completed_at: None, working_now: false }); }
+                "config" => { payload["provider"]["model"] = json!("new-model"); }
+                "contract" => { payload["completionContract"] = json!({"revision":"new", "criterionIds":["objective"]}); }
+                _ => unreachable!(),
+            }
+            if shape != "contract" { payload["provider"]["instructions"] = json!("edited skill"); }
+            executor.save_state().unwrap();
+            let bytes = fs::read(executor.state_path()).unwrap();
+            for _ in 0..2 {
+                let error = executor.prepare(&payload).unwrap_err();
+                assert_eq!(error.refusal_code(), Some(code), "{shape}");
+                assert_eq!(fs::read(executor.state_path()).unwrap(), bytes, "{shape}");
+                assert!(executor.provider.is_none());
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn prepare_launch_drift_is_a_structured_refusal_without_rewriting_history() {
+        let (directory, mut executor, payload) = prepared_skill_checkpoint("pi_rpc", true);
+        executor.state.as_mut().unwrap().pi_launch_profile_digest = Some("previous-profile".to_owned());
+        executor.save_state().unwrap();
+        let saved = fs::read(executor.state_path()).unwrap();
+        for _ in 0..2 {
+            let error = executor.prepare(&payload).unwrap_err();
+            assert_eq!(error.refusal_code(), Some("provider_launch_profile_mismatch"));
+            assert_eq!(error.to_string(), "Pi runner launch profile changed across the durable run");
+            assert_eq!(fs::read(executor.state_path()).unwrap(), saved);
+            assert!(executor.provider.is_none(), "a refusal cannot start a provider");
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
