@@ -32,7 +32,10 @@ const github = {
   version: 1, sourceChannel: "github",
   sections: [{ title: "GitHub sender", rows: [{ type: "key_value", label: "Sender", value: "synthetic-bot" }] }],
 } as const;
-const slack = { version: 1, sourceChannel: "slack" } as const;
+const slack = {
+  version: 1, sourceChannel: "slack",
+  sections: [{ title: "Slack sender", rows: [{ type: "key_value", label: "Sender", value: "synthetic-slack-user" }] }],
+} as const;
 const specs = [
   { slug: "first-task", identifier: "PRE-1", comments: [
     { body: "plain", type: "user", metadata: null },
@@ -62,10 +65,8 @@ function bundle() {
         "        authorUserId: null", "        presentation: null", "        createdAt: null",
         ...(comment.metadata === null ? ["        metadata: null"] : [
           "        metadata:", "          version: 1", `          sourceChannel: ${comment.metadata.sourceChannel}`,
-          ...(comment.metadata.sourceChannel === "github" ? [
-            "          sections:", "            -", "              title: GitHub sender", "              rows:",
-            "                -", "                  type: key_value", "                  label: Sender", "                  value: synthetic-bot",
-          ] : []),
+          "          sections:", "            -", `              title: ${comment.metadata.sections[0].title}`, "              rows:",
+          "                -", "                  type: key_value", "                  label: Sender", `                  value: ${comment.metadata.sections[0].rows[0].value}`,
         ]),
       ]),
     ]), "",
