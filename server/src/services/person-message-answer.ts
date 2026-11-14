@@ -38,6 +38,7 @@ export function importedPersonHistorySql(m: { id: SQL; companyId: SQL; issueId: 
       (select min(l.created_at) from ${activityLog} l where l.company_id = ${m.companyId}
         and l.action = ${ISSUE_IMPORTED_ACTION} and l.entity_type = 'issue' and l.entity_id = ${m.issueId}::text),
       (select min(c.created_at) from ${activityLog} c where c.company_id = ${m.companyId} and c.action = ${COMPANY_IMPORTED_ACTION}
+        and c.entity_type = 'company' and c.entity_id = ${m.companyId}::text
         and exists (select 1 from ${issues} i where i.id = ${m.issueId} and i.company_id = ${m.companyId}
           and i.origin_kind = 'company_import'))))`;
 }
