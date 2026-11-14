@@ -8,6 +8,7 @@ import { useMemo, type ReactNode } from "react";
 import type { IssueAttachment } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
+import { TaskChatRunActivityReveal } from "./expansion-state";
 import type {
   TaskChatInteractionItem,
   TaskChatItem,
@@ -87,6 +88,11 @@ interface TaskChatThreadViewProps {
   onOpenBrowser?: (browserId: string) => void;
 }
 
+/** Settled run turns are keyed `${runId}:turn` or `${runId}:turn:${segment}`. */
+function turnRunId(id: string): string | undefined {
+  return /^(.+?):turn(?::\d+)?$/.exec(id)?.[1];
+}
+
 function renderItem(
   item: TaskChatItem,
   onApprovalDecision?: (statusItemId: string, optionId: string) => void,
@@ -132,6 +138,7 @@ function renderItem(
           }
         : item.attachedTurn;
       const turn = attachedTurnItem ? (
+        <TaskChatRunActivityReveal runId={item.sourceRunId}>
         <TaskChatTurn
           item={attachedTurnItem}
           timestampPrefix={
@@ -159,6 +166,7 @@ function renderItem(
             )
           }
         />
+        </TaskChatRunActivityReveal>
       ) : undefined;
       // MCP Apps views ride with the reply, outside the folded tool history.
       const appViews = item.author === "agent" && item.sourceRunId
@@ -248,6 +256,7 @@ function renderItem(
       return <TaskChatSubagentTree subagents={item.subagents} />;
     case "turn":
       return (
+        <TaskChatRunActivityReveal runId={turnRunId(item.id)}>
         <TaskChatTurn
           item={item}
           renderChild={(child) =>
@@ -271,6 +280,7 @@ function renderItem(
             )
           }
         />
+        </TaskChatRunActivityReveal>
       );
     case "protocol":
       return (

@@ -1659,14 +1659,24 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     ...comments.flatMap(comment => [comment.createdByRunId, comment.derivedCreatedByRunId]),
     ...(inputFacts.data ?? []).flatMap(event => [event.runId, event.details?.targetRunId]),
   ].filter((id): id is string => typeof id === "string" && isUuidLike(id)))].sort(), [comments, inputFacts.data]);
+  // The compact window keeps only the latest run. Read the summaries (never
+  // transcripts) of the runs behind visible replies too, so every saved turn
+  // stays reachable through the history disclosure, in tasks as in Agent Chat.
   const commentRuns = useIssueIdBatches(
     [...queryKeys.issues.runs(issueQueryRef), "comment-window"], observedRunIds,
-    ids => activityApi.runsByIdsForIssue(issueQueryRef, ids), !!issueId && !!conversationMode && !historyExpanded,
+    ids => activityApi.runsByIdsForIssue(issueQueryRef, ids), !!issueId && !historyExpanded,
   );
-  const linkedRuns = useMemo(() => [...new Map([
-    ...(Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? []),
-    ...(conversationMode && !historyExpanded ? commentRuns.data ?? [] : []),
-  ].map(run => [run.runId, run])).values()], [linkedRunHistory, conversationMode, historyExpanded, commentRuns.data]);
+  const linkedRuns = useMemo(() => {
+    const windowRuns = Array.isArray(linkedRunHistory) ? linkedRunHistory : linkedRunHistory?.runs ?? [];
+    const visibleReplyRuns = historyExpanded ? [] : commentRuns.data ?? [];
+    // A task's polled window stays authoritative for the runs it holds; the
+    // one-time summaries only add the earlier runs it omits.
+    const windowRunIds = new Set(windowRuns.map(run => run.runId));
+    return [...new Map([
+      ...windowRuns,
+      ...(conversationMode ? visibleReplyRuns : visibleReplyRuns.filter(run => !windowRunIds.has(run.runId))),
+    ].map(run => [run.runId, run])).values()];
+  }, [linkedRunHistory, conversationMode, historyExpanded, commentRuns.data]);
   const hasEarlierRuns = !Array.isArray(linkedRunHistory) && linkedRunHistory?.hasEarlierRuns === true;
   const resolvedActivity = useMemo(
     () => [...new Map([...(activity ?? []), ...(inputFacts.data ?? [])].map((event) => [event.id, event])).values()],
@@ -2681,7 +2691,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               initialMetadataPending ||
               activityPending ||
               linkedRunsPending ||
-              (conversationMode && observedRunIds.length > 0 && commentRuns.isPending) ||
+              (!historyExpanded && observedRunIds.length > 0 && commentRuns.isPending) ||
               inputFacts.isLoading ||
               !runtimeSelectionKnown)
             }
@@ -2690,7 +2700,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               activityError ||
               (!historyExpanded && inputFacts.isError) ||
               linkedRunsError ||
-              (conversationMode && commentRuns.isError) ||
+              (!historyExpanded && commentRuns.isError) ||
               liveRunsError ||
               (activeRunQueryEnabled && activeRunError)
             }
@@ -2699,7 +2709,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
               void refetchActivity();
               if (!historyExpanded && inputCommentIds.length) void inputFacts.refetch();
               void refetchLinkedRuns();
-              if (conversationMode && observedRunIds.length) void commentRuns.refetch();
+              if (!historyExpanded && observedRunIds.length) void commentRuns.refetch();
               void refetchLiveRuns();
               if (activeRunQueryEnabled) void refetchActiveRun();
             }}

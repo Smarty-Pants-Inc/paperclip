@@ -1,5 +1,6 @@
 import { groupImageResources } from "./image-resources";
-import { useState, type ReactNode } from "react";
+import { useContext, useState, type ReactNode } from "react";
+import { TaskChatRevealActivity } from "./expansion-state";
 import { cn } from "@/lib/utils";
 import { TaskChatRunHealthBanner } from "./TaskChatRunHealthBanner";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
@@ -156,10 +157,17 @@ export function TaskChatTurn({
       ? item.items.filter((child) => !persistentItemIds.has(child.id))
       : item.items;
   // Parent-row live turns and settled turns start as their one-line header;
-  // only the headerless legacy live turn starts expanded.
+  // only the headerless legacy live turn starts expanded, or a settled turn
+  // whose compacted output the reader just revealed ("More run output").
+  const reveal = useContext(TaskChatRevealActivity);
   const [open, setOpen] = useState(
-    () => !item.settled && item.liveStatus == null,
+    () => (!item.settled && item.liveStatus == null) || reveal,
   );
+  const [revealed, setRevealed] = useState(reveal);
+  if (reveal && !revealed) {
+    setRevealed(true);
+    setOpen(true);
+  }
   // Historical folds can contain thousands of tool/reasoning rows. Mount them
   // on first inspection, then retain them for closing motion and child state.
   const [historyMounted, setHistoryMounted] = useState(open);

@@ -2394,6 +2394,31 @@ describe("IssueDetail", () => {
     expect(mockActivityApi.runsForIssue).not.toHaveBeenCalled();
   });
 
+  // RFL F2 (turn-steps r2): a cold ordinary task must know every completed run
+  // behind a visible reply, not just the latest, so the existing history
+  // disclosure can open each turn's saved steps. Summaries only, no transcripts.
+  it("supplies the run summaries behind every visible reply on a cold ordinary task", async () => {
+    queryClient.setQueryData(["issues", "history-expanded", "PAP-1"], false);
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+    const firstRunId = "11111111-1111-4111-8111-111111111111", secondRunId = "22222222-2222-4222-8222-222222222222";
+    const run = (runId: string, minute: number) => ({ runId, runtimeMode: "native", status: "succeeded", agentId: "agent-1",
+      createdAt: `2026-04-21T00:0${minute}:00.000Z`, finishedAt: `2026-04-21T00:0${minute}:10.000Z` });
+    const first = run(firstRunId, 1), second = run(secondRunId, 2);
+    const reply = (id: string, runId: string, minute: number) => createIssueComment({ id, authorType: "agent", authorAgentId: "agent-1",
+      authorUserId: null, createdByRunId: runId, body: `Reply ${minute}`, createdAt: new Date(`2026-04-21T00:0${minute}:09.000Z`) } as Partial<IssueComment>);
+    const comments = [reply("reply-2", secondRunId, 2), reply("reply-1", firstRunId, 1)];
+    mockIssuesApi.recentComments.mockResolvedValue({ comments, latestCommentId: "reply-2", oldestCommentId: "reply-1", hasMore: false });
+    mockActivityApi.recentRunsForIssue.mockResolvedValue([second, first]);
+    mockActivityApi.runsByIdsForIssue.mockImplementation(async (_issue: string, ids: string[]) => [second, first].filter(r => ids.includes(r.runId)));
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => {
+      const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0];
+      expect(props?.compactHistory).toBe(true);
+      expect(props?.linkedRuns.map((r: { runId: string }) => r.runId).sort()).toEqual([firstRunId, secondRunId]);
+    });
+    expect(mockActivityApi.runsForIssue).not.toHaveBeenCalled();
+  });
+
   it("reveals omitted runs through the history disclosure when there are no older comments", async () => {
     queryClient.setQueryData(["issues", "history-expanded", "PAP-1"], false);
     mockIssuesApi.get.mockResolvedValue(createIssue());
