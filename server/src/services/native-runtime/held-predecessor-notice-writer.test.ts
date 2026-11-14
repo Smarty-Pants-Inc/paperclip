@@ -44,6 +44,8 @@ describe.skipIf(!support.supported)("held predecessor notice writer", () => {
       .filter(comment => String((comment.metadata as Record<string, unknown> | null)?.authorizationReason ?? "")
         === `native_prior_owner_held:${sessionId}`);
     expect(notices).toHaveLength(1);
+    // RFL 20:36Z: a note the person must read is written open, not folded behind a chevron.
+    expect(notices[0]!.presentation).toMatchObject({ kind: "system_notice", detailsDefaultOpen: true });
   });
 
   it("writes one notice per hold: none while it stands, one new notice after the same session continued", async () => {

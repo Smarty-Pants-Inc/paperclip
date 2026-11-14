@@ -8377,6 +8377,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       title: "Recovery: waiting on dependencies — moved to blocked",
       density: "compact",
     });
+    // RFL 20:36Z: compactRecoveryPresentation writes the note open.
+    expect(comments[0]?.presentation).toMatchObject({ detailsDefaultOpen: true });
     expect(comments[0]?.metadata).toMatchObject({
       version: 1,
       sections: [
