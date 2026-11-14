@@ -26,6 +26,17 @@ execution and finalization path.
   become settled merely because instructions changed. Checkpoints written by
   the preceding release retain their existing shape and thread identity; no
   migration or destructive reset is needed for this instructions-only refresh.
+  A settled predecessor that only prepared, without opening a thread, likewise
+  adopts the next run's instructions before its first `session.open`.
+
+  The Codex `run.attach` instructions-only exception deliberately deviates from
+  upstream's provider-profile mismatch refusal, introduced in
+  [2a5a323e5 / #16997](https://github.com/paperclipai/paperclip/pull/16997).
+  Upstream refuses changed instructions on attach; this fork admits them only
+  for a different, settled run with an otherwise unchanged profile. The upstream
+  refusal test is intentionally inverted for that case. Expect a sync conflict
+  at this guard and its test on the next upstream sync; preserve or explicitly
+  reconcile this deviation rather than silently restoring the refusal.
 - `turn.start` requires bounded non-empty `payload.text`. `turn.steer`,
   `turn.interrupt`, `turn.stop`, and `run.cancel` use Codex's native turn IDs,
   while PRP continues to use its own stable run and turn identities.

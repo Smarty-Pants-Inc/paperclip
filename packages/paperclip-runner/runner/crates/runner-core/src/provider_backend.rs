@@ -3485,7 +3485,6 @@ impl CodexCommandExecutor {
             // Same-run, live-work and every other profile fence stay strict.
             let mut stable_config = config.clone();
             if rebind_run
-                && state.thread_id.is_some()
                 && state.config.provider == config.provider
                 && matches!(config.provider.as_str(), "pi_rpc" | "codex")
             {
@@ -3561,6 +3560,8 @@ impl CodexCommandExecutor {
                 }
                 if rebind_run {
                     // A prepared session with no thread has never started work.
+                    // Adopt the admitted instructions before its first session.open.
+                    state.config.instructions = config.instructions.clone();
                     state.completion_contract = completion_contract;
                     changed = true;
                 }

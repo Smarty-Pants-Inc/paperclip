@@ -77,6 +77,66 @@ mod skill_edit {
         }
     }
 
+    // Keep: RFL F4 found that a settled, prepared predecessor with no thread
+    // refused edited instructions forever. Exercise real prepare and disk reload
+    // without opening a provider process, for both affected providers.
+    #[test]
+    fn prepared_without_thread_skill_edit_adopts_new_run_instructions() {
+        let mut refusals = Vec::new();
+        for provider in ["codex", "pi_rpc"] {
+            let (directory, fixture, mut payload) = prepared_skill_checkpoint(provider, true);
+            // Reuse only the fixture's launch profile and payload. This executor
+            // gets a fresh state directory and never opens or fabricates a thread.
+            let state_directory = directory.join("never-opened");
+            let mut executor = CodexCommandExecutor::new(&state_directory);
+            executor.pi_launch_profile = fixture.pi_launch_profile.clone();
+            executor.event_identity = Some(prepare_contract_identity("run-A"));
+            executor.prepare(&payload).unwrap();
+            let before = executor.state.as_ref().unwrap().clone();
+            assert_eq!(before.lifecycle, "prepared");
+            assert!(before.thread_id.is_none());
+            assert!(before.is_settled_for_run_attachment());
+            assert!(executor.provider.is_none());
+            payload["provider"]["instructions"] = json!("Assigned skill: edited description v2");
+
+            // No thread is not permission to mutate the current invocation.
+            let bytes = fs::read(executor.state_path()).unwrap();
+            assert!(executor.prepare(&payload).is_err(), "{provider}: same run");
+            assert_eq!(executor.state.as_ref().unwrap(), &before);
+            assert_eq!(fs::read(executor.state_path()).unwrap(), bytes);
+
+            // The next invocation reads the predecessor's real prepared state.
+            let mut next = CodexCommandExecutor::new(&state_directory);
+            next.pi_launch_profile = executor.pi_launch_profile.clone();
+            next.event_identity = Some(prepare_contract_identity("run-B"));
+            next.load_state_without_provider().unwrap();
+            if let Err(error) = next.prepare(&payload) {
+                eprintln!("SKILL_EDIT provider={provider} shape=no_thread_prepared REFUSED: {error}");
+                refusals.push(format!("{provider}: {error}"));
+                fs::remove_dir_all(directory).unwrap();
+                continue;
+            }
+            let state = next.state.as_ref().unwrap();
+            let mut expected_config = before.config.clone();
+            expected_config.instructions = "Assigned skill: edited description v2".to_owned();
+            assert_eq!(state.config, expected_config, "{provider}");
+            assert_eq!(state.completion_contract, before.completion_contract);
+            assert_eq!(state.run_identity, Some(prepare_contract_identity("run-B")));
+            assert_eq!(state.lifecycle, "prepared");
+            assert!(state.thread_id.is_none());
+            assert!(next.provider.is_none());
+            // A same-run retry must accept the adopted config, not get stuck.
+            next.prepare(&payload).unwrap();
+            let mut recovered = CodexCommandExecutor::new(&state_directory);
+            recovered.pi_launch_profile = next.pi_launch_profile.clone();
+            recovered.load_state_without_provider().unwrap();
+            assert_eq!(recovered.state, next.state, "{provider}: durable adoption");
+            eprintln!("SKILL_EDIT provider={provider} shape=no_thread_prepared ADOPTED persisted=true retry=true");
+            fs::remove_dir_all(directory).unwrap();
+        }
+        assert!(refusals.is_empty(), "instructions-only refresh refused: {refusals:?}");
+    }
+
     #[test]
     fn prepare_skill_edit_keeps_same_run_and_other_profile_fields_immutable() {
         for provider in ["codex", "pi_rpc"] {
