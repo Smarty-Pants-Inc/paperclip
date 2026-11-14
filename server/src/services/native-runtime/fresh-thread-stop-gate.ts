@@ -21,10 +21,13 @@ export const FRESH_THREAD_TURN_NOTE = "Your message is saved; the current step m
 export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof heartbeatRuns.$inferSelect): Promise<string> {
   const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown; prepareRefusalCode?: unknown } | undefined;
   const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
-  // A generic/no-code run.prepare envelope is normalized to
-  // provider_prepare_refused. Only the typed refresh path (which has no
-  // generic prepare refusal) may claim that an instruction/skill change landed.
-  if (code !== "native_runner_refresh_required" || refusal?.prepareRefusalCode != null) return FRESH_THREAD_STARTED_NOTE;
+  // Only the typed instruction-refresh channel proves a skill change. Generic
+  // prepare refusal and unrelated specific prepare refusals stay neutral.
+  const typedRefreshCodes = new Set([
+    "provider_active_turn", "provider_live_descendants", "provider_active_goal", "provider_contract_changed",
+  ]);
+  if (code !== "native_runner_refresh_required"
+    || (refusal?.prepareRefusalCode != null && !typedRefreshCodes.has(String(refusal.prepareRefusalCode)))) return FRESH_THREAD_STARTED_NOTE;
   const [agent] = await db.select({ name: agents.name }).from(agents).where(and(
     eq(agents.companyId, run.companyId), eq(agents.id, run.agentId))).limit(1);
   return `your skill change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
