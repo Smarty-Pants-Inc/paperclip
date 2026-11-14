@@ -701,6 +701,71 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
+  // RFL 04:58Z: a PAUSED agent's chat. "Sending it again is safe" is false
+  // advice there; the note says the agent is paused and who can resume it.
+  const PAUSED_TEXT = "Managed Pi is paused. Your message is saved, and it will run when Managed Pi is resumed. "
+    + "A board user or Managed Pi's manager can resume Managed Pi.";
+  const pause = (f: { agentId: string }) => db.update(agents).set({ status: "paused", lifecycleState: "paused",
+    lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, f.agentId));
+  const resume = (f: { agentId: string }) => db.update(agents).set({ status: "active", lifecycleState: "ready",
+    lifecycleHolds: [], pauseReason: null }).where(eq(agents.id, f.agentId));
+
+  it("paused agent: a person's message gets ONE note that says the agent is paused and who can resume it, never 'sending again is safe'", async () => {
+    const f = await fixture();
+    await pause(f);
+    const commentId = await f.message("Are you there?");
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    await settleAt(f, 10 * 60_000);
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(PAUSED_TEXT);
+    expect(notices[0]!.body).not.toMatch(/sending it again|send the message again|safe/i);
+    expect(notices[0]!.presentation).toMatchObject({ title: "Managed Pi is paused" });
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(rowsOf(notices[0]!).some(row => row.label === "Failure code")).toBe(false);
+  });
+
+  it("paused agent, then resumed: the saved message's run is the only run (B' starts none), no second note, the answer supersedes it", async () => {
+    const f = await fixture();
+    await pause(f);
+    const commentId = await f.message("Are you there?");
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
+    const runsCarrying = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId)))
+      .filter(r => (r.contextSnapshot as Record<string, unknown> | null)?.wakeCommentId === commentId).length;
+    expect(await runsCarrying()).toBe(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+    // Resumed: Paperclip delivers the saved message to one run of its own.
+    await resume(f);
+    const run = await f.run({ commentId, status: "running" });
+    await settleAt(f, 4 * 60_000);
+    await settleAt(f, 20 * 60_000);
+    expect((await f.visible()).map(n => n.body)).toEqual([PAUSED_TEXT]);
+    expect(await runsCarrying()).toBe(1);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run));
+    await f.reply(run);
+    await settleAt(f, 21 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("paused while a waiting-to-start note stands: the SAME note becomes the paused text", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    const [waitingNote] = await f.visible();
+    expect(waitingNote!.body).toBe(WAITING);
+    await pause(f);
+    await settleAt(f, 4 * 60_000);
+    const notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.id).toBe(waitingNote!.id);
+    expect(notices[0]!.body).toBe(PAUSED_TEXT);
+  });
+
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
     for (let round = 0; round < 4; round++) {
       const f = await fixture();
