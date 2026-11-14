@@ -12,7 +12,7 @@ export function buildGatewayToolCallResult(input: {
     : null;
   // executeTool has already validated/redacted this value. Never fetch a raw
   // provider response here, or turn persisted replay receipts into live images.
-  const provider = data && ["mcp_http", "local_stdio", "cognee_cloud"].includes(String(data.transport))
+  const provider = data && ["mcp_http", "local_stdio", "cognee_cloud", "paperclip_plugin"].includes(String(data.transport))
     ? CallToolResultSchema.safeParse({ content: data.content, isError: data.isError === true })
     : null;
   if (provider?.success && provider.data.content.length > 0) {

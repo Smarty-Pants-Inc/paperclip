@@ -26,6 +26,7 @@ import type {
 import type { ToolRunContext, ToolResult, ExecuteToolParams } from "@paperclipai/plugin-sdk";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { logger } from "../middleware/logger.js";
+import { validatePluginToolResult } from "./plugin-tool-result.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -435,6 +436,7 @@ export function createPluginToolRegistry(
       };
 
       const result = await workerManager.call(dbId, "executeTool", rpcParams);
+      validatePluginToolResult(result);
 
       log.debug(
         {

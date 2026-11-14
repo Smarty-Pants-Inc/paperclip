@@ -325,6 +325,8 @@ export type {
   PluginLauncherRegistration,
   ToolRunContext,
   ToolResult,
+  PluginToolResultContent,
+  PluginToolResultData,
   PluginEntityUpsert,
   PluginEntityRecord,
   PluginEntityQuery,

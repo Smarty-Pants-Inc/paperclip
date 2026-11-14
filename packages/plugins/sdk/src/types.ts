@@ -283,11 +283,24 @@ export interface ToolRunContext {
  *
  * @see PLUGIN_SPEC.md §13.10 — `executeTool`
  */
-export interface ToolResult {
-  /** String content returned to the agent. Required for success responses. */
+export type PluginToolResultContent =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: "image/png" | "image/jpeg" | "image/webp" };
+
+/** Opt-in native MCP content. Images use canonical base64, not URLs. */
+export interface PluginToolResultData {
+  content: PluginToolResultContent[];
+  [key: string]: unknown;
+}
+
+export interface ToolResult<TData = unknown> {
+  /** Legacy text content. Native tools can put text blocks in data.content. */
   content?: string;
-  /** Structured data returned alongside or instead of string content. */
-  data?: unknown;
+  /** Structured data; use ToolResult<PluginToolResultData> for native MCP blocks.
+   * Limits: 5 MiB decoded/image, 10 MiB decoded/result including text/metadata,
+   * and 64 blocks. Invalid or oversized native results fail, never truncate.
+   */
+  data?: TData;
   /** If present, indicates the tool call failed. */
   error?: string;
 }

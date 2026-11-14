@@ -1,4 +1,7 @@
 import { assertAgentToolAssignmentInteractions } from "./connection-management.js";
+import { preparePluginToolResult, pluginGatewayToolResult } from "./plugin-tool-result.js";
+import type { ToolExecutionResult } from "./plugin-tool-registry.js";
+import type { StorageService } from "../storage/types.js";
 import { isNewHumanIntentAfterToolRejection } from "./tool-action-replay-intent.js";
 import { approvalSnapshotsMatch, approvalTargetChangeMessage, oauthApprovalConfig,
   approvalGrantTenantIdentity, externalCredentialApprovalIdentity } from "./tool-approval-target.js";
@@ -1329,6 +1332,8 @@ export function createToolGatewayService(
   db: Db,
   options: {
     pluginToolDispatcher?: PluginToolDispatcher;
+    /** Bounded private tool-image storage; defaults to the configured storage service. */
+    toolResultStorage?: StorageService;
     budgetHooks?: BudgetServiceHooks;
     /** Internal test seam for classification; never accepted from tool inputs. */
     promptInjectionProvider?: typeof runPromptInjectionProvider;
@@ -13108,8 +13113,13 @@ export function createToolGatewayService(
                 executionTimeoutMs,
               ));
 
+        const gatewayResult = tool.providerType === "paperclip_plugin"
+          ? pluginGatewayToolResult(await preparePluginToolResult(result as ToolExecutionResult, {
+              companyId: session.companyId, invocationId, storage: options.toolResultStorage, signal: input.signal,
+            }))
+          : result;
         const resultValidation = await validateToolContent({
-          value: result,
+          value: gatewayResult,
           direction: "result",
           sensitiveMode: "redact",
           promptInjectionMode: "block", classifier: resultClassifier(session, tool, invocationId, { approvedAction: Boolean(input.approvedActionRequestId), signal: input.signal }),
@@ -13529,11 +13539,11 @@ export function createToolGatewayService(
 
       const startedAt = Date.now();
       try {
-        const result = await pluginToolDispatcher.executeTool(
+        const result = await preparePluginToolResult(await pluginToolDispatcher.executeTool(
           input.tool,
           requestedParameters,
           input.runContext,
-        );
+        ), { companyId: input.runContext.companyId, invocationId, storage: options.toolResultStorage });
         const resultValidation = await validateToolContent({
           value: result,
           direction: "result",

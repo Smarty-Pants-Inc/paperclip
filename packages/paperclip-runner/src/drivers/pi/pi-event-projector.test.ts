@@ -322,7 +322,14 @@ describe("P0-1 large records are display-only", () => {
     expect(events[0]).toMatchObject({ eventType: "item.completed", itemId: started[0].itemId, payload: { toolName: "read", output: expect.stringContaining("[Pi image omitted from projection]") }, debug: { piProjection: { truncated: true } } });
     expect(events.at(-1)?.payload.status).toBe("completed");
     for (const event of events) expect(Buffer.byteLength(JSON.stringify(envelope(event, 0)))).toBeLessThan(256 * 1024);
-    expect(JSON.stringify(events)).not.toContain("A".repeat(1000));
+    const payload = JSON.stringify(events);
+    const bytes = Buffer.from("A".repeat(300_000), "base64");
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    expect(payload).not.toContain("A".repeat(1000));
+    expect(payload).not.toContain("data:image/");
+    expect(payload).toContain(`sha256:${sha256}`);
+    expect(payload).toContain(String(bytes.length));
+    expect(payload).toContain("image/png");
     expect(JSON.stringify(input)).toBe(before);
     expect(projector.project(final())[0].eventType).toBe("item.completed");
   });

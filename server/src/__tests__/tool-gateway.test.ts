@@ -22,6 +22,7 @@ import {
   connectionGrants,
   createDb,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueThreadInteractions,
   issues,
   principalPermissionGrants,
@@ -51,7 +52,11 @@ import {
 import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat.js";
 import { resolveNativeRuntimeMcpSnapshot } from "../services/native-runtime/runtime-context.js";
 import type { ToolMcpGatewayTokenAction } from "@paperclipai/shared";
-import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+import { createPluginToolDispatcher, type PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { createStorageService } from "../storage/service.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
 import {
@@ -6501,6 +6506,56 @@ rl.on("line", (line) => {
       status: "pending",
       continuationPolicy: "wake_assignee",
     });
+  });
+
+  // Keep: plugin/MCP trust boundary and persistence safety. Real dispatcher,
+  // registry, storage, DB, policy and HTTP; only the plugin worker is controlled.
+  it("returns a plugin frame through MCP while audit retains references only", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const bytes = Buffer.from("private synthetic frame bytes: MCP bridge acceptance");
+    const image = { type: "image", data: bytes.toString("base64"), mimeType: "image/png" };
+    const content = [{ type: "text", text: "one frame" }, image];
+    const worker = { isRunning: () => true, call: vi.fn(async () => ({ data: { content } })) } as unknown as PluginWorkerManager;
+    const dispatcher = createPluginToolDispatcher({ workerManager: worker });
+    dispatcher.registerPluginTools("demo.capture", {
+      id: "demo.capture", apiVersion: 1, version: "1.0.0", displayName: "Frame capture", description: "One frame",
+      author: "Paperclip", categories: ["automation"], capabilities: [], entrypoints: { worker: "dist/worker.js" },
+      tools: [{ name: "frame", displayName: "Frame", description: "Return one frame", parametersSchema: { type: "object", properties: {} } }],
+    } as unknown as PaperclipPluginManifestV1, randomUUID());
+    const root = mkdtempSync(join(tmpdir(), "paperclip-plugin-frame-"));
+    const storage = createStorageService(createLocalDiskStorageProvider(root));
+    try {
+      const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher, toolResultStorage: storage });
+      const [profile] = await db.insert(toolProfiles).values({ companyId: company.id, profileKey: `frame-${randomUUID()}`, name: "Frame", defaultAction: "deny" }).returning();
+      await db.insert(toolProfileEntries).values({ companyId: company.id, profileId: profile.id, selectorType: "tool_name", effect: "include", toolName: "demo.capture:frame" });
+      const named = await gateway.createNamedGateway({ companyId: company.id, body: { name: "Frame", profileId: profile.id, agentId: agent.id } });
+      const token = await gateway.createNamedGatewayToken({ companyId: company.id, gatewayId: named.id, body: { name: "Test", clientLabel: "Test", ownerNote: "", subjectType: "heartbeat_run", subjectId: run.id } });
+      const response = await request(createGatewayRouteApp(db, gateway)).post(named.endpointPath)
+        .set("authorization", `Bearer ${token.token}`)
+        .send({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "demo.capture:frame", arguments: {} } });
+      expect(response.status, response.body.error?.message).toBe(200);
+      expect(response.body.result?.content).toEqual(content);
+      expect(response.body.result.isError).toBe(false);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const references = response.body.result.structuredContent.imageReferences;
+      expect(references).toEqual([expect.objectContaining({ sha256, sizeBytes: bytes.length, mimeType: "image/png" })]);
+      expect(readFileSync(join(root, references[0].objectKey))).toEqual(bytes);
+      await expect(storage.getObject(randomUUID(), references[0].objectKey)).rejects.toThrow("Object does not belong to company");
+      const invocations = await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id));
+      const audit = await db.select().from(activityLog).where(eq(activityLog.companyId, company.id));
+      const calls = await db.select().from(toolCallEvents).where(eq(toolCallEvents.companyId, company.id));
+      const runEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id));
+      const persisted = JSON.stringify({ invocations, audit, calls, runEvents });
+      expect(persisted).not.toContain(image.data);
+      expect(persisted).not.toContain("data:image/");
+      expect(persisted).toContain(sha256);
+      expect(persisted).toContain('sizeBytes');
+      expect(persisted).toContain(references[0].objectKey);
+      expect(invocations).toContainEqual(expect.objectContaining({ status: "succeeded" }));
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it.each([1, 2])("wraps plugin tool discovery and execution behind the same gateway policy (%i copies)", async copies => {

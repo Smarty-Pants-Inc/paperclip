@@ -49,9 +49,15 @@ function displayValue(value: unknown, depth = 0, preview = (value: string) => va
   ]));
   return value;
 }
-function contentText(value: unknown): string {
+function contentText(value: unknown, includeImageReferences = false): string {
   return (Array.isArray(value) ? value : []).map(block => record(block)).map(block => block.type === "text" ? text(block.text)
-    : `[Pi ${text(block.type).slice(0, 40) || "content"} omitted from projection]`).join("\n");
+    : includeImageReferences && block.type === "image" && typeof block.data === "string"
+      ? (() => {
+          const bytes = Buffer.from(block.data, "base64");
+          const sha256 = createHash("sha256").update(bytes).digest("hex");
+          return `[Pi image omitted from projection] ${JSON.stringify({ reference: `sha256:${sha256}`, sha256, sizeBytes: bytes.length, mimeType: text(block.mimeType).slice(0, 100) })}`;
+        })()
+      : `[Pi ${text(block.type).slice(0, 40) || "content"} omitted from projection]`).join("\n");
 }
 /** Receipts need counts and cost provenance, not arbitrary provider metadata. */
 function projectionUsage(value: unknown): unknown {
@@ -293,7 +299,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     startTool(tool, output);
     const end = event.type === "tool_execution_end";
     const result = record(end ? event.result : event.partialResult);
-    const fullBody = contentText(result.content);
+    const fullBody = contentText(result.content, true);
     const body = Buffer.byteLength(fullBody) <= MAX_TEXT_BYTES ? fullBody : toolOutputPreview(fullBody, MAX_TEXT_BYTES);
     const outputWasTruncated = originalToolOutput?.truncated === true || body !== fullBody;
     if (outputWasTruncated) displayTruncated = true;
@@ -348,7 +354,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
     if (control !== source) {
       const key = source.type === "message_end" ? "message" : source.type === "tool_execution_update" ? "partialResult" : "result";
       const nativeResult = record(source[key]);
-      const fullBody = contentText(nativeResult.content);
+      const fullBody = contentText(nativeResult.content, true);
       const preview = Buffer.byteLength(fullBody) <= MAX_TEXT_BYTES ? fullBody : toolOutputPreview(fullBody, MAX_TEXT_BYTES);
       const omittedContent = Array.isArray(nativeResult.content) && nativeResult.content.some(part => record(part).type !== "text");
       if (omittedContent) displayTruncated = true;

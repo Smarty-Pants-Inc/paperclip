@@ -2,6 +2,7 @@ import type { PromptInjectionModelOutcome, PromptInjectionDetectorMetadata } fro
 import { createCipheriv, createDecipheriv, createHash, createHmac, hkdfSync, randomBytes, timingSafeEqual } from "node:crypto";
 import { redactEventPayload, redactSensitiveText, REDACTED_EVENT_VALUE } from "../redaction.js";
 import { deriveLocalEncryptedInstanceSecret, type LocalEncryptedKeyEnv } from "../secrets/local-encrypted-provider.js";
+import { referenceToolImages, restoreToolImages } from "./tool-result-images.js";
 
 export class ToolContentValidationError extends Error {
   constructor(
@@ -296,7 +297,8 @@ export function readSignedToolArguments(input: {
 }
 
 export function summarizeToolValue(value: unknown) {
-  const redacted = isPlainObject(value) ? redactEventPayload(value) : value;
+  const referenced = referenceToolImages(value);
+  const redacted = isPlainObject(referenced) ? redactEventPayload(referenced) : referenced;
   const serialized = stableSerialize(redacted);
   const redactedText = redactSensitiveText(serialized);
   return {
@@ -316,7 +318,8 @@ export async function validateToolContent(input: {
 }) {
   const sensitiveMode = input.sensitiveMode ?? "redact";
   const promptInjectionMode = input.promptInjectionMode ?? (input.direction === "result" ? "block" : "ignore");
-  const redactedValue = isPlainObject(input.value) ? redactEventPayload(input.value) : input.value;
+  const referencedValue = referenceToolImages(input.value);
+  const redactedValue = isPlainObject(referencedValue) ? redactEventPayload(referencedValue) : referencedValue;
   const redactedSummary = summarizeToolValue(redactedValue);
   const findings: string[] = [];
 
@@ -332,7 +335,7 @@ export async function validateToolContent(input: {
   if (promptInjectionMode !== "ignore") {
     // Wrapping allows the existing recursive redactor to handle root arrays and
     // strings, without changing the tool return value or its historical hash.
-    const outbound = redactSensitiveText(stableSerialize(redactEventPayload({ value: input.value })?.value));
+    const outbound = redactSensitiveText(stableSerialize(redactEventPayload({ value: referencedValue })?.value));
     // A verdict cannot cover text hidden from the model but still delivered to
     // the caller by the legacy return contract. Fall back before dispatch, so a
     // secret-named field cannot conceal instructions behind a safe verdict.
@@ -345,7 +348,7 @@ export async function validateToolContent(input: {
       promptFindings = outcome.findings;
       detectorMetadata = { detector: "model", model: outcome.model, invocationId: outcome.invocationId, policyVersion: outcome.policyVersion };
     } else {
-      promptFindings = scanPromptInjection(input.value);
+      promptFindings = scanPromptInjection(referencedValue);
       detectorMetadata = { detector: "regex", ...(outcome ? { fallbackReason: outcome.reason, model: outcome.model, invocationId: outcome.invocationId } : {}) };
     }
   }
@@ -362,7 +365,7 @@ export async function validateToolContent(input: {
   }
 
   return {
-    value: redactedValue,
+    value: restoreToolImages(redactedValue, input.value),
     summary: redactedSummary,
     findings,
     detectorMetadata,
