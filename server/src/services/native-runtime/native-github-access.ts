@@ -105,12 +105,15 @@ export async function createNativeGitHubAccess(input: {
     active = null;
     activeGeneration = null;
     server.closeAllConnections();
+    // A file bridge's final pause writes its run marker under the launcher
+    // directory. Stop it before removing that directory so teardown cannot
+    // recreate launchers after cleanup has completed.
+    const bridgeStop = await Promise.allSettled([stopBridge()]);
     const results = await Promise.allSettled([
-      stopBridge(),
       new Promise<void>(resolve => server.close(() => resolve())),
       cleanupGitHubOperationLaunchers(location),
     ]);
-    if (results.some(result => result.status === "rejected")) {
+    if (bridgeStop.some(result => result.status === "rejected") || results.some(result => result.status === "rejected")) {
       await input.onLog?.("stderr", "[paperclip] GitHub session cleanup incomplete.\n").catch(() => undefined);
     }
   })();
