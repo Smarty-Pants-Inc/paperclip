@@ -6,6 +6,7 @@ import { notifyNativeEnvironmentSettlement } from "./native-environment-settleme
 import { notifyRetainedNativeSessionCleanup } from "./retained-native-session-cleanup-notifications.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { notifyEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { rearmDestroyedWorkingCopyCleanup } from "./working-copy-cleanup-events.js";
 import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { withoutCleanupVerification } from "./cleanup-verification-proof.js";
 import { withEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -1818,7 +1819,10 @@ export function environmentService(db: Db) {
         .where(condition)
         .returning()
         .then((rows) => rows[0] ?? null);
-        if (released) await clearRemoteWorkspaceLocationForReleasedLease({ db: tx, lease: toEnvironmentLease(released) });
+        if (released) {
+          await clearRemoteWorkspaceLocationForReleasedLease({ db: tx, lease: toEnvironmentLease(released) });
+          await rearmDestroyedWorkingCopyCleanup(tx as unknown as Db, { companyId: released.companyId, leaseId: released.id });
+        }
         return released;
       });
       return row ? toEnvironmentLease(row) : null;

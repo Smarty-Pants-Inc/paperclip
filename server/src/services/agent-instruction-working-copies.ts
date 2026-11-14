@@ -112,6 +112,9 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       const [updated] = await tx.update(copies).set({ ...values, updatedAt: new Date() }).where(and(
         scope(row.companyId, row.runId), eq(copies.state, row.state), eq(copies.attempts, row.attempts), eq(copies.baseHash, row.baseHash), eq(copies.localRoot, row.localRoot),
         sql`${copies.receipt}->>'retainedByRunId' IS NOT DISTINCT FROM ${typeof row.receipt?.retainedByRunId === "string" ? row.receipt.retainedByRunId : null}`,
+        // A late I/O completion cannot overwrite a destruction/rearm event's
+        // newer receipt, even when state/save-attempts/baseline did not change.
+        values.receipt !== undefined ? sql`${copies.receipt} IS NOT DISTINCT FROM ${JSON.stringify(row.receipt)}::jsonb` : undefined,
         requireDue ? or(isNull(copies.nextAttemptAt), lte(copies.nextAttemptAt, new Date())) : undefined, condition,
       )).returning();
       return updated;
@@ -136,20 +139,27 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     const receipt = { ...row.receipt, cleanupAttempts: Math.min(MAX_DIRECTORY_CLEANUP_ATTEMPTS,
       Math.max(0, Number(row.receipt?.cleanupAttempts) || 0) + 1),
       cleanupLastReason: row.processStoppedAt ? "remote_cleanup_failed" : "stop_unconfirmed" };
-    return { receipt, nextAttemptAt: new Date(Date.now() + directoryCleanupBackoffMs({ receipt })) };
+    // Reserve the final park in the claim transaction, before I/O. A crash on
+    // attempt twelve cannot leave an unbounded thirteenth claim behind.
+    return receipt.cleanupAttempts >= MAX_DIRECTORY_CLEANUP_ATTEMPTS
+      ? { receipt: { ...receipt, cleanupParked: { state: "parked", reason: "retry_exhausted",
+          lastReason: receipt.cleanupLastReason, attempts: receipt.cleanupAttempts, parkedAt: new Date().toISOString() } }, nextAttemptAt: null }
+      : { receipt, nextAttemptAt: new Date(Date.now() + directoryCleanupBackoffMs({ receipt })) };
   }
   async function finishCleanupAttempt(row: Copy, lastReason: string, error?: unknown) {
     if (!isAgentDirectoryCopy(row) || row.location === "local" && !row.processStoppedAt) return;
     const current = await get(row.companyId, row.runId);
-    if (!current || current.receipt?.cleanupTerminal || !collectionCandidate(current) && !directoryCleanupEntry(current)) return;
+    if (!current || current.receipt?.cleanupTerminal) return;
+    const pending = { ...current, receipt: { ...current.receipt, cleanupParked: undefined } };
+    if (!collectionCandidate(pending) && !directoryCleanupEntry(pending)) return;
     const attempts = Number(current.receipt?.cleanupAttempts) || 0;
     // The claim already durably reserved this attempt's backoff before I/O.
     // Do not shift its deadline (or publish another wake) on mere inspection.
     if (attempts < MAX_DIRECTORY_CLEANUP_ATTEMPTS && !error) return;
     await patch(current, { receipt: { ...current.receipt, cleanupLastReason: lastReason,
       ...(error ? { cleanupLastError: error instanceof Error ? error.message : String(error) } : {}),
-      ...(attempts >= MAX_DIRECTORY_CLEANUP_ATTEMPTS ? { cleanupTerminal: {
-        state: "abandoned", reason: "retry_exhausted", lastReason, attempts, settledAt: new Date().toISOString(),
+      ...(attempts >= MAX_DIRECTORY_CLEANUP_ATTEMPTS ? { cleanupParked: {
+        state: "parked", reason: "retry_exhausted", lastReason, attempts, parkedAt: new Date().toISOString(),
       } } : {}),
     }, nextAttemptAt: attempts >= MAX_DIRECTORY_CLEANUP_ATTEMPTS ? null : current.nextAttemptAt },
       sql`${copies.receipt} = ${JSON.stringify(current.receipt)}::jsonb`);
@@ -347,7 +357,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
   async function collectStoppedOnce(input: Parameters<typeof collectStopped>[0]) {
     let row = await get(input.companyId, input.runId);
     if (!row) return row;
-    if (isAgentDirectoryCopy(row)) return directories.collectStopped(row, input.target);
+    if (isAgentDirectoryCopy(row)) return directories.collectStopped(await directories.rearm(row), input.target);
     if (completed.has(row.state) || row.state === "conflict") return row;
     row = await patch(row, { processStoppedAt: row.processStoppedAt ?? new Date(), attempts: row.attempts + 1 });
     if (completed.has(row.state) || row.state === "conflict") return row;
@@ -393,13 +403,14 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
    * proof. Terminal run status is never a substitute for that proof. Remote
    * receipts mean the environment is stopped; do not restart it just to read. */
   function collectionCandidate(row: Copy) {
-    return !row.receipt?.cleanupTerminal && !row.receipt?.retainedByRunId && (
+    return !row.receipt?.cleanupTerminal && !row.receipt?.cleanupParked && !row.receipt?.retainedByRunId && (
       row.attempts < MAX_COLLECTION_ATTEMPTS && (["prepared", "pending_collection", "unchanged_turn", "warm_saved"].includes(row.state)
         || row.state === "preparing" && isAgentDirectoryCopy(row))
       || row.state === "unavailable" && !row.processStoppedAt && row.location.startsWith("remote:") && isAgentDirectoryCopy(row));
   }
   function collectionPredicate() {
-    return and(sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
+    return and(sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupParked')
+      AND NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
       AND NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'retainedByRunId') AND (
       (${copies.attempts} < 3 AND (${copies.state} IN ('prepared', 'pending_collection', 'unchanged_turn', 'warm_saved')
         OR (${copies.state} = 'preparing' AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1')))
@@ -417,7 +428,8 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
         errorCode: "AGENT_FILES_PREPARE_FAILED", errorMessage: "Agent-file preparation was interrupted. The temporary copy was discarded.", nextAttemptAt: null }));
     } else if (row.location === "local" && (row.processStoppedAt || runtimeMode === "native" &&
         await hasNativeLocalProcessStop(db, row.companyId, row.runId))) {
-      const result = await collectStopped({ companyId: row.companyId, runId: row.runId });
+      const result = isAgentDirectoryCopy(row) ? await directories.collectStopped(row)
+        : await collectStopped({ companyId: row.companyId, runId: row.runId });
       if (result && isAgentDirectoryCopy(result) && completed.has(result.state)) await directories.release(result);
     } else if (row.location !== "local" && await remoteExecutionHasStopped(db, row.companyId, row.runId)) {
       if (row.receipt?.warm === true) {
@@ -470,7 +482,8 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     if (dueAt > Date.now()) return { ...entry, dueAt };
     if (!admitted()) throw new Error("Instruction collection recovery stopped");
     const claimed = await tryPatch(current.copy, cleanupClaim(current.copy), true,
-      and(sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')`,
+      and(sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupParked')
+        AND NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')`,
         sql`EXISTS (SELECT 1 FROM ${heartbeatRuns} WHERE ${heartbeatRuns.id} = ${copies.runId}
         AND ${heartbeatRuns.companyId} = ${copies.companyId}
         AND ${heartbeatRuns.status} IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`,
@@ -515,14 +528,15 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
 
   type DirectoryCleanupEntry = { id: string; companyId: string; dueAt: number };
   function directoryCleanupEntry(row: Copy | null): DirectoryCleanupEntry | null {
-    return row && !row.receipt?.cleanupTerminal && ["saved", "unchanged", "resolved", "unavailable"].includes(row.state)
+    return row && !row.receipt?.cleanupTerminal && !row.receipt?.cleanupParked && ["saved", "unchanged", "resolved", "unavailable"].includes(row.state)
       && row.processStoppedAt && isAgentDirectoryCopy(row) && !row.receipt?.retainedByRunId
       && (row.receipt?.cleanupPending === false ? row.nextAttemptAt !== null
         : Object.hasOwn(row.receipt!, "baseline") || row.receipt?.cleanupPending === true)
       ? { id: row.runId, companyId: row.companyId, dueAt: row.nextAttemptAt?.getTime() ?? 0 } : null;
   }
   function directoryCleanupPredicate() {
-    return sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
+    return sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupParked')
+      AND NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
       AND ${copies.state} IN ('saved', 'unchanged', 'resolved', 'unavailable')
       AND ${copies.processStoppedAt} IS NOT NULL
       AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
@@ -663,7 +677,15 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       errorMessage: "The registered instruction copy could not be retrieved safely before environment release. No instruction save is claimed.", nextAttemptAt: null });
   }
 
-  async function release(companyId: string, runId: string) { liveTargets.delete(targetKey(companyId, runId)); const row = await get(companyId, runId); if (row && isAgentDirectoryCopy(row)) await directories.release(row); }
+  async function release(companyId: string, runId: string) {
+    liveTargets.delete(targetKey(companyId, runId));
+    const row = await get(companyId, runId);
+    if (row && isAgentDirectoryCopy(row)) {
+      const current = await directories.rearm(row);
+      if (!current.processStoppedAt) await directories.recoverUnavailable(current);
+      await directories.release(current);
+    }
+  }
   async function reportRetirementUnconfirmed(companyId: string, runId: string) {
     const row = await get(companyId, runId);
     if (!row || !isAgentDirectoryCopy(row) || row.receipt?.retainedByRunId || row.processStoppedAt) return row;

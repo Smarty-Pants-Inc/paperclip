@@ -286,29 +286,38 @@ preserves those bytes even if local stop proof arrives later.
 Deferred directory cleanup reserves a durable exponential retry before I/O in
 both stopped-collection and post-save cleanup recovery: 30 seconds, one minute,
 two minutes, and so on, capped at one hour. After 12 unsuccessful attempts it
-records `receipt.cleanupTerminal` with state `abandoned`, reason
+records `receipt.cleanupParked` with state `parked`, reason
 `retry_exhausted`, the last reason and attempt count, and clears `next_attempt_at`.
+Parking stops automatic claims; it is not source-loss or successful-cleanup proof.
 The cleanup count is independent of the three collection/save attempts. Local
 warm-copy stop observations leave adoption authority unchanged; this retry
 budget applies to remote recovery and cleanup with recorded local stop proof.
 
-An exact registered lease that has been released, expired or failed, or whose
-environment reference has been removed, cannot service remote cleanup. Recovery
-retires that obligation with reason `source_gone` instead of repeatedly checking
-it. A newly released or stopped lease gets one 30-second grace period for its final
-destruction receipt; reinspection never extends this grace period. Exact
-confirmed destruction still uses the existing locked local-cleanup path and
-records a settled `source_gone` receipt. Otherwise abandonment removes no files
-and grants no process-stop, destruction or successful-save proof. A missing,
-foreign or ambiguously bound lease is uncertainty, not evidence of source loss;
-its retries remain bounded by the same attempt budget.
+Released, expired, failed, stopped-and-retained, or missing-environment lease
+rows do not prove that a source is gone. They receive the same bounded reversible
+parking, with no timer-based source-loss inference. For a bound native source,
+recovery uses the existing `remoteRunnerGenerationLost` standing-proof predicate:
+a fresh read of its exact provider box, or its exact runner generation's marker
+and exit-45/47 process check. The optional long-stop policy is disabled here.
+A failed read, unknown identity, stopped label or failed close proves nothing;
+recovery never executes against a stopped/released allocation to probe it.
+Exact confirmed destruction still uses the existing locked local-cleanup path
+and records a settled `source_gone` receipt. Generation-loss abandonment removes
+no files and grants no successful-save proof; its receipt names the predicate,
+lease, provider allocation and runner/session identity.
 
-Terminal cleanup receipts are excluded from both workers' SQL predicates and
-partial indexes. Settlement preserves the evidence row, save state, original
-save error and any captured candidate bytes. Abandoned receipts preserve the
-baseline and source binding as well; they are not successful cleanup receipts.
-Restart reconstructs only outstanding obligations, so retained terminal rows
-schedule no further checks.
+Parked and terminal cleanup receipts are excluded from both workers' SQL
+predicates and v2 partial indexes. An exact destruction producer durably clears
+the park and resets the automatic retry budget in its transaction, registering
+both existing worker wake intents before the write. An explicit release or an
+identity-checked restored live target can also rearm a parked row. No new poller
+or provider destruction is added. These events do not contradict a standing
+prior-generation loss proof, so they do not clear terminal receipts. Preparing
+a new accounted-for lifecycle remains the existing explicit replacement path.
+Settlement preserves the evidence row, save state and captured candidate bytes.
+Parking and abandonment preserve the baseline, source binding and original
+save failure as well. Restart reconstructs only outstanding automatic work;
+retained parked and terminal rows schedule no further checks.
 If releasing a run's instruction copy fails, the run records a cleanup warning
 and leaves the durable copy for the recovery sweep. Cleanup does not replace the
 provider's result, discard usage accounting, or prevent environment lease release.
@@ -331,7 +340,7 @@ required proof is available. Exact destruction of the current owner's remote
 allocation permits an explicit unavailable/no-save outcome and owned local
 cleanup. A stopped-but-retained allocation instead keeps its failed or pending
 save outcome and its files preserved, even after automatic cleanup retries
-retire. The current remote execute API may restart a stopped sandbox even when
+park. The current remote execute API may restart a stopped sandbox even when
 it bypasses a persistent session, so recovery cannot use it for retrieval
 or deletion. Safe retrieval from a stopped allocation remains a transport gap;
 live owner retirement still collects before the environment stops. No save is

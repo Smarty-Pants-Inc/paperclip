@@ -71,12 +71,16 @@ describe("working-copy cleanup retry storm", () => {
   const recover = (stopped: boolean) => stopped ? service.recoverCaptured() : service.recoverStopped();
   const get = async (runId: string) => (await service.get(companyId, runId))!;
 
-  it.each([false, true])("settles 2,736 gone sources, then executes zero SQL in a two-minute worker window (stop proof=%s)", async stopped => {
+  it.each([false, true])("parks 2,736 unproven sources, then executes zero SQL in a two-minute worker window (stop proof=%s)", async stopped => {
     const rows = await seed(2736, stopped);
+    // Performance starts at the final budgeted attempt. Per-row tests below
+    // exercise all twelve claims and their durable deadlines.
+    await db.update(copies).set({ receipt: sql`${copies.receipt} || '{"cleanupAttempts":11}'::jsonb` }).where(eq(copies.companyId, companyId));
     for (let batch = 0; batch < Math.ceil(rows.length / 20); batch++) await recover(stopped);
     const retained = await db.select().from(copies).where(eq(copies.companyId, companyId));
     expect(retained).toHaveLength(2736);
-    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    // Real wall clock and the real coordinator/DB: retained parked rows must
+    // cause no recurring statements, not merely have their timers cancelled.
     const errors: unknown[] = [];
     const worker = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true, onError: error => { errors.push(error); } });
     const priorDebug = db.$client.options.debug;
@@ -86,11 +90,12 @@ describe("working-copy cleanup retry storm", () => {
       await expect.poll(() => idleWorkSnapshot().active).toBe(0);
       const statements: string[] = [];
       db.$client.options.debug = (_id, query) => { statements.push(query); };
-      for (let second = 0; second < 120; second++) {
-        await vi.advanceTimersByTimeAsync(1000);
-        await expect.poll(() => idleWorkSnapshot().active).toBe(0);
-      }
-      process.stdout.write(`STORM stopProof=${stopped} retained=2736 windowMs=120000 SQL=${statements.length} statementsPerMinute=${statements.length / 2}\n`);
+      const start = performance.now();
+      await new Promise(resolve => setTimeout(resolve, 120_000));
+      const windowMs = performance.now() - start;
+      await expect.poll(() => idleWorkSnapshot().active).toBe(0);
+      process.stdout.write(`STORM realWallClock=true stopProof=${stopped} retained=2736 windowMs=${windowMs} SQL=${statements.length} statementsPerMinute=${statements.length * 60_000 / windowMs}\n`);
+      expect(windowMs).toBeGreaterThanOrEqual(119_900);
       expect(statements).toEqual([]);
       expect(worker.nextWakeAt()).toBeNull();
       expect(errors).toEqual([]);
@@ -100,50 +105,67 @@ describe("working-copy cleanup retry storm", () => {
     const plan = await db.transaction(async tx => {
       await tx.execute(sql`set local enable_seqscan = off`);
       return tx.execute(sql`explain (format json) select run_id from ${copies}
-        where not (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
+        where not (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupParked')
+          and not (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
           and not (coalesce(${copies.receipt}, '{}'::jsonb) ? 'retainedByRunId')
           and ${copies.state} = 'unavailable' and ${copies.processStoppedAt} is null
           and ${copies.location} like 'remote:%' and ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
         order by run_id limit 20`);
     });
-    expect(JSON.stringify(plan)).toContain("agent_instruction_copies_collection_idx");
+    expect(JSON.stringify(plan)).toContain("agent_instruction_copies_collection_v2_idx");
     const indexes = await db.execute(sql`select indexname, indexdef from pg_indexes where tablename = 'agent_instruction_working_copies'
-      and indexname in ('agent_instruction_copies_collection_idx', 'agent_instruction_copies_cleanup_idx')`);
+      and indexname in ('agent_instruction_copies_collection_v2_idx', 'agent_instruction_copies_cleanup_v2_idx')`);
     expect(indexes).toHaveLength(2);
-    for (const index of indexes) expect(index.indexdef).toContain("cleanupTerminal");
+    for (const index of indexes) {
+      expect(index.indexdef).toContain("cleanupTerminal");
+      expect(index.indexdef).toContain("cleanupParked");
+    }
     for (const row of retained) {
-      expect(row.receipt).toMatchObject({ cleanupTerminal: { state: "abandoned", reason: "source_gone" }, baseline: { evidence: "keep" } });
+      expect(row.receipt).toMatchObject({ cleanupParked: { state: "parked", reason: "retry_exhausted", attempts: 12 }, baseline: { evidence: "keep" } });
+      expect(row.receipt?.cleanupTerminal).toBeUndefined();
       expect(row.nextAttemptAt).toBeNull();
       expect(row.errorCode).toBe("INSTRUCTION_COLLECTION_UNAVAILABLE");
       expect(row.candidateHash).toBe("preserved");
       expect(row.candidateBase64).toBe(Buffer.from("preserved bytes").toString("base64"));
       expect(row.processStoppedAt !== null).toBe(stopped);
     }
-  }, 90_000);
+  }, 180_000);
 
-  it.each(["expired", "stopped", "missing_sandbox"] as const)("settles a %s source without granting stop proof or discarding local bytes", async source => {
+  it.each(["expired", "stopped", "missing_sandbox"] as const)("parks an unproven %s source without granting stop proof or discarding local bytes", async source => {
     const [{ runId }] = await seed(1, false, source);
     const row = await get(runId);
     await fs.mkdir(row.localRoot, { recursive: true });
     await fs.writeFile(path.join(row.localRoot, "unsaved.txt"), "uncollected evidence");
-    await recover(false);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await recover(false);
+      const next = (await get(runId)).nextAttemptAt;
+      if (next) vi.setSystemTime(next);
+    }
     expect(await get(runId)).toMatchObject({ state: "unavailable", processStoppedAt: null, nextAttemptAt: null,
-      receipt: { cleanupTerminal: { reason: "source_gone" } } });
+      receipt: { cleanupParked: { reason: "retry_exhausted" } } });
+    expect((await get(runId)).receipt?.cleanupTerminal).toBeUndefined();
     expect(await fs.readFile(path.join(row.localRoot, "unsaved.txt"), "utf8")).toBe("uncollected evidence");
   });
 
-  it("settles an active but terminal stopped-and-retained source without executing or granting cleanup authority", async () => {
+  it("parks an active stopped-and-retained source without executing or granting cleanup authority", async () => {
     const [{ runId, leaseId }] = await seed(1, false, "active");
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
     const receipt = remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" })!;
     receipt.confirmedAt = new Date(Date.now() - 3_600_000).toISOString();
     await db.update(environmentLeases).set({ metadata: { remoteExecutionTermination: receipt } }).where(eq(environmentLeases.id, leaseId));
-    await recover(false);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await recover(false);
+      const next = (await get(runId)).nextAttemptAt;
+      if (next) vi.setSystemTime(next);
+    }
     expect(await get(runId)).toMatchObject({ state: "unavailable", processStoppedAt: null, nextAttemptAt: null,
-      receipt: { cleanupTerminal: { reason: "source_gone" } } });
+      receipt: { cleanupParked: { reason: "retry_exhausted" } } });
+    expect((await get(runId)).receipt?.cleanupTerminal).toBeUndefined();
   });
 
-  it.each([false, true])("a fresh retirement gets only one fixed grace period (stop proof=%s)", async stopped => {
+  it.each([false, true])("a fresh retirement backs off without inventing source loss (stop proof=%s)", async stopped => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const [{ runId, leaseId }] = await seed(1, stopped);
     const now = Date.now();
@@ -153,7 +175,8 @@ describe("working-copy cleanup retry storm", () => {
     expect((await get(runId)).receipt?.cleanupTerminal).toBeUndefined();
     vi.setSystemTime(now + 30_000);
     await recover(stopped);
-    expect(await get(runId)).toMatchObject({ nextAttemptAt: null, receipt: { cleanupTerminal: { reason: "source_gone" } } });
+    expect(await get(runId)).toMatchObject({ nextAttemptAt: new Date(now + 90_000), receipt: { cleanupAttempts: 2 } });
+    expect((await get(runId)).receipt?.cleanupTerminal).toBeUndefined();
   });
 
   it.each([false, true])("concurrent owners count only one due claim (stop proof=%s)", async stopped => {
@@ -183,7 +206,7 @@ describe("working-copy cleanup retry storm", () => {
         service = agentInstructionWorkingCopyService(db); // retry count survives restart
       } else {
         expect(row.nextAttemptAt).toBeNull();
-        expect(row.receipt).toMatchObject({ cleanupTerminal: { state: "abandoned", reason: "retry_exhausted",
+        expect(row.receipt).toMatchObject({ cleanupParked: { state: "parked", reason: "retry_exhausted",
           lastReason: stopped ? "remote_cleanup_failed" : "stop_unconfirmed", attempts: 12 } });
         expect(row.errorCode).toBe("INSTRUCTION_COLLECTION_UNAVAILABLE");
       }

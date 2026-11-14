@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
-import { agents, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
+import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
 import { withDirectoryMergeLock, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -14,9 +14,10 @@ import { resolveInstructionActor } from "./agent-instruction-authorization.js";
 import { HttpError, conflict, notFound } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
+import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { agentDirectoryBaselineDigest, agentDirectoryProbeProgram, observeLocalAgentDirectory } from "./agent-directory-probe.js";
-import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
 import { cachedAgentFileManifest, captureAgentFileCheckpoint, checkpointBaseline, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
 import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
 import { logger } from "../middleware/logger.js";
@@ -191,6 +192,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     if (row && !completed.has(row.state) && row.state !== "preparing") {
       if (input.target?.kind === "remote") {
+        const lease = await ownedRemoteLease(row);
+        if (lease?.status === "active" && !lease.releasedAt && !hasRemoteTerminationReceipt(lease)
+          && input.target.leaseId === lease.id) row = await rearm(row);
         if (disposableRemoteCopy(row)) await restoreProjection(row, input.target);
         if (!transports.has(key(row))) transports.set(key(row), await transport(row, input.target, true));
       }
@@ -511,6 +515,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     await release(row);
     return (await get(row.companyId, row.runId))!;
   }
+  /** An explicit owner/transport event may retry a parked obligation. It does
+   * not contradict standing source-loss proof, so terminal receipts stay final. */
+  async function rearm(row: Copy): Promise<Copy> {
+    if (!row.receipt?.cleanupParked || row.receipt?.cleanupTerminal || row.receipt?.retainedByRunId) return row;
+    const { cleanupParked: _parked, ...receipt } = row.receipt;
+    return patch(row, { receipt: { ...receipt, cleanupAttempts: 0 }, nextAttemptAt: new Date() },
+      sql`${copies.receipt} = ${JSON.stringify(row.receipt)}::jsonb`);
+  }
   function releaseIsNoop(row: Copy) {
     return Boolean(row.receipt?.cleanupTerminal) || row.state === "superseded" || !row.processStoppedAt ||
       completed.has(row.state) && row.receipt?.cleanupPending === false;
@@ -558,6 +570,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       cleanupPending ||= !await cleanupRemoteAfterRestart(row).catch(() => false);
     }
     if (completed.has(row.state) && row.processStoppedAt) {
+      if (cleanupPending) {
+        // Failed transport/uncertain lease cleanup has not settled anything.
+        // Keep the baseline, exact source binding and remaining local evidence
+        // while backing off or parked; compact only a successful cleanup.
+        await patch(row, { receipt: { ...row.receipt, cleanupPending: true },
+          nextAttemptAt: row.receipt?.cleanupParked ? null : new Date(Date.now() + directoryCleanupBackoffMs(row)) });
+        return;
+      }
       try { await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true }); }
       catch {
         // Leave the baseline marker so restart recovery retries failed cleanup.
@@ -566,6 +586,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         ...(row.receipt?.cleanupAttempts ? { cleanupAttempts: row.receipt.cleanupAttempts } : {}),
+        ...(cleanupPending && row.receipt?.cleanupParked ? { cleanupParked: row.receipt.cleanupParked } : {}),
         ...(row.receipt?.cleanupLastReason ? { cleanupLastReason: row.receipt.cleanupLastReason } : {}),
         ...(row.receipt?.cleanupLastError ? { cleanupLastError: row.receipt.cleanupLastError } : {}),
         ...(destroyed && !cleanupPending ? { cleanupTerminal: { state: "settled", reason: "source_gone",
@@ -576,9 +597,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         nextAttemptAt: cleanupPending ? new Date(Date.now() + directoryCleanupBackoffMs(row)) : null });
     }
   }
-  /** Retire an unreachable cleanup obligation, not its save outcome or bytes.
-   * A missing/foreign lease is uncertainty, never proof of source loss. Exact
-   * destruction still uses the existing locked local-cleanup path below. */
+  /** Only the existing generation-loss predicate can retire a source. Lease
+   * labels, elapsed time and absent environment references prove nothing.
+   * Exact destruction follows the existing locked cleanup path instead. */
   async function abandonGoneSource(row: Copy): Promise<Copy | null> {
     if (!isAgentDirectoryCopy(row) || !row.location.startsWith("remote:") || row.receipt?.retainedByRunId || row.receipt?.cleanupTerminal) return null;
     const cleanup = row.receipt?.cleanup as { leaseId?: string; remoteCwd?: string } | undefined;
@@ -595,15 +616,30 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (typeof remoteCwd !== "string" || row.executionRoot !== path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", row.agentId,
       String(row.receipt?.materializationRunId ?? row.receipt?.directoryRunId ?? row.runId))) return null;
     if (hasRemoteTerminationReceipt(lease) && (lease.metadata?.remoteExecutionTermination as { state?: string })?.state === "destroyed") return null;
-    const stopped = hasBoundRemoteStopReceipt(lease);
-    const terminalLease = ["released", "expired", "failed"].includes(lease.status) || lease.releasedAt !== null || stopped;
-    const termination = lease.metadata?.remoteExecutionTermination as { confirmedAt?: string } | undefined;
-    const retiredAt = lease.releasedAt?.getTime() ?? (stopped ? Date.parse(termination?.confirmedAt ?? "") : NaN);
-    // Allow the first reservation after a fresh release/stop to observe its
-    // final destruction receipt. Reinspection cannot renew this grace period.
-    if (lease.environmentId !== null && (!terminalLease || Number.isFinite(retiredAt) && retiredAt + 30_000 > Date.now())) return null;
-    return patch(row, { nextAttemptAt: null, receipt: { ...row.receipt, cleanupTerminal: {
+    if (!environmentRuntime || !lease.providerLeaseId || !lease.environmentId) return null;
+    const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.companyId), eq(heartbeatRuns.id, row.runId)));
+    if (!run?.runnerInstanceId || !run.nativeSessionId) return null;
+    const [environment] = await db.select().from(environments).where(eq(environments.id, lease.environmentId));
+    if (!environment || environment.driver !== "sandbox") return null;
+    // The same-box predicate is shared with native recovery. Disable its
+    // optional long-stop policy: time alone is not a working-copy loss proof.
+    const { remoteRunnerGenerationLost } = await import("./native-runtime/native-session-executor.js");
+    const runtime = environmentRuntime;
+    const runner = { execute: (request: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) => {
+      // execute can restart a retained sandbox even with bypassSession. Only a
+      // currently active, unreleased source may receive a marker probe.
+      if (lease.status !== "active" || lease.releasedAt || hasRemoteTerminationReceipt(lease)) throw new Error("working_copy_source_not_probeable");
+      return runtime.execute({ ...request, environment: environment as Environment, lease: lease as EnvironmentLease });
+    } } as CommandManagedRuntimeRunner;
+    const identity = { runnerInstanceId: run.runnerInstanceId, normalizedSessionId: run.nativeSessionId };
+    const lost = await remoteRunnerGenerationLost({ runner, remoteCwd, identity, longStopProvesLossAlone: false,
+      predecessor: { providerLeaseId: lease.providerLeaseId, probedProviderLeaseId: lease.providerLeaseId,
+        start: run.processStartedAt ? { at: run.processStartedAt.toISOString(), source: "process" } : null,
+        readSandbox: () => runtime.readPredecessorSandboxRecord({ companyId: row.companyId, leaseId: lease.id }) } });
+    if (!lost) return null;
+    return patch(row, { nextAttemptAt: null, receipt: { ...row.receipt, cleanupParked: undefined, cleanupTerminal: {
       state: "abandoned", reason: "source_gone", lastReason: row.errorCode ?? "source_unreachable",
+      proof: { predicate: "remoteRunnerGenerationLost", leaseId: lease.id, providerLeaseId: lease.providerLeaseId, ...identity },
       attempts: row.receipt?.cleanupAttempts ?? 0, settledAt: new Date().toISOString(),
     } } }, sql`${copies.receipt} = ${JSON.stringify(row.receipt)}::jsonb`);
   }
@@ -711,7 +747,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
     }));
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, abandonGoneSource,
+  return { rearm: (row: Copy) => row.receipt?.cleanupParked && !row.receipt?.cleanupTerminal && !row.receipt?.retainedByRunId
+      ? serial(row, rearm, "agent_directory_release") : Promise.resolve(row), prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, abandonGoneSource,
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
     checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint"),
     collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => collectStopped(current, target), "agent_directory_collect"),

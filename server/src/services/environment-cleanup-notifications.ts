@@ -5,6 +5,7 @@ import { notifyNativeEnvironmentSettlement, type NativeEnvironmentSettlementScop
 import type { Db } from "@paperclipai/db";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyQueuedRunDispatch } from "./run-dispatch-notifications.js";
+import { rearmDestroyedWorkingCopyCleanup } from "./working-copy-cleanup-events.js";
 
 export type EnvironmentCleanupWorkScope = NativeEnvironmentSettlementScope & { leaseId?: string };
 
@@ -42,7 +43,9 @@ export async function notifyEnvironmentCleanup(transaction: object, scope?: Envi
 export function writeEnvironmentCleanup<T>(db: Db, write: (tx: Db) => PromiseLike<T>, scope: EnvironmentCleanupWorkScope): Promise<T> {
   return db.transaction(async tx => {
     await notifyEnvironmentCleanup(tx, scope);
-    return write(tx as unknown as Db);
+    const result = await write(tx as unknown as Db);
+    await rearmDestroyedWorkingCopyCleanup(tx as unknown as Db, scope);
+    return result;
   });
 }
 

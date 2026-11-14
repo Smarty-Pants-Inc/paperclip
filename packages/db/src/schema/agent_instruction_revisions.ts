@@ -114,13 +114,15 @@ export const agentInstructionWorkingCopies = pgTable(
   },
   (t) => ({
     owner: foreignKey({ columns: [t.companyId, t.agentId], foreignColumns: [agents.companyId, agents.id] }).onDelete("cascade"),
-    collection: index("agent_instruction_copies_collection_idx").on(t.runId, t.companyId).where(sql`NOT (coalesce(${t.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
+    collection: index("agent_instruction_copies_collection_v2_idx").on(t.runId, t.companyId).where(sql`NOT (coalesce(${t.receipt}, '{}'::jsonb) ? 'cleanupParked')
+      AND NOT (coalesce(${t.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
       AND NOT (coalesce(${t.receipt}, '{}'::jsonb) ? 'retainedByRunId') AND (
       (${t.attempts} < 3 AND (${t.state} IN ('prepared', 'pending_collection', 'unchanged_turn', 'warm_saved')
         OR (${t.state} = 'preparing' AND ${t.receipt}->>'schema' = 'paperclip.agent-files.v1')))
       OR (${t.state} = 'unavailable' AND ${t.processStoppedAt} IS NULL
         AND ${t.location} LIKE 'remote:%' AND ${t.receipt}->>'schema' = 'paperclip.agent-files.v1'))`),
-    directoryCleanup: index("agent_instruction_copies_cleanup_idx").on(t.runId, t.companyId).where(sql`NOT (coalesce(${t.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
+    directoryCleanup: index("agent_instruction_copies_cleanup_v2_idx").on(t.runId, t.companyId).where(sql`NOT (coalesce(${t.receipt}, '{}'::jsonb) ? 'cleanupParked')
+      AND NOT (coalesce(${t.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
       AND ${t.state} IN ('saved', 'unchanged', 'resolved', 'unavailable')
       AND ${t.processStoppedAt} IS NOT NULL
       AND ${t.receipt}->>'schema' = 'paperclip.agent-files.v1'

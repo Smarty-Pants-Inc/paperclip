@@ -9,7 +9,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const migrationSql = await readFile(new URL("./migrations/0479_organic_pixie.sql", import.meta.url), "utf8");
+const migrationSql = (await Promise.all([
+  "./migrations/0487_organic_pixie.sql", "./migrations/0488_working_copy_cleanup_parking.sql",
+].map(file => readFile(new URL(file, import.meta.url), "utf8")))).join("\n--> statement-breakpoint\n");
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
 
@@ -50,20 +52,20 @@ describePostgres("working-copy receipt index migration", () => {
         WHERE i.indrelid = 'agent_instruction_working_copies'::regclass ORDER BY c.relname`);
       const indexOids = async () => Array.from(await sql`
         SELECT c.relname, c.oid::text AS oid FROM pg_class c
-        WHERE c.relname IN ('agent_instruction_copies_collection_idx', 'agent_instruction_copies_cleanup_idx')
+        WHERE c.relname IN ('agent_instruction_copies_collection_v2_idx', 'agent_instruction_copies_cleanup_v2_idx')
         ORDER BY c.relname`);
       const beforeRows = await rows();
       const beforeHistory = await history();
       const expectedIndexes = await indexes();
       expect(beforeRows).toHaveLength(4);
       expect(expectedIndexes.filter((index) =>
-        ["agent_instruction_copies_collection_idx", "agent_instruction_copies_cleanup_idx"].includes(index.relname),
+        ["agent_instruction_copies_collection_v2_idx", "agent_instruction_copies_cleanup_v2_idx"].includes(index.relname),
       )).toHaveLength(2);
 
       // Start with the old, broader indexes. Applying just CREATE IF NOT EXISTS
       // would silently preserve these stale definitions; the guarded drops matter.
-      await sql`DROP INDEX CONCURRENTLY agent_instruction_copies_collection_idx`;
-      await sql`DROP INDEX CONCURRENTLY agent_instruction_copies_cleanup_idx`;
+      await sql`DROP INDEX CONCURRENTLY agent_instruction_copies_collection_v2_idx`;
+      await sql`DROP INDEX CONCURRENTLY agent_instruction_copies_cleanup_v2_idx`;
       await sql`CREATE INDEX agent_instruction_copies_collection_idx ON agent_instruction_working_copies (run_id, company_id)`;
       await sql`CREATE INDEX agent_instruction_copies_cleanup_idx ON agent_instruction_working_copies (run_id, company_id)`;
       expect(await indexes()).not.toEqual(expectedIndexes);
@@ -78,7 +80,7 @@ describePostgres("working-copy receipt index migration", () => {
       }
 
       // A partial previous attempt with a missing index is also recoverable.
-      await sql`DROP INDEX CONCURRENTLY agent_instruction_copies_cleanup_idx`;
+      await sql`DROP INDEX CONCURRENTLY agent_instruction_copies_cleanup_v2_idx`;
       for (const statement of migrationSql.split("--> statement-breakpoint").map((part) => part.trim()).filter(Boolean)) {
         await sql.unsafe(statement);
       }
