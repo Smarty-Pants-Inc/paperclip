@@ -222,6 +222,7 @@ describeDb("retired native backup source authority", () => {
   it.each([
     ["the later predecessor stamp does not match the manifest", { stampSha: `sha256:${"c".repeat(64)}` }],
     ["the handoff chain is not verified", { handoffFault: "changed_receipt" as const }],
+    ["the later predecessor stamp names a different runner instance than the manifest", { stampIdentity: "wrong_runner" as const }],
   ])("keeps the same latest-completedAt warm backup timeline held when %s", async (_label, options) => {
     await expect(fixture({ handoffs: 11, predecessorStamp: true, idleWarm: "released", stoppedWarm: true,
       tipStamp: "older_matching", providerEventAt: new Date(completedAt.getTime() - 60_000), ...options })).resolves.toBe(false);
