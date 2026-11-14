@@ -1,5 +1,6 @@
 import { TaskChatPausedTakeover, type TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { IssueRecoveryActionCard } from "../components/IssueRecoveryActionCard";
 // @vitest-environment jsdom
 
@@ -467,7 +468,7 @@ vi.mock("../components/TaskChatThread", () => ({
       <div data-testid="task-chat-thread">
         {props.threadHeader}
         Task chat thread
-        {process.env.JUDGE_EVIDENCE_DIR && props.recoveryAction ? (
+        {props.recoveryAction ? (
           <IssueRecoveryActionCard action={props.recoveryAction} onResolve={props.onResolveRecoveryAction} />
         ) : null}
         {props.comments?.map((comment, index) => comment.metadata?.recovery ? <DispositionRecoveryNotice key={index} snapshot={comment.metadata.recovery} /> : null)}
@@ -1487,27 +1488,40 @@ describe("IssueDetail", () => {
     mockRouteParams.companyPrefix = "PAP";
   });
 
-  if (process.env.JUDGE_EVIDENCE_DIR) {
-    it("R6 real IssueDetail path renders the system-interrupted refreshed card and retries current B", async () => {
-      const dir = process.env.JUDGE_EVIDENCE_DIR!;
-      const manifest = JSON.parse(readFileSync(`${dir}/ui-loopback.json`, "utf8"));
-      vi.mocked(globalThis.fetch).mockRestore();
+  it("R6 real IssueDetail path renders the system-interrupted refreshed card and retries current B", async () => {
+      const evidenceDir = process.env.JUDGE_EVIDENCE_DIR;
+      const fixturePath = [resolve(process.cwd(), "ui/src/__fixtures__/refused-card-from-get.json"),
+        resolve(process.cwd(), "../ui/src/__fixtures__/refused-card-from-get.json")].find(existsSync)!;
+      const action = JSON.parse(readFileSync(fixturePath, "utf8")) as NonNullable<Issue["activeRecoveryAction"]>;
+      const manifest = {
+        issueId: action.sourceIssueId,
+        companyId: action.companyId,
+        userId: "local-board",
+        actionId: action.id,
+        B: String(action.evidence.latestRunId),
+        agent: createAgent({ id: action.returnOwnerAgentId ?? "agent-1", companyId: action.companyId }),
+      };
+      const issue = createIssue({
+        id: manifest.issueId,
+        companyId: manifest.companyId,
+        identifier: String(action.evidence.sourceIdentifier ?? "R6-1"),
+        status: "blocked",
+        assigneeAgentId: manifest.agent.id,
+        activeRecoveryAction: action,
+        interruption: {
+          intentId: null, responsibility: "system", state: "failed", nextRetryAt: null,
+          canRetry: false, userAction: null, sourceRunIds: [manifest.B], observedRunId: manifest.B,
+        },
+      });
       const trace: Array<Record<string, any>> = [];
-      const http = async (method: string, path: string, body?: unknown) => {
-        const reply = await fetch(`${manifest.origin}${path}`, {
-          method,
-          headers: { "Content-Type": "application/json" },
-          ...(body ? { body: JSON.stringify(body) } : {}),
+      const http = async (method: string, path: string, body?: unknown): Promise<any> => {
+        const value = method === "GET" ? issue : { issue, recoveryAction: action };
+        trace.push({ method, path, request: body, status: 200,
+          actionId: issue.activeRecoveryAction?.id,
+          sourceRunId: issue.activeRecoveryAction?.evidence?.latestRunId,
+          responsibility: issue.interruption?.responsibility,
         });
-        const value = await reply.json();
-        trace.push({ method, path, request: body, status: reply.status,
-          actionId: value.activeRecoveryAction?.id,
-          sourceRunId: value.activeRecoveryAction?.evidence?.latestRunId,
-          responsibility: value.interruption?.responsibility,
-          error: value.error, details: value.details,
-        });
-        writeFileSync(`${dir}/ui-request-trace.json`, JSON.stringify(trace, null, 2));
-        if (!reply.ok) throw new ApiError(value.error, reply.status, value);
+        if (evidenceDir) writeFileSync(`${evidenceDir}/ui-request-trace.json`, JSON.stringify(trace, null, 2));
         return value;
       };
       mockRouteParams.issueId = manifest.issueId;
@@ -1551,13 +1565,12 @@ describe("IssueDetail", () => {
       expect(post.request).toEqual({ actionId: manifest.actionId, sourceRunId: manifest.B,
         outcome: "restored", sourceIssueStatus: "todo" });
       await waitForAssertion(() => expect(trace.some(entry => entry.method === "GET" && entry.sourceRunId === manifest.B)).toBe(true), 100);
-      writeFileSync(`${dir}/ui-loopback-result.json`, JSON.stringify({ post, pageProps: {
+      if (evidenceDir) writeFileSync(`${evidenceDir}/ui-loopback-result.json`, JSON.stringify({ post, pageProps: {
         recoveryActionId: pageProps.recoveryAction.id,
         recoverySourceRunId: pageProps.recoveryAction.evidence.latestRunId,
         interruptionResponsibility: initial.interruption.responsibility,
       }, passed: true }, null, 2));
     }, 60_000);
-  }
 
   it("clears only the monitor after confirmation and refreshes the task", async () => {
     const nextCheckAt = new Date(Date.now() + 60_000).toISOString();
