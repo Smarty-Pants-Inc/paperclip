@@ -2513,6 +2513,45 @@ describe("IssueDetail", () => {
     });
   });
 
+  it("does not offer Retry when the execution blocker refuses continuation", async () => {
+    const refusalText = "The previous continuation could not be reconciled. Inspect the stopped run before continuing.";
+    const interruption: NonNullable<Issue["interruption"]> = {
+      intentId: null,
+      responsibility: "system",
+      state: "failed",
+      nextRetryAt: null,
+      // The execution blocker is the authoritative retry eligibility for this refusal.
+      canRetry: true,
+      userAction: null,
+      sourceRunIds: ["refused-run"],
+      observedRunId: "refused-run",
+      notice: { code: "native_continuation_requires_reconciliation", text: refusalText },
+    };
+    const issue = createIssue({
+      status: "blocked",
+      assigneeAgentId: "agent-1",
+      interruption,
+      executionBlocker: {
+        recoveryActionId: "recovery-action",
+        runId: "refused-run",
+        agentId: "agent-1",
+        cause: "native_continuation_requires_reconciliation",
+        nextAction: "Inspect the stopped run before continuing.",
+        canRetry: false,
+      },
+    });
+    mockIssuesApi.get.mockResolvedValue(issue);
+    mockAuthApi.getSession.mockResolvedValue({ session: { userId: "local-board" }, user: { id: "local-board" } });
+    mockAccessApi.getCurrentBoardAccess.mockResolvedValue({ companyIds: [issue.companyId], isInstanceAdmin: true,
+      source: "local_implicit", keyId: null, user: null, userId: "local-board" });
+
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="task-execution-notice"]')?.textContent).toBe(refusalText));
+    await waitForAssertion(() => expect(mockAccessApi.getCurrentBoardAccess).toHaveBeenCalled());
+    expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
+    expect(mockIssuesApi.retryTask).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("refreshes admission with latest comments (compact chat: %s)", async compact => {
     const interruption: NonNullable<Issue["interruption"]> = { intentId: "retry", responsibility: "system", state: "failed",
       nextRetryAt: null, canRetry: true, userAction: null, sourceRunIds: ["failed-run"], observedRunId: "failed-run",
