@@ -482,6 +482,13 @@ export interface WorkerStartOptions {
    */
   proactiveCompanyScopes?: readonly string[];
   /**
+   * Reload the plugin's stored configured companies for a company-referencing
+   * job/proactive host RPC. The loader supplies the registry read so authority
+   * never depends on which server process received the latest config save.
+   * A failed read denies the call rather than trusting the startup snapshot.
+   */
+  loadProactiveCompanyScopes?: () => Promise<readonly string[]>;
+  /**
    * Callback for stream notifications from the worker (streams.open/emit/close).
    * The host wires this to the PluginStreamBus to fan out events to SSE clients.
    */
@@ -2861,7 +2868,37 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function contextForWorkerMessage(message: JsonRpcRequest | JsonRpcNotification): WorkerHostCallContext {
+  async function companyScopesForWorkerRequest(request: JsonRpcRequest): Promise<ReadonlySet<string>> {
+    const invocationId = readNonEmptyString(
+      (request as { paperclipInvocationId?: unknown }).paperclipInvocationId,
+    );
+    // Never let a forged/retired id or an already company-scoped invocation
+    // acquire authority from configuration. Resolve the context again after the
+    // read, so an invocation retired while the database was pending stays denied.
+    if (!options.loadProactiveCompanyScopes ||
+        (invocationId && activeInvocations.get(invocationId)?.scope !== null) ||
+        !referencedCompanyId(request.method, request.params)) return proactiveCompanyScopes;
+
+    try {
+      // One indexed registry read per explicit-company unscoped RPC. This also
+      // revokes removed companies immediately, with no idle polling or timer.
+      const scopes = new Set((await options.loadProactiveCompanyScopes())
+        .map(readNonEmptyString).filter((id): id is string => id !== null));
+      proactiveCompanyScopes.clear();
+      for (const id of scopes) proactiveCompanyScopes.add(id);
+      return scopes;
+    } catch {
+      proactiveCompanyScopes.clear();
+      throw Object.assign(new Error("Could not verify configured plugin companies"), {
+        code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+      });
+    }
+  }
+
+  function contextForWorkerMessage(
+    message: JsonRpcRequest | JsonRpcNotification,
+    companyScopes: ReadonlySet<string> = proactiveCompanyScopes,
+  ): WorkerHostCallContext {
     const invocationId = readNonEmptyString(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
@@ -2880,7 +2917,7 @@ export function createPluginWorkerHandle(
         message.method,
         (message as { params?: unknown }).params,
       );
-      if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
+      if (proactiveCompanyId && companyScopes.has(proactiveCompanyId)) {
         return { invocationScope: { companyId: proactiveCompanyId } };
       }
       const hasActiveInvocation = activeInvocations.size > 0 ||
@@ -2894,7 +2931,7 @@ export function createPluginWorkerHandle(
     // allowlist as proactive calls, without inheriting another invocation's scope.
     if (entry.scope === null) {
       const companyId = referencedCompanyId(message.method, (message as { params?: unknown }).params);
-      if (companyId && proactiveCompanyScopes.has(companyId)) {
+      if (companyId && companyScopes.has(companyId)) {
         return { invocationScope: { companyId }, traceparent: entry.traceparent, providerSpanBudget: entry.providerSpanBudget };
       }
     }
@@ -2958,7 +2995,8 @@ export function createPluginWorkerHandle(
     }
 
     try {
-      const context = contextForWorkerMessage(request);
+      const companyScopes = await companyScopesForWorkerRequest(request);
+      const context = contextForWorkerMessage(request, companyScopes);
       if (context.invalidInvocationScope) throw Object.assign(new Error("Missing or unknown invocation scope"), {
         code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
       });

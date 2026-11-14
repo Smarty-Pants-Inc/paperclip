@@ -2459,6 +2459,11 @@ export function pluginLoader(
         // set is exactly the plugin's configured companies — proactive access
         // never reaches an unconfigured company.
         proactiveCompanyScopes: configRows.map((row) => row.companyId),
+        // Config saves only update the receiving process's in-memory snapshot.
+        // Recheck the authoritative rows for job/proactive host calls so other
+        // processes observe both newly configured and removed companies.
+        loadProactiveCompanyScopes: async () =>
+          (await registry.listConfigs(pluginId)).map((row) => row.companyId),
       };
 
       if (prebuiltOnly) {
